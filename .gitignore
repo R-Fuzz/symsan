@@ -1,0 +1,17 @@
+.vscode
+*.taint
+*.o
+*.so
+*.dwo
+*.bc
+GPATH
+GRTAGS
+GTAGS
+GSYMS
+output*/
+*.tar.gz
+*.tar.xz
+auto/
+/bin/
+.DS_Store
+/build/
