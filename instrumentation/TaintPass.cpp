@@ -734,7 +734,7 @@ bool Taint::doInitialization(Module &M) {
       Int64Ty, Int64Ty };
   TaintTraceCmpFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCmpArgs, false);
-  Type *TaintTraceCondArgs[2] = { ShadowTy, IntegerType::get(*Ctx, 1) };
+  Type *TaintTraceCondArgs[2] = { ShadowTy, IntegerType::get(*Ctx, 8) };
   TaintTraceCondFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCondArgs, false);
   TaintTraceIndirectCallFnTy = FunctionType::get(
@@ -947,6 +947,7 @@ void Taint::initializeCallbackFunctions(Module &M) {
     AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
                          Attribute::NoUnwind);
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
     TaintTraceCondFn =
         Mod->getOrInsertFunction("__taint_trace_cond", TaintTraceCondFnTy, AL);
   }
