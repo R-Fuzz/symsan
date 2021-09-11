@@ -45,7 +45,6 @@
 using namespace __dfsan;
 
 typedef atomic_uint32_t atomic_dfsan_label;
-static const dfsan_label kInitializingLabel = -1;
 
 static atomic_dfsan_label __dfsan_last_label;
 static dfsan_label_info *__dfsan_label_info;
@@ -59,15 +58,12 @@ static dfsan_label __saved_alloca_stack_top[MAX_SAVED_STACK_ENTRIES];
 static int __current_saved_stack_index = 0;
 
 // taint source
-static struct taint_file tainted;
+struct taint_file __dfsan::tainted;
 
 // Hash table
 static const uptr hashtable_size = (1ULL << 32);
 static const size_t union_table_size = (1ULL << 18);
 static __taint::union_hashtable __union_table(union_table_size);
-
-// filter?
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
 
 Flags __dfsan::flags_data;
 bool print_debug;
@@ -157,7 +153,7 @@ static inline u32 xxhash(u32 h1, u32 h2, u32 h3) {
   return h32;
 }
 
-static inline dfsan_label_info* get_label_info(dfsan_label label) {
+dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
   return &__dfsan_label_info[label];
 }
 
@@ -711,6 +707,8 @@ static void InitializeTaintFile() {
   }
 }
 
+extern "C" void InitializeSolver();
+
 static void InitializeFlags() {
   SetCommonFlagsDefaults();
   flags().SetDefaults();
@@ -786,6 +784,8 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   InitializeInterceptors();
 
   InitializeTaintFile();
+
+  InitializeSolver();
 
   // Register the fini callback to run when the program terminates successfully
   // or it is killed by the runtime.

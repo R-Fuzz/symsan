@@ -98,9 +98,6 @@ off_t get_utmp_offset(void);
 void set_utmp_offset(off_t offset);
 int is_utmp_taint(void);
 
-// additional constraints
-void add_constraints(dfsan_label label);
-
 }  // extern "C"
 
 template <typename T>
@@ -109,6 +106,8 @@ void dfsan_set_label(dfsan_label label, T &data) {  // NOLINT
 }
 
 namespace __dfsan {
+
+const dfsan_label kInitializingLabel = -1;
 
 void InitializeInterceptors();
 
@@ -124,6 +123,8 @@ inline void *app_for(const dfsan_label *l) {
   return (void *) ((((uptr) l) >> 2) | AppBaseAddr());
 }
 
+dfsan_label_info* get_label_info(dfsan_label label);
+
 struct Flags {
 #define DFSAN_FLAG(Type, Name, DefaultValue, Description) Type Name;
 #include "dfsan_flags.inc"
@@ -136,6 +137,9 @@ extern Flags flags_data;
 inline Flags &flags() {
   return flags_data;
 }
+
+// taint source
+extern struct taint_file tainted;
 
 enum operators {
   Not       = 1,

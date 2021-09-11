@@ -62,6 +62,9 @@ static inline dfsan_label get_label_for(int fd, off_t offset) {
   else return (offset + CONST_OFFSET);
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_offset(dfsan_label offset_label, int64_t offset, unsigned size);
+
 extern "C" {
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_stat(const char *path, struct stat *buf, dfsan_label path_label,
@@ -2118,9 +2121,7 @@ __dfsw_lseek(int fd, off_t offset, int whence, dfsan_label fd_label,
     if (taint_get_file(fd)) {
       taint_set_offset_label(offset_label);
       if (offset_label) {
-        dfsan_label sc = dfsan_union(offset_label, 0, (bveq << 8) | ICmp, sizeof(offset) * 8,
-            0, offset);
-        add_constraints(sc);
+        __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
       }
     }
     *ret_label = offset_label;
@@ -2138,9 +2139,7 @@ __dfsw_fseek(FILE *stream, long offset, int whence, dfsan_label stream_label,
   if (ret == 0 && taint_get_file(fd)) {
     taint_set_offset_label(offset_label);
     if (offset_label) {
-      dfsan_label sc = dfsan_union(offset_label, 0, (bveq << 8) | ICmp, sizeof(offset) * 8,
-          0, offset);
-      add_constraints(sc);
+      __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
     }
   }
   return ret;
@@ -2156,9 +2155,7 @@ __dfsw_fseeko(FILE *stream, off_t offset, int whence, dfsan_label stream_label,
   if (ret == 0 && taint_get_file(fd)) {
     taint_set_offset_label(offset_label);
     if (offset_label) {
-      dfsan_label sc = dfsan_union(offset_label, 0, (bveq << 8) | ICmp, sizeof(offset) * 8,
-          0, offset);
-      add_constraints(sc);
+      __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
     }
   }
   return ret;
@@ -2174,9 +2171,7 @@ __dfsw_fseeko64(FILE *stream, off64_t offset, int whence, dfsan_label stream_lab
   if (ret == 0 && taint_get_file(fd)) {
     taint_set_offset_label(offset_label);
     if (offset_label) {
-      dfsan_label sc = dfsan_union(offset_label, 0, (bveq << 8) | ICmp, sizeof(offset) * 8,
-          0, offset);
-      add_constraints(sc);
+      __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
     }
   }
   return ret;

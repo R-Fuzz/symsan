@@ -96,7 +96,7 @@ static void add_runtime() {
 
   cc_params[cc_par_cnt++] = alloc_printf("-Wl,-T%s/../lib/symsan/taint.ld", obj_path);
 
-  if (!is_cxx && !getenv("KO_USE_NATIVE_LIBCXX")) {
+  if (is_cxx && !getenv("KO_USE_NATIVE_LIBCXX")) {
     cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libc++.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libc++abi.a", obj_path);
@@ -114,6 +114,13 @@ static void add_runtime() {
   cc_params[cc_par_cnt++] = "-lm";
   if (!getenv("KO_NO_NATIVE_ZLIB")) {
     cc_params[cc_par_cnt++] = "-lz";
+  }
+
+  if (getenv("KO_USE_Z3")) {
+    cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libZ3Solver.a", obj_path);
+    cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
+    cc_params[cc_par_cnt++] = "-lz3";
   }
 }
 
