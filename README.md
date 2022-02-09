@@ -34,3 +34,9 @@ make
 make install
 ```
 
+### Docker
+
+```
+docker build -t symsan .
+```
+
