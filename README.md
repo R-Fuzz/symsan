@@ -34,9 +34,10 @@ make
 make install
 ```
 
-### Docker
+### Build in Docker
 
 ```
 docker build -t symsan .
+docker run  --rm --ulimit core=0 symsan bash -c 'cd /workdir/symsan && ./check.sh 2>/dev/null'
 ```
 
