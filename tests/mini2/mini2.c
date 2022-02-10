@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
       y - 987654325 <= 0 && a - 123456789 == 0) {
 
     printf("hey, you hit it \n");
-    // abort();
+    abort();
     /* _exit(6); */
   }
   return 0;
