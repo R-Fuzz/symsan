@@ -281,6 +281,7 @@ fun:strncasecmp=custom
 fun:strncmp=custom
 fun:strrchr=custom
 fun:strstr=custom
+fun:bcmp=custom
 
 # Functions which take action based on global state, such as running a callback
 # set by a separate function.
