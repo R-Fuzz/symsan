@@ -797,3 +797,18 @@ static void dfsan_init(int argc, char **argv, char **envp) {
 __attribute__((section(".preinit_array"), used))
 static void (*dfsan_init_ptr)(int, char **, char **) = dfsan_init;
 #endif
+
+extern "C" {
+SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSolver, void) {}
+
+// Default empty implementations (weak) for hooks
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
+                             u32, u32, u64, u64) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, u8) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
+                             dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
+                             unsigned) {}
+SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
+}  // extern "C"
