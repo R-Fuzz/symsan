@@ -100,6 +100,7 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libc++.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libc++abi.a", obj_path);
+    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libunwind.a", obj_path);
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
   } else {
     cc_params[cc_par_cnt++] = "-lc++";
