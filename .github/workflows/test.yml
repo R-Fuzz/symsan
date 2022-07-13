@@ -21,7 +21,7 @@ jobs:
       run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
 
     - name: Build
-      run: cmake --build ${{ github.workspace }}/build --config Release
+      run: CC=clang-12 CXX=clang++-12 cmake --build ${{ github.workspace }}/build --config Release
 
     - name: Test
       run: |
