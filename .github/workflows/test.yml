@@ -18,7 +18,7 @@ jobs:
         sudo ./llvm.sh 12
 
     - name: Configure
-      run: CC=clang-12 CXX=clang-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
+      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
 
     - name: Build
       run: cmake --build ${{ github.workspace }}/build --config Release
