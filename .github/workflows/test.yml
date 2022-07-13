@@ -15,7 +15,7 @@ jobs:
       run: |
         wget https://apt.llvm.org/llvm.sh
         chmod +x llvm.sh
-        sudo ./llvm.sh 12
+        sudo ./llvm.sh 12 all
 
     - name: Configure
       run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
