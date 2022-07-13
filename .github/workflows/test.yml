@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: install clang-12
+      run: |
+      wget https://apt.llvm.org/llvm.sh
+      chmod +x llvm.sh
+      sudo ./llvm.sh 12
+
+    - name: Configure
+      run: CC=clang-12 CXX=clang-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build ${{ github.workspace }}/build --config Release
+
+    - name: Test
+      run: |
+        ls ${{ github.workspace }}
+        ls ${{ github.workspace }}/build
