@@ -13,9 +13,9 @@ jobs:
 
     - name: install clang-12
       run: |
-      wget https://apt.llvm.org/llvm.sh
-      chmod +x llvm.sh
-      sudo ./llvm.sh 12
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 12
 
     - name: Configure
       run: CC=clang-12 CXX=clang-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
