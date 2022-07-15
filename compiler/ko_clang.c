@@ -102,9 +102,11 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libc++abi.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libunwind.a", obj_path);
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
+    // cc_params[cc_par_cnt++] = alloc_printf("-L%s/../lib/symsan/", obj_path);
   } else {
     cc_params[cc_par_cnt++] = "-lc++";
     cc_params[cc_par_cnt++] = "-lc++abi";
+    cc_params[cc_par_cnt++] = "-lunwind";
   }
   cc_params[cc_par_cnt++] = "-lrt";
 
@@ -113,6 +115,7 @@ static void add_runtime() {
   cc_params[cc_par_cnt++] = "-ldl";
   cc_params[cc_par_cnt++] = "-lpthread";
   cc_params[cc_par_cnt++] = "-lm";
+
   if (!getenv("KO_NO_NATIVE_ZLIB")) {
     cc_params[cc_par_cnt++] = "-lz";
   }
@@ -264,7 +267,7 @@ static void edit_params(u32 argc, char **argv) {
 
   if (is_cxx && !getenv("KO_USE_NATIVE_LIBCXX")) {
     // FIXME: or use the same header
-    // cc_params[cc_par_cnt++] = "-I/path-to-llvm/include/c++/v1";
+    // cc_params[cc_par_cnt++] = alloc_printf("-I%s/../include/c++/v1", obj_path);
     cc_params[cc_par_cnt++] = "-stdlib=libc++";
   }
 

@@ -7,39 +7,6 @@ fun:isatty=discard
 fun:longjmp=discard
 fun:wait=discard
 
-### libcxx
-fun:__atomic_fetch_add_4=uninstrumented
-fun:__atomic_fetch_add_4=functional
-fun:__gxx_personality_v0=uninstrumented
-fun:__gxx_personality_v0=discard
-
-fun:_ZNSt12length_errorD1Ev=uninstrumented
-fun:_ZNSt12length_errorD1Ev=discard
-fun:_ZNSt12out_of_rangeD1Ev=uninstrumented
-fun:_ZNSt12out_of_rangeD1Ev=discard
-fun:_ZNSt16invalid_argumentD1Ev=uninstrumented
-fun:_ZNSt16invalid_argumentD1Ev=discard
-fun:_ZNSt11logic_errorD2Ev=uninstrumented
-fun:_ZNSt11logic_errorD2Ev=discard
-fun:_ZNSt13runtime_errorD1Ev=uninstrumented
-fun:_ZNSt13runtime_errorD1Ev=discard
-fun:_ZNSt13runtime_errorD2Ev=uninstrumented
-fun:_ZNSt13runtime_errorD2Ev=discard
-
-fun:_ZNKSt13runtime_error4whatEv=uninstrumented
-fun:_ZNKSt13runtime_error4whatEv=discard
-fun:_ZNKSt11logic_error4whatEv=uninstrumented
-fun:_ZNKSt11logic_error4whatEv=discard
-
-fun:__cxa_guard_acquire=uninstrumented
-fun:__cxa_guard_acquire=discard
-fun:__cxa_guard_release=uninstrumented
-fun:__cxa_guard_release=discard
-fun:__cxa_guard_abort=uninstrumented
-fun:__cxa_guard_abort=discard
-fun:__cxa_pure_virtual=uninstrumented
-fun:__cxa_pure_virtual=discard
-
 fun:main=uninstrumented
 fun:main=discard
 
@@ -79,12 +46,18 @@ fun:dfsan_fun_fini=discard
 # libunwind
 ###############################################################################
 
+fun:__clang_call_terminate=uninstrumented
+fun:__clang_call_terminate=discard
+fun:__unw_getcontext=uninstrumented
+fun:__unw_getcontext=discard
 fun:unw_getcontext=uninstrumented
 fun:unw_getcontext=discard
 fun:_ZN9libunwind13Registers_x866jumptoEv=uninstrumented
 fun:_ZN9libunwind13Registers_x866jumptoEv=discard
 fun:_ZN9libunwind16Registers_x86_646jumptoEv=uninstrumented
 fun:_ZN9libunwind16Registers_x86_646jumptoEv=discard
+fun:__libunwind_Registers_x86_64_jumpto=uninstrumented
+fun:__libunwind_Registers_x86_64_jumpto=discard
 
 ###############################################################################
 # glibc
