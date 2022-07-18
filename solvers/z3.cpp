@@ -191,6 +191,9 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     z3::expr e = serialize(info->l2, deps);
     tsize_cache[label] = tsize_cache[info->l2]; // lazy init
     return cache_expr(label, -e, deps);
+  } else if (info->op == IntToPtr) {
+    z3::expr e = serialize(info->l1, deps);
+    return cache_expr(label, e, deps);
   }
   // higher-order
   else if (info->op == fmemcmp) {
