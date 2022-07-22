@@ -123,6 +123,12 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
     cc_params[cc_par_cnt++] = "-lz3";
   }
+
+  if (getenv("KO_USE_FASTGEN")) {
+    cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libFastgen.a", obj_path);
+    cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
+  }
 }
 
 static void add_taint_pass() {

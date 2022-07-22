@@ -20,10 +20,6 @@
 #include <stdio.h>
 
 using __sanitizer::uptr;
-using __sanitizer::u64;
-using __sanitizer::u32;
-using __sanitizer::u16;
-using __sanitizer::u8;
 
 extern bool print_debug;
 
