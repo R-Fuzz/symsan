@@ -34,22 +34,6 @@ using namespace __dfsan;
     printf(__VA_ARGS__);                                \
   } while(false)
 
-enum pipe_msg_type {
-  cond_type = 0,
-  gep_type = 1,
-  memcmp_type = 2,
-  add_cons_type = 3,
-};
-
-struct pipe_msg {
-  u32 msg_type;
-  u32 instance_id;
-  uptr addr;
-  u32 context;
-  u32 label;  //size for memcmp
-  u64 result; //direction for conditional branch, index for GEP and memcmp
-} __attribute__((packed));
-
 static dfsan_label_info *__dfsan_label_info;
 static char *input_buf;
 static size_t input_size;
@@ -381,11 +365,9 @@ static bool __solve_expr(z3::expr &e) {
   return ret;
 }
 
-static void __solve_cond(dfsan_label label, u8 r, void *addr) {
+static void __solve_cond(dfsan_label label, u8 r, bool add_nested, void *addr) {
 
   z3::expr result = __z3_context.bool_val(r != 0);
-
-  bool add_nested = true;
 
   bool pushed = false;
   try {
@@ -541,13 +523,13 @@ int main(int argc, char* const argv[]) {
     // solve constraints
     switch (msg.msg_type) {
       case cond_type:
-        __solve_cond(msg.label, msg.result, (void*)msg.addr);
+        __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr);
         break;
       case gep_type:
         break;
       case memcmp_type:
         break;
-      case add_cons_type:
+      case fsize_type:
         break;
       default:
         break;

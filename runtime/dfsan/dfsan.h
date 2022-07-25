@@ -189,6 +189,37 @@ static inline bool is_commutative(unsigned char op) {
   }
 }
 
+// for out-of-process solving
+
+enum pipe_msg_type {
+  cond_type = 0,
+  gep_type = 1,
+  memcmp_type = 2,
+  fsize_type = 3,
+};
+
+#define F_ADD_CONS  0x1
+
+struct pipe_msg {
+  u16 msg_type;
+  u16 flags;
+  u32 instance_id;
+  uptr addr;
+  u32 context;
+  u32 label;  //size for memcmp
+  u64 result; //direction for conditional branch, index for GEP and memcmp
+} __attribute__((packed));
+
+// additional info for gep
+struct gep_msg {
+  u32 ptr_label;
+  u32 index_label;
+  u64 index;
+  u64 num_elems;
+  u64 elem_size;
+  s64 current_offset;
+} __attribute__((packed));
+
 }  // namespace __dfsan
 
 #endif  // DFSAN_H

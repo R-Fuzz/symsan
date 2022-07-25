@@ -23,32 +23,6 @@
 
 using namespace __dfsan;
 
-enum pipe_msg_type {
-  cond_type = 0,
-  gep_type = 1,
-  memcmp_type = 2,
-  add_cons_type = 3,
-};
-
-struct pipe_msg {
-  u32 msg_type;
-  u32 instance_id;
-  uptr addr;
-  u32 context;
-  u32 label;  //size for memcmp
-  u64 result; //direction for conditional branch, index for GEP and memcmp
-} __attribute__((packed));
-
-// additional info for gep
-struct gep_msg {
-  u32 ptr_label;
-  u32 index_label;
-  u64 index;
-  u64 num_elems;
-  u64 elem_size;
-  s64 current_offset;
-} __attribute__((packed));
-
 static u32 __instance_id;
 static u32 __session_id;
 static int __pipe_fd;
@@ -73,11 +47,15 @@ static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
   return 0;
 }
 
-static inline void __solve_cond(dfsan_label label, u8 result, void *addr) {
+static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, void *addr) {
+
+  u16 flags = 0;
+  if (add_nested) flags |= F_ADD_CONS;
 
   // send info
   pipe_msg msg = {
     .msg_type = cond_type,
+    .flags = flags,
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
@@ -102,7 +80,8 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
   u8 r = get_const_result(c1, c2, predicate);
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
 
-  __solve_cond(temp, r, addr);
+  // add nested only for matching cases
+  __solve_cond(temp, r, r, addr);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -114,7 +93,8 @@ __taint_trace_cond(dfsan_label label, u8 r) {
 
   AOUT("solving cond: %u %u %u %p\n", label, r, __taint_trace_callstack, addr);
 
-  __solve_cond(label, r, addr);
+  // always add nested
+  __solve_cond(label, r, 1, addr);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
