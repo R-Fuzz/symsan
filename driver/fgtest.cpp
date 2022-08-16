@@ -374,13 +374,6 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, void *addr) {
     std::unordered_set<dfsan_label> inputs;
     z3::expr cond = serialize(label, inputs);
 
-#if 0
-    if (get_label_info(label)->tree_size > 50000) {
-      // don't bother?
-      throw z3::exception("formula too large");
-    }
-#endif
-
     // collect additional input deps
     std::vector<dfsan_label> worklist;
     worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
@@ -443,6 +436,139 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, void *addr) {
 
   } catch (z3::exception e) {
     AOUT("WARNING: solving error: %s @%p\n", e.msg(), addr);
+  }
+
+}
+
+// assumes under try-catch and the global solver already has context
+static void __solve_gep(z3::expr &index, uint64_t lb, uint64_t ub, uint64_t step, void *addr) {
+
+  // enumerate indices
+  for (uint64_t i = lb; i < ub; i += step) {
+    z3::expr idx = __z3_context.bv_val(i, 64);
+    z3::expr e = (index == idx);
+    if (__solve_expr(e))
+      AOUT("\tindex == %ld feasible\n", i);
+  }
+
+  // check feasibility for OOB
+  // upper bound
+  z3::expr u = __z3_context.bv_val(ub, 64);
+  z3::expr e = z3::uge(index, u);
+  if (__solve_expr(e))
+    AOUT("\tindex >= %ld solved @%p\n", ub, addr);
+  else
+    AOUT("\tindex >= %ld not possible\n", ub);
+
+  // lower bound
+  if (lb == 0) {
+    e = (index < 0);
+  } else {
+    z3::expr l = __z3_context.bv_val(lb, 64);
+    e = z3::ult(index, l);
+  }
+  if (__solve_expr(e))
+    AOUT("\tindex < %ld solved @%p\n", lb, addr);
+  else
+    AOUT("\tindex < %ld not possible\n", lb);
+}
+
+static void __handle_gep(dfsan_label ptr_label, uptr ptr,
+                         dfsan_label index_label, int64_t index,
+                         uint64_t num_elems, uint64_t elem_size,
+                         int64_t current_offset, void* addr) {
+
+  AOUT("tainted GEP index: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
+      index, index_label, num_elems, elem_size, current_offset);
+
+  u8 size = get_label_info(index_label)->size;
+  try {
+    std::unordered_set<dfsan_label> inputs;
+    z3::expr i = serialize(index_label, inputs);
+    z3::expr r = __z3_context.bv_val(index, size);
+
+    // collect additional input deps
+    std::vector<dfsan_label> worklist;
+    worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
+    while (!worklist.empty()) {
+      auto off = worklist.back();
+      worklist.pop_back();
+
+      auto deps = get_branch_dep(off);
+      if (deps != nullptr) {
+        for (auto i : deps->input_deps) {
+          if (inputs.insert(i).second)
+            worklist.push_back(i);
+        }
+      }
+    }
+
+    // set up the global solver with nested constraints
+    __z3_solver.reset();
+    __z3_solver.set("timeout", 5000U);
+    expr_set_t added;
+    for (auto off : inputs) {
+      auto deps = get_branch_dep(off);
+      if (deps != nullptr) {
+        for (auto &expr : deps->expr_deps) {
+          if (added.insert(expr).second) {
+            __z3_solver.add(expr);
+          }
+        }
+      }
+    }
+    assert(__z3_solver.check() == z3::sat);
+
+    // first, check against fixed array bounds if available
+    z3::expr idx = z3::zext(i, 64 - size);
+    if (num_elems > 0) {
+      __solve_gep(idx, 0, num_elems, 1, addr);
+    } else {
+      dfsan_label_info *bounds = get_label_info(ptr_label);
+      // if the array is not with fixed size, check bound info
+      if (bounds->op == Alloca) {
+        z3::expr es = __z3_context.bv_val(elem_size, 64);
+        z3::expr co = __z3_context.bv_val(current_offset, 64);
+        if (bounds->l2 == 0) {
+          // only perform index enumeration and bound check
+          // when the size of the buffer is fixed
+          z3::expr p = __z3_context.bv_val(ptr, 64);
+          z3::expr np = idx * es + co + p;
+          __solve_gep(np, (uint64_t)bounds->op1.i, (uint64_t)bounds->op2.i, elem_size, addr);
+        } else {
+          // if the buffer size is input-dependent (not fixed)
+          // check if over flow is possible
+          std::unordered_set<dfsan_label> dummy;
+          z3::expr bs = serialize(bounds->l2, dummy); // size label
+          if (bounds->l1) {
+            dummy.clear();
+            z3::expr be = serialize(bounds->l1, dummy); // elements label
+            bs = bs * be;
+          }
+          z3::expr e = z3::ugt(idx * es * co, bs);
+          if (__solve_expr(e))
+            AOUT("index >= buffer size feasible @%p\n", addr);
+        }
+      }
+    }
+
+    // always preserve
+    for (auto off : inputs) {
+      auto c = get_branch_dep(off);
+      if (c == nullptr) {
+        c = new branch_dep_t();
+        set_branch_dep(off, c);
+      }
+      if (c == nullptr) {
+        AOUT("WARNING: out of memory\n");
+      } else {
+        c->input_deps.insert(inputs.begin(), inputs.end());
+        c->expr_deps.insert(i == r);
+      }
+    }
+
+  } catch (z3::exception e) {
+    AOUT("WARNING: index solving error: %s @%p\n", e.msg(), __builtin_return_address(0));
   }
 
 }
@@ -519,6 +645,7 @@ int main(int argc, char* const argv[]) {
   close(pipefds[1]);
 
   pipe_msg msg;
+  gep_msg gmsg;
   while (read(pipefds[0], &msg, sizeof(msg)) > 0) {
     // solve constraints
     switch (msg.msg_type) {
@@ -526,6 +653,17 @@ int main(int argc, char* const argv[]) {
         __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr);
         break;
       case gep_type:
+        if (read(pipefds[0], &gmsg, sizeof(gmsg)) != sizeof(gmsg)) {
+          fprintf(stderr, "Failed to receive gep msg: %s\n", strerror(errno));
+          break;
+        }
+        // double check
+        if (msg.label != gmsg.index_label) {
+          fprintf(stderr, "Incorrect gep msg: %d vs %d\n", msg.label, gmsg.index_label);
+          break;
+        }
+        __handle_gep(gmsg.ptr_label, gmsg.ptr, gmsg.index_label, gmsg.index,
+                     gmsg.num_elems, gmsg.elem_size, gmsg.current_offset, (void*)msg.addr);
         break;
       case memcmp_type:
         break;

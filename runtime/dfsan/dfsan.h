@@ -214,10 +214,11 @@ struct pipe_msg {
 struct gep_msg {
   u32 ptr_label;
   u32 index_label;
-  u64 index;
-  u64 num_elems;
-  u64 elem_size;
-  s64 current_offset;
+  uptr ptr;
+  int64_t index;
+  uint64_t num_elems;
+  uint64_t elem_size;
+  int64_t current_offset;
 } __attribute__((packed));
 
 }  // namespace __dfsan

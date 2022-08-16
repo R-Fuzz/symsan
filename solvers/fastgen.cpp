@@ -106,8 +106,8 @@ __taint_trace_indcall(dfsan_label label) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_gep(dfsan_label ptr_label, u64 ptr, dfsan_label index_label, s64 index,
-                  u64 num_elems, u64 elem_size, s64 current_offset) {
+__taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, int64_t index,
+                  uint64_t num_elems, uint64_t elem_size, int64_t current_offset) {
   if (index_label == 0)
     return;
 
@@ -115,6 +115,32 @@ __taint_trace_gep(dfsan_label ptr_label, u64 ptr, dfsan_label index_label, s64 i
 
   AOUT("tainted GEP index: %lld = %d, ne: %lld, es: %lld, offset: %lld\n",
       index, index_label, num_elems, elem_size, current_offset);
+
+  // send gep info, in two pieces
+  pipe_msg msg = {
+    .msg_type = gep_type,
+    .flags = 0,
+    .instance_id = __instance_id,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack,
+    .label = index_label, // just in case
+    .result = (u64)index
+  };
+
+  internal_write(__pipe_fd, &msg, sizeof(msg));
+
+  gep_msg gmsg = {
+    .ptr_label = ptr_label,
+    .index_label = index_label,
+    .ptr = ptr,
+    .index = index,
+    .num_elems = num_elems,
+    .elem_size = elem_size,
+    .current_offset = current_offset
+  };
+
+  // FIXME: assuming single writer so msg will arrive in the same order
+  internal_write(__pipe_fd, &gmsg, sizeof(gmsg));
 
   return; 
 }
