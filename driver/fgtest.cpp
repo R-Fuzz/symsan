@@ -54,6 +54,7 @@ static z3::solver __z3_solver(__z3_context, "QF_BV");
 static std::unordered_map<dfsan_label, u32> tsize_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<u32> > deps_cache;
 static std::unordered_map<dfsan_label, z3::expr> expr_cache;
+static std::unordered_map<dfsan_label, memcmp_msg*> memcmp_cache;
 
 // dependencies
 struct expr_hash {
@@ -87,15 +88,16 @@ static inline void set_branch_dep(size_t n, branch_dep_t* dep) {
   __branch_deps.at(n) = dep;
 }
 
-static z3::expr read_concrete(u64 addr, u8 size) {
-  u8 *ptr = reinterpret_cast<u8*>(addr);
-  if (ptr == nullptr) {
-    throw z3::exception("invalid concrete address");
+static z3::expr read_concrete(dfsan_label label, u16 size) {
+  auto itr = memcmp_cache.find(label);
+  if (itr == memcmp_cache.end()) {
+    throw z3::exception("cannot find memcmp content");
   }
 
-  z3::expr val = __z3_context.bv_val(*ptr++, 8);
+  memcmp_msg *mmsg = itr->second;
+  z3::expr val = __z3_context.bv_val(mmsg->content[0], 8);
   for (u8 i = 1; i < size; i++) {
-    val = z3::concat(__z3_context.bv_val(*ptr++, 8), val);
+    val = z3::concat(__z3_context.bv_val(mmsg->content[i], 8), val);
   }
   return val;
 }
@@ -208,15 +210,15 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   // higher-order
   else if (info->op == fmemcmp) {
     z3::expr op1 = (info->l1 >= CONST_OFFSET) ? serialize(info->l1, deps) :
-                   read_concrete(info->op1.i, info->size); // memcmp size in bytes
+                   read_concrete(label, info->size); // memcmp size in bytes
     if (info->l2 < CONST_OFFSET) {
       throw z3::exception("invalid memcmp operand2");
     }
     z3::expr op2 = serialize(info->l2, deps);
     tsize_cache[label] = 1; // lazy init
-    // don't cache becaue of read_concrete?
-    return z3::ite(op1 == op2, __z3_context.bv_val(0, 32),
-                               __z3_context.bv_val(1, 32));
+    z3::expr e = z3::ite(op1 == op2, __z3_context.bv_val(0, 32),
+                                     __z3_context.bv_val(1, 32));
+    return cache_expr(label, e, deps);
   } else if (info->op == fsize) {
     // file size
     z3::symbol symbol = __z3_context.str_symbol("fsize");
@@ -646,6 +648,10 @@ int main(int argc, char* const argv[]) {
 
   pipe_msg msg;
   gep_msg gmsg;
+  dfsan_label_info *info;
+  size_t msg_size;
+  memcmp_msg *mmsg = nullptr;
+
   while (read(pipefds[0], &msg, sizeof(msg)) > 0) {
     // solve constraints
     switch (msg.msg_type) {
@@ -666,6 +672,23 @@ int main(int argc, char* const argv[]) {
                      gmsg.num_elems, gmsg.elem_size, gmsg.current_offset, (void*)msg.addr);
         break;
       case memcmp_type:
+        info = get_label_info(msg.label);
+        // if both operands are symbolic, no content to be read
+        if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
+          break;
+        msg_size = sizeof(memcmp_msg) + msg.result;
+        mmsg = (memcmp_msg*)malloc(msg_size); // not freed until terminate
+        if (read(pipefds[0], mmsg, msg_size) != msg_size) {
+          fprintf(stderr, "Failed to receive memcmp msg: %s\n", strerror(errno));
+          break;
+        }
+        // double check
+        if (msg.label != mmsg->label) {
+          fprintf(stderr, "Incorrect memcmp msg: %d vs %d\n", msg.label, mmsg->label);
+          break;
+        }
+        // save the content
+        memcmp_cache[msg.label] = mmsg;
         break;
       case fsize_type:
         break;

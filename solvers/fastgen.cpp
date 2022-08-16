@@ -150,6 +150,41 @@ __taint_trace_offset(dfsan_label offset_label, s64 offset, unsigned size) {
   return;
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_memcmp(dfsan_label label) {
+  if (label == 0)
+    return;
+
+  void *addr = __builtin_return_address(0);
+  dfsan_label_info *info = get_label_info(label);
+
+  pipe_msg msg = {
+    .msg_type = memcmp_type,
+    .flags = 0,
+    .instance_id = __instance_id,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack,
+    .label = label, // just in case
+    .result = (u64)info->size
+  };
+
+  internal_write(__pipe_fd, &msg, sizeof(msg));
+
+  // if both operands are symbolic, skip sending the content
+  if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
+    return;
+
+  size_t msg_size = sizeof(memcmp_msg) + info->size;
+  memcmp_msg *mmsg = (memcmp_msg*)__builtin_alloca(msg_size);
+  mmsg->label = label;
+  internal_memcpy(mmsg->content, (void*)info->op1.i, info->size); // concrete oprand is always in op1
+
+  // FIXME: assuming single writer so msg will arrive in the same order
+  internal_write(__pipe_fd, mmsg, msg_size);
+
+  return;
+}
+
 extern "C" void InitializeSolver() {
   __instance_id = flags().instance_id;
   __session_id = flags().session_id;

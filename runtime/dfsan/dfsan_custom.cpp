@@ -65,6 +65,9 @@ static inline dfsan_label get_label_for(int fd, off_t offset) {
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, int64_t offset, unsigned size);
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_memcmp(dfsan_label label);
+
 extern "C" {
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_stat(const char *path, struct stat *buf, dfsan_label path_label,
@@ -208,6 +211,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
   dfsan_label ls2 = dfsan_read_label(s2, n);
   // ugly hack ...
   *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (u64)s1, (u64)s2);
+  if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
 
@@ -222,6 +226,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   dfsan_label ls2 = dfsan_read_label(s2, n);
   // ugly hack ...
   *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (u64)s1, (u64)s2);
+  if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
 
@@ -245,6 +250,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
   dfsan_label ls2 = dfsan_read_label(s2, size);
   // ugly hack ...
   *ret_label = dfsan_union(ls1, ls2, fmemcmp, size, (u64)s1, (u64)s2);
+  if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
 
@@ -262,6 +268,7 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
   dfsan_label ls2 = dfsan_read_label(s2, size);
   // ugly hack ...
   *ret_label = dfsan_union(ls1, ls2, fmemcmp, size, (u64)s1, (u64)s2);
+  if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
 
@@ -293,6 +300,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
   dfsan_label ls2 = dfsan_read_label(s2, n);
   // ugly hack ...
   *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (u64)s1, (u64)s2);
+  if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
 
@@ -316,6 +324,7 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
   dfsan_label ls2 = dfsan_read_label(s2, n);
   // ugly hack ...
   *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (u64)s1, (u64)s2);
+  if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
 

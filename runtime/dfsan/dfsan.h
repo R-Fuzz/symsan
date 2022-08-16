@@ -46,7 +46,7 @@ struct dfsan_label_info {
   data op1;
   data op2;
   u16 op;
-  u16 size;
+  u16 size; // FIXME: this limit the size of the operand to 65535 bits or bytes (in case of memcmp)
   u32 hash;
 } __attribute__((aligned (8), packed));
 
@@ -74,7 +74,7 @@ void dfsan_add_label(dfsan_label label, u8 op, void *addr, uptr size);
 void dfsan_set_label(dfsan_label label, void *addr, uptr size);
 dfsan_label dfsan_read_label(const void *addr, uptr size);
 void dfsan_store_label(dfsan_label l1, void *addr, uptr size);
-dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u8 size,
+dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
                         u64 op1, u64 op2);
 dfsan_label dfsan_create_label(off_t offset);
 dfsan_label dfsan_get_label(const void *addr);
@@ -206,8 +206,8 @@ struct pipe_msg {
   u32 instance_id;
   uptr addr;
   u32 context;
-  u32 label;  //size for memcmp
-  u64 result; //direction for conditional branch, index for GEP and memcmp
+  u32 label;
+  u64 result;
 } __attribute__((packed));
 
 // additional info for gep
@@ -219,6 +219,12 @@ struct gep_msg {
   uint64_t num_elems;
   uint64_t elem_size;
   int64_t current_offset;
+} __attribute__((packed));
+
+// saving the memcmp target
+struct memcmp_msg {
+  u32 label;
+  u8 content[0];
 } __attribute__((packed));
 
 }  // namespace __dfsan

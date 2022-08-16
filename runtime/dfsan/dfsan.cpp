@@ -456,7 +456,7 @@ __dfsan_vararg_wrapper(const char *fname) {
 // Like __dfsan_union, but for use from the client or custom functions.  Hence
 // the equality comparison is done here before calling __dfsan_union.
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
-dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u8 size, u64 op1, u64 op2) {
+dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size, u64 op1, u64 op2) {
   return __taint_union(l1, l2, op, size, op1, op2);
 }
 
@@ -832,5 +832,6 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
                              dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
                              unsigned) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
 SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
 }  // extern "C"
