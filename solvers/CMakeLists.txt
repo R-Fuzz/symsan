@@ -9,3 +9,9 @@ target_include_directories(Z3Solver PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
 )
 install (TARGETS Z3Solver DESTINATION ${SYMSAN_LIB_DIR})
+
+add_library(Fastgen STATIC fastgen.cpp)
+target_include_directories(Fastgen PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+)
+install (TARGETS Fastgen DESTINATION ${SYMSAN_LIB_DIR})

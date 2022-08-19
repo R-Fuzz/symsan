@@ -21,8 +21,8 @@ namespace __dfsan {
 #if defined(__x86_64__)
 struct Mapping {
   static const uptr kShadowAddr = 0x10000;
-  static const uptr kUnionTableAddr = 0x400000000000;
-  static const uptr kHashTableAddr = 0x400c00000000;
+  static const uptr kHashTableAddr = 0x400000000000;
+  static const uptr kUnionTableAddr = 0x400100000000;
   static const uptr kAppAddr = 0x700000040000;
   static const uptr kAppBaseAddr = 0x700000000000;
   static const uptr kShadowMask = ~0x700000000000;
@@ -30,8 +30,8 @@ struct Mapping {
 #elif defined(__mips64)
 struct Mapping {
   static const uptr kShadowAddr = 0x10000;
-  static const uptr kUnionTableAddr = 0x2000000000;
-  static const uptr kHashTableAddr = 0x3000000000;
+  static const uptr kHashTableAddr = 0x2000000000;
+  static const uptr kUnionTableAddr = 0x2100000000;
   static const uptr kAppAddr = 0xF000008000;
   static const uptr kAppBaseAddr = 0xF000000000;
   static const uptr kShadowMask = ~0xF000000000;
@@ -39,8 +39,8 @@ struct Mapping {
 #elif defined(__aarch64__)
 struct Mapping39 {
   static const uptr kShadowAddr = 0x10000;
-  static const uptr kUnionTableAddr = 0x1000000000;
-  static const uptr kHashTableAddr = 0x2000000000;
+  static const uptr kHashTableAddr = 0x1000000000;
+  static const uptr kUnionTableAddr = 0x1100000000;
   static const uptr kAppAddr = 0x7000008000;
   static const uptr kAppBaseAddr = 0x7000000000;
   static const uptr kShadowMask = ~0x7800000000;
@@ -48,8 +48,8 @@ struct Mapping39 {
 
 struct Mapping42 {
   static const uptr kShadowAddr = 0x10000;
-  static const uptr kUnionTableAddr = 0x8000000000;
-  static const uptr kHashTableAddr = 0x9000000000;
+  static const uptr kHashTableAddr = 0x8000000000;
+  static const uptr kUnionTableAddr = 0x8100000000;
   static const uptr kAppAddr = 0x3ff00008000;
   static const uptr kAppBaseAddr = 0x3ff00000000;
   static const uptr kShadowMask = ~0x3c000000000;
@@ -57,8 +57,8 @@ struct Mapping42 {
 
 struct Mapping48 {
   static const uptr kShadowAddr = 0x10000;
-  static const uptr kUnionTableAddr = 0x8000000000;
-  static const uptr kHashTableAddr = 0x9000000000;
+  static const uptr kHashTableAddr = 0x8000000000;
+  static const uptr kUnionTableAddr = 0x8100000000;
   static const uptr kAppAddr = 0xffff00008000;
   static const uptr kAppBaseAddr = 0xffff00000000;
   static const uptr kShadowMask = ~0xfffff0000000;

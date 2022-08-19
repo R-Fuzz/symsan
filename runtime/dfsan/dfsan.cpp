@@ -48,6 +48,7 @@ typedef atomic_uint32_t atomic_dfsan_label;
 
 static atomic_dfsan_label __dfsan_last_label;
 static dfsan_label_info *__dfsan_label_info;
+static const size_t uniontable_size = 0xc00000000; // FIXME
 
 // FIXME: single thread
 // statck bottom
@@ -62,8 +63,8 @@ struct taint_file __dfsan::tainted;
 
 // Hash table
 static const uptr hashtable_size = (1ULL << 32);
-static const size_t union_table_size = (1ULL << 18);
-static __taint::union_hashtable __union_table(union_table_size);
+static const size_t hashtable_buckets = (1ULL << 20);
+static __taint::union_hashtable __union_table(hashtable_buckets);
 
 Flags __dfsan::flags_data;
 bool print_debug;
@@ -87,11 +88,11 @@ SANITIZER_INTERFACE_ATTRIBUTE uptr __dfsan_shadow_ptr_mask;
 // +--------------------+ 0x700000040000 (kAppAddr)
 // |--------------------| UnusedAddr()
 // |                    |
-// |    hash table      |
-// |                    |
-// +--------------------+ 0x4000c0000000 (kHashTableAddr)
 // |    union table     |
-// +--------------------+ 0x400000000000 (kUnionTableAddr)
+// |                    |
+// +--------------------+ 0x400100000000 (kUnionTableAddr)
+// |    hash table      |
+// +--------------------+ 0x400000000000 (kHashTableAddr)
 // |   shadow memory    |
 // +--------------------+ 0x000000100000 (kShadowAddr)
 // |       unused       |
@@ -111,7 +112,7 @@ int __dfsan::vmaSize;
 #endif
 
 static uptr UnusedAddr() {
-  return MappingArchImpl<MAPPING_HASH_TABLE_ADDR>() + hashtable_size;
+  return MappingArchImpl<MAPPING_UNION_TABLE_ADDR>() + uniontable_size;
 }
 
 // Checks we do not run out of labels.
@@ -455,7 +456,7 @@ __dfsan_vararg_wrapper(const char *fname) {
 // Like __dfsan_union, but for use from the client or custom functions.  Hence
 // the equality comparison is done here before calling __dfsan_union.
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
-dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u8 size, u64 op1, u64 op2) {
+dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size, u64 op1, u64 op2) {
   return __taint_union(l1, l2, op, size, op1, op2);
 }
 
@@ -468,6 +469,8 @@ dfsan_label dfsan_create_label(off_t offset) {
   __dfsan_label_info[label].size = 8;
   // label may not equal to offset when using stdin
   __dfsan_label_info[label].op1.i = offset;
+  // init a non-zero hash
+  __dfsan_label_info[label].hash = xxhash(offset, 0, 8);
   return label;
 }
 
@@ -707,6 +710,7 @@ static void InitializeTaintFile() {
   }
 }
 
+// information is passed implicitly through flags()
 extern "C" void InitializeSolver();
 
 static void InitializeFlags() {
@@ -755,6 +759,9 @@ static void dfsan_fini() {
   if (tainted.buf) {
     UnmapOrDie(tainted.buf, tainted.buf_size);
   }
+  if (flags().shm_id != -1) {
+    shmdt((void *)UnionTableAddr());
+  }
 }
 
 static void dfsan_init(int argc, char **argv, char **envp) {
@@ -762,12 +769,29 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   print_debug = flags().debug;
 
   ::InitializePlatformEarly();
-  MmapFixedSuperNoReserve(ShadowAddr(), UnusedAddr() - ShadowAddr());
+  MmapFixedSuperNoReserve(ShadowAddr(), UnionTableAddr() - ShadowAddr());
   __dfsan_label_info = (dfsan_label_info *)UnionTableAddr();
-  // init const size
+
+  // init union table
+  if (flags().shm_id != -1) {
+    void *ret = shmat(flags().shm_id, (void *)UnionTableAddr(), SHM_REMAP);
+    if (ret == (void*)-1) {
+      Printf("FATAL: error mapping shared union table\n");
+      Die();
+    }
+  } else {
+    MmapFixedSuperNoReserve(UnionTableAddr(), uniontable_size);
+  }
+
+  // init const label
+  internal_memset(&__dfsan_label_info[CONST_LABEL], 0, sizeof(dfsan_label_info));
   __dfsan_label_info[CONST_LABEL].size = 8;
+
+  // init hashtable allocator
+  __taint::allocator_init(HashTableAddr(), HashTableAddr() + hashtable_size);
+
   // init main thread
-  auto num_of_labels = (HashTableAddr() - UnionTableAddr()) / sizeof(dfsan_label_info);
+  auto num_of_labels = uniontable_size / sizeof(dfsan_label_info);
   __alloca_stack_top = __alloca_stack_bottom = (dfsan_label)(num_of_labels - 2);
 
   // Protect the region of memory we don't use, to preserve the one-to-one
@@ -778,8 +802,6 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   uptr init_addr = (uptr)&dfsan_init;
   if (!(init_addr >= UnusedAddr() && init_addr < AppAddr()))
     MmapFixedNoAccess(UnusedAddr(), AppAddr() - UnusedAddr());
-  MmapFixedSuperNoReserve(HashTableAddr(), hashtable_size);
-  __taint::allocator_init(HashTableAddr(), HashTableAddr() + hashtable_size);
 
   InitializeInterceptors();
 
@@ -810,5 +832,6 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
                              dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
                              unsigned) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
 SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
 }  // extern "C"
