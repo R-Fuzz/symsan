@@ -24,8 +24,11 @@ jobs:
     - name: configure
       run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
 
-    - name: build and install
-      run: CC=clang-12 CXX=clang++-12 cmake --build ${{ github.workspace }}/build --config Release install
+    - name: build
+      run: CC=clang-12 CXX=clang++-12 cmake --build ${{ github.workspace }}/build
+
+    - name: install
+      run: CC=clang-12 CXX=clang++-12 cmake --install ${{ github.workspace }}/build
 
     - name: test
       run: lit --verbose .
