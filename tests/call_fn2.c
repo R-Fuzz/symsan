@@ -1,6 +1,6 @@
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out
-// RUN: python -c'print"A"*20' > %t.bin
+// RUN: python -c'print("A"*20)' > %t.bin
 // RUN: clang -o %t.uninstrumented %s
 // RUN: %t.uninstrumented %t.bin | FileCheck --check-prefix=CHECK-ORIG %s
 // RUN: env KO_USE_FASTGEN=1 %ko-clang -o %t.fg %s
