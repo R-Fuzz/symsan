@@ -1,6 +1,6 @@
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out
-// RUN: python -c'print"A"*32' > %t.bin
+// RUN: python -c'print("A"*32)' > %t.bin
 // RUN: clang -o %t.uninstrumented %s
 // RUN: env KO_USE_FASTGEN=1 %ko-clang -o %t.fg %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg %t.bin
