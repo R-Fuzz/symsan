@@ -5,7 +5,7 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build and test:
     runs-on: ubuntu-latest
 
     steps:
@@ -17,13 +17,12 @@ jobs:
         chmod +x llvm.sh
         sudo ./llvm.sh 12 all
 
-    - name: Configure
-      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release
+    - name: configure
+      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
 
-    - name: Build
-      run: CC=clang-12 CXX=clang++-12 cmake --build ${{ github.workspace }}/build --config Release
+    - name: build and install
+      run: CC=clang-12 CXX=clang++-12 cmake --build ${{ github.workspace }}/build --config Release install
 
-    - name: Test
-      run: |
-        ls ${{ github.workspace }}
-        ls ${{ github.workspace }}/build
+    - name: test
+      run: lit --verbose .
+      working-directory: {{ github.workspace }}/build

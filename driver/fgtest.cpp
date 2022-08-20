@@ -585,6 +585,17 @@ int main(int argc, char* const argv[]) {
   char *program = argv[1];
   char *input = argv[2];
 
+  // setup output dir
+  char *options = getenv("TAINT_OPTIONS");
+  char *output = strstr(options, "output_dir=");
+  if (output) {
+    output += 11; // skip "output_dir="
+    char *end = strchr(output, ':'); // try ':' first, then ' '
+    if (end == NULL) end = strchr(output, ' ');
+    size_t n = end == NULL? strlen(output) : (size_t)(end - output);
+    __output_dir = strndup(output, n);
+  }
+
   // load input file
   struct stat st;
   int fd = open(input, O_RDONLY);
@@ -623,7 +634,7 @@ int main(int argc, char* const argv[]) {
   // prepare the env and fork
   int length = snprintf(NULL, 0, "taint_file=%s:shm_id=%d:pipe_fd=%d:debug=1",
                         input, shmid, pipefds[1]);
-  char *options = (char *)malloc(length + 1);
+  options = (char *)malloc(length + 1);
   snprintf(options, length + 1, "taint_file=%s:shm_id=%d:pipe_fd=%d:debug=1",
            input, shmid, pipefds[1]);
   
