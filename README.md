@@ -92,7 +92,7 @@ Still under construction, unfortunately.
 To cite SymSan in scientific work, please use the following BibTeX:
 
 ``` bibtex
-@inproceedings {chen2020symsan,
+@inproceedings {chen2022symsan,
   author =       {Ju Chen and Wookhyun Han and Mingjun Yin and Haochen Zeng and
                   Chengyu Song and Byoungyong Lee and Heng Yin and Insik Shin},
   title =        {SymSan: Time and Space Efficient Concolic Execution via Dynamic Data-Flow Analysis},
