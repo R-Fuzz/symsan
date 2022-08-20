@@ -30,6 +30,9 @@ jobs:
     - name: install
       run: CC=clang-12 CXX=clang++-12 cmake --install ${{ github.workspace }}/build
 
+    - name: install lit
+      run: pip install lit
+
     - name: test
       run: lit --verbose .
       working-directory: ${{ github.workspace }}/build
