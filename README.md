@@ -52,7 +52,8 @@ To rebuild these libraries from source, execute the `rebuild.sh` script in the
 ## Test
 
 To verify the code works, try some simple tests
-(forked from [Angora](https://github.com/AngoraFuzzer/Angora), adapted by @insuyun to lit):
+(forked from [Angora](https://github.com/AngoraFuzzer/Angora),
+adapted by [@insuyun](https://github.com/insuyun) to lit):
 
 ```
 $ pip install lit
