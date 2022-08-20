@@ -25,4 +25,4 @@ jobs:
 
     - name: test
       run: lit --verbose .
-      working-directory: {{ github.workspace }}/build
+      working-directory: ${{ github.workspace }}/build
