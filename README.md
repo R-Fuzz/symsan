@@ -51,14 +51,13 @@ To rebuild these libraries from source, execute the `rebuild.sh` script in the
 
 ## Test
 
-To verify the code works, try the a simple test (forked from [Angora](https://github.com/AngoraFuzzer/Angora)):
+To verify the code works, try some simple tests
+(forked from [Angora](https://github.com/AngoraFuzzer/Angora), adapted by @insuyun to lit):
 
 ```
-cd tests/mini
-KO_CC=clang-12 KO_USE_Z3=1 /path/to/ko-clang mini.c -o mini.taint
-python -c "print('A'*20)" > i
-TAINT_OPTIONS="taint_file=i" ./mini.taint i
-./mini.taint id-0-0-0
+$ pip install lit
+$ cd your_build_dir
+$ lit tests
 ```
 
 ### Environment Options
