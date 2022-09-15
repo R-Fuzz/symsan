@@ -49,6 +49,14 @@ The repo contains instrumented libc++ and libc++abi to support C++ programs.
 To rebuild these libraries from source, execute the `rebuild.sh` script in the
 `libcxx` directory.
 
+**NOTE**: because the in-process solving module (`solver/z3.cpp`) uses Z3's C++ API
+and STL containers, so itself depends on the C++ libs. Due to such dependencies,
+you'll see linking errors when building C++ targets when using this module.
+Though it's possible to resolve these errors by not instrumenting the dependencies
+(adding them to the [ABIList](https://clang.llvm.org/docs/DataFlowSanitizer.html#abi-list),
+ then rebuild the C++ libs), we don't recommend using it for C++ targets.
+Instead, it's much cleaner to use ann out-of-process solving module like Fastgen.
+
 ## Test
 
 To verify the code works, try some simple tests
