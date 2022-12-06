@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 #
-<<<<<<< HEAD
 # usage: rebuild.sh path_to_ko_clang
-=======
-# usage: compile.sh path_to_ko_clang
->>>>>>> 53b6efffd76dd6f000c3cbc1caeda573973d518c
 
 if [[ $# -ne 1 ]]; then
     echo "Usage: ${0} path_to_ko_clang" 1>&2
