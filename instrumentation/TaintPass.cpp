@@ -55,6 +55,7 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/DJB.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/SpecialCaseList.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -392,6 +393,7 @@ class Taint : public ModulePass {
 
   void initializeRuntimeFunctions(Module &M);
   void initializeCallbackFunctions(Module &M);
+  uint32_t getInstructionId(Instruction *Inst);
 
   /// Returns a zero constant with the shadow type of OrigTy.
   ///
@@ -636,15 +638,43 @@ Type *Taint::getShadowTy(Value *V) {
   return getShadowTy(V->getType());
 }
 
+uint32_t Taint::getInstructionId(Instruction *Inst) {
+  static uint32_t unamed = 0;
+  auto SourceInfo = Mod->getSourceFileName();
+  DILocation *Loc = Inst->getDebugLoc();
+  if (Loc) {
+    auto Line = Loc->getLine();
+    auto Col = Loc->getColumn();
+    SourceInfo += ":" + std::to_string(Line) + ":" + std::to_string(Col);
+  } else {
+    SourceInfo += "unamed:" + std::to_string(unamed++);
+  }
+
+  return djbHash(SourceInfo);
+}
+
 void Taint::addContextRecording(Function &F) {
   // Most code from Angora
   BasicBlock *BB = &F.getEntryBlock();
   assert(pred_begin(BB) == pred_end(BB) &&
          "Assume that entry block has no predecessors");
 
-  // Add ctx ^ random_index at the beginning of a function
+  // Add ctx ^ hash(fun_name) at the beginning of a function
   IRBuilder<> IRB(&*(BB->getFirstInsertionPt()));
-  ConstantInt *CID = ConstantInt::get(Int32Ty, (uint32_t)random());
+
+  // Strip dfs$ prefix
+  auto FName = F.getName();
+  if (FName.startswith("dfs")) {
+    size_t pos = FName.find_first_of('$');
+    FName = FName.drop_front(pos + 1);
+  }
+  // add source file name for static function
+  if (!F.hasExternalLinkage()) {
+    FName = StringRef(Mod->getSourceFileName() + "::" + FName.str());
+  }
+  uint32_t hash = djbHash(FName);
+
+  ConstantInt *CID = ConstantInt::get(Int32Ty, hash);
   LoadInst *LCS = IRB.CreateLoad(CallStack);
   LCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
   Value *NCS = IRB.CreateXor(LCS, CID);
@@ -730,11 +760,11 @@ bool Taint::doInitialization(Module &M) {
       Type::getVoidTy(*Ctx), None, /*isVarArg=*/false);
   TaintVarargWrapperFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), Type::getInt8PtrTy(*Ctx), /*isVarArg=*/false);
-  Type *TaintTraceCmpArgs[6] = { ShadowTy, ShadowTy, ShadowTy, ShadowTy,
-      Int64Ty, Int64Ty };
+  Type *TaintTraceCmpArgs[7] = { ShadowTy, ShadowTy, ShadowTy, ShadowTy,
+      Int64Ty, Int64Ty, Int32Ty };
   TaintTraceCmpFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCmpArgs, false);
-  Type *TaintTraceCondArgs[2] = { ShadowTy, IntegerType::get(*Ctx, 8) };
+  Type *TaintTraceCondArgs[3] = { ShadowTy, IntegerType::get(*Ctx, 8), Int32Ty };
   TaintTraceCondFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCondArgs, false);
   TaintTraceIndirectCallFnTy = FunctionType::get(
@@ -1201,7 +1231,8 @@ bool Taint::runOnModule(Module &M) {
       continue;
 
     addContextRecording(*i);
-    addFrameTracing(*i);
+    if (!i->getName().startswith("dfsw$"))
+      addFrameTracing(*i);
     removeUnreachableBlocks(*i);
 
     TaintFunction TF(*this, i, FnsWithNativeABI.count(i));
@@ -1661,6 +1692,7 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   unsigned size = DL.getTypeSizeInBits(Cond->getType());
   ConstantInt *Size = ConstantInt::get(TT.ShadowTy, size);
   ConstantInt *Predicate = ConstantInt::get(TT.ShadowTy, 32); // EQ, ==
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
 
   for (auto C : I->cases()) {
     Value *CV = C.getCaseValue();
@@ -1669,7 +1701,7 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
     Cond = IRB.CreateZExtOrTrunc(Cond, TT.Int64Ty);
     CV = IRB.CreateZExtOrTrunc(CV, TT.Int64Ty);
     IRB.CreateCall(TT.TaintTraceCmpFn, {CondShadow, TT.ZeroShadow, Size, Predicate,
-                   Cond, CV});
+                   Cond, CV, CID});
   }
 }
 
@@ -2212,7 +2244,8 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   Value *Shadow = getShadow(Condition);
   if (Shadow == TT.ZeroShadow)
     return;
-  IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition});
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, CID});
 }
 
 void TaintVisitor::visitBranchInst(BranchInst &BR) {

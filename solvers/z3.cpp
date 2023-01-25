@@ -446,7 +446,7 @@ static void __solve_cond(dfsan_label label, z3::expr &result, bool add_nested, v
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
-                  u64 c1, u64 c2) {
+                  u64 c1, u64 c2, u32 cid) {
   if ((op1 == 0 && op2 == 0))
     return;
 
@@ -460,7 +460,8 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
     return;
   }
 
-  AOUT("solving cmp: %u %u %u %d %llu %llu @%p\n", op1, op2, size, predicate, c1, c2, addr);
+  AOUT("solving cmp: %u %u %u %d %llu %llu 0x%x @%p\n",
+       op1, op2, size, predicate, c1, c2, cid, addr);
 
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
 
@@ -474,7 +475,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cond(dfsan_label label, u8 r) {
+__taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
   if (label == 0)
     return;
 
@@ -488,7 +489,8 @@ __taint_trace_cond(dfsan_label label, u8 r) {
     return;
   }
 
-  AOUT("solving cond: %u %u %u %p %u\n", label, r, __taint_trace_callstack, addr, itr->second);
+  AOUT("solving cond: %u %u 0x%x 0x%x %p %u\n",
+       label, r, __taint_trace_callstack, cid, addr, itr->second);
 
   z3::expr result = __z3_context.bool_val(r);
   __solve_cond(label, result, true, addr);
