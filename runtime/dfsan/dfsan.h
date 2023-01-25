@@ -206,6 +206,7 @@ struct pipe_msg {
   u32 instance_id;
   uptr addr;
   u32 context;
+  u32 id;
   u32 label;
   u64 result;
 } __attribute__((packed));
