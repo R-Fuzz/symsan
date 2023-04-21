@@ -1742,7 +1742,7 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
       if (isa<ConstantInt>(Index)) {
         int64_t arrayIdx = cast<ConstantInt>(Index)->getSExtValue();
         CurrentOffset += arrayIdx * DL.getTypeAllocSize(ETy);
-      } else {
+      } else if (Index->getType()->isIntegerTy()) { // FIXEME: handle vector type
         // non-constant index, check if it's tainted
         Value *Shadow = getShadow(Index);
         if (!TT.isZeroShadow(Shadow)) {
