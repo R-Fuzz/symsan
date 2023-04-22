@@ -210,7 +210,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
   dfsan_label ls1 = dfsan_read_label(s1, n);
   dfsan_label ls2 = dfsan_read_label(s2, n);
   // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (u64)s1, (u64)s2);
+  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
   if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
@@ -225,7 +225,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   dfsan_label ls1 = dfsan_read_label(s1, n);
   dfsan_label ls2 = dfsan_read_label(s2, n);
   // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (u64)s1, (u64)s2);
+  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
   if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
@@ -249,7 +249,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
   dfsan_label ls1 = dfsan_read_label(s1, size);
   dfsan_label ls2 = dfsan_read_label(s2, size);
   // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, size, (u64)s1, (u64)s2);
+  *ret_label = dfsan_union(ls1, ls2, fmemcmp, size, (uint64_t)s1, (uint64_t)s2);
   if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
@@ -267,7 +267,7 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
   dfsan_label ls1 = dfsan_read_label(s1, size);
   dfsan_label ls2 = dfsan_read_label(s2, size);
   // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, size, (u64)s1, (u64)s2);
+  *ret_label = dfsan_union(ls1, ls2, fmemcmp, size, (uint64_t)s1, (uint64_t)s2);
   if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
@@ -299,7 +299,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
   dfsan_label ls1 = dfsan_read_label(s1, n);
   dfsan_label ls2 = dfsan_read_label(s2, n);
   // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (u64)s1, (u64)s2);
+  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
   if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
@@ -323,7 +323,7 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
   dfsan_label ls1 = dfsan_read_label(s1, n);
   dfsan_label ls2 = dfsan_read_label(s2, n);
   // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (u64)s1, (u64)s2);
+  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
   if (*ret_label) __taint_trace_memcmp(*ret_label);
   return ret;
 }
@@ -1639,7 +1639,7 @@ __dfsw_realloc(void *ptr, size_t new_size,
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, new_size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + new_size);
+          (uint64_t)ret, (uint64_t)ret + new_size);
       *ret_label = bound;
     }
   }
@@ -1682,7 +1682,7 @@ __dfsw___libc_realloc(void *ptr, size_t new_size,
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, new_size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + new_size);
+          (uint64_t)ret, (uint64_t)ret + new_size);
       *ret_label = bound;
     }
   }
@@ -1725,7 +1725,7 @@ void *__dfsw_reallocarray(void *ptr, size_t nmemb, size_t new_size,
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size * nmemb);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(nmemb_label, new_size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + (new_size * nmemb));
+          (uint64_t)ret, (uint64_t)ret + (new_size * nmemb));
       *ret_label = bound;
     }
   }
@@ -1767,7 +1767,7 @@ void *__dfsw___libc_reallocarray(void *ptr, size_t nmemb, size_t new_size,
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size * nmemb);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(nmemb_label, new_size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + (new_size * nmemb));
+          (uint64_t)ret, (uint64_t)ret + (new_size * nmemb));
       *ret_label = bound;
     }
   }
@@ -1810,7 +1810,7 @@ void *__dfsw_calloc(size_t nmemb, size_t size,
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size * nmemb);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(nmemb_label, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + (size * nmemb));
+          (uint64_t)ret, (uint64_t)ret + (size * nmemb));
       *ret_label = bound;
       AOUT("nmemb: %lld = %d, size: %lld = %d, addr: %p = %d\n", nmemb, nmemb_label,
           size, size_label, ret, *ret_label);
@@ -1829,7 +1829,7 @@ void *__dfsw___libc_calloc(size_t nmemb, size_t size,
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size * nmemb);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(nmemb_label, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + (size * nmemb));
+          (uint64_t)ret, (uint64_t)ret + (size * nmemb));
       *ret_label = bound;
       AOUT("nmemb: %lld = %d, size: %lld = %d, addr: %p = %d\n", nmemb, nmemb_label,
           size, size_label, ret, *ret_label);
@@ -1847,7 +1847,7 @@ void *__dfsw_malloc(size_t size, dfsan_label size_label,
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + size);
+          (uint64_t)ret, (uint64_t)ret + size);
       *ret_label = bound;
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, ret, *ret_label);
     }
@@ -1864,7 +1864,7 @@ void *__dfsw___libc_malloc(size_t size, dfsan_label size_label,
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + size);
+          (uint64_t)ret, (uint64_t)ret + size);
       *ret_label = bound;
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, ret, *ret_label);
     }
@@ -1882,7 +1882,7 @@ void *__dfsw_aligned_alloc(size_t alignment, size_t size,
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + size);
+          (uint64_t)ret, (uint64_t)ret + size);
       *ret_label = bound;
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, ret, *ret_label);
     }
@@ -1900,7 +1900,7 @@ int __dfsw_posix_memalign(void **memptr, size_t alignment, size_t size,
     internal_memset(shadow_for(*memptr), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(*memptr) * 8,
-          (u64)(*memptr), (u64)(*memptr) + size);
+          (uint64_t)(*memptr), (uint64_t)(*memptr) + size);
       dfsan_set_label(bound, memptr, sizeof(*memptr));
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, *memptr, *ret_label);
     }
@@ -1916,7 +1916,7 @@ void *__dfsw_valloc(size_t size, dfsan_label size_label, dfsan_label *ret_label)
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + size);
+          (uint64_t)ret, (uint64_t)ret + size);
       *ret_label = bound;
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, ret, *ret_label);
     }
@@ -1932,7 +1932,7 @@ void *__dfsw___libc_valloc(size_t size, dfsan_label size_label, dfsan_label *ret
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + size);
+          (uint64_t)ret, (uint64_t)ret + size);
       *ret_label = bound;
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, ret, *ret_label);
     }
@@ -1949,7 +1949,7 @@ void *__dfsw_memalign(size_t alignment, size_t size, dfsan_label alignment_label
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + size);
+          (uint64_t)ret, (uint64_t)ret + size);
       *ret_label = bound;
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, ret, *ret_label);
     }
@@ -1966,7 +1966,7 @@ void *__dfsw___libc_memalign(size_t alignment, size_t size, dfsan_label alignmen
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + size);
+          (uint64_t)ret, (uint64_t)ret + size);
       *ret_label = bound;
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, ret, *ret_label);
     }
@@ -1982,7 +1982,7 @@ void *__dfsw_pvalloc(size_t size, dfsan_label size_label, dfsan_label *ret_label
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + size);
+          (uint64_t)ret, (uint64_t)ret + size);
       *ret_label = bound;
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, ret, *ret_label);
     }
@@ -1998,7 +1998,7 @@ void *__dfsw___libc_pvalloc(size_t size, dfsan_label size_label, dfsan_label *re
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
-          (u64)ret, (u64)ret + size);
+          (uint64_t)ret, (uint64_t)ret + size);
       *ret_label = bound;
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, ret, *ret_label);
     }
