@@ -31,7 +31,6 @@
 static char *obj_path;       /* Path to runtime libraries         */
 static char **cc_params;     /* Parameters passed to the real CC  */
 static u32 cc_par_cnt = 1; /* Param count, including argv0      */
-static u8 clang_type = CLANG_FAST_TYPE;
 static u8 is_cxx = 0;
 
 /* Try to find the runtime libraries. If that fails, abort. */
