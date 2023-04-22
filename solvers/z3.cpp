@@ -16,30 +16,30 @@ using namespace __dfsan;
 
 // for output
 static const char* __output_dir;
-static u32 __instance_id;
-static u32 __session_id;
-static u32 __current_index = 0;
+static uint32_t __instance_id;
+static uint32_t __session_id;
+static uint32_t __current_index = 0;
 static z3::context __z3_context;
 static z3::solver __z3_solver(__z3_context, "QF_BV");
 
 // filter?
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 
 static std::unordered_set<dfsan_label> __solved_labels;
-typedef std::pair<u32, void*> trace_context;
+typedef std::pair<uint32_t, void*> trace_context;
 struct context_hash {
   std::size_t operator()(const trace_context &context) const {
-    return std::hash<u32>{}(context.first) ^ std::hash<void*>{}(context.second);
+    return std::hash<uint32_t>{}(context.first) ^ std::hash<void*>{}(context.second);
   }
 };
-static std::unordered_map<trace_context, u16, context_hash> __branches;
-static const u16 MAX_BRANCH_COUNT = 16;
-static const u64 MAX_GEP_INDEX = 0x10000;
+static std::unordered_map<trace_context, uint16_t, context_hash> __branches;
+static const uint16_t MAX_BRANCH_COUNT = 16;
+static const uint64_t MAX_GEP_INDEX = 0x10000;
 static std::unordered_set<uptr> __buffers;
 
 // caches
-static std::unordered_map<dfsan_label, u32> tsize_cache;
-static std::unordered_map<dfsan_label, std::unordered_set<u32> > deps_cache;
+static std::unordered_map<dfsan_label, uint32_t> tsize_cache;
+static std::unordered_map<dfsan_label, std::unordered_set<uint32_t> > deps_cache;
 static std::unordered_map<dfsan_label, z3::expr> expr_cache;
 
 // dependencies
@@ -74,20 +74,20 @@ static inline void set_branch_dep(size_t n, branch_dep_t* dep) {
   __branch_deps.at(n) = dep;
 }
 
-static z3::expr read_concrete(u64 addr, u8 size) {
-  u8 *ptr = reinterpret_cast<u8*>(addr);
+static z3::expr read_concrete(uint64_t addr, uint8_t size) {
+  uint8_t *ptr = reinterpret_cast<uint8_t*>(addr);
   if (ptr == nullptr) {
     throw z3::exception("invalid concrete address");
   }
 
   z3::expr val = __z3_context.bv_val(*ptr++, 8);
-  for (u8 i = 1; i < size; i++) {
+  for (uint8_t i = 1; i < size; i++) {
     val = z3::concat(__z3_context.bv_val(*ptr++, 8), val);
   }
   return val;
 }
 
-static z3::expr get_cmd(z3::expr const &lhs, z3::expr const &rhs, u32 predicate) {
+static z3::expr get_cmd(z3::expr const &lhs, z3::expr const &rhs, uint32_t predicate) {
   switch (predicate) {
     case bveq:  return lhs == rhs;
     case bvneq: return lhs != rhs;
@@ -108,13 +108,13 @@ static z3::expr get_cmd(z3::expr const &lhs, z3::expr const &rhs, u32 predicate)
   Die();
 }
 
-static inline z3::expr cache_expr(dfsan_label label, z3::expr const &e, std::unordered_set<u32> &deps) {
+static inline z3::expr cache_expr(dfsan_label label, z3::expr const &e, std::unordered_set<uint32_t> &deps) {
   expr_cache.insert({label,e});
   deps_cache.insert({label,deps});
   return e;
 }
 
-static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
+static z3::expr serialize(dfsan_label label, std::unordered_set<uint32_t> &deps) {
   if (label < CONST_OFFSET || label == kInitializingLabel) {
     Report("WARNING: invalid label: %d\n", label);
     throw z3::exception("invalid label");
@@ -141,12 +141,12 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     // caching is not super helpful
     return __z3_context.constant(symbol, sort);
   } else if (info->op == Load) {
-    u64 offset = get_label_info(info->l1)->op1.i;
+    uint64_t offset = get_label_info(info->l1)->op1.i;
     z3::symbol symbol = __z3_context.int_symbol(offset);
     z3::sort sort = __z3_context.bv_sort(8);
     z3::expr out = __z3_context.constant(symbol, sort);
     deps.insert(offset);
-    for (u32 i = 1; i < info->l2; i++) {
+    for (uint32_t i = 1; i < info->l2; i++) {
       symbol = __z3_context.int_symbol(offset + i);
       out = z3::concat(__z3_context.constant(symbol, sort), out);
       deps.insert(offset + i);
@@ -158,12 +158,12 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     if (base.is_bool()) // dirty hack since llvm lacks bool
       base = z3::ite(base, __z3_context.bv_val(1, 1),
                            __z3_context.bv_val(0, 1));
-    u32 base_size = base.get_sort().bv_size();
+    uint32_t base_size = base.get_sort().bv_size();
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, z3::zext(base, info->size - base_size), deps);
   } else if (info->op == SExt) {
     z3::expr base = serialize(info->l1, deps);
-    u32 base_size = base.get_sort().bv_size();
+    uint32_t base_size = base.get_sort().bv_size();
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, z3::sext(base, info->size - base_size), deps);
   } else if (info->op == Trunc) {
@@ -224,7 +224,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   }
 
   // common ops
-  u8 size = info->size;
+  uint8_t size = info->size;
   // size for concat is a bit complicated ...
   if (info->op == Concat && info->l1 == 0) {
     assert(info->l2 >= CONST_OFFSET);
@@ -242,7 +242,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   }
   z3::expr op2 = __z3_context.bv_val((uint64_t)info->op2.i, size);
   if (info->l2 >= CONST_OFFSET) {
-    std::unordered_set<u32> deps2;
+    std::unordered_set<uint32_t> deps2;
     op2 = serialize(info->l2, deps2).simplify();
     deps.insert(deps2.begin(),deps2.end());
   } else if (info->size == 1) {
@@ -307,7 +307,7 @@ static void generate_input(z3::model &m) {
 
     if (name.kind() == Z3_INT_SYMBOL) {
       int offset = name.to_int();
-      u8 value = (u8)e.get_numeral_int();
+      uint8_t value = (uint8_t)e.get_numeral_int();
       AOUT("offset %lld = %x\n", offset, value);
       internal_lseek(fd, offset, SEEK_SET);
       WriteToFile(fd, &value, sizeof(value));
@@ -316,7 +316,7 @@ static void generate_input(z3::model &m) {
         off_t size = (off_t)e.get_numeral_int64();
         if (size > tainted.size) { // grow
           internal_lseek(fd, size, SEEK_SET);
-          u8 dummy = 0;
+          uint8_t dummy = 0;
           WriteToFile(fd, &dummy, sizeof(dummy));
         } else {
           AOUT("truncate file to %lld\n", size);
@@ -445,8 +445,8 @@ static void __solve_cond(dfsan_label label, z3::expr &result, bool add_nested, v
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
-                  u64 c1, u64 c2, u32 cid) {
+__taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t predicate,
+                  uint64_t c1, uint64_t c2, uint32_t cid) {
   if ((op1 == 0 && op2 == 0))
     return;
 
@@ -475,7 +475,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
+__taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
   if (label == 0)
     return;
 
@@ -555,7 +555,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
       index, index_label, num_elems, elem_size, current_offset);
 
   void *addr = __builtin_return_address(0);
-  u8 size = get_label_info(index_label)->size;
+  uint8_t size = get_label_info(index_label)->size;
   try {
     std::unordered_set<dfsan_label> inputs;
     z3::expr i = serialize(index_label, inputs);

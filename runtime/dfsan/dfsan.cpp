@@ -74,10 +74,10 @@ bool print_debug;
 static const int kArgTlsSize = 800;
 static const int kRetvalTlsSize = 800;
 
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u64
-    __dfsan_retval_tls[kRetvalTlsSize / sizeof(u64)];
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u64
-    __dfsan_arg_tls[kArgTlsSize / sizeof(u64)];
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint64_t
+    __dfsan_retval_tls[kRetvalTlsSize / sizeof(uint64_t)];
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint64_t
+    __dfsan_arg_tls[kArgTlsSize / sizeof(uint64_t)];
 
 SANITIZER_INTERFACE_ATTRIBUTE uptr __dfsan_shadow_ptr_mask;
 
@@ -128,15 +128,15 @@ static void dfsan_check_label(dfsan_label label) {
 
 // based on https://github.com/Cyan4973/xxHash
 // simplified since we only have 12 bytes info
-static inline u32 xxhash(u32 h1, u32 h2, u32 h3) {
-  const u32 PRIME32_1 = 2654435761U;
-  const u32 PRIME32_2 = 2246822519U;
-  const u32 PRIME32_3 = 3266489917U;
-  const u32 PRIME32_4 =  668265263U;
-  const u32 PRIME32_5 =  374761393U;
+static inline uint32_t xxhash(uint32_t h1, uint32_t h2, uint32_t h3) {
+  const uint32_t PRIME32_1 = 2654435761U;
+  const uint32_t PRIME32_2 = 2246822519U;
+  const uint32_t PRIME32_3 = 3266489917U;
+  const uint32_t PRIME32_4 =  668265263U;
+  const uint32_t PRIME32_5 =  374761393U;
 
   #define XXH_rotl32(x,r) ((x << r) | (x >> (32 - r)))
-  u32 h32 = PRIME32_5;
+  uint32_t h32 = PRIME32_5;
   h32 += h1 * PRIME32_3;
   h32  = XXH_rotl32(h32, 17) * PRIME32_4;
   h32 += h2 * PRIME32_3;
@@ -162,15 +162,15 @@ static inline bool is_constant_label(dfsan_label label) {
   return label == CONST_LABEL;
 }
 
-static inline bool is_kind_of_label(dfsan_label label, u16 kind) {
+static inline bool is_kind_of_label(dfsan_label label, uint16_t kind) {
   return get_label_info(label)->op == kind;
 }
 
 static bool isZeroOrPowerOfTwo(uint16_t x) { return (x & (x - 1)) == 0; }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
-                          u64 op1, u64 op2) {
+dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
+                          uint64_t op1, uint64_t op2) {
   if (l1 > l2 && is_commutative(op)) {
     // needs to swap both labels and concretes
     Swap(l1, l2);
@@ -194,11 +194,11 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
   }
 
   // setup a hash tree for dedup
-  u32 h1 = l1 ? __dfsan_label_info[l1].hash : 0;
-  u32 h2 = l2 ? __dfsan_label_info[l2].hash : 0;
-  u32 h3 = op;
+  uint32_t h1 = l1 ? __dfsan_label_info[l1].hash : 0;
+  uint32_t h2 = l2 ? __dfsan_label_info[l2].hash : 0;
+  uint32_t h3 = op;
   h3 = (h3 << 16) | size;
-  u32 hash = xxhash(h1, h2, h3);
+  uint32_t hash = xxhash(h1, h2, h3);
 
   struct dfsan_label_info label_info = {
     .l1 = l1, .l2 = l2, .op1 = op1, .op2 = op2, .op = op, .size = size,
@@ -296,7 +296,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n) {
   dfsan_label label = label0;
   for (uptr i = get_label_info(label0)->size / 8; i < n;) {
     dfsan_label next_label = ls[i];
-    u16 next_size = get_label_info(next_label)->size;
+    uint16_t next_size = get_label_info(next_label)->size;
     AOUT("next label=%u, size=%u\n", next_label, next_size);
     if (!is_constant_label(next_label)) {
       if (next_size <= (n - i) * 8) {
@@ -380,7 +380,7 @@ void __taint_pop_stack_frame() {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_trace_alloca(dfsan_label l, u64 size, u64 elem_size, u64 base) {
+dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size, uint64_t elem_size, uint64_t base) {
   if (flags().trace_bounds) {
     __alloca_stack_top -= 1;
     AOUT("label = %d, base = %p, size = %lld, elem_size = %lld\n",
@@ -456,7 +456,7 @@ __dfsan_vararg_wrapper(const char *fname) {
 // Like __dfsan_union, but for use from the client or custom functions.  Hence
 // the equality comparison is done here before calling __dfsan_union.
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
-dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size, u64 op1, u64 op2) {
+dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size, uint64_t op1, uint64_t op2) {
   return __taint_union(l1, l2, op, size, op1, op2);
 }
 
@@ -499,7 +499,7 @@ void dfsan_set_label(dfsan_label label, void *addr, uptr size) {
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
-void dfsan_add_label(dfsan_label label, u8 op, void *addr, uptr size) {
+void dfsan_add_label(dfsan_label label, uint8_t op, void *addr, uptr size) {
   for (dfsan_label *labelp = shadow_for(addr); size != 0; --size, ++labelp)
     *labelp = __taint_union(*labelp, label, op, 1, 0, 0);
 }
@@ -571,7 +571,7 @@ dfsan_dump_labels(int fd) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_debug(dfsan_label op1, dfsan_label op2, int predicate,
-              u32 size, u32 target) {
+              uint32_t size, uint32_t target) {
   if (op1 == 0 && op2 == 0) return;
 }
 
@@ -833,13 +833,13 @@ SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSolver, void) {}
 
 // Default empty implementations (weak) for hooks
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
-                             u32, u32, u64, u64, u32) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, u8, u32) {}
+                             uint32_t, uint32_t, uint64_t, uint64_t, uint32_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, uint8_t, uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
                              dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
                              unsigned) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
-SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
+SANITIZER_WEAK_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 }  // extern "C"
