@@ -23,14 +23,14 @@
 
 using namespace __dfsan;
 
-static u32 __instance_id;
-static u32 __session_id;
+static uint32_t __instance_id;
+static uint32_t __session_id;
 static int __pipe_fd;
 
 // filter?
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 
-static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
+static uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predicate) {
   switch (predicate) {
     case __dfsan::bveq:  return c1 == c2;
     case __dfsan::bvneq: return c1 != c2;
@@ -47,9 +47,9 @@ static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
   return 0;
 }
 
-static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, u32 cid, void *addr) {
+static inline void __solve_cond(dfsan_label label, uint8_t result, uint8_t add_nested, uint32_t cid, void *addr) {
 
-  u16 flags = 0;
+  uint16_t flags = 0;
   if (add_nested) flags |= F_ADD_CONS;
 
   // send info
@@ -68,8 +68,8 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, u32
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
-                  u64 c1, u64 c2, u32 cid) {
+__taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t predicate,
+                  uint64_t c1, uint64_t c2, uint32_t cid) {
   if ((op1 == 0 && op2 == 0))
     return;
 
@@ -79,7 +79,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
        op1, op2, size, predicate, c1, c2, cid, addr);
 
   // save info to a union table slot
-  u8 r = get_const_result(c1, c2, predicate);
+  uint8_t r = get_const_result(c1, c2, predicate);
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
 
   // add nested only for matching cases
@@ -87,7 +87,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
+__taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
   if (label == 0)
     return;
 
@@ -127,7 +127,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
     .label = index_label, // just in case
-    .result = (u64)index
+    .result = (uint64_t)index
   };
 
   internal_write(__pipe_fd, &msg, sizeof(msg));
@@ -168,7 +168,7 @@ __taint_trace_memcmp(dfsan_label label) {
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
     .label = label, // just in case
-    .result = (u64)info->size
+    .result = (uint64_t)info->size
   };
 
   internal_write(__pipe_fd, &msg, sizeof(msg));

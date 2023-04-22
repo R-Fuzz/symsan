@@ -14,8 +14,6 @@
 #ifndef DFSAN_PLATFORM_H
 #define DFSAN_PLATFORM_H
 
-#include "defs.h"
-
 namespace __dfsan {
 
 #if defined(__x86_64__)

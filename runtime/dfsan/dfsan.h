@@ -18,6 +18,7 @@
 #include "sanitizer_common/sanitizer_internal_defs.h"
 #include "dfsan_platform.h"
 #include <stdio.h>
+#include <stdint.h>
 
 using __sanitizer::uptr;
 
@@ -32,10 +33,10 @@ extern bool print_debug;
   } while(false)
 
 // Copy declarations from public sanitizer/dfsan_interface.h header here.
-typedef u32 dfsan_label;
+typedef uint32_t dfsan_label;
 
 typedef union {
-  u64 i;
+  uint64_t i;
   float f;
   double d;
 } data;
@@ -45,9 +46,9 @@ struct dfsan_label_info {
   dfsan_label l2;
   data op1;
   data op2;
-  u16 op;
-  u16 size; // FIXME: this limit the size of the operand to 65535 bits or bytes (in case of memcmp)
-  u32 hash;
+  uint16_t op;
+  uint16_t size; // FIXME: this limit the size of the operand to 65535 bits or bytes (in case of memcmp)
+  uint32_t hash;
 } __attribute__((aligned (8), packed));
 
 #ifndef PATH_MAX
@@ -63,19 +64,19 @@ struct taint_file {
   dfsan_label offset_label;
   dfsan_label label;
   off_t size;
-  u8 is_stdin;
-  u8 is_utmp;
+  uint8_t is_stdin;
+  uint8_t is_utmp;
   char *buf;
   uptr buf_size;
 };
 
 extern "C" {
-void dfsan_add_label(dfsan_label label, u8 op, void *addr, uptr size);
+void dfsan_add_label(dfsan_label label, uint8_t op, void *addr, uptr size);
 void dfsan_set_label(dfsan_label label, void *addr, uptr size);
 dfsan_label dfsan_read_label(const void *addr, uptr size);
 void dfsan_store_label(dfsan_label l1, void *addr, uptr size);
-dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
-                        u64 op1, u64 op2);
+dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
+                        uint64_t op1, uint64_t op2);
 dfsan_label dfsan_create_label(off_t offset);
 dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
@@ -201,20 +202,20 @@ enum pipe_msg_type {
 #define F_ADD_CONS  0x1
 
 struct pipe_msg {
-  u16 msg_type;
-  u16 flags;
-  u32 instance_id;
+  uint16_t msg_type;
+  uint16_t flags;
+  uint32_t instance_id;
   uptr addr;
-  u32 context;
-  u32 id;
-  u32 label;
-  u64 result;
+  uint32_t context;
+  uint32_t id;
+  uint32_t label;
+  uint64_t result;
 } __attribute__((packed));
 
 // additional info for gep
 struct gep_msg {
-  u32 ptr_label;
-  u32 index_label;
+  uint32_t ptr_label;
+  uint32_t index_label;
   uptr ptr;
   int64_t index;
   uint64_t num_elems;
@@ -224,8 +225,8 @@ struct gep_msg {
 
 // saving the memcmp target
 struct memcmp_msg {
-  u32 label;
-  u8 content[0];
+  uint32_t label;
+  uint8_t content[0];
 } __attribute__((packed));
 
 }  // namespace __dfsan
