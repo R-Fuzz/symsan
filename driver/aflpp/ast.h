@@ -137,7 +137,7 @@ namespace rgd {
     return h32;
   }
 
-  static inline void buf_to_hex_string(uint8_t *buf, unsigned length,
+  static inline void buf_to_hex_string(const uint8_t *buf, unsigned length,
                                        std::string &str) {
     const char hex_table[16] = {
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',

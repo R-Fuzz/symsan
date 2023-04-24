@@ -38,6 +38,8 @@ using namespace __dfsan;
 #define DEBUG 1
 #endif
 
+#define NEED_OFFLINE 0
+
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
     char* _tmp; \
@@ -193,7 +195,7 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
 #if NEED_OFFLINE
     std::string val;
     rgd::buf_to_hex_string(&buf[offset], info->l2, val);
-    ret->set_value(std::move(std::to_string(val)));
+    ret->set_value(std::move(val));
     ret->set_index(offset);
     ret->set_name("read");
 #endif
