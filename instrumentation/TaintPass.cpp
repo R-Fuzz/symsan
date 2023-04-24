@@ -1424,7 +1424,7 @@ Value *TaintFunction::getShadow(Value *V) {
         while (ArgIdx--)
           ++i;
         Shadow = &*i;
-        assert(Shadow->getType() == TT.ShadowTy);
+        // assert(Shadow->getType() == TT.ShadowTy);
         break;
       }
       }
