@@ -58,11 +58,27 @@ namespace rgd {
     Memcmp, //37
   };
 
-  static inline bool isRelationalKind(AstKind kind) {
+  static inline bool isRelationalKind(uint32_t kind) {
     if (kind >= Equal && kind <= Sge)
       return true;
     else
       return false;
+  }
+
+  static inline uint32_t negate_cmp(uint32_t kind) {
+    switch (kind) {
+      case Equal: return Distinct;
+      case Distinct: return Equal;
+      case Ult: return Uge;
+      case Ule: return Ugt;
+      case Ugt: return Ule;
+      case Uge: return Ult;
+      case Slt: return Sge;
+      case Sle: return Sgt;
+      case Sgt: return Sle;
+      case Sge: return Slt;
+      default: return Bool;
+    }
   }
 
   static bool isEqualAstRecursive(const AstNode& lhs, const AstNode& rhs) {
@@ -73,24 +89,10 @@ namespace rgd {
     if (lhs.bits() != rhs.bits()) return false;
     
     if (lhs.kind() != rhs.kind()) {
-      // to maximize the reuse of JIT'ed functions, we treats opposite
-      // relational operators as the same:
-      //   equal <-> distinct
-      //   ult <-> uge
-      //   ule <-> ugt
-      //   slt <-> sge
-      //   sle <-> sgt
-      if ((lhs.kind() == Equal    && rhs.kind() == Distinct) || 
-          (lhs.kind() == Distinct && rhs.kind() == Equal) ||
-          (lhs.kind() == Ult      && rhs.kind() == Uge) || 
-          (lhs.kind() == Ule      && rhs.kind() == Ugt) ||
-          (lhs.kind() == Ugt      && rhs.kind() == Ule) || 
-          (lhs.kind() == Uge      && rhs.kind() == Ult) ||
-          (lhs.kind() == Slt      && rhs.kind() == Sge) ||
-          (lhs.kind() == Sle      && rhs.kind() == Sgt) ||
-          (lhs.kind() == Sgt      && rhs.kind() == Sle) ||
-          (lhs.kind() == Sge      && rhs.kind() == Slt)
-        ) {
+      // to maximize the reuse of JIT'ed functions, jigsaw does not
+      // care about which relational operator is used, as long as
+      // they are both relational operators
+      if (isRelationalKind(lhs.kind()) && isRelationalKind(rhs.kind())) {
         // do nothing, fall through to compare operands
       } else {
         return false;
