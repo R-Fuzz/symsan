@@ -102,6 +102,10 @@ static const std::unordered_map<unsigned, std::pair<unsigned, const char*> > OP_
 #undef RELATIONAL_ICMP
 };
 
+static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
+  return (op & 0xff) == __dfsan::ICmp && (op >> 8) == pred;
+}
+
 typedef std::shared_ptr<rgd::AstNode> SymExpr;
 
 // global caches
@@ -290,10 +294,343 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
 #endif
   }
 
-  uint32_t hash = rgd::xxhash(left->hash(), ret->kind(), right->hash());
+  // binary ops, we don't really care about comparison ops in jigsaw,
+  // as long as the operands are the same, we can reuse the AST/function
+  uint32_t kind = rgd::isRelationalKind(ret->kind()) ? rgd::Bool : ret->kind();
+  uint32_t hash = rgd::xxhash(left->hash(), (kind << 16) | ret->bits(), right->hash());
   ret->set_hash(hash);
 
-  return ret;
+  return true;
+}
+
+static std::shared_ptr<rgd::Constraint>
+parse_constraint(bool expected_r, dfsan_label label, const u8 *buf, size_t buf_size) {
+  // make sure root is a comparison node
+  dfsan_label_info *info = get_label_info(label);
+  assert((info->op & 0xff) == __dfsan::ICmp);
+
+  std::unordered_set<dfsan_label> visited;
+  std::shared_ptr<rgd::Constraint> constraint = std::make_shared<rgd::Constraint>();
+  if (!do_uta_rel(label, constraint->get_root(), buf, buf_size, constraint, visited)) {
+    return nullptr;
+  }
+  constraint->comparison = constraint->get_root()->kind();
+  if (!expected_r) { // if expected result is false
+    // make sure the expected result is always true
+    constraint->comparison = rgd::negate_cmp(constraint->comparison);
+  }
+  return constraint;
+}
+
+static bool find_roots(dfsan_label label, rgd::AstNode *ret,
+                       std::unordered_set<dfsan_label> &subroots,
+                       std::unordered_set<dfsan_label> &visited);
+
+// sometimes llvm will zext bool
+static dfsan_label strip_zext(dfsan_label label) {
+  dfsan_label_info *info = get_label_info(label);
+  while (info->op == __dfsan::ZExt) {
+    info = get_label_info(info->l1);
+    if (info->size == 1) {
+      // extending a boolean value
+      return info->l1;
+    }
+  }
+  return label;
+}
+
+static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
+                          std::unordered_set<dfsan_label> &subroots,
+                          std::unordered_set<dfsan_label> &visited) {
+  // try some simplification, 0 LAnd x = 0, 1 LAnd x = x
+  // symsan always keeps rhs as symbolic
+  dfsan_label lhs = info->l1 >= CONST_OFFSET ? strip_zext(info->l1) : 0;
+  dfsan_label rhs = strip_zext(info->l2);
+  if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
+    // if nothing go stripped, we can't simplify
+    bool r = find_roots(rhs, ret, subroots, visited);
+    if (lhs >= CONST_OFFSET) {
+      r |= find_roots(lhs, ret, subroots, visited);
+    }
+    return r;
+  }
+
+  // by communicative, we can parse the rhs first
+  DEBUGF("simplify land: %d LAnd %d, %d\n", lhs, rhs, info->size);
+  rgd::AstNode *right = ret->add_children();
+  bool rr = find_roots(rhs, right, subroots, visited);
+  assert(right->bits() == 1); // rhs must be a boolean after parsing
+  // if nothing added, rhs must be a constant
+  if (unlikely(!rr)) {
+    assert(right->kind() == rgd::Bool);
+    if (right->boolvalue() == 0) { // x LAnd 0 = 0
+      ret->set_kind(rgd::Bool);
+      ret->set_boolvalue(0);
+      return false;
+    }
+  }
+  if (unlikely(lhs == 0)) {
+    // lhs is a constant
+    if (info->op1.i == 0) {
+      ret->set_kind(rgd::Bool);
+      ret->set_boolvalue(0);
+      return false;
+    } else {
+      assert(info->op1.i == 1);
+      ret->CopyFrom(*right);
+      return rr;
+    }
+  } else {
+    rgd::AstNode *left = ret->add_children();
+    bool lr = find_roots(lhs, left, subroots, visited);
+    assert(left->bits() == 1); // lhs must be a boolean after parsing
+    // if nothing added, lhs must be a constant
+    if (unlikely(!lr)) {
+      assert(left->kind() == rgd::Bool);
+      if (left->boolvalue() == 0) {
+        ret->set_kind(rgd::Bool);
+        ret->set_boolvalue(0);
+        return false;
+      } else if (!rr) {
+        // both lhs and rhs are constants
+        ret->set_kind(rgd::Bool);
+        ret->set_boolvalue(1);
+        return false;
+      } else {
+        // lhs is 1, rhs is not
+        ret->CopyFrom(*right);
+        return rr;
+      }
+    }
+  }
+
+  ret->set_kind(rgd::LAnd);
+  ret->set_bits(1);
+  return true;
+}
+
+static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
+                         std::unordered_set<dfsan_label> &subroots,
+                         std::unordered_set<dfsan_label> &visited) {
+  // try some simplification, x LOr 0 = x, x LOr 1 = 1
+  // symsan always keeps rhs as symbolic
+  dfsan_label lhs = info->l1 >= CONST_OFFSET ? strip_zext(info->l1) : 0;
+  dfsan_label rhs = strip_zext(info->l2);
+  if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
+    // if nothing go stripped, we can't simplify
+    bool r = find_roots(rhs, ret, subroots, visited);
+    if (lhs >= CONST_OFFSET) {
+      r |= find_roots(lhs, ret, subroots, visited);
+    }
+    return r;
+  }
+
+  // by communicative, we can parse the rhs first
+  rgd::AstNode *right = ret->add_children();
+  bool rr = find_roots(rhs, right, subroots, visited);
+  assert(right->bits() == 1); // rhs must be a boolean after parsing
+  // if nothing added, rhs must be a constant
+  if (unlikely(!rr)) {
+    assert(right->kind() == rgd::Bool);
+    if (right->boolvalue() == 1) {
+      ret->set_kind(rgd::Bool);
+      ret->set_boolvalue(1);
+      return false;
+    }
+  }
+  if (unlikely(lhs == 0)) {
+    // lhs is a constant
+    if (info->op1.i == 1) {
+      ret->set_kind(rgd::Bool);
+      ret->set_boolvalue(1);
+      return false;
+    } else {
+      assert(info->op1.i == 0);
+      ret->CopyFrom(*right);
+      return rr;
+    }
+  } else {
+    rgd::AstNode *left = ret->add_children();
+    bool lr = find_roots(lhs, left, subroots, visited);
+    assert(left->bits() == 1); // lhs must be a boolean after parsing
+    // if nothing added, lhs must be a constant
+    if (unlikely(!lr)) {
+      assert(left->kind() == rgd::Bool);
+      if (left->boolvalue() == 1) {
+        ret->set_kind(rgd::Bool);
+        ret->set_boolvalue(1);
+        return false;
+      } else if (!rr) {
+        // both lhs and rhs are constants
+        ret->set_kind(rgd::Bool);
+        ret->set_boolvalue(0);
+        return false;
+      } else {
+        // lhs is 0, rhs is not
+        ret->CopyFrom(*right);
+        return rr;
+      }
+    }
+  }
+
+  ret->set_kind(rgd::LOr);
+  ret->set_bits(1);
+  return true;
+}
+
+static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
+                         std::unordered_set<dfsan_label> &subroots,
+                         std::unordered_set<dfsan_label> &visited) {
+  // llvm uses xor to do LNot
+  // symsan always keeps rhs as symbolic
+  dfsan_label lhs = info->l1 >= CONST_OFFSET ? strip_zext(info->l1) : 0;
+  dfsan_label rhs = strip_zext(info->l2);
+  if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
+    // if nothing go stripped, we can't simplify
+    bool r = find_roots(rhs, ret, subroots, visited);
+    if (lhs >= CONST_OFFSET) {
+      r |= find_roots(lhs, ret, subroots, visited);
+    }
+    return r;
+  }
+
+  // by communicative, we can parse the rhs first
+  rgd::AstNode *right = ret->add_children();
+  bool rr = find_roots(rhs, right, subroots, visited);
+  assert(right->bits() == 1); // rhs must be a boolean after parsing
+  ret->set_bits(1);
+  if (unlikely(!rr)) {
+    // if nothing added, rhs must be a constant
+    assert(right->kind() == rgd::Bool);
+    ret->set_kind(rgd::Bool);
+    if (likely(info->l1 == 0)) { // left is a constant
+      ret->set_boolvalue(right->boolvalue() ^ (uint32_t)info->op1.i);
+      return false;
+    }
+  }
+  
+  if (likely(info->l1 == 0)) {
+    // when reach here, rhs must not be a constant
+    if (info->op1.i == 1) {
+      ret->set_kind(rgd::LNot);
+      return true;
+    } else {
+      ret->CopyFrom(*right);
+      return rr;
+    }
+  } else {
+    rgd::AstNode *left = ret->add_children();
+    bool lr = find_roots(info->l1, left, subroots, visited);
+    if (unlikely(!lr)) {
+      // if nothing added, lhs must be a constant
+      assert(left->kind() == rgd::Bool);
+      if (left->boolvalue() == 0) {
+        ret->CopyFrom(*right);
+      } else {
+        ret->set_kind(rgd::LNot);
+      }
+      return rr;
+    }
+  }
+  ret->set_kind(rgd::Xor);
+  return true;
+}
+
+static bool find_roots(dfsan_label label, rgd::AstNode *ret,
+                       std::unordered_set<dfsan_label> &subroots,
+                       std::unordered_set<dfsan_label> &visited) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) {
+    WARNF("invalid label: %d\n", label);
+    return false;
+  }
+
+  if (visited.count(label)) {
+    return false;
+  }
+  visited.insert(label);
+
+  dfsan_label_info *info = get_label_info(label);
+
+  // possible boolean operations
+  if (info->op == __dfsan::And) {
+    return simplify_land(info, ret, subroots, visited);
+  } else if (info->op == __dfsan::Or) {
+    return simplify_lor(info, ret, subroots, visited);
+  } else if (info->op == __dfsan::Xor) {
+    return simplify_xor(info, ret, subroots, visited);
+  } else if ((info->op & 0xff) == __dfsan::ICmp) {
+    // if it's a comparison, we need to make sure both operands don't
+    // contain any additional comparison operator
+    bool lr = false, rr = false;
+    rgd::AstNode *left = nullptr, *right = new rgd::AstNode();
+    // by communicative, symsan always keeps the rhs as symbolic
+    rr = find_roots(strip_zext(info->l2), right, subroots, visited);
+    if (unlikely(rr)) {
+      // if there are additional icmp in rhs, this icmp must be simplifiable
+      assert(right->bits() == 1);
+      assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
+      if (likely(info->l1 == 0)) {
+        if (is_rel_cmp(info->op, __dfsan::bveq)) {
+          if (info->op1.i == 1) {
+            ret->CopyFrom(*right);
+          } else {
+            ret->set_kind(rgd::LNot);
+            ret->add_children()->CopyFrom(*right);
+          }
+        } else { // bvneq
+          if (info->op1.i == 0) {
+            ret->CopyFrom(*right);
+          } else {
+            ret->set_kind(rgd::LNot);
+            ret->add_children()->CopyFrom(*right);
+          }
+        }
+      } else {
+        // bool icmp bool ?!
+        WARNF("bool icmp bool ?!\n");
+        ret->set_kind(rgd::Bool);
+        ret->set_boolvalue(0);
+      }
+      delete right;
+      return true;
+    }
+    if (unlikely(info->l1 >= CONST_OFFSET)) {
+      left = new rgd::AstNode();
+      lr = find_roots(strip_zext(info->l1), left, subroots, visited);
+      assert(!lr);
+      delete left;
+    }
+    // !lr && !rr when reach here
+    ret->set_bits(1);
+    auto itr = OP_MAP.find(info->op);
+    assert(itr != OP_MAP.end());
+    ret->set_kind(itr->second.first);
+    ret->set_label(label);
+    subroots.insert(label);
+    return true;
+  }
+
+  // for all other cases, just visit the operands
+  bool r = false;
+  if (likely(info->l2 >= CONST_OFFSET)) {
+    r |= find_roots(info->l1, ret, subroots, visited);
+  }
+  if (info->l1 >= CONST_OFFSET) {
+    r |= find_roots(info->l1, ret, subroots, visited);
+  }
+  return r;
+}
+
+static void printAst(const rgd::AstNode *node, int indent) {
+  fprintf(stderr, "(%d, ", node->kind());
+  fprintf(stderr, "%d, ", node->bits());
+  for(int i = 0; i < node->children_size(); i++) {
+    printAst(&node->children(i), indent + 1);
+    if (i != node->children_size() - 1) {
+      fprintf(stderr, ", ");
+    }
+  }
+  fprintf(stderr, ")\n");
 }
 
 static bool union_to_ast(bool r, dfsan_label label, dfsan_label_info *label_info,
@@ -306,10 +643,20 @@ static bool union_to_ast(bool r, dfsan_label label, dfsan_label_info *label_info
     return true;
   }
 
-  std::unordered_set<dfsan_label> visited;
-  std::shared_ptr<rgd::Constraint> constraint = std::make_shared<rgd::Constraint>();
+  // given a condition, we want to parse them into a DNF form of
+  // relational sub-expressions, where each sub-expression only contains
+  // one relational operator at the root
   rgd::AstNode *root = new rgd::AstNode();
-  do_uta_rel(label, root, buf, buf_size, constraint, visited);
+  std::unordered_set<dfsan_label> subroots;
+  std::unordered_set<dfsan_label> visited;
+  // we start by constructing a tree of relational expressions
+  find_roots(label, root, subroots, visited);
+#if DEBUG
+  for (auto const& subroot : subroots) {
+    DEBUGF("subroot: %d\n", subroot);
+  }
+  printAst(root, 0);
+#endif
   return true;
 }
 
