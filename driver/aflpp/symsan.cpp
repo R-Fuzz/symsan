@@ -106,10 +106,12 @@ static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
   return (op & 0xff) == __dfsan::ICmp && (op >> 8) == pred;
 }
 
-typedef std::shared_ptr<rgd::AstNode> SymExpr;
+typedef std::shared_ptr<rgd::AstNode> expr_t;
+typedef std::shared_ptr<rgd::Constraint> constraint_t;
+typedef std::shared_ptr<rgd::SearchTask> task_t;
 
 // global caches
-static std::unordered_map<dfsan_label, SymExpr> expr_cache;
+static std::unordered_map<dfsan_label, constraint_t> expr_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<size_t> > input_dep_cache;
 static std::unordered_map<dfsan_label, std::shared_ptr<u8>> memcmp_cache;
 
@@ -303,23 +305,39 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   return true;
 }
 
-static std::shared_ptr<rgd::Constraint>
-parse_constraint(bool expected_r, dfsan_label label, const u8 *buf, size_t buf_size) {
+static constraint_t
+parse_constraint(dfsan_label label, const u8 *buf, size_t buf_size) {
+  DEBUGF("constructing constraint for label %u\n", label);
   // make sure root is a comparison node
   dfsan_label_info *info = get_label_info(label);
   assert((info->op & 0xff) == __dfsan::ICmp);
 
   std::unordered_set<dfsan_label> visited;
-  std::shared_ptr<rgd::Constraint> constraint = std::make_shared<rgd::Constraint>();
+  constraint_t constraint = std::make_shared<rgd::Constraint>();
   if (!do_uta_rel(label, constraint->get_root(), buf, buf_size, constraint, visited)) {
     return nullptr;
   }
-  constraint->comparison = constraint->get_root()->kind();
-  if (!expected_r) { // if expected result is false
-    // make sure the expected result is always true
-    constraint->comparison = rgd::negate_cmp(constraint->comparison);
-  }
   return constraint;
+}
+
+static task_t construct_task(std::vector<const rgd::AstNode*> clause,
+                             const u8 *buf, size_t buf_size) {
+  task_t task = std::make_shared<rgd::SearchTask>();
+  for (auto const& node: clause) {
+    auto itr = expr_cache.find(node->label());
+    if (itr != expr_cache.end()) {
+      task->constraints.push_back(itr->second);
+      continue;
+    }
+    constraint_t constraint = parse_constraint(node->label(), buf, buf_size);
+    // XXX: we need to fix the comparison ops because we may have negated it
+    // during transformation
+    constraint->comparison = node->kind();
+    task->constraints.push_back(constraint);
+    expr_cache.insert({node->label(), constraint});
+  }
+  task->finalize();
+  return task;
 }
 
 static bool find_roots(dfsan_label label, rgd::AstNode *ret,
@@ -623,6 +641,7 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
 
 static void printAst(const rgd::AstNode *node, int indent) {
   fprintf(stderr, "(%d, ", node->kind());
+  fprintf(stderr, "%d, ", node->label());
   fprintf(stderr, "%d, ", node->bits());
   for(int i = 0; i < node->children_size(); i++) {
     printAst(&node->children(i), indent + 1);
@@ -630,18 +649,78 @@ static void printAst(const rgd::AstNode *node, int indent) {
       fprintf(stderr, ", ");
     }
   }
-  fprintf(stderr, ")\n");
+  fprintf(stderr, ")");
 }
 
-static bool union_to_ast(bool r, dfsan_label label, dfsan_label_info *label_info,
-                         const u8 *buf, size_t buf_size,
-                         std::vector<SymExpr> &exprs) {
-
-  // check if the label is already in the cache
-  if (expr_cache.find(label) != expr_cache.end()) {
-    exprs.push_back(expr_cache[label]);
-    return true;
+static void to_nnf(bool expected_r, rgd::AstNode *node) {
+  if (!expected_r) {
+    // we're looking for a negated formula
+    if (node->kind() == rgd::LNot) {
+      // double negation
+      assert(node->children_size() == 1);
+      rgd::AstNode *child = node->mutable_children(0);
+      // transform the child, now looking for a true formula
+      to_nnf(true, child);
+      node->CopyFrom(*child);
+    } else if (node->kind() == rgd::LAnd) {
+      // De Morgan's law
+      assert(node->children_size() == 2);
+      node->set_kind(rgd::LOr);
+      to_nnf(false, node->mutable_children(0));
+      to_nnf(false, node->mutable_children(1));
+    } else if (node->kind() == rgd::LOr) {
+      // De Morgan's law
+      assert(node->children_size() == 2);
+      node->set_kind(rgd::LAnd);
+      to_nnf(false, node->mutable_children(0));
+      to_nnf(false, node->mutable_children(1));
+    } else {
+      // leaf node
+      assert(rgd::isRelationalKind(node->kind()));
+      node->set_kind(rgd::negate_cmp(node->kind()));
+    }
+  } else {
+    // we're looking for a true formula
+    // negate the expected result if we see a LNot
+    if (node->kind() == rgd::LNot) expected_r = false;
+    for (int i = 0; i < node->children_size(); i++) {
+      to_nnf(expected_r, node->mutable_children(i));
+    }
   }
+}
+
+typedef std::vector<std::vector<const rgd::AstNode*> > formula_t;
+
+static void to_dnf(const rgd::AstNode *node, formula_t &formula) {
+  if (node->kind() == rgd::LAnd) {
+    formula_t left, right;
+    to_dnf(&node->children(0), left);
+    to_dnf(&node->children(1), right);
+    for (auto const& sub1: left) {
+      for (auto const& sub2: right) {
+        std::vector<const rgd::AstNode*> clause;
+        clause.insert(clause.end(), sub1.begin(), sub1.end());
+        clause.insert(clause.end(), sub2.begin(), sub2.end());
+        formula.push_back(clause);
+      }
+    }
+    if (left.size() == 0) {
+      formula = right;
+    }
+  } else if (node->kind() == rgd::LOr) {
+    // copy the clauses from the children
+    to_dnf(&node->children(0), formula);
+    to_dnf(&node->children(1), formula);
+  } else {
+    std::vector<const rgd::AstNode*> clause;
+    clause.push_back(node);
+    formula.push_back(clause);
+  }
+}
+
+static bool union_to_ast(bool current_r, dfsan_label label,
+                         const u8 *buf, size_t buf_size,
+                         std::vector<task_t> &tasks) {
 
   // given a condition, we want to parse them into a DNF form of
   // relational sub-expressions, where each sub-expression only contains
@@ -649,14 +728,40 @@ static bool union_to_ast(bool r, dfsan_label label, dfsan_label_info *label_info
   rgd::AstNode *root = new rgd::AstNode();
   std::unordered_set<dfsan_label> subroots;
   std::unordered_set<dfsan_label> visited;
-  // we start by constructing a tree of relational expressions
+  // we start by constructing a boolean formula with relational expressions
+  // as leaf nodes
   find_roots(label, root, subroots, visited);
+  if (root->kind() == rgd::Bool) {
+    // if the simplified formula is a boolean constant, nothing to do
+    return false;
+  }
 #if DEBUG
   for (auto const& subroot : subroots) {
     DEBUGF("subroot: %d\n", subroot);
   }
   printAst(root, 0);
+  fprintf(stderr, "\n");
 #endif
+
+  // next, convert the formula to NNF form, possibly negate the root
+  // if the current concrete r is true (i.e., we are looking for a false)
+  to_nnf(!current_r, root);
+#if DEBUG
+  printAst(root, 0);
+  fprintf(stderr, "\n");
+#endif
+  // then we need to convert the boolean formula into a DNF form
+  formula_t dnf;
+  to_dnf(root, dnf);
+
+  // finally, we construct a search task for each clause in the DNF
+  for (auto const& clause : dnf) {
+    task_t task = construct_task(clause, buf, buf_size);
+    if (task != nullptr) {
+      tasks.push_back(task);
+    }
+  }
+
   return true;
 }
 
@@ -667,9 +772,8 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size) {
 
   // parse the uniont table AST to protobuf ASTs
   // each protobuf AST is a single relational expression
-  std::vector<SymExpr> exprs;
-  union_to_ast(msg.result == 0, msg.label, __dfsan_label_info,
-               buf, buf_size, exprs);
+  std::vector<task_t> tasks;
+  union_to_ast(msg.result != 0, msg.label, buf, buf_size, tasks);
 }
 
 static void handle_gep(gep_msg &gmsg, pipe_msg &msg) {
