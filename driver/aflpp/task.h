@@ -18,12 +18,17 @@ typedef void(*test_fn_type)(uint64_t*);
 static const int RET_OFFSET = 2;
 
 struct Constraint {
-  Constraint(): fn(nullptr), comparison(AstKind::Bool), const_num(0) {}
+  Constraint(): fn(nullptr), comparison(AstKind::Bool), const_num(0) {
+    ast = std::make_shared<AstNode>();
+  }
+  AstNode *get_root() { return ast.get(); }
 
   // JIT'ed function for a comparison expression
   test_fn_type fn;
+  // the AST
+  std::shared_ptr<AstNode> ast;
   // the relational operator
-  rgd::AstKind comparison;
+  uint32_t comparison;
 
   // During constraint collection, (symbolic) input bytes are recorded
   // as offsets from the beginning of the input.  However, the JIT'ed
