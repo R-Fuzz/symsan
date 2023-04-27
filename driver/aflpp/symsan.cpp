@@ -527,7 +527,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
     }
   }
   
-  if (likely(info->l1 == 0)) {
+  if (likely(lhs == 0)) {
     // when reach here, rhs must not be a constant
     if (info->op1.i == 1) {
       ret->set_kind(rgd::LNot);
@@ -538,7 +538,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
     }
   } else {
     rgd::AstNode *left = ret->add_children();
-    bool lr = find_roots(info->l1, left, subroots, visited);
+    bool lr = find_roots(lhs, left, subroots, visited);
     if (unlikely(!lr)) {
       // if nothing added, lhs must be a constant
       assert(left->kind() == rgd::Bool);
@@ -569,6 +569,9 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
 
   dfsan_label_info *info = get_label_info(label);
 
+  if (info->op == 0 || info->op == __dfsan::Load)
+    return false;
+
   // possible boolean operations
   if (info->op == __dfsan::And) {
     return simplify_land(info, ret, subroots, visited);
@@ -580,10 +583,42 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
     // if it's a comparison, we need to make sure both operands don't
     // contain any additional comparison operator
     bool lr = false, rr = false;
-    rgd::AstNode *left = nullptr, *right = new rgd::AstNode();
-    // by communicative, symsan always keeps the rhs as symbolic
-    rr = find_roots(strip_zext(info->l2), right, subroots, visited);
-    if (unlikely(rr)) {
+    std::shared_ptr<rgd::AstNode> left = std::make_shared<rgd::AstNode>();
+    std::shared_ptr<rgd::AstNode> right = std::make_shared<rgd::AstNode>();
+    if (info->l1 >= CONST_OFFSET) {
+      lr = find_roots(strip_zext(info->l1), left.get(), subroots, visited);
+    }
+    if (info->l2 >= CONST_OFFSET) {
+      rr = find_roots(strip_zext(info->l2), right.get(), subroots, visited);
+    }
+    if (unlikely(lr)) {
+      // if there are additional icmp in lhs, this icmp must be simplifiable
+      assert(left->bits() == 1);
+      assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
+      if (likely(info->l2 == 0)) {
+        if (is_rel_cmp(info->op, __dfsan::bveq)) {
+          if (info->op2.i == 1) {
+            ret->CopyFrom(*left);
+          } else {
+            ret->set_kind(rgd::LNot);
+            ret->add_children()->CopyFrom(*left);
+          }
+        } else { // bvneq
+          if (info->op2.i == 0) {
+            ret->CopyFrom(*left);
+          } else {
+            ret->set_kind(rgd::LNot);
+            ret->add_children()->CopyFrom(*left);
+          }
+        }
+      } else {
+        // bool icmp bool ?!
+        WARNF("bool icmp bool ?!\n");
+        ret->set_kind(rgd::Bool);
+        ret->set_boolvalue(0);
+        return false;
+      }
+    } else if (unlikely(rr)) {
       // if there are additional icmp in rhs, this icmp must be simplifiable
       assert(right->bits() == 1);
       assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
@@ -608,30 +643,24 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
         WARNF("bool icmp bool ?!\n");
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(0);
+        return false;
       }
-      delete right;
+    } else {
+      // !lr && !rr when reach here
+      ret->set_bits(1);
+      auto itr = OP_MAP.find(info->op);
+      assert(itr != OP_MAP.end());
+      ret->set_kind(itr->second.first);
+      ret->set_label(label);
+      subroots.insert(label);
       return true;
     }
-    if (unlikely(info->l1 >= CONST_OFFSET)) {
-      left = new rgd::AstNode();
-      lr = find_roots(strip_zext(info->l1), left, subroots, visited);
-      assert(!lr);
-      delete left;
-    }
-    // !lr && !rr when reach here
-    ret->set_bits(1);
-    auto itr = OP_MAP.find(info->op);
-    assert(itr != OP_MAP.end());
-    ret->set_kind(itr->second.first);
-    ret->set_label(label);
-    subroots.insert(label);
-    return true;
   }
 
   // for all other cases, just visit the operands
   bool r = false;
   if (likely(info->l2 >= CONST_OFFSET)) {
-    r |= find_roots(info->l1, ret, subroots, visited);
+    r |= find_roots(info->l2, ret, subroots, visited);
   }
   if (info->l1 >= CONST_OFFSET) {
     r |= find_roots(info->l1, ret, subroots, visited);
