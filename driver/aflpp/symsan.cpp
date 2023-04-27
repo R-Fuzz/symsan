@@ -754,12 +754,12 @@ static bool union_to_ast(bool current_r, dfsan_label label,
   // given a condition, we want to parse them into a DNF form of
   // relational sub-expressions, where each sub-expression only contains
   // one relational operator at the root
-  rgd::AstNode *root = new rgd::AstNode();
+  expr_t root = std::make_shared<rgd::AstNode>();
   std::unordered_set<dfsan_label> subroots;
   std::unordered_set<dfsan_label> visited;
   // we start by constructing a boolean formula with relational expressions
   // as leaf nodes
-  find_roots(label, root, subroots, visited);
+  find_roots(label, root.get(), subroots, visited);
   if (root->kind() == rgd::Bool) {
     // if the simplified formula is a boolean constant, nothing to do
     return false;
@@ -768,20 +768,20 @@ static bool union_to_ast(bool current_r, dfsan_label label,
   for (auto const& subroot : subroots) {
     DEBUGF("subroot: %d\n", subroot);
   }
-  printAst(root, 0);
+  printAst(root.get(), 0);
   fprintf(stderr, "\n");
 #endif
 
   // next, convert the formula to NNF form, possibly negate the root
   // if the current concrete r is true (i.e., we are looking for a false)
-  to_nnf(!current_r, root);
+  to_nnf(!current_r, root.get());
 #if DEBUG
-  printAst(root, 0);
+  printAst(root.get(), 0);
   fprintf(stderr, "\n");
 #endif
   // then we need to convert the boolean formula into a DNF form
   formula_t dnf;
-  to_dnf(root, dnf);
+  to_dnf(root.get(), dnf);
 
   // finally, we construct a search task for each clause in the DNF
   for (auto const& clause : dnf) {
