@@ -27,6 +27,7 @@ protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS rgd.proto)
 
 add_library(SymSanMutator SHARED
   symsan.cpp
+  z3-solver.cpp
   ${PROTO_SRCS}
   ${PROTO_HDRS}
 )
@@ -41,6 +42,7 @@ target_link_libraries(SymSanMutator
   tcmalloc
   LLVM
   pthread
+  z3
 )
 
 install (TARGETS SymSanMutator DESTINATION ${SYMSAN_BIN_DIR})
