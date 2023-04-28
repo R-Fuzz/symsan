@@ -9,6 +9,7 @@
 #include "ast.h"
 #include "task.h"
 #include "solver.h"
+#include "cov.h"
 
 extern "C" {
 #include "afl-fuzz.h"
@@ -55,6 +56,7 @@ typedef std::shared_ptr<rgd::AstNode> expr_t;
 typedef std::shared_ptr<rgd::Constraint> constraint_t;
 typedef std::shared_ptr<rgd::SearchTask> task_t;
 typedef std::shared_ptr<rgd::Solver> solver_t;
+typedef std::shared_ptr<rgd::BranchContext> branch_ctx_t;
 
 enum mutation_state_t {
   MUTATION_INVALID,
@@ -64,11 +66,12 @@ enum mutation_state_t {
 
 struct my_mutator_t {
   my_mutator_t() = delete;
-  my_mutator_t(afl_state_t *afl, rgd::TaskManager* mgr) :
+  my_mutator_t(afl_state_t *afl, rgd::TaskManager* tmgr, rgd::CovManager* cmgr) :
     afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
     argv(NULL), out_fd(-1), shm_id(-1), cur_queue_entry(NULL),
     cur_mutation_state(MUTATION_INVALID), output_buf(NULL),
-    task_mgr(mgr) {}
+    cur_task(nullptr), cur_solver_index(-1), cur_solver_stage(-1),
+    task_mgr(tmgr), cov_mgr(cmgr) {}
 
   ~my_mutator_t() {
     if (out_fd >= 0) close(out_fd);
@@ -93,6 +96,7 @@ struct my_mutator_t {
 
   std::unordered_set<u32> fuzzed_inputs;
   rgd::TaskManager* task_mgr;
+  rgd::CovManager* cov_mgr;
   std::vector<solver_t> solvers;
 
   // XXX: well, we have to keep track of solving states
@@ -786,9 +790,9 @@ static void to_dnf(const rgd::AstNode *node, formula_t &formula) {
   }
 }
 
-static bool union_to_ast(bool current_r, dfsan_label label,
-                         const u8 *buf, size_t buf_size,
-                         std::vector<task_t> &tasks) {
+static bool construct_tasks(bool target_direction, dfsan_label label,
+                            const u8 *buf, size_t buf_size,
+                            std::vector<task_t> &tasks) {
 
   // given a condition, we want to parse them into a DNF form of
   // relational sub-expressions, where each sub-expression only contains
@@ -812,8 +816,8 @@ static bool union_to_ast(bool current_r, dfsan_label label,
 #endif
 
   // next, convert the formula to NNF form, possibly negate the root
-  // if the current concrete r is true (i.e., we are looking for a false)
-  to_nnf(!current_r, root.get());
+  // if we are looking for a false formula
+  to_nnf(target_direction, root.get());
 #if DEBUG
   printAst(root.get(), 0);
   fprintf(stderr, "\n");
@@ -839,14 +843,22 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
     return;
   }
 
-  // parse the uniont table AST to protobuf ASTs
-  // each protobuf AST is a single relational expression
-  std::vector<task_t> tasks;
-  union_to_ast(msg.result != 0, msg.label, buf, buf_size, tasks);
+  const branch_ctx_t ctx = my_mutator->cov_mgr->add_branch((void*)msg.addr,
+      msg.id, msg.result != 0, msg.context, false, false);
 
-  // add the tasks to the task manager
-  for (auto const& task : tasks) {
-    my_mutator->task_mgr->add_task(task);
+  branch_ctx_t neg_ctx = std::make_shared<rgd::BranchContext>();
+  *neg_ctx = *ctx;
+  neg_ctx->direction = !ctx->direction;
+
+  if (my_mutator->cov_mgr->is_branch_interesting(neg_ctx)) {
+    // parse the uniont table AST to solving tasks
+    std::vector<task_t> tasks;
+    construct_tasks(neg_ctx->direction, msg.label, buf, buf_size, tasks);
+
+    // add the tasks to the task manager
+    for (auto const& task : tasks) {
+      my_mutator->task_mgr->add_task(neg_ctx, task);
+    }
   }
 }
 
@@ -867,8 +879,9 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   (void)(seed);
 
   struct stat st;
-  rgd::TaskManager *mgr = new rgd::FIFOTaskManager();
-  my_mutator_t *data = new my_mutator_t(afl, mgr);
+  rgd::TaskManager *tmgr = new rgd::FIFOTaskManager();
+  rgd::CovManager *cmgr = new rgd::EdgeCovManager();
+  my_mutator_t *data = new my_mutator_t(afl, tmgr, cmgr);
   if (!data) {
     FATAL("afl_custom_init alloc");
     return NULL;
@@ -982,6 +995,7 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
     setenv("TAINT_OPTIONS", (char*)options, 1);
     if (data->afl->fsrv.use_stdin) {
       close(0);
+      lseek(data->out_fd, 0, SEEK_SET);
       dup2(data->out_fd, 0);
     }
 #if !DEBUG
