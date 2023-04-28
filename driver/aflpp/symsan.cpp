@@ -8,6 +8,7 @@
 
 #include "ast.h"
 #include "task.h"
+#include "solver.h"
 
 extern "C" {
 #include "afl-fuzz.h"
@@ -50,7 +51,35 @@ using namespace __dfsan;
     _tmp; \
   })
 
-typedef struct my_mutator {
+typedef std::shared_ptr<rgd::AstNode> expr_t;
+typedef std::shared_ptr<rgd::Constraint> constraint_t;
+typedef std::shared_ptr<rgd::SearchTask> task_t;
+typedef std::shared_ptr<rgd::Solver> solver_t;
+
+enum mutation_state_t {
+  MUTATION_INVALID,
+  MUTATION_IN_VALIDATION,
+  MUTATION_VALIDATED,
+};
+
+struct my_mutator_t {
+  my_mutator_t() = delete;
+  my_mutator_t(afl_state_t *afl, rgd::TaskManager* mgr) :
+    afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
+    argv(NULL), out_fd(-1), shm_id(-1), cur_queue_entry(NULL),
+    cur_mutation_state(MUTATION_INVALID), output_buf(NULL),
+    task_mgr(mgr) {}
+
+  ~my_mutator_t() {
+    if (out_fd >= 0) close(out_fd);
+    if (shm_id >= 0) shmctl(shm_id, IPC_RMID, NULL);
+    // unlink(data->out_file);
+    ck_free(out_dir);
+    ck_free(out_file);
+    ck_free(output_buf);
+    delete task_mgr;
+  }
+
   afl_state_t *afl;
   char *out_dir;
   char *out_file;
@@ -58,10 +87,19 @@ typedef struct my_mutator {
   char **argv;
   int out_fd;
   int shm_id;
-} my_mutator_t;
+  u8* cur_queue_entry;
+  int cur_mutation_state;
+  u8* output_buf;
 
-// FIXME: a temporary way to find out input that has been fuzzed before
-static std::unordered_set<u32> __fuzzed_inputs;
+  std::unordered_set<u32> fuzzed_inputs;
+  rgd::TaskManager* task_mgr;
+  std::vector<solver_t> solvers;
+
+  // XXX: well, we have to keep track of solving states
+  task_t cur_task;
+  size_t cur_solver_index;
+  int cur_solver_stage;
+};
 
 // FIXME: find another way to make the union table hash work
 static dfsan_label_info *__dfsan_label_info;
@@ -106,11 +144,7 @@ static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
   return (op & 0xff) == __dfsan::ICmp && (op >> 8) == pred;
 }
 
-typedef std::shared_ptr<rgd::AstNode> expr_t;
-typedef std::shared_ptr<rgd::Constraint> constraint_t;
-typedef std::shared_ptr<rgd::SearchTask> task_t;
-
-// global caches
+// FIXME: global caches
 static std::unordered_map<dfsan_label, constraint_t> expr_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<size_t> > input_dep_cache;
 static std::unordered_map<dfsan_label, std::shared_ptr<u8>> memcmp_cache;
@@ -178,6 +212,7 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_label(label);
     uint64_t offset = info->op1.i;
     assert(offset < buf_size);
+    ret->set_index(offset);
     // map arg
     uint32_t hash = map_arg(buf, offset, 1, constraint);
     ret->set_hash(hash);
@@ -185,7 +220,6 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     std::string val;
     rgd::buf_to_hex_string(&buf[offset], 1, val);
     ret->set_value(std::move(val));
-    ret->set_index(offset);
     ret->set_name("read");
 #endif
     return true;
@@ -195,6 +229,7 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_label(label);
     uint64_t offset = get_label_info(info->l1)->op1.i;
     assert(offset + info->l2 <= buf_size);
+    ret->set_index(offset);
     // map arg
     uint32_t hash = map_arg(buf, offset, info->l2, constraint);
     ret->set_hash(hash);
@@ -202,7 +237,6 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     std::string val;
     rgd::buf_to_hex_string(&buf[offset], info->l2, val);
     ret->set_value(std::move(val));
-    ret->set_index(offset);
     ret->set_name("read");
 #endif
     return true;
@@ -243,13 +277,13 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     left->set_bits(size);
     // map args
     uint32_t arg_index = (uint32_t)constraint->input_args.size();
+    left->set_index(arg_index);
     constraint->input_args.push_back(std::make_pair(false, info->op1.i));
     constraint->const_num += 1;
     uint32_t hash = rgd::xxhash(size, rgd::Constant, arg_index);
     left->set_hash(hash);
 #if NEED_OFFLINE
     left->set_value(std::to_string(info->op1.i));
-    left->set_index(arg_index);
     left->set_name("constant");
 #endif
   }
@@ -285,13 +319,13 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     right->set_bits(size);
     // map args
     uint32_t arg_index = (uint32_t)constraint->input_args.size();
+    right->set_index(arg_index);
     constraint->input_args.push_back(std::make_pair(false, info->op2.i));
     constraint->const_num += 1;
     uint32_t hash = rgd::xxhash(size, rgd::Constant, arg_index);
     right->set_hash(hash);
 #if NEED_OFFLINE
     right->set_value(std::to_string(info->op1.i));
-    right->set_index(arg_index);
     right->set_name("constant");
 #endif
   }
@@ -314,7 +348,7 @@ parse_constraint(dfsan_label label, const u8 *buf, size_t buf_size) {
 
   std::unordered_set<dfsan_label> visited;
   constraint_t constraint = std::make_shared<rgd::Constraint>();
-  if (!do_uta_rel(label, constraint->get_root(), buf, buf_size, constraint, visited)) {
+  if (!do_uta_rel(label, constraint->ast.get(), buf, buf_size, constraint, visited)) {
     return nullptr;
   }
   return constraint;
@@ -329,10 +363,13 @@ static task_t construct_task(std::vector<const rgd::AstNode*> clause,
       task->constraints.push_back(itr->second);
       continue;
     }
-    constraint_t constraint = parse_constraint(node->label(), buf, buf_size);
-    // XXX: we need to fix the comparison ops because we may have negated it
+    // save the comparison op because we may have negated it
     // during transformation
-    constraint->comparison = node->kind();
+    uint32_t comparison = node->kind();
+    constraint_t constraint = parse_constraint(node->label(), buf, buf_size);
+    // XXX: we need to fix the comparison ops
+    constraint->comparison = comparison;
+    constraint->ast->set_kind(comparison);
     task->constraints.push_back(constraint);
     expr_cache.insert({node->label(), constraint});
   }
@@ -652,7 +689,9 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
       assert(itr != OP_MAP.end());
       ret->set_kind(itr->second.first);
       ret->set_label(label);
+#ifdef DEBUG
       subroots.insert(label);
+#endif
       return true;
     }
   }
@@ -794,7 +833,8 @@ static bool union_to_ast(bool current_r, dfsan_label label,
   return true;
 }
 
-static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size) {
+static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
+                        my_mutator_t *my_mutator) {
   if (unlikely(msg.label == 0)) {
     return;
   }
@@ -803,6 +843,11 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size) {
   // each protobuf AST is a single relational expression
   std::vector<task_t> tasks;
   union_to_ast(msg.result != 0, msg.label, buf, buf_size, tasks);
+
+  // add the tasks to the task manager
+  for (auto const& task : tasks) {
+    my_mutator->task_mgr->add_task(task);
+  }
 }
 
 static void handle_gep(gep_msg &gmsg, pipe_msg &msg) {
@@ -822,11 +867,14 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   (void)(seed);
 
   struct stat st;
-  my_mutator_t *data = (my_mutator_t *)calloc(1, sizeof(my_mutator_t));
+  rgd::TaskManager *mgr = new rgd::FIFOTaskManager();
+  my_mutator_t *data = new my_mutator_t(afl, mgr);
   if (!data) {
     FATAL("afl_custom_init alloc");
     return NULL;
   }
+  solver_t solver = std::make_shared<rgd::Z3Solver>();
+  data->solvers.push_back(solver);
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
     FATAL(
@@ -876,16 +924,18 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     FATAL("Failed to map shm(%d): %s\n", data->shm_id, strerror(errno));
   }
 
-  data->afl = afl;
+  // allocate output buffer
+  data->output_buf = (u8 *)malloc(MAX_FILE);
+  if (!data->output_buf) {
+    FATAL("Failed to alloc output buffer\n");
+  }
 
   return data;
 }
 
 extern "C" void afl_custom_deinit(my_mutator_t *data) {
-  close(data->out_fd);
-  // unlink(data->out_file);
   shmdt(__dfsan_label_info);
-  ck_free(data->argv);
+  delete data;
 }
 
 static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size,
@@ -910,7 +960,9 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
 
   // FIXME: should we use the afl->queue_cur->fname instead?
   // write the buf to the file
+  lseek(data->out_fd, 0, SEEK_SET);
   ck_write(data->out_fd, buf, buf_size, data->out_file);
+  fsync(data->out_fd);
   if (ftruncate(data->out_fd, buf_size)) {
     WARNF("Failed to truncate output file: %s\n", strerror(errno));
     return 0;
@@ -920,7 +972,9 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
   const char *taint_file = data->afl->fsrv.use_stdin ? "stdin" : data->out_file;
   char *options = alloc_printf("taint_file=%s:shm_id=%d:pipe_fd=%d:debug=%d",
                                 taint_file, data->shm_id, pipefds[1], DEBUG);
+#if DEBUG
   DEBUGF("TAINT_OPTIONS=%s\n", options);
+#endif
   
   int pid = fork();
   if (pid == 0) {
@@ -962,10 +1016,14 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   // we don't use the afl_custom_queue_new_entry() because we may not
   // want to solve all the tasks
   u32 input_id = data->afl->queue_cur->id;
-  if (__fuzzed_inputs.find(input_id) != __fuzzed_inputs.end()) {
+  if (data->fuzzed_inputs.find(input_id) != data->fuzzed_inputs.end()) {
     return 0;
   }
-  __fuzzed_inputs.insert(input_id);
+  data->fuzzed_inputs.insert(input_id);
+
+  // record the name of the current queue entry
+  data->cur_queue_entry = data->afl->queue_cur->fname;
+  DEBUGF("Fuzzing %s\n", data->cur_queue_entry);
 
   // create pipe for communication
   int pipefds[2];
@@ -999,7 +1057,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
     switch (msg.msg_type) {
       // conditional branch
       case cond_type:
-        handle_cond(msg, buf, buf_size);
+        handle_cond(msg, buf, buf_size, data);
         break;
       case gep_type:
         if (read(pipefds[0], &gmsg, sizeof(gmsg)) != sizeof(gmsg)) {
@@ -1045,12 +1103,104 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   // clean up
   close(pipefds[0]);
 
-  return 0;
+  // reinit solving state
+  data->cur_task = nullptr;
+
+  size_t max_stages = 0;
+  for (auto const& solver: data->solvers) {
+    max_stages += solver->stages();
+  }
+  // to be conservative, we return the maximum number of possible mutations
+  return (u32)(data->task_mgr->get_num_tasks() * max_stages);
 
 }
 
-extern "C" size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
-                                  u8 **out_buf, uint8_t *add_buf, size_t add_buf_size,
-                                  size_t max_size) {
+extern "C"
+size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
+                       u8 **out_buf, uint8_t *add_buf, size_t add_buf_size,
+                       size_t max_size) {
+  (void)(add_buf);
+  (void)(add_buf_size);
+  (void)(max_size);
+  assert(buf_size < MAX_FILE);
+
+  // try to get a task if we don't already have one
+  // or if we've find a valid solution from the previous mutation
+  if (!data->cur_task || data->cur_mutation_state == MUTATION_VALIDATED) {
+    data->cur_task = data->task_mgr->get_next_task();
+    if (!data->cur_task) {
+      DEBUGF("No more tasks to solve\n");
+      *out_buf = buf;
+      return buf_size;
+    }
+    // reset the solver and state
+    data->cur_solver_index = 0;
+    data->cur_solver_stage = 0;
+    data->cur_mutation_state = MUTATION_INVALID;
+  }
+
+  // check the previous mutation state
+  if (data->cur_mutation_state == MUTATION_IN_VALIDATION) {
+    // oops, not solve, move on to next stage
+    data->cur_solver_stage++;
+  }
+
+  auto &solver = data->solvers[data->cur_solver_index];
+  if (data->cur_solver_stage >= solver->stages()) {
+    // if reached the max stage of the current solver, move on to the next solver
+    data->cur_solver_index++;
+    if (data->cur_solver_index >= data->solvers.size()) {
+      // if reached the max solver, move on to the next task
+      data->cur_task = data->task_mgr->get_next_task();
+      if (!data->cur_task) {
+        DEBUGF("No more tasks to solve\n");
+        *out_buf = buf;
+        return buf_size;
+      }
+      data->cur_solver_index = 0; // reset solver index
+    }
+    solver = data->solvers[data->cur_solver_index];
+    // reset the solver index
+    data->cur_solver_stage = 0;
+  }
+
+  // default return values
+  size_t new_buf_size = buf_size;
+  *out_buf = buf;
+  auto ret = solver->solve(data->cur_solver_stage, data->cur_task,
+      buf, buf_size, data->output_buf, new_buf_size);
+  if (likely(ret == rgd::SOLVER_SAT)) {
+    DEBUGF("task solved\n");
+    data->cur_mutation_state = MUTATION_IN_VALIDATION;
+    *out_buf = data->output_buf;
+  } else if (ret == rgd::SOLVER_TIMEOUT) {
+    // if not solved, move on to next stage
+    data->cur_mutation_state = MUTATION_INVALID;
+    data->cur_solver_stage++;
+  } else if (ret == rgd::SOLVER_UNSAT) {
+    // at any stage if the task is deemed unsolvable, just skip it
+    DEBUGF("task not solvable\n");
+    data->cur_task = nullptr;
+  } else {
+    WARNF("Unknown solver return value %d\n", ret);
+    new_buf_size = 0;
+  }
+
+  return new_buf_size;
+}
+
+
+// FIXME: use new queue entry as feedback to see if the last mutation is successful
+extern "C"
+uint8_t afl_custom_queue_new_entry(my_mutator_t * data,
+                                   const uint8_t *filename_new_queue,
+                                   const uint8_t *filename_orig_queue) {
+  // if we're in validation state and the current queue entry is the same as
+  // mark the constraints as solved
+  DEBUGF("new queue entry: %s\n", filename_new_queue);
+  if (data->cur_queue_entry == filename_orig_queue &&
+      data->cur_mutation_state == MUTATION_IN_VALIDATION) {
+    data->cur_mutation_state = MUTATION_VALIDATED;
+  }
   return 0;
 }

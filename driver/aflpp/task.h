@@ -6,6 +6,7 @@
 #include <memory>
 #include <unordered_map>
 #include <bitset>
+#include <queue>
 
 #include "ast.h"
 
@@ -21,7 +22,7 @@ struct Constraint {
   Constraint(): fn(nullptr), comparison(AstKind::Bool), const_num(0) {
     ast = std::make_shared<AstNode>();
   }
-  AstNode *get_root() { return ast.get(); }
+  const AstNode *get_root() const { return const_cast<const AstNode*>(ast.get()); }
 
   // JIT'ed function for a comparison expression
   test_fn_type fn;
@@ -68,6 +69,11 @@ struct SearchTask {
   std::vector<std::shared_ptr<const Constraint>> constraints;
   // per-constraint mutable metadata
   std::vector<std::unique_ptr<ConsMeta>> consmeta;
+
+  // nested constraints, could be shared, strictly read-only
+  std::vector<std::shared_ptr<const Constraint>> nested_constraints;
+  // per-constraint mutable metadata
+  std::vector<std::unique_ptr<ConsMeta>> nested_consmeta;
 
   // inputs as pairs of <offset (from the beginning of the input, and value>
   std::vector<std::pair<uint32_t, uint8_t>> inputs;
@@ -165,6 +171,36 @@ struct SearchTask {
     }
   }
 
+};
+
+class TaskManager {
+public:
+  virtual ~TaskManager() {}
+  virtual bool add_task(std::shared_ptr<SearchTask> task) = 0;
+  virtual std::shared_ptr<SearchTask> get_next_task() = 0;
+  virtual size_t get_num_tasks() = 0;
+};
+
+class FIFOTaskManager : public TaskManager {
+public:
+  bool add_task(std::shared_ptr<SearchTask> task) override {
+    tasks.push_back(task);
+    return true;
+  }
+
+  std::shared_ptr<SearchTask> get_next_task() override {
+    if (tasks.empty()) return nullptr;
+    auto task = tasks.front();
+    tasks.pop_front();
+    return task;
+  }
+
+  size_t get_num_tasks() override {
+    return tasks.size();
+  }
+
+private:
+  std::deque<std::shared_ptr<SearchTask>> tasks;
 };
 
 }; // namespace rgd
