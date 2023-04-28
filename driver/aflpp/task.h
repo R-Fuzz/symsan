@@ -9,6 +9,7 @@
 #include <queue>
 
 #include "ast.h"
+#include "cov.h"
 
 namespace rgd {
 
@@ -176,14 +177,15 @@ struct SearchTask {
 class TaskManager {
 public:
   virtual ~TaskManager() {}
-  virtual bool add_task(std::shared_ptr<SearchTask> task) = 0;
+  virtual bool add_task(std::shared_ptr<BranchContext> ctx, std::shared_ptr<SearchTask> task) = 0;
   virtual std::shared_ptr<SearchTask> get_next_task() = 0;
   virtual size_t get_num_tasks() = 0;
 };
 
 class FIFOTaskManager : public TaskManager {
 public:
-  bool add_task(std::shared_ptr<SearchTask> task) override {
+  bool add_task(std::shared_ptr<BranchContext> ctx, std::shared_ptr<SearchTask> task) override {
+    (void)ctx;
     tasks.push_back(task);
     return true;
   }
