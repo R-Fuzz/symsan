@@ -76,6 +76,11 @@ struct SearchTask {
   // per-constraint mutable metadata
   std::vector<std::unique_ptr<ConsMeta>> consmeta;
 
+  // nested constraints, could be shared, strictly read-only
+  std::vector<std::shared_ptr<const Constraint>> nested_constraints;
+  // per-constraint mutable metadata
+  std::vector<std::unique_ptr<ConsMeta>> nested_consmeta;
+
   // inputs as pairs of <offset (from the beginning of the input, and value>
   std::vector<std::pair<uint32_t, uint8_t>> inputs;
   // shape information at each offset
