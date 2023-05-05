@@ -66,7 +66,7 @@ enum mutation_state_t {
 
 struct my_mutator_t {
   my_mutator_t() = delete;
-  my_mutator_t(afl_state_t *afl, rgd::TaskManager* tmgr, rgd::CovManager* cmgr) :
+  my_mutator_t(const afl_state_t *afl, rgd::TaskManager* tmgr, rgd::CovManager* cmgr) :
     afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
     argv(NULL), out_fd(-1), shm_id(-1), cur_queue_entry(NULL),
     cur_mutation_state(MUTATION_INVALID), output_buf(NULL),
@@ -83,7 +83,7 @@ struct my_mutator_t {
     delete task_mgr;
   }
 
-  afl_state_t *afl;
+  const afl_state_t *afl;
   char *out_dir;
   char *out_file;
   char *symsan_bin;
@@ -962,7 +962,7 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
       FATAL("Failed to alloc argv\n");
     }
     for (int i = 0; i < argc; i++) {
-      if (strstr(data->afl->argv[i], (char*)data->afl->fsrv.out_file)) {
+      if (strstr(data->afl->argv[i], (char*)data->afl->tmp_dir)) {
         DEBUGF("Replacing %s with %s\n", data->afl->argv[i], data->out_file);
         data->argv[i] = data->out_file;
       } else {
