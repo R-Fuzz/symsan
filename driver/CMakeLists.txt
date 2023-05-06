@@ -9,5 +9,5 @@ set_target_properties(FGTest PROPERTIES OUTPUT_NAME "fgtest")
 target_include_directories(FGTest PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
 )
-target_link_options(FGTest PRIVATE "-lz3")
+target_link_options(FGTest PRIVATE "-lz3" "-lrt")
 install (TARGETS FGTest DESTINATION ${SYMSAN_BIN_DIR})

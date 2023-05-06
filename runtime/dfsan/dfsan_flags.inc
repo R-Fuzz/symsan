@@ -32,7 +32,7 @@ DFSAN_FLAG(const char *, dump_labels_at_exit, "", "The path of the file where "
 DFSAN_FLAG(const char *, taint_file, "", "The path of the file which "
                                          "will be tainted.")
 DFSAN_FLAG(const char *, union_table, "union.txt", "union table.")
-DFSAN_FLAG(int, shm_id, -1, "shared union table.")
+DFSAN_FLAG(int, shm_fd, -1, "shared union table.")
 DFSAN_FLAG(int, pipe_fd, -1, "communication fd.")
 DFSAN_FLAG(bool, trace_bounds, false, "trace bounds info.")
 DFSAN_FLAG(bool, debug, false, "Print debug output.")

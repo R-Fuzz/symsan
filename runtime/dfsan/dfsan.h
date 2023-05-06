@@ -56,6 +56,8 @@ struct dfsan_label_info {
 #define CONST_OFFSET 1
 #define CONST_LABEL 0
 
+static const size_t uniontable_size = 0xc00000000; // FIXME
+
 struct taint_file {
   char filename[PATH_MAX];
   int fd;
