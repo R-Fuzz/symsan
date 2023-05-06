@@ -38,6 +38,8 @@ static dfsan_label_info *__dfsan_label_info;
 static char *input_buf;
 static size_t input_size;
 
+static const char *shm_name = "/symsan_union_table";
+
 dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
   return &__dfsan_label_info[label];
 }
@@ -610,20 +612,28 @@ int main(int argc, char* const argv[]) {
     fprintf(stderr, "Failed to map input file: %s\n", strerror(errno));
     exit(1);
   }
+  close(fd);
 
   // setup shmem and pipe
-  int shmid = shmget(IPC_PRIVATE, 0xc00000000,
-    O_CREAT | SHM_NORESERVE | S_IRUSR | S_IWUSR);
-  if (shmid == -1) {
-    fprintf(stderr, "Failed to get shmid: %s\n", strerror(errno));
+  int shmfd = shm_open(shm_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+  if (shmfd == -1) {
+    fprintf(stderr, "Failed to open shmem: %s\n", strerror(errno));
     exit(1);
   }
 
-  __dfsan_label_info = (dfsan_label_info *)shmat(shmid, NULL, SHM_RDONLY);
-  if (__dfsan_label_info == (void *)-1) {
-    fprintf(stderr, "Failed to map shm(%d): %s\n", shmid, strerror(errno));
+  if (ftruncate(shmfd, uniontable_size) == -1) {
+    fprintf(stderr, "Failed to truncate shmem: %s\n", strerror(errno));
     exit(1);
   }
+
+  __dfsan_label_info = (dfsan_label_info *)mmap(NULL, uniontable_size,
+      PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0);
+  if (__dfsan_label_info == (void *)-1) {
+    fprintf(stderr, "Failed to map shm: %s\n", strerror(errno));
+    exit(1);
+  }
+  // clear O_CLOEXEC flag
+  fcntl(shmfd, F_SETFD, fcntl(shmfd, F_GETFD) & ~FD_CLOEXEC);
 
   int pipefds[2];
   if (pipe(pipefds) != 0) {
@@ -632,11 +642,11 @@ int main(int argc, char* const argv[]) {
   }
 
   // prepare the env and fork
-  int length = snprintf(NULL, 0, "taint_file=%s:shm_id=%d:pipe_fd=%d:debug=1",
-                        input, shmid, pipefds[1]);
+  int length = snprintf(NULL, 0, "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=1",
+                        input, shmfd, pipefds[1]);
   options = (char *)malloc(length + 1);
-  snprintf(options, length + 1, "taint_file=%s:shm_id=%d:pipe_fd=%d:debug=1",
-           input, shmid, pipefds[1]);
+  snprintf(options, length + 1, "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=1",
+           input, shmfd, pipefds[1]);
   
   int pid = fork();
   if (pid < 0) {
@@ -709,5 +719,8 @@ int main(int argc, char* const argv[]) {
   }
 
   wait(NULL);
+  close(pipefds[0]);
+  close(shmfd);
+  shm_unlink(shm_name);
   exit(0);
 }

@@ -41,6 +41,7 @@
 #include <sys/types.h>
 #include <assert.h>
 #include <fcntl.h>
+#include <string.h>
 
 using namespace __dfsan;
 
@@ -48,7 +49,6 @@ typedef atomic_uint32_t atomic_dfsan_label;
 
 static atomic_dfsan_label __dfsan_last_label;
 static dfsan_label_info *__dfsan_label_info;
-static const size_t uniontable_size = 0xc00000000; // FIXME
 
 // FIXME: single thread
 // statck bottom
@@ -759,8 +759,8 @@ static void dfsan_fini() {
   if (tainted.buf) {
     UnmapOrDie(tainted.buf, tainted.buf_size);
   }
-  if (flags().shm_id != -1) {
-    shmdt((void *)UnionTableAddr());
+  if (flags().shm_fd != -1) {
+    internal_munmap((void *)UnionTableAddr(), uniontable_size);
   }
 }
 
@@ -769,18 +769,26 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   print_debug = flags().debug;
 
   ::InitializePlatformEarly();
-  MmapFixedSuperNoReserve(ShadowAddr(), UnionTableAddr() - ShadowAddr());
-  __dfsan_label_info = (dfsan_label_info *)UnionTableAddr();
+  uptr ret;
+  int err;
+  ret = MmapFixedSuperNoReserve(ShadowAddr(), UnionTableAddr() - ShadowAddr());
+  if (internal_iserror(ret, &err)) {
+    Printf("FATAL: error mapping shadow %s\n", strerror(err));
+    Die();
+  }
 
   // init union table
-  if (flags().shm_id != -1) {
-    void *ret = shmat(flags().shm_id, (void *)UnionTableAddr(), SHM_REMAP);
-    if (ret == (void*)-1) {
-      Printf("FATAL: error mapping shared union table\n");
-      Die();
-    }
+  __dfsan_label_info = (dfsan_label_info *)UnionTableAddr();
+if (flags().shm_fd != -1) {
+    AOUT("shm_fd %d\n", flags().shm_fd);
+    ret = internal_mmap((void*)UnionTableAddr(), uniontable_size,
+        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, flags().shm_fd, 0);
   } else {
-    MmapFixedSuperNoReserve(UnionTableAddr(), uniontable_size);
+    ret = MmapFixedSuperNoReserve(UnionTableAddr(), uniontable_size);
+  }
+  if (internal_iserror(ret, &err)) {
+    Printf("FATAL: error mapping shared union table %s\n", strerror(err));
+    Die();
   }
 
   // init const label
