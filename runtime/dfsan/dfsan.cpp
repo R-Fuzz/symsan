@@ -176,21 +176,54 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t 
     Swap(l1, l2);
     Swap(op1, op2);
   }
-  if (l1 == 0 && l2 < CONST_OFFSET && op != fsize && op != Alloca) return 0;
+  if (l1 == 0 && l2 < CONST_OFFSET && op != fsize && op != __dfsan::Alloca) return 0;
   if (l1 == kInitializingLabel || l2 == kInitializingLabel) return kInitializingLabel;
 
   // special handling for bounds
-  if (get_label_info(l1)->op == Alloca || get_label_info(l2)->op == Alloca) {
+  if (get_label_info(l1)->op == __dfsan::Alloca || get_label_info(l2)->op == __dfsan::Alloca) {
     // propagate if it's casting op
-    if (op == BitCast) return l1;
-    if (op == PtrToInt) {AOUT("WARNING: ptrtoint %d\n", l1); return 0;}
-    if (op != Extract) return 0;
+    if (op == __dfsan::BitCast) return l1;
+    if (op == __dfsan::PtrToInt) {AOUT("WARNING: ptrtoint %d\n", l1); return 0;}
+    if (op != __dfsan::Extract) return 0;
   }
 
   // special handling for bounds, which may use all four fields
-  if (op != Alloca) {
+  if (op != __dfsan::Alloca) {
     if (l1 >= CONST_OFFSET) op1 = 0;
     if (l2 >= CONST_OFFSET) op2 = 0;
+  }
+
+  // try simple simplifications, from qsym
+  bool op1_is_zero = (l1 == 0 && op1 == 0);
+  bool op1_is_all_one = (l1 == 0 && op1 == ((uint64_t)1 << size) - 1);
+  bool op2_is_zero = (l2 == 0 && op2 == 0);
+  if (op1_is_zero) {
+    switch (op) {
+      case __dfsan::And: // 0 & x = 0
+      case __dfsan::Mul: // 0 * x = 0
+      case __dfsan::Shl: // 0 << x = 0
+        return 0;
+      case __dfsan::Or: // 0 | x = x
+      case __dfsan::Xor: // 0 ^ x = x
+      case __dfsan::Add: // 0 + x = x
+        return l2;
+    }
+  } else if (op1_is_all_one) {
+    if (op == __dfsan::And) return l2; // 11..1b & x = x
+    else if (op == __dfsan::Or) return 0; // 11..1b | x = 11..1b
+  }
+  if (op2_is_zero) {
+    if (op == __dfsan::Sub) return l1; // x - 0 = x
+    else if (op == __dfsan::Shl) return l1; // x << 0 = x
+    else if (op == __dfsan::LShr) return l1; // x >> 0 = x
+    else if (op == __dfsan::AShr) return l1; // x >> 0 = x
+  }
+  if (op == __dfsan::Trunc) {
+    if (__dfsan_label_info[l1].op == __dfsan::ZExt ||
+        __dfsan_label_info[l1].op == __dfsan::SExt) {
+      dfsan_label base = __dfsan_label_info[l1].l1;
+      if (size == __dfsan_label_info[base].size) return base;
+    }
   }
 
   // setup a hash tree for dedup
