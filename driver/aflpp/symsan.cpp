@@ -68,15 +68,17 @@ struct my_mutator_t {
   my_mutator_t() = delete;
   my_mutator_t(const afl_state_t *afl, rgd::TaskManager* tmgr, rgd::CovManager* cmgr) :
     afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
-    argv(NULL), out_fd(-1), shm_id(-1), cur_queue_entry(NULL),
+    argv(NULL), out_fd(-1), shm_fd(-1), cur_queue_entry(NULL),
     cur_mutation_state(MUTATION_INVALID), output_buf(NULL),
     cur_task(nullptr), cur_solver_index(-1), cur_solver_stage(-1),
     task_mgr(tmgr), cov_mgr(cmgr) {}
 
   ~my_mutator_t() {
     if (out_fd >= 0) close(out_fd);
-    if (shm_id >= 0) shmctl(shm_id, IPC_RMID, NULL);
+    if (shm_fd >= 0) close(shm_fd);
     // unlink(data->out_file);
+    shm_unlink(shm_name);
+    ck_free(shm_name);
     ck_free(out_dir);
     ck_free(out_file);
     ck_free(output_buf);
@@ -89,7 +91,8 @@ struct my_mutator_t {
   char *symsan_bin;
   char **argv;
   int out_fd;
-  int shm_id;
+  char *shm_name;
+  int shm_fd;
   u8* cur_queue_entry;
   int cur_mutation_state;
   u8* output_buf;
@@ -926,16 +929,24 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   }
 
   // setup shmem for label info
-  data->shm_id = shmget(IPC_PRIVATE, 0xc00000000,
-    O_CREAT | SHM_NORESERVE | S_IRUSR | S_IWUSR);
-  if (data->shm_id == -1) {
-    FATAL("Failed to get shmid: %s\n", strerror(errno));
+  data->shm_name = alloc_printf("/symsan-union-table-%d", afl->_id);
+  data->shm_fd = shm_open(data->shm_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);;
+  if (data->shm_fd == -1) {
+    FATAL("Failed to open shm(%s): %s\n", data->shm_name, strerror(errno));
   }
 
-  __dfsan_label_info = (dfsan_label_info *)shmat(data->shm_id, NULL, SHM_RDONLY);
-  if (__dfsan_label_info == (void *)-1) {
-    FATAL("Failed to map shm(%d): %s\n", data->shm_id, strerror(errno));
+  if (ftruncate(data->shm_fd, uniontable_size) == -1) {
+    FATAL("Failed to truncate shmem: %s\n", strerror(errno));
   }
+
+  __dfsan_label_info = (dfsan_label_info *)mmap(NULL, uniontable_size,
+      PROT_READ | PROT_WRITE, MAP_SHARED, data->shm_fd, 0);
+  if (__dfsan_label_info == (void *)-1) {
+    FATAL("Failed to map shm(%d): %s\n", data->shm_fd, strerror(errno));
+  }
+
+  // clear O_CLOEXEC flag
+  fcntl(data->shm_fd, F_SETFD, fcntl(data->shm_fd, F_GETFD) & ~FD_CLOEXEC);
 
   // allocate output buffer
   data->output_buf = (u8 *)malloc(MAX_FILE);
@@ -983,8 +994,8 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
 
   // setup the env vars for SYMSAN
   const char *taint_file = data->afl->fsrv.use_stdin ? "stdin" : data->out_file;
-  char *options = alloc_printf("taint_file=%s:shm_id=%d:pipe_fd=%d:debug=%d",
-                                taint_file, data->shm_id, pipefds[1], DEBUG);
+  char *options = alloc_printf("taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=%d",
+                                taint_file, data->shm_fd, pipefds[1], DEBUG);
 #if DEBUG
   DEBUGF("TAINT_OPTIONS=%s\n", options);
 #endif
