@@ -82,25 +82,12 @@ __dfsw_stat(const char *path, struct stat *buf, dfsan_label path_label,
   return ret;
 }
 
+#if __GLIBC__ <= 2 && __GLIBC_MINOR__ < 33
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw___xstat(int vers, const char *path, struct stat *buf,
                dfsan_label vers_label, dfsan_label path_label,
                dfsan_label buf_label, dfsan_label *ret_label) {
   int ret = __xstat(vers, path, buf);
-  if (ret == 0) {
-    dfsan_set_label(0, buf, sizeof(struct stat));
-    dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
-    dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
-  }
-  *ret_label = 0;
-  return ret;
-}
-
-SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_fstat(int fd, struct stat *buf,
-                                               dfsan_label fd_label,
-                                               dfsan_label buf_label,
-                                               dfsan_label *ret_label) {
-  int ret = fstat(fd, buf);
   if (ret == 0) {
     dfsan_set_label(0, buf, sizeof(struct stat));
     dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
@@ -125,9 +112,25 @@ __dfsw___fxstat(int vers, const int fd, struct stat *buf,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_lstat(const char *path, struct stat *buf, dfsan_label path_label,
-             dfsan_label buf_label, dfsan_label *ret_label) {
-  int ret = lstat(path, buf);
+__dfsw___lxstat(int vers, const char *path, struct stat *buf,
+                dfsan_label vers_label, dfsan_label path_label,
+                dfsan_label buf_label, dfsan_label *ret_label) {
+  int ret = __lxstat(vers, path, buf);
+  if (ret == 0) {
+    dfsan_set_label(0, buf, sizeof(struct stat));
+    dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
+    dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+  }
+  *ret_label = 0;
+  return ret;
+}
+#endif
+
+SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_fstat(int fd, struct stat *buf,
+                                               dfsan_label fd_label,
+                                               dfsan_label buf_label,
+                                               dfsan_label *ret_label) {
+  int ret = fstat(fd, buf);
   if (ret == 0) {
     dfsan_set_label(0, buf, sizeof(struct stat));
     dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
@@ -138,10 +141,9 @@ __dfsw_lstat(const char *path, struct stat *buf, dfsan_label path_label,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw___lxstat(int vers, const char *path, struct stat *buf,
-                dfsan_label vers_label, dfsan_label path_label,
-                dfsan_label buf_label, dfsan_label *ret_label) {
-  int ret = __lxstat(vers, path, buf);
+__dfsw_lstat(const char *path, struct stat *buf, dfsan_label path_label,
+             dfsan_label buf_label, dfsan_label *ret_label) {
+  int ret = lstat(path, buf);
   if (ret == 0) {
     dfsan_set_label(0, buf, sizeof(struct stat));
     dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
