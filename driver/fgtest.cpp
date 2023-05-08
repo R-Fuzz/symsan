@@ -665,6 +665,7 @@ int main(int argc, char* const argv[]) {
     args[1] = input;
     args[2] = NULL;
     execv(program, args);
+    fprintf(stderr, "execv %s %s %s\n", program, input, strerror(errno));
     exit(0);
   }
 
@@ -680,7 +681,11 @@ int main(int argc, char* const argv[]) {
     // solve constraints
     switch (msg.msg_type) {
       case cond_type:
-        __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr);
+        fprintf(stderr, "LOOP_INFO: label = %u, id = %u, latch = %u, exit = %u\n",
+                msg.label, msg.id,
+                msg.flags & F_LOOP_LATCH, msg.flags & F_LOOP_EXIT);
+        if (msg.label)
+          __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr);
         break;
       case gep_type:
         if (read(pipefds[0], &gmsg, sizeof(gmsg)) != sizeof(gmsg)) {
@@ -715,6 +720,9 @@ int main(int argc, char* const argv[]) {
         memcmp_cache[msg.label] = mmsg;
         break;
       case fsize_type:
+        break;
+      case loop_type:
+        fprintf(stderr, "enter loop: %u %lx\n", msg.id, msg.addr);
         break;
       default:
         break;

@@ -198,9 +198,12 @@ enum pipe_msg_type {
   gep_type = 1,
   memcmp_type = 2,
   fsize_type = 3,
+  loop_type = 4,
 };
 
 #define F_ADD_CONS  0x1
+#define F_LOOP_EXIT 0x2
+#define F_LOOP_LATCH 0x4
 
 struct pipe_msg {
   u16 msg_type;

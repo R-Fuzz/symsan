@@ -475,7 +475,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
+__taint_trace_cond(dfsan_label label, u8 r, u8 flag, u32 cid) {
   if (label == 0)
     return;
 
@@ -489,8 +489,8 @@ __taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
     return;
   }
 
-  AOUT("solving cond: %u %u 0x%x 0x%x %p %u\n",
-       label, r, __taint_trace_callstack, cid, addr, itr->second);
+  AOUT("solving cond: %u %u 0x%x 0x%x 0x%x %p %u\n",
+       label, r, flag, __taint_trace_callstack, cid, addr, itr->second);
 
   z3::expr result = __z3_context.bool_val(r);
   __solve_cond(label, result, true, addr);

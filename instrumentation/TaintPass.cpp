@@ -157,6 +157,11 @@ static cl::opt<bool> ClTraceBound(
     cl::desc("Trace buffer bound info."),
     cl::Hidden, cl::init(true));
 
+static cl::opt<bool> ClTraceLoop(
+    "taint-trace-loop",
+    cl::desc("Trace loop entering and exiting."),
+    cl::Hidden, cl::init(true));
+
 static StringRef GetGlobalTypeString(const GlobalValue &G) {
   // Types of GlobalVariables are always pointer types.
   Type *GType = G.getValueType();
@@ -343,6 +348,7 @@ class Taint : public ModulePass {
   FunctionType *TaintVarargWrapperFnTy;
   FunctionType *TaintTraceCmpFnTy;
   FunctionType *TaintTraceCondFnTy;
+  FunctionType *TaintTraceLoopFnTy;
   FunctionType *TaintTraceIndirectCallFnTy;
   FunctionType *TaintTraceGEPFnTy;
   FunctionType *TaintPushStackFrameFnTy;
@@ -360,6 +366,7 @@ class Taint : public ModulePass {
   FunctionCallee TaintVarargWrapperFn;
   FunctionCallee TaintTraceCmpFn;
   FunctionCallee TaintTraceCondFn;
+  FunctionCallee TaintTraceLoopFn;
   FunctionCallee TaintTraceIndirectCallFn;
   FunctionCallee TaintTraceGEPFn;
   FunctionCallee TaintPushStackFrameFn;
@@ -436,6 +443,7 @@ struct TaintFunction {
   Taint &TT;
   Function *F;
   DominatorTree DT;
+  LoopInfo *LI;
   Taint::InstrumentedABI IA;
   bool IsNativeABI;
   Value *ArgTLSPtr = nullptr;
@@ -465,11 +473,14 @@ struct TaintFunction {
   TaintFunction(Taint &TT, Function *F, bool IsNativeABI)
       : TT(TT), F(F), IA(TT.getInstrumentedABI()), IsNativeABI(IsNativeABI) {
     DT.recalculate(*F);
+    LI = new LoopInfo(DT);
     // FIXME: Need to track down the register allocator issue which causes poor
     // performance in pathological cases with large numbers of basic blocks.
     AvoidNewBlocks = F->size() > 1000;
     srandom(std::hash<std::string>{}(F->getName().str()));
   }
+
+  ~TaintFunction() { delete LI; }
 
   /// Computes the shadow address for a given function argument.
   ///
@@ -764,9 +775,11 @@ bool Taint::doInitialization(Module &M) {
       Int64Ty, Int64Ty, Int32Ty };
   TaintTraceCmpFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCmpArgs, false);
-  Type *TaintTraceCondArgs[3] = { ShadowTy, IntegerType::get(*Ctx, 8), Int32Ty };
+  Type *TaintTraceCondArgs[4] = { ShadowTy, Int8Ty, Int8Ty, Int32Ty };
   TaintTraceCondFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCondArgs, false);
+  TaintTraceLoopFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), { Int32Ty }, false);
   TaintTraceIndirectCallFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), { ShadowTy }, false);
   Type *TaintTraceGEPArgs[7] = { ShadowTy, Int64Ty, ShadowTy, Int64Ty, Int64Ty,
@@ -986,6 +999,14 @@ void Taint::initializeCallbackFunctions(Module &M) {
     AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
                          Attribute::NoUnwind);
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    TaintTraceLoopFn =
+        Mod->getOrInsertFunction("__taint_trace_loop", TaintTraceLoopFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
+                         Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     TaintTraceIndirectCallFn =
         Mod->getOrInsertFunction("__taint_trace_indcall", TaintTraceIndirectCallFnTy, AL);
   }
@@ -1086,6 +1107,7 @@ bool Taint::runOnModule(Module &M) {
         &i != TaintVarargWrapperFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceCmpFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceCondFn.getCallee()->stripPointerCasts() &&
+        &i != TaintTraceLoopFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceIndirectCallFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceGEPFn.getCallee()->stripPointerCasts() &&
         &i != TaintPushStackFrameFn.getCallee()->stripPointerCasts() &&
@@ -1242,6 +1264,16 @@ bool Taint::runOnModule(Module &M) {
     SmallVector<BasicBlock *, 4> BBList(depth_first(&i->getEntryBlock()));
 
     for (BasicBlock *i : BBList) {
+      // check for loop header
+      if (ClTraceLoop) {
+        if (TF.LI->isLoopHeader(i)) {
+          // This is a loop header
+          Instruction *FI = &*(i->getFirstInsertionPt());
+          ConstantInt *CID = ConstantInt::get(Int32Ty, getInstructionId(FI));
+          IRBuilder<> IRB(FI);
+          IRB.CreateCall(TaintTraceLoopFn, {CID});
+        }
+      }
       Instruction *Inst = &i->front();
       while (true) {
         // TaintVisitor may split the current basic block, changing the current
@@ -2238,14 +2270,46 @@ void TaintVisitor::visitPHINode(PHINode &PN) {
   TF.setShadow(&PN, ShadowPN);
 }
 
+static inline bool isLoopLatch(const BasicBlock *BB, const BasicBlock *Header) {
+  const BasicBlock *Succ = nullptr;
+  if (BB == Header)
+    return true;
+  else if ((Succ = BB->getSingleSuccessor()) != nullptr)
+    return isLoopLatch(Succ, Header);
+  else
+    return false;
+}
+
 void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   IRBuilder<> IRB(I);
   // get operand
   Value *Shadow = getShadow(Condition);
-  if (Shadow == TT.ZeroShadow)
+  uint8_t flag = 0;
+  if (ClTraceLoop && isa<BranchInst>(I)) {
+    // check loop exit and latch
+    BasicBlock *BB = I->getParent();
+    Loop *L = LI->getLoopFor(BB);
+    if (L) {
+      BranchInst *BI = cast<BranchInst>(I);
+      BasicBlock *TB = I->getSuccessor(0);
+      BasicBlock *FB = I->getSuccessor(1);
+      if (isLoopLatch(TB, L->getHeader())) // loop latch
+        flag |= 0x8;
+      if (isLoopLatch(FB, L->getHeader())) // loop latch
+        flag |= 0x4;
+      if (!L->contains(TB)) // loop exit
+        flag |= 0x2;
+      if (!L->contains(FB)) // loop exit
+        flag |= 0x1;
+    }
+  }
+  // we are not interested if the condition is not tainted,
+  // except for loop exit
+  if (Shadow == TT.ZeroShadow && (flag & 0x3) == 0)
     return;
+  ConstantInt *LF = ConstantInt::get(TT.Int8Ty, flag);
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
-  IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, CID});
+  IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, LF, CID});
 }
 
 void TaintVisitor::visitBranchInst(BranchInst &BR) {

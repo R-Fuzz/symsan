@@ -47,10 +47,21 @@ static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
   return 0;
 }
 
-static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, u32 cid, void *addr) {
+static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
+                                u8 loop_flag, u32 cid, void *addr) {
 
   u16 flags = 0;
   if (add_nested) flags |= F_ADD_CONS;
+  // set the loop flags according to branching results
+  if (result) {
+    // true branch
+    if (loop_flag & 0x2) flags |= F_LOOP_EXIT;
+    if (loop_flag & 0x8) flags |= F_LOOP_LATCH;
+  } else {
+    // false branch
+    if (loop_flag & 0x1) flags |= F_LOOP_EXIT;
+    if (loop_flag & 0x4) flags |= F_LOOP_LATCH;
+  }
 
   // send info
   pipe_msg msg = {
@@ -83,21 +94,24 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
 
   // add nested only for matching cases
-  __solve_cond(temp, r, r, cid, addr);
+  __solve_cond(temp, r, r, 0, cid, addr);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
-  if (label == 0)
-    return;
+__taint_trace_cond(dfsan_label label, u8 r, u8 flag, u32 cid) {
+  if (label == 0) {
+    // check for real loop loop exits
+    if (!(((flag & 0x1) && !r) || ((flag & 0x2) && r)))
+      return;
+  }
 
   void *addr = __builtin_return_address(0);
 
-  AOUT("solving cond: %u %u 0x%x 0x%x %p\n",
-       label, r, __taint_trace_callstack, cid, addr);
+  AOUT("solving cond: %u %u 0x%x 0x%x 0x%x %p\n",
+       label, r, flag, __taint_trace_callstack, cid, addr);
 
   // always add nested
-  __solve_cond(label, r, 1, cid, addr);
+  __solve_cond(label, r, 1, flag, cid, addr);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -126,6 +140,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
+    .id = 0,
     .label = index_label, // just in case
     .result = (u64)index
   };
@@ -146,6 +161,28 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
   internal_write(__pipe_fd, &gmsg, sizeof(gmsg));
 
   return; 
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_loop(u32 bid) {
+  void *addr = __builtin_return_address(0);
+
+  AOUT("loop header: %u @%p\n", bid, addr);
+
+  pipe_msg msg = {
+    .msg_type = loop_type,
+    .flags = 0,
+    .instance_id = __instance_id,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack,
+    .id = bid,
+    .label = 0,
+    .result = 0
+  };
+
+  internal_write(__pipe_fd, &msg, sizeof(msg));
+
+  return;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
