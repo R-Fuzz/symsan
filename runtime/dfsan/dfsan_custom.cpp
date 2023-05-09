@@ -2214,4 +2214,22 @@ __dfsw_fseeko64(FILE *stream, off64_t offset, int whence, dfsan_label stream_lab
   return ret;
 }
 
+SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
+__dfsw_bswap(u32 netlong, dfsan_label net_label, uint8_t bytes) {
+  //b3b2b1b0
+  dfsan_label b0 = dfsan_union(net_label, 0, Extract, 8, 0, 0);
+  dfsan_label b1 = dfsan_union(net_label, 0, Extract, 8, 0, 8);
+  dfsan_label b2 = dfsan_union(net_label, 0, Extract, 8, 0, 16);
+  dfsan_label b3 = dfsan_union(net_label, 0, Extract, 8, 0, 24);
+
+  //b0b1
+  dfsan_label ret = dfsan_union(b1, b0, Concat, 16, 0, 0);
+  //b0b1b2
+  ret = dfsan_union(b2, ret, Concat, 24, 0, 0);
+  //b0b1b2b3
+  ret = dfsan_union(b3, ret, Concat, 32, 0, 0);
+  return ret;
+}
+
+
 }  // extern "C"

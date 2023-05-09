@@ -342,6 +342,7 @@ class Taint : public ModulePass {
   FunctionType *TaintNonzeroLabelFnTy;
   FunctionType *TaintVarargWrapperFnTy;
   FunctionType *TaintTraceCmpFnTy;
+  FunctionType *BSwapFnTy;
   FunctionType *TaintTraceCondFnTy;
   FunctionType *TaintTraceIndirectCallFnTy;
   FunctionType *TaintTraceGEPFnTy;
@@ -782,6 +783,7 @@ bool Taint::doInitialization(Module &M) {
       ShadowTy, TaintTraceAllocaArgs, false);
   TaintCheckBoundsFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), { ShadowTy, Int64Ty }, false);
+  BSwapFnTy = FunctionType::get(ShadowTy, { Int64Ty, ShadowTy, IntegerType::get(*Ctx, 8)}, false);
 
   TaintDebugFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
       {ShadowTy, ShadowTy, ShadowTy, ShadowTy, ShadowTy}, false);
@@ -1945,7 +1947,24 @@ void TaintVisitor::visitReturnInst(ReturnInst &RI) {
 void TaintVisitor::visitCallBase(CallBase &CB) {
   Function *F = CB.getCalledFunction();
   if (CB.isInlineAsm()) {
-    // FIXME: inline asm
+    AttributeList AL;
+    AL = AL.addAttribute(TF.TT.Mod->getContext(), AttributeList::FunctionIndex,
+        Attribute::NoUnwind);
+    AL = AL.addParamAttribute(TF.TT.Mod->getContext(), 0, Attribute::ZExt);
+    FunctionCallee BSwapFn = TF.TT.Mod->getOrInsertFunction("__dfsw_bswap", TF.TT.BSwapFnTy, AL);
+    const InlineAsm* asmt = cast<InlineAsm>(CB.getCalledOperand());
+    const std::string& asm_tr = asmt->getAsmString();
+    if (asm_tr.find("bswap") != llvm::StringLiteral::npos) {
+      //  // insert a call to the callback __dfsw_bswap
+      IRBuilder<> IRB(&CB);
+      Value *Op = CB.getArgOperand(0);
+      Value *Shadow = TF.getShadow(Op);
+      auto &DL = TF.TT.Mod->getDataLayout();
+      Value *Bytes = ConstantInt::get(TF.TT.Int8Ty, DL.getTypeSizeInBits(Op->getType()) / 8);
+      Op = IRB.CreateZExt(Op, TF.TT.Int64Ty);
+      Value *RetShadow = IRB.CreateCall(BSwapFn, {Op, Shadow, Bytes});
+      TF.setShadow(&CB, RetShadow);
+    }
     return;
   }
   if (F && F->isIntrinsic()) {
