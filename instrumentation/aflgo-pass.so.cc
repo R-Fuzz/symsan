@@ -416,10 +416,12 @@ bool AFLCoverage::runOnModule(Module &M) {
 
 #ifdef __x86_64__
     IntegerType *LargestType = Int64Ty;
-    ConstantInt *MapCntLoc = ConstantInt::get(LargestType, MAP_SIZE + 8);
+    ConstantInt *MapCntLoc = ConstantInt::get(LargestType, MAP_SIZE + 8 + 8);
+    ConstantInt *MapDistSumLoc = ConstantInt::get(LargestType, MAP_SIZE + 8);
 #else
     IntegerType *LargestType = Int32Ty;
-    ConstantInt *MapCntLoc = ConstantInt::get(LargestType, MAP_SIZE + 4);
+    ConstantInt *MapCntLoc = ConstantInt::get(LargestType, MAP_SIZE + 4 + 4);
+    ConstantInt *MapDistSumLoc = ConstantInt::get(LargestType, MAP_SIZE + 4);
 #endif
     ConstantInt *MapDistLoc = ConstantInt::get(LargestType, MAP_SIZE);
     ConstantInt *One = ConstantInt::get(LargestType, 1);
@@ -430,10 +432,11 @@ bool AFLCoverage::runOnModule(Module &M) {
     GlobalVariable *AFLMapPtr =
         new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
                            GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
-
+#ifdef AFL_COV_TRACE
     GlobalVariable *AFLPrevLoc = new GlobalVariable(
         M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_loc",
         0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
+#endif
 
     for (auto &F : M) {
 
@@ -486,6 +489,7 @@ bool AFLCoverage::runOnModule(Module &M) {
         BasicBlock::iterator IP = BB.getFirstInsertionPt();
         IRBuilder<> IRB(&(*IP));
 
+#ifdef AFL_COV_TRACE
         if (AFL_R(100) >= inst_ratio) continue;
 
         /* Make up cur_loc */
@@ -520,38 +524,36 @@ bool AFLCoverage::runOnModule(Module &M) {
         StoreInst *Store =
             IRB.CreateStore(ConstantInt::get(Int32Ty, cur_loc >> 1), AFLPrevLoc);
         Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-
+#endif
         if (distance >= 0) {
 
+          /* set BB distance to shm[MAPSIZE] */
+          LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
           ConstantInt *Distance =
               ConstantInt::get(LargestType, (unsigned) distance);
-
-          /* Add distance to shm[MAPSIZE] */
-
           Value *MapDistPtr = IRB.CreateBitCast(
               IRB.CreateGEP(MapPtr, MapDistLoc), LargestType->getPointerTo());
-          LoadInst *MapDist = IRB.CreateLoad(MapDistPtr);
-          MapDist->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-
-          Value *IncrDist = IRB.CreateAdd(MapDist, Distance);
-          IRB.CreateStore(IncrDist, MapDistPtr)
+          IRB.CreateStore(Distance, MapDistPtr)
               ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
-          /* Increase count at shm[MAPSIZE + (4 or 8)] */
+          /* Add accumulated distance to shm[MAPSIZE + (4 or 8)] */
+          Value *MapDistSumPtr = IRB.CreateBitCast(
+              IRB.CreateGEP(MapPtr, MapDistSumLoc), LargestType->getPointerTo());
+          LoadInst *MapDistSum = IRB.CreateLoad(MapDistSumPtr);
+          MapDistSum->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+          Value *IncrDist = IRB.CreateAdd(MapDistSum, Distance);
+          IRB.CreateStore(IncrDist, MapDistSumPtr)
+              ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
+          /* Increase count at shm[MAPSIZE + (4 or 8) + (4 or 8)] */
           Value *MapCntPtr = IRB.CreateBitCast(
               IRB.CreateGEP(MapPtr, MapCntLoc), LargestType->getPointerTo());
           LoadInst *MapCnt = IRB.CreateLoad(MapCntPtr);
           MapCnt->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-
           Value *IncrCnt = IRB.CreateAdd(MapCnt, One);
           IRB.CreateStore(IncrCnt, MapCntPtr)
               ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-
         }
-
-        /* Increase count at shm[MAPSIZE + (8 or 16)] */
-        // add the BB distance
 
         inst_blocks++;
 

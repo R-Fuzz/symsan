@@ -19,8 +19,6 @@
 
 */
 
-// #include "../config.h"
-// #include "../types.h"
 #include "defs.h"
 
 #include <stdio.h>
