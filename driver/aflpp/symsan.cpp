@@ -376,7 +376,8 @@ static task_t construct_task(std::vector<const rgd::AstNode*> clause,
     constraint_t constraint = parse_constraint(node->label(), buf, buf_size);
     // XXX: we need to fix the comparison ops
     constraint->comparison = comparison;
-    constraint->ast->set_kind(comparison);
+    // not changing the kind of the root node for now, to maximize the resuability
+    // constraint->ast->set_kind(comparison);
     task->constraints.push_back(constraint);
     expr_cache.insert({node->label(), constraint});
   }
