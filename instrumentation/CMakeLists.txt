@@ -9,3 +9,7 @@ endif(APPLE)
 add_library(TaintPass MODULE TaintPass.cpp)
 target_link_libraries(TaintPass LLVMPassConfig)
 install (TARGETS TaintPass DESTINATION ${SYMSAN_LIB_DIR})
+
+add_library(AFLGOPass MODULE aflgo-pass.so.cc)
+target_link_libraries(AFLGOPass LLVMPassConfig)
+install (TARGETS AFLGOPass DESTINATION ${SYMSAN_LIB_DIR})

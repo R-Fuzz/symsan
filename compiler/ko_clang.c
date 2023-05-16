@@ -89,6 +89,10 @@ static u8 check_if_assembler(u32 argc, char **argv) {
 
 static void add_runtime() {
   cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
+  if (getenv("KO_ADD_AFLGO")) {
+  cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libAFLGORT.a", obj_path);
+  cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
+  }
   cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libdfsan_rt-x86_64.a", obj_path);
   cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
   cc_params[cc_par_cnt++] =
@@ -131,6 +135,26 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libFastgen.a", obj_path);
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
+  }
+  // link libAFLGORT.a here
+}
+
+static void add_aflgo_pass() {
+  // if this option is set from the ENV, then appending the following flag to the compiler
+  if (getenv("KO_ADD_AFLGO")) {
+  cc_params[cc_par_cnt++] = "-Xclang";
+  cc_params[cc_par_cnt++] = "-load";
+  cc_params[cc_par_cnt++] = "-Xclang";
+  cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libAFLGOPass.so", obj_path);
+  char *target_dir = getenv("AFLGO_TARGET_DIR");
+  if (!target_dir)
+    FATAL("ENV variable KO_ADD_AFLGO and AFLGO_TARGET_DIR must be set together");
+  cc_params[cc_par_cnt++] = "-mllvm";
+  cc_params[cc_par_cnt++] = alloc_printf("-outdir=%s", target_dir);
+  // cc_params[cc_par_cnt++] = "-mllvm";
+  // cc_params[cc_par_cnt++] = alloc_printf("-targets=%s/BBtargets.txt", target_dir);
+  cc_params[cc_par_cnt++] = "-mllvm";
+  cc_params[cc_par_cnt++] = alloc_printf("-distance=%s/distance.cfg.txt", target_dir);
   }
 }
 
@@ -229,6 +253,7 @@ static void edit_params(u32 argc, char **argv) {
 
   if (!maybe_assembler) {
     add_taint_pass();
+    add_aflgo_pass();
   }
 
   cc_params[cc_par_cnt++] = "-pie";
