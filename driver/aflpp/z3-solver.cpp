@@ -166,72 +166,59 @@ z3::expr Z3Solver::serialize(const AstNode* node,
       z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
       return cache_expr(node->label(), z3::ashr(c1, c2), expr_cache);
     }
-    case rgd::Equal: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), c1 == c2, expr_cache);
-    }
-    case rgd::Distinct: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), c1 != c2, expr_cache);
-    }
-    case rgd::Ult: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), z3::ult(c1, c2), expr_cache);
-    }
-    case rgd::Ule: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), z3::ule(c1, c2), expr_cache);
-    }
-    case rgd::Ugt: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), z3::ugt(c1, c2), expr_cache);
-    }
-    case rgd::Uge: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), z3::uge(c1, c2), expr_cache);
-    }
-    case rgd::Slt: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), c1 < c2, expr_cache);
-    }
-    case rgd::Sle: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), c1 <= c2, expr_cache);
-    }
-    case rgd::Sgt: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), c1 > c2, expr_cache);
-    }
-    case rgd::Sge: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), c1 >= c2, expr_cache);
-    }
-    case rgd::LOr: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), c1 || c2, expr_cache);
-    }
-    case rgd::LAnd: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
-      return cache_expr(node->label(), c1 && c2, expr_cache);
-    }
-    case rgd::LNot: {
-      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
-      return cache_expr(node->label(), !c1, expr_cache);
-    }
+    // case rgd::LOr: {
+    //   z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+    //   z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
+    //   return cache_expr(node->label(), c1 || c2, expr_cache);
+    // }
+    // case rgd::LAnd: {
+    //   z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+    //   z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
+    //   return cache_expr(node->label(), c1 && c2, expr_cache);
+    // }
+    // case rgd::LNot: {
+    //   z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+    //   return cache_expr(node->label(), !c1, expr_cache);
+    // }
     default:
       WARNF("unhandler expr: ");
+      throw z3::exception("unsupported operator");
+      break;
+  }
+}
+
+z3::expr Z3Solver::serialize_rel(uint32_t comparison,
+    const AstNode* node,
+    const std::vector<std::pair<bool, uint64_t>> &input_args,
+    std::unordered_map<uint32_t,z3::expr> &expr_cache) {
+
+  assert(node->children_size() == 2);
+  z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+  z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
+
+  switch(comparison) {
+    case rgd::Equal:
+      return c1 == c2;
+    case rgd::Distinct:
+      return c1 != c2;
+    case rgd::Ult:
+      return z3::ult(c1, c2);
+    case rgd::Ule:
+      return z3::ule(c1, c2);
+    case rgd::Ugt:
+      return z3::ugt(c1, c2);
+    case rgd::Uge:
+      return z3::uge(c1, c2);
+    case rgd::Slt:
+      return c1 < c2;
+    case rgd::Sle:
+      return c1 <= c2;
+    case rgd::Sgt:
+      return c1 > c2;
+    case rgd::Sge:
+      return c1 >= c2;
+    default:
+      WARNF("unhandler comparison: %d", comparison);
       throw z3::exception("unsupported operator");
       break;
   }
@@ -248,7 +235,7 @@ static inline void extract_model(z3::model &m, uint8_t *buf, size_t buf_size) {
       size_t offset = name.to_int();
       assert(offset < buf_size);
       buf[offset] = value;
-      DEBUGF("generate_input %zu == %u\n", offset, value);
+      DEBUGF("generate_input offset:%zu => %u\n", offset, value);
     }
   }
 }
@@ -265,7 +252,7 @@ Z3Solver::solve(int stage, std::shared_ptr<SearchTask> task,
 
       for (auto const &c : task->constraints) {
         std::unordered_map<uint32_t, z3::expr> expr_cache;
-        z3::expr z3expr = serialize(c->get_root(), c->input_args, expr_cache);
+        z3::expr z3expr = serialize_rel(c->comparison, c->get_root(), c->input_args, expr_cache);
         DEBUGF("adding expr %s\n", z3expr.to_string().c_str());
         solver_.add(z3expr);
       }
@@ -288,7 +275,7 @@ Z3Solver::solve(int stage, std::shared_ptr<SearchTask> task,
       // do nested solving, add more constraints
       for (auto const &c : task->nested_constraints) {
         std::unordered_map<uint32_t, z3::expr> expr_cache;
-        z3::expr z3expr = serialize(c->get_root(), c->input_args, expr_cache);
+        z3::expr z3expr = serialize_rel(c->comparison, c->get_root(), c->input_args, expr_cache);
         solver_.add(z3expr);
       }
       auto ret = solver_.check();
