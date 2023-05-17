@@ -4,8 +4,6 @@ extern "C" {
 #include "afl-fuzz.h"
 }
 
-#define OPTIMISTIC 0
-
 using namespace rgd;
 
 z3::context g_z3_context;
@@ -18,15 +16,6 @@ Z3Solver::Z3Solver()
   z3::params p(context_);
   p.set(":timeout", kSolverTimeout);
   solver_.set(p);
-}
-
-int Z3Solver::stages()
-{
-#if OPTIMISTIC
-  return 2;
-#else
-  return 1;
-#endif
 }
 
 static inline z3::expr
@@ -224,7 +213,8 @@ z3::expr Z3Solver::serialize_rel(uint32_t comparison,
   }
 }
 
-static inline void extract_model(z3::model &m, uint8_t *buf, size_t buf_size) {
+static inline void extract_model(z3::model &m, uint8_t *buf, size_t buf_size,
+                                 std::unordered_map<size_t, uint8_t> &solution) {
   unsigned num_constants = m.num_consts();
   for (unsigned i = 0; i< num_constants; i++) {
     z3::func_decl decl = m.get_const_decl(i);
@@ -235,64 +225,66 @@ static inline void extract_model(z3::model &m, uint8_t *buf, size_t buf_size) {
       size_t offset = name.to_int();
       assert(offset < buf_size);
       buf[offset] = value;
+      solution[offset] = value;
       DEBUGF("generate_input offset:%zu => %u\n", offset, value);
     }
   }
 }
 
 solver_result_t
-Z3Solver::solve(int stage, std::shared_ptr<SearchTask> task,
+Z3Solver::solve(std::shared_ptr<SearchTask> task,
                 const uint8_t *in_buf, size_t in_size,
                 uint8_t *out_buf, size_t &out_size) {
 
   try {
-    if (stage == 0) {
-      // last branch constraints
-      solver_.reset(); // reset solver
+    solver_.reset(); // reset solver
+    auto base_task = task->base_task;
+    std::vector<z3::expr> assumptions;
+    while (base_task != nullptr) {
+      // no need to solve
+      if (base_task->skip_next) {
+        DEBUGF("skipping task\n");
+        task->skip_next = true; // set the flag for following tasks
+        out_size = in_size;
+        memcpy(out_buf, in_buf, in_size);
+        if (base_task->solved) {
+          for (auto const &[offset, value] : base_task->solution) {
+            out_buf[offset] = value;
+          }
+          return SOLVER_SAT;
+        } else {
+          return SOLVER_UNSAT;
+        }
+      } else if (base_task->solved) {
+        for (auto const &[offset, value] : base_task->solution) {
+          z3::symbol symbol = context_.int_symbol(offset);
+          z3::sort sort = context_.bv_sort(8);
+          z3::expr i = context_.constant(symbol, sort);
+          assumptions.push_back(i == value);
+        }
+      }
+      base_task = base_task->base_task;
+    }
 
-      for (auto const &c : task->constraints) {
-        std::unordered_map<uint32_t, z3::expr> expr_cache;
-        z3::expr z3expr = serialize_rel(c->comparison, c->get_root(), c->input_args, expr_cache);
-        DEBUGF("adding expr %s\n", z3expr.to_string().c_str());
-        solver_.add(z3expr);
-      }
-#if OPTIMISTIC
-      // if use optimistic solving, generate a result
-      auto ret = solver_.check();
-      if (ret == z3::sat) {
-        memcpy(out_buf, in_buf, in_size);
-        out_size = in_size;
-        z3::model m = solver_.get_model();
-        extract_model(m, out_buf, out_size);
-        return SOLVER_SAT;
-      } else if (ret == z3::unsat) {
-        return SOLVER_UNSAT;
-      } else {
-        return SOLVER_TIMEOUT;
-      }
-    } else if (stage == 2) {
-#endif
-      // do nested solving, add more constraints
-      for (auto const &c : task->nested_constraints) {
-        std::unordered_map<uint32_t, z3::expr> expr_cache;
-        z3::expr z3expr = serialize_rel(c->comparison, c->get_root(), c->input_args, expr_cache);
-        solver_.add(z3expr);
-      }
-      auto ret = solver_.check();
-      if (ret == z3::sat) {
-        memcpy(out_buf, in_buf, in_size);
-        out_size = in_size;
-        z3::model m = solver_.get_model();
-        extract_model(m, out_buf, out_size);
-        return SOLVER_SAT;
-      } else if (ret == z3::unsat) {
-        return SOLVER_UNSAT;
-      } else {
-        return SOLVER_TIMEOUT;
-      }
+    std::unordered_map<uint32_t, z3::expr> expr_cache;
+    for (size_t i = 0; i < task->constraints.size(); i++) {
+      auto const &c = task->constraints[i];
+      z3::expr z3expr = serialize_rel(task->comparisons[i], c->get_root(), c->input_args, expr_cache);
+      DEBUGF("adding expr %s\n", z3expr.to_string().c_str());
+      solver_.add(z3expr);
+    }
+    auto ret = solver_.check();
+    if (ret == z3::sat) {
+      memcpy(out_buf, in_buf, in_size);
+      out_size = in_size;
+      z3::model m = solver_.get_model();
+      extract_model(m, out_buf, out_size, task->solution);
+      task->solved = true;
+      return SOLVER_SAT;
+    } else if (ret == z3::unsat) {
+      return SOLVER_UNSAT;
     } else {
-      // unknown stage
-      return SOLVER_ERROR;
+      return SOLVER_TIMEOUT;
     }
   } catch (z3::exception e) {
     WARNF("z3 exception\n");

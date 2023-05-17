@@ -22,8 +22,7 @@ enum solver_result_t {
 class Solver {
 public:
   virtual ~Solver() {};
-  virtual int stages() = 0;
-  virtual solver_result_t solve(int stage, std::shared_ptr<SearchTask> task,
+  virtual solver_result_t solve(std::shared_ptr<SearchTask> task,
                                 const uint8_t *in_buf, size_t in_size,
                                 uint8_t *out_buf, size_t &out_size) = 0;
 };
@@ -31,8 +30,7 @@ public:
 class Z3Solver : public Solver {
 public:
   Z3Solver();
-  int stages() override;
-  solver_result_t solve(int stage, std::shared_ptr<SearchTask> task,
+  solver_result_t solve(std::shared_ptr<SearchTask> task,
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
 private:

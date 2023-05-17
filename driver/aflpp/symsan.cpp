@@ -10,6 +10,7 @@
 #include "task.h"
 #include "solver.h"
 #include "cov.h"
+#include "union_find.h"
 
 extern "C" {
 #include "afl-fuzz.h"
@@ -42,6 +43,8 @@ using namespace __dfsan;
 
 #define NEED_OFFLINE 0
 
+static bool NestedSolving = true;
+
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
     char* _tmp; \
@@ -70,7 +73,7 @@ struct my_mutator_t {
     afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
     argv(NULL), out_fd(-1), shm_fd(-1), cur_queue_entry(NULL),
     cur_mutation_state(MUTATION_INVALID), output_buf(NULL),
-    cur_task(nullptr), cur_solver_index(-1), cur_solver_stage(-1),
+    cur_task(nullptr), cur_solver_index(-1),
     task_mgr(tmgr), cov_mgr(cmgr) {}
 
   ~my_mutator_t() {
@@ -105,7 +108,6 @@ struct my_mutator_t {
   // XXX: well, we have to keep track of solving states
   task_t cur_task;
   size_t cur_solver_index;
-  int cur_solver_stage;
 };
 
 // FIXME: find another way to make the union table hash work
@@ -152,14 +154,24 @@ static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
 }
 
 // FIXME: global caches
-static std::unordered_map<dfsan_label, constraint_t> expr_cache;
-static std::unordered_map<dfsan_label, std::unordered_set<size_t> > input_dep_cache;
+static std::unordered_map<dfsan_label, expr_t> root_expr_cache;
+static std::unordered_map<dfsan_label, constraint_t> constraint_cache;
+static std::unordered_map<dfsan_label, std::unordered_set<size_t> > branch_to_inputs;
 static std::unordered_map<dfsan_label, std::shared_ptr<u8>> memcmp_cache;
+// FIXME: global input dependency forests
+static rgd::UnionFind data_flow_deps;
+static std::vector<std::vector<expr_t> > input_to_branches;
 
-static void clear_global_caches() {
-  expr_cache.clear();
-  input_dep_cache.clear();
+static void reset_global_caches(size_t buf_size) {
+  root_expr_cache.clear();
+  constraint_cache.clear();
+  branch_to_inputs.clear();
   memcmp_cache.clear();
+  data_flow_deps.reset(buf_size);
+  for (auto &s: input_to_branches) {
+    s.clear();
+  }
+  input_to_branches.resize(buf_size);
 }
 
 static uint32_t map_arg(const u8 *buf, size_t offset, uint32_t length,
@@ -365,27 +377,27 @@ static task_t construct_task(std::vector<const rgd::AstNode*> clause,
                              const u8 *buf, size_t buf_size) {
   task_t task = std::make_shared<rgd::SearchTask>();
   for (auto const& node: clause) {
-    auto itr = expr_cache.find(node->label());
-    if (itr != expr_cache.end()) {
+    auto itr = constraint_cache.find(node->label());
+    if (itr != constraint_cache.end()) {
       task->constraints.push_back(itr->second);
+      task->comparisons.push_back(node->kind());
       continue;
     }
     // save the comparison op because we may have negated it
     // during transformation
-    uint32_t comparison = node->kind();
     constraint_t constraint = parse_constraint(node->label(), buf, buf_size);
-    // XXX: we need to fix the comparison ops
-    constraint->comparison = comparison;
-    // not changing the kind of the root node for now, to maximize the resuability
-    // constraint->ast->set_kind(comparison);
+    // to maximize the resuability of the AST, the relational operator
+    // is recorded elsewhere
     task->constraints.push_back(constraint);
-    expr_cache.insert({node->label(), constraint});
+    task->comparisons.push_back(node->kind());
+    constraint_cache.insert({node->label(), constraint});
   }
   task->finalize();
   return task;
 }
 
 static bool find_roots(dfsan_label label, rgd::AstNode *ret,
+                       std::unordered_set<size_t> &input_deps,
                        std::unordered_set<dfsan_label> &subroots,
                        std::unordered_set<dfsan_label> &visited);
 
@@ -403,6 +415,7 @@ static dfsan_label strip_zext(dfsan_label label) {
 }
 
 static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
+                          std::unordered_set<size_t> &input_deps,
                           std::unordered_set<dfsan_label> &subroots,
                           std::unordered_set<dfsan_label> &visited) {
   // try some simplification, 0 LAnd x = 0, 1 LAnd x = x
@@ -411,9 +424,9 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
   dfsan_label rhs = strip_zext(info->l2);
   if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
     // if nothing go stripped, we can't simplify
-    bool r = find_roots(rhs, ret, subroots, visited);
+    bool r = find_roots(rhs, ret, input_deps, subroots, visited);
     if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, subroots, visited);
+      r |= find_roots(lhs, ret, input_deps, subroots, visited);
     }
     return r;
   }
@@ -421,7 +434,7 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
   // by communicative, we can parse the rhs first
   DEBUGF("simplify land: %d LAnd %d, %d\n", lhs, rhs, info->size);
   rgd::AstNode *right = ret->add_children();
-  bool rr = find_roots(rhs, right, subroots, visited);
+  bool rr = find_roots(rhs, right, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
   // if nothing added, rhs must be a constant
   if (unlikely(!rr)) {
@@ -429,39 +442,47 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
     if (right->boolvalue() == 0) { // x LAnd 0 = 0
       ret->set_kind(rgd::Bool);
       ret->set_boolvalue(0);
+      ret->clear_children();
       return false;
-    }
+    } // rhs is 1, fall through
   }
   if (unlikely(lhs == 0)) {
     // lhs is a constant
-    if (info->op1.i == 0) {
+    if (info->op1.i == 0) { // 0 LAnd x = 0
       ret->set_kind(rgd::Bool);
       ret->set_boolvalue(0);
+      ret->clear_children();
       return false;
     } else {
-      assert(info->op1.i == 1);
-      ret->CopyFrom(*right);
+      assert(info->op1.i == 1); // 1 LAnd x = x
+      rgd::AstNode temp;
+      temp.CopyFrom(*right);
+      ret->CopyFrom(temp); // XXX: CopyFrom will clear the children?
       return rr;
     }
   } else {
     rgd::AstNode *left = ret->add_children();
-    bool lr = find_roots(lhs, left, subroots, visited);
+    bool lr = find_roots(lhs, left, input_deps, subroots, visited);
     assert(left->bits() == 1); // lhs must be a boolean after parsing
     // if nothing added, lhs must be a constant
     if (unlikely(!lr)) {
       assert(left->kind() == rgd::Bool);
-      if (left->boolvalue() == 0) {
+      if (left->boolvalue() == 0) { // 0 LAnd x = 0
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(0);
+        ret->clear_children();
         return false;
       } else if (!rr) {
         // both lhs and rhs are constants
         ret->set_kind(rgd::Bool);
-        ret->set_boolvalue(1);
+        ret->set_boolvalue(1); // 1 LAnd 1 = 1 // rhs == 0 has returned earlier
+        ret->clear_children();
         return false;
-      } else {
+      } else { // 1 LAnd x = x
         // lhs is 1, rhs is not
-        ret->CopyFrom(*right);
+        rgd::AstNode temp;
+        temp.CopyFrom(*right);
+        ret->CopyFrom(temp);
         return rr;
       }
     }
@@ -473,6 +494,7 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
 }
 
 static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
+                         std::unordered_set<size_t> &input_deps,
                          std::unordered_set<dfsan_label> &subroots,
                          std::unordered_set<dfsan_label> &visited) {
   // try some simplification, x LOr 0 = x, x LOr 1 = 1
@@ -481,56 +503,64 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
   dfsan_label rhs = strip_zext(info->l2);
   if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
     // if nothing go stripped, we can't simplify
-    bool r = find_roots(rhs, ret, subroots, visited);
+    bool r = find_roots(rhs, ret, input_deps, subroots, visited);
     if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, subroots, visited);
+      r |= find_roots(lhs, ret, input_deps, subroots, visited);
     }
     return r;
   }
 
   // by communicative, we can parse the rhs first
   rgd::AstNode *right = ret->add_children();
-  bool rr = find_roots(rhs, right, subroots, visited);
+  bool rr = find_roots(rhs, right, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
   // if nothing added, rhs must be a constant
   if (unlikely(!rr)) {
     assert(right->kind() == rgd::Bool);
-    if (right->boolvalue() == 1) {
+    if (right->boolvalue() == 1) { // x LOr 1 = 1
       ret->set_kind(rgd::Bool);
       ret->set_boolvalue(1);
+      ret->clear_children();
       return false;
-    }
+    } // rhs is 0, fall through
   }
   if (unlikely(lhs == 0)) {
     // lhs is a constant
-    if (info->op1.i == 1) {
+    if (info->op1.i == 1) { // x LOr 1 = 1
       ret->set_kind(rgd::Bool);
       ret->set_boolvalue(1);
+      ret->clear_children();
       return false;
-    } else {
+    } else { // 0 LOr x = x
       assert(info->op1.i == 0);
-      ret->CopyFrom(*right);
+      rgd::AstNode temp;
+      temp.CopyFrom(*right);
+      ret->CopyFrom(temp);
       return rr;
     }
   } else {
     rgd::AstNode *left = ret->add_children();
-    bool lr = find_roots(lhs, left, subroots, visited);
+    bool lr = find_roots(lhs, left, input_deps, subroots, visited);
     assert(left->bits() == 1); // lhs must be a boolean after parsing
     // if nothing added, lhs must be a constant
     if (unlikely(!lr)) {
       assert(left->kind() == rgd::Bool);
-      if (left->boolvalue() == 1) {
+      if (left->boolvalue() == 1) { // 1 LOr x = 1
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(1);
+        ret->clear_children();
         return false;
       } else if (!rr) {
         // both lhs and rhs are constants
         ret->set_kind(rgd::Bool);
-        ret->set_boolvalue(0);
+        ret->set_boolvalue(0); // 0 LOr 0 = 0 // rhs == 1 has returned earlier
+        ret->clear_children();
         return false;
-      } else {
+      } else { // 0 LOr x = x
         // lhs is 0, rhs is not
-        ret->CopyFrom(*right);
+        rgd::AstNode temp;
+        temp.CopyFrom(*right);
+        ret->CopyFrom(temp);
         return rr;
       }
     }
@@ -542,6 +572,7 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
 }
 
 static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
+                         std::unordered_set<size_t> &input_deps,
                          std::unordered_set<dfsan_label> &subroots,
                          std::unordered_set<dfsan_label> &visited) {
   // llvm uses xor to do LNot
@@ -550,16 +581,16 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
   dfsan_label rhs = strip_zext(info->l2);
   if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
     // if nothing go stripped, we can't simplify
-    bool r = find_roots(rhs, ret, subroots, visited);
+    bool r = find_roots(rhs, ret, input_deps, subroots, visited);
     if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, subroots, visited);
+      r |= find_roots(lhs, ret, input_deps, subroots, visited);
     }
     return r;
   }
 
   // by communicative, we can parse the rhs first
   rgd::AstNode *right = ret->add_children();
-  bool rr = find_roots(rhs, right, subroots, visited);
+  bool rr = find_roots(rhs, right, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
   ret->set_bits(1);
   if (unlikely(!rr)) {
@@ -568,28 +599,33 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
     ret->set_kind(rgd::Bool);
     if (likely(info->l1 == 0)) { // left is a constant
       ret->set_boolvalue(right->boolvalue() ^ (uint32_t)info->op1.i);
+      ret->clear_children();
       return false;
-    }
+    } // left is symbolic, fall through
   }
   
   if (likely(lhs == 0)) {
     // when reach here, rhs must not be a constant
-    if (info->op1.i == 1) {
+    if (info->op1.i == 1) { // 1 LXor x = LNot x
       ret->set_kind(rgd::LNot);
       return true;
-    } else {
-      ret->CopyFrom(*right);
+    } else { // 0 LXor x = x
+      rgd::AstNode temp;
+      temp.CopyFrom(*right);
+      ret->CopyFrom(temp);
       return rr;
     }
   } else {
     rgd::AstNode *left = ret->add_children();
-    bool lr = find_roots(lhs, left, subroots, visited);
+    bool lr = find_roots(lhs, left, input_deps, subroots, visited);
     if (unlikely(!lr)) {
       // if nothing added, lhs must be a constant
       assert(left->kind() == rgd::Bool);
-      if (left->boolvalue() == 0) {
-        ret->CopyFrom(*right);
-      } else {
+      if (left->boolvalue() == 0) { // 0 LXor x = x
+        rgd::AstNode temp;
+        temp.CopyFrom(*right);
+        ret->CopyFrom(temp);
+      } else { // 1 LXor x = LNot x
         ret->set_kind(rgd::LNot);
       }
       return rr;
@@ -600,6 +636,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
 }
 
 static bool find_roots(dfsan_label label, rgd::AstNode *ret,
+                       std::unordered_set<size_t> &input_deps,
                        std::unordered_set<dfsan_label> &subroots,
                        std::unordered_set<dfsan_label> &visited) {
   if (label < CONST_OFFSET || label == kInitializingLabel) {
@@ -607,51 +644,61 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
     return false;
   }
 
+  dfsan_label_info *info = get_label_info(label);
+
+  if (info->op == 0) {
+    input_deps.insert(info->op1.i);
+    return false;
+  } else if (info->op == __dfsan::Load) {
+    uint64_t offset = get_label_info(info->l1)->op1.i;
+    for (size_t i = 0; i < info->l2; ++i)
+      input_deps.insert(offset + i);
+    return false;
+  }
+
+  // check for visited after input deps have been added
   if (visited.count(label)) {
     return false;
   }
   visited.insert(label);
 
-  dfsan_label_info *info = get_label_info(label);
-
-  if (info->op == 0 || info->op == __dfsan::Load)
-    return false;
-
   // possible boolean operations
   if (info->op == __dfsan::And) {
-    return simplify_land(info, ret, subroots, visited);
+    return simplify_land(info, ret, input_deps, subroots, visited);
   } else if (info->op == __dfsan::Or) {
-    return simplify_lor(info, ret, subroots, visited);
+    return simplify_lor(info, ret, input_deps, subroots, visited);
   } else if (info->op == __dfsan::Xor) {
-    return simplify_xor(info, ret, subroots, visited);
+    return simplify_xor(info, ret, input_deps, subroots, visited);
   } else if ((info->op & 0xff) == __dfsan::ICmp) {
     // if it's a comparison, we need to make sure both operands don't
     // contain any additional comparison operator
     bool lr = false, rr = false;
     std::shared_ptr<rgd::AstNode> left = std::make_shared<rgd::AstNode>();
     std::shared_ptr<rgd::AstNode> right = std::make_shared<rgd::AstNode>();
+    auto &deps = branch_to_inputs[label]; // get the input deps of this branch
     if (info->l1 >= CONST_OFFSET) {
-      lr = find_roots(strip_zext(info->l1), left.get(), subroots, visited);
+      lr = find_roots(strip_zext(info->l1), left.get(), deps, subroots, visited);
     }
     if (info->l2 >= CONST_OFFSET) {
-      rr = find_roots(strip_zext(info->l2), right.get(), subroots, visited);
+      rr = find_roots(strip_zext(info->l2), right.get(), deps, subroots, visited);
     }
+    input_deps.insert(deps.begin(), deps.end()); // propagate input deps
     if (unlikely(lr)) {
       // if there are additional icmp in lhs, this icmp must be simplifiable
       assert(left->bits() == 1);
       assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
       if (likely(info->l2 == 0)) {
         if (is_rel_cmp(info->op, __dfsan::bveq)) {
-          if (info->op2.i == 1) {
+          if (info->op2.i == 1) { // checking bool == true
             ret->CopyFrom(*left);
-          } else {
+          } else { // checking bool == false
             ret->set_kind(rgd::LNot);
             ret->add_children()->CopyFrom(*left);
           }
         } else { // bvneq
-          if (info->op2.i == 0) {
+          if (info->op2.i == 0) { // checking bool != false
             ret->CopyFrom(*left);
-          } else {
+          } else { // checking bool != true
             ret->set_kind(rgd::LNot);
             ret->add_children()->CopyFrom(*left);
           }
@@ -669,16 +716,16 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
       assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
       if (likely(info->l1 == 0)) {
         if (is_rel_cmp(info->op, __dfsan::bveq)) {
-          if (info->op1.i == 1) {
+          if (info->op1.i == 1) { // checking true == bool
             ret->CopyFrom(*right);
-          } else {
+          } else { // checking false == bool
             ret->set_kind(rgd::LNot);
             ret->add_children()->CopyFrom(*right);
           }
         } else { // bvneq
-          if (info->op1.i == 0) {
+          if (info->op1.i == 0) { // checking false != bool
             ret->CopyFrom(*right);
-          } else {
+          } else { // checking true != bool
             ret->set_kind(rgd::LNot);
             ret->add_children()->CopyFrom(*right);
           }
@@ -707,16 +754,16 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
   // for all other cases, just visit the operands
   bool r = false;
   if (likely(info->l2 >= CONST_OFFSET)) {
-    r |= find_roots(info->l2, ret, subroots, visited);
+    r |= find_roots(info->l2, ret, input_deps, subroots, visited);
   }
   if (info->l1 >= CONST_OFFSET) {
-    r |= find_roots(info->l1, ret, subroots, visited);
+    r |= find_roots(info->l1, ret, input_deps, subroots, visited);
   }
   return r;
 }
 
 static void printAst(const rgd::AstNode *node, int indent) {
-  fprintf(stderr, "(%d, ", node->kind());
+  fprintf(stderr, "(%s, ", rgd::AstKindName[node->kind()]);
   fprintf(stderr, "%d, ", node->label());
   fprintf(stderr, "%d, ", node->bits());
   for(int i = 0; i < node->children_size(); i++) {
@@ -737,7 +784,9 @@ static void to_nnf(bool expected_r, rgd::AstNode *node) {
       rgd::AstNode *child = node->mutable_children(0);
       // transform the child, now looking for a true formula
       to_nnf(true, child);
-      node->CopyFrom(*child);
+      rgd::AstNode tmp;
+      tmp.CopyFrom(*child);
+      node->CopyFrom(tmp);
     } else if (node->kind() == rgd::LAnd) {
       // De Morgan's law
       assert(node->children_size() == 2);
@@ -794,6 +843,34 @@ static void to_dnf(const rgd::AstNode *node, formula_t &formula) {
   }
 }
 
+static inline expr_t get_root_expr(dfsan_label label) {
+  expr_t root = nullptr;
+  auto itr = root_expr_cache.find(label);
+  if (itr != root_expr_cache.end()) {
+    root = itr->second;
+  } else {
+    root = std::make_shared<rgd::AstNode>();
+    std::unordered_set<dfsan_label> subroots;
+    std::unordered_set<dfsan_label> visited;
+    // FIXME: implicitly updated here, not very clean
+    auto &deps = branch_to_inputs[label];
+    // we start by constructing a boolean formula with relational expressions
+    // as leaf nodes
+    find_roots(label, root.get(), deps, subroots, visited);
+    root_expr_cache.insert({label, root});
+#if DEBUG
+    for (auto const& subroot : subroots) {
+      DEBUGF("subroot: %d\n", subroot);
+    }
+#endif
+  }
+#if DEBUG
+  printAst(root.get(), 0);
+  fprintf(stderr, "\n");
+#endif
+  return root;
+}
+
 static bool construct_tasks(bool target_direction, dfsan_label label,
                             const u8 *buf, size_t buf_size,
                             std::vector<task_t> &tasks) {
@@ -801,23 +878,15 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
   // given a condition, we want to parse them into a DNF form of
   // relational sub-expressions, where each sub-expression only contains
   // one relational operator at the root
-  expr_t root = std::make_shared<rgd::AstNode>();
-  std::unordered_set<dfsan_label> subroots;
-  std::unordered_set<dfsan_label> visited;
-  // we start by constructing a boolean formula with relational expressions
-  // as leaf nodes
-  find_roots(label, root.get(), subroots, visited);
-  if (root->kind() == rgd::Bool) {
+  expr_t orig_root = get_root_expr(label);
+  if (orig_root->kind() == rgd::Bool) {
     // if the simplified formula is a boolean constant, nothing to do
     return false;
   }
-#if DEBUG
-  for (auto const& subroot : subroots) {
-    DEBUGF("subroot: %d\n", subroot);
-  }
-  printAst(root.get(), 0);
-  fprintf(stderr, "\n");
-#endif
+
+  // duplication the original root for transformation
+  expr_t root = std::make_shared<rgd::AstNode>();
+  root->CopyFrom(*orig_root);
 
   // next, convert the formula to NNF form, possibly negate the root
   // if we are looking for a false formula
@@ -835,6 +904,95 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
     task_t task = construct_task(clause, buf, buf_size);
     if (task != nullptr) {
       tasks.push_back(task);
+    }
+
+    if (NestedSolving) {
+      // collect dependencies based on data-flow (i.e., shared input bytes)
+      std::vector<const rgd::AstNode*> nested_caluse;
+      // first, copy the last branch constraints
+      nested_caluse.insert(nested_caluse.end(), clause.begin(), clause.end());
+      // then, iterate each var in the clause
+      for (auto const& var: clause) {
+        const dfsan_label l = var->label();
+        auto itr = branch_to_inputs.find(l);
+        assert(itr != branch_to_inputs.end());
+        assert(itr->second.size() > 0);
+        for (auto input: itr->second) {
+          // for each input byte used in the var, we collect additional constraints
+          auto const& bucket = input_to_branches[input];
+          for (auto const& nc : bucket) {
+#if DEBUG
+            fprintf(stderr, "add nested constraint: (%d, %d)\n", nc->label(), nc->kind());
+#endif
+            nested_caluse.push_back(nc.get()); // XXX: borrow the raw ptr, should be fine?
+          }
+        }
+      }
+      task_t nested_task = construct_task(nested_caluse, buf, buf_size);
+      if (nested_task != nullptr) {
+        nested_task->base_task = task;
+        tasks.push_back(nested_task);
+      }
+    }
+  }
+
+  return true;
+}
+
+static bool add_data_flow_constraints(bool direction, dfsan_label label,
+                                      const u8 *buf, size_t buf_size) {
+  // similar to solving tasks, we parse the original branch constraint
+  // into a DNF form of relational sub-expressions, where each sub-expression
+  // only contains one relational operator at the root
+  expr_t orig_root = get_root_expr(label);
+  if (orig_root->kind() == rgd::Bool) {
+    // if the simplified formula is a boolean constant, nothing to do
+    return false;
+  }
+
+  // duplication the original root for transformation
+  expr_t root = std::make_shared<rgd::AstNode>();
+  root->CopyFrom(*orig_root);
+
+  // next, convert the formula to NNF form, possibly negate the root
+  // if we are looking for a false formula
+  to_nnf(direction, root.get());
+#if DEBUG
+  printAst(root.get(), 0);
+  fprintf(stderr, "\n");
+#endif
+  // then we need to convert the boolean formula into a DNF form
+  formula_t dnf;
+  to_dnf(root.get(), dnf);
+
+  // now we associate the constraints with input bytes
+  for (auto const& clause : dnf) {
+    // each clause is a conjunction of relational expressions
+    // that need to be evaluated to true (satisfied)
+    // we associate that with the corresponding input bytes
+    for (auto const& var : clause) {
+      // get the input bytes
+      expr_t node = std::make_shared<rgd::AstNode>();
+      node->CopyFrom(*var);
+      const dfsan_label l = node->label();
+      auto itr = branch_to_inputs.find(l);
+      assert(itr != branch_to_inputs.end());
+      assert(itr->second.size() > 0);
+      // update uion find
+      size_t root = *(itr->second.begin());
+      for (auto iitr = ++itr->second.begin(); iitr != itr->second.end(); ++iitr) {
+#if DEBUG
+        DEBUGF("union input bytes: (%zu, %zu)\n", root, *iitr);
+#endif
+        root = data_flow_deps.merge(root, *iitr);
+      }
+      // add the constraint
+      auto &bucket = input_to_branches[root];
+      bucket.push_back(node);
+      // we need to record the kind as it may be negated during transformation
+#if DEBUG
+      DEBUGF("add df constraint: %zu <- (%d, %d)\n", root, l, node->kind());
+#endif
     }
   }
 
@@ -863,6 +1021,11 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
     for (auto const& task : tasks) {
       my_mutator->task_mgr->add_task(neg_ctx, task);
     }
+  }
+
+  if (msg.flags & F_ADD_CONS) {
+    // add the current branch direction as nested conditions
+    add_data_flow_constraints(ctx->direction, msg.label, buf, buf_size);
   }
 }
 
@@ -1076,7 +1239,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   u32 num_tasks = 0;
 
   // clear all caches
-  clear_global_caches();
+  reset_global_caches(buf_size);
 
   while (read(pipefds[0], &msg, sizeof(msg)) > 0) {
     // create solving tasks
@@ -1132,10 +1295,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   // reinit solving state
   data->cur_task = nullptr;
 
-  size_t max_stages = 0;
-  for (auto const& solver: data->solvers) {
-    max_stages += solver->stages();
-  }
+  size_t max_stages = data->solvers.size();
   // to be conservative, we return the maximum number of possible mutations
   return (u32)(data->task_mgr->get_num_tasks() * max_stages);
 
@@ -1161,19 +1321,12 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
     }
     // reset the solver and state
     data->cur_solver_index = 0;
-    data->cur_solver_stage = 0;
     data->cur_mutation_state = MUTATION_INVALID;
   }
 
   // check the previous mutation state
   if (data->cur_mutation_state == MUTATION_IN_VALIDATION) {
-    // oops, not solve, move on to next stage
-    data->cur_solver_stage++;
-  }
-
-  auto &solver = data->solvers[data->cur_solver_index];
-  if (data->cur_solver_stage >= solver->stages()) {
-    // if reached the max stage of the current solver, move on to the next solver
+    // oops, not solve, move on to next solver
     data->cur_solver_index++;
     if (data->cur_solver_index >= data->solvers.size()) {
       // if reached the max solver, move on to the next task
@@ -1185,16 +1338,14 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
       }
       data->cur_solver_index = 0; // reset solver index
     }
-    solver = data->solvers[data->cur_solver_index];
-    // reset the solver index
-    data->cur_solver_stage = 0;
   }
 
   // default return values
   size_t new_buf_size = buf_size;
   *out_buf = buf;
-  auto ret = solver->solve(data->cur_solver_stage, data->cur_task,
-      buf, buf_size, data->output_buf, new_buf_size);
+  auto &solver = data->solvers[data->cur_solver_index];
+  auto ret = solver->solve(data->cur_task, buf, buf_size,
+      data->output_buf, new_buf_size);
   if (likely(ret == rgd::SOLVER_SAT)) {
     DEBUGF("task solved\n");
     data->cur_mutation_state = MUTATION_IN_VALIDATION;
@@ -1202,10 +1353,10 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
   } else if (ret == rgd::SOLVER_TIMEOUT) {
     // if not solved, move on to next stage
     data->cur_mutation_state = MUTATION_INVALID;
-    data->cur_solver_stage++;
   } else if (ret == rgd::SOLVER_UNSAT) {
     // at any stage if the task is deemed unsolvable, just skip it
     DEBUGF("task not solvable\n");
+    data->cur_task->skip_next = true;
     data->cur_task = nullptr;
   } else {
     WARNF("Unknown solver return value %d\n", ret);
@@ -1227,6 +1378,7 @@ uint8_t afl_custom_queue_new_entry(my_mutator_t * data,
   if (data->cur_queue_entry == filename_orig_queue &&
       data->cur_mutation_state == MUTATION_IN_VALIDATION) {
     data->cur_mutation_state = MUTATION_VALIDATED;
+    data->cur_task->skip_next = true;
   }
   return 0;
 }

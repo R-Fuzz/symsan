@@ -20,7 +20,7 @@ typedef void(*test_fn_type)(uint64_t*);
 static const int RET_OFFSET = 2;
 
 struct Constraint {
-  Constraint(): fn(nullptr), comparison(AstKind::Bool), const_num(0) {
+  Constraint(): fn(nullptr), const_num(0) {
     ast = std::make_shared<AstNode>();
   }
   const AstNode *get_root() const { return const_cast<const AstNode*>(ast.get()); }
@@ -29,8 +29,6 @@ struct Constraint {
   test_fn_type fn;
   // the AST
   std::shared_ptr<AstNode> ast;
-  // the relational operator
-  uint32_t comparison;
 
   // During constraint collection, (symbolic) input bytes are recorded
   // as offsets from the beginning of the input.  However, the JIT'ed
@@ -54,6 +52,8 @@ struct Constraint {
 struct ConsMeta {
   // per-constraint arg mapping, so we can share the constraints
   std::vector<std::pair<bool, uint64_t>> input_args;
+  // per-constraint relational operator, so we can share the AST
+  uint32_t comparison;
   // input2state inference related
   bool i2s_feasible;
   uint64_t op1, op2;
@@ -61,20 +61,17 @@ struct ConsMeta {
 
 struct SearchTask {
   SearchTask(): scratch_args(nullptr), max_const_num(0),
-      stopped(false), attempts(0), num_minimal_optima(0),
-      gsol(false), opti_hit(false) {}
+      stopped(false), attempts(0), solved(false), skip_next(false),
+      base_task(nullptr) {}
   ~SearchTask() { if (scratch_args) free(scratch_args); }
 
   uint32_t num_exprs;
   // constraints, could be shared, strictly read-only
   std::vector<std::shared_ptr<const Constraint>> constraints;
+  // temporary storage for the comparison operation
+  std::vector<uint32_t> comparisons;
   // per-constraint mutable metadata
   std::vector<std::unique_ptr<ConsMeta>> consmeta;
-
-  // nested constraints, could be shared, strictly read-only
-  std::vector<std::shared_ptr<const Constraint>> nested_constraints;
-  // per-constraint mutable metadata
-  std::vector<std::unique_ptr<ConsMeta>> nested_consmeta;
 
   // inputs as pairs of <offset (from the beginning of the input, and value>
   std::vector<std::pair<uint32_t, uint8_t>> inputs;
@@ -96,14 +93,14 @@ struct SearchTask {
   uint64_t start; //start time
   bool stopped;
   int attempts;
-  int num_minimal_optima;
-  bool gsol;
-  bool opti_hit;
 
   // solutions
-  std::unordered_map<size_t, uint8_t> *rgd_solution;
-  std::unordered_map<size_t, uint8_t> *opti_solution;
-  std::unordered_map<size_t, uint8_t> *hint_solution;
+  bool solved;
+  std::unordered_map<size_t, uint8_t> solution;
+
+  // base task
+  std::shared_ptr<SearchTask> base_task;
+  bool skip_next; // FIXME: an ugly hack to skip the next task
 
   void finalize() {
     // aggregate the contraints, map each input byte to a constraint to
@@ -113,6 +110,7 @@ struct SearchTask {
     for (size_t i = 0; i < constraints.size(); i++) {
       std::unique_ptr<ConsMeta> cm = std::make_unique<ConsMeta>();
       cm->input_args = constraints[i]->input_args;
+      cm->comparison = comparisons[i];
       uint32_t last_offset = -1;
       cm->i2s_feasible = true;
       for (const auto& [offset, lidx] : constraints[i]->local_map) {
@@ -164,11 +162,12 @@ struct SearchTask {
     distances.resize(constraints.size(), 0);
   }
 
-  void load_hint() { // load hint
+  void load_hint() { // load hint from base task
+    if (!base_task || !base_task->solved) return;
     for (auto itr = inputs.begin(); itr != inputs.end(); itr++) {
-      auto got = hint_solution->find(itr->first);
-      if (got != hint_solution->end()) 
-        itr->second = got->second; 
+      auto got = base_task->solution.find(itr->first);
+      if (got != base_task->solution.end())
+        itr->second = got->second;
     }
   }
 
