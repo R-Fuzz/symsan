@@ -58,6 +58,47 @@ namespace rgd {
     Memcmp, //37
   };
 
+  static const char* AstKindName[] = {
+    "Bool",
+    "Constant",
+    "Read",
+    "Concat",
+    "Extract",
+    "ZExt",
+    "SExt",
+    "Add",
+    "Sub",
+    "Mul",
+    "UDiv",
+    "SDiv",
+    "URem",
+    "SRem",
+    "Neg",
+    "Not",
+    "And",
+    "Or",
+    "Xor",
+    "Shl",
+    "LShr",
+    "AShr",
+    "Equal",
+    "Distinct",
+    "Ult",
+    "Ule",
+    "Ugt",
+    "Uge",
+    "Slt",
+    "Sle",
+    "Sgt",
+    "Sge",
+    "LOr",
+    "LAnd",
+    "LNot",
+    "Ite",
+    "Load",
+    "Memcmp",
+  };
+
   static inline bool isRelationalKind(uint32_t kind) {
     if (kind >= Equal && kind <= Sge)
       return true;
