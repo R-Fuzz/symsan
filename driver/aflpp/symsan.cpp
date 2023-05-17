@@ -625,7 +625,9 @@ static int simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
         return NONE_CMP_NODE;
       } else { // 1 LAnd x = x
         // lhs is 1, rhs is not
-        ret->CopyFrom(*right);
+        rgd::AstNode temp;
+        temp.CopyFrom(*right);
+        ret->CopyFrom(temp);
         return rr;
       }
     } else if (rr == NONE_CMP_NODE) {
@@ -686,7 +688,9 @@ static int simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
       return NONE_CMP_NODE;
     } else { // 0 LOr x = x
       assert(info->op1.i == 0);
-      ret->CopyFrom(*right);
+      rgd::AstNode temp;
+      temp.CopyFrom(*right);
+      ret->CopyFrom(temp);
       return rr;
     }
   } else {
@@ -710,7 +714,9 @@ static int simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
         return NONE_CMP_NODE;
       } else { // 0 LOr x = x
         // lhs is 0, rhs is not
-        ret->CopyFrom(*right);
+        rgd::AstNode temp;
+        temp.CopyFrom(*right);
+        ret->CopyFrom(temp);
         return rr;
       }
     } else if (rr == NONE_CMP_NODE) {
@@ -1056,7 +1062,9 @@ static void to_nnf(bool expected_r, rgd::AstNode *node) {
       rgd::AstNode *child = node->mutable_children(0);
       // transform the child, now looking for a true formula
       to_nnf(true, child);
-      node->CopyFrom(*child);
+      rgd::AstNode tmp;
+      tmp.CopyFrom(*child);
+      node->CopyFrom(tmp);
     } else if (node->kind() == rgd::LAnd) {
       // De Morgan's law
       assert(node->children_size() == 2);
@@ -1334,6 +1342,11 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
   }
 
   if (NestedSolving && (msg.flags & F_ADD_CONS)) {
+    // add the current branch direction as nested conditions
+    add_data_flow_constraints(ctx->direction, msg.label, buf, buf_size);
+  }
+
+  if (msg.flags & F_ADD_CONS) {
     // add the current branch direction as nested conditions
     add_data_flow_constraints(ctx->direction, msg.label, buf, buf_size);
   }
