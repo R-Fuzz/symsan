@@ -367,7 +367,6 @@ static void cal_gradient(MutInput &input, uint64_t f0, Grad &grad, std::shared_p
     bool sign = false;
     bool is_linear = false;
     uint64_t val = 0;
-
     partial_derivative(input, index, f0, &sign, &is_linear, &val, task);
     if (val > max) {
       max = val;
