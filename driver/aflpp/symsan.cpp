@@ -917,8 +917,14 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
         auto itr = branch_to_inputs.find(l);
         assert(itr != branch_to_inputs.end());
         assert(itr->second.size() > 0);
+        // for each input byte used in the var, we collect additional constraints
+        // first, we use union find to add additional related input bytes
+        std::unordered_set<size_t> related_inputs;
         for (auto input: itr->second) {
-          // for each input byte used in the var, we collect additional constraints
+          data_flow_deps.get_set(input, related_inputs);
+        }
+        // then, we collect the branch constraints for each related input byte
+        for (auto input: related_inputs) {
           auto const& bucket = input_to_branches[input];
           for (auto const& nc : bucket) {
 #if DEBUG
