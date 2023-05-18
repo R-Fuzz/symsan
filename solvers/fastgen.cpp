@@ -26,6 +26,9 @@ using namespace __dfsan;
 static u32 __instance_id;
 static u32 __session_id;
 static int __pipe_fd;
+extern "C" {
+  extern u8* __afl_area_ptr;
+}
 
 // filter?
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
@@ -54,11 +57,11 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
   if (add_nested) flags |= F_ADD_CONS;
   // set the loop flags according to branching results
   if (result) {
-    // true branch
+    // loop_flag |= 0x2; True branch for loop exit
     if (loop_flag & 0x2) flags |= F_LOOP_EXIT;
     if (loop_flag & 0x8) flags |= F_LOOP_LATCH;
   } else {
-    // false branch
+    // loop_flag |= 0x1; False branch for loop exit
     if (loop_flag & 0x1) flags |= F_LOOP_EXIT;
     if (loop_flag & 0x4) flags |= F_LOOP_LATCH;
   }
@@ -110,6 +113,17 @@ __taint_trace_cond(dfsan_label label, u8 r, u8 flag, u32 cid) {
   AOUT("solving cond: %u %u 0x%x 0x%x 0x%x %p\n",
        label, r, flag, __taint_trace_callstack, cid, addr);
 
+#ifdef __x86_64__
+  AOUT("BB distance: %llu, accumulated distance: %llu, counter: %llu \n", 
+                    *(unsigned long*)(__afl_area_ptr+MAP_SIZE), 
+                    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8), 
+                    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16));
+#else
+  AOUT("BB distance: %u, accumulated distance: %u, counter: %u \n", 
+                    *(unsigned int*)(__afl_area_ptr+MAP_SIZE), 
+                    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+4), 
+                    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8));
+#endif
   // always add nested
   __solve_cond(label, r, 1, flag, cid, addr);
 }
@@ -210,7 +224,7 @@ __taint_trace_memcmp(dfsan_label label) {
 
   internal_write(__pipe_fd, &msg, sizeof(msg));
 
-  // FIXME: memcmp msg type miss up the pipe
+  // FIXME: memcmp msg type miss up the communication pipe
   // if both operands are symbolic, skip sending the content
   // if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
   //   return;

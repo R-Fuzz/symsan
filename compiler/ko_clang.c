@@ -142,19 +142,22 @@ static void add_runtime() {
 static void add_aflgo_pass() {
   // if this option is set from the ENV, then appending the following flag to the compiler
   if (getenv("KO_ADD_AFLGO")) {
-  cc_params[cc_par_cnt++] = "-Xclang";
-  cc_params[cc_par_cnt++] = "-load";
-  cc_params[cc_par_cnt++] = "-Xclang";
-  cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libAFLGOPass.so", obj_path);
-  char *target_dir = getenv("AFLGO_TARGET_DIR");
-  if (!target_dir)
-    FATAL("ENV variable KO_ADD_AFLGO and AFLGO_TARGET_DIR must be set together");
-  cc_params[cc_par_cnt++] = "-mllvm";
-  cc_params[cc_par_cnt++] = alloc_printf("-outdir=%s", target_dir);
-  // cc_params[cc_par_cnt++] = "-mllvm";
-  // cc_params[cc_par_cnt++] = alloc_printf("-targets=%s/BBtargets.txt", target_dir);
-  cc_params[cc_par_cnt++] = "-mllvm";
-  cc_params[cc_par_cnt++] = alloc_printf("-distance=%s/distance.cfg.txt", target_dir);
+    cc_params[cc_par_cnt++] = "-Xclang";
+    cc_params[cc_par_cnt++] = "-load";
+    cc_params[cc_par_cnt++] = "-Xclang";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libAFLGOPass.so", obj_path);
+    char *target_dir = getenv("AFLGO_TARGET_DIR");
+    if (!target_dir)
+      FATAL("ENV variable KO_ADD_AFLGO and AFLGO_TARGET_DIR must be set together");
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = alloc_printf("-outdir=%s", target_dir);
+    if (getenv("AFLGO_PREPROCESSING")) {
+      cc_params[cc_par_cnt++] = "-mllvm";
+      cc_params[cc_par_cnt++] = alloc_printf("-targets=%s/BBtargets.txt", target_dir);
+    }else{
+      cc_params[cc_par_cnt++] = "-mllvm";
+      cc_params[cc_par_cnt++] = alloc_printf("-distance=%s/distance.cfg.txt", target_dir);
+    }
   }
 }
 
