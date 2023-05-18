@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <vector>
+#include <unordered_set>
 
 namespace rgd {
 
@@ -67,14 +68,14 @@ public:
   }
 
   // get the set containing x
-  size_t get_set(size_t x, std::vector<size_t> &set) {
+  size_t get_set(size_t x, std::unordered_set<size_t> &set) {
     assert(x < size_);
     size_t temp = x;
     set.clear();
-    set.push_back(temp);
+    set.insert(temp);
     while (next[temp] != x) {
       temp = next[temp];
-      set.push_back(temp);
+      set.insert(temp);
     }
     return set.size();
   }
