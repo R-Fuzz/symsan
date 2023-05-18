@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <utility>
 #include <memory>
+#include <atomic>
 
 namespace rgd {
 
@@ -48,6 +49,13 @@ private:
 };
 
 class JITSolver : public Solver {
+public:
+  JITSolver();
+  solver_result_t solve(std::shared_ptr<SearchTask> task,
+                        const uint8_t *in_buf, size_t in_size,
+                        uint8_t *out_buf, size_t &out_size) override;
+private:
+  std::atomic_ulong uuid;
 };
 
 
