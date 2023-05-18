@@ -25,14 +25,18 @@ include_directories(${PROTOBUF_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS rgd.proto)
 
+add_subdirectory(jigsaw)
+
 add_library(SymSanMutator SHARED
   symsan.cpp
   z3-solver.cpp
+  jit-solver.cpp
   ${PROTO_SRCS}
   ${PROTO_HDRS}
 )
 
 target_include_directories(SymSanMutator PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime
   ${AFLPP_PATH}/include
 )
@@ -40,9 +44,8 @@ target_include_directories(SymSanMutator PRIVATE
 target_link_libraries(SymSanMutator
   ${PROTOBUF_LIBRARIES}
   tcmalloc
-  LLVM
-  pthread
   z3
+  jigsaw
 )
 
 install (TARGETS SymSanMutator DESTINATION ${SYMSAN_BIN_DIR})
