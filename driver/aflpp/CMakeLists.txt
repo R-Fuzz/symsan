@@ -18,6 +18,8 @@ endif()
 
 add_subdirectory(jigsaw)
 
+add_subdirectory(jigsaw)
+
 add_library(SymSanMutator SHARED
   symsan.cpp
   z3-solver.cpp
