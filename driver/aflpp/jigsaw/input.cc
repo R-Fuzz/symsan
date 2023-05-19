@@ -42,7 +42,7 @@ void MutInput::flip(size_t index, size_t bit_index) {
 
 void MutInput::set(const size_t index, uint8_t val)
 {
-  value[index] = val;
+  value[index] = (uint64_t)val;
 }
 
 uint64_t MutInput::len() {
@@ -68,7 +68,7 @@ void MutInput::dump() {
 
 void MutInput::randomize() {
   for(int i=0;i<size_;i++) {
-    value[i] = get_rand();
+    value[i] = (uint64_t)get_rand();
     //std::cout << "randomize " << i << " and assign value " << (int)value[i] << std::endl;
   }
 }
@@ -79,7 +79,7 @@ uint8_t MutInput::get(const size_t i) {
 
 MutInput::MutInput(size_t size) {
   r_idx = 0;
-  value = (uint8_t*)malloc(size);
+  value = (uint64_t*)malloc(size * sizeof(uint64_t));
   size_ = size;
   unsigned int seed;
   //_rdseed32_step(&seed);
