@@ -86,8 +86,10 @@ struct SearchTask {
   uint64_t* scratch_args;
 
   // intermediate states for the search
-  std::vector<uint64_t> orig_distances;
-  std::vector<uint64_t> distances;
+  std::vector<uint64_t> min_distances; // current best
+  std::vector<uint64_t> distances; // general scratch
+  std::vector<uint64_t> plus_distances; // used in partial derivation
+  std::vector<uint64_t> minus_distances; // used in partial derivation
 
   // statistics
   uint64_t start; //start time
@@ -158,8 +160,10 @@ struct SearchTask {
     // allocate the input array, reserver 2 for comparison operands a,b
     scratch_args = (uint64_t*)aligned_alloc(sizeof(*scratch_args),
         (2 + inputs.size() + max_const_num + 1) * sizeof(*scratch_args));
-    orig_distances.resize(constraints.size(), 0);
+    min_distances.resize(constraints.size(), 0);
     distances.resize(constraints.size(), 0);
+    plus_distances.resize(constraints.size(), 0);
+    minus_distances.resize(constraints.size(), 0);
   }
 
   void load_hint() { // load hint from base task
