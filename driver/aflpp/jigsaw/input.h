@@ -20,7 +20,7 @@ public:
 class MutInput {
 public:
   // std::vector<uint8_t> value;
-  uint8_t* value;
+  uint64_t* value;
   // std::vector<InputMeta> meta;
   size_t size_;
   size_t get_size();
@@ -46,13 +46,13 @@ public:
 
   static void copy(MutInput *dst, const MutInput *src)
   {
-    uint8_t *dst_value = dst->value;
+    uint64_t *dst_value = dst->value;
     memcpy(dst, src, sizeof(MutInput));
     if (!dst_value)
-      dst->value = (uint8_t*)malloc(src->size_);
+      dst->value = (uint64_t*)malloc(src->size_ * sizeof(uint64_t));
     else
       dst->value = dst_value;
-    memcpy(dst->value, src->value, src->size_);
+    memcpy(dst->value, src->value, src->size_ * sizeof(uint64_t));
   }
 };
 

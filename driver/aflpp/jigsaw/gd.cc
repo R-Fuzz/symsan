@@ -28,7 +28,7 @@ using namespace rgd;
                                                                                \
   })
 
-static void dumpResults(MutInput &input, std::shared_ptr<SearchTask> task) {
+static void dump_results(MutInput &input, std::shared_ptr<SearchTask> task) {
   int i = 0;
   for (auto it : task->inputs) {
     std::cout << "index is " << it.first << " result is " << (int)input.value[i] << std::endl;
@@ -36,8 +36,14 @@ static void dumpResults(MutInput &input, std::shared_ptr<SearchTask> task) {
   }
 }
 
+static void dump_distances(std::vector<uint64_t> &distances) {
+  for (size_t i = 0; i < distances.size(); i++) {
+    std::cout << "distance " << i << " is " << distances[i] << std::endl;
+  }
+}
 
-static void addResults(MutInput &input, std::shared_ptr<SearchTask> task) {
+
+static void add_results(MutInput &input, std::shared_ptr<SearchTask> task) {
   int i = 0;
   // since we used a trick (allow each byte to overflow and then use add instead
   // of bitwise or to concatenate, so the overflow would be visible)
@@ -102,7 +108,7 @@ static uint32_t negate(uint32_t op) {
 }
 
 
-static uint64_t getDistance(uint32_t comp, uint64_t a, uint64_t b) {
+static uint64_t get_distance(uint32_t comp, uint64_t a, uint64_t b) {
   uint64_t dis = 0;
   switch (comp) {
     case rgd::Equal:
@@ -152,32 +158,37 @@ static uint64_t getDistance(uint32_t comp, uint64_t a, uint64_t b) {
 }
 
 
-static void single_distance(MutInput &input, std::shared_ptr<SearchTask> task, int index) {
+static uint64_t single_distance(MutInput &input, std::vector<uint64_t> &distances, std::shared_ptr<SearchTask> task, int index) {
   // only re-compute the distance of the constraints that are affected by the change
+  uint64_t res = 0;
   for (uint32_t cons_id : task->cmap[index]) {
     auto& c = task->constraints[cons_id];
     auto& cm = task->consmeta[cons_id];
     int arg_idx = 0;
     for (auto arg : cm->input_args) {
       if (arg.first) {// symbolic
-        task->scratch_args[RET_OFFSET + arg_idx] = (uint64_t)input.value[arg.second];
+        task->scratch_args[RET_OFFSET + arg_idx] = input.value[arg.second];
       } else {
         task->scratch_args[RET_OFFSET + arg_idx] = arg.second;
       }
       ++arg_idx;
     }
     c->fn(task->scratch_args);
-    uint64_t dis = getDistance(cm->comparison, task->scratch_args[0], task->scratch_args[1]);
-    task->distances[cons_id] = dis;
+    uint64_t dis = get_distance(cm->comparison, task->scratch_args[0], task->scratch_args[1]);
+    distances[cons_id] = dis;
+#if DEBUG
+    std::cout << "single distance of constraint " << cons_id << " is " << dis << std::endl;
+#endif
+    res = sat_inc(res, dis);
   }
+  return res;
 }
 
 
-static uint64_t distance(MutInput &input, std::shared_ptr<SearchTask> task) {
+static uint64_t distance(MutInput &input, std::vector<uint64_t> &distances, std::shared_ptr<SearchTask> task) {
   static int timeout = 0;
   static int solved= 0;
   uint64_t res = 0;
-  uint64_t dis0 = 0;
 
   for (int i = 0; i < task->constraints.size(); i++) {
     auto& c = task->constraints[i];
@@ -186,38 +197,27 @@ static uint64_t distance(MutInput &input, std::shared_ptr<SearchTask> task) {
     int arg_idx = 0;
     for (auto arg : cm->input_args) {
       if (arg.first) { // symbolic
-        task->scratch_args[RET_OFFSET + arg_idx] = (uint64_t)input.value[arg.second];
+        task->scratch_args[RET_OFFSET + arg_idx] = input.value[arg.second];
       } else {
         task->scratch_args[RET_OFFSET + arg_idx] = arg.second;
       }
       ++arg_idx;
     }
-    // for(int p=0;p<task->n_sym_args+task->n_const_args;p++)
-    //   std::cout << (int)task->scratch_args[p]<<", ";
-    // std::cout << std::endl;
     c->fn(task->scratch_args);
-    uint64_t dis = getDistance(cm->comparison, task->scratch_args[0], task->scratch_args[1]);
-    task->distances[i] = dis;
+    uint64_t dis = get_distance(cm->comparison, task->scratch_args[0], task->scratch_args[1]);
+    distances[i] = dis;
     cm->op1 = task->scratch_args[0];
     cm->op2 = task->scratch_args[1];
-    if (i == 0) dis0 = dis;
-    /*
-       if (dis == 0 && i == 0 && !task->opti_hit) {
-       task->opti_hit = true;
-       addOptiResults(input, task);
-       }
-    */
-    //printf("func called and expr %d, comparison %d, arg0 %lu and arg1 %lu and return value is %lu \n",i, c.comparison, task->scratch_args[0], task->scratch_args[1], dis);
-    if (likely(dis > 0)) {
-      res = sat_inc(res, dis);
-    }
+#if DEBUG
+    std::cout << "distance of constraint " << i << " is " << dis << std::endl;
+#endif
+    res = sat_inc(res, dis);
   }
   if (res == 0) {
     task->stopped = true;
     task->solved = true;
-    //dumpResults(input, task);
-    //task->scratch_args[24] = task->scratch_args[24] & 0x1f;
-    addResults(input, task);
+    //dump_results(input, task);
+    add_results(input, task);
   }
   task->attempts++;
   if (task->attempts > MAX_EXEC_TIMES) {
@@ -229,46 +229,71 @@ static uint64_t distance(MutInput &input, std::shared_ptr<SearchTask> task) {
 
 
 static void partial_derivative(MutInput &orig_input, size_t index, uint64_t f0, bool *sign, bool* is_linear, uint64_t *val, std::shared_ptr<SearchTask> task) {
-  //TODO assign constructors
-  //MutInput input = orig_input;
-  //std::cout << "calculating partial derivative and orig_input is " << orig_input.get(0) << " and " << orig_input.get(1) << std::endl;
-  //std::cout << "calculating partial derivative and input is " << input.get(0) << " and " << input.get(1) << std::endl;
-  //int idx = 0;
-  //for(auto i : orig_input.value)
-  //task->scratch_args[idx++] = i;
 
-  uint8_t orig_val = orig_input.get(index);
-  //uint8_t orig_val = task->scratch_args[index];
+  uint64_t orig_val = orig_input.value[index];
+  uint64_t delta = 1;
+  uint64_t f_plus = 0, f_minus = 0;
+  uint64_t single_dis;
 
-  // calculate f(x+1)
-  orig_input.update(index, true, 1);
-  single_distance(orig_input, task, index);
-  uint64_t f_plus = 0;
-  for (int i = 0; i < task->constraints.size(); i++)
-    f_plus = sat_inc(f_plus, task->distances[i]);
+  // calculate f(x+delta)
+  for (delta = 1; delta < 256; delta = delta << 1) {
+    task->plus_distances = task->min_distances;
+    orig_input.update(index, true, delta);
+    single_dis = single_distance(orig_input, task->plus_distances, task, index);
+    if (single_dis == 0) { // well, we got lucky and found a solution
+      *sign = true;
+      *is_linear = false;
+      *val = 0;
+      return;
+    }
+    f_plus = 0;
+    for (int i = 0; i < task->constraints.size(); i++)
+      f_plus = sat_inc(f_plus, task->plus_distances[i]);
 
-  task->attempts += 1;
-  if (task->attempts > MAX_EXEC_TIMES)
-    task->stopped = true;
-  orig_input.set(index, orig_val);
-  task->distances = task->orig_distances;
-  if (task->stopped) { *val = 0; return; }
+    task->attempts += 1;
+    if (task->attempts > MAX_EXEC_TIMES)
+      task->stopped = true;
+    if (task->stopped) { *val = 0; return; }
 
-  // calculate f(x-1)
-  orig_input.update(index, false, 1);
-  uint64_t f_minus = 0;
-  single_distance(orig_input, task, index);
-  for (int i = 0; i < task->constraints.size(); i++)
-    f_minus += task->distances[i];
+    if (f_plus == f0) { // if f(x+delta) == f(x), delta is not large enough
+      delta = delta << 1;
+    } else {
+      break;
+    }
+  }
+  orig_input.value[index] = orig_val; // restore the original value
 
-  task->attempts += 1;
-  if (task->attempts > MAX_EXEC_TIMES)
-    task->stopped = true;
-  orig_input.set(index, orig_val);
-  task->distances = task->orig_distances;
-  if (task->stopped) { *val = 0; return;}
+  // calculate f(x-delta)
+  for (delta = 1; delta < 256; delta = delta << 1) {
+    task->minus_distances = task->min_distances;
+    orig_input.update(index, false, delta);
+    single_dis = single_distance(orig_input, task->minus_distances, task, index);
+    if (single_dis == 0) { // well, we got lucky and found a solution
+      *sign = false;
+      *is_linear = false;
+      *val = 0;
+      return;
+    }
+    f_minus = 0;
+    for (int i = 0; i < task->constraints.size(); i++)
+      f_minus = sat_inc(f_minus, task->minus_distances[i]);
 
-  //std::cout << "calculating partial and f0 is " << f0 << " f_minus is" << f_minus << " and f_plus is " << f_plus << std::endl;
+    task->attempts += 1;
+    if (task->attempts > MAX_EXEC_TIMES)
+      task->stopped = true;
+    if (task->stopped) { *val = 0; return;}
+
+    if (f_minus == f0) { // if f(x-delta) == f(x), delta is not large enough
+      delta = delta << 1;
+    } else {
+      break;
+    }
+  }
+  orig_input.value[index] = orig_val; // restore the original value
+
+#if DEBUG
+  std::cout << "calculating partial and f0 is " << f0 << " f_minus is " << f_minus << " and f_plus is " << f_plus << std::endl;
+#endif
 
   if (f_minus < f0) {
     if (f_plus < f0) {
@@ -276,23 +301,23 @@ static void partial_derivative(MutInput &orig_input, size_t index, uint64_t f0, 
         *sign = false;
         *is_linear = false;
         *val = f0 - f_minus;
-      } else {
+      } else { // f_minus >= f_plus
         *sign = true;
         *is_linear = false;
         *val = f0 - f_plus;
       }
-    } else {
+    } else { // f_plus >= f0
       *sign = false;
-      *is_linear = ((f_minus != f0) && (f0 - f_minus == f_plus -f0));
-      *val = f0 -f_minus;
+      *is_linear = ((f_minus != f0) && (f0 - f_minus == f_plus - f0));
+      *val = f0 - f_minus;
     }
-  } else {
+  } else { // f_minus >= f0
     if (f_plus < f0) {
       *sign = true;
       *is_linear = ((f_minus != f0) && (f_minus - f0 == f0 - f_plus));
       *val = f0 - f_plus;
-    }
-    else {
+    } else { // f_plus >= f0
+      // reached a local optimum
       *sign = true;
       *is_linear = false;
       *val = 0;
@@ -307,6 +332,11 @@ static void compute_delta_all(MutInput &input, Grad &grad, size_t step) {
   for (auto &gradu : grad.get_value()) {
     double movement = gradu.pct * step;
     input.update(index, gradu.sign, (uint64_t)movement);
+#if DEBUG
+    std::cout << "compute_delta_all for index = " << index
+              << ", sign = " << gradu.sign
+              << ", move = " << movement << std::endl;
+#endif
     index++;
   }
 }
@@ -317,17 +347,21 @@ static void cal_gradient(MutInput &input, uint64_t f0, Grad &grad, std::shared_p
   int index = 0;
   for (auto &gradu : grad.get_value()) {
 
-    //std::cout << "cal_gradient" << std::endl;
     if (task->stopped) {
       break;
     }
     bool sign = false;
     bool is_linear = false;
     uint64_t val = 0;
+
     partial_derivative(input, index, f0, &sign, &is_linear, &val, task);
     if (val > max) {
       max = val;
     }
+#if DEBUG
+    std::cout << "cal_gradient for index = " << index << ", offset = "
+              << task->inputs[index].first << ", val = " << val << std::endl;
+#endif
     //linear = linear && l;
     gradu.sign = sign;
     gradu.val = val;
@@ -347,13 +381,22 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
   if (vsum > 0) {
     auto guess_step = f0 / vsum;
     compute_delta_all(input, grad, guess_step);
-    uint64_t f_new = distance(input,task);
+    uint64_t f_new = distance(input, task->distances, task);
     if (f_new >= f_last) {
       input = input_min;
+    } else if (f_new == 0) {
+      // found a solution
+      task->stopped = true;
+      task->solved = true;
+      add_results(input, task);
+      return 0;
     } else {
       input_min = input;
       f_last = f_new;
+      task->min_distances = task->distances;
     }
+  } else {
+    task->distances = task->min_distances;
   }
 
   size_t step = 1;
@@ -367,30 +410,46 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
       if (doDelta) {
         double movement = grad.get_value()[deltaIdx].pct * (double)step;
         input.update(deltaIdx, grad.get_value()[deltaIdx].sign, (uint64_t)movement);
+#if DEBUG
+        std::cout << "update index = " << deltaIdx << ", offset = "
+                  << task->inputs[deltaIdx].first << ", sign = "
+                  << grad.get_value()[deltaIdx].sign
+                  << ", movement = " << movement << std::endl;
+#endif
 
-        single_distance(input, task, deltaIdx);
+        uint64_t single_dis = single_distance(input, task->distances, task, deltaIdx);
         for (int i = 0; i < task->constraints.size(); i++)
-          f_new += task->distances[i];
+          f_new = sat_inc(f_new, task->distances[i]);
         task->attempts += 1;
         if (task->attempts > MAX_EXEC_TIMES)
           task->stopped = true;
+        if (single_dis == 0) {
+          // if we're doing delta and the single distance is 0
+          // we're done with the current index
+          break;
+        }
 
       } else {
         compute_delta_all(input, grad, step);
-        f_new = distance(input,task);
+        f_new = distance(input, task->distances, task);
       }
 
-
-      if (f_new >= f_last) {
+      if (f_new == 0) {
+        // found a solution
+        task->stopped = true;
+        task->solved = true;
+        add_results(input, task);
+        return 0;
+      } else if (f_new > f_last) { // use > to give the next larger step a chance
         //if (f_new == UINTMAX_MAX)
         break;
       }
 
       step *= 2;
       input_min = input;
+      task->min_distances = task->distances;
       f_last = f_new;
     }
-    //break;
 
     if (grad.len() == 1) {
       break;
@@ -404,6 +463,7 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
         break;
       }
       input = input_min;
+      task->distances = task->min_distances;
       step = 1;
     }
   }
@@ -450,7 +510,7 @@ static uint64_t try_new_i2s_value(std::shared_ptr<const Constraint> &c, uint32_t
     ++arg_idx;
   }
   c->fn(task->scratch_args);
-  return getDistance(comparison, task->scratch_args[0], task->scratch_args[1]);
+  return get_distance(comparison, task->scratch_args[0], task->scratch_args[1]);
 }
 
 
@@ -460,7 +520,7 @@ static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, 
   for (int k = 0; k < task->constraints.size(); k++) {
     auto& c = task->constraints[k];
     auto& cm = task->consmeta[k];
-    if (task->distances[k] && cm->i2s_feasible) {
+    if (task->min_distances[k] && cm->i2s_feasible) {
       // check concatenated inputs against comparison operands
       // FIXME: add support for other input encodings
       uint64_t input = 0, input_r, value = 0, dis = -1;
@@ -485,7 +545,7 @@ static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, 
         std::cout << "i2s updated c = " << k << " t = " << t << " input = " << input
                   << " op1 = " << cm->op1 << " op2 = " << cm->op2
                   << " cmp = " << cm->comparison << " value = " << value
-                  << " old-dis = " << task->distances[k] << " new-dis = " << dis << std::endl;
+                  << " old-dis = " << task->min_distances[k] << " new-dis = " << dis << std::endl;
 #endif
         // successful, update the real inputs
         i = 0;
@@ -525,10 +585,11 @@ try_reverse:
     }
   }
   if (updated) {
-    uint64_t f_new = distance(temp_input, task);
+    uint64_t f_new = distance(temp_input, task->distances, task);
     if (f_new < f0) {
       // std::cout << "i2s succeeded: " << f0 << " -> " << f_new << std::endl;
       input_min = temp_input;
+      task->min_distances = task->distances;
       return f_new;
     }
   }
@@ -537,8 +598,7 @@ try_reverse:
 
 static uint64_t repick_start_point(MutInput &input_min, std::shared_ptr<SearchTask> task) {
   input_min.randomize();
-  uint64_t ret = distance(input_min, task);
-  task->orig_distances = task->distances;
+  uint64_t ret = distance(input_min, task->min_distances, task);
   return ret;
 }
 
@@ -551,16 +611,14 @@ static uint64_t reload_input(MutInput &input_min, std::shared_ptr<SearchTask> ta
     printf("offset %u value %u\n", itr.first, itr.second);
   }
 #endif
-  uint64_t ret = distance(input_min, task);
-  task->orig_distances = task->distances;
+  uint64_t ret = distance(input_min, task->min_distances, task);
   return ret;
 }
-
 
 bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
   MutInput input(task->inputs.size());
   MutInput scratch_input(task->inputs.size());
-  //return true;
+  task->attempts = 0;
 
   uint64_t f0 = reload_input(input, task);
   f0 = try_i2s(input, scratch_input, f0, task);
@@ -575,14 +633,18 @@ bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
   Grad grad(input.len());
 
   while (true) {
-    //std::cout << "<<< epoch=" << ep_i << " f0=" << f0 << std::endl;
     if (task->stopped) {
       break;
     }
+#if DEBUG
+    std::cout << "<<< epoch=" << ep_i << " f0=" << f0 << std::endl;
+    dump_results(input, task);
+    dump_distances(task->min_distances);
+#endif
+
     cal_gradient(input, f0, grad, task);
 
     int g_i = 0;
-
     while (grad.max_val() == 0) {
       if (g_i > MAX_NUM_MINIMAL_OPTIMA_ROUND) {
         break;
@@ -607,6 +669,7 @@ bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
     grad.normalize();
     f0 = descend(input, scratch_input, f0, grad, task);
     ep_i += 1;
+    //if (ep_i == 2) break;
   }
 
   return task->solved;
