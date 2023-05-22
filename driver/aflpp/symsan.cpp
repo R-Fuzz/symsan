@@ -41,6 +41,10 @@ using namespace __dfsan;
 #define DEBUG 1
 #endif
 
+#if !DEBUG
+#define DEBUGF(_str...) do { } while (0)
+#endif
+
 #define NEED_OFFLINE 0
 
 static bool NestedSolving = true;
@@ -1119,7 +1123,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   fcntl(data->shm_fd, F_SETFD, fcntl(data->shm_fd, F_GETFD) & ~FD_CLOEXEC);
 
   // allocate output buffer
-  data->output_buf = (u8 *)malloc(MAX_FILE);
+  data->output_buf = (u8 *)malloc(MAX_FILE+1);
   if (!data->output_buf) {
     FATAL("Failed to alloc output buffer\n");
   }
@@ -1314,7 +1318,7 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
   (void)(add_buf);
   (void)(add_buf_size);
   (void)(max_size);
-  assert(buf_size < MAX_FILE);
+  assert(buf_size <= MAX_FILE);
 
   // try to get a task if we don't already have one
   // or if we've find a valid solution from the previous mutation
@@ -1323,7 +1327,7 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
     if (!data->cur_task) {
       DEBUGF("No more tasks to solve\n");
       *out_buf = buf;
-      return buf_size;
+      return 0;
     }
     // reset the solver and state
     data->cur_solver_index = 0;
@@ -1366,6 +1370,7 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
     data->cur_task = nullptr;
   } else {
     WARNF("Unknown solver return value %d\n", ret);
+    *out_buf = NULL;
     new_buf_size = 0;
   }
 
