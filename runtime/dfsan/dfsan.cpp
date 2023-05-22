@@ -843,4 +843,5 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
                              unsigned) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
 SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
+SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack_addr;
 }  // extern "C"

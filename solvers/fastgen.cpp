@@ -32,6 +32,7 @@ extern "C" {
 
 // filter?
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack_addr;
 
 static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
   switch (predicate) {
@@ -73,6 +74,7 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
+    .context_addr = __taint_trace_callstack_addr,
     .id = cid,
     .label = label,
     .result = result
@@ -154,6 +156,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
+    .context_addr = __taint_trace_callstack_addr,
     .id = 0,
     .label = index_label, // just in case
     .result = (u64)index
@@ -189,6 +192,7 @@ __taint_trace_loop(u32 bid) {
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
+    .context_addr = __taint_trace_callstack_addr,
     .id = bid,
     .label = 0,
     .result = 0
@@ -218,6 +222,7 @@ __taint_trace_memcmp(dfsan_label label) {
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
+    .context_addr = __taint_trace_callstack_addr,
     .label = label, // just in case
     .result = (u64)info->size
   };

@@ -77,6 +77,10 @@
 
 using namespace llvm;
 
+// Number of bits to discard when computing the call stack hash.
+// This must be in the range of 1-32.
+static const unsigned kContextSensitiveGranularity = 4; 
+
 // This must be consistent with ShadowWidthBits.
 static const Align kShadowTLSAlignment = Align(4);
 
@@ -375,6 +379,7 @@ class Taint : public ModulePass {
   FunctionCallee TaintCheckBoundsFn;
   FunctionCallee TaintDebugFn;
   Constant *CallStack;
+  Constant *CallStackAddr;
   MDNode *ColdCallWeights;
   TaintABIList ABIList;
   DenseMap<Value *, Function *> UnwrappedFnMap;
@@ -692,6 +697,17 @@ void Taint::addContextRecording(Function &F) {
   StoreInst *SCS = IRB.CreateStore(NCS, CallStack);
   SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
 
+  // Add (ctx << kContextSensitiveGranularity) ^ return_addr at the beginning of a function
+  Value *ReturnAddress = IRB.CreateCall(
+    Intrinsic::getDeclaration(F.getParent(), Intrinsic::returnaddress),
+    IRB.getInt32(0));
+  LoadInst *LCSA = IRB.CreateLoad(CallStackAddr);
+  LCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+  Value *ShiftedLCS = IRB.CreateShl(LCSA, kContextSensitiveGranularity);  
+  Value *NCSA = IRB.CreateXor(ShiftedLCS, ReturnAddress);
+  StoreInst *SCSA = IRB.CreateStore(NCSA, CallStackAddr);
+  SCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+
   // Recover ctx at the end of a function
   for (auto FI = F.begin(), FE = F.end(); FI != FE; FI++) {
     BasicBlock *BB = &*FI;
@@ -700,6 +716,8 @@ void Taint::addContextRecording(Function &F) {
       IRB.SetInsertPoint(Inst);
       SCS = IRB.CreateStore(LCS, CallStack);
       SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+      SCSA = IRB.CreateStore(LCSA, CallStackAddr);
+      SCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
     }
   }
 }
@@ -1086,6 +1104,11 @@ bool Taint::runOnModule(Module &M) {
 
   CallStack = Mod->getOrInsertGlobal("__taint_trace_callstack", Int32Ty);
   if (GlobalVariable *G = dyn_cast<GlobalVariable>(CallStack)) {
+    Changed |= G->getThreadLocalMode() != GlobalVariable::InitialExecTLSModel;
+    G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
+  }
+  CallStackAddr = Mod->getOrInsertGlobal("__taint_trace_callstack_addr", Int32Ty);
+  if (GlobalVariable *G = dyn_cast<GlobalVariable>(CallStackAddr)) {
     Changed |= G->getThreadLocalMode() != GlobalVariable::InitialExecTLSModel;
     G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
   }
