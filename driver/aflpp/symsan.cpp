@@ -1063,8 +1063,9 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     FATAL("afl_custom_init alloc");
     return NULL;
   }
-  solver_t solver = std::make_shared<rgd::Z3Solver>();
-  data->solvers.push_back(solver);
+  // try jigsaw first
+  data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
+  data->solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
     FATAL(
@@ -1097,7 +1098,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   }
 
   // create the output file
-  data->out_fd = open(data->out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  data->out_fd = open(data->out_file, O_RDWR | O_CREAT | O_TRUNC, 0644);
   if (data->out_fd < 0) {
     FATAL("Failed to create output file %s: %s\n", data->out_file, strerror(errno));
   }
@@ -1326,6 +1327,7 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
     data->cur_task = data->task_mgr->get_next_task();
     if (!data->cur_task) {
       DEBUGF("No more tasks to solve\n");
+      data->cur_mutation_state = MUTATION_INVALID;
       *out_buf = buf;
       return 0;
     }
@@ -1343,15 +1345,16 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
       data->cur_task = data->task_mgr->get_next_task();
       if (!data->cur_task) {
         DEBUGF("No more tasks to solve\n");
+        data->cur_mutation_state = MUTATION_INVALID;
         *out_buf = buf;
-        return buf_size;
+        return 0;
       }
       data->cur_solver_index = 0; // reset solver index
     }
   }
 
   // default return values
-  size_t new_buf_size = buf_size;
+  size_t new_buf_size = 0;
   *out_buf = buf;
   auto &solver = data->solvers[data->cur_solver_index];
   auto ret = solver->solve(data->cur_task, buf, buf_size,
@@ -1389,7 +1392,8 @@ uint8_t afl_custom_queue_new_entry(my_mutator_t * data,
   if (data->cur_queue_entry == filename_orig_queue &&
       data->cur_mutation_state == MUTATION_IN_VALIDATION) {
     data->cur_mutation_state = MUTATION_VALIDATED;
-    data->cur_task->skip_next = true;
+    if (data->cur_task)
+      data->cur_task->skip_next = true;
   }
   return 0;
 }
