@@ -697,6 +697,7 @@ static void InitializeTaintFile() {
   }
   struct stat st;
   const char *filename = flags().taint_file;
+  int err;
   if (internal_strcmp(filename, "stdin") == 0) {
     tainted.fd = 0;
     // try to get the size, as stdin may be a file
@@ -706,8 +707,8 @@ static void InitializeTaintFile() {
       // map a copy
       tainted.buf_size = RoundUpTo(st.st_size, GetPageSizeCached());
       uptr map = internal_mmap(nullptr, tainted.buf_size, PROT_READ, MAP_PRIVATE, 0, 0);
-      if (internal_iserror(map)) {
-        Printf("FATAL: failed to map a copy of input file\n");
+      if (internal_iserror(map, &err)) {
+        Printf("FATAL: failed to map a copy of input file %s\n", strerror(err));
         Die();
       }
       tainted.buf = reinterpret_cast<char *>(map);
