@@ -109,23 +109,32 @@ __taint_trace_cond(dfsan_label label, u8 r, u8 flag, u32 cid) {
       return;
   }
 
-  void *addr = __builtin_return_address(0);
-
-  AOUT("solving cond: %u %u 0x%x 0x%x 0x%x %p\n",
-       label, r, flag, __taint_trace_callstack, cid, addr);
+  u64 bb_dist = 0;
+  u64 avg_dist = 0;
   if (__afl_area_ptr){
   #ifdef __x86_64__
-    AOUT("BB distance: %llu, accumulated distance: %llu, counter: %llu \n", 
-                      *(unsigned long*)(__afl_area_ptr+MAP_SIZE), 
-                      *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8), 
-                      *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16));
+    unsigned long counter = *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16);
+    if (counter){
+      bb_dist = (u64)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
+      avg_dist = (u64)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) / counter);
+    }
+    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = 0;
+    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
   #else
-    AOUT("BB distance: %u, accumulated distance: %u, counter: %u \n", 
-                      *(unsigned int*)(__afl_area_ptr+MAP_SIZE), 
-                      *(unsigned int*)(__afl_area_ptr+MAP_SIZE+4), 
-                      *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8));
-#endif
+    unsigned int counter = *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8);
+    if (counter){
+      bb_dist = (u64)*(unsigned int*)(__afl_area_ptr+MAP_SIZE);
+      avg_dist = (u64)(*(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) / counter);
+    }
+    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) = 0;
+    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8) = 0;
+  #endif
+    AOUT("CallStack: 0x%x, BB distance: %llu, Avg distance: %llu \n", __taint_trace_callstack_addr, bb_dist, avg_dist);
   }
+
+  void *addr = __builtin_return_address(0);
+  AOUT("solving cond: %u %u 0x%x 0x%x 0x%x %p\n",
+       label, r, flag, __taint_trace_callstack, cid, addr);
   // always add nested
   __solve_cond(label, r, 1, flag, cid, addr);
 }
