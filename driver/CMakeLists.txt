@@ -11,5 +11,3 @@ target_include_directories(FGTest PUBLIC
 )
 target_link_options(FGTest PRIVATE "-lz3" "-lrt")
 install (TARGETS FGTest DESTINATION ${SYMSAN_BIN_DIR})
-
-add_subdirectory(mazerunner)

@@ -79,7 +79,7 @@ static u8 is_persistent;
 
 static void __afl_map_shm(void) {
 
-  u8 *id_str = getenv(SHM_ENV_VAR);
+  char *id_str = getenv(SHM_ENV_VAR);
 
   /* If we're running under AFL, attach to the appropriate region, replacing the
      early-stage __afl_area_initial region that is needed to allow some really
@@ -291,7 +291,7 @@ void __sanitizer_cov_trace_pc_guard(uint32_t* guard) {
 void __sanitizer_cov_trace_pc_guard_init(uint32_t* start, uint32_t* stop) {
 
   u32 inst_ratio = 100;
-  u8* x;
+  char* x;
 
   if (start == stop || *start) return;
 

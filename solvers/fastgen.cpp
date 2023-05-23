@@ -26,9 +26,8 @@ using namespace __dfsan;
 static u32 __instance_id;
 static u32 __session_id;
 static int __pipe_fd;
-extern "C" {
-  extern u8* __afl_area_ptr;
-}
+
+SANITIZER_WEAK_ATTRIBUTE u8* __afl_area_ptr=nullptr;
 
 // filter?
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
@@ -114,18 +113,19 @@ __taint_trace_cond(dfsan_label label, u8 r, u8 flag, u32 cid) {
 
   AOUT("solving cond: %u %u 0x%x 0x%x 0x%x %p\n",
        label, r, flag, __taint_trace_callstack, cid, addr);
-
-#ifdef __x86_64__
-  AOUT("BB distance: %llu, accumulated distance: %llu, counter: %llu \n", 
-                    *(unsigned long*)(__afl_area_ptr+MAP_SIZE), 
-                    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8), 
-                    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16));
-#else
-  AOUT("BB distance: %u, accumulated distance: %u, counter: %u \n", 
-                    *(unsigned int*)(__afl_area_ptr+MAP_SIZE), 
-                    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+4), 
-                    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8));
+  if (__afl_area_ptr){
+  #ifdef __x86_64__
+    AOUT("BB distance: %llu, accumulated distance: %llu, counter: %llu \n", 
+                      *(unsigned long*)(__afl_area_ptr+MAP_SIZE), 
+                      *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8), 
+                      *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16));
+  #else
+    AOUT("BB distance: %u, accumulated distance: %u, counter: %u \n", 
+                      *(unsigned int*)(__afl_area_ptr+MAP_SIZE), 
+                      *(unsigned int*)(__afl_area_ptr+MAP_SIZE+4), 
+                      *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8));
 #endif
+  }
   // always add nested
   __solve_cond(label, r, 1, flag, cid, addr);
 }
