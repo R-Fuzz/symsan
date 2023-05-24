@@ -161,7 +161,7 @@ static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
 static std::unordered_map<dfsan_label, expr_t> root_expr_cache;
 static std::unordered_map<dfsan_label, constraint_t> constraint_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<size_t> > branch_to_inputs;
-static std::unordered_map<dfsan_label, std::shared_ptr<u8>> memcmp_cache;
+static std::unordered_map<dfsan_label, std::shared_ptr<uint8_t[]>> memcmp_cache;
 // FIXME: global input dependency forests
 static rgd::UnionFind data_flow_deps;
 static std::vector<std::vector<expr_t> > input_to_branches;
@@ -261,6 +261,48 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     rgd::buf_to_hex_string(&buf[offset], info->l2, val);
     ret->set_value(std::move(val));
     ret->set_name("read");
+#endif
+    return true;
+  } else if (info->op == __dfsan::fmemcmp) {
+    rgd::AstNode *s1 = ret->add_children();
+    if (info->l1 >= CONST_OFFSET) {
+      if (!do_uta_rel(info->l1, s1, buf, buf_size, constraint, visited)) {
+        return false;
+      }
+      visited.insert(info->l1);
+    } else {
+      // s1 is a constant array
+      s1->set_kind(rgd::MemcmpConst);
+      s1->set_bits(info->size * 8);
+      s1->set_label(0);
+      // map arg
+      auto itr = memcmp_cache.find(label);
+      assert(itr != memcmp_cache.end());
+      uint32_t arg_index = (uint32_t)constraint->memcmp_const.size();
+      s1->set_index(arg_index);
+      constraint->memcmp_const.push_back(itr->second);
+      uint32_t hash = rgd::xxhash(info->size, rgd::MemcmpConst, arg_index);
+      s1->set_hash(hash);
+#if NEED_OFFLINE
+      std::string val;
+      rgd::buf_to_hex_string(itr->second, info->size, val);
+      ret->set_value(std::move(val));
+      ret->set_name("memcmp_const");
+#endif
+    }
+    assert(info->l2 >= CONST_OFFSET);
+    rgd::AstNode *s2 = ret->add_children();
+    if (!do_uta_rel(info->l2, s2, buf, buf_size, constraint, visited)) {
+      return false;
+    }
+    visited.insert(info->l2);
+    ret->set_kind(rgd::Memcmp);
+    ret->set_bits(1);
+    ret->set_label(label);
+    uint32_t hash = rgd::xxhash(s1->hash(), rgd::Memcmp, s2->hash());
+    ret->set_hash(hash);
+#if NEED_OFFLINE
+    ret->set_name("memcmp");
 #endif
     return true;
   }
@@ -367,7 +409,7 @@ parse_constraint(dfsan_label label, const u8 *buf, size_t buf_size) {
   DEBUGF("constructing constraint for label %u\n", label);
   // make sure root is a comparison node
   dfsan_label_info *info = get_label_info(label);
-  assert((info->op & 0xff) == __dfsan::ICmp);
+  assert(((info->op & 0xff) == __dfsan::ICmp) || (info->op == __dfsan::fmemcmp));
 
   std::unordered_set<dfsan_label> visited;
   constraint_t constraint = std::make_shared<rgd::Constraint>();
@@ -392,12 +434,17 @@ static task_t construct_task(std::vector<const rgd::AstNode*> clause,
     constraint_t constraint = parse_constraint(node->label(), buf, buf_size);
     // to maximize the resuability of the AST, the relational operator
     // is recorded elsewhere
-    task->constraints.push_back(constraint);
-    task->comparisons.push_back(node->kind());
-    constraint_cache.insert({node->label(), constraint});
+    if (likely(constraint != nullptr)) {
+      task->constraints.push_back(constraint);
+      task->comparisons.push_back(node->kind());
+      constraint_cache.insert({node->label(), constraint});
+    }
   }
-  task->finalize();
-  return task;
+  if (!task->constraints.empty()) {
+    task->finalize();
+    return task;
+  }
+  return nullptr;
 }
 
 static bool find_roots(dfsan_label label, rgd::AstNode *ret,
@@ -412,6 +459,9 @@ static dfsan_label strip_zext(dfsan_label label) {
     info = get_label_info(info->l1);
     if (info->size == 1) {
       // extending a boolean value
+      return info->l1;
+    } else if (info->op == __dfsan::fmemcmp) {
+      // extending the result of memcmp
       return info->l1;
     }
   }
@@ -753,6 +803,26 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
 #endif
       return true;
     }
+  } else if (info->op == __dfsan::fmemcmp) {
+    // memcmp is also considered as a root node (relational comparison)
+    bool s1_r = false, s2_r = false;
+    std::shared_ptr<rgd::AstNode> s1 = std::make_shared<rgd::AstNode>();
+    std::shared_ptr<rgd::AstNode> s2 = std::make_shared<rgd::AstNode>();
+    auto &deps = branch_to_inputs[label]; // get the input deps of this branch
+    if (info->l1 >= CONST_OFFSET) {
+      s1_r = find_roots(info->l1, s1.get(), deps, subroots, visited);
+    }
+    assert(info->l2 >= CONST_OFFSET);
+    s2_r = find_roots(info->l2, s2.get(), deps, subroots, visited);
+    input_deps.insert(deps.begin(), deps.end()); // propagate input deps
+    assert(!s1_r && !s2_r && "memcmp should not have additional icmp");
+    ret->set_bits(1); // XXX: treat memcmp as a boolean
+    ret->set_kind(rgd::Memcmp); // fix later
+    ret->set_label(label);
+#ifdef DEBUG
+    subroots.insert(label);
+#endif
+    return true;
   }
 
   // for all other cases, just visit the operands
@@ -805,15 +875,35 @@ static void to_nnf(bool expected_r, rgd::AstNode *node) {
       to_nnf(false, node->mutable_children(1));
     } else {
       // leaf node
-      assert(rgd::isRelationalKind(node->kind()));
-      node->set_kind(rgd::negate_cmp(node->kind()));
+      if (rgd::isRelationalKind(node->kind())) {
+        node->set_kind(rgd::negate_cmp(node->kind()));
+      } else if (node->kind() == rgd::Memcmp) {
+        // memcmp is also considered as a leaf node (relational comparison)
+        // memcmp == 0 actually means s1 == s2
+        // so we don't need to negate it
+      } else {
+        assert(false && "unexpected node kind");
+      }
     }
   } else {
     // we're looking for a true formula
-    // negate the expected result if we see a LNot
-    if (node->kind() == rgd::LNot) expected_r = false;
-    for (int i = 0; i < node->children_size(); i++) {
-      to_nnf(expected_r, node->mutable_children(i));
+    if (node->kind() == rgd::LNot) {
+      assert(node->children_size() == 1);
+      rgd::AstNode *child = node->mutable_children(0);
+      // negate the child, now looking for a false formula
+      to_nnf(false, child);
+      rgd::AstNode tmp;
+      tmp.CopyFrom(*child);
+      node->CopyFrom(tmp);
+    } else if (node->kind() == rgd::Memcmp) {
+      // memcmp is also considered as a leaf node (relational comparison)
+      // memcmp == 1 actually means s1 != s2
+      // so we negate it
+      node->set_kind(rgd::MemcmpN);
+    } else {
+      for (int i = 0; i < node->children_size(); i++) {
+        to_nnf(expected_r, node->mutable_children(i));
+      }
     }
   }
 }
@@ -1064,7 +1154,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     return NULL;
   }
   // try jigsaw first
-  data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
+  //data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
   data->solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
@@ -1243,10 +1333,10 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
  
   pipe_msg msg;
   gep_msg gmsg;
+  memcmp_msg *mmsg;
   dfsan_label_info *info;
   size_t msg_size;
-  std::shared_ptr<u8> msg_buf;
-  std::shared_ptr<memcmp_msg> mmsg;
+  std::shared_ptr<uint8_t[]> memcmp_const;
   u32 num_tasks = 0;
 
   // clear all caches
@@ -1277,19 +1367,23 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
         if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
           break;
         msg_size = sizeof(memcmp_msg) + msg.result;
-        msg_buf = std::make_shared<u8>(msg_size); // use shared_ptr to avoid memory leak
-        if (read(pipefds[0], msg_buf.get(), msg_size) != msg_size) {
+        mmsg = (memcmp_msg*)malloc(msg_size);
+        if (read(pipefds[0], mmsg, msg_size) != msg_size) {
           WARNF("Failed to receive memcmp msg: %s\n", strerror(errno));
+          free(mmsg);
           break;
         }
         // double check
-        mmsg = std::reinterpret_pointer_cast<memcmp_msg>(msg_buf);
         if (msg.label != mmsg->label) {
           WARNF("Incorrect memcmp msg: %d vs %d\n", msg.label, mmsg->label);
+          free(mmsg);
           break;
         }
         // save the content
-        memcmp_cache[msg.label] = msg_buf;
+        memcmp_const = std::make_shared<uint8_t[]>(msg.result); // use shared_ptr to avoid memory leak
+        memcpy(memcmp_const.get(), mmsg->content, msg.result);
+        memcmp_cache[msg.label] = memcmp_const;
+        free(mmsg);
         break;
       case fsize_type:
         break;

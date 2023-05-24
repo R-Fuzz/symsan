@@ -56,6 +56,8 @@ namespace rgd {
     Ite, // 35
     Load, // 36    to be worked with TT-Fuzzer
     Memcmp, //37
+    MemcmpN, // 38
+    MemcmpConst, // 39
   };
 
   static const char* AstKindName[] = {
@@ -97,6 +99,8 @@ namespace rgd {
     "Ite",
     "Load",
     "Memcmp",
+    "MemcmpN",
+    "MemcmpConst",
   };
 
   static inline bool isRelationalKind(uint32_t kind) {
