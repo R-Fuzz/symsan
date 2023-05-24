@@ -673,6 +673,7 @@ int main(int argc, char* const argv[]) {
 
   pipe_msg msg;
   gep_msg gmsg;
+  mazerunner_msg mr_msg;
   dfsan_label_info *info;
   size_t msg_size;
   memcmp_msg *mmsg = nullptr;
@@ -684,8 +685,14 @@ int main(int argc, char* const argv[]) {
         fprintf(stderr, "LOOP_INFO: label = %u, id = %u, latch = %u, exit = %u\n",
                 msg.label, msg.id,
                 msg.flags & F_LOOP_LATCH, msg.flags & F_LOOP_EXIT);
-        if (msg.label)
+        if (msg.label){
           __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr);
+          // consume mazerunner message
+          if (read(pipefds[0], &mr_msg, sizeof(mr_msg)) != sizeof(mr_msg)) {
+            fprintf(stderr, "Failed to receive mazerunner msg: %s\n", strerror(errno));
+            break;
+          }
+        }
         break;
       case gep_type:
         if (read(pipefds[0], &gmsg, sizeof(gmsg)) != sizeof(gmsg)) {

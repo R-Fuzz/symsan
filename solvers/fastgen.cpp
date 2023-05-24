@@ -50,6 +50,53 @@ static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
   return 0;
 }
 
+static inline void __handle_new_state(u32 cid, void *addr, u8 result, u8 loop_flag) {
+  u16 flags = 0;
+  // set the loop flags according to branching results
+  if (result) {
+    // True branch for loop exit
+    if (loop_flag & 0x2) flags |= F_LOOP_EXIT;
+  } else {
+    // False branch for loop exit
+    if (loop_flag & 0x1) flags |= F_LOOP_EXIT;
+  }
+
+  u64 bb_dist = 0;
+  u64 avg_dist = 0;
+  if (__afl_area_ptr){
+  #ifdef __x86_64__
+    unsigned long counter = *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16);
+    if (counter){
+      flags |= F_HAS_DISTANCE;
+      bb_dist = (u64)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
+      avg_dist = (u64)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) / counter);
+    }
+    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = 0;
+    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
+  #else
+    unsigned int counter = *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8);
+    if (counter){
+      flags |= F_HAS_DISTANCE;
+      bb_dist = (u64)*(unsigned int*)(__afl_area_ptr+MAP_SIZE);
+      avg_dist = (u64)(*(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) / counter);
+    }
+    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) = 0;
+    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8) = 0;
+  #endif
+    AOUT("CallStack: 0x%x, BB distance: %llu, Avg distance: %llu \n", __taint_trace_callstack_addr, bb_dist, avg_dist);
+  }
+
+  mazerunner_msg mmsg = {
+    .flags = flags,
+    .id = cid,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack_addr,
+    .bb_dist = bb_dist,
+    .avg_dist = avg_dist
+  };
+  internal_write(__pipe_fd, &mmsg, sizeof(mmsg));
+}
+
 static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
                                 u8 loop_flag, u32 cid, void *addr) {
 
@@ -57,11 +104,11 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
   if (add_nested) flags |= F_ADD_CONS;
   // set the loop flags according to branching results
   if (result) {
-    // loop_flag |= 0x2; True branch for loop exit
+    // True branch for loop exit
     if (loop_flag & 0x2) flags |= F_LOOP_EXIT;
     if (loop_flag & 0x8) flags |= F_LOOP_LATCH;
   } else {
-    // loop_flag |= 0x1; False branch for loop exit
+    // False branch for loop exit
     if (loop_flag & 0x1) flags |= F_LOOP_EXIT;
     if (loop_flag & 0x4) flags |= F_LOOP_LATCH;
   }
@@ -73,13 +120,14 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
-    .context_addr = __taint_trace_callstack_addr,
     .id = cid,
     .label = label,
     .result = result
   };
 
   internal_write(__pipe_fd, &msg, sizeof(msg));
+  if (label)
+    __handle_new_state(cid, addr, result, loop_flag);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -107,29 +155,6 @@ __taint_trace_cond(dfsan_label label, u8 r, u8 flag, u32 cid) {
     // check for real loop loop exits
     if (!(((flag & 0x1) && !r) || ((flag & 0x2) && r)))
       return;
-  }
-
-  u64 bb_dist = 0;
-  u64 avg_dist = 0;
-  if (__afl_area_ptr){
-  #ifdef __x86_64__
-    unsigned long counter = *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16);
-    if (counter){
-      bb_dist = (u64)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
-      avg_dist = (u64)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) / counter);
-    }
-    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = 0;
-    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
-  #else
-    unsigned int counter = *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8);
-    if (counter){
-      bb_dist = (u64)*(unsigned int*)(__afl_area_ptr+MAP_SIZE);
-      avg_dist = (u64)(*(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) / counter);
-    }
-    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) = 0;
-    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8) = 0;
-  #endif
-    AOUT("CallStack: 0x%x, BB distance: %llu, Avg distance: %llu \n", __taint_trace_callstack_addr, bb_dist, avg_dist);
   }
 
   void *addr = __builtin_return_address(0);
@@ -165,7 +190,6 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
-    .context_addr = __taint_trace_callstack_addr,
     .id = 0,
     .label = index_label, // just in case
     .result = (u64)index
@@ -201,7 +225,6 @@ __taint_trace_loop(u32 bid) {
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
-    .context_addr = __taint_trace_callstack_addr,
     .id = bid,
     .label = 0,
     .result = 0
@@ -231,7 +254,6 @@ __taint_trace_memcmp(dfsan_label label) {
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
-    .context_addr = __taint_trace_callstack_addr,
     .label = label, // just in case
     .result = (u64)info->size
   };
