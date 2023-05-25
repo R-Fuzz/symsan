@@ -19,6 +19,7 @@ endif()
 add_subdirectory(jigsaw)
 
 add_subdirectory(jigsaw)
+add_dependencies(jigsaw proto)
 
 add_library(SymSanMutator SHARED
   symsan.cpp
