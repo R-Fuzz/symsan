@@ -60,26 +60,29 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
 
       llvm::Value* idx[1];
       idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), start + RET_OFFSET);
-      ret = Builder.CreateLoad(Builder.CreateGEP(arg, idx));
-      ret = Builder.CreateTrunc(ret,
+      llvm::PointerType *constPtr = llvm::PointerType::getUnqual(
           llvm::Type::getIntNTy(Builder.getContext(), node->bits()));
+      ret = Builder.CreateGEP(arg, idx); // calculate the offset
+      ret = Builder.CreateBitCast(ret, constPtr);
+      ret = Builder.CreateLoad(ret); // load length bytes at once
       break;
     }
     case rgd::Read: {
       uint32_t start = local_map.at(node->index());
       size_t length = node->bits() / 8;
       //std::cout << "read index " << start << " length " << length << std::endl;
+      llvm::Type *retTy = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
       llvm::Value* idx[1];
       idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), start + RET_OFFSET);
       ret = Builder.CreateLoad(Builder.CreateGEP(arg, idx));
+      ret = Builder.CreateZExtOrTrunc(ret, retTy);
       for (uint32_t k = 1; k < length; k++) {
         idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), start + k + RET_OFFSET);
-        llvm::Value* tmp = Builder.CreateLoad(Builder.CreateGEP(arg,idx));
+        llvm::Value* tmp = Builder.CreateLoad(Builder.CreateGEP(arg, idx));
+        tmp = Builder.CreateZExtOrTrunc(tmp, retTy);
         tmp = Builder.CreateShl(tmp, 8 * k);
         ret = Builder.CreateAdd(ret, tmp);
       }
-      ret = Builder.CreateTrunc(ret,
-          llvm::Type::getIntNTy(Builder.getContext(), node->bits()));
       break;
     }
     case rgd::Concat: {
@@ -268,7 +271,17 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       break;
     }
     // all the following ICmp expressions should be top level
-    case rgd::Equal: {
+    case rgd::Equal:
+    case rgd::Distinct:
+    case rgd::Ult:
+    case rgd::Ule:
+    case rgd::Ugt:
+    case rgd::Uge:
+    case rgd::Slt:
+    case rgd::Sle:
+    case rgd::Sgt:
+    case rgd::Sge: {
+    // we don't really care about the comparison, just need to save the operands
       const AstNode* rc1 = &node->children(0);
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
@@ -288,182 +301,20 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       ret = nullptr;
       break;
     }
-    case rgd::Distinct: {
+    case rgd::Memcmp:
+    case rgd::MemcmpN: {
       const AstNode* rc1 = &node->children(0);
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateZExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateZExt(c2, Builder.getInt64Ty());
+      // c1 & c2 should be IntNty
+      llvm::Value* ret = Builder.CreateICmpEQ(c1, c2);
+      ret = Builder.CreateZExt(ret, Builder.getInt64Ty());
 
-      // save the comparison operands to the output args
-      // so it's easier to negate the condition
-      llvm::Value* idx[1];
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg, idx));
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg, idx));
-
-      ret = nullptr;
-      break;
-    }
-    case rgd::Ult: {
-      const AstNode* rc1 = &node->children(0);
-      const AstNode* rc2 = &node->children(1);
-      llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
-      llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateZExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateZExt(c2, Builder.getInt64Ty());
-
-      // save the comparison operands to the output args
-      // so it's easier to negate the condition
+      // just save the results
       llvm::Value* idx[1];
       idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg, idx));
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg, idx));
-
-      ret = nullptr;
-      break;
-    }
-    case rgd::Ule: {
-      const AstNode* rc1 = &node->children(0);
-      const AstNode* rc2 = &node->children(1);
-      llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
-      llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateZExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateZExt(c2, Builder.getInt64Ty());
-
-      // save the comparison operands to the output args
-      // so it's easier to negate the condition
-      llvm::Value* idx[1];
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg, idx));
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg, idx));
-
-      ret = nullptr;
-      break;
-    }
-    case rgd::Ugt: {
-      const AstNode* rc1 = &node->children(0);
-      const AstNode* rc2 = &node->children(1);
-      llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
-      llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateZExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateZExt(c2, Builder.getInt64Ty());
-
-      // save the comparison operands to the output args
-      // so it's easier to negate the condition
-      llvm::Value* idx[1];
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(),0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg,idx));
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(),1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg,idx));
-
-      ret = nullptr;
-      break;
-    }
-    case rgd::Uge: {
-      const AstNode* rc1 = &node->children(0);
-      const AstNode* rc2 = &node->children(1);
-      llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
-      llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateZExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateZExt(c2, Builder.getInt64Ty());
-
-      // save the comparison operands to the output args
-      // so it's easier to negate the condition
-      llvm::Value* idx[1];
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg, idx));
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg, idx));
-
-      ret = nullptr;
-      break;
-    }
-    case rgd::Slt: {
-      const AstNode* rc1 = &node->children(0);
-      const AstNode* rc2 = &node->children(1);
-      llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
-      llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateSExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateSExt(c2, Builder.getInt64Ty());
-
-      // save the comparison operands to the output args
-      // so it's easier to negate the condition
-      llvm::Value* idx[1];
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg, idx));
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg, idx));
-
-      ret = nullptr;
-      break;
-    }
-    case rgd::Sle: {
-      const AstNode* rc1 = &node->children(0);
-      const AstNode* rc2 = &node->children(1);
-      llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
-      llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateSExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateSExt(c2, Builder.getInt64Ty());
-
-      // save the comparison operands to the output args
-      // so it's easier to negate the condition
-      llvm::Value* idx[1];
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg, idx));
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg, idx));
-
-      ret = nullptr;
-      break;
-    }
-    case rgd::Sgt: {
-      const AstNode* rc1 = &node->children(0);
-      const AstNode* rc2 = &node->children(1);
-      llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
-      llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateSExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateSExt(c2, Builder.getInt64Ty());
-
-      // save the comparison operands to the output args
-      // so it's easier to negate the condition
-      llvm::Value* idx[1];
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg, idx));
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg, idx));
-
-      ret = nullptr;
-      break;
-    }
-    case rgd::Sge: {
-      const AstNode* rc1 = &node->children(0);
-      const AstNode* rc2 = &node->children(1);
-      llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
-      llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateSExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateSExt(c2, Builder.getInt64Ty());
-
-      // save the comparison operands to the output args
-      // so it's easier to negate the condition
-      llvm::Value* idx[1];
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg, idx));
-      idx[0]= llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg, idx));
+      Builder.CreateStore(ret, Builder.CreateGEP(arg, idx));
 
       ret = nullptr;
       break;
@@ -515,7 +366,7 @@ int rgd::addFunction(const AstNode* node,
     std::map<size_t,uint32_t> const& local_map,
     uint64_t id) {
 
-  assert(isRelationalKind(node->kind()) && "non-relational expr");
+  assert((isRelationalKind(node->kind()) || node->kind() == rgd::Memcmp || node->kind() == rgd::MemcmpN) && "non-relational expr");
 
   // Open a new module.
   std::string moduleName = "rgdjit_m" + std::to_string(id);
