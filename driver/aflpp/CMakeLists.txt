@@ -17,15 +17,14 @@ if (NOT DEFINED AFLPP_PATH OR NOT AFLPP_PATH)
 endif()
 
 # Proto file
-get_filename_component(rgd_proto "rgd.proto" ABSOLUTE)
-get_filename_component(rgd_proto_path "${rgd_proto}" PATH)
-
 find_package(Protobuf REQUIRED)
 include_directories(${PROTOBUF_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS rgd.proto)
+add_custom_target(proto ALL DEPENDS ${PROTO_SRCS} ${PROTO_SRCS})
 
 add_subdirectory(jigsaw)
+add_dependencies(jigsaw proto)
 
 add_library(SymSanMutator SHARED
   symsan.cpp
