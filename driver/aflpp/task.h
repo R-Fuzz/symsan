@@ -47,8 +47,6 @@ struct Constraint {
   std::unordered_map<uint32_t, uint32_t> shapes;
   // number of constant in the input array
   uint32_t const_num;
-  // memcmp constant
-  std::vector<std::shared_ptr<uint8_t[]>> memcmp_const;
 };
 
 struct ConsMeta {

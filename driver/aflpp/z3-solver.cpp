@@ -43,8 +43,21 @@ z3::expr Z3Solver::serialize(const AstNode* node,
       uint64_t val = input_args[node->index()].second;
       if (node->bits() == 1) {
         return context_.bool_val(val == 1);
-      } else {
+      } else if (node->bits() <= 64) {
         return context_.bv_val(val, node->bits());
+      } else {
+        uint32_t chunks = node->bits() / 64;
+        uint32_t remain = node->bits() % 64;
+        z3::expr ret = context_.bv_val(val, 64);
+        for (uint32_t i = 1; i < chunks; i++) {
+          val = input_args[node->index() + i].second;
+          ret = z3::concat(context_.bv_val(val, 64), ret);
+        }
+        if (remain > 0) {
+          val = input_args[node->index() + chunks].second;
+          ret = z3::concat(context_.bv_val(val, remain), ret);
+        }
+        return ret;
       }
     }
     case rgd::Read: {
@@ -179,32 +192,18 @@ z3::expr Z3Solver::serialize(const AstNode* node,
 z3::expr Z3Solver::serialize_rel(uint32_t comparison,
     const AstNode* node,
     const std::vector<std::pair<bool, uint64_t>> &input_args,
-    const std::vector<std::shared_ptr<uint8_t[]>> &memcmp_const,
     std::unordered_map<uint32_t,z3::expr> &expr_cache) {
 
   assert(node->children_size() == 2);
-  // handle memcmp
-  if (comparison == rgd::Memcmp || comparison == rgd::MemcmpN) {
-    z3::expr s1 = node->children(0).kind() != rgd::MemcmpConst ?
-      serialize(&node->children(0), input_args, expr_cache) :
-      ({auto child = &node->children(0);
-       auto content = memcmp_const[child->index()];
-       z3::expr val = context_.bv_val(content[0], 8);
-       for (uint32_t i = 1; i < child->bits() / 8; i++) {
-        val = z3::concat(context_.bv_val(content[i], 8), val);
-       }
-       val;});
-    z3::expr s2 = serialize(&node->children(1), input_args, expr_cache);
-    return comparison == rgd::Memcmp ? s1 == s2 : s1 != s2;
-  }
-
   z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
   z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
 
   switch(comparison) {
     case rgd::Equal:
+    case rgd::Memcmp:
       return c1 == c2;
     case rgd::Distinct:
+    case rgd::MemcmpN:
       return c1 != c2;
     case rgd::Ult:
       return z3::ult(c1, c2);
@@ -285,7 +284,7 @@ Z3Solver::solve(std::shared_ptr<SearchTask> task,
     std::unordered_map<uint32_t, z3::expr> expr_cache;
     for (size_t i = 0; i < task->constraints.size(); i++) {
       auto const &c = task->constraints[i];
-      z3::expr z3expr = serialize_rel(task->comparisons[i], c->get_root(), c->input_args, c->memcmp_const, expr_cache);
+      z3::expr z3expr = serialize_rel(task->comparisons[i], c->get_root(), c->input_args, expr_cache);
       DEBUGF("adding expr %s\n", z3expr.to_string().c_str());
       solver_.add(z3expr);
     }
