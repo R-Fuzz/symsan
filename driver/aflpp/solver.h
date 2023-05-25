@@ -38,7 +38,6 @@ private:
   z3::expr serialize_rel(uint32_t comparison,
                          const AstNode* node,
                          const std::vector<std::pair<bool, uint64_t>> &input_args,
-                         const std::vector<std::shared_ptr<uint8_t[]>> &memcmp_const,
                          std::unordered_map<uint32_t,z3::expr> &expr_cache);
 
   z3::expr serialize(const AstNode* node,

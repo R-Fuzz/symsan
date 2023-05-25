@@ -272,22 +272,39 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       visited.insert(info->l1);
     } else {
       // s1 is a constant array
-      s1->set_kind(rgd::MemcmpConst);
+      s1->set_kind(rgd::Constant);
       s1->set_bits(info->size * 8);
       s1->set_label(0);
-      // map arg
+      // use constant args to pass the array
       auto itr = memcmp_cache.find(label);
       assert(itr != memcmp_cache.end());
-      uint32_t arg_index = (uint32_t)constraint->memcmp_const.size();
+      uint32_t arg_index = (uint32_t)constraint->input_args.size();
       s1->set_index(arg_index);
-      constraint->memcmp_const.push_back(itr->second);
-      uint32_t hash = rgd::xxhash(info->size, rgd::MemcmpConst, arg_index);
+      uint16_t chunks = info->size / 8;
+      uint16_t remain = info->size % 8;
+      uint64_t val = 0;
+      for (uint16_t i = 0; i < chunks; i++) {
+        val = *(uint64_t*)&itr->second[i * 8];
+        constraint->input_args.push_back(std::make_pair(false, val));
+        constraint->const_num += 1;
+        DEBUGF("memcmp constant chunk %d = 0x%lx\n", i, val);
+      }
+      if (remain) {
+        val = 0;
+        for (uint16_t i = 0; i < remain; i++) {
+          val |= (uint64_t)itr->second[chunks * 8 + i] << (i * 8);
+        }
+        constraint->input_args.push_back(std::make_pair(false, val));
+        constraint->const_num += 1;
+        DEBUGF("memcmp constant remain = %lu\n", val);
+      }
+      uint32_t hash = rgd::xxhash(info->size, rgd::Constant, arg_index);
       s1->set_hash(hash);
 #if NEED_OFFLINE
       std::string val;
       rgd::buf_to_hex_string(itr->second, info->size, val);
       ret->set_value(std::move(val));
-      ret->set_name("memcmp_const");
+      ret->set_name("constant");
 #endif
     }
     assert(info->l2 >= CONST_OFFSET);
