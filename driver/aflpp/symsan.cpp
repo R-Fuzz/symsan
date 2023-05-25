@@ -161,7 +161,7 @@ static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
 static std::unordered_map<dfsan_label, expr_t> root_expr_cache;
 static std::unordered_map<dfsan_label, constraint_t> constraint_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<size_t> > branch_to_inputs;
-static std::unordered_map<dfsan_label, std::shared_ptr<uint8_t[]>> memcmp_cache;
+static std::unordered_map<dfsan_label, std::shared_ptr<uint8_t>> memcmp_cache;
 // FIXME: global input dependency forests
 static rgd::UnionFind data_flow_deps;
 static std::vector<std::vector<expr_t> > input_to_branches;
@@ -284,7 +284,7 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       uint16_t remain = info->size % 8;
       uint64_t val = 0;
       for (uint16_t i = 0; i < chunks; i++) {
-        val = *(uint64_t*)&itr->second[i * 8];
+        val = *(uint64_t*)&(itr->second.get()[i * 8]);
         constraint->input_args.push_back(std::make_pair(false, val));
         constraint->const_num += 1;
         DEBUGF("memcmp constant chunk %d = 0x%lx\n", i, val);
@@ -292,7 +292,7 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       if (remain) {
         val = 0;
         for (uint16_t i = 0; i < remain; i++) {
-          val |= (uint64_t)itr->second[chunks * 8 + i] << (i * 8);
+          val |= (uint64_t)itr->second.get()[chunks * 8 + i] << (i * 8);
         }
         constraint->input_args.push_back(std::make_pair(false, val));
         constraint->const_num += 1;
@@ -1353,7 +1353,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   memcmp_msg *mmsg;
   dfsan_label_info *info;
   size_t msg_size;
-  std::shared_ptr<uint8_t[]> memcmp_const;
+  std::shared_ptr<uint8_t> memcmp_const;
   u32 num_tasks = 0;
 
   // clear all caches
@@ -1397,7 +1397,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
           break;
         }
         // save the content
-        memcmp_const = std::make_shared<uint8_t[]>(msg.result); // use shared_ptr to avoid memory leak
+        memcmp_const = std::make_shared<uint8_t>(msg.result); // use shared_ptr to avoid memory leak
         memcpy(memcmp_const.get(), mmsg->content, msg.result);
         memcmp_cache[msg.label] = memcmp_const;
         free(mmsg);
