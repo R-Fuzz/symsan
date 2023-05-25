@@ -1171,7 +1171,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     return NULL;
   }
   // try jigsaw first
-  //data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
+  data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
   data->solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {

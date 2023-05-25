@@ -125,11 +125,15 @@ struct SearchTask {
         } else {
           gidx = gitr->second;
         }
-        auto slot = cmap.find(gidx);
-        if (slot != cmap.end()) {
-          slot->second.push_back(i);
-        } else {
-          cmap.emplace(std::make_pair(gidx, std::vector<size_t>{i}));
+        // record input to constraint mapping
+        // skip memcmp constraints
+        if (cm->comparison != rgd::Memcmp && cm->comparison != rgd::MemcmpN) {
+          auto slot = cmap.find(gidx);
+          if (slot != cmap.end()) {
+            slot->second.push_back(i);
+          } else {
+            cmap.emplace(std::make_pair(gidx, std::vector<size_t>{i}));
+          }
         }
         // save the mapping between the local index (i.e., where the JIT'ed
         // function is going to read the input from) and the global index
@@ -145,7 +149,8 @@ struct SearchTask {
         last_offset = offset;
       }
       // FIXME: only support up to 64-bit for now
-      if (constraints[i]->local_map.size() > 8) {
+      if (comparisons[i] != rgd::Memcmp && comparisons[i] != rgd::MemcmpN
+          && constraints[i]->local_map.size() > 8) {
         cm->i2s_feasible = false;
       }
 
