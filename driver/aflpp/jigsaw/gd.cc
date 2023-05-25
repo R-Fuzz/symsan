@@ -11,6 +11,8 @@
 
 using namespace rgd;
 
+#define DEBUG 0
+
 #define likely(x)       __builtin_expect(!!(x), 1)
 #define unlikely(x)     __builtin_expect(!!(x), 0)
 
@@ -72,13 +74,19 @@ static void add_results(MutInput &input, std::shared_ptr<SearchTask> task) {
     result = ordered_inputs_v[i].second;
     length = task->shapes[start];
     if (length == 0) { ++i; continue; }
-    // first, concatenate the bytes according to the shape
-    for (int j = 1; j < length; ++j) {
-      result += (ordered_inputs_v[i + j].second << (8 * j));
-    }
-    // then extract the correct values, little endian
-    for (int j = 0; j < length; ++j) {
-      task->solution[start + j] = (uint8_t)((result >> (8 * j)) & 0xff);
+    if (length <= 8) { // 8 bytes or less
+      // first, concatenate the bytes according to the shape
+      for (int j = 1; j < length; ++j) {
+        result += (ordered_inputs_v[i + j].second << (8 * j));
+      }
+      // then extract the correct values, little endian
+      for (int j = 0; j < length; ++j) {
+        task->solution[start + j] = (uint8_t)((result >> (8 * j)) & 0xff);
+      }
+    } else { // if it's too large, just copy the value
+      for (int j = 0; j < length; ++j) {
+        task->solution[start + j] = ordered_inputs_v[i + j].second;
+      }
     }
     i += length;
   }
@@ -151,6 +159,12 @@ static uint64_t get_distance(uint32_t comp, uint64_t a, uint64_t b) {
       if ((int64_t)a >= (int64_t)b) return 0;
       else dis = b - a;
       break;
+    case rgd::Memcmp:
+      dis = a ^ 1;
+      break;
+    case rgd::MemcmpN:
+      dis = a;
+      break;
     default:
       assert(false && "Non-relational op!");
   }
@@ -165,7 +179,7 @@ static uint64_t single_distance(MutInput &input, std::vector<uint64_t> &distance
     auto& c = task->constraints[cons_id];
     auto& cm = task->consmeta[cons_id];
     int arg_idx = 0;
-    for (auto arg : cm->input_args) {
+    for (auto const &arg : cm->input_args) {
       if (arg.first) {// symbolic
         task->scratch_args[RET_OFFSET + arg_idx] = input.value[arg.second];
       } else {
@@ -195,7 +209,7 @@ static uint64_t distance(MutInput &input, std::vector<uint64_t> &distances, std:
     auto& cm = task->consmeta[i];
     // mapping symbolic args
     int arg_idx = 0;
-    for (auto arg : cm->input_args) {
+    for (auto const &arg : cm->input_args) {
       if (arg.first) { // symbolic
         task->scratch_args[RET_OFFSET + arg_idx] = input.value[arg.second];
       } else {
@@ -503,7 +517,7 @@ static uint64_t try_new_i2s_value(std::shared_ptr<const Constraint> &c, uint32_t
     i += 8;
   }
   int arg_idx = 0;
-  for (auto arg : c->input_args) {
+  for (auto const& arg : c->input_args) {
     // NOTE: using the constaints input_args here (instead of the consmeta's)
     // is fine because the constants are always the same
     if (!arg.first) task->scratch_args[RET_OFFSET + arg_idx] = arg.second;
@@ -521,64 +535,88 @@ static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, 
     auto& c = task->constraints[k];
     auto& cm = task->consmeta[k];
     if (task->min_distances[k] && cm->i2s_feasible) {
-      // check concatenated inputs against comparison operands
-      // FIXME: add support for other input encodings
-      uint64_t input = 0, input_r, value = 0, dis = -1;
-      int i = 0, t = c->local_map.size() * 8;
-      for (auto const& [offset, lidx] : c->local_map) {
-        input |= (input_min.get(cm->input_args[lidx].second) << i);
-        input_r |= (input_min.get(cm->input_args[lidx].second) << (t - i - 8));
-        i += 8;
-      }
-      if (input == cm->op1) {
-        value = get_i2s_value(cm->comparison, cm->op2, true);
-      } else if (input == cm->op2) {
-        value = get_i2s_value(cm->comparison, cm->op1, false);
-      } else {
-        goto try_reverse;
-      }
-
-      // test the new value
-      dis = try_new_i2s_value(c, cm->comparison, value, task);
-      if (dis == 0) {
-#if DEBUG
-        std::cout << "i2s updated c = " << k << " t = " << t << " input = " << input
-                  << " op1 = " << cm->op1 << " op2 = " << cm->op2
-                  << " cmp = " << cm->comparison << " value = " << value
-                  << " old-dis = " << task->min_distances[k] << " new-dis = " << dis << std::endl;
-#endif
-        // successful, update the real inputs
-        i = 0;
+      if (likely(isRelationalKind(cm->comparison))) {
+        // check concatenated inputs against comparison operands
+        // FIXME: add support for other input encodings
+        uint64_t input = 0, input_r, value = 0, dis = -1;
+        int i = 0, t = c->local_map.size() * 8;
         for (auto const& [offset, lidx] : c->local_map) {
-          uint8_t v = ((value >> i) & 0xff);
-          temp_input.set(cm->input_args[lidx].second, v);
+          input |= (input_min.get(cm->input_args[lidx].second) << i);
+          input_r |= (input_min.get(cm->input_args[lidx].second) << (t - i - 8));
           i += 8;
         }
-        updated = true;
-        continue;
-      }
+        if (input == cm->op1) {
+          value = get_i2s_value(cm->comparison, cm->op2, true);
+        } else if (input == cm->op2) {
+          value = get_i2s_value(cm->comparison, cm->op1, false);
+        } else {
+          goto try_reverse;
+        }
+
+        // test the new value
+        dis = try_new_i2s_value(c, cm->comparison, value, task);
+        if (dis == 0) {
+#if DEBUG
+          std::cout << "i2s updated c = " << k << " t = " << t << " input = " << input
+                    << " op1 = " << cm->op1 << " op2 = " << cm->op2
+                    << " cmp = " << cm->comparison << " value = " << value
+                    << " old-dis = " << task->min_distances[k] << " new-dis = " << dis << std::endl;
+#endif
+          // successful, update the real inputs
+          i = 0;
+          for (auto const& [offset, lidx] : c->local_map) {
+            uint8_t v = ((value >> i) & 0xff);
+            temp_input.set(cm->input_args[lidx].second, v);
+            i += 8;
+          }
+          updated = true;
+          continue;
+        }
 
 try_reverse:
-      // try reverse encoding
-      if (input_r == cm->op1) {
-        value = get_i2s_value(cm->comparison, cm->op2, true);
-      } else if (input_r == cm->op2) {
-        value = get_i2s_value(cm->comparison, cm->op1, false);
-      } else {
-        continue;
-      }
+        // try reverse encoding
+        if (input_r == cm->op1) {
+          value = get_i2s_value(cm->comparison, cm->op2, true);
+        } else if (input_r == cm->op2) {
+          value = get_i2s_value(cm->comparison, cm->op1, false);
+        } else {
+          continue;
+        }
 
-      // test the new value
-      value = SWAP64(value) >> (64 - t); // reverse the value
-      dis = try_new_i2s_value(c, cm->comparison, value, task);
-      if (dis == 0) {
-        // successful, update the real inputs
-        i = 0;
+        // test the new value
+        value = SWAP64(value) >> (64 - t); // reverse the value
+        dis = try_new_i2s_value(c, cm->comparison, value, task);
+        if (dis == 0) {
+          // successful, update the real inputs
+          i = 0;
+          for (auto const& [offset, lidx] : c->local_map) {
+            uint8_t v = ((value >> i) & 0xff);
+            // uint8_t v = ((value >> (t - i - 8)) & 0xff);
+            temp_input.set(cm->input_args[lidx].second, v);
+            i += 8;
+          }
+          updated = true;
+        }
+      } else if (cm->comparison == rgd::Memcmp) {
+        // memcmp(s1, s2) is i2s_feasible iff s1 is constant
+        // try copy s1 to s2
+        size_t const_index = 0;
+        for (auto const& arg : c->input_args) {
+          if (!arg.first) break;
+          const_index++;
+        }
+        int i = 0;
+        uint64_t value = 0;
         for (auto const& [offset, lidx] : c->local_map) {
+          if (i == 0)
+            value = c->input_args[const_index].second;
           uint8_t v = ((value >> i) & 0xff);
-          // uint8_t v = ((value >> (t - i - 8)) & 0xff);
           temp_input.set(cm->input_args[lidx].second, v);
           i += 8;
+          if (i == 64) {
+            const_index++; // move on to the next 64-bit chunk
+            i = 0;
+          }
         }
         updated = true;
       }
