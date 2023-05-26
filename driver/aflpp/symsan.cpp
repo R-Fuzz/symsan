@@ -772,6 +772,8 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->CopyFrom(*left);
           } else { // checking bool == false
             ret->set_kind(rgd::LNot);
+            ret->set_label(label);
+            ret->set_bits(1);
             ret->add_children()->CopyFrom(*left);
           }
         } else { // bvneq
@@ -779,6 +781,8 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->CopyFrom(*left);
           } else { // checking bool != true
             ret->set_kind(rgd::LNot);
+            ret->set_label(label);
+            ret->set_bits(1);
             ret->add_children()->CopyFrom(*left);
           }
         }
@@ -800,6 +804,8 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->CopyFrom(*right);
           } else { // checking false == bool
             ret->set_kind(rgd::LNot);
+            ret->set_label(label);
+            ret->set_bits(1);
             ret->add_children()->CopyFrom(*right);
           }
         } else { // bvneq
@@ -807,6 +813,8 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->CopyFrom(*right);
           } else { // checking true != bool
             ret->set_kind(rgd::LNot);
+            ret->set_label(label);
+            ret->set_bits(1);
             ret->add_children()->CopyFrom(*right);
           }
         }
@@ -1487,7 +1495,7 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
     *out_buf = data->output_buf;
   } else if (ret == rgd::SOLVER_TIMEOUT) {
     // if not solved, move on to next stage
-    data->cur_mutation_state = MUTATION_INVALID;
+    data->cur_mutation_state = MUTATION_IN_VALIDATION;
   } else if (ret == rgd::SOLVER_UNSAT) {
     // at any stage if the task is deemed unsolvable, just skip it
     DEBUGF("task not solvable\n");
