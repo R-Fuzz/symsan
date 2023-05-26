@@ -129,8 +129,10 @@ static const std::unordered_map<unsigned, std::pair<unsigned, const char*> > OP_
   {__dfsan::SExt,    {rgd::SExt, "sext"}},
   {__dfsan::Add,     {rgd::Add, "add"}},
   {__dfsan::Sub,     {rgd::Sub, "sub"}},
+  {__dfsan::Mul,     {rgd::Mul, "mul"}},
   {__dfsan::UDiv,    {rgd::UDiv, "udiv"}},
   {__dfsan::SDiv,    {rgd::SDiv, "sdiv"}},
+  {__dfsan::URem,    {rgd::URem, "urem"}},
   {__dfsan::SRem,    {rgd::SRem, "srem"}},
   {__dfsan::Shl,     {rgd::Shl, "shl"}},
   {__dfsan::LShr,    {rgd::LShr, "lshr"}},
@@ -504,6 +506,7 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
 
   // by communicative, we can parse the rhs first
   DEBUGF("simplify land: %d LAnd %d, %d\n", lhs, rhs, info->size);
+  assert(ret->children_size() == 0);
   rgd::AstNode *right = ret->add_children();
   bool rr = find_roots(rhs, right, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
@@ -582,6 +585,8 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
   }
 
   // by communicative, we can parse the rhs first
+  DEBUGF("simplify land: %d LOr %d, %d\n", lhs, rhs, info->size);
+  assert(ret->children_size() == 0);
   rgd::AstNode *right = ret->add_children();
   bool rr = find_roots(rhs, right, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
@@ -660,6 +665,8 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
   }
 
   // by communicative, we can parse the rhs first
+  DEBUGF("simplify land: %d LXor %d, %d\n", lhs, rhs, info->size);
+  assert(ret->children_size() == 0);
   rgd::AstNode *right = ret->add_children();
   bool rr = find_roots(rhs, right, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
@@ -746,6 +753,7 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
     bool lr = false, rr = false;
     std::shared_ptr<rgd::AstNode> left = std::make_shared<rgd::AstNode>();
     std::shared_ptr<rgd::AstNode> right = std::make_shared<rgd::AstNode>();
+    visited.clear(); // don't carry visited info across subtrees, to properly collect input deps
     auto &deps = branch_to_inputs[label]; // get the input deps of this branch
     if (info->l1 >= CONST_OFFSET) {
       lr = find_roots(strip_zext(info->l1), left.get(), deps, subroots, visited);
@@ -774,6 +782,7 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->add_children()->CopyFrom(*left);
           }
         }
+        return true;
       } else {
         // bool icmp bool ?!
         WARNF("bool icmp bool ?!\n");
@@ -801,6 +810,7 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->add_children()->CopyFrom(*right);
           }
         }
+        return true;
       } else {
         // bool icmp bool ?!
         WARNF("bool icmp bool ?!\n");
@@ -825,6 +835,7 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
     bool s1_r = false, s2_r = false;
     std::shared_ptr<rgd::AstNode> s1 = std::make_shared<rgd::AstNode>();
     std::shared_ptr<rgd::AstNode> s2 = std::make_shared<rgd::AstNode>();
+    visited.clear(); // don't carry visited info across subtrees
     auto &deps = branch_to_inputs[label]; // get the input deps of this branch
     if (info->l1 >= CONST_OFFSET) {
       s1_r = find_roots(info->l1, s1.get(), deps, subroots, visited);
