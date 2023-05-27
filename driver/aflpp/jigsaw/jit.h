@@ -3,7 +3,7 @@
 
 #include <memory>
 
-#include "rgd.pb.h"
+#include "ast.h"
 #include "task.h"
 
 namespace rgd {
