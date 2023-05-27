@@ -126,10 +126,10 @@ namespace rgd {
 
   class AstNode {
   public:
-    AstNode() : child0_(0), child1_(0), kind_(0), bits_(0), index_(0),
+    AstNode(int size=32) : child0_(0), child1_(0), kind_(0), bits_(0), index_(0),
       boolvalue_(0), is_root_(1), label_(0), hash_(0) {
       root_ = new std::vector<AstNode>(); // only allocate if is root
-      root_->reserve(32); // default capacity
+      root_->reserve(size); // default capacity
       root_->emplace_back(AstNode(root_)); // add a dummy root
     }
     AstNode(std::vector<AstNode> *r) : root_(r), child0_(0), child1_(0),
@@ -169,7 +169,7 @@ namespace rgd {
 
     AstNode* add_children() {
       size_t size = root_->size();
-      assert(size < UINT32_MAX);
+      assert(size + 1 < root_->capacity() && "cannot resize");
       if (child0_ == 0) child0_ = size;
       else if (child1_ == 0) child1_ = size;
       else assert(false && "too many children");

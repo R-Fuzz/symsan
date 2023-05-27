@@ -164,6 +164,7 @@ static std::unordered_map<dfsan_label, expr_t> root_expr_cache;
 static std::unordered_map<dfsan_label, constraint_t> constraint_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<size_t> > branch_to_inputs;
 static std::unordered_map<dfsan_label, std::shared_ptr<uint8_t>> memcmp_cache;
+static std::unordered_map<dfsan_label, size_t> ast_size_cache;
 // FIXME: global input dependency forests
 static rgd::UnionFind data_flow_deps;
 static std::vector<std::vector<expr_t> > input_to_branches;
@@ -173,6 +174,7 @@ static void reset_global_caches(size_t buf_size) {
   constraint_cache.clear();
   branch_to_inputs.clear();
   memcmp_cache.clear();
+  ast_size_cache.clear();
   data_flow_deps.reset(buf_size);
   for (auto &s: input_to_branches) {
     s.clear();
@@ -430,8 +432,11 @@ parse_constraint(dfsan_label label, const u8 *buf, size_t buf_size) {
   dfsan_label_info *info = get_label_info(label);
   assert(((info->op & 0xff) == __dfsan::ICmp) || (info->op == __dfsan::fmemcmp));
 
+  // retrieve the ast size
+  auto itr = ast_size_cache.find(label);
+  assert(itr != ast_size_cache.end() && itr->second > 0);
   std::unordered_set<dfsan_label> visited;
-  constraint_t constraint = std::make_shared<rgd::Constraint>();
+  constraint_t constraint = std::make_shared<rgd::Constraint>(itr->second);
   if (!do_uta_rel(label, constraint->ast.get(), buf, buf_size, constraint, visited)) {
     return nullptr;
   }
@@ -467,6 +472,7 @@ static task_t construct_task(std::vector<const rgd::AstNode*> clause,
 }
 
 static bool find_roots(dfsan_label label, rgd::AstNode *ret,
+                       size_t &tree_size,
                        std::unordered_set<size_t> &input_deps,
                        std::unordered_set<dfsan_label> &subroots,
                        std::unordered_set<dfsan_label> &visited);
@@ -488,6 +494,7 @@ static dfsan_label strip_zext(dfsan_label label) {
 }
 
 static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
+                          size_t &tree_size,
                           std::unordered_set<size_t> &input_deps,
                           std::unordered_set<dfsan_label> &subroots,
                           std::unordered_set<dfsan_label> &visited) {
@@ -497,10 +504,11 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
   dfsan_label rhs = strip_zext(info->l2);
   if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
     // if nothing go stripped, we can't simplify
-    bool r = find_roots(rhs, ret, input_deps, subroots, visited);
+    bool r = find_roots(rhs, ret, tree_size, input_deps, subroots, visited);
     if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, input_deps, subroots, visited);
+      r |= find_roots(lhs, ret, tree_size, input_deps, subroots, visited);
     }
+    tree_size += 2;
     return r;
   }
 
@@ -508,7 +516,8 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
   DEBUGF("simplify land: %d LAnd %d, %d\n", lhs, rhs, info->size);
   assert(ret->children_size() == 0);
   rgd::AstNode *right = ret->add_children();
-  bool rr = find_roots(rhs, right, input_deps, subroots, visited);
+  tree_size += 1;
+  bool rr = find_roots(rhs, right, tree_size, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
   // if nothing added, rhs must be a constant
   if (unlikely(!rr)) {
@@ -534,7 +543,8 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
     }
   } else {
     rgd::AstNode *left = ret->add_children();
-    bool lr = find_roots(lhs, left, input_deps, subroots, visited);
+    tree_size += 1;
+    bool lr = find_roots(lhs, left, tree_size, input_deps, subroots, visited);
     assert(left->bits() == 1); // lhs must be a boolean after parsing
     // if nothing added, lhs must be a constant
     if (unlikely(!lr)) {
@@ -565,6 +575,7 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
 }
 
 static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
+                         size_t &tree_size,
                          std::unordered_set<size_t> &input_deps,
                          std::unordered_set<dfsan_label> &subroots,
                          std::unordered_set<dfsan_label> &visited) {
@@ -574,10 +585,11 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
   dfsan_label rhs = strip_zext(info->l2);
   if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
     // if nothing go stripped, we can't simplify
-    bool r = find_roots(rhs, ret, input_deps, subroots, visited);
+    bool r = find_roots(rhs, ret, tree_size, input_deps, subroots, visited);
     if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, input_deps, subroots, visited);
+      r |= find_roots(lhs, ret, tree_size, input_deps, subroots, visited);
     }
+    tree_size += 2;
     return r;
   }
 
@@ -585,7 +597,8 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
   DEBUGF("simplify land: %d LOr %d, %d\n", lhs, rhs, info->size);
   assert(ret->children_size() == 0);
   rgd::AstNode *right = ret->add_children();
-  bool rr = find_roots(rhs, right, input_deps, subroots, visited);
+  tree_size += 1;
+  bool rr = find_roots(rhs, right, tree_size, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
   // if nothing added, rhs must be a constant
   if (unlikely(!rr)) {
@@ -611,7 +624,8 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
     }
   } else {
     rgd::AstNode *left = ret->add_children();
-    bool lr = find_roots(lhs, left, input_deps, subroots, visited);
+    tree_size += 1;
+    bool lr = find_roots(lhs, left, tree_size, input_deps, subroots, visited);
     assert(left->bits() == 1); // lhs must be a boolean after parsing
     // if nothing added, lhs must be a constant
     if (unlikely(!lr)) {
@@ -641,6 +655,7 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
 }
 
 static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
+                         size_t &tree_size,
                          std::unordered_set<size_t> &input_deps,
                          std::unordered_set<dfsan_label> &subroots,
                          std::unordered_set<dfsan_label> &visited) {
@@ -650,10 +665,11 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
   dfsan_label rhs = strip_zext(info->l2);
   if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
     // if nothing go stripped, we can't simplify
-    bool r = find_roots(rhs, ret, input_deps, subroots, visited);
+    bool r = find_roots(rhs, ret, tree_size, input_deps, subroots, visited);
     if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, input_deps, subroots, visited);
+      r |= find_roots(lhs, ret, tree_size, input_deps, subroots, visited);
     }
+    tree_size += 2;
     return r;
   }
 
@@ -661,7 +677,8 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
   DEBUGF("simplify land: %d LXor %d, %d\n", lhs, rhs, info->size);
   assert(ret->children_size() == 0);
   rgd::AstNode *right = ret->add_children();
-  bool rr = find_roots(rhs, right, input_deps, subroots, visited);
+  tree_size += 1;
+  bool rr = find_roots(rhs, right, tree_size, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
   ret->set_bits(1);
   if (unlikely(!rr)) {
@@ -686,7 +703,8 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
     }
   } else {
     rgd::AstNode *left = ret->add_children();
-    bool lr = find_roots(lhs, left, input_deps, subroots, visited);
+    tree_size += 1;
+    bool lr = find_roots(lhs, left, tree_size, input_deps, subroots, visited);
     if (unlikely(!lr)) {
       // if nothing added, lhs must be a constant
       assert(left->kind() == rgd::Bool);
@@ -703,6 +721,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
 }
 
 static bool find_roots(dfsan_label label, rgd::AstNode *ret,
+                       size_t &tree_size,
                        std::unordered_set<size_t> &input_deps,
                        std::unordered_set<dfsan_label> &subroots,
                        std::unordered_set<dfsan_label> &visited) {
@@ -714,9 +733,11 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
   dfsan_label_info *info = get_label_info(label);
 
   if (info->op == 0) {
+    tree_size += 1;
     input_deps.insert(info->op1.i);
     return false;
   } else if (info->op == __dfsan::Load) {
+    tree_size += 1;
     uint64_t offset = get_label_info(info->l1)->op1.i;
     for (size_t i = 0; i < info->l2; ++i)
       input_deps.insert(offset + i);
@@ -725,31 +746,33 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
 
   // check for visited after input deps have been added
   if (visited.count(label)) {
+    tree_size += 1;
     return false;
   }
   visited.insert(label);
 
   // possible boolean operations
   if (info->op == __dfsan::And) {
-    return simplify_land(info, ret, input_deps, subroots, visited);
+    return simplify_land(info, ret, tree_size, input_deps, subroots, visited);
   } else if (info->op == __dfsan::Or) {
-    return simplify_lor(info, ret, input_deps, subroots, visited);
+    return simplify_lor(info, ret, tree_size, input_deps, subroots, visited);
   } else if (info->op == __dfsan::Xor) {
-    return simplify_xor(info, ret, input_deps, subroots, visited);
+    return simplify_xor(info, ret, tree_size, input_deps, subroots, visited);
   } else if ((info->op & 0xff) == __dfsan::ICmp) {
     // if it's a comparison, we need to make sure both operands don't
     // contain any additional comparison operator
     bool lr = false, rr = false;
     rgd::AstNode *left = ret->add_children();
     rgd::AstNode *right = ret->add_children();
+    size_t left_size = 0, right_size = 0;
     visited.clear(); // don't carry visited info across subtrees, to properly collect input deps
     auto &deps = branch_to_inputs[label]; // get the input deps of this branch
     if (info->l1 >= CONST_OFFSET) {
-      lr = find_roots(strip_zext(info->l1), left, deps, subroots, visited);
-    }
+      lr = find_roots(strip_zext(info->l1), left, left_size, deps, subroots, visited);
+    } else { left_size = 1; }
     if (info->l2 >= CONST_OFFSET) {
-      rr = find_roots(strip_zext(info->l2), right, deps, subroots, visited);
-    }
+      rr = find_roots(strip_zext(info->l2), right, right_size, deps, subroots, visited);
+    } else { right_size = 1; }
     input_deps.insert(deps.begin(), deps.end()); // propagate input deps
     if (unlikely(lr)) {
       // if there are additional icmp in lhs, this icmp must be simplifiable
@@ -773,6 +796,7 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->clear_children(1);
           }
         }
+        tree_size += left_size;
         return true;
       } else {
         // bool icmp bool ?!
@@ -803,12 +827,14 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->clear_children(0);
           }
         }
+        tree_size += right_size;
         return true;
       } else {
         // bool icmp bool ?!
         WARNF("bool icmp bool ?!\n");
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(0);
+        ret->clear_children();
         return false;
       }
     } else {
@@ -819,6 +845,8 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
       ret->set_kind(itr->second.first);
       ret->set_label(label);
       ret->clear_children();
+      // true subroot, save the size of this subtree
+      ast_size_cache.insert({label, left_size + right_size});
 #ifdef DEBUG
       subroots.insert(label);
 #endif
@@ -829,19 +857,22 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
     bool s1_r = false, s2_r = false;
     rgd::AstNode *s1 = ret->add_children();
     rgd::AstNode *s2 = ret->add_children();
+    size_t s1_size = 0, s2_size = 0;
     visited.clear(); // don't carry visited info across subtrees
     auto &deps = branch_to_inputs[label]; // get the input deps of this branch
     if (info->l1 >= CONST_OFFSET) {
-      s1_r = find_roots(info->l1, s1, deps, subroots, visited);
-    }
+      s1_r = find_roots(info->l1, s1, s1_size, deps, subroots, visited);
+    } else { s1_size = 1;}
     assert(info->l2 >= CONST_OFFSET);
-    s2_r = find_roots(info->l2, s2, deps, subroots, visited);
+    s2_r = find_roots(info->l2, s2, s2_size, deps, subroots, visited);
     input_deps.insert(deps.begin(), deps.end()); // propagate input deps
     assert(!s1_r && !s2_r && "memcmp should not have additional icmp");
     ret->set_bits(1); // XXX: treat memcmp as a boolean
     ret->set_kind(rgd::Memcmp); // fix later
     ret->set_label(label);
     ret->clear_children();
+    // true subroot, save the size of this subtree
+    ast_size_cache.insert({label, s1_size + s2_size});
 #ifdef DEBUG
     subroots.insert(label);
 #endif
@@ -851,11 +882,12 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
   // for all other cases, just visit the operands
   bool r = false;
   if (likely(info->l2 >= CONST_OFFSET)) {
-    r |= find_roots(info->l2, ret, input_deps, subroots, visited);
+    r |= find_roots(info->l2, ret, tree_size, input_deps, subroots, visited);
   }
   if (info->l1 >= CONST_OFFSET) {
-    r |= find_roots(info->l1, ret, input_deps, subroots, visited);
+    r |= find_roots(info->l1, ret, tree_size, input_deps, subroots, visited);
   }
+  tree_size += 2; // count two children to be conservative
   return r;
 }
 
@@ -965,12 +997,14 @@ static inline expr_t get_root_expr(dfsan_label label) {
     root = std::make_shared<rgd::AstNode>();
     std::unordered_set<dfsan_label> subroots;
     std::unordered_set<dfsan_label> visited;
+    size_t tree_size = 0;
     // FIXME: implicitly updated here, not very clean
     auto &deps = branch_to_inputs[label];
     // we start by constructing a boolean formula with relational expressions
     // as leaf nodes
-    find_roots(label, root.get(), deps, subroots, visited);
+    find_roots(label, root.get(), tree_size, deps, subroots, visited);
     root_expr_cache.insert({label, root});
+    ast_size_cache.insert({label, tree_size});
 #if DEBUG
     for (auto const& subroot : subroots) {
       DEBUGF("subroot: %d\n", subroot);
