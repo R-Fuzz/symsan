@@ -16,22 +16,12 @@ if (NOT DEFINED AFLPP_PATH OR NOT AFLPP_PATH)
   message(FATAL_ERROR "AFL++ directory not defined !")
 endif()
 
-# Proto file
-find_package(Protobuf REQUIRED)
-include_directories(${PROTOBUF_INCLUDE_DIRS})
-include_directories(${CMAKE_CURRENT_BINARY_DIR})
-protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS rgd.proto)
-add_custom_target(proto ALL DEPENDS ${PROTO_SRCS} ${PROTO_SRCS})
-
 add_subdirectory(jigsaw)
-add_dependencies(jigsaw proto)
 
 add_library(SymSanMutator SHARED
   symsan.cpp
   z3-solver.cpp
   jit-solver.cpp
-  ${PROTO_SRCS}
-  ${PROTO_HDRS}
 )
 
 target_include_directories(SymSanMutator PRIVATE
@@ -41,10 +31,10 @@ target_include_directories(SymSanMutator PRIVATE
 )
 
 target_link_libraries(SymSanMutator
-  ${PROTOBUF_LIBRARIES}
   tcmalloc
   z3
   jigsaw
+  profiler
 )
 
 install (TARGETS SymSanMutator DESTINATION ${SYMSAN_BIN_DIR})

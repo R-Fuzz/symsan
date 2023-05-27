@@ -1,8 +1,8 @@
 #pragma once
 
-#include "rgd.pb.h"
-
 #include <stdint.h>
+#include <assert.h>
+#include <vector>
 #include <string>
 
 namespace rgd {
@@ -101,14 +101,14 @@ namespace rgd {
     "MemcmpN",
   };
 
-  static inline bool isRelationalKind(uint32_t kind) {
+  static inline bool isRelationalKind(uint16_t kind) {
     if (kind >= Equal && kind <= Sge)
       return true;
     else
       return false;
   }
 
-  static inline uint32_t negate_cmp(uint32_t kind) {
+  static inline uint16_t negate_cmp(uint16_t kind) {
     switch (kind) {
       case Equal: return Distinct;
       case Distinct: return Equal;
@@ -123,6 +123,120 @@ namespace rgd {
       default: return Bool;
     }
   }
+
+  class AstNode {
+  public:
+    AstNode() : child0_(0), child1_(0), kind_(0), bits_(0), index_(0),
+      boolvalue_(0), is_root_(1), label_(0), hash_(0) {
+      root_ = new std::vector<AstNode>(); // only allocate if is root
+      root_->reserve(32); // default capacity
+      root_->emplace_back(AstNode(root_)); // add a dummy root
+    }
+    AstNode(std::vector<AstNode> *r) : root_(r), child0_(0), child1_(0),
+      kind_(0), bits_(0), index_(0), boolvalue_(0), is_root_(0), label_(0),
+      hash_(0) {} // don't allocate if not root
+    ~AstNode() { if (is_root_) delete root_; }
+
+    inline void CopyFrom(const AstNode& other) {
+      if (this->root_ == other.root_) {
+        // don't change is_root_ flag
+        child0_ = other.child0_;
+        child1_ = other.child1_;
+        kind_ = other.kind_;
+        bits_ = other.bits_;
+        index_ = other.index_;
+        boolvalue_ = other.boolvalue_;
+        label_ = other.label_;
+        hash_ = other.hash_;
+      } else {
+        RecursiveCopyFrom(other);
+      }
+    }
+
+    inline uint32_t children_size() const {
+      return (!!child0_) + (!!child1_);
+    }
+
+    inline const AstNode& children(uint32_t i) const {
+      assert(i < 2);
+      return i == 0 ? root_->at(child0_) : root_->at(child1_);
+    }
+
+    inline AstNode* mutable_children(uint32_t i) {
+      assert(i < 2);
+      return i == 0 ? &root_->at(child0_) : &root_->at(child1_);
+    }
+
+    AstNode* add_children() {
+      size_t size = root_->size();
+      assert(size < UINT32_MAX);
+      if (child0_ == 0) child0_ = size;
+      else if (child1_ == 0) child1_ = size;
+      else assert(false && "too many children");
+      root_->emplace_back(AstNode(root_));
+      return &root_->back();
+    }
+
+    inline void clear_children() { child0_ = child1_ = 0; }
+    inline void clear_children(uint32_t i) {
+      assert(i < 2);
+      if (i == 1) child1_ = 0;
+      else child0_ = child1_; // pop child1 to child0
+    }
+
+    inline uint16_t kind() const { return kind_; }
+    inline void set_kind(uint16_t kind) { kind_ = kind; }
+    inline uint16_t bits() const { return bits_; }
+    inline void set_bits(uint16_t bits) { bits_ = bits; }
+    inline uint32_t index() const { return index_; }
+    inline void set_index(uint32_t index) { index_ = index; }
+    inline uint8_t boolvalue() const { return boolvalue_; }
+    inline void set_boolvalue(uint8_t value) { boolvalue_ = value ? 0 : 1; }
+    inline uint32_t label() const { return label_; }
+    inline void set_label(uint32_t label) { label_ = label; }
+    inline uint32_t hash() const { return hash_; }
+    inline void set_hash(uint32_t hash) { hash_ = hash; }
+  private:
+    std::vector<AstNode> *root_; // root of the AST
+    uint32_t child0_;
+    uint32_t child1_;
+    uint16_t kind_;
+    uint16_t bits_;
+    uint32_t index_ : 30;  //used by read expr for index and extract expr
+    uint8_t boolvalue_ : 1;  //used by bool expr
+    uint8_t is_root_ : 1; // true if this is the root of the AST
+    uint32_t label_;  //for expression dedup
+    uint32_t hash_;  //for node dedup
+
+    void RecursiveCopyFrom(const AstNode &other) {
+      // copy children
+      if (other.child0_) {
+        if (this->child0_ == 0) {
+          child0_ = root_->size();
+          root_->emplace_back(AstNode(root_));
+        }
+        root_->at(child0_).RecursiveCopyFrom(other.children(0));
+      } else {
+        child0_ = 0;
+      }
+      if (other.child1_) {
+        if (this->child1_ == 0) {
+          child1_ = root_->size();
+          root_->emplace_back(AstNode(root_));
+        }
+        root_->at(child1_).RecursiveCopyFrom(other.children(1));
+      } else {
+        child1_ = 0;
+      }
+      // copy other fields
+      kind_ = other.kind_;
+      bits_ = other.bits_;
+      index_ = other.index_;
+      boolvalue_ = other.boolvalue_;
+      label_ = other.label_;
+      hash_ = other.hash_;
+    }
+  };
 
   static bool isEqualAstRecursive(const AstNode& lhs, const AstNode& rhs) {
     
