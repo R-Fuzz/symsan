@@ -529,9 +529,7 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
       return false;
     } else {
       assert(info->op1.i == 1); // 1 LAnd x = x
-      rgd::AstNode temp;
-      temp.CopyFrom(*right);
-      ret->CopyFrom(temp); // XXX: CopyFrom will clear the children?
+      ret->CopyFrom(*right);
       return rr;
     }
   } else {
@@ -554,15 +552,14 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
         return false;
       } else { // 1 LAnd x = x
         // lhs is 1, rhs is not
-        rgd::AstNode temp;
-        temp.CopyFrom(*right);
-        ret->CopyFrom(temp);
+        ret->CopyFrom(*right);
         return rr;
       }
     }
   }
 
   ret->set_kind(rgd::LAnd);
+  assert(ret->children_size() == 2);
   ret->set_bits(1);
   return true;
 }
@@ -609,9 +606,7 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
       return false;
     } else { // 0 LOr x = x
       assert(info->op1.i == 0);
-      rgd::AstNode temp;
-      temp.CopyFrom(*right);
-      ret->CopyFrom(temp);
+      ret->CopyFrom(*right);
       return rr;
     }
   } else {
@@ -634,9 +629,7 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
         return false;
       } else { // 0 LOr x = x
         // lhs is 0, rhs is not
-        rgd::AstNode temp;
-        temp.CopyFrom(*right);
-        ret->CopyFrom(temp);
+        ret->CopyFrom(*right);
         return rr;
       }
     }
@@ -688,9 +681,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
       ret->set_kind(rgd::LNot);
       return true;
     } else { // 0 LXor x = x
-      rgd::AstNode temp;
-      temp.CopyFrom(*right);
-      ret->CopyFrom(temp);
+      ret->CopyFrom(*right);
       return rr;
     }
   } else {
@@ -700,9 +691,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
       // if nothing added, lhs must be a constant
       assert(left->kind() == rgd::Bool);
       if (left->boolvalue() == 0) { // 0 LXor x = x
-        rgd::AstNode temp;
-        temp.CopyFrom(*right);
-        ret->CopyFrom(temp);
+        ret->CopyFrom(*right);
       } else { // 1 LXor x = LNot x
         ret->set_kind(rgd::LNot);
       }
@@ -751,15 +740,15 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
     // if it's a comparison, we need to make sure both operands don't
     // contain any additional comparison operator
     bool lr = false, rr = false;
-    std::shared_ptr<rgd::AstNode> left = std::make_shared<rgd::AstNode>();
-    std::shared_ptr<rgd::AstNode> right = std::make_shared<rgd::AstNode>();
+    rgd::AstNode *left = ret->add_children();
+    rgd::AstNode *right = ret->add_children();
     visited.clear(); // don't carry visited info across subtrees, to properly collect input deps
     auto &deps = branch_to_inputs[label]; // get the input deps of this branch
     if (info->l1 >= CONST_OFFSET) {
-      lr = find_roots(strip_zext(info->l1), left.get(), deps, subroots, visited);
+      lr = find_roots(strip_zext(info->l1), left, deps, subroots, visited);
     }
     if (info->l2 >= CONST_OFFSET) {
-      rr = find_roots(strip_zext(info->l2), right.get(), deps, subroots, visited);
+      rr = find_roots(strip_zext(info->l2), right, deps, subroots, visited);
     }
     input_deps.insert(deps.begin(), deps.end()); // propagate input deps
     if (unlikely(lr)) {
@@ -772,18 +761,16 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->CopyFrom(*left);
           } else { // checking bool == false
             ret->set_kind(rgd::LNot);
-            ret->set_label(label);
             ret->set_bits(1);
-            ret->add_children()->CopyFrom(*left);
+            ret->clear_children(1);
           }
         } else { // bvneq
           if (info->op2.i == 0) { // checking bool != false
             ret->CopyFrom(*left);
           } else { // checking bool != true
             ret->set_kind(rgd::LNot);
-            ret->set_label(label);
             ret->set_bits(1);
-            ret->add_children()->CopyFrom(*left);
+            ret->clear_children(1);
           }
         }
         return true;
@@ -804,18 +791,16 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
             ret->CopyFrom(*right);
           } else { // checking false == bool
             ret->set_kind(rgd::LNot);
-            ret->set_label(label);
             ret->set_bits(1);
-            ret->add_children()->CopyFrom(*right);
+            ret->clear_children(0);
           }
         } else { // bvneq
           if (info->op1.i == 0) { // checking false != bool
             ret->CopyFrom(*right);
           } else { // checking true != bool
             ret->set_kind(rgd::LNot);
-            ret->set_label(label);
             ret->set_bits(1);
-            ret->add_children()->CopyFrom(*right);
+            ret->clear_children(0);
           }
         }
         return true;
@@ -833,6 +818,7 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
       assert(itr != OP_MAP.end());
       ret->set_kind(itr->second.first);
       ret->set_label(label);
+      ret->clear_children();
 #ifdef DEBUG
       subroots.insert(label);
 #endif
@@ -841,20 +827,21 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
   } else if (info->op == __dfsan::fmemcmp) {
     // memcmp is also considered as a root node (relational comparison)
     bool s1_r = false, s2_r = false;
-    std::shared_ptr<rgd::AstNode> s1 = std::make_shared<rgd::AstNode>();
-    std::shared_ptr<rgd::AstNode> s2 = std::make_shared<rgd::AstNode>();
+    rgd::AstNode *s1 = ret->add_children();
+    rgd::AstNode *s2 = ret->add_children();
     visited.clear(); // don't carry visited info across subtrees
     auto &deps = branch_to_inputs[label]; // get the input deps of this branch
     if (info->l1 >= CONST_OFFSET) {
-      s1_r = find_roots(info->l1, s1.get(), deps, subroots, visited);
+      s1_r = find_roots(info->l1, s1, deps, subroots, visited);
     }
     assert(info->l2 >= CONST_OFFSET);
-    s2_r = find_roots(info->l2, s2.get(), deps, subroots, visited);
+    s2_r = find_roots(info->l2, s2, deps, subroots, visited);
     input_deps.insert(deps.begin(), deps.end()); // propagate input deps
     assert(!s1_r && !s2_r && "memcmp should not have additional icmp");
     ret->set_bits(1); // XXX: treat memcmp as a boolean
     ret->set_kind(rgd::Memcmp); // fix later
     ret->set_label(label);
+    ret->clear_children();
 #ifdef DEBUG
     subroots.insert(label);
 #endif
@@ -894,9 +881,7 @@ static void to_nnf(bool expected_r, rgd::AstNode *node) {
       rgd::AstNode *child = node->mutable_children(0);
       // transform the child, now looking for a true formula
       to_nnf(true, child);
-      rgd::AstNode tmp;
-      tmp.CopyFrom(*child);
-      node->CopyFrom(tmp);
+      node->CopyFrom(*child);
     } else if (node->kind() == rgd::LAnd) {
       // De Morgan's law
       assert(node->children_size() == 2);
@@ -928,9 +913,7 @@ static void to_nnf(bool expected_r, rgd::AstNode *node) {
       rgd::AstNode *child = node->mutable_children(0);
       // negate the child, now looking for a false formula
       to_nnf(false, child);
-      rgd::AstNode tmp;
-      tmp.CopyFrom(*child);
-      node->CopyFrom(tmp);
+      node->CopyFrom(*child);
     } else if (node->kind() == rgd::Memcmp) {
       // memcmp is also considered as a leaf node (relational comparison)
       // memcmp == 1 actually means s1 != s2
