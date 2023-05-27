@@ -625,9 +625,7 @@ static int simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
         return NONE_CMP_NODE;
       } else { // 1 LAnd x = x
         // lhs is 1, rhs is not
-        rgd::AstNode temp;
-        temp.CopyFrom(*right);
-        ret->CopyFrom(temp);
+        ret->CopyFrom(*right);
         return rr;
       }
     } else if (rr == NONE_CMP_NODE) {
@@ -688,9 +686,7 @@ static int simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
       return NONE_CMP_NODE;
     } else { // 0 LOr x = x
       assert(info->op1.i == 0);
-      rgd::AstNode temp;
-      temp.CopyFrom(*right);
-      ret->CopyFrom(temp);
+      ret->CopyFrom(*right);
       return rr;
     }
   } else {
@@ -714,9 +710,7 @@ static int simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
         return NONE_CMP_NODE;
       } else { // 0 LOr x = x
         // lhs is 0, rhs is not
-        rgd::AstNode temp;
-        temp.CopyFrom(*right);
-        ret->CopyFrom(temp);
+        ret->CopyFrom(*right);
         return rr;
       }
     } else if (rr == NONE_CMP_NODE) {
@@ -1062,9 +1056,7 @@ static void to_nnf(bool expected_r, rgd::AstNode *node) {
       rgd::AstNode *child = node->mutable_children(0);
       // transform the child, now looking for a true formula
       to_nnf(true, child);
-      rgd::AstNode tmp;
-      tmp.CopyFrom(*child);
-      node->CopyFrom(tmp);
+      node->CopyFrom(*child);
     } else if (node->kind() == rgd::LAnd) {
       // De Morgan's law
       assert(node->children_size() == 2);
