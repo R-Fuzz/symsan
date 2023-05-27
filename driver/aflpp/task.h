@@ -20,8 +20,9 @@ typedef void(*test_fn_type)(uint64_t*);
 static const int RET_OFFSET = 2;
 
 struct Constraint {
-  Constraint(): fn(nullptr), const_num(0) {
-    ast = std::make_shared<AstNode>();
+  Constraint() = delete;
+  Constraint(int ast_size): fn(nullptr), const_num(0) {
+    ast = std::make_shared<AstNode>(ast_size);
   }
   const AstNode *get_root() const { return const_cast<const AstNode*>(ast.get()); }
 
