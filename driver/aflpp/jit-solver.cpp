@@ -79,6 +79,7 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
     if (c->fn == nullptr) {
       struct myKV *res = fCache.find(c->ast);
       if (res == nullptr) {
+        cache_misses++;
         DEBUGF("jit constraint %d\n", c->ast->label());
         uint64_t id = ++uuid;
         addFunction(c->get_root(), c->local_map, id);
@@ -88,6 +89,7 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
           delete kv;
         const_cast<Constraint*>(c.get())->fn = fn; // XXX: workaround, no concurrent access
       } else {
+        cache_hits++;
         const_cast<Constraint*>(c.get())->fn = res->fn; // XXX: workaround
       }
     }
@@ -103,9 +105,20 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
       DEBUGF("generate_input offset:%zu => %u\n", offset, value);
       out_buf[offset] = value;
     }
+    num_solved++;
     return SOLVER_SAT;
   } else {
     DEBUGF("timeout\n");
+    num_timeout++;
     return SOLVER_TIMEOUT;
   }
+}
+
+void JITSolver::print_stats() {
+  fprintf(stderr, "JIT solver stats:\n");
+  fprintf(stderr, "  uuid: %lu\n", uuid.load());
+  fprintf(stderr, "  cache hits: %lu\n", cache_hits.load());
+  fprintf(stderr, "  cache misses: %lu\n", cache_misses.load());
+  fprintf(stderr, "  num solved: %lu\n", num_solved.load());
+  fprintf(stderr, "  num timeout: %lu\n", num_timeout.load());
 }
