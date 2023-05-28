@@ -16,6 +16,7 @@ extern "C" {
 #include "afl-fuzz.h"
 }
 
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -46,6 +47,8 @@ using namespace __dfsan;
 #endif
 
 #define NEED_OFFLINE 0
+
+#define PRINT_STATS 0
 
 static bool NestedSolving = true;
 
@@ -168,6 +171,13 @@ static std::unordered_map<dfsan_label, size_t> ast_size_cache;
 // FIXME: global input dependency forests
 static rgd::UnionFind data_flow_deps;
 static std::vector<std::vector<expr_t> > input_to_branches;
+// staticstics
+static uint64_t total_branches = 0;
+static uint64_t branches_to_solve = 0;
+static uint64_t total_tasks = 0;
+static std::map<uint64_t, uint64_t> task_size_dist;
+static uint64_t solved_tasks = 0;
+static uint64_t solved_branches = 0;
 
 static void reset_global_caches(size_t buf_size) {
   root_expr_cache.clear();
@@ -1158,6 +1168,8 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
     return;
   }
 
+  total_branches += 1;
+
   const branch_ctx_t ctx = my_mutator->cov_mgr->add_branch((void*)msg.addr,
       msg.id, msg.result != 0, msg.context, false, false);
 
@@ -1173,7 +1185,11 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
     // add the tasks to the task manager
     for (auto const& task : tasks) {
       my_mutator->task_mgr->add_task(neg_ctx, task);
+      task_size_dist[task->constraints.size()] += 1;
     }
+
+    total_tasks += tasks.size();
+    branches_to_solve += 1;
   }
 
   if (msg.flags & F_ADD_CONS) {
@@ -1459,6 +1475,22 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
 
 }
 
+static void print_stats(my_mutator_t *data) {
+  fprintf(stderr,
+    "Total branches: %zu,\n"\
+    "Total tasks: %zu,\n"\
+    "Solved tasks: %zu,\n"\
+    "Solved branches: %zu\n",
+    total_branches, total_tasks, solved_tasks, solved_branches);
+  fprintf(stderr, "Task size distribution:\n");
+  for (auto const& kv : task_size_dist) {
+    fprintf(stderr, "\t %zu: %zu\n", kv.first, kv.second);
+  }
+  for (auto &solver : data->solvers) {
+    solver->print_stats();
+  }
+}
+
 extern "C"
 size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
                        u8 **out_buf, uint8_t *add_buf, size_t add_buf_size,
@@ -1476,6 +1508,9 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
       DEBUGF("No more tasks to solve\n");
       data->cur_mutation_state = MUTATION_INVALID;
       *out_buf = buf;
+#if PRINT_STATS
+      print_stats(data);
+#endif
       return 0;
     }
     // reset the solver and state
@@ -1494,6 +1529,9 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
         DEBUGF("No more tasks to solve\n");
         data->cur_mutation_state = MUTATION_INVALID;
         *out_buf = buf;
+#if PRINT_STATS
+        print_stats(data);
+#endif
         return 0;
       }
       data->cur_solver_index = 0; // reset solver index
@@ -1510,6 +1548,7 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
     DEBUGF("task solved\n");
     data->cur_mutation_state = MUTATION_IN_VALIDATION;
     *out_buf = data->output_buf;
+    solved_tasks += 1;
   } else if (ret == rgd::SOLVER_TIMEOUT) {
     // if not solved, move on to next stage
     data->cur_mutation_state = MUTATION_IN_VALIDATION;
@@ -1539,8 +1578,10 @@ uint8_t afl_custom_queue_new_entry(my_mutator_t * data,
   if (data->cur_queue_entry == filename_orig_queue &&
       data->cur_mutation_state == MUTATION_IN_VALIDATION) {
     data->cur_mutation_state = MUTATION_VALIDATED;
-    if (data->cur_task)
+    if (data->cur_task) {
       data->cur_task->skip_next = true;
+      solved_branches += 1;
+    }
   }
   return 0;
 }
