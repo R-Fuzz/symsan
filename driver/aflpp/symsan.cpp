@@ -43,6 +43,7 @@ using namespace __dfsan;
 #endif
 
 #if !DEBUG
+#undef DEBUGF
 #define DEBUGF(_str...) do { } while (0)
 #endif
 
