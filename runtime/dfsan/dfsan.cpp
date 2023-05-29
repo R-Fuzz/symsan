@@ -188,7 +188,8 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t 
   }
 
   // special handling for bounds, which may use all four fields
-  if (op != __dfsan::Alloca) {
+  // record icmp operands as well
+  if (op != __dfsan::Alloca && (op & 0xff) != __dfsan::ICmp) {
     if (l1 >= CONST_OFFSET) op1 = 0;
     if (l2 >= CONST_OFFSET) op2 = 0;
   }
