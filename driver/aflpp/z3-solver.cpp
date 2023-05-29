@@ -6,6 +6,11 @@ extern "C" {
 
 using namespace rgd;
 
+#if !DEBUG
+#undef DEBUGF
+#define DEBUGF(_str...) do { } while (0)
+#endif
+
 z3::context g_z3_context;
 const unsigned kSolverTimeout = 10000; // 10 seconds
 
