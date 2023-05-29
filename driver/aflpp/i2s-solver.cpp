@@ -6,6 +6,11 @@ extern "C" {
 
 using namespace rgd;
 
+#if !DEBUG
+#undef DEBUGF
+#define DEBUGF(_str...) do { } while (0)
+#endif
+
 #define SWAP16(_x)                    \
   ({                                  \
                                       \
