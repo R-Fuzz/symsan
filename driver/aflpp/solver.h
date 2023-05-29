@@ -26,7 +26,7 @@ public:
   virtual solver_result_t solve(std::shared_ptr<SearchTask> task,
                                 const uint8_t *in_buf, size_t in_size,
                                 uint8_t *out_buf, size_t &out_size) = 0;
-  virtual void print_stats() = 0;
+  virtual void print_stats(int fd) = 0;
 };
 
 class Z3Solver : public Solver {
@@ -35,7 +35,7 @@ public:
   solver_result_t solve(std::shared_ptr<SearchTask> task,
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
-  void print_stats() override {} ;
+  void print_stats(int fd) override {} ;
 private:
   z3::expr serialize_rel(uint32_t comparison,
                          const AstNode* node,
@@ -56,7 +56,7 @@ public:
   solver_result_t solve(std::shared_ptr<SearchTask> task,
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
-  void print_stats() override;
+  void print_stats(int fd) override;
 private:
   std::atomic_ulong uuid;
   std::atomic_ulong cache_hits;
