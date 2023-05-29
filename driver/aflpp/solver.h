@@ -65,5 +65,16 @@ private:
   std::atomic_ulong num_solved;
 };
 
+class I2SSolver : public Solver {
+public:
+  I2SSolver();
+  solver_result_t solve(std::shared_ptr<SearchTask> task,
+                        const uint8_t *in_buf, size_t in_size,
+                        uint8_t *out_buf, size_t &out_size) override;
+  void print_stats(int fd) override {};
+private:
+  uint64_t matches;
+  uint64_t mismatches;
+};
 
 }; // namespace rgd

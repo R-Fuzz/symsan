@@ -22,6 +22,7 @@ add_library(SymSanMutator SHARED
   symsan.cpp
   z3-solver.cpp
   jit-solver.cpp
+  i2s-solver.cpp
 )
 
 target_include_directories(SymSanMutator PRIVATE
