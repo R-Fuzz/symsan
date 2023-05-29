@@ -48,7 +48,7 @@ using namespace __dfsan;
 
 #define NEED_OFFLINE 0
 
-#define PRINT_STATS 0
+#define PRINT_STATS 1
 
 static bool NestedSolving = true;
 
@@ -106,6 +106,7 @@ struct my_mutator_t {
   u8* cur_queue_entry;
   int cur_mutation_state;
   u8* output_buf;
+  int log_fd;
 
   std::unordered_set<u32> fuzzed_inputs;
   rgd::TaskManager* task_mgr;
@@ -1066,8 +1067,11 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
     if (NestedSolving) {
       // collect dependencies based on data-flow (i.e., shared input bytes)
       std::vector<const rgd::AstNode*> nested_caluse;
+      std::unordered_set<dfsan_label> inserted;
       // first, copy the last branch constraints
       nested_caluse.insert(nested_caluse.end(), clause.begin(), clause.end());
+      for (auto const& var : clause) inserted.insert(var->label());
+      bool has_nested = false;
       // then, iterate each var in the clause
       for (auto const& var: clause) {
         const dfsan_label l = var->label();
@@ -1084,6 +1088,9 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
         for (auto input: related_inputs) {
           auto const& bucket = input_to_branches[input];
           for (auto const& nc : bucket) {
+            if (inserted.count(nc->label())) continue;
+            inserted.insert(nc->label());
+            has_nested = true;
 #if DEBUG
             fprintf(stderr, "add nested constraint: (%d, %d)\n", nc->label(), nc->kind());
 #endif
@@ -1091,10 +1098,12 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
           }
         }
       }
-      task_t nested_task = construct_task(nested_caluse, buf, buf_size);
-      if (nested_task != nullptr) {
-        nested_task->base_task = task;
-        tasks.push_back(nested_task);
+      if (has_nested) { // only add nested task if there are additional constraints
+        task_t nested_task = construct_task(nested_caluse, buf, buf_size);
+        if (nested_task != nullptr) {
+          nested_task->base_task = task;
+          tasks.push_back(nested_task);
+        }
       }
     }
   }
@@ -1288,6 +1297,18 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     FATAL("Failed to alloc output buffer\n");
   }
 
+#if PRINT_STATS
+  char *log_f = getenv("SYMSAN_LOG_FILE");
+  if (log_f) {
+    data->log_fd = open(log_f, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (data->log_fd < 0) {
+      FATAL("Failed to create log file: %s\n", strerror(errno));
+    }
+  } else {
+    data->log_fd = 2; // stderr by default
+  }
+#endif
+
   return data;
 }
 
@@ -1476,18 +1497,18 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
 }
 
 static void print_stats(my_mutator_t *data) {
-  fprintf(stderr,
+  dprintf(data->log_fd,
     "Total branches: %zu,\n"\
     "Total tasks: %zu,\n"\
     "Solved tasks: %zu,\n"\
     "Solved branches: %zu\n",
     total_branches, total_tasks, solved_tasks, solved_branches);
-  fprintf(stderr, "Task size distribution:\n");
+  dprintf(data->log_fd, "Task size distribution:\n");
   for (auto const& kv : task_size_dist) {
-    fprintf(stderr, "\t %zu: %zu\n", kv.first, kv.second);
+    dprintf(data->log_fd, "\t %zu: %zu\n", kv.first, kv.second);
   }
   for (auto &solver : data->solvers) {
-    solver->print_stats();
+    solver->print_stats(data->log_fd);
   }
 }
 
