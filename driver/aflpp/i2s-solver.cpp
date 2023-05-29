@@ -160,6 +160,12 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
           last_offset = offset;
         } else {
           if (last_offset + 1 != offset) {
+            if (i > 8) { // too large
+              value = in_buf[offset] << (i * 8);
+              i = 1;
+              last_offset = offset;
+              continue; // next offset
+            }
             // starting a new sequence of byte(s)
             // check if the previous sequence is a match
             value_r = SWAP64(value) >> (64 - i * 8);
@@ -178,8 +184,8 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
               r = get_i2s_value(comparison, c->op1, true);
               r = SWAP64(r) >> (64 - i * 8);
             } else {
-              value = 0;
-              i = 0;
+              value = in_buf[offset] << (i * 8);;
+              i = 1;
               last_offset = offset;
               continue; // next offset
             }
@@ -197,30 +203,32 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       }
     }
     // check the last sequence
-    value_r = SWAP64(value) >> (64 - i * 8);
-    if (c->op1 == value) {
-      matches++;
-      r = get_i2s_value(comparison, c->op2, false);
-    } else if (c->op2 == value) {
-      matches++;
-      r = get_i2s_value(comparison, c->op1, true);
-    } else if (c->op1 == value_r) {
-      matches++;
-      r = get_i2s_value(comparison, c->op2, false);
-      r = SWAP64(r) >> (64 - i * 8);
-    } else if (c->op2 == value_r) {
-      matches++;
-      r = get_i2s_value(comparison, c->op1, true);
-      r = SWAP64(r) >> (64 - i * 8);
-    } else {
-      mismatches++;
-      return SOLVER_TIMEOUT;
+    if (i <= 8) { // FIXME: at most 8 bytes for now
+      value_r = SWAP64(value) >> (64 - i * 8);
+      if (c->op1 == value) {
+        matches++;
+        r = get_i2s_value(comparison, c->op2, false);
+      } else if (c->op2 == value) {
+        matches++;
+        r = get_i2s_value(comparison, c->op1, true);
+      } else if (c->op1 == value_r) {
+        matches++;
+        r = get_i2s_value(comparison, c->op2, false);
+        r = SWAP64(r) >> (64 - i * 8);
+      } else if (c->op2 == value_r) {
+        matches++;
+        r = get_i2s_value(comparison, c->op1, true);
+        r = SWAP64(r) >> (64 - i * 8);
+      } else {
+        mismatches++;
+        return SOLVER_TIMEOUT;
+      }
+      DEBUGF("i2s: %lu = %lx\n", last_offset, r);
+      memcpy(out_buf, in_buf, in_size);
+      out_size = in_size;
+      memcpy(&out_buf[last_offset], &r, i);
+      return SOLVER_SAT;
     }
-    DEBUGF("i2s: %lu = %lx\n", last_offset, r);
-    memcpy(out_buf, in_buf, in_size);
-    out_size = in_size;
-    memcpy(&out_buf[last_offset], &r, i);
-    return SOLVER_SAT;
   } else if (comparison == rgd::Memcmp) {
     DEBUGF("i2s: try memcmp\n");
     memcpy(out_buf, in_buf, in_size);
