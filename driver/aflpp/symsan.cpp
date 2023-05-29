@@ -427,6 +427,12 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
 #endif
   }
 
+  // record comparison operands
+  if (rgd::isRelationalKind(ret->kind())) {
+    constraint->op1 = info->op1.i;
+    constraint->op2 = info->op2.i;
+  }
+
   // binary ops, we don't really care about comparison ops in jigsaw,
   // as long as the operands are the same, we can reuse the AST/function
   uint32_t kind = rgd::isRelationalKind(ret->kind()) ? rgd::Bool : ret->kind();
@@ -1232,6 +1238,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     return NULL;
   }
   // try jigsaw first
+  data->solvers.emplace_back(std::make_shared<rgd::I2SSolver>());
   data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
   data->solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
 

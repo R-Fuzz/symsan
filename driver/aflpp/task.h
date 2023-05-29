@@ -48,6 +48,8 @@ struct Constraint {
   std::unordered_map<uint32_t, uint32_t> shapes;
   // number of constant in the input array
   uint32_t const_num;
+  // recorded comparison operands
+  uint64_t op1, op2;
 };
 
 struct ConsMeta {
