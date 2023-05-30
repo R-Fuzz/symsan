@@ -115,26 +115,9 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       if (s > 8) {
         continue;
       }
-      switch(s) {
-        case 1:
-          value = in_buf[offset];
-          value_r = value;
-          break;
-        case 2:
-          value = *(uint16_t*)&in_buf[offset];
-          value_r = SWAP16(value);
-          break;
-        case 4:
-          value = *(uint32_t*)&in_buf[offset];
-          value_r = SWAP32(value);
-          break;
-        case 8:
-          value = *(uint64_t*)&in_buf[offset];
-          value_r = SWAP64(value);
-          break;
-        default:
-          assert(false && "unsupported shape");
-      }
+      // size can be not a power of 2
+      memcpy(&value, &in_buf[offset], s);
+      value = SWAP64(value) >> (64 - s * 8);
       if (c->op1 == value) {
         matches++;
         r = get_i2s_value(comparison, c->op2, false);
