@@ -104,107 +104,37 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
     return SOLVER_TIMEOUT;
   }
   auto const& c = task->constraints[0];
+  auto const& cm = task->consmeta[0];
   auto comparison = task->comparisons[0];
   if (likely(isRelationalKind(comparison))) {
-    size_t last_offset = -1;
     uint64_t value = 0, value_r = 0;
     uint64_t r = 0;
-    int i = 0;
-    for (const auto& [offset, lidx] : c->local_map) {
-      uint32_t s = c->shapes.at(offset);
-      if (s > 1) {
-        switch(s) {
-          case 2:
-            value = *(uint16_t*)&in_buf[offset];
-            value_r = SWAP16(value);
-            break;
-          case 4:
-            value = *(uint32_t*)&in_buf[offset];
-            value_r = SWAP32(value);
-            break;
-          case 8:
-            value = *(uint64_t*)&in_buf[offset];
-            value_r = SWAP64(value);
-            break;
-          default:
-            assert(false && "unsupported shape");
-        }
-        if (c->op1 == value) {
-          matches++;
-          r = get_i2s_value(comparison, c->op2, false);
-        } else if (c->op2 == value) {
-          matches++;
-          r = get_i2s_value(comparison, c->op1, true);
-        } else if (c->op1 == value_r) {
-          matches++;
-          r = get_i2s_value(comparison, c->op2, false);
-          r = SWAP64(r) >> (64 - s * 8);
-        } else if (c->op2 == value_r) {
-          matches++;
-          r = get_i2s_value(comparison, c->op1, true);
-          r = SWAP64(r) >> (64 - s * 8);
-        } else {
-          value = 0;
-          i = 0;
-          last_offset = offset;
-          continue; // next offset
-        }
-        DEBUGF("i2s: %lu = %lx\n", offset, r);
-        memcpy(out_buf, in_buf, in_size);
-        out_size = in_size;
-        memcpy(&out_buf[offset], &r, s);
-        return SOLVER_SAT;
-      } else { // s == 1
-        // check individual bytes
-        if (i == 0) {
-          last_offset = offset;
-        } else {
-          if (last_offset + 1 != offset) {
-            if (i > 8) { // too large
-              value = in_buf[offset] << (i * 8);
-              i = 1;
-              last_offset = offset;
-              continue; // next offset
-            }
-            // starting a new sequence of byte(s)
-            // check if the previous sequence is a match
-            value_r = SWAP64(value) >> (64 - i * 8);
-            if (c->op1 == value) {
-              matches++;
-              r = get_i2s_value(comparison, c->op2, false);
-            } else if (c->op2 == value) {
-              matches++;
-              r = get_i2s_value(comparison, c->op1, true);
-            } else if (c->op1 == value_r) {
-              matches++;
-              r = get_i2s_value(comparison, c->op2, false);
-              r = SWAP64(r) >> (64 - i * 8);
-            } else if (c->op2 == value_r) {
-              matches++;
-              r = get_i2s_value(comparison, c->op1, true);
-              r = SWAP64(r) >> (64 - i * 8);
-            } else {
-              value = in_buf[offset] << (i * 8);;
-              i = 1;
-              last_offset = offset;
-              continue; // next offset
-            }
-            DEBUGF("i2s: %lu = %lx\n", last_offset, r);
-            memcpy(out_buf, in_buf, in_size);
-            out_size = in_size;
-            memcpy(&out_buf[offset], &r, i);
-            return SOLVER_SAT;
-          } else {
-            // match, do nothing
-          }
-        }
-        value |= in_buf[offset] << (i * 8);
-        i++;
+    for (auto const& candidate : cm->i2s_candidates) {
+      size_t offset = candidate.first;
+      uint32_t s = candidate.second;
+      if (s > 8) {
+        continue;
       }
-    }
-    // check the last sequence
-    if (i <= 8) { // FIXME: at most 8 bytes for now
-      value_r = SWAP64(value) >> (64 - i * 8);
+      switch(s) {
+        case 1:
+          value = in_buf[offset];
+          value_r = value;
+          break;
+        case 2:
+          value = *(uint16_t*)&in_buf[offset];
+          value_r = SWAP16(value);
+          break;
+        case 4:
+          value = *(uint32_t*)&in_buf[offset];
+          value_r = SWAP32(value);
+          break;
+        case 8:
+          value = *(uint64_t*)&in_buf[offset];
+          value_r = SWAP64(value);
+          break;
+        default:
+          assert(false && "unsupported shape");
+      }
       if (c->op1 == value) {
         matches++;
         r = get_i2s_value(comparison, c->op2, false);
@@ -214,38 +144,45 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       } else if (c->op1 == value_r) {
         matches++;
         r = get_i2s_value(comparison, c->op2, false);
-        r = SWAP64(r) >> (64 - i * 8);
+        r = SWAP64(r) >> (64 - s * 8);
       } else if (c->op2 == value_r) {
         matches++;
         r = get_i2s_value(comparison, c->op1, true);
-        r = SWAP64(r) >> (64 - i * 8);
+        r = SWAP64(r) >> (64 - s * 8);
       } else {
-        mismatches++;
-        return SOLVER_TIMEOUT;
+        continue; // next offset
       }
-      DEBUGF("i2s: %lu = %lx\n", last_offset, r);
+      DEBUGF("i2s: %lu = %lx\n", offset, r);
       memcpy(out_buf, in_buf, in_size);
       out_size = in_size;
-      memcpy(&out_buf[last_offset], &r, i);
+      memcpy(&out_buf[offset], &r, s);
       return SOLVER_SAT;
     }
   } else if (comparison == rgd::Memcmp) {
     DEBUGF("i2s: try memcmp\n");
     memcpy(out_buf, in_buf, in_size);
-    auto const& cm = task->consmeta[0];
+
     size_t const_index = 0;
     for (auto const& arg : c->input_args) {
       if (!arg.first) break; // first constant arg
       const_index++;
     }
-    int i = 0;
+    if (const_index == c->input_args.size()) { // only do memcmp(const, symbolic)
+      mismatches++;
+      return SOLVER_TIMEOUT;
+    }
+    assert(cm->i2s_candidates.size() == 1 && "only support single candidate");
+    size_t offset = cm->i2s_candidates[0].first;
+    uint32_t size = cm->i2s_candidates[0].second;
+    assert(size == c->local_map.size() && "input size mismatch");
     uint64_t value = 0;
-    for (auto const& [offset, lidx] : c->local_map) {
+    int i = 0;
+    for (size_t o = offset; o < offset + size; o++) {
       if (i == 0)
         value = c->input_args[const_index].second;
       uint8_t v = ((value >> i) & 0xff);
-      out_buf[offset] = v;
-      DEBUGF("  %lu = %u\n", offset, v);
+      out_buf[o] = v;
+      DEBUGF("  %lu = %u\n", o, v);
       i += 8;
       if (i == 64) {
         const_index++; // move on to the next 64-bit chunk
