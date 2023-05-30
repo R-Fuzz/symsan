@@ -58,7 +58,7 @@ struct ConsMeta {
   // per-constraint relational operator, so we can share the AST
   uint32_t comparison;
   // input2state inference related
-  bool i2s_feasible;
+  std::vector<std::pair<size_t, uint32_t>> i2s_candidates;
   uint64_t op1, op2;
 };
 
@@ -117,7 +117,7 @@ struct SearchTask {
       cm->input_args = constraints[i]->input_args;
       cm->comparison = comparisons[i];
       uint32_t last_offset = -1;
-      cm->i2s_feasible = true;
+      uint32_t size = 0;
       for (const auto& [offset, lidx] : constraints[i]->local_map) {
         auto gitr = sym_map.find(offset);
         if (gitr == sym_map.end()) {
@@ -147,15 +147,16 @@ struct SearchTask {
         // check if the input bytes are consecutive
         // using std::map ensures that the offsets (keys) are sorted
         if (last_offset != -1 && last_offset + 1 != offset) {
-          cm->i2s_feasible = false;
+          // a new set of consecutive input bytes, save the info
+          // and resset
+          cm->i2s_candidates.push_back({last_offset + 1 - size, size});
+          size = 0;
         }
         last_offset = offset;
+        size++;
       }
-      // FIXME: only support up to 64-bit for now
-      if (comparisons[i] != rgd::Memcmp && comparisons[i] != rgd::MemcmpN
-          && constraints[i]->local_map.size() > 8) {
-        cm->i2s_feasible = false;
-      }
+      // save the last set of consecutive input bytes
+      cm->i2s_candidates.push_back({last_offset + 1 - size, size});
 
       // update the number of required constants in the input array
       if (max_const_num < constraints[i]->const_num)
