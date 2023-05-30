@@ -629,7 +629,7 @@ try_reverse:
           if (i == 0)
             value = c->input_args[const_index].second;
           uint8_t v = ((value >> i) & 0xff);
-          temp_input.set(cm->input_args[l].second, v);
+          temp_input.set(cm->input_args[lidx].second, v);
           i += 8;
           if (i == 64) {
             const_index++; // move on to the next 64-bit chunk
