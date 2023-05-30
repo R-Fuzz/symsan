@@ -545,10 +545,10 @@ static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, 
           if (size > 8) {
             continue;
           }
-          const uint32_t lidx = c->local_map.at(offset);
           int i = 0, t = size * 8;
-          for (uint32_t l = lidx; l < lidx + size; l++) {
-            uint64_t v = input_min.get(cm->input_args[l].second);
+          for (size_t off = offset; off < offset + size; off++) {
+            const uint32_t lidx = c->local_map.at(off);
+            uint64_t v = input_min.get(cm->input_args[lidx].second);
             input |= (v << i);
             input_r |= (v << (t - i - 8));
             i += 8;
@@ -572,9 +572,10 @@ static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, 
 #endif
             // successful, update the real inputs
             i = 0;
-            for (uint32_t l = lidx; l < lidx + size; l++) {
+            for (size_t off = offset; off < offset + size; off++) {
+              const uint32_t lidx = c->local_map.at(off);
               uint8_t v = ((value >> i) & 0xff);
-              temp_input.set(cm->input_args[l].second, v);
+              temp_input.set(cm->input_args[lidx].second, v);
               i += 8;
             }
             updated = true;
@@ -597,10 +598,11 @@ try_reverse:
           if (dis == 0) {
             // successful, update the real inputs
             i = 0;
-            for (uint32_t l = lidx; l < lidx + size; l++) {
+            for (size_t off = offset; off < offset + size; off++) {
+              const uint32_t lidx = c->local_map.at(off);
               uint8_t v = ((value >> i) & 0xff);
               // uint8_t v = ((value >> (t - i - 8)) & 0xff);
-              temp_input.set(cm->input_args[l].second, v);
+              temp_input.set(cm->input_args[lidx].second, v);
               i += 8;
             }
             updated = true;
@@ -622,12 +624,12 @@ try_reverse:
         assert(size == c->local_map.size() && "input size mismatch");
         int i = 0;
         uint64_t value = 0;
-        const uint32_t lidx = c->local_map.at(offset);
-        for (uint32_t l = lidx; l < lidx + size; l++) {
+        for (size_t off = offset; off < offset + size; off++) {
+          const uint32_t lidx = c->local_map.at(off);
           if (i == 0)
             value = c->input_args[const_index].second;
           uint8_t v = ((value >> i) & 0xff);
-          temp_input.set(cm->input_args[l].second, v);
+          temp_input.set(cm->input_args[lidx].second, v);
           i += 8;
           if (i == 64) {
             const_index++; // move on to the next 64-bit chunk
