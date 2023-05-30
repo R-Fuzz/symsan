@@ -534,84 +534,100 @@ static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, 
   for (int k = 0; k < task->constraints.size(); k++) {
     auto& c = task->constraints[k];
     auto& cm = task->consmeta[k];
-    if (task->min_distances[k] && cm->i2s_feasible) {
+    if (task->min_distances[k]) {
       if (likely(isRelationalKind(cm->comparison))) {
-        // check concatenated inputs against comparison operands
+        // check consecutive input bytes against comparison operands
         // FIXME: add support for other input encodings
         uint64_t input = 0, input_r, value = 0, dis = -1;
-        int i = 0, t = c->local_map.size() * 8;
-        for (auto const& [offset, lidx] : c->local_map) {
-          input |= (input_min.get(cm->input_args[lidx].second) << i);
-          input_r |= (input_min.get(cm->input_args[lidx].second) << (t - i - 8));
-          i += 8;
-        }
-        if (input == cm->op1) {
-          value = get_i2s_value(cm->comparison, cm->op2, true);
-        } else if (input == cm->op2) {
-          value = get_i2s_value(cm->comparison, cm->op1, false);
-        } else {
-          goto try_reverse;
-        }
-
-        // test the new value
-        dis = try_new_i2s_value(c, cm->comparison, value, task);
-        if (dis == 0) {
-#if DEBUG
-          std::cout << "i2s updated c = " << k << " t = " << t << " input = " << input
-                    << " op1 = " << cm->op1 << " op2 = " << cm->op2
-                    << " cmp = " << cm->comparison << " value = " << value
-                    << " old-dis = " << task->min_distances[k] << " new-dis = " << dis << std::endl;
-#endif
-          // successful, update the real inputs
-          i = 0;
-          for (auto const& [offset, lidx] : c->local_map) {
-            uint8_t v = ((value >> i) & 0xff);
-            temp_input.set(cm->input_args[lidx].second, v);
+        for (auto const& candidate : cm->i2s_candidates) {
+          const size_t offset = candidate.first;
+          const uint32_t size = candidate.second;
+          if (size > 8) {
+            continue;
+          }
+          const uint32_t lidx = c->local_map.at(offset);
+          int i = 0, t = size * 8;
+          for (uint32_t l = lidx; l < lidx + size; l++) {
+            uint64_t v = input_min.get(cm->input_args[l].second);
+            input |= (v << i);
+            input_r |= (v << (t - i - 8));
             i += 8;
           }
-          updated = true;
-          continue;
-        }
+          if (input == cm->op1) {
+            value = get_i2s_value(cm->comparison, cm->op2, true);
+          } else if (input == cm->op2) {
+            value = get_i2s_value(cm->comparison, cm->op1, false);
+          } else {
+            goto try_reverse;
+          }
+
+          // test the new value
+          dis = try_new_i2s_value(c, cm->comparison, value, task);
+          if (dis == 0) {
+#if DEBUG
+            std::cerr << "i2s updated c = " << k << " t = " << t << " input = " << input
+                      << " op1 = " << cm->op1 << " op2 = " << cm->op2
+                      << " cmp = " << cm->comparison << " value = " << value
+                      << " old-dis = " << task->min_distances[k] << " new-dis = " << dis << std::endl;
+#endif
+            // successful, update the real inputs
+            i = 0;
+            for (uint32_t l = lidx; l < lidx + size; l++) {
+              uint8_t v = ((value >> i) & 0xff);
+              temp_input.set(cm->input_args[l].second, v);
+              i += 8;
+            }
+            updated = true;
+            break; // one match per comparison
+          }
 
 try_reverse:
-        // try reverse encoding
-        if (input_r == cm->op1) {
-          value = get_i2s_value(cm->comparison, cm->op2, true);
-        } else if (input_r == cm->op2) {
-          value = get_i2s_value(cm->comparison, cm->op1, false);
-        } else {
-          continue;
-        }
-
-        // test the new value
-        value = SWAP64(value) >> (64 - t); // reverse the value
-        dis = try_new_i2s_value(c, cm->comparison, value, task);
-        if (dis == 0) {
-          // successful, update the real inputs
-          i = 0;
-          for (auto const& [offset, lidx] : c->local_map) {
-            uint8_t v = ((value >> i) & 0xff);
-            // uint8_t v = ((value >> (t - i - 8)) & 0xff);
-            temp_input.set(cm->input_args[lidx].second, v);
-            i += 8;
+          // try reverse encoding
+          if (input_r == cm->op1) {
+            value = get_i2s_value(cm->comparison, cm->op2, true);
+          } else if (input_r == cm->op2) {
+            value = get_i2s_value(cm->comparison, cm->op1, false);
+          } else {
+            continue;
           }
-          updated = true;
-        }
+
+          // test the new value
+          value = SWAP64(value) >> (64 - t); // reverse the value
+          dis = try_new_i2s_value(c, cm->comparison, value, task);
+          if (dis == 0) {
+            // successful, update the real inputs
+            i = 0;
+            for (uint32_t l = lidx; l < lidx + size; l++) {
+              uint8_t v = ((value >> i) & 0xff);
+              // uint8_t v = ((value >> (t - i - 8)) & 0xff);
+              temp_input.set(cm->input_args[l].second, v);
+              i += 8;
+            }
+            updated = true;
+            break;
+          }
+        } // end foreach candidate
       } else if (cm->comparison == rgd::Memcmp) {
-        // memcmp(s1, s2) is i2s_feasible iff s1 is constant
-        // try copy s1 to s2
         size_t const_index = 0;
         for (auto const& arg : c->input_args) {
           if (!arg.first) break;
           const_index++;
         }
+        // memcmp(s1, s2) is i2s_feasible iff s1 is constant
+        // try copy s1 to s2
+        if (const_index == c->input_args.size()) continue;
+        assert(cm->i2s_candidates.size() == 1 && "memcmp should have only one candidate");
+        size_t offset = cm->i2s_candidates[0].first;
+        uint32_t size = cm->i2s_candidates[0].second;
+        assert(size == c->local_map.size() && "input size mismatch");
         int i = 0;
         uint64_t value = 0;
-        for (auto const& [offset, lidx] : c->local_map) {
+        const uint32_t lidx = c->local_map.at(offset);
+        for (uint32_t l = lidx; l < lidx + size; l++) {
           if (i == 0)
             value = c->input_args[const_index].second;
           uint8_t v = ((value >> i) & 0xff);
-          temp_input.set(cm->input_args[lidx].second, v);
+          temp_input.set(cm->input_args[l].second, v);
           i += 8;
           if (i == 64) {
             const_index++; // move on to the next 64-bit chunk
