@@ -93,7 +93,9 @@ struct my_mutator_t {
     ck_free(out_dir);
     ck_free(out_file);
     ck_free(output_buf);
+    ck_free(argv);
     delete task_mgr;
+    delete cov_mgr;
   }
 
   const afl_state_t *afl;
@@ -168,7 +170,7 @@ static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
 static std::unordered_map<dfsan_label, expr_t> root_expr_cache;
 static std::unordered_map<dfsan_label, constraint_t> constraint_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<size_t> > branch_to_inputs;
-static std::unordered_map<dfsan_label, std::shared_ptr<uint8_t>> memcmp_cache;
+static std::unordered_map<dfsan_label, std::unique_ptr<uint8_t[]>> memcmp_cache;
 static std::unordered_map<dfsan_label, size_t> ast_size_cache;
 // FIXME: global input dependency forests
 static rgd::UnionFind data_flow_deps;
@@ -1331,7 +1333,7 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
   if (unlikely(!data->argv)) {
     int argc = 0;
     while (data->afl->argv[argc]) { argc++; }
-    data->argv = (char **)calloc(argc, sizeof(char *));
+    data->argv = (char **)calloc(argc + 1, sizeof(char *));
     if (!data->argv) {
       FATAL("Failed to alloc argv\n");
     }
@@ -1343,6 +1345,7 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
         data->argv[i] = data->afl->argv[i];
       }
     }
+    data->argv[argc] = NULL;
   }
 
   // FIXME: should we use the afl->queue_cur->fname instead?
@@ -1379,7 +1382,7 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
     dup2(data->afl->fsrv.dev_null_fd, 2);
 #endif
     execv(data->symsan_bin, data->argv);
-    DEBUGF("Failed to execv: %s", data->symsan_bin);
+    DEBUGF("Failed to execv: %s: %s", data->symsan_bin, strerror(errno));
     exit(-1);
   } if (pid < 0) {
     WARNF("Failed to fork: %s\n", strerror(errno));
@@ -1434,7 +1437,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   memcmp_msg *mmsg;
   dfsan_label_info *info;
   size_t msg_size;
-  std::shared_ptr<uint8_t> memcmp_const;
+  std::unique_ptr<uint8_t[]> memcmp_const;
   u32 num_tasks = 0;
 
   // clear all caches
@@ -1478,9 +1481,9 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
           break;
         }
         // save the content
-        memcmp_const = std::make_shared<uint8_t>(msg.result); // use shared_ptr to avoid memory leak
+        memcmp_const = std::make_unique<uint8_t[]>(msg.result); // use unique_ptr to avoid memory leak
         memcpy(memcmp_const.get(), mmsg->content, msg.result);
-        memcmp_cache[msg.label] = memcmp_const;
+        memcmp_cache.insert({msg.label, std::move(memcmp_const)});
         free(mmsg);
         break;
       case fsize_type:
