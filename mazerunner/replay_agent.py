@@ -2,11 +2,14 @@
 
 import os
 import pickle
+# import logging
+
 from agent import *
 
 class ReplayAgent(Agent):
     # def __init__(self):
     #     super().__init__()
+    #     self.logger = logging.getLogger('mazerunner.replay_agent')
 
     def replay_log(self, log_dir):
         seed_traces = os.listdir(log_dir)

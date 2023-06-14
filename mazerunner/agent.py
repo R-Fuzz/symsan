@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import collections
+import logging
+
 import q_learning
 from config import *
 
@@ -24,7 +26,8 @@ class Agent:
         self.state = ProgramState()
         self.history_actions = []
         self.learner = q_learning.QLearner()
-        
+        self.logger = logging.getLogger('mazerunner.agent')
+
     def compute_reward(self, d):
         reward = 0
         if d >= MAX_DISTANCE or d < 0:
@@ -35,11 +38,12 @@ class Agent:
         return reward
 
     def process_env_data(self, pc, callstack, action, distance):
-        last_sa = (self.state.pc, self.state.callstack, self.action)
+        last_sa = (self.state.pc, self.state.callstack, self.state.action)
         next_s = (pc, callstack)
         reward = self.compute_reward(distance)
         if last_sa:
             self.learner.learn(last_sa, next_s, reward)
+            self.logger.info(f"last_SA: {last_sa}, next_SA: {next_s + (action,)} ,distance: {distance}, reward: {reward}, Q: {self.learner.Q_table[last_sa]}")
         self.state.pc = pc
         self.state.callstack = callstack
         self.state.action = action

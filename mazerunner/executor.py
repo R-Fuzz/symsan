@@ -9,6 +9,7 @@ import ctypes
 import collections
 import z3
 from enum import Enum
+import logging
 
 from config import *
 import agent
@@ -92,32 +93,30 @@ CONST_OFFSET = 1
 kInitializingLabel = -1
 
 offline_agent = agent.Agent()
+logger = logging.getLogger('mazerunner.executor')
 
 def get_label_info(label):
     offset = label * ctypes.sizeof(dfsan_label_info)
     return dfsan_label_info.from_buffer(shm.buf[offset:offset+ctypes.sizeof(dfsan_label_info)])
 
 def __handle_loop(id, addr):
-    print(f"__handle_loop: id={id}, loop_header={hex(addr)}")
+    logger.debug(f"__handle_loop: id={id}, loop_header={hex(addr)}")
     
 def __handle_new_state(id, addr, flag, callstack, bb_dis, avg_dis, action):
     global offline_agent
-    print(f"__handle_new_state: id={id}, addr={hex(addr)}, flag={flag}, callstack={callstack}, bb_dis={bb_dis}, avg_dis={avg_dis}")
+    logger.debug(f"__handle_new_state: id={id}, addr={hex(addr)}, flag={flag}, callstack={callstack}, bb_dis={bb_dis}, avg_dis={avg_dis}")
     offline_agent.process_env_data(addr, callstack, action, avg_dis)
 
 def __solve_cond(label, r, add_nested, addr):
-    print(f"__solve_cond: label={label}, result={r}, add_cons={add_nested}, addr={hex(addr)}")
+    logger.debug(f"__solve_cond: label={label}, result={r}, add_cons={add_nested}, addr={hex(addr)}")
 
 def __handle_gep(ptr_label, ptr, index_label, index, num_elems, elem_size, current_offset, addr):
-    print(f"__handle_gep: ptr_label={ptr_label}, ptr={ptr}, index_label={index_label}, index={index}, "
+    logger.debug(f"__handle_gep: ptr_label={ptr_label}, ptr={ptr}, index_label={index_label}, index={index}, "
           f"num_elems={num_elems}, elem_size={elem_size}, current_offset={current_offset}, addr={addr}")
 
 def main(argv):
-    global output_dir
-    global input_buf
-    global input_size
-    global shm
-    
+    global output_dir, logger, input_buf, input_size, shm
+
     program = argv[1]
     input = argv[2]
 
@@ -135,7 +134,7 @@ def main(argv):
     try:
         shm = shared_memory.SharedMemory(create=True, size=0xc00000000)
     except:
-        print(f"Failed to map shm({shm._fd}), size(shm.size)")
+        logger.error(f"Failed to map shm({shm._fd}), size(shm.size)")
         return -1
 
     # pipefds[0] for read, pipefds[1] for write
@@ -147,7 +146,7 @@ def main(argv):
         proc = subprocess.Popen([program, input], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, env={"TAINT_OPTIONS": options}, pass_fds=(shm._fd, pipefds[1]))
     except:
-        print("Failed to execute subprocess")
+        logger.error("Failed to execute subprocess")
         os.close(pipefds[0])
         os.close(pipefds[1])
         return -1
@@ -166,13 +165,13 @@ def main(argv):
                 mmsg = mazerunner_msg.from_buffer_copy(mazerunner_data)
                 __handle_new_state(mmsg.id, mmsg.addr, mmsg.flags, mmsg.context, mmsg.bb_dist, mmsg.avg_dist, msg.result)
             if (msg.flags & F_LOOP_EXIT) and (msg.flags & F_LOOP_LATCH):
-                print(f"Loop exiting: {hex(msg.addr)}")
+                logger.debug(f"Loop exiting: {hex(msg.addr)}")
         elif msg.msg_type == MsgType.gep_type.value:
             gep_data = os.read(pipefds[0], ctypes.sizeof(gep_msg))
             gmsg = gep_msg.from_buffer_copy(gep_data)
             # Double check
             if msg.label != gmsg.index_label:
-                print(f"Incorrect gep msg: {msg.label} vs {gmsg.index_label}")
+                logger.debug(f"Incorrect gep msg: {msg.label} vs {gmsg.index_label}")
                 continue
             __handle_gep(gmsg.ptr_label, gmsg.ptr, gmsg.index_label, gmsg.index,
                         gmsg.num_elems, gmsg.elem_size, gmsg.current_offset, msg.addr)
@@ -183,12 +182,13 @@ def main(argv):
         elif msg.msg_type == MsgType.fsize_type.value:
             pass
         else:
-            print(f"Unknown message type: {msg.msg_type}", file=sys.stderr)
+            logger.error(f"Unknown message type: {msg.msg_type}", file=sys.stderr)
 
     os.close(pipefds[0])
     return 0
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     if len(sys.argv) != 3:
         print("Usage: {} target input".format(sys.argv[0]), file=sys.stderr)
         sys.exit(1)
