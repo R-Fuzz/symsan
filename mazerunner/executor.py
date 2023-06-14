@@ -92,7 +92,7 @@ branch_deps = []
 CONST_OFFSET = 1
 kInitializingLabel = -1
 
-offline_agent = agent.Agent()
+agent = agent.Agent()
 logger = logging.getLogger('mazerunner.executor')
 
 def get_label_info(label):
@@ -103,9 +103,12 @@ def __handle_loop(id, addr):
     logger.debug(f"__handle_loop: id={id}, loop_header={hex(addr)}")
     
 def __handle_new_state(id, addr, flag, callstack, bb_dis, avg_dis, action):
-    global offline_agent
+    global agent
     logger.debug(f"__handle_new_state: id={id}, addr={hex(addr)}, flag={flag}, callstack={callstack}, bb_dis={bb_dis}, avg_dis={avg_dis}")
-    offline_agent.process_env_data(addr, callstack, action, avg_dis)
+    has_dist = False
+    if flag & F_HAS_DISTANCE:
+        has_dist = True
+    agent.offline_learn(addr, callstack, action, avg_dis, has_dist)
 
 def __solve_cond(label, r, add_nested, addr):
     logger.debug(f"__solve_cond: label={label}, result={r}, add_cons={add_nested}, addr={hex(addr)}")
