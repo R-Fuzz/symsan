@@ -33,32 +33,17 @@ namespace rgd {
       llvm::orc::ExecutionSession ES;
       llvm::orc::RTDyldObjectLinkingLayer ObjectLayer;
       llvm::orc::IRCompileLayer CompileLayer;
-      llvm::orc::IRTransformLayer OptimizeLayer;
-      //std::unique_ptr<llvm::TargetMachine> TM;
 
       llvm::DataLayout DL;
       llvm::orc::MangleAndInterner Mangle;
       llvm::orc::JITDylib *MainJD;
-      // llvm::orc::ThreadSafeContext Ctx;
-      // std::unique_ptr<llvm::orc::JITCompileCallbackManager> CompileCallbackManager;
-      // llvm::orc::CompileOnDemandLayer CODLayer;
 
     public:
-      GradJit(llvm::orc::JITTargetMachineBuilder JTMB, llvm::DataLayout DL)
+      GradJit(std::unique_ptr<llvm::TargetMachine> TM, llvm::DataLayout DL)
         : ObjectLayer(ES,
             []() { return std::make_unique<llvm::SectionMemoryManager>(); }),
-        // TM(llvm::EngineBuilder().selectTarget()),
-        CompileLayer(ES, ObjectLayer, std::make_unique<llvm::orc::ConcurrentIRCompiler>(std::move(JTMB))),
-        OptimizeLayer(ES, CompileLayer, optimizeModule),
+        CompileLayer(ES, ObjectLayer, std::make_unique<llvm::orc::TMOwningSimpleCompiler>(std::move(TM))),
         DL(std::move(DL)), Mangle(ES, this->DL)
-        // CompileCallbackManager(
-        //   llvm::orc::createLocalCompileCallbackManager(TM->getTargetTriple(), ES, 0)),
-        //   CODLayer(ES, OptimizeLayer,
-        //   [this](llvm::Function &F) { return std::set<llvm::Function*>({&F}); },
-        //   *CompileCallbackManager,
-        //   llvm::orc::createLocalIndirectStubsManagerBuilder(
-        //     TM->getTargetTriple()))
-        //   Ctx(std::make_unique<llvm::LLVMContext>())
         {
           MainJD = &cantFail(ES.createJITDylib("main"));
 
@@ -73,8 +58,6 @@ namespace rgd {
       }
 
       const llvm::DataLayout &getDataLayout() const { return DL; }
-      // llvm::LLVMContext &getContext() { return *Ctx.getContext(); }
-      // llvm::orc::ThreadSafeContext &getTSC() {return Ctx;}
 
       static llvm::Expected<std::unique_ptr<GradJit>> Create() {
         auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
@@ -90,13 +73,19 @@ namespace rgd {
           return DL.takeError();
         }
 
-        return std::make_unique<GradJit>(std::move(*JTMB), std::move(*DL));
+        auto TM = JTMB->createTargetMachine();
+        if (!TM) {
+          llvm::errs() << "Cannot creat the target machine: " << TM.takeError() << "\n";
+          return TM.takeError();
+        }
+
+        return std::make_unique<GradJit>(std::move(*TM), std::move(*DL));
       }
 
-      llvm::Error addModule(std::unique_ptr<llvm::Module> M,
+      void addModule(std::unique_ptr<llvm::Module> M,
                             std::unique_ptr<llvm::LLVMContext> ctx) {
-        return OptimizeLayer.add(*MainJD,
-          llvm::orc::ThreadSafeModule(std::move(M), std::move(ctx)));
+        cantFail(CompileLayer.add(*MainJD,
+          llvm::orc::ThreadSafeModule(std::move(M), std::move(ctx))));
       }
 
       llvm::Expected<llvm::JITEvaluatedSymbol> lookup(llvm::StringRef Name) {
