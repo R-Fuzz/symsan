@@ -63,6 +63,9 @@ private:
   std::atomic_ulong cache_misses;
   std::atomic_ulong num_timeout;
   std::atomic_ulong num_solved;
+  std::atomic_ulong process_time;
+  std::atomic_ulong jit_time;
+  std::atomic_ulong solving_time;
 };
 
 class I2SSolver : public Solver {
