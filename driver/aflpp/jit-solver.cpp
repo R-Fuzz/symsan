@@ -18,6 +18,14 @@ using namespace rgd;
 #define DEBUGF(_str...) do { } while (0)
 #endif
 
+static const uint64_t kUsToS = 1000000;
+
+static uint64_t getTimeStamp() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return tv.tv_sec * kUsToS + tv.tv_usec;
+}
+
 extern std::unique_ptr<GradJit> JIT;
 
 struct myKV {
@@ -56,6 +64,7 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
                  uint8_t *out_buf, size_t &out_size) {
 
   auto base_task = task->base_task;
+  uint64_t start;
   while (base_task != nullptr) {
     // no need to solve
     if (base_task->skip_next) {
@@ -87,8 +96,12 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
         cache_misses++;
         DEBUGF("jit constraint %d\n", c->ast->label());
         uint64_t id = ++uuid;
+        start = getTimeStamp();
         addFunction(c->get_root(), c->local_map, id);
+        process_time += (getTimeStamp() - start);
+        start = getTimeStamp();
         auto fn = performJit(id);
+        jit_time += (getTimeStamp() - start);
         auto kv = new struct myKV(c->ast, fn);
         if (!fCache.insert(kv))
           delete kv;
@@ -101,7 +114,9 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
   }
 
   // solve the task
+  start = getTimeStamp();
   bool res = gd_entry(task);
+  solving_time += (getTimeStamp() - start);
   if (res) {
     DEBUGF("solved\n");
     out_size = in_size;
@@ -125,4 +140,7 @@ void JITSolver::print_stats(int fd) {
   dprintf(fd, "  cache misses: %lu\n", cache_misses.load());
   dprintf(fd, "  num solved: %lu\n", num_solved.load());
   dprintf(fd, "  num timeout: %lu\n", num_timeout.load());
+  dprintf(fd, "  process time: %lu\n", process_time.load());
+  dprintf(fd, "  jit  time: %lu\n", jit_time.load());
+  dprintf(fd, "  solving time: %lu\n", solving_time.load());
 }
