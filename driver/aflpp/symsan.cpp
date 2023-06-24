@@ -51,6 +51,8 @@ using namespace __dfsan;
 
 #define PRINT_STATS 1
 
+#define MAX_DEPTH 100
+
 static bool NestedSolving = true;
 
 #undef alloc_printf
@@ -73,6 +75,13 @@ enum mutation_state_t {
   MUTATION_INVALID,
   MUTATION_IN_VALIDATION,
   MUTATION_VALIDATED,
+};
+
+enum ast_node_t {
+  NONE_CMP_NODE = 0,
+  CMP_NODE = 1,
+  INVALID_NODE = 2,
+  CONCRETIZE_NODE = 4,
 };
 
 struct my_mutator_t {
@@ -164,6 +173,25 @@ static const std::unordered_map<unsigned, std::pair<unsigned, const char*> > OP_
 
 static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
   return (op & 0xff) == __dfsan::ICmp && (op >> 8) == pred;
+}
+
+static inline bool eval_icmp(uint16_t op, uint64_t op1, uint64_t op2) {
+  if ((op & 0xff) == __dfsan::ICmp) {
+    switch (op >> 8) {
+      case __dfsan::bveq: return op1 == op2;
+      case __dfsan::bvneq: return op1 != op2;
+      case __dfsan::bvugt: return op1 > op2;
+      case __dfsan::bvuge: return op1 >= op2;
+      case __dfsan::bvult: return op1 < op2;
+      case __dfsan::bvule: return op1 <= op2;
+      case __dfsan::bvsgt: return (int64_t)op1 > (int64_t)op2;
+      case __dfsan::bvsge: return (int64_t)op1 >= (int64_t)op2;
+      case __dfsan::bvslt: return (int64_t)op1 < (int64_t)op2;
+      case __dfsan::bvsle: return (int64_t)op1 <= (int64_t)op2;
+      default: return false;
+    }
+  }
+  return false;
 }
 
 // FIXME: global caches
@@ -491,11 +519,11 @@ static task_t construct_task(std::vector<const rgd::AstNode*> clause,
   return nullptr;
 }
 
-static bool find_roots(dfsan_label label, rgd::AstNode *ret,
-                       size_t &tree_size,
-                       std::unordered_set<size_t> &input_deps,
-                       std::unordered_set<dfsan_label> &subroots,
-                       std::unordered_set<dfsan_label> &visited);
+static int find_roots(dfsan_label label, rgd::AstNode *ret,
+                      size_t &tree_size, size_t depth,
+                      std::unordered_set<size_t> &input_deps,
+                      std::unordered_set<dfsan_label> &subroots,
+                      std::unordered_set<dfsan_label> &visited);
 
 // sometimes llvm will zext bool
 static dfsan_label strip_zext(dfsan_label label) {
@@ -513,20 +541,20 @@ static dfsan_label strip_zext(dfsan_label label) {
   return label;
 }
 
-static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
-                          size_t &tree_size,
-                          std::unordered_set<size_t> &input_deps,
-                          std::unordered_set<dfsan_label> &subroots,
-                          std::unordered_set<dfsan_label> &visited) {
+static int simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
+                         size_t &tree_size, size_t depth,
+                         std::unordered_set<size_t> &input_deps,
+                         std::unordered_set<dfsan_label> &subroots,
+                         std::unordered_set<dfsan_label> &visited) {
   // try some simplification, 0 LAnd x = 0, 1 LAnd x = x
   // symsan always keeps rhs as symbolic
   dfsan_label lhs = info->l1 >= CONST_OFFSET ? strip_zext(info->l1) : 0;
   dfsan_label rhs = strip_zext(info->l2);
   if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
     // if nothing go stripped, we can't simplify
-    bool r = find_roots(rhs, ret, tree_size, input_deps, subroots, visited);
+    int r = find_roots(rhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
     if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, tree_size, input_deps, subroots, visited);
+      r |= find_roots(lhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
     }
     tree_size += 2;
     return r;
@@ -537,7 +565,7 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
   assert(ret->children_size() == 0);
   rgd::AstNode *right = ret->add_children();
   tree_size += 1;
-  bool rr = find_roots(rhs, right, tree_size, input_deps, subroots, visited);
+  int rr = find_roots(rhs, right, tree_size, depth, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
   // if nothing added, rhs must be a constant
   if (unlikely(!rr)) {
@@ -546,7 +574,7 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
       ret->set_kind(rgd::Bool);
       ret->set_boolvalue(0);
       ret->clear_children();
-      return false;
+      return NONE_CMP_NODE;
     } // rhs is 1, fall through
   }
   if (unlikely(lhs == 0)) {
@@ -555,7 +583,7 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
       ret->set_kind(rgd::Bool);
       ret->set_boolvalue(0);
       ret->clear_children();
-      return false;
+      return NONE_CMP_NODE;
     } else {
       assert(info->op1.i == 1); // 1 LAnd x = x
       ret->CopyFrom(*right);
@@ -564,7 +592,7 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
   } else {
     rgd::AstNode *left = ret->add_children();
     tree_size += 1;
-    bool lr = find_roots(lhs, left, tree_size, input_deps, subroots, visited);
+    int lr = find_roots(lhs, left, tree_size, depth, input_deps, subroots, visited);
     assert(left->bits() == 1); // lhs must be a boolean after parsing
     // if nothing added, lhs must be a constant
     if (unlikely(!lr)) {
@@ -573,13 +601,13 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(0);
         ret->clear_children();
-        return false;
+        return NONE_CMP_NODE;
       } else if (!rr) {
         // both lhs and rhs are constants
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(1); // 1 LAnd 1 = 1 // rhs == 0 has returned earlier
         ret->clear_children();
-        return false;
+        return NONE_CMP_NODE;
       } else { // 1 LAnd x = x
         // lhs is 1, rhs is not
         ret->CopyFrom(*right);
@@ -591,23 +619,23 @@ static bool simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
   ret->set_kind(rgd::LAnd);
   assert(ret->children_size() == 2);
   ret->set_bits(1);
-  return true;
+  return CMP_NODE;
 }
 
-static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
-                         size_t &tree_size,
-                         std::unordered_set<size_t> &input_deps,
-                         std::unordered_set<dfsan_label> &subroots,
-                         std::unordered_set<dfsan_label> &visited) {
+static int simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
+                        size_t &tree_size, size_t depth,
+                        std::unordered_set<size_t> &input_deps,
+                        std::unordered_set<dfsan_label> &subroots,
+                        std::unordered_set<dfsan_label> &visited) {
   // try some simplification, x LOr 0 = x, x LOr 1 = 1
   // symsan always keeps rhs as symbolic
   dfsan_label lhs = info->l1 >= CONST_OFFSET ? strip_zext(info->l1) : 0;
   dfsan_label rhs = strip_zext(info->l2);
   if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
     // if nothing go stripped, we can't simplify
-    bool r = find_roots(rhs, ret, tree_size, input_deps, subroots, visited);
+    int r = find_roots(rhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
     if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, tree_size, input_deps, subroots, visited);
+      r |= find_roots(lhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
     }
     tree_size += 2;
     return r;
@@ -618,7 +646,7 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
   assert(ret->children_size() == 0);
   rgd::AstNode *right = ret->add_children();
   tree_size += 1;
-  bool rr = find_roots(rhs, right, tree_size, input_deps, subroots, visited);
+  int rr = find_roots(rhs, right, tree_size, depth, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
   // if nothing added, rhs must be a constant
   if (unlikely(!rr)) {
@@ -627,7 +655,7 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
       ret->set_kind(rgd::Bool);
       ret->set_boolvalue(1);
       ret->clear_children();
-      return false;
+      return NONE_CMP_NODE;
     } // rhs is 0, fall through
   }
   if (unlikely(lhs == 0)) {
@@ -636,7 +664,7 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
       ret->set_kind(rgd::Bool);
       ret->set_boolvalue(1);
       ret->clear_children();
-      return false;
+      return NONE_CMP_NODE;
     } else { // 0 LOr x = x
       assert(info->op1.i == 0);
       ret->CopyFrom(*right);
@@ -645,7 +673,7 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
   } else {
     rgd::AstNode *left = ret->add_children();
     tree_size += 1;
-    bool lr = find_roots(lhs, left, tree_size, input_deps, subroots, visited);
+    int lr = find_roots(lhs, left, tree_size, depth, input_deps, subroots, visited);
     assert(left->bits() == 1); // lhs must be a boolean after parsing
     // if nothing added, lhs must be a constant
     if (unlikely(!lr)) {
@@ -654,13 +682,13 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(1);
         ret->clear_children();
-        return false;
+        return NONE_CMP_NODE;
       } else if (!rr) {
         // both lhs and rhs are constants
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(0); // 0 LOr 0 = 0 // rhs == 1 has returned earlier
         ret->clear_children();
-        return false;
+        return NONE_CMP_NODE;
       } else { // 0 LOr x = x
         // lhs is 0, rhs is not
         ret->CopyFrom(*right);
@@ -671,23 +699,23 @@ static bool simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
 
   ret->set_kind(rgd::LOr);
   ret->set_bits(1);
-  return true;
+  return CMP_NODE;
 }
 
-static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
-                         size_t &tree_size,
-                         std::unordered_set<size_t> &input_deps,
-                         std::unordered_set<dfsan_label> &subroots,
-                         std::unordered_set<dfsan_label> &visited) {
+static int simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
+                        size_t &tree_size, size_t depth,
+                        std::unordered_set<size_t> &input_deps,
+                        std::unordered_set<dfsan_label> &subroots,
+                        std::unordered_set<dfsan_label> &visited) {
   // llvm uses xor to do LNot
   // symsan always keeps rhs as symbolic
   dfsan_label lhs = info->l1 >= CONST_OFFSET ? strip_zext(info->l1) : 0;
   dfsan_label rhs = strip_zext(info->l2);
   if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
     // if nothing go stripped, we can't simplify
-    bool r = find_roots(rhs, ret, tree_size, input_deps, subroots, visited);
+    int r = find_roots(rhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
     if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, tree_size, input_deps, subroots, visited);
+      r |= find_roots(lhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
     }
     tree_size += 2;
     return r;
@@ -698,7 +726,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
   assert(ret->children_size() == 0);
   rgd::AstNode *right = ret->add_children();
   tree_size += 1;
-  bool rr = find_roots(rhs, right, tree_size, input_deps, subroots, visited);
+  int rr = find_roots(rhs, right, tree_size, depth, input_deps, subroots, visited);
   assert(right->bits() == 1); // rhs must be a boolean after parsing
   ret->set_bits(1);
   if (unlikely(!rr)) {
@@ -708,7 +736,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
     if (likely(info->l1 == 0)) { // left is a constant
       ret->set_boolvalue(right->boolvalue() ^ (uint32_t)info->op1.i);
       ret->clear_children();
-      return false;
+      return NONE_CMP_NODE;
     } // left is symbolic, fall through
   }
   
@@ -716,7 +744,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
     // when reach here, rhs must not be a constant
     if (info->op1.i == 1) { // 1 LXor x = LNot x
       ret->set_kind(rgd::LNot);
-      return true;
+      return CMP_NODE;
     } else { // 0 LXor x = x
       ret->CopyFrom(*right);
       return rr;
@@ -724,7 +752,7 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
   } else {
     rgd::AstNode *left = ret->add_children();
     tree_size += 1;
-    bool lr = find_roots(lhs, left, tree_size, input_deps, subroots, visited);
+    int lr = find_roots(lhs, left, tree_size, depth, input_deps, subroots, visited);
     if (unlikely(!lr)) {
       // if nothing added, lhs must be a constant
       assert(left->kind() == rgd::Bool);
@@ -737,17 +765,17 @@ static bool simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
     }
   }
   ret->set_kind(rgd::Xor);
-  return true;
+  return CMP_NODE;
 }
 
-static bool find_roots(dfsan_label label, rgd::AstNode *ret,
-                       size_t &tree_size,
-                       std::unordered_set<size_t> &input_deps,
-                       std::unordered_set<dfsan_label> &subroots,
-                       std::unordered_set<dfsan_label> &visited) {
+static int find_roots(dfsan_label label, rgd::AstNode *ret,
+                      size_t &tree_size, size_t depth,
+                      std::unordered_set<size_t> &input_deps,
+                      std::unordered_set<dfsan_label> &subroots,
+                      std::unordered_set<dfsan_label> &visited) {
   if (label < CONST_OFFSET || label == kInitializingLabel) {
     WARNF("invalid label: %d\n", label);
-    return false;
+    return INVALID_NODE;
   }
 
   dfsan_label_info *info = get_label_info(label);
@@ -755,13 +783,13 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
   if (info->op == 0) {
     tree_size += 1;
     input_deps.insert(info->op1.i);
-    return false;
+    return NONE_CMP_NODE;
   } else if (info->op == __dfsan::Load) {
     tree_size += 1;
     uint64_t offset = get_label_info(info->l1)->op1.i;
     for (size_t i = 0; i < info->l2; ++i)
       input_deps.insert(offset + i);
-    return false;
+    return NONE_CMP_NODE;
   }
 
   // check for visited after input deps have been added
@@ -771,28 +799,62 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
   }
   visited.insert(label);
 
+  if (depth > MAX_DEPTH) {
+    WARNF("exceed max depth: %zu\n", depth);
+    return CONCRETIZE_NODE;
+  }
+
   // possible boolean operations
   if (info->op == __dfsan::And) {
-    return simplify_land(info, ret, tree_size, input_deps, subroots, visited);
+    return simplify_land(info, ret, tree_size, depth, input_deps, subroots, visited);
   } else if (info->op == __dfsan::Or) {
-    return simplify_lor(info, ret, tree_size, input_deps, subroots, visited);
+    return simplify_lor(info, ret, tree_size, depth, input_deps, subroots, visited);
   } else if (info->op == __dfsan::Xor) {
-    return simplify_xor(info, ret, tree_size, input_deps, subroots, visited);
+    return simplify_xor(info, ret, tree_size, depth, input_deps, subroots, visited);
   } else if ((info->op & 0xff) == __dfsan::ICmp) {
     // if it's a comparison, we need to make sure both operands don't
     // contain any additional comparison operator
-    bool lr = false, rr = false;
+    int lr = NONE_CMP_NODE, rr = NONE_CMP_NODE;
     rgd::AstNode *left = ret->add_children();
     rgd::AstNode *right = ret->add_children();
     size_t left_size = 0, right_size = 0;
+    std::unordered_set<size_t> left_deps, right_deps;
     visited.clear(); // don't carry visited info across subtrees, to properly collect input deps
     auto &deps = branch_to_inputs[label]; // get the input deps of this branch
     if (info->l1 >= CONST_OFFSET) {
-      lr = find_roots(strip_zext(info->l1), left, left_size, deps, subroots, visited);
-    } else { left_size = 1; }
+      lr = find_roots(strip_zext(info->l1), left, left_size, 1, left_deps, subroots, visited);
+      // if something wrong happens, concretize the whole subtree
+      if (unlikely(((lr & INVALID_NODE) != 0) || ((lr & CONCRETIZE_NODE) != 0))) {
+        left->set_kind(rgd::Constant);
+        left_deps.clear();
+        left_size = 1;
+        lr = NONE_CMP_NODE;
+      }
+    } else {
+      left->set_kind(rgd::Constant);
+      left_size = 1;
+    }
     if (info->l2 >= CONST_OFFSET) {
-      rr = find_roots(strip_zext(info->l2), right, right_size, deps, subroots, visited);
-    } else { right_size = 1; }
+      rr = find_roots(strip_zext(info->l2), right, right_size, 1, right_deps, subroots, visited);
+      if (unlikely(((rr & INVALID_NODE) != 0) || ((rr & CONCRETIZE_NODE) != 0))) {
+        left->set_kind(rgd::Constant);
+        right_deps.clear();
+        right_size = 1;
+        rr = NONE_CMP_NODE;
+      }
+    } else {
+      right->set_kind(rgd::Constant);
+      right_size = 1;
+    }
+    // if both sides are constants, set it as a constant boolean
+    if (unlikely(left->kind() == rgd::Constant && right->kind() == rgd::Constant)) {
+      ret->set_kind(rgd::Bool);
+      ret->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
+      ret->clear_children();
+      return NONE_CMP_NODE;
+    }
+    deps.insert(left_deps.begin(), left_deps.end()); // propagate input deps
+    deps.insert(right_deps.begin(), right_deps.end()); // propagate input deps
     input_deps.insert(deps.begin(), deps.end()); // propagate input deps
     if (unlikely(lr)) {
       // if there are additional icmp in lhs, this icmp must be simplifiable
@@ -817,13 +879,14 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
           }
         }
         tree_size += left_size;
-        return true;
+        return CMP_NODE;
       } else {
         // bool icmp bool ?!
         WARNF("bool icmp bool ?!\n");
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(0);
-        return false;
+        ret->clear_children();
+        return NONE_CMP_NODE;
       }
     } else if (unlikely(rr)) {
       // if there are additional icmp in rhs, this icmp must be simplifiable
@@ -848,14 +911,14 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
           }
         }
         tree_size += right_size;
-        return true;
+        return CMP_NODE;
       } else {
         // bool icmp bool ?!
         WARNF("bool icmp bool ?!\n");
         ret->set_kind(rgd::Bool);
         ret->set_boolvalue(0);
         ret->clear_children();
-        return false;
+        return NONE_CMP_NODE;
       }
     } else {
       // !lr && !rr when reach here
@@ -870,21 +933,34 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
 #ifdef DEBUG
       subroots.insert(label);
 #endif
-      return true;
+      return CMP_NODE;
     }
   } else if (info->op == __dfsan::fmemcmp) {
     // memcmp is also considered as a root node (relational comparison)
-    bool s1_r = false, s2_r = false;
+    int s1_r = NONE_CMP_NODE, s2_r = NONE_CMP_NODE;
     rgd::AstNode *s1 = ret->add_children();
     rgd::AstNode *s2 = ret->add_children();
     size_t s1_size = 0, s2_size = 0;
+    std::unordered_set<size_t> s1_deps, s2_deps;
     visited.clear(); // don't carry visited info across subtrees
     auto &deps = branch_to_inputs[label]; // get the input deps of this branch
     if (info->l1 >= CONST_OFFSET) {
-      s1_r = find_roots(info->l1, s1, s1_size, deps, subroots, visited);
+      s1_r = find_roots(info->l1, s1, s1_size, 1, s1_deps, subroots, visited);
+      // if something wrong happens, return error, as the concrete value is not
+      // available
+      if (unlikely(((s1_r & INVALID_NODE) != 0) || ((s1_r & CONCRETIZE_NODE) != 0))) {
+        return s1_r;
+      }
     } else { s1_size = 1;}
     assert(info->l2 >= CONST_OFFSET);
-    s2_r = find_roots(info->l2, s2, s2_size, deps, subroots, visited);
+    s2_r = find_roots(info->l2, s2, s2_size, 1, s2_deps, subroots, visited);
+    // if something wrong happens, return error, as the concrete value is not
+    // available
+    if (unlikely(((s2_r & INVALID_NODE) != 0) || ((s2_r & CONCRETIZE_NODE) != 0))) {
+      return s2_r;
+    }
+    deps.insert(s1_deps.begin(), s1_deps.end()); // propagate input deps
+    deps.insert(s2_deps.begin(), s2_deps.end()); // propagate input deps
     input_deps.insert(deps.begin(), deps.end()); // propagate input deps
     assert(!s1_r && !s2_r && "memcmp should not have additional icmp");
     ret->set_bits(1); // XXX: treat memcmp as a boolean
@@ -896,16 +972,16 @@ static bool find_roots(dfsan_label label, rgd::AstNode *ret,
 #ifdef DEBUG
     subroots.insert(label);
 #endif
-    return true;
+    return CMP_NODE;
   }
 
   // for all other cases, just visit the operands
-  bool r = false;
+  int r = NONE_CMP_NODE;
   if (likely(info->l2 >= CONST_OFFSET)) {
-    r |= find_roots(info->l2, ret, tree_size, input_deps, subroots, visited);
+    r |= find_roots(info->l2, ret, tree_size, depth + 1, input_deps, subroots, visited);
   }
   if (info->l1 >= CONST_OFFSET) {
-    r |= find_roots(info->l1, ret, tree_size, input_deps, subroots, visited);
+    r |= find_roots(info->l1, ret, tree_size, depth + 1, input_deps, subroots, visited);
   }
   tree_size += 2; // count two children to be conservative
   return r;
@@ -1022,7 +1098,7 @@ static inline expr_t get_root_expr(dfsan_label label) {
     auto &deps = branch_to_inputs[label];
     // we start by constructing a boolean formula with relational expressions
     // as leaf nodes
-    find_roots(label, root.get(), tree_size, deps, subroots, visited);
+    find_roots(label, root.get(), tree_size, 0, deps, subroots, visited);
     root_expr_cache.insert({label, root});
     ast_size_cache.insert({label, tree_size});
 #if DEBUG
