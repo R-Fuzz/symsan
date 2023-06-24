@@ -12,66 +12,8 @@ from enum import Enum
 import logging
 
 from config import *
+from defs import *
 import agent
-
-class MsgType(Enum):
-    cond_type = 0
-    gep_type = 1
-    memcmp_type = 2
-    fsize_type = 3
-    loop_type = 4
-
-# 36 bytes
-class pipe_msg(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [("msg_type", ctypes.c_uint16),
-                ("flags", ctypes.c_uint16),
-                ("instance_id", ctypes.c_uint32),
-                ("addr", ctypes.c_ulong),
-                ("context", ctypes.c_uint32),
-                ("id", ctypes.c_uint32),
-                ("label", ctypes.c_uint32),
-                ("result", ctypes.c_uint64)]
-
-# 48 bytes
-class gep_msg(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [("ptr_label", ctypes.c_uint32),
-                ("index_label", ctypes.c_uint32),
-                ("ptr", ctypes.c_ulong),
-                ("index", ctypes.c_int64),
-                ("num_elems", ctypes.c_uint64),
-                ("elem_size", ctypes.c_uint64),
-                ("current_offset", ctypes.c_int64)]
-# 4 bytes
-class memcmp_msg(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [("label", ctypes.c_uint32),
-                ("content", ctypes.c_ubyte * 0)]
-
-class mazerunner_msg(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [("flags", ctypes.c_uint16),
-                ("id", ctypes.c_uint32),
-                ("addr", ctypes.c_ulong),
-                ("context", ctypes.c_uint32),
-                ("bb_dist", ctypes.c_uint64),
-                ("avg_dist", ctypes.c_uint64)]
-# 8 bytes
-class data(ctypes.Union):
-    _fields_ = [("i", ctypes.c_uint64),
-                ("f", ctypes.c_float),
-                ("d", ctypes.c_double)]
-# 32 bytes
-class dfsan_label_info(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [("l1", ctypes.c_uint32),
-                ("l2", ctypes.c_uint32),
-                ("op1", data),
-                ("op2", data),
-                ("op", ctypes.c_uint16),
-                ("size", ctypes.c_uint16),
-                ("hash", ctypes.c_uint32)]
 
 # for output
 output_dir = "."
@@ -135,7 +77,7 @@ def main(argv):
 
     # Create and map shared memory
     try:
-        shm = shared_memory.SharedMemory(create=True, size=0xc00000000)
+        shm = shared_memory.SharedMemory(create=True, size=UNIONTABLE_SIZE)
     except:
         logger.error(f"Failed to map shm({shm._fd}), size(shm.size)")
         return -1
