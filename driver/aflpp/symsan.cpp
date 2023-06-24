@@ -200,6 +200,7 @@ static std::unordered_map<dfsan_label, constraint_t> constraint_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<size_t> > branch_to_inputs;
 static std::unordered_map<dfsan_label, std::unique_ptr<uint8_t[]>> memcmp_cache;
 static std::unordered_map<dfsan_label, size_t> ast_size_cache;
+static std::unordered_map<dfsan_label, uint8_t> concretize_node;
 // FIXME: global input dependency forests
 static rgd::UnionFind data_flow_deps;
 static std::vector<std::vector<expr_t> > input_to_branches;
@@ -217,6 +218,7 @@ static void reset_global_caches(size_t buf_size) {
   branch_to_inputs.clear();
   memcmp_cache.clear();
   ast_size_cache.clear();
+  concretize_node.clear();
   data_flow_deps.reset(buf_size);
   for (auto &s: input_to_branches) {
     s.clear();
@@ -383,14 +385,24 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   ret->set_name(op_itr->second.second);
 #endif
 
+  // in case we needs concretization
+  uint8_t needs_concretization = 0;
+  auto node_itr = concretize_node.find(label);
+  if (node_itr != concretize_node.end()) {
+    needs_concretization = node_itr->second;
+  }
+
   // now we visit the children
   rgd::AstNode *left = ret->add_children();
-  if (info->l1 >= CONST_OFFSET) {
+  if (likely(needs_concretization != 1) && (info->l1 >= CONST_OFFSET)) {
     if (!do_uta_rel(info->l1, left, buf, buf_size, constraint, visited)) {
       return false;
     }
     visited.insert(info->l1);
   } else {
+    if (unlikely(needs_concretization)) {
+      assert(rgd::isRelationalKind(ret->kind()) && "invalid kind for concretization");
+    }
     // constant
     left->set_kind(rgd::Constant);
     left->set_label(0);
@@ -427,12 +439,15 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   }
 
   rgd::AstNode *right = ret->add_children();
-  if (info->l2 >= CONST_OFFSET) {
+  if (likely(needs_concretization != 2) && (info->l2 >= CONST_OFFSET)) {
     if (!do_uta_rel(info->l2, right, buf, buf_size, constraint, visited)) {
       return false;
     }
     visited.insert(info->l2);
   } else {
+    if (unlikely(needs_concretization)) {
+      assert(rgd::isRelationalKind(ret->kind()) && "invalid kind for concretization");
+    }
     // constant
     right->set_kind(rgd::Constant);
     right->set_label(0);
@@ -829,6 +844,8 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
         left_deps.clear();
         left_size = 1;
         lr = NONE_CMP_NODE;
+        // record the info
+        concretize_node[label] = 1;
       }
     } else {
       left->set_kind(rgd::Constant);
@@ -837,10 +854,12 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
     if (info->l2 >= CONST_OFFSET) {
       rr = find_roots(strip_zext(info->l2), right, right_size, 1, right_deps, subroots, visited);
       if (unlikely(((rr & INVALID_NODE) != 0) || ((rr & CONCRETIZE_NODE) != 0))) {
-        left->set_kind(rgd::Constant);
+        right->set_kind(rgd::Constant);
         right_deps.clear();
         right_size = 1;
         rr = NONE_CMP_NODE;
+        // record the info
+        concretize_node[label] = 2;
       }
     } else {
       right->set_kind(rgd::Constant);
