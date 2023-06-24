@@ -893,6 +893,7 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
     // if both sides are constants, set it as a constant boolean
     if (unlikely(left->kind() == rgd::Constant && right->kind() == rgd::Constant)) {
       ret->set_kind(rgd::Bool);
+      ret->set_bits(1);
       ret->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
       ret->clear_children();
       return NONE_CMP_NODE;
@@ -928,6 +929,7 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
         // bool icmp bool ?!
         WARNF("bool icmp bool ?!\n");
         ret->set_kind(rgd::Bool);
+        ret->set_bits(1);
         ret->set_boolvalue(0);
         ret->clear_children();
         return NONE_CMP_NODE;
@@ -960,6 +962,7 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
         // bool icmp bool ?!
         WARNF("bool icmp bool ?!\n");
         ret->set_kind(rgd::Bool);
+        ret->set_bits(1);
         ret->set_boolvalue(0);
         ret->clear_children();
         return NONE_CMP_NODE;
@@ -1330,7 +1333,7 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
     branches_to_solve += 1;
   }
 
-  if (msg.flags & F_ADD_CONS) {
+  if (NestedSolving && (msg.flags & F_ADD_CONS)) {
     // add the current branch direction as nested conditions
     add_data_flow_constraints(ctx->direction, msg.label, buf, buf_size);
   }
