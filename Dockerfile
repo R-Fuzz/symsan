@@ -3,6 +3,9 @@ FROM ubuntu:jammy
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
 WORKDIR /workdir
 COPY . /workdir/symsan
 
