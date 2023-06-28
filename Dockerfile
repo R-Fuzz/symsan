@@ -18,3 +18,7 @@ RUN apt clean
 RUN cd symsan/ && mkdir -p build && \
     cd build && CC=clang-12 CXX=clang++-12 cmake -DCMAKE_INSTALL_PREFIX=. -DAFLPP_PATH=/workdir/aflpp ../  && \
     make -j4 && make install
+
+ENV KO_CC=clang-12
+ENV KO_CXX=clang++-12
+ENV KO_USE_FASTGEN=1
