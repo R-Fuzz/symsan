@@ -79,7 +79,7 @@ using namespace llvm;
 
 // Number of bits to discard when computing the call stack hash.
 // This must be in the range of 1-32.
-static const unsigned kContextSensitiveGranularity = 4; 
+static const unsigned kContextSensitiveGranularity = 4;
 
 // This must be consistent with ShadowWidthBits.
 static const Align kShadowTLSAlignment = Align(4);
@@ -697,13 +697,11 @@ void Taint::addContextRecording(Function &F) {
   StoreInst *SCS = IRB.CreateStore(NCS, CallStack);
   SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
 
-  // Add (ctx << kContextSensitiveGranularity) ^ return_addr at the beginning of a function
-  Value *ReturnAddress = IRB.CreateCall(
-    Intrinsic::getDeclaration(F.getParent(), Intrinsic::returnaddress),
-    IRB.getInt32(0));
+  // instrument (ctx << kContextSensitiveGranularity) ^ return_addr at the beginning of a function
+  ConstantInt *ReturnAddress = ConstantInt::get(Int32Ty, hash);
   LoadInst *LCSA = IRB.CreateLoad(CallStackAddr);
   LCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
-  Value *ShiftedLCS = IRB.CreateShl(LCSA, kContextSensitiveGranularity);  
+  Value *ShiftedLCS = IRB.CreateShl(LCSA, kContextSensitiveGranularity);
   Value *NCSA = IRB.CreateXor(ShiftedLCS, ReturnAddress);
   StoreInst *SCSA = IRB.CreateStore(NCSA, CallStackAddr);
   SCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
