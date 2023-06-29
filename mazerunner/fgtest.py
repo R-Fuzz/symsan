@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 import os
 import sys
-import mmap
 from multiprocessing import shared_memory
 import subprocess
 import ctypes
 import z3
-import tempfile
 
 from config import *
 from defs import *
-# import pdb; pdb.set_trace()
 
 # resources
 pipefds = shm = proc = None
@@ -24,23 +21,15 @@ __z3_context = z3.Context()
 __z3_solver = z3.SolverFor("QF_BV", ctx=__z3_context)
 
 # caches
-# static std::unordered_map<dfsan_label, std::unordered_set<u32> > deps_cache;
-deps_cache = {}
-# static std::unordered_map<dfsan_label, z3::expr> expr_cache;
-expr_cache = {}
-# static std::unordered_map<dfsan_label, memcmp_msg*> memcmp_cache;
-memcmp_cache = {}
-
-# dependencies
-# static std::vector<branch_dep_t*> __branch_deps;
-__branch_deps = []
+deps_cache = {} # key: dfsan_label, value: set()
+expr_cache = {} # key: dfsan_label, value: z3.ExprRef
+memcmp_cache = {} # key: dfsan_label, value: memcmp_msg
+__branch_deps = [] # list of branch_dep_t dependencies
 
 class branch_dep_t:
     def __init__(self):
-        # std::unordered_set<ExprRef> expr_deps;
-        self.expr_deps = set()
-        # std::unordered_set<dfsan_label> input_deps;
-        self.input_deps = set()
+        self.expr_deps = set() # z3.ExprRef set
+        self.input_deps = set() # dfsan_label set
 
 def get_branch_dep(n: int):
   if n >= len(__branch_deps):
@@ -274,7 +263,7 @@ def serialize(label: int, deps: set):
         print("FATAL: unsupported op: {}".format(info.op))
         raise ValueError("Unsupported operator")
 
-def __solve_expr(e):
+def __solve_expr(e: z3.ExprRef):
   has_solved = False
   # set up local optmistic solver
   opt_solver = z3.SolverFor("QF_BV", ctx=__z3_context)
@@ -296,7 +285,7 @@ def __solve_expr(e):
     __z3_solver.pop()
   return has_solved
 
-def __solve_cond(label, r, add_nested, addr):
+def __solve_cond(label: ctypes.c_uint32, r: ctypes.c_uint64, add_nested: bool, addr: ctypes.c_ulong):
     print(f"__solve_cond: label={label}, result={r}, add_cons={add_nested}, addr={hex(addr)}")
     
     result = z3.BoolVal(r != 0, ctx=__z3_context)
@@ -352,12 +341,103 @@ def __solve_cond(label, r, add_nested, addr):
 def __handle_loop(id, addr):
     print(f"__handle_loop: id={id}, loop_header={hex(addr)}")
 
-def __solve_gep(index, lb, ub, step, addr):
-    pass
+def __solve_gep(index: z3.ExprRef, lb: int, ub: int, step: int, addr: int):
+    # enumerate indices
+    for i in range(lb, ub, step):
+        idx = z3.BitVecVal(i, 64, __z3_context)
+        e = (index == idx)
+        if __solve_expr(e):
+            print(f"\tindex == {i} feasible")
+    # check feasibility for OOB
+    # upper bound
+    u = z3.BitVecVal(ub, 64, __z3_context)
+    e = z3.UGE(index, u)
+    if __solve_expr(e):
+        print(f"\tindex >= {ub} solved @{addr}")
+    else:
+        print(f"\tindex >= {ub} not possible")
+    # lower bound
+    if lb == 0:
+        e = (index < 0)
+    else:
+        l = z3.BitVecVal(lb, 64, __z3_context)
+        e = z3.ULT(index, l)
+    if __solve_expr(e):
+        print(f"\tindex < {lb} solved @{addr}")
+    else:
+        print(f"\tindex < {lb} not possible")
 
-def __handle_gep(ptr_label, ptr, index_label, index, num_elems, elem_size, current_offset, addr):
+
+def __handle_gep(ptr_label: ctypes.c_uint32, ptr: ctypes.c_ulong, index_label: ctypes.c_uint32, 
+                 index: ctypes.c_int64, num_elems: ctypes.c_uint64, elem_size: ctypes.c_uint64, 
+                 current_offset: ctypes.c_int64, addr: ctypes.c_ulong):
     print(f"__handle_gep: ptr_label={ptr_label}, ptr={ptr}, index_label={index_label}, index={index}, "
           f"num_elems={num_elems}, elem_size={elem_size}, current_offset={current_offset}, addr={addr}")
+    size = get_label_info(index_label).size
+    inputs = set()
+    index_bv = serialize(index_label, inputs)
+    # collect additional input deps
+    worklist = list(inputs)
+    while worklist:
+        off = worklist.pop()
+        deps = get_branch_dep(off)
+        if deps:
+            for i in deps.input_deps:
+                if i not in inputs:
+                    inputs.add(i)
+                    worklist.append(i)
+    # set up the global solver with nested constraints
+    __z3_solver.reset()
+    __z3_solver.set("timeout", 5000)
+    added = set()
+    for off in inputs:
+        deps = get_branch_dep(off)
+        if deps:
+            for expr in deps.expr_deps:
+                if expr not in added:
+                    added.add(expr)
+                    __z3_solver.add(expr)
+    assert __z3_solver.check() == z3.sat
+    # first, check against fixed array bounds if available
+    idx = z3.ZeroExt(64 - size, index_bv)
+    if num_elems > 0:
+        __solve_gep(idx, 0, num_elems, 1, addr)
+    else:
+        bounds = get_label_info(ptr_label)
+        # if the array is not with fixed size, check bound info
+        if bounds.op == LLVM_INS.Alloca:
+            es = z3.BitVecVal(elem_size, 64, __z3_context)
+            co = z3.BitVecVal(current_offset, 64, __z3_context)
+            if bounds.l2 == 0:
+                # only perform index enumeration and bound check
+                # when the size of the buffer is fixed
+                p = z3.BitVecVal(ptr, 64, __z3_context)
+                np = idx * es + co + p
+                __solve_gep(np, bounds.op1.i, bounds.op2.i, elem_size, addr)
+            else:
+                # if the buffer size is input-dependent (not fixed)
+                # check if over flow is possible
+                dummy = set()
+                bs = serialize(bounds.l2, dummy)  # size label
+                if bounds.l1:
+                    dummy.clear()
+                    be = serialize(bounds.l1, dummy)  # elements label
+                    bs = bs * be
+                e = z3.UGT(idx * es * co, bs)  # unsigned greater than
+                if __solve_expr(e):
+                    print(f"index >= buffer size feasible @{addr}")
+    # always preserve
+    r_bv = z3.BitVecVal(index, size, __z3_context)
+    for off in inputs:
+        c = get_branch_dep(off)
+        if not c:
+            c = branch_dep_t()
+            set_branch_dep(off, c)
+        if not c:
+            print("WARNING: out of memory")
+        else:
+            c.input_deps.update(inputs)
+            c.expr_deps.add(index_bv == r_bv)
 
 def tear_down():
     global pipefds, shm, proc
@@ -382,7 +462,6 @@ def main(argv):
     if "output_dir=" in options:
         output = options.split("output_dir=")[1].split(":")[0].split(" ")[0]
         output_dir = output
-
     with open(input_file, "rb") as f:
         input_size = os.path.getsize(input_file)
         input_buf = f.read()
@@ -398,13 +477,10 @@ def main(argv):
     pipefds = os.pipe()
 
     # create and execute the child symsan process
-    # options = f"taint_file={input_file}:shm_fd={shm._fd}:pipe_fd={pipefds[1]}:debug=0"
-    options = f"taint_file={input_file}:shm_fd={shm._fd}:pipe_fd={pipefds[1]}:debug=1"
+    options = f"taint_file={input_file}:shm_fd={shm._fd}:pipe_fd={pipefds[1]}:debug=0"
     try:
-        # proc = subprocess.Popen([program, input_file], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        #                     stderr=subprocess.DEVNULL, env={"TAINT_OPTIONS": options}, pass_fds=(shm._fd, pipefds[1]))
-        proc = subprocess.Popen([program, input_file], stdin=None, stdout=None,
-                            stderr=None, env={"TAINT_OPTIONS": options}, pass_fds=(shm._fd, pipefds[1]))
+        proc = subprocess.Popen([program, input_file], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, env={"TAINT_OPTIONS": options}, pass_fds=(shm._fd, pipefds[1]))
     except:
         print("Failed to execute subprocess")
         tear_down()
@@ -445,7 +521,7 @@ def main(argv):
                 continue
             memcmp_cache[msg.label] = mmsg
         elif msg.msg_type == MsgType.loop_type.value:
-            __handle_loop(msg.id, msg.addr)
+            pass
         elif msg.msg_type == MsgType.fsize_type.value:
             pass
         else:
