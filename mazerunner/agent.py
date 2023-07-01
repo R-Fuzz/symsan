@@ -26,7 +26,7 @@ class Agent:
         self.state = ProgramState()
         self.history_actions = []
         self.learner = q_learning.QLearner()
-        self.logger = logging.getLogger('mazerunner.agent')
+        self.logger = logging.getLogger(self.__class__.__qualname__)
 
     def compute_reward(self, d, has_dist):
         reward = 0

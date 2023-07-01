@@ -6,7 +6,7 @@ import collections
 class QLearner:
     def __init__(self):
         self.Q_table = collections.defaultdict(float)
-        # self.logger = logging.getLogger('mazerunner.q_learner')
+        # self.logger = logging.getLogger(self.__class__.__qualname__)
 
     def learn(self, last_SA, next_s, last_reward):
         last_Q = self.Q_table[last_SA]
