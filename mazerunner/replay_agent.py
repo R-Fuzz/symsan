@@ -1,15 +1,9 @@
-#!/usr/bin/env python3
-
 import os
 import pickle
-# import logging
 
 from agent import *
 
 class ReplayAgent(Agent):
-    # def __init__(self):
-    #     super().__init__()
-    #     self.logger = logging.getLogger(self.__class__.__qualname__)
 
     def replay_log(self, log_dir):
         seed_traces = os.listdir(log_dir)
@@ -23,7 +17,7 @@ class ReplayAgent(Agent):
     def replay_trace(self, trace):
         last_SA = 0
         last_reward = 0
-        last_d = MAX_DISTANCE
+        last_d = self.config.max_distance
         for (next_s, a, d) in trace:
             next_sa = next_s + (a,)
             reward = self.compute_reward(d, last_d)

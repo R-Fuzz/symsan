@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
 import os
 from multiprocessing import shared_memory
 import ctypes
 import z3
 import logging
 
-from config import *
 from defs import *
 
 def get_label_info(label: int, shm: shared_memory.SharedMemory):
@@ -18,8 +16,10 @@ class branch_dep_t:
         self.input_deps = set() # dfsan_label set
 
 class Serializer:
-    def __init__(self, shm, context):
+    def __init__(self, config, shm, context):
+        self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
+        self.logger.setLevel(config.logging_level)
         self.shm = shm
         self.__z3_context = context
         # caches
@@ -215,11 +215,12 @@ class Serializer:
         return e
 
 class Solver:
-    def __init__(self, shm, input_file, output="."):
+    def __init__(self, config, shm, input_file):
+        self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
+        self.logger.setLevel(config.logging_level)
         self.shm = shm
         # for output
-        self.output_dir = output
         self.__instance_id = 0
         self.__session_id = 0
         self.__current_index = 0
@@ -232,7 +233,7 @@ class Solver:
         self.__z3_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         # list of branch_dep_t dependencies
         self.__branch_deps = []
-        self.serializer = Serializer(self.shm, self.__z3_context)
+        self.serializer = Serializer(self.config, self.shm, self.__z3_context)
 
     def handle_gep(self, gmsg: gep_msg, addr: ctypes.c_ulong):
         self.logger.debug(f"handle_gep: ptr_label={gmsg.ptr_label}, ptr={gmsg.ptr}, "
@@ -345,7 +346,7 @@ class Solver:
                 self.__generate_input(m)
                 has_solved = True
             else:
-                if OPTIMISTIC:
+                if self.config.optimistic_solving:
                     m = opt_solver.model()
                     self.__generate_input(m)
             # reset
@@ -354,7 +355,7 @@ class Solver:
 
     def __generate_input(self, m: z3.Model):
         fname = f"id-{self.__instance_id}-{self.__session_id}-{self.__current_index}"
-        path = os.path.join(self.output_dir, fname)
+        path = os.path.join(self.config.seed_dir, fname)
         self.__current_index += 1
         with open(path, "wb") as f:
             f.write(self.input_buf)
@@ -424,7 +425,7 @@ class Solver:
         else:
             self.logger.debug("__solve_cond: branch not solvable @{}".format(addr))
         # 3. nested branch
-        if NESTED_BRANCH_ENABLED:
+        if self.config.nested_branch:
             for off in inputs:
                 c = self.__get_branch_dep(off)
                 if not c:
