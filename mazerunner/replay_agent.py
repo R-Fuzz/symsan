@@ -15,7 +15,7 @@ class ReplayAgent(Agent):
                 self.replay_trace(trace)
 
     def replay_trace(self, trace):
-        last_SA = 0
+        last_SA = None
         last_reward = 0
         last_d = self.config.max_distance
         for (next_s, a, d) in trace:
