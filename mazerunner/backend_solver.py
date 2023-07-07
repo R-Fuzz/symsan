@@ -16,6 +16,9 @@ class branch_dep_t:
         self.input_deps = set() # dfsan_label set
 
 class Serializer:
+    class InvalidData(ValueError):
+        pass
+
     def __init__(self, config, shm, context):
         self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
@@ -30,7 +33,7 @@ class Serializer:
     def to_z3_expr(self, label: int, deps: set):
         if label < CONST_OFFSET or label == INIT_LABEL:
             self.logger.error(f"to_z3_expr: Invalid label {label}")
-            raise ValueError(f"Invalid label {label}\n")
+            raise Serializer.InvalidData(f"Invalid label {label}\n")
         info = get_label_info(label, self.shm)
         self.logger.debug(f"to_z3_expr: {label} = (l1:{info.l1}, l2:{info.l2}, op:{info.op}, size:{info.size}, "
             f"op1:{info.op1.i}, op2:{info.op2.i}, hash:{info.hash})")
@@ -78,17 +81,17 @@ class Serializer:
         elif info.op == LLVM_INS.Not.value:
             if info.l2 == 0 or info.size != 1:
                 self.logger.error(f"to_z3_expr: Invalid Not operation {label}")
-                raise ValueError("Invalid Not operation")
+                raise Serializer.InvalidData("Invalid Not operation")
             e = self.to_z3_expr(info.l2, deps)
             if z3.is_bool(e):
                 self.logger.error(f"to_z3_expr: Only LNot should be recorded {label}")
-                raise ValueError("Only LNot should be recorded")
+                raise Serializer.InvalidData("Only LNot should be recorded")
             return self.__cache_expr(label, z3.Not(e), deps)
 
         elif info.op == LLVM_INS.Neg.value:
             if info.l2 == 0:
                 self.logger.error(f"to_z3_expr: Invalid Neg predicate {label}")
-                raise ValueError("Invalid Neg predicate")
+                raise Serializer.InvalidData("Invalid Neg predicate")
             e = self.to_z3_expr(info.l2, deps)
             return self.__cache_expr(label, -e, deps)
         # higher-order operations
@@ -96,7 +99,7 @@ class Serializer:
             op1 = self.to_z3_expr(info.l1, deps) if info.l1 >= CONST_OFFSET else self.__read_concrete(label, info.size)
             if info.l2 < CONST_OFFSET:
                 self.logger.error(f"to_z3_expr: Invalid fmemcmp operand2 {label}")
-                raise ValueError("Invalid memcmp operand2")
+                raise Serializer.InvalidData("Invalid memcmp operand2")
             op2 = self.to_z3_expr(info.l2, deps)
             e = z3.If(op1 == op2, z3.BitVecVal(0, 32, self.__z3_context), z3.BitVecVal(1, 32, self.__z3_context))
             return self.__cache_expr(label, e, deps)
@@ -118,7 +121,7 @@ class Serializer:
         if info.op == LLVM_INS.Concat.value and info.l1 == 0:
             if info.l2 < CONST_OFFSET:
                 self.logger.error(f"to_z3_expr: Invalid Concat operation {label}")
-                raise ValueError("Invalid Concat operation")
+                raise Serializer.InvalidData("Invalid Concat operation")
             size = info.size - get_label_info(info.l2, self.shm).size
         op1 = z3.BitVecVal(info.op1.i, size, self.__z3_context)
         if info.l1 >= CONST_OFFSET:
@@ -128,7 +131,7 @@ class Serializer:
         if info.op == LLVM_INS.Concat.value and info.l2 == 0:
             if info.l1 < CONST_OFFSET:
                 self.logger.error("to_z3_expr: Invalid Concat operation {label}")
-                raise ValueError("Invalid Concat operation")
+                raise Serializer.InvalidData("Invalid Concat operation")
             size = info.size - get_label_info(info.l1, self.shm).size
         op2 = z3.BitVecVal(info.op2.i, size, self.__z3_context)
         if info.l2 >= CONST_OFFSET:
@@ -172,7 +175,7 @@ class Serializer:
         else:
             # Should never reach here
             self.logger.error("to_z3_expr: Unsupported op: {}".format(info.op))
-            raise ValueError("Unsupported op: {}".format(info.op))
+            raise OperationUnsupportedError("Unsupported op: {}".format(info.op))
 
     def __get_cmd(self, lhs: z3.ExprRef, rhs: z3.ExprRef, predicate: int):
         if predicate == Predicate.bveq.value:
@@ -197,7 +200,7 @@ class Serializer:
             return lhs <= rhs
         else:
             self.logger.error(f"__get_cmd: unsupported predicate: {predicate}")
-            raise ValueError("unsupported predicate")
+            raise OperationUnsupportedError("unsupported predicate")
 
     def __read_concrete(self, label: int, size: int):
         if(not label in self.memcmp_cache):
@@ -215,14 +218,18 @@ class Serializer:
         return e
 
 class Solver:
-    def __init__(self, config, shm, input_file):
+    class AbortConcolicExecution(Exception):
+        pass
+
+    def __init__(self, config, shm, input_file, instance_id, session_id):
         self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logger.setLevel(config.logging_level)
         self.shm = shm
         # for output
-        self.__instance_id = 0
-        self.__session_id = 0
+        self.generated_files = []
+        self.__instance_id = instance_id
+        self.__session_id = session_id
         self.__current_index = 0
         # for input
         with open(input_file, "rb") as f:
@@ -243,7 +250,7 @@ class Solver:
         inputs = set()
         try:
             index_bv = self.serializer.to_z3_expr(gmsg.index_label, inputs)
-        except ValueError:
+        except Serializer.InvalidData:
             return
         self.__collect_constraints(inputs)
         assert self.__z3_solver.check() == z3.sat
@@ -269,18 +276,18 @@ class Solver:
                     dummy = set()
                     try:
                         bs = self.serializer.to_z3_expr(bounds.l2, dummy)  # size label
-                    except ValueError:
+                    except Serializer.InvalidData:
                         return
                     if bounds.l1:
                         dummy.clear()
                         try:
                             be = self.serializer.to_z3_expr(bounds.l1, dummy)  # elements label
-                        except ValueError:
+                        except Serializer.InvalidData:
                             return
                         bs = bs * be
                     e = z3.UGT(idx * es * co, bs)  # unsigned greater than
                     if self.__solve_expr(e):
-                        self.logger.info(f"index >= buffer size feasible @{addr}")
+                        self.logger.debug(f"index >= buffer size feasible @{addr}")
         # always preserve
         r_bv = z3.BitVecVal(gmsg.index, size, self.__z3_context)
         for off in inputs:
@@ -294,18 +301,17 @@ class Solver:
                 c.input_deps.update(inputs)
                 c.expr_deps.add(index_bv == r_bv)
 
+    # TODO: implement loop tracing
     def handle_loop_enter(self, id, addr):
         self.logger.debug(f"handle_loop_enter: id={id}, loop_header={hex(addr)}")
     
     def handle_loop_exit(self, id, addr):
         self.logger.debug(f"Loop handle_loop_exit: id={id}, target={hex(addr)}")
         
-    def handle_cond(self, msg: pipe_msg, pipe: int):
-        if msg.label:
-            self.__solve_cond(msg.label, msg.result, msg.addr)
-            os.read(pipe, ctypes.sizeof(mazerunner_msg))
-        if (msg.flags & F_LOOP_EXIT) and (msg.flags & F_LOOP_LATCH):
-            self.handle_loop_exit(msg.id, msg.addr)
+    def handle_cond(self, msg: pipe_msg, options: int):
+        if options & SolverFlag.SHOULD_SKIP:
+            return
+        self.__solve_cond(msg.label, msg.result, msg.addr, options)
 
     def handle_memcmp(self, msg: pipe_msg, pipe):
         info = get_label_info(msg.label, self.shm)
@@ -343,19 +349,21 @@ class Solver:
             self.__z3_solver.add(e)
             if self.__z3_solver.check() == z3.sat:
                 m = self.__z3_solver.model()
-                self.__generate_input(m)
+                self.__generate_input(m, False)
                 has_solved = True
             else:
-                if self.config.optimistic_solving:
+                if self.config.optimistic_solving_enabled:
                     m = opt_solver.model()
-                    self.__generate_input(m)
+                    self.__generate_input(m, True)
             # reset
             self.__z3_solver.pop()
         return has_solved
 
-    def __generate_input(self, m: z3.Model):
+    def __generate_input(self, m: z3.Model, is_optimistic: bool):
         fname = f"id-{self.__instance_id}-{self.__session_id}-{self.__current_index}"
-        path = os.path.join(self.config.seed_dir, fname)
+        if is_optimistic:
+            fname += "-opt"
+        path = os.path.join(self.config.output_seed_dir, fname)
         self.__current_index += 1
         with open(path, "wb") as f:
             f.write(self.input_buf)
@@ -384,6 +392,7 @@ class Solver:
                         with open(path, "r+b") as f:
                             f.truncate(size)
         fp.close()
+        self.generated_files.append(fname)
 
     def __collect_constraints(self, inputs: set):
         # collect additional input deps
@@ -409,23 +418,28 @@ class Solver:
                         added.add(expr)
                         self.__z3_solver.add(expr)
 
-    def __solve_cond(self, label: ctypes.c_uint32, r: ctypes.c_uint64, addr: ctypes.c_ulong):
+    def __solve_cond(self, label: ctypes.c_uint32, r: ctypes.c_uint64,
+                     addr: ctypes.c_ulong, options: int):
         self.logger.debug(f"__solve_cond: label={label}, result={r}, addr={hex(addr)}")
         result = z3.BoolVal(r != 0, ctx=self.__z3_context)
         inputs = set()
         try:
             cond = self.serializer.to_z3_expr(label, inputs)
-        except ValueError:
+        except Serializer.InvalidData:
             return
         self.__collect_constraints(inputs)
         assert self.__z3_solver.check() == z3.sat
-        e = (cond != result)
-        if self.__solve_expr(e):
-            self.logger.debug("__solve_cond: branch solved")
-        else:
-            self.logger.debug("__solve_cond: branch not solvable @{}".format(addr))
+        if options & SolverFlag.SHOULD_SOLVE:
+            e = (cond != result)
+            if self.__solve_expr(e):
+                self.logger.debug("__solve_cond: branch solved")
+                if options & SolverFlag.SHOULD_ABORT:
+                    self.logger.debug("__solve_cond: aborting")
+                    raise Solver.AbortConcolicExecution()
+            else:
+                self.logger.debug("__solve_cond: branch not solvable @{}".format(addr))
         # 3. nested branch
-        if self.config.nested_branch:
+        if self.config.nested_branch_enabled:
             for off in inputs:
                 c = self.__get_branch_dep(off)
                 if not c:

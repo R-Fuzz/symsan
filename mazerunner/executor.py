@@ -9,8 +9,12 @@ from defs import *
 from backend_solver import Solver
 
 class Executor:
-    def __init__(self, config):
+    class InvalidGEPMessage(Exception):
+        pass
+
+    def __init__(self, config, agent):
         self.config = config
+        self.agent = agent
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logger.setLevel(config.logging_level)
         # resources
@@ -31,7 +35,7 @@ class Executor:
             self.shm.close()
             self.shm.unlink()
 
-    def setup(self, input_file):
+    def setup(self, input_file, session_id):
         self.input_file = input_file
         # Create and map shared memory
         try:
@@ -41,7 +45,7 @@ class Executor:
             sys.exit(1)
         # pipefds[0] for read, pipefds[1] for write
         self.pipefds = os.pipe()
-        self.solver = Solver(self.config, self.shm, self.input_file)
+        self.solver = Solver(self.config, self.shm, self.input_file, 0, session_id)
 
     def run(self):
         # create and execute the child symsan process
@@ -55,6 +59,31 @@ class Executor:
             self.tear_down()
             sys.exit(1)
         os.close(self.pipefds[1])
+    
+    def __process_cond_request(self, msg):
+        if msg.label:
+            state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
+            state_msg = mazerunner_msg.from_buffer_copy(state_data)
+            self.agent.handle_new_state(state_msg, msg.result)
+            is_interesting = self.agent.is_interesting_branch()
+            flags = 0
+            if self.config.record_replay_mode_enabled:
+                flags |= SolverFlag.SHOULD_SKIP
+            if is_interesting:
+                flags |= SolverFlag.SHOULD_SOLVE
+                if self.config.onetime_solving_enabled:
+                    flags |= SolverFlag.SHOULD_ABORT
+            self.solver.handle_cond(msg, flags)
+        if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
+            self.solver.handle_loop_exit(msg.id, msg.addr)
+
+    def __process_gep_request(self, msg):
+        gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))
+        gmsg = gep_msg.from_buffer_copy(gep_data)
+        if msg.label != gmsg.index_label: # Double check
+            self.logger.error(f"process_request: Incorrect gep msg: {msg.label} vs {gmsg.index_label}")
+            raise Executor.InvalidGEPMessage()
+        if self.config.gep_solver_enabled: self.solver.handle_gep(gmsg, msg.addr)
 
     def process_request(self):
         while not self.proc.poll():
@@ -63,14 +92,12 @@ class Executor:
                 break
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:
-                self.solver.handle_cond(msg, self.pipefds[0])
+                self.__process_cond_request(msg)
             elif msg.msg_type == MsgType.gep_type.value:
-                gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))
-                gmsg = gep_msg.from_buffer_copy(gep_data)
-                if msg.label != gmsg.index_label: # Double check
-                    self.logger.error(f"process_request: Incorrect gep msg: {msg.label} vs {gmsg.index_label}")
+                try:
+                    self.__process_gep_request(msg)
+                except Executor.InvalidGEPMessage:
                     continue
-                if self.config.gep_solving: self.solver.handle_gep(gmsg, msg.addr)
             elif msg.msg_type == MsgType.memcmp_type.value:
                 self.solver.handle_memcmp(msg, self.pipefds[0])
             elif msg.msg_type == MsgType.loop_type.value:

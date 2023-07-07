@@ -3,6 +3,7 @@ import sys
 import os
 import logging
 
+from agent import Agent, RLModel
 from config import Config
 from executor import Executor
 
@@ -14,12 +15,16 @@ if __name__ == "__main__":
     config.program = sys.argv[1]
     input_file = sys.argv[2]
     options = os.environ['TAINT_OPTIONS']
-    config.seed_dir = "."
+    config.output_seed_dir = "."
     if "output_dir=" in options:
-        config.seed_dir = options.split("output_dir=")[1].split(":")[0].split(" ")[0]
+        config.output_seed_dir = options.split("output_dir=")[1].split(":")[0].split(" ")[0]
     config.logging_level = logging.INFO
-    executor = Executor(config)
-    executor.setup(input_file)
+    model = RLModel(config)
+    fastgen_agent = Agent(config, model)
+    executor = Executor(config, fastgen_agent)
+    executor.setup(input_file, 0)
     executor.run()
-    executor.process_request()
-    executor.tear_down()
+    try:
+        executor.process_request()
+    finally:
+        executor.tear_down()

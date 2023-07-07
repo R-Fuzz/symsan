@@ -20,7 +20,7 @@ class ReplayAgent(Agent):
         last_d = self.config.max_distance
         for (next_s, a, d) in trace:
             next_sa = next_s + (a,)
-            reward = self.compute_reward(d, last_d)
+            reward = self._compute_reward(d, last_d)
             if last_SA:
                 self.learner.learn(last_SA, next_s, last_reward)
             last_d = d
