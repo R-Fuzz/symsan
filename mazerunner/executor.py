@@ -13,13 +13,20 @@ class Executor:
         pass
 
     def __init__(self, config, agent):
-        self.config = config
+        self.program = config.cmd[0]
         self.agent = agent
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.logger.setLevel(config.logging_level)
+        self.logging_level = config.logging_level
+        self.logger.setLevel(self.logging_level)
         # resources
         self.pipefds = self.shm = self.proc = None
         self.solver = None
+        # TODO: self.model = "model/" save the RL model
+        # options
+        self.union_table_size = config.union_table_size
+        self.record_replay_mode_enabled = config.record_replay_mode_enabled
+        self.onetime_solving_enabled = config.onetime_solving_enabled
+        self.gep_solver_enabled = config.gep_solver_enabled
 
     def tear_down(self):
         if self.pipefds:
@@ -35,11 +42,11 @@ class Executor:
             self.shm.close()
             self.shm.unlink()
 
-    def setup(self, input_file, session_id):
+    def setup(self, input_file, session_id=0):
         self.input_file = input_file
         # Create and map shared memory
         try:
-            self.shm = shared_memory.SharedMemory(create=True, size=self.config.union_table_size)
+            self.shm = shared_memory.SharedMemory(create=True, size=self.union_table_size)
         except:
             self.logger.critical(f"setup: Failed to map shm({self.shm._fd}), size(shm.size)")
             sys.exit(1)
@@ -49,10 +56,10 @@ class Executor:
 
     def run(self):
         # create and execute the child symsan process
-        logging_level = 1 if self.config.logging_level == logging.DEBUG else 0
+        logging_level = 1 if self.logging_level == logging.DEBUG else 0
         self.options = f"taint_file={self.input_file}:shm_fd={self.shm._fd}:pipe_fd={self.pipefds[1]}:debug={logging_level}"
         try:
-            self.proc = subprocess.Popen([self.config.program, self.input_file], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            self.proc = subprocess.Popen([self.program, self.input_file], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, env={"TAINT_OPTIONS": self.options}, pass_fds=(self.shm._fd, self.pipefds[1]))
         except:
             self.logger.critical(f"run: Failed to execute subprocess, input_file: {self.input_file}")
@@ -67,11 +74,11 @@ class Executor:
             self.agent.handle_new_state(state_msg, msg.result)
             is_interesting = self.agent.is_interesting_branch()
             flags = 0
-            if self.config.record_replay_mode_enabled:
+            if self.record_replay_mode_enabled:
                 flags |= SolverFlag.SHOULD_SKIP
             if is_interesting:
                 flags |= SolverFlag.SHOULD_SOLVE
-                if self.config.onetime_solving_enabled:
+                if self.onetime_solving_enabled:
                     flags |= SolverFlag.SHOULD_ABORT
             self.solver.handle_cond(msg, flags)
         if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
@@ -83,7 +90,7 @@ class Executor:
         if msg.label != gmsg.index_label: # Double check
             self.logger.error(f"process_request: Incorrect gep msg: {msg.label} vs {gmsg.index_label}")
             raise Executor.InvalidGEPMessage()
-        if self.config.gep_solver_enabled: self.solver.handle_gep(gmsg, msg.addr)
+        if self.gep_solver_enabled: self.solver.handle_gep(gmsg, msg.addr)
 
     def process_request(self):
         while not self.proc.poll():

@@ -6,6 +6,10 @@ import logging
 
 from defs import *
 
+CONST_LABEL = 0
+INIT_LABEL = -1
+CONST_OFFSET = 1
+
 def get_label_info(label: int, shm: shared_memory.SharedMemory):
     offset = label * ctypes.sizeof(dfsan_label_info)
     return dfsan_label_info.from_buffer_copy(shm.buf[offset:offset+ctypes.sizeof(dfsan_label_info)])
@@ -20,7 +24,6 @@ class Serializer:
         pass
 
     def __init__(self, config, shm, context):
-        self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logger.setLevel(config.logging_level)
         self.shm = shm
@@ -222,7 +225,6 @@ class Solver:
         pass
 
     def __init__(self, config, shm, input_file, instance_id, session_id):
-        self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logger.setLevel(config.logging_level)
         self.shm = shm
@@ -236,11 +238,14 @@ class Solver:
             self.input_size = os.path.getsize(input_file)
             self.input_buf = f.read()
         # for z3
+        self.output_dir = config.output_seed_dir
+        self.optimistic_solving_enabled = config.optimistic_solving_enabled
+        self.nested_branch_enabled = config.nested_branch_enabled
         self.__z3_context = z3.Context()
         self.__z3_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         # list of branch_dep_t dependencies
         self.__branch_deps = []
-        self.serializer = Serializer(self.config, self.shm, self.__z3_context)
+        self.serializer = Serializer(config, self.shm, self.__z3_context)
 
     def handle_gep(self, gmsg: gep_msg, addr: ctypes.c_ulong):
         self.logger.debug(f"handle_gep: ptr_label={gmsg.ptr_label}, ptr={gmsg.ptr}, "
@@ -352,7 +357,7 @@ class Solver:
                 self.__generate_input(m, False)
                 has_solved = True
             else:
-                if self.config.optimistic_solving_enabled:
+                if self.optimistic_solving_enabled:
                     m = opt_solver.model()
                     self.__generate_input(m, True)
             # reset
@@ -363,7 +368,7 @@ class Solver:
         fname = f"id-{self.__instance_id}-{self.__session_id}-{self.__current_index}"
         if is_optimistic:
             fname += "-opt"
-        path = os.path.join(self.config.output_seed_dir, fname)
+        path = os.path.join(self.output_dir, fname)
         self.__current_index += 1
         with open(path, "wb") as f:
             f.write(self.input_buf)
@@ -439,7 +444,7 @@ class Solver:
             else:
                 self.logger.debug("__solve_cond: branch not solvable @{}".format(addr))
         # 3. nested branch
-        if self.config.nested_branch_enabled:
+        if self.nested_branch_enabled:
             for off in inputs:
                 c = self.__get_branch_dep(off)
                 if not c:

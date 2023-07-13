@@ -19,10 +19,10 @@ class ProgramState:
         return (self.state, self.action, self.d)
 
 class RLModel:
-    def __init__(self, config: Config):
-        self.config = config
+    def __init__(self):
         self.visited_sa = set()
         self.Q_table = {}
+        # TODO: move self.visited to here?
         
     # TODO: implement save/load model
     def save_model(self, path=None):
@@ -33,9 +33,9 @@ class RLModel:
 
 class Agent:
     def __init__(self, config: Config, model: RLModel):
-        self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logger.setLevel(config.logging_level)
+        self.max_distance = config.max_distance
         # RL related fields
         self.last_state = None
         self.curr_state = ProgramState(distance=config.max_distance)
@@ -51,7 +51,7 @@ class Agent:
 
     def _compute_reward(self, has_dist):
         reward = 0
-        if not has_dist or self.curr_state.d > self.config.max_distance or self.curr_state.d < 0:
+        if not has_dist or self.curr_state.d > self.max_distance or self.curr_state.d < 0:
             return reward
         else:
             reward = self.last_state.d - self.curr_state.d

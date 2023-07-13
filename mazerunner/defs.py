@@ -1,10 +1,6 @@
 from enum import Enum
 import ctypes
 
-CONST_LABEL = 0
-INIT_LABEL = -1
-CONST_OFFSET = 1
-
 class OperationUnsupportedError(SystemExit):
     pass
 
