@@ -1,9 +1,10 @@
 import atexit
 import os
-import subprocess as sp
+import subprocess
 import tempfile
 
-from afl import fix_at_file
+import utils
+
 # status for TestCaseMinimizer
 NEW = 0
 OLD = 1
@@ -14,11 +15,11 @@ MAP_SIZE = 65536
 
 def read_bitmap_file(bitmap_file):
     with open(bitmap_file, "rb") as f:
-        return map(ord, list(f.read()))
+        return list(map(ord, list(f.read())))
 
 def write_bitmap_file(bitmap_file, bitmap):
     with open(bitmap_file, "wb") as f:
-        f.write(''.join(map(chr, bitmap)))
+        f.write(bytes(map(chr, bitmap)))
 
 class TestcaseMinimizer(object):
     def __init__(self, cmd, afl_path, out_dir, qemu_mode, map_size=MAP_SIZE):
@@ -57,13 +58,10 @@ class TestcaseMinimizer(object):
                "--"
         ] + self.cmd
 
-        cmd, stdin = fix_at_file(cmd, testcase)
-        with open(os.devnull, "wb") as devnull:
-            proc = sp.Popen(cmd, stdin=sp.PIPE, stdout=devnull, stderr=devnull)
-            proc.communicate(stdin)
-
+        cmd, stdin = utils.fix_at_file(cmd, testcase)
+        result = subprocess.run(cmd, input=stdin.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         this_bitmap = read_bitmap_file(self.temp_file)
-        return self.is_interesting_testcase(this_bitmap, proc.returncode)
+        return self.is_interesting_testcase(this_bitmap, result.returncode)
 
     def is_interesting_testcase(self, bitmap, returncode):
         if returncode == 0:
