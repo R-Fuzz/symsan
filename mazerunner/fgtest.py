@@ -6,7 +6,6 @@ import logging
 from agent import Agent
 from config import Config
 from executor import Executor
-from model import RLModel
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
@@ -19,7 +18,7 @@ if __name__ == "__main__":
     options = os.environ['TAINT_OPTIONS']
     if "output_dir=" in options:
         output_seed_dir = options.split("output_dir=")[1].split(":")[0].split(" ")[0]
-    fastgen_agent = Agent(config, RLModel())
+    fastgen_agent = Agent(config)
     symsan = Executor(config, fastgen_agent, output_seed_dir)
     symsan.setup(config.cmd[1])
     symsan.run()

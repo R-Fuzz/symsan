@@ -6,7 +6,7 @@ import utils
 
 from config import Config
 from model import RLModel
-import q_learning
+from utils import mkdir
 
 class ProgramState:
     def __init__(self, distance, pc=0, callstack=0, action=0, loop_counter=0):
@@ -23,16 +23,17 @@ class ProgramState:
         return (self.state, self.action, self.d)
 
 class Agent:
-    def __init__(self, config: Config, model: RLModel, output_dir = "."):
+    def __init__(self, config: Config, model: RLModel=None, output_dir: str=None):
+        if output_dir:
+            self.my_dir = output_dir
+            mkdir(self.my_traces)
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.my_dir = output_dir
         self.max_distance = config.max_distance
         self.loopinfo = {}
         # RL related fields
         self.last_state = None
         self.curr_state = ProgramState(distance=config.max_distance)
         self.episode = []
-        self.learner = q_learning.BasicQLearner(model.Q_table, config.discount_factor, config.learning_rate)
 
     @property
     def my_traces(self):

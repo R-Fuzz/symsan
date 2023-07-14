@@ -1,7 +1,16 @@
 from agent import *
-from defs import *
+from defs import TaintFlag
+from learner import BasicQLearner
 
 class ExploreAgent(Agent):
+
+    def __init__(self, config: Config, model: RLModel, output_dir):
+        super().__init__(config, model, output_dir)
+        # TODO: remove assertion after testing
+        assert model is not None
+        assert output_dir is not None
+        self.model = model
+        self.learner = BasicQLearner(model.Q_table, config.discount_factor, config.learning_rate)
 
     def handle_new_state(self, msg, action):
         tmp = self.last_state 
