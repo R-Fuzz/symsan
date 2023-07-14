@@ -21,7 +21,7 @@ def write_bitmap_file(bitmap_file, bitmap):
     with open(bitmap_file, "wb") as f:
         f.write(bytes(map(chr, bitmap)))
 
-class TestcaseMinimizer(object):
+class TestcaseMinimizer:
     def __init__(self, cmd, afl_path, out_dir, qemu_mode, map_size=MAP_SIZE):
         self.cmd = cmd
         self.qemu_mode = qemu_mode

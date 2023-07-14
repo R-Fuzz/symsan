@@ -25,7 +25,6 @@ class Serializer:
 
     def __init__(self, config, shm, context):
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.logger.setLevel(config.logging_level)
         self.shm = shm
         self.__z3_context = context
         # caches
@@ -224,9 +223,8 @@ class Solver:
     class AbortConcolicExecution(Exception):
         pass
 
-    def __init__(self, config, shm, input_file, instance_id, session_id):
+    def __init__(self, config, shm, input_file, output_dir, instance_id, session_id):
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.logger.setLevel(config.logging_level)
         self.shm = shm
         # for output
         self.generated_files = []
@@ -238,7 +236,7 @@ class Solver:
             self.input_size = os.path.getsize(input_file)
             self.input_buf = f.read()
         # for z3
-        self.output_dir = config.output_seed_dir
+        self.output_dir = output_dir
         self.optimistic_solving_enabled = config.optimistic_solving_enabled
         self.nested_branch_enabled = config.nested_branch_enabled
         self.__z3_context = z3.Context()

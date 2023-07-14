@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 import argparse
-import logging
 import os
 import time
 
 import afl
-import utils
 from config import Config
-
-logging.basicConfig(level=logging.INFO)
+from utils import AT_FILE
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("-agent", dest="agent_type", required=True, help="RL agent type")
-    p.add_argument("-o", dest="output_dir", required=True, help="hybrid fuzzing output directory")
-    p.add_argument("-a", dest="afl_dir", required=True, help="AFL name")
-    p.add_argument("-n", dest="mazerunner_dir", default="mazerunner", help="mazerunner output directory")
+    p.add_argument("-o", dest="output_dir", required=True, help="hybrid fuzzing output path")
+    p.add_argument("-a", dest="afl_dir", required=True, help="AFL instance name")
+    p.add_argument("-n", dest="mazerunner_dir", default="mazerunner", help="mazerunner instance name")
     p.add_argument("-i", dest="input", default=None, help="initial seed directory")
     p.add_argument("-m", dest="mail", default=None, help="Interesting result will be sent to the Email address")
     p.add_argument("-deli", dest="deli", default=None, help="Delimiter used to split the input")
@@ -23,7 +20,7 @@ def parse_args():
     p.add_argument("-log", dest="log_file", default=None, help="Enable logging to file")
     p.add_argument("-config", dest="config_path", default=None, help="path of configuration file")
     p.add_argument("-debug", dest="debug_enabled", action="store_true", help="Enable debug mode")
-    p.add_argument("cmd", nargs="+", help=f"cmdline, use {utils.AT_FILE} to denote a file")
+    p.add_argument("cmd", nargs="+", help=f"cmdline, use {AT_FILE} to denote a file")
     return p.parse_args()
 
 def check_args(args):
@@ -48,13 +45,14 @@ def main():
         e = afl.ExploreExecutor(config)
     elif args.agent_type == "exploit":
         e = afl.ExploitExecutor(config)
+    elif args.agent_type == "hybrid":
+        e = afl.HybridExecutor(config)
     elif args.agent_type == "record":
         e = afl.RecordExecutor(config)
     elif args.agent_type == "replay":
         e = afl.ReplayExecutor(config)
     elif args.agent_type == "qsym":
         e = afl.QSYMExecutor(config)
-    # TODO: add RLhybrid(explore + exploit) agent
     else:
         raise ValueError(f"unknown agent type {args.agent_type}")
     try:

@@ -1,20 +1,19 @@
 import copy
 import logging
 import functools
-import json
 import os
 import pickle
 import shutil
 import subprocess
-import sys
-import tempfile
 import time
-import threading
 import queue
 
-from defs import AT_FILE
-import executor
+import agent
+from explore_agent import ExploreAgent
+from executor import Executor
+from mazerunner.defs import OperationUnsupportedError
 import minimizer
+import utils
 
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 10 * 60 # 10 minutes
@@ -42,34 +41,12 @@ def testcase_compare(a, b):
     b_score = get_score(b)
     return 1 if a_score > b_score else -1
 
-def mkdir(dirp):
-    if not os.path.exists(dirp):
-        os.makedirs(dirp)
-
 def get_afl_cmd(fuzzer_stats):
     with open(fuzzer_stats) as f:
         for l in f:
             if l.startswith("command_line"):
                 # format is "command_line: [cmd]"
                 return l.lstrip('command_line:').strip().split()
-
-def fix_at_file(cmd, testcase):
-    cmd = copy.copy(cmd)
-    if AT_FILE in cmd:
-        idx = cmd.index(AT_FILE)
-        cmd[idx] = testcase
-        stdin = None
-    else:
-        with open(testcase, "rb") as f:
-            stdin = f.read()
-
-    return cmd, stdin
-
-def run_command(cmd, testcase):
-    cmd, stdin = fix_at_file(cmd, testcase)
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return p.communicate(stdin)
 
 class AFLExecutorState:
     def __init__(self):
@@ -118,24 +95,19 @@ class AFLExecutorState:
 
 class AFLExecutor:
     def __init__(self, config):
-        self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.logger.setLevel(config.logging_level)
+        self.config = config
         self.cmd = config.cmd
         self.output = config.output_dir
         self.afl = config.afl_dir
         self.name = config.mazerunner_dir
         self.filename = ".cur_input"
         self.mail = config.mail
-        self._unreachable_branches = []
-        self._loop_info = {}
-        self.tmp_dir = tempfile.mkdtemp()
         self.afl_cmd, afl_path, qemu_mode = self._parse_fuzzer_stats()
         self.minimizer = minimizer.TestcaseMinimizer(
             self.afl_cmd, afl_path, self.output, qemu_mode)
-        self._import_state()
-        if config.import_loopinfo_enabled:
-            self._import_loop_info()
         self._make_dirs()
+        self._setup_logger(config.logging_level, config.log_file)
+        self._import_state()
 
     @property
     def cur_input(self):
@@ -166,6 +138,10 @@ class AFLExecutor:
         return os.path.join(self.my_dir, "errors")
 
     @property
+    def testcase_dir(self):
+        return os.path.join(self.my_dir, "generated_inputs")
+
+    @property
     def metadata(self):
         return os.path.join(self.my_dir, "metadata")
 
@@ -177,40 +153,24 @@ class AFLExecutor:
     def dictionary(self):
         return os.path.join(self.my_dir, "dictionary")
 
-    @property
-    def unreachable_branches(self):
-        if not self._unreachable_branches:
-            path = os.path.join(self.my_dir, "unreachable_branches.json")
-            if os.path.isfile(path):
-                with open(path, 'r') as fp:
-                    json.load(fp, self._unreachable_branches)
-        return self._unreachable_branches
-
-    @property
-    def loopinfo(self):
-        return self._loop_info
-
     def cleanup(self):
-        try:
-            self._export_state()
-            #shutil.rmtree(self.tmp_dir)
-        except:
-            pass
-
-    def sync_with_afl(self, seedBufferQ):
-        pass
-
-    def run(self):
-        pass
+        self._export_state()
 
     def _make_dirs(self):
-        mkdir(self.tmp_dir)
-        mkdir(self.my_queue)
-        mkdir(self.my_hangs)
-        mkdir(self.my_errors)
+        utils.mkdir(self.my_queue)
+        utils.mkdir(self.my_hangs)
+        utils.mkdir(self.my_errors)
+        utils.mkdir(self.testcase_dir)
 
-    # return cmd, afl_path, qemu_mode
-    # cmd will be used in minimizer
+    def _setup_logger(self, logging_level, logfile):
+        self.logger = logging.getLogger(self.__class__.__qualname__)
+        if logfile:
+            log_path = os.path.join(self.my_dir, logfile)
+            logging.basicConfig(filename=log_path, level=logging_level)
+        else:
+            logging.basicConfig(level=logging_level)
+
+    # Returns afl's cmd, afl_path, qemu_mode, cmd will be used in minimizer
     def _parse_fuzzer_stats(self):
         cmd = get_afl_cmd(os.path.join(self.afl_dir, "fuzzer_stats"))
         assert cmd is not None
@@ -224,18 +184,6 @@ class AFLExecutor:
         else:
             self.state = AFLExecutorState()
 
-    def _import_loop_info(self):
-        path = os.path.join(self.my_dir, "loops.json")
-        if not os.path.isfile(path):
-            program = self.cmd[0]
-            loop_finder = os.path.join(os.path.dirname(__file__), 'static_anlysis.py')
-            # run angr in a seperete process as it overwrites logging configs
-            completed_process = subprocess.run([loop_finder, program, path], stdout=subprocess.DEVNULL)
-            if completed_process.returncode != 0:
-                raise RuntimeError(f"failed to run {loop_finder}")
-        with open(path, 'r') as fp:
-            json.load(fp, self._loop_info)
-
     def _sync_files(self):
         files = []
         for name in os.listdir(self.afl_queue):
@@ -247,16 +195,6 @@ class AFLExecutor:
         return sorted(files,
                       key=functools.cmp_to_key(testcase_compare),
                       reverse=True)
-
-    def _run_target(self, cur_input, tmp_dir, skipEpisodeNum, targetBA):
-        # Trigger linearlize to remove complicate expressions
-        q = executor.Executor(self.cmd, targetBA, self.dbNum, self.deli, self.pkglen, cur_input, self.my_dir, tmp_dir, self.shared_map_addr, skipEpisodeNum, bitmap=self.bitmap, argv=["-l", "1"])
-        ret = q.run(self.state.timeout)
-        self.logger.debug(f"Total={ret.total_time} s, "
-                     f"Emulation={ret.emulation_time} s, "
-                     f"Solver={ret.solving_time} s, "
-                     f"Return={ret.returncode}")
-        return q, ret
 
     def _send_mail(self, subject, info, attach=None):
         if attach is None:
@@ -272,34 +210,28 @@ class AFLExecutor:
         info["CMD"] = " ".join(self.cmd)
 
         text = "\n" # skip cc
-        for k, v in info.iteritems():
+        for k, v in info.items():
             text += "%s\n" % k
             text += "-" * 30 + "\n"
             text += "%s" % v + "\n" * 3
         try:
-            devnull = open(os.devnull, "wb")
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=devnull, stderr=devnull)
-            proc.communicate(text)
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.communicate(text.encode())
         except OSError:
             pass
-        finally:
-            devnull.close()
 
     def _check_crashes(self):
         for fuzzer in os.listdir(self.output):
             crash_dir = os.path.join(self.output, fuzzer, "crashes")
             if not os.path.exists(crash_dir):
                 continue
-
             # initialize if it's first time to see the fuzzer
             if not fuzzer in self.state.crashes:
                 self.state.crashes[fuzzer] = -1
-
             for name in sorted(os.listdir(crash_dir)):
                 # skip readme
-                if name == "README.txt":
+                if "id:" not in name:
                     continue
-
                 # read id from the format "id:000000..."
                 num = int(name[3:9])
                 if num > self.state.crashes[fuzzer]:
@@ -307,7 +239,7 @@ class AFLExecutor:
                     self.state.crashes[fuzzer] = num
 
     def _report_error(self, fp, log):
-        self.logger.debug("Error is occured: %s\nLog:%s" % (fp, log))
+        self.logger.debug("Error is occurred: %s\nLog:%s" % (fp, log))
         # if no mail, then stop
         if self.mail is None:
             return
@@ -332,17 +264,14 @@ class AFLExecutor:
 
         self.state.num_crash_reports += 1
         info = {}
-        stdout, stderr = run_command(["timeout", "-k", "5", "5"] + self.afl_cmd, fp)
+        stdout, stderr = utils.run_command(["timeout", "-k", "5", "5"] + self.afl_cmd, fp)
         info["STDOUT"] = stdout
         info["STDERR"] = stderr
         self._send_mail("Crash found", info, [fp])
 
     def _export_state(self):
-        with open(self.metadata, "wb") as f:
-            pickle.dump(self.state, f)
-        path = os.path.join(self.my_dir, "unreachable_branches.json")
-        with open(path, 'w') as fp:
-            json.dump(self._unreachable_branches, fp)
+        with open(self.metadata, "wb") as fp:
+            pickle.dump(self.state, fp, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _handle_empty_files(self):
         if len(self.state.hang) > MIN_HANG_FILES:
@@ -350,3 +279,116 @@ class AFLExecutor:
         else:
             self.logger.debug("Sleep for getting files")
             time.sleep(5)
+
+class QSYMExecutor(AFLExecutor):
+    def __init__(self, config):
+        super().__init__(config)
+
+    def run(self):
+        while True:
+            files = self.sync_files()
+            if not files:
+                self._handle_empty_files()
+                continue
+            for fp in files:
+                self._run_file(fp)
+                break
+
+    def _run_file(self, fp):
+        # copy the test case
+        shutil.copy2(fp, self.cur_input)
+        self.logger.debug("Run mazerunner: input=%s" % fp)
+        symsan_res = self._run_target()
+        self._handle_return_status(symsan_res.returncode, symsan_res.stderr, fp)
+        self._sync_back_if_interesting(fp, symsan_res.generated_testcases)
+        self._check_crashes()
+        self.state.processed.add(fp)
+
+    def _run_target(self):
+        model = agent.RLModel(self.my_dir)
+        explore_agent = ExploreAgent(self.config, model)
+        symsan = Executor(self.config, explore_agent, self.testcase_dir)
+        symsan.setup(self.cur_input, len(self.state.processed))
+        symsan.run()
+        try:
+            symsan.process_request()
+        finally:
+            symsan.tear_down()
+        symsan_res = symsan.get_result()
+        self.logger.debug("Total=%d s, Emulation=%d s, Solver=%d s, Return=%d"
+                     % (symsan_res.total_time,
+                        symsan_res.emulation_time,
+                        symsan_res.solving_time,
+                        symsan_res.returncode))
+        return symsan_res
+
+    def _sync_back_if_interesting(self, fp, testcases):
+        old_idx = self.state.index
+        target = os.path.basename(fp)[:len("id:......")]
+        num_testcase = 0
+        for testcase in testcases():
+            num_testcase += 1
+            if not self.minimizer.check_testcase(testcase):
+                # Remove if it's not interesting testcases
+                os.unlink(testcase)
+                continue
+            index = self.state.tick()
+            filename = os.path.join(
+                    self.my_queue,
+                    "id:%06d,src:%s" % (index, target))
+            shutil.move(testcase, filename)
+            self.logger.debug("Creating: %s" % filename)
+        self.logger.debug("Generate %d testcases" % num_testcase)
+        self.logger.debug("%d testcases are new" % (self.state.index - old_idx))
+
+    def _handle_return_status(self, retcode, log, fp):
+        if retcode in [124, -9]: # killed
+            shutil.copy2(fp, os.path.join(self.my_hangs, os.path.basename(fp)))
+            self.state.hang.add(fp)
+        else:
+            self.state.done.add(fp)
+
+        # segfault or abort
+        if (retcode in [128 + 11, -11, 128 + 6, -6]):
+            shutil.copy2(fp, os.path.join(self.my_errors, os.path.basename(fp)))
+            self.report_error(fp, log)
+
+# TODO: implement this
+class ExploreExecutor(AFLExecutor):
+    def __init__(self, config):
+        super().__init__(config)
+
+    def run(self):
+        pass
+
+# TODO: implement this
+class ExploitExecutor(AFLExecutor):
+    def __init__(self, config):
+        super().__init__(config)
+
+    def run(self):
+        raise OperationUnsupportedError("ExploitExecutor not implemented")
+
+# TODO: implement this
+class RecordExecutor(AFLExecutor):
+    def __init__(self, config):
+        super().__init__(config)
+
+    def run(self):
+        raise OperationUnsupportedError("RecordExecutor not implemented")
+
+# TODO: implement this
+class ReplayExecutor(AFLExecutor):
+    def __init__(self, config):
+        super().__init__(config)
+
+    def run(self):
+        raise OperationUnsupportedError("ReplayExecutor not implemented")
+
+# TODO: implement this
+class HybridExecutor(AFLExecutor):
+    def __init__(self, config):
+        super().__init__(config)
+
+    def run(self):
+        raise OperationUnsupportedError("HybridExecutor not implemented")

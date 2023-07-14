@@ -4,12 +4,9 @@ import logging
 
 # Default configurations
 LOGGING_LEVEL = logging.ERROR
-# Default generated seeds directory
-SEED_OUTPUT_DIR = "."
 RANDOM_INPUT = "AAAA"
 MAX_DISTANCE = 0xFFFFFFFF
 UNION_TABLE_SIZE = 0xc00000000
-IMPORT_LOOPINFO_ENABLED = False
 NESTED_BRANCH_ENABLED = True
 GEP_SOLVER_ENABLED = False
 OPTIMISTIC_SOLVING_ENABLED = True
@@ -24,11 +21,9 @@ class Config:
                  'random_input', 
                  'max_distance', 
                  'union_table_size', 
-                 'import_loopinfo_enabled', 
                  'nested_branch_enabled', 
                  'gep_solver_enabled', 
                  'optimistic_solving_enabled', 
-                 'output_seed_dir', 
                  'record_replay_mode_enabled', 
                  'onetime_solving_enabled',
                  'discount_factor', 
@@ -40,7 +35,8 @@ class Config:
                  "mail",
                  "delimiter",
                  "pkglen",
-                 "cmd"]
+                 "cmd",
+                 "log_file"]
 
     def __init__(self):
         self._load_default()
@@ -73,19 +69,16 @@ class Config:
         if args.debug_enabled:
             self.logging_level = logging.DEBUG
         if args.log_file:
-            log_path = os.path.join(self.output_dir, self.mazerunner_dir + args.log_file)
-            logging.basicConfig(filename=log_path, level=self.logging_level)
+            self.log_file = args.log_file
 
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL
         self.random_input = RANDOM_INPUT
         self.max_distance = MAX_DISTANCE
         self.union_table_size = UNION_TABLE_SIZE
-        self.import_loopinfo_enabled = IMPORT_LOOPINFO_ENABLED
         self.nested_branch_enabled = NESTED_BRANCH_ENABLED
         self.gep_solver_enabled = GEP_SOLVER_ENABLED
         self.optimistic_solving_enabled = OPTIMISTIC_SOLVING_ENABLED
-        self.output_seed_dir = SEED_OUTPUT_DIR
         self.record_replay_mode_enabled = RECORD_REPLAY_MODE_ENABLED
         self.onetime_solving_enabled = ONETIME_SOLVING_ENABLED
         self.discount_factor = DISCOUNT_FACTOR
