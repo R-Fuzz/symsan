@@ -1,7 +1,11 @@
 import logging
+import os
+import pickle
+import subprocess
+import utils
 
-from defs import OperationUnsupportedError
 from config import Config
+from model import RLModel
 import q_learning
 
 class ProgramState:
@@ -18,36 +22,34 @@ class ProgramState:
     def serialize(self):
         return (self.state, self.action, self.d)
 
-class RLModel:
-    def __init__(self):
-        self.visited_sa = set()
-        self.Q_table = {}
-        # TODO: move self.visited to here?
-        
-    # TODO: implement save/load model
-    def save_model(self, path=None):
-        raise OperationUnsupportedError("save_model() not implemented")
-    
-    def load_model(self, path=None):
-        raise OperationUnsupportedError("load_model() not implemented")
-
 class Agent:
-    def __init__(self, config: Config, model: RLModel):
+    def __init__(self, config: Config, model: RLModel, output_dir = "."):
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.logger.setLevel(config.logging_level)
+        self.my_dir = output_dir
         self.max_distance = config.max_distance
+        self.loopinfo = {}
         # RL related fields
         self.last_state = None
         self.curr_state = ProgramState(distance=config.max_distance)
         self.episode = []
-        self.visited = model.visited_sa
         self.learner = q_learning.BasicQLearner(model.Q_table, config.discount_factor, config.learning_rate)
+
+    @property
+    def my_traces(self):
+        return os.path.join(self.my_dir, "traces")
+
+    def _make_dirs(self):
+        utils.mkdir(self.my_traces)
 
     def handle_new_state(self, msg, action):
         pass
 
     def is_interesting_branch(self):
         return True
+
+    def save_trace(self, log_path):
+        with open(log_path, 'wb') as fd:
+            pickle.dump(self.episode, fd, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _compute_reward(self, has_dist):
         reward = 0
@@ -66,3 +68,15 @@ class Agent:
                               f"distance: {self.curr_state.d if has_dist else 'NA'}, "
                               f"reward: {reward}, "
                               f"Q: {self.learner.Q_lookup(last_sa)}")
+
+    def _import_loop_info(self):
+        path = os.path.join(self.my_dir, "loops")
+        if not os.path.isfile(path):
+            program = self.cmd[0]
+            loop_finder = os.path.join(os.path.dirname(__file__), 'static_anlysis.py')
+            # run angr in a separate process as it overwrites logging configs
+            completed_process = subprocess.run([loop_finder, program, path], stdout=subprocess.DEVNULL)
+            if completed_process.returncode != 0:
+                raise RuntimeError("failed to run %s" % loop_finder)
+        with open(path, 'rb') as fp:
+            self._loop_info = pickle.load(fp)

@@ -14,10 +14,10 @@ class ExploreAgent(Agent):
             d = self.max_distance
         self.curr_state.update(msg.addr, msg.context, action, d)
         curr_sa = self.curr_state.state + (self.curr_state.action, )
-        self.visited.add(curr_sa)
+        self.model.visited_sa.add(curr_sa)
         self._learn(has_dist)
 
     def is_interesting_branch(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
         reversed_sa = self.curr_state.state + (reversed_action, )
-        return reversed_sa not in self.visited
+        return reversed_sa not in self.model.visited_sa

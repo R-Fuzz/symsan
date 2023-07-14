@@ -19,8 +19,7 @@ if __name__ == "__main__":
     options = os.environ['TAINT_OPTIONS']
     if "output_dir=" in options:
         output_seed_dir = options.split("output_dir=")[1].split(":")[0].split(" ")[0]
-    model = RLModel(".")
-    fastgen_agent = Agent(config, model)
+    fastgen_agent = Agent(config, RLModel())
     symsan = Executor(config, fastgen_agent, output_seed_dir)
     symsan.setup(config.cmd[1])
     symsan.run()

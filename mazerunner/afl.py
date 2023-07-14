@@ -8,11 +8,11 @@ import subprocess
 import time
 import queue
 
-import agent
 from explore_agent import ExploreAgent
 from executor import Executor
-from mazerunner.defs import OperationUnsupportedError
+from defs import OperationUnsupportedError
 import minimizer
+from model import RLModel
 import utils
 
 DEFAULT_TIMEOUT = 60
@@ -305,8 +305,7 @@ class QSYMExecutor(AFLExecutor):
         self.state.processed.add(fp)
 
     def _run_target(self):
-        model = agent.RLModel(self.my_dir)
-        explore_agent = ExploreAgent(self.config, model)
+        explore_agent = ExploreAgent(self.config, RLModel(self.my_dir))
         symsan = Executor(self.config, explore_agent, self.testcase_dir)
         symsan.setup(self.cur_input, len(self.state.processed))
         symsan.run()
