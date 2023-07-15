@@ -219,7 +219,7 @@ class Serializer:
         self.__deps_cache[label] = deps
         return e
 
-class Solver:
+class Z3Solver:
     class AbortConcolicExecution(Exception):
         pass
 
@@ -438,7 +438,7 @@ class Solver:
                 self.logger.debug("__solve_cond: branch solved")
                 if options & SolverFlag.SHOULD_ABORT:
                     self.logger.debug("__solve_cond: aborting")
-                    raise Solver.AbortConcolicExecution()
+                    raise Z3Solver.AbortConcolicExecution()
             else:
                 self.logger.debug("__solve_cond: branch not solvable @{}".format(addr))
         # 3. nested branch

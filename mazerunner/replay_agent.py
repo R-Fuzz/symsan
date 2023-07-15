@@ -6,11 +6,11 @@ from learner import BasicQLearner
 
 class ReplayAgent(Agent):
 
-    def __init__(self, config: Config, model: RLModel, output_dir: str):
-        super().__init__(config, model, output_dir)
+    def __init__(self, config: Config, model: RLModel):
+        super().__init__(config, model)
         # TODO: remove assertion after testing
         assert model is not None
-        assert output_dir is not None
+        assert config.mazerunner_dir is not None
         self.model = model
         self.learner = BasicQLearner(model.Q_table, config.discount_factor, config.learning_rate)
 

@@ -6,7 +6,7 @@ import ctypes
 import logging
 import time
 
-from backend_solver import Solver
+from backend_solver import Z3Solver
 from defs import *
 import utils
 
@@ -23,12 +23,12 @@ class ExecutorResult:
     def emulation_time(self):
         return self.total_time - self.solving_time
 
-class Executor:
+class SymSanExecutor:
     class InvalidGEPMessage(Exception):
         pass
     
     class Timer:
-        def __init__(self, timeout):
+        def __init__(self):
             self.proc_start_time = 0
             self.proc_end_time = 0
             self.solving_time = 0
@@ -37,7 +37,7 @@ class Executor:
         self.config = config
         self.cmd = config.cmd
         self.agent = agent
-        self.timer = Executor.Timer()
+        self.timer = SymSanExecutor.Timer()
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logging_level = config.logging_level
         # resources
@@ -81,12 +81,13 @@ class Executor:
             sys.exit(1)
         # pipefds[0] for read, pipefds[1] for write
         self.pipefds = os.pipe()
-        self.solver = Solver(self.config, self.shm, self.input_file, self.testcase_dir, 0, session_id)
+        self.solver = Z3Solver(self.config, self.shm, self.input_file, self.testcase_dir, 0, session_id)
 
     def process_request(self):
         self.timer.solving_time = 0
         while not self.proc.poll():
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
+            if not msg_data: break
             start_time = time.time()
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:
@@ -109,7 +110,7 @@ class Executor:
         # create and execute the child symsan process
         logging_level = 1 if self.logging_level == logging.DEBUG else 0
         options = f"taint_file={self.input_file}:shm_fd={self.shm._fd}:pipe_fd={self.pipefds[1]}:debug={logging_level}"
-        cmd, stdin = utils.fix_at_file(cmd, self.input_file)
+        cmd, stdin = utils.fix_at_file(self.cmd, self.input_file)
         if timeout:
             cmd = ["timeout", "-k", str(5), str(timeout)] + cmd
         try:
@@ -126,7 +127,7 @@ class Executor:
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, env={"TAINT_OPTIONS": options}, pass_fds=(self.shm._fd, self.pipefds[1]))
         except:
-            self.logger.critical(f"run: Failed to execute subprocess, input: {self.input_file}")
+            self.logger.critical(f"run: Failed to execute subprocess, input: {self.input_file}, cmd: {' '.join(cmd)}")
             self.tear_down()
             sys.exit(1)
         os.close(self.pipefds[1])
@@ -160,5 +161,5 @@ class Executor:
         gmsg = gep_msg.from_buffer_copy(gep_data)
         if msg.label != gmsg.index_label: # Double check
             self.logger.error(f"process_request: Incorrect gep msg: {msg.label} vs {gmsg.index_label}")
-            raise Executor.InvalidGEPMessage()
+            raise SymSanExecutor.InvalidGEPMessage()
         if self.gep_solver_enabled: self.solver.handle_gep(gmsg, msg.addr)

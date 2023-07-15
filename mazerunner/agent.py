@@ -23,9 +23,9 @@ class ProgramState:
         return (self.state, self.action, self.d)
 
 class Agent:
-    def __init__(self, config: Config, model: RLModel=None, output_dir: str=None):
-        if output_dir:
-            self.my_dir = output_dir
+    def __init__(self, config: Config, model: RLModel=None):
+        if config.mazerunner_dir:
+            self.my_dir = config.mazerunner_dir
             mkdir(self.my_traces)
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.max_distance = config.max_distance

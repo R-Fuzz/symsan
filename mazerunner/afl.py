@@ -9,7 +9,7 @@ import time
 import queue
 
 from explore_agent import ExploreAgent
-from executor import Executor
+from executor import SymSanExecutor
 from defs import OperationUnsupportedError
 import minimizer
 from model import RLModel
@@ -100,11 +100,14 @@ class AFLExecutor:
         self.output = config.output_dir
         self.afl = config.afl_dir
         self.name = config.mazerunner_dir
-        self.filename = ".cur_input"
         self.mail = config.mail
+        self.initial_seed_dir = config.initial_seed_dir
+        self.filename = ".cur_input"
         self.afl_cmd, afl_path, qemu_mode = self._parse_fuzzer_stats()
         self.minimizer = minimizer.TestcaseMinimizer(
             self.afl_cmd, afl_path, self.output, qemu_mode)
+        self.my_dir = os.path.join(self.output, self.name)
+        self.config.mazerunner_dir = self.my_dir
         self._make_dirs()
         self._setup_logger(config.logging_level, config.log_file)
         self._import_state()
@@ -120,10 +123,6 @@ class AFLExecutor:
     @property
     def afl_queue(self):
         return os.path.join(self.afl_dir, "queue")
-
-    @property
-    def my_dir(self):
-        return os.path.join(self.output, self.name)
 
     @property
     def my_queue(self):
@@ -305,8 +304,8 @@ class QSYMExecutor(AFLExecutor):
         self.state.processed.add(fp)
 
     def _run_target(self):
-        explore_agent = ExploreAgent(self.config, RLModel(self.my_dir))
-        symsan = Executor(self.config, explore_agent, self.testcase_dir)
+        explore_agent = ExploreAgent(self.config, RLModel(self.config))
+        symsan = SymSanExecutor(self.config, explore_agent, self.testcase_dir)
         symsan.setup(self.cur_input, len(self.state.processed))
         symsan.run()
         try:

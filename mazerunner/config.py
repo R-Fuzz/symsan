@@ -10,8 +10,6 @@ UNION_TABLE_SIZE = 0xc00000000
 NESTED_BRANCH_ENABLED = True
 GEP_SOLVER_ENABLED = False
 OPTIMISTIC_SOLVING_ENABLED = True
-ONETIME_SOLVING_ENABLED = False
-RECORD_REPLAY_MODE_ENABLED = False
 DISCOUNT_FACTOR = 1
 LEARNING_RATE = 0.5
 
@@ -24,14 +22,14 @@ class Config:
                  'nested_branch_enabled', 
                  'gep_solver_enabled', 
                  'optimistic_solving_enabled', 
-                 'record_replay_mode_enabled', 
-                 'onetime_solving_enabled',
                  'discount_factor', 
                  'learning_rate',
+                 'onetime_solving_enabled',
+                 'record_replay_mode_enabled', 
                  "output_dir",
                  "afl_dir",
                  "mazerunner_dir",
-                 "input_path",
+                 "initial_seed_dir",
                  "mail",
                  "delimiter",
                  "pkglen",
@@ -61,7 +59,7 @@ class Config:
         self.output_dir = args.output_dir
         self.afl_dir = args.afl_dir
         self.mazerunner_dir = args.mazerunner_dir
-        self.input_path = args.input
+        self.initial_seed_dir = args.input
         self.mail = args.mail
         self.delimiter = args.deli
         self.pkglen = args.pkglen
@@ -79,7 +77,16 @@ class Config:
         self.nested_branch_enabled = NESTED_BRANCH_ENABLED
         self.gep_solver_enabled = GEP_SOLVER_ENABLED
         self.optimistic_solving_enabled = OPTIMISTIC_SOLVING_ENABLED
-        self.record_replay_mode_enabled = RECORD_REPLAY_MODE_ENABLED
-        self.onetime_solving_enabled = ONETIME_SOLVING_ENABLED
         self.discount_factor = DISCOUNT_FACTOR
         self.learning_rate = LEARNING_RATE
+        # The following should obly be set by the mazerunner launcher
+        self.onetime_solving_enabled = False
+        self.record_replay_mode_enabled = False
+        self.output_dir = None
+        self.afl_dir = None
+        self.mazerunner_dir = None
+        self.initial_seed_dir = None
+        self.mail = None
+        self.delimiter = None
+        self.pkglen = None
+        self.cmd = None
