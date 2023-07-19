@@ -1,18 +1,21 @@
+import atexit
 import os
 import pickle
 
 from agent import *
 from learner import BasicQLearner
+from model import RLModel
 
 class ReplayAgent(Agent):
 
-    def __init__(self, config: Config, model: RLModel):
-        super().__init__(config, model)
+    def __init__(self, config: Config):
+        super().__init__(config)
         # TODO: remove assertion after testing
-        assert model is not None
         assert config.mazerunner_dir is not None
-        self.model = model
-        self.learner = BasicQLearner(model.Q_table, config.discount_factor, config.learning_rate)
+        self.model = RLModel(config)
+        self.model.load()
+        self.learner = BasicQLearner(self.model.Q_table, config.discount_factor, config.learning_rate)
+        atexit.register(self.model.save)
 
     def replay_log(self, log_dir):
         seed_traces = os.listdir(log_dir)

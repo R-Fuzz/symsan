@@ -1,4 +1,5 @@
 .vscode
+test.py
 *.taint
 *.o
 *.so

@@ -1,3 +1,4 @@
+import collections
 import copy
 import logging
 import functools
@@ -6,13 +7,11 @@ import pickle
 import shutil
 import subprocess
 import time
-import queue
 
 from explore_agent import ExploreAgent
 from executor import SymSanExecutor
 from defs import OperationUnsupportedError
 import minimizer
-from model import RLModel
 import utils
 
 DEFAULT_TIMEOUT = 60
@@ -48,16 +47,19 @@ def get_afl_cmd(fuzzer_stats):
                 # format is "command_line: [cmd]"
                 return l.lstrip('command_line:').strip().split()
 
-class AFLExecutorState:
+class MazerunnerState:
     def __init__(self):
         self.hang = set()
         self.processed = set()
         self.timeout = DEFAULT_TIMEOUT
         self.done = set()
+        self.crashes = set()
+        self.testscases_md5 = set()
+        self.seedQ = collections.deque()
         self.index = 0
         self.num_error_reports = 0
         self.num_crash_reports = 0
-        self.crashes = set()
+        self.distance_reached = float("inf")
 
     def __setstate__(self, dict):
         self.__dict__ = dict
@@ -66,8 +68,8 @@ class AFLExecutorState:
         return self.__dict__
 
     def clear(self):
+        self.processed = self.processed - self.hang
         self.hang = set()
-        self.processed = set()
 
     def increase_timeout(self, logger):
         old_timeout = self.timeout
@@ -82,7 +84,7 @@ class AFLExecutorState:
             self.timeout = DEFAULT_TIMEOUT
         # sleep for a minutes to wait until AFL resolves it
         time.sleep(60)
-        # clear state for restarting
+        # clear state for retesting seeds that needs more time
         self.clear()
 
     def tick(self):
@@ -91,26 +93,31 @@ class AFLExecutorState:
         return old_index
 
     def get_num_processed(self):
-        return len(self.processed) + len(self.hang) + len(self.done)
+        return len(self.processed)
 
-class AFLExecutor:
+class Mazerunner:
     def __init__(self, config):
         self.config = config
         self.cmd = config.cmd
         self.output = config.output_dir
-        self.afl = config.afl_dir
         self.name = config.mazerunner_dir
         self.mail = config.mail
         self.initial_seed_dir = config.initial_seed_dir
         self.filename = ".cur_input"
-        self.afl_cmd, afl_path, qemu_mode = self._parse_fuzzer_stats()
-        self.minimizer = minimizer.TestcaseMinimizer(
-            self.afl_cmd, afl_path, self.output, qemu_mode)
         self.my_dir = os.path.join(self.output, self.name)
         self.config.mazerunner_dir = self.my_dir
         self._make_dirs()
-        self._setup_logger(config.logging_level, config.log_file)
         self._import_state()
+        self._setup_logger(config.logging_level, config.log_file)
+        self.afl = None
+        if config.afl_dir:
+            self.afl = config.afl_dir
+            self.afl_cmd, afl_path, qemu_mode = self._parse_fuzzer_stats()
+            self.minimizer = minimizer.TestcaseMinimizer(
+                self.afl_cmd, afl_path, self.output, qemu_mode, self.state)
+        else:
+            self.minimizer = minimizer.TestcaseMinimizer(
+                None, None, self.output, None, self.state)
 
     @property
     def cur_input(self):
@@ -118,10 +125,14 @@ class AFLExecutor:
 
     @property
     def afl_dir(self):
+        if not self.afl:
+            return None
         return os.path.join(self.output, self.afl)
 
     @property
     def afl_queue(self):
+        if not self.afl_dir:
+            return None
         return os.path.join(self.afl_dir, "queue")
 
     @property
@@ -155,6 +166,76 @@ class AFLExecutor:
     def cleanup(self):
         self._export_state()
 
+    def run_file(self, fn):
+        # copy the test case
+        fp = os.path.join(self.testcase_dir, fn)
+        shutil.copy2(fp, self.cur_input)
+        self.logger.info("Run: input=%s" % fp)
+        symsan_res = self._run_target()
+        self.handle_return_status(symsan_res.returncode, symsan_res.stderr, fp)
+        self.sync_back_if_interesting(fp, symsan_res)
+        self._check_crashes()
+        self.state.processed.add(fn)
+
+    def sync_from_afl(self):
+        files = []
+        if self.afl_queue and os.path.exists(self.afl_queue):
+            for name in os.listdir(self.afl_queue):
+                path = os.path.join(self.afl_queue, name)
+                if os.path.isfile(path):
+                    shutil.copy2(path, os.path.join(self.testcase_dir, name))
+                    files.append(name)
+            files = list(set(files) - self.state.processed)
+        return sorted(files,
+                      key=functools.cmp_to_key(testcase_compare),
+                      reverse=True)
+
+    def sync_from_initial_seeds(self):
+        files = []
+        for name in os.listdir(self.initial_seed_dir):
+            path = os.path.join(self.initial_seed_dir, name)
+            if os.path.isfile(path):
+                shutil.copy2(path, os.path.join(self.testcase_dir, name))
+                files.append(name)
+        return files
+
+    def handle_return_status(self, retcode, log, fp):
+        fn = os.path.basename(fp)
+        if retcode in [124, -9]: # killed
+            shutil.copy2(fp, os.path.join(self.my_hangs, fn))
+            self.state.hang.add(fn)
+        else:
+            self.state.done.add(fn)
+
+        # segfault or abort
+        if (retcode in [128 + 11, -11, 128 + 6, -6]):
+            shutil.copy2(fp, os.path.join(self.my_errors, fn))
+            self.report_error(fp, log)
+
+    def handle_empty_files(self):
+        if len(self.state.hang) > MIN_HANG_FILES:
+            self.state.increase_timeout(self.logger)
+        else:
+            # TODO: implement RL thinking: replay from the past
+            self.logger.debug("Sleep for getting files from AFL seed queue")
+            time.sleep(5)
+
+    def _run_target(self):
+        symsan = SymSanExecutor(self.config, self.agent, self.testcase_dir)
+        symsan.setup(self.cur_input, len(self.state.processed))
+        symsan.run()
+        try:
+            symsan.process_request()
+        finally:
+            symsan.tear_down()
+        symsan_res = symsan.get_result()
+        self.logger.debug("Total=%d s, Emulation=%d s, Solver=%d s, Return=%d"
+                     % (symsan_res.total_time,
+                        symsan_res.emulation_time,
+                        symsan_res.solving_time,
+                        symsan_res.returncode))
+        return symsan_res
+
     def _make_dirs(self):
         utils.mkdir(self.my_queue)
         utils.mkdir(self.my_hangs)
@@ -181,40 +262,26 @@ class AFLExecutor:
             with open(self.metadata, "rb") as f:
                 self.state = pickle.load(f)
         else:
-            self.state = AFLExecutorState()
-
-    def _sync_files(self):
-        files = []
-        for name in os.listdir(self.afl_queue):
-            path = os.path.join(self.afl_queue, name)
-            if os.path.isfile(path):
-                files.append(path)
-
-        files = list(set(files) - self.state.done - self.state.processed)
-        return sorted(files,
-                      key=functools.cmp_to_key(testcase_compare),
-                      reverse=True)
+            self.state = MazerunnerState()
 
     def _send_mail(self, subject, info, attach=None):
         if attach is None:
             attach = []
-
         cmd = ["mail"]
         for path in attach:
             cmd += ["-A", path]
         cmd += ["-s", "[mazerunner-report] %s" % subject]
         cmd.append(self.mail)
-
         info = copy.copy(info)
         info["CMD"] = " ".join(self.cmd)
-
         text = "\n" # skip cc
         for k, v in info.items():
             text += "%s\n" % k
             text += "-" * 30 + "\n"
             text += "%s" % v + "\n" * 3
         try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, 
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             proc.communicate(text.encode())
         except OSError:
             pass
@@ -242,25 +309,20 @@ class AFLExecutor:
         # if no mail, then stop
         if self.mail is None:
             return
-
         # don't do too much
         if self.state.num_error_reports >= MAX_ERROR_REPORTS:
             return
-
         self.state.num_error_reports += 1
         self._send_mail("Error found", {"LOG": log}, [fp])
 
     def _report_crash(self, fp):
         self.logger.debug("Crash is found: %s" % fp)
-
         # if no mail, then stop
         if self.mail is None:
             return
-
         # don't do too much
         if self.state.num_crash_reports >= MAX_CRASH_REPORTS:
             return
-
         self.state.num_crash_reports += 1
         info = {}
         stdout, stderr = utils.run_command(["timeout", "-k", "5", "5"] + self.afl_cmd, fp)
@@ -272,61 +334,25 @@ class AFLExecutor:
         with open(self.metadata, "wb") as fp:
             pickle.dump(self.state, fp, protocol=pickle.HIGHEST_PROTOCOL)
 
-    def _handle_empty_files(self):
-        if len(self.state.hang) > MIN_HANG_FILES:
-            self.state.increase_timeout(self.logger)
-        else:
-            self.logger.debug("Sleep for getting files")
-            time.sleep(5)
-
-class QSYMExecutor(AFLExecutor):
-    def __init__(self, config):
-        super().__init__(config)
-
+class QSYMExecutor(Mazerunner):
     def run(self):
+        self.agent = self.create_agent()
         while True:
-            files = self.sync_files()
+            files = self.sync_from_afl()
             if not files:
-                self._handle_empty_files()
+                self.handle_empty_files()
                 continue
             for fp in files:
-                self._run_file(fp)
+                self.run_file(fp)
                 break
 
-    def _run_file(self, fp):
-        # copy the test case
-        shutil.copy2(fp, self.cur_input)
-        self.logger.debug("Run mazerunner: input=%s" % fp)
-        symsan_res = self._run_target()
-        self._handle_return_status(symsan_res.returncode, symsan_res.stderr, fp)
-        self._sync_back_if_interesting(fp, symsan_res.generated_testcases)
-        self._check_crashes()
-        self.state.processed.add(fp)
-
-    def _run_target(self):
-        explore_agent = ExploreAgent(self.config, RLModel(self.config))
-        symsan = SymSanExecutor(self.config, explore_agent, self.testcase_dir)
-        symsan.setup(self.cur_input, len(self.state.processed))
-        symsan.run()
-        try:
-            symsan.process_request()
-        finally:
-            symsan.tear_down()
-        symsan_res = symsan.get_result()
-        self.logger.debug("Total=%d s, Emulation=%d s, Solver=%d s, Return=%d"
-                     % (symsan_res.total_time,
-                        symsan_res.emulation_time,
-                        symsan_res.solving_time,
-                        symsan_res.returncode))
-        return symsan_res
-
-    def _sync_back_if_interesting(self, fp, testcases):
+    def sync_back_if_interesting(self, fp, res):
         old_idx = self.state.index
         target = os.path.basename(fp)[:len("id:......")]
         num_testcase = 0
-        for testcase in testcases():
+        for testcase in res.generated_testcases():
             num_testcase += 1
-            if not self.minimizer.check_testcase(testcase):
+            if not self.minimizer.has_new_cov(testcase):
                 # Remove if it's not interesting testcases
                 os.unlink(testcase)
                 continue
@@ -334,33 +360,56 @@ class QSYMExecutor(AFLExecutor):
             filename = os.path.join(
                     self.my_queue,
                     "id:%06d,src:%s" % (index, target))
-            shutil.move(testcase, filename)
-            self.logger.debug("Creating: %s" % filename)
-        self.logger.debug("Generate %d testcases" % num_testcase)
+            shutil.copy2(testcase, filename)
+            self.logger.debug("Sync back: %s" % filename)
+        self.logger.debug("Generated %d testcases" % num_testcase)
         self.logger.debug("%d testcases are new" % (self.state.index - old_idx))
 
-    def _handle_return_status(self, retcode, log, fp):
-        if retcode in [124, -9]: # killed
-            shutil.copy2(fp, os.path.join(self.my_hangs, os.path.basename(fp)))
-            self.state.hang.add(fp)
-        else:
-            self.state.done.add(fp)
+    def create_agent(self):
+        return ExploreAgent(self.config)
 
-        # segfault or abort
-        if (retcode in [128 + 11, -11, 128 + 6, -6]):
-            shutil.copy2(fp, os.path.join(self.my_errors, os.path.basename(fp)))
-            self.report_error(fp, log)
-
-# TODO: implement this
-class ExploreExecutor(AFLExecutor):
-    def __init__(self, config):
-        super().__init__(config)
-
+class ExploreExecutor(Mazerunner):
     def run(self):
-        pass
+        self.agent = self.create_agent()
+        if not self.state.seedQ:
+            files = self.sync_from_afl()
+            if not files:
+                files += self.sync_from_initial_seeds()
+            self.state.seedQ.extend(files)
+        while True:
+            while self.state.seedQ:
+                next_seed = self.state.seedQ.popleft()
+                self.run_file(next_seed)
+            files = self.sync_from_afl()
+            if files:
+                self.state.seedQ.extendleft(files)
+            if not self.state.seedQ:
+                self.handle_empty_files()
+                continue
+
+    def sync_back_if_interesting(self, fp, res):
+        num_testcase = 0
+        for t in res.generated_testcases:
+            testcase = os.path.join(self.testcase_dir, t)
+            num_testcase += 1
+            if not self.minimizer.is_new_file(testcase):
+                os.unlink(testcase)
+                continue
+            self.state.seedQ.append(t)
+        has_closer_dist = self.minimizer.has_closer_distance(res.distance)
+        if self.afl_queue \
+            and (has_closer_dist or self.minimizer.has_new_cov(fp)):
+            self.logger.info("Sync back: %s" % os.path.basename(fp))
+            # TODO: try to infer the source of fp, check naming pattern like qsym
+            filename = os.path.join(self.my_queue, os.path.basename(fp))
+            shutil.copy2(fp, filename)
+        self.logger.info("Generated %d testcases" % num_testcase)
+
+    def create_agent(self):
+        return ExploreAgent(self.config)
 
 # TODO: implement this
-class ExploitExecutor(AFLExecutor):
+class ExploitExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
 
@@ -368,7 +417,7 @@ class ExploitExecutor(AFLExecutor):
         raise OperationUnsupportedError("ExploitExecutor not implemented")
 
 # TODO: implement this
-class RecordExecutor(AFLExecutor):
+class RecordExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
 
@@ -376,7 +425,7 @@ class RecordExecutor(AFLExecutor):
         raise OperationUnsupportedError("RecordExecutor not implemented")
 
 # TODO: implement this
-class ReplayExecutor(AFLExecutor):
+class ReplayExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
 
@@ -384,7 +433,7 @@ class ReplayExecutor(AFLExecutor):
         raise OperationUnsupportedError("ReplayExecutor not implemented")
 
 # TODO: implement this
-class HybridExecutor(AFLExecutor):
+class HybridExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
 

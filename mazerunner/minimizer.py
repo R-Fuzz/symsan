@@ -1,4 +1,5 @@
 import atexit
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -21,18 +22,25 @@ def write_bitmap_file(bitmap_file, bitmap):
     with open(bitmap_file, "wb") as f:
         f.write(bytes(map(chr, bitmap)))
 
+def compute_md5(file_path):
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as file:
+        for chunk in iter(lambda: file.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
 class TestcaseMinimizer:
-    def __init__(self, cmd, afl_path, out_dir, qemu_mode, map_size=MAP_SIZE):
+    def __init__(self, cmd, afl_path, out_dir, qemu_mode, state, map_size=MAP_SIZE):
         self.cmd = cmd
         self.qemu_mode = qemu_mode
-        self.showmap = os.path.join(afl_path, "afl-showmap")
+        self.showmap = None if not afl_path else os.path.join(afl_path, "afl-showmap")
         self.bitmap_file = os.path.join(out_dir, "afl-bitmap")
         self.crash_bitmap_file = os.path.join(out_dir, "afl-crash-bitmap")
         _, self.temp_file = tempfile.mkstemp(dir=out_dir)
-        atexit.register(self.cleanup)
-
         self.bitmap = self.initialize_bitmap(self.bitmap_file, map_size)
         self.crash_bitmap = self.initialize_bitmap(self.crash_bitmap_file, map_size)
+        self.mazerunner_state = state
+        atexit.register(self.cleanup)
 
     def initialize_bitmap(self, filename, map_size):
         if os.path.exists(filename):
@@ -42,7 +50,22 @@ class TestcaseMinimizer:
             bitmap = [0] * map_size
         return bitmap
 
-    def check_testcase(self, testcase):
+    def is_new_file(self, testcase):
+        md5 = compute_md5(testcase)
+        if md5 in self.mazerunner_state.testscases_md5:
+            return False
+        else:
+            self.mazerunner_state.testscases_md5.add(md5)
+            return True
+
+    def has_closer_distance(self, distance):
+        if distance < self.mazerunner_state.distance_reached:
+            self.mazerunner_state.distance_reached = distance
+            return True
+        else:
+            return False
+
+    def has_new_cov(self, testcase):
         cmd = [self.showmap,
                "-t",
                str(TIMEOUT),

@@ -3,7 +3,7 @@ import os
 import logging
 
 # Default configurations
-LOGGING_LEVEL = logging.ERROR
+LOGGING_LEVEL = logging.INFO
 RANDOM_INPUT = "AAAA"
 MAX_DISTANCE = 0xFFFFFFFF
 UNION_TABLE_SIZE = 0xc00000000
@@ -66,8 +66,7 @@ class Config:
         self.cmd = args.cmd
         if args.debug_enabled:
             self.logging_level = logging.DEBUG
-        if args.log_file:
-            self.log_file = args.log_file
+        self.log_file = args.log_file
 
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL

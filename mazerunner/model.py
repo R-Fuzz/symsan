@@ -16,7 +16,7 @@ class RLModel:
     def my_dir(self):
         return os.path.join(self.output, "model")
 
-    def save_model(self):
+    def save(self):
         with open(os.path.join(self.my_dir, "visited_sa"), 'wb') as fp:
             pickle.dump(self.visited_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
         with open(os.path.join(self.my_dir, "Q_table"), 'wb') as fp:
@@ -24,10 +24,16 @@ class RLModel:
         with open(os.path.join(self.my_dir, "unreachable_branches"), 'wb') as fp:
             pickle.dump(self._unreachable_branches, fp, protocol=pickle.HIGHEST_PROTOCOL)
     
-    def load_model(self):
-        with open(os.path.join(self.my_dir, "visited_sa"), 'rb') as fp:
-            self.visited_sa = pickle.load(fp)
-        with open(os.path.join(self.my_dir, "Q_table"), 'rb') as fp:
-            self.Q_table = pickle.load(fp)
-        with open(os.path.join(self.my_dir, "unreachable_branches"), 'rb') as fp:
-            self._unreachable_branches = pickle.load(fp)
+    def load(self):
+        visited_sa_path = os.path.join(self.my_dir, "visited_sa")
+        if os.path.isfile(visited_sa_path):
+            with open(visited_sa_path, 'rb') as fp:
+                self.visited_sa = pickle.load(fp)
+        Q_table_path = os.path.join(self.my_dir, "Q_table")
+        if os.path.isfile(Q_table_path):
+            with open(Q_table_path, 'rb') as fp:
+                self.Q_table = pickle.load(fp)
+        unreachable_branches_path = os.path.join(self.my_dir, "unreachable_branches")
+        if os.path.isfile(unreachable_branches_path):
+            with open(unreachable_branches_path, 'rb') as fp:
+                self._unreachable_branches = pickle.load(fp)

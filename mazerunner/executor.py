@@ -11,13 +11,14 @@ from defs import *
 import utils
 
 class ExecutorResult:
-    def __init__(self, total_time, solving_time, returncode, out, err, iterator):
+    def __init__(self, total_time, solving_time, dist, returncode, out, err, testcases):
         self.returncode = returncode
         self.total_time = total_time
         self.solving_time = solving_time
-        self.generated_testcases = iterator
-        self.stdout = out
-        self.stderr = err
+        self.distance = dist
+        self.generated_testcases = testcases
+        self.stdout = out.read() if out else "Output not available"
+        self.stderr = err.read() if err else "Unknown error"
 
     @property
     def emulation_time(self):
@@ -66,10 +67,11 @@ class SymSanExecutor:
             self.shm.unlink()
 
     def get_result(self):
+        # TODO: implement stream reader thread in case the subprocess closes
             return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
-                                  self.timer.solving_time, self.proc.returncode,
-                                  self.proc.stdin.read(), self.proc.stderr.read(),
-                                  self.__get_testcases)
+                                  self.timer.solving_time, self.agent.min_distance, 
+                                  self.proc.returncode, self.proc.stdin,
+                                  self.proc.stderr, self.solver.generated_files)
 
     def setup(self, input_file, session_id=0):
         self.input_file = input_file
@@ -81,7 +83,9 @@ class SymSanExecutor:
             sys.exit(1)
         # pipefds[0] for read, pipefds[1] for write
         self.pipefds = os.pipe()
-        self.solver = Z3Solver(self.config, self.shm, self.input_file, self.testcase_dir, 0, session_id)
+        self.solver = Z3Solver(self.config, self.shm, self.input_file, 
+                               self.testcase_dir, 0, session_id)
+        self.agent.reset()
 
     def process_request(self):
         self.timer.solving_time = 0
@@ -101,7 +105,8 @@ class SymSanExecutor:
             elif msg.msg_type == MsgType.fsize_type.value:
                 pass
             else:
-                self.logger.error(f"process_request: Unknown message type: {msg.msg_type}", file=sys.stderr)
+                self.logger.error(f"process_request: Unknown message type: {msg.msg_type}",
+                                  file=sys.stderr)
             end_time = time.time()
             self.timer.solving_time += end_time - start_time
         self.timer.proc_end_time = time.time()
@@ -109,7 +114,10 @@ class SymSanExecutor:
     def run(self, timeout=None):
         # create and execute the child symsan process
         logging_level = 1 if self.logging_level == logging.DEBUG else 0
-        options = f"taint_file={self.input_file}:shm_fd={self.shm._fd}:pipe_fd={self.pipefds[1]}:debug={logging_level}"
+        options = (f"taint_file={self.input_file}"
+        f":shm_fd={self.shm._fd}"
+        f":pipe_fd={self.pipefds[1]}"
+        f":debug={logging_level}")
         cmd, stdin = utils.fix_at_file(self.cmd, self.input_file)
         if timeout:
             cmd = ["timeout", "-k", str(5), str(timeout)] + cmd
@@ -118,26 +126,24 @@ class SymSanExecutor:
             self.timer.proc_start_time = time.time()
             if stdin:
                 # the symsan proc reads the input from stdin
-                self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, env={"TAINT_OPTIONS": options}, pass_fds=(self.shm._fd, self.pipefds[1]))
+                self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             env={"TAINT_OPTIONS": options},
+                                             pass_fds=(self.shm._fd, self.pipefds[1]))
                 self.proc.stdin.write(stdin.encode())
                 self.proc.stdin.flush()
             else:
                 # the symsan proc reads the input from file stream
-                self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, env={"TAINT_OPTIONS": options}, pass_fds=(self.shm._fd, self.pipefds[1]))
+                self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             env={"TAINT_OPTIONS": options},
+                                             pass_fds=(self.shm._fd, self.pipefds[1]))
         except:
-            self.logger.critical(f"run: Failed to execute subprocess, input: {self.input_file}, cmd: {' '.join(cmd)}")
+            self.logger.critical(f"run: Failed to execute subprocess, "
+                                 f"input: {self.input_file}, cmd: {' '.join(cmd)}")
             self.tear_down()
             sys.exit(1)
         os.close(self.pipefds[1])
-
-    def __get_testcases(self):
-        for name in sorted(self.solver.generated_files):
-            if not "id:" in name:
-                continue
-            path = os.path.join(self.testcase_dir, name)
-            yield path
 
     def __process_cond_request(self, msg):
         if msg.label:
@@ -160,6 +166,7 @@ class SymSanExecutor:
         gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))
         gmsg = gep_msg.from_buffer_copy(gep_data)
         if msg.label != gmsg.index_label: # Double check
-            self.logger.error(f"process_request: Incorrect gep msg: {msg.label} vs {gmsg.index_label}")
+            self.logger.error(f"process_request: Incorrect gep msg: {msg.label} "
+                              f"vs {gmsg.index_label}")
             raise SymSanExecutor.InvalidGEPMessage()
         if self.gep_solver_enabled: self.solver.handle_gep(gmsg, msg.addr)

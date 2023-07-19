@@ -5,7 +5,6 @@ import subprocess
 import utils
 
 from config import Config
-from model import RLModel
 from utils import mkdir
 
 class ProgramState:
@@ -23,21 +22,24 @@ class ProgramState:
         return (self.state, self.action, self.d)
 
 class Agent:
-    def __init__(self, config: Config, model: RLModel=None):
+    def __init__(self, config: Config):
         if config.mazerunner_dir:
             self.my_dir = config.mazerunner_dir
             mkdir(self.my_traces)
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.max_distance = config.max_distance
         self.loopinfo = {}
-        # RL related fields
-        self.last_state = None
-        self.curr_state = ProgramState(distance=config.max_distance)
         self.episode = []
 
     @property
     def my_traces(self):
         return os.path.join(self.my_dir, "traces")
+
+    def reset(self):
+        self.last_state = None
+        self.curr_state = ProgramState(distance=self.max_distance)
+        self.episode.clear()
+        self.min_distance = self.max_distance
 
     def _make_dirs(self):
         utils.mkdir(self.my_traces)

@@ -1,16 +1,20 @@
+import atexit
+
 from agent import *
 from defs import TaintFlag
 from learner import BasicQLearner
+from model import RLModel
 
 class ExploreAgent(Agent):
 
-    def __init__(self, config: Config, model: RLModel=None):
-        super().__init__(config, model)
+    def __init__(self, config: Config):
+        super().__init__(config)
         # TODO: remove assertion after testing
-        assert model is not None
         assert config.mazerunner_dir is not None
-        self.model = model
-        self.learner = BasicQLearner(model.Q_table, config.discount_factor, config.learning_rate)
+        self.model = RLModel(config)
+        self.model.load()
+        self.learner = BasicQLearner(self.model.Q_table, config.discount_factor, config.learning_rate)
+        atexit.register(self.model.save)
 
     def handle_new_state(self, msg, action):
         tmp = self.last_state 
@@ -21,6 +25,8 @@ class ExploreAgent(Agent):
             d = msg.avg_dist
         else:
             d = self.max_distance
+        if d < self.min_distance:
+            self.min_distance = d
         self.curr_state.update(msg.addr, msg.context, action, d)
         curr_sa = self.curr_state.state + (self.curr_state.action, )
         self.model.visited_sa.add(curr_sa)
