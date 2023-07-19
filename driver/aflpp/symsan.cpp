@@ -1363,10 +1363,12 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     FATAL("afl_custom_init alloc");
     return NULL;
   }
-  // try jigsaw first
+  // always use the simpler i2s solver
   data->solvers.emplace_back(std::make_shared<rgd::I2SSolver>());
-  data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
-  data->solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
+  if (!getenv("SYMSAN_USE_JIGSAW"))
+    data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
+  if (!getenv("SYMSAN_USE_Z3"))
+    data->solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
     FATAL(
