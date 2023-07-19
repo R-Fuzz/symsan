@@ -10,6 +10,9 @@ from backend_solver import Z3Solver
 from defs import *
 import utils
 
+# TODO: automatically infer this
+UNION_TABLE_SIZE = 0xc00000000
+
 class ExecutorResult:
     def __init__(self, total_time, solving_time, dist, returncode, out, err, testcases):
         self.returncode = returncode
@@ -46,7 +49,6 @@ class SymSanExecutor:
         self.solver = None
         # options
         self.testcase_dir = output_dir
-        self.union_table_size = config.union_table_size
         self.record_replay_mode_enabled = config.record_replay_mode_enabled
         self.onetime_solving_enabled = config.onetime_solving_enabled
         self.gep_solver_enabled = config.gep_solver_enabled
@@ -61,7 +63,7 @@ class SymSanExecutor:
         if self.proc and not self.proc.poll():
             self.proc.kill()
             self.proc.wait()
-            self.timer.proc_end_time = time.time()
+            self.timer.proc_end_time = int(time.time() * 1000)
         if self.shm:
             self.shm.close()
             self.shm.unlink()
@@ -77,7 +79,7 @@ class SymSanExecutor:
         self.input_file = input_file
         # Create and map shared memory
         try:
-            self.shm = shared_memory.SharedMemory(create=True, size=self.union_table_size)
+            self.shm = shared_memory.SharedMemory(create=True, size=UNION_TABLE_SIZE)
         except:
             self.logger.critical(f"setup: Failed to map shm({self.shm._fd}), size(shm.size)")
             sys.exit(1)
@@ -92,7 +94,7 @@ class SymSanExecutor:
         while not self.proc.poll():
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
             if not msg_data: break
-            start_time = time.time()
+            start_time = int(time.time() * 1000)
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:
                 self.__process_cond_request(msg)
@@ -107,9 +109,9 @@ class SymSanExecutor:
             else:
                 self.logger.error(f"process_request: Unknown message type: {msg.msg_type}",
                                   file=sys.stderr)
-            end_time = time.time()
+            end_time = int(time.time() * 1000)
             self.timer.solving_time += end_time - start_time
-        self.timer.proc_end_time = time.time()
+        self.timer.proc_end_time = int(time.time() * 1000)
 
     def run(self, timeout=None):
         # create and execute the child symsan process
@@ -123,7 +125,7 @@ class SymSanExecutor:
             cmd = ["timeout", "-k", str(5), str(timeout)] + cmd
         try:
             self.logger.debug("Executing %s" % ' '.join(cmd))
-            self.timer.proc_start_time = time.time()
+            self.timer.proc_start_time = int(time.time() * 1000)
             if stdin:
                 # the symsan proc reads the input from stdin
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,

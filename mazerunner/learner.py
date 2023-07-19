@@ -14,8 +14,8 @@ class BasicQLearner:
             chosen_Q = curr_state_taken
         else:
             chosen_Q = curr_state_not_taken
-        last_Q = last_Q + self.learning_rate \
-            * (last_reward + self.discount_factor * chosen_Q - last_Q)
+        last_Q = (last_Q + self.learning_rate 
+            * (last_reward + self.discount_factor * chosen_Q - last_Q))
         if last_Q != 0.:
             self.Q_table[last_SA] = last_Q
 

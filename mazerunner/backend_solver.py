@@ -340,6 +340,8 @@ class Z3Solver:
             self.__branch_deps.extend([None] * (n + 1 - len(self.__branch_deps)))
         self.__branch_deps[n] = dep
 
+    # TODO: do not solve if the same constraint has been solved before, 
+    # retrieve the previous generation.
     def __solve_expr(self, e: z3.ExprRef):
         has_solved = False
         # set up local optmistic solver
@@ -370,7 +372,7 @@ class Z3Solver:
         self.__current_index += 1
         with open(path, "wb") as f:
             f.write(self.input_buf)
-        self.logger.info(f"generate {fname}")
+        self.logger.debug(f"generate {fname}")
         fp = open(path, "r+b")
         for decl in m:
             name = decl.name()

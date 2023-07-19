@@ -49,10 +49,10 @@ def get_afl_cmd(fuzzer_stats):
 
 class MazerunnerState:
     def __init__(self):
+        self.synced = set()
         self.hang = set()
         self.processed = set()
         self.timeout = DEFAULT_TIMEOUT
-        self.done = set()
         self.crashes = set()
         self.testscases_md5 = set()
         self.seedQ = collections.deque()
@@ -177,18 +177,18 @@ class Mazerunner:
         self._check_crashes()
         self.state.processed.add(fn)
 
-    def sync_from_afl(self):
+    def sync_from_afl(self, reversed_order=True):
         files = []
         if self.afl_queue and os.path.exists(self.afl_queue):
             for name in os.listdir(self.afl_queue):
                 path = os.path.join(self.afl_queue, name)
-                if os.path.isfile(path):
+                if os.path.isfile(path) and not name in self.state.synced:
                     shutil.copy2(path, os.path.join(self.testcase_dir, name))
                     files.append(name)
-            files = list(set(files) - self.state.processed)
+                    self.state.synced.add(name)
         return sorted(files,
                       key=functools.cmp_to_key(testcase_compare),
-                      reverse=True)
+                      reverse=reversed_order)
 
     def sync_from_initial_seeds(self):
         files = []
@@ -204,8 +204,6 @@ class Mazerunner:
         if retcode in [124, -9]: # killed
             shutil.copy2(fp, os.path.join(self.my_hangs, fn))
             self.state.hang.add(fn)
-        else:
-            self.state.done.add(fn)
 
         # segfault or abort
         if (retcode in [128 + 11, -11, 128 + 6, -6]):
@@ -217,7 +215,7 @@ class Mazerunner:
             self.state.increase_timeout(self.logger)
         else:
             # TODO: implement RL thinking: replay from the past
-            self.logger.debug("Sleep for getting files from AFL seed queue")
+            self.logger.info("Sleep for getting files from AFL seed queue")
             time.sleep(5)
 
     def _run_target(self):
@@ -229,7 +227,7 @@ class Mazerunner:
         finally:
             symsan.tear_down()
         symsan_res = symsan.get_result()
-        self.logger.debug("Total=%d s, Emulation=%d s, Solver=%d s, Return=%d"
+        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d"
                      % (symsan_res.total_time,
                         symsan_res.emulation_time,
                         symsan_res.solving_time,
@@ -335,8 +333,11 @@ class Mazerunner:
             pickle.dump(self.state, fp, protocol=pickle.HIGHEST_PROTOCOL)
 
 class QSYMExecutor(Mazerunner):
+    def __init__(self, config):
+        super().__init__(config)
+        self.agent = ExploreAgent(self.config)
+
     def run(self):
-        self.agent = self.create_agent()
         while True:
             files = self.sync_from_afl()
             if not files:
@@ -365,27 +366,29 @@ class QSYMExecutor(Mazerunner):
         self.logger.debug("Generated %d testcases" % num_testcase)
         self.logger.debug("%d testcases are new" % (self.state.index - old_idx))
 
-    def create_agent(self):
-        return ExploreAgent(self.config)
-
 class ExploreExecutor(Mazerunner):
+    def __init__(self, config):
+        super().__init__(config)
+        self.agent = ExploreAgent(self.config)
+        self.sync_frequency = self.config.sync_frequency
+
     def run(self):
-        self.agent = self.create_agent()
         if not self.state.seedQ:
             files = self.sync_from_afl()
             if not files:
                 files += self.sync_from_initial_seeds()
             self.state.seedQ.extend(files)
         while True:
-            while self.state.seedQ:
-                next_seed = self.state.seedQ.popleft()
-                self.run_file(next_seed)
-            files = self.sync_from_afl()
-            if files:
+            if (not self.state.seedQ
+                or len(self.state.processed) % self.sync_frequency == 0):
+                files = self.sync_from_afl(False)
                 self.state.seedQ.extendleft(files)
             if not self.state.seedQ:
                 self.handle_empty_files()
                 continue
+            next_seed = self.state.seedQ.popleft()
+            if not next_seed in self.state.processed:
+                self.run_file(next_seed)
 
     def sync_back_if_interesting(self, fp, res):
         num_testcase = 0
@@ -396,17 +399,14 @@ class ExploreExecutor(Mazerunner):
                 os.unlink(testcase)
                 continue
             self.state.seedQ.append(t)
-        has_closer_dist = self.minimizer.has_closer_distance(res.distance)
-        if self.afl_queue \
-            and (has_closer_dist or self.minimizer.has_new_cov(fp)):
+        if (self.afl_queue 
+            and (self.minimizer.has_closer_distance(res.distance)
+                 or self.minimizer.has_new_cov(fp))):
             self.logger.info("Sync back: %s" % os.path.basename(fp))
-            # TODO: try to infer the source of fp, check naming pattern like qsym
+            # TODO: try to infer the source of fp, check naming pattern of qsym
             filename = os.path.join(self.my_queue, os.path.basename(fp))
             shutil.copy2(fp, filename)
         self.logger.info("Generated %d testcases" % num_testcase)
-
-    def create_agent(self):
-        return ExploreAgent(self.config)
 
 # TODO: implement this
 class ExploitExecutor(Mazerunner):

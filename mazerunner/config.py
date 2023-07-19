@@ -6,19 +6,18 @@ import logging
 LOGGING_LEVEL = logging.INFO
 RANDOM_INPUT = "AAAA"
 MAX_DISTANCE = 0xFFFFFFFF
-UNION_TABLE_SIZE = 0xc00000000
 NESTED_BRANCH_ENABLED = True
 GEP_SOLVER_ENABLED = False
 OPTIMISTIC_SOLVING_ENABLED = True
 DISCOUNT_FACTOR = 1
 LEARNING_RATE = 0.5
+SEED_SYNC_FREQUENCY = 100
 
 class Config:
     __slots__ = ['__dict__', '__weakref__',
                  'logging_level', 
                  'random_input', 
                  'max_distance', 
-                 'union_table_size', 
                  'nested_branch_enabled', 
                  'gep_solver_enabled', 
                  'optimistic_solving_enabled', 
@@ -34,7 +33,8 @@ class Config:
                  "delimiter",
                  "pkglen",
                  "cmd",
-                 "log_file"]
+                 "log_file",
+                 "sync_frequency"]
 
     def __init__(self):
         self._load_default()
@@ -72,12 +72,12 @@ class Config:
         self.logging_level = LOGGING_LEVEL
         self.random_input = RANDOM_INPUT
         self.max_distance = MAX_DISTANCE
-        self.union_table_size = UNION_TABLE_SIZE
         self.nested_branch_enabled = NESTED_BRANCH_ENABLED
         self.gep_solver_enabled = GEP_SOLVER_ENABLED
         self.optimistic_solving_enabled = OPTIMISTIC_SOLVING_ENABLED
         self.discount_factor = DISCOUNT_FACTOR
         self.learning_rate = LEARNING_RATE
+        self.sync_frequency = SEED_SYNC_FREQUENCY
         # The following should obly be set by the mazerunner launcher
         self.onetime_solving_enabled = False
         self.record_replay_mode_enabled = False
