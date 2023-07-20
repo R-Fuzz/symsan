@@ -30,7 +30,7 @@ cd /workdir/aflpp && CC=clang-12 CXX=clang++-12 make install
 Next, download symsan and build
 
 ```
-git clone --depth=1 https://github.com/R-Fuzz/symsan /workdir/symsan
+git clone -b aflpp https://github.com/R-Fuzz/symsan /workdir/symsan
 cd symsan/ && mkdir -p build && \
   cd build && CC=clang-12 CXX=clang++-12 cmake -DCMAKE_INSTALL_PREFIX=. -DAFLPP_PATH=/workdir/aflpp ../  && \
   make -j4 && make install
