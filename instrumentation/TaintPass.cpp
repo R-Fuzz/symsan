@@ -2272,7 +2272,7 @@ void TaintVisitor::visitPHINode(PHINode &PN) {
 
 static inline bool isLoopLatch(const BasicBlock *BB, const BasicBlock *Header) {
   const BasicBlock *Succ = nullptr;
-  std::vector<const BasicBlock *> Visited;
+  SmallVector<const BasicBlock*> Visited;
   while (BB != Header) {
     Visited.push_back(BB);
     if ((Succ = BB->getSingleSuccessor()) == nullptr)
