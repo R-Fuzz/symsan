@@ -15,7 +15,9 @@ First, install dependencies:
 
 ```
 apt-get update
-apt-get install -y cmake llvm-12 clang-12 libc++-12-dev libc++abi-12-dev python3-minimal python-is-python3 zlib1g-dev git joe libprotobuf-dev
+apt-get install -y lsb-release wget software-properties-common gnupg
+wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && ./llvm.sh 12
+apt-get install -y cmake libc++-12-dev libc++abi-12-dev libunwind-12 python3-minimal python-is-python3 zlib1g-dev git gdb joe
 apt-get install -y libz3-dev libgoogle-perftools-dev
 ```
 
@@ -24,7 +26,7 @@ Next, download and build AFL++:
 ```
 git clone --depth=1 https://github.com/AFLplusplus/AFLplusplus /workdir/aflpp
 ENV LLVM_CONFIG=llvm-config-12
-cd /workdir/aflpp && CC=clang-12 CXX=clang++-12 make install
+cd /workdir/aflpp && CC=clang-12 CXX=clang++-12 make source-only && make install
 ```
 
 Next, download symsan and build
@@ -32,8 +34,8 @@ Next, download symsan and build
 ```
 git clone -b aflpp https://github.com/R-Fuzz/symsan /workdir/symsan
 cd symsan/ && mkdir -p build && \
-  cd build && CC=clang-12 CXX=clang++-12 cmake -DCMAKE_INSTALL_PREFIX=. -DAFLPP_PATH=/workdir/aflpp ../  && \
-  make -j4 && make install
+  cd build && CC=clang-12 CXX=clang++-12 cmake -DAFLPP_PATH=/workdir/aflpp ../  && \
+  make -j && make install
 ```
 
 ### Build target binaries
