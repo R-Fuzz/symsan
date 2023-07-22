@@ -11,6 +11,7 @@ GEP_SOLVER_ENABLED = False
 OPTIMISTIC_SOLVING_ENABLED = True
 DISCOUNT_FACTOR = 1
 LEARNING_RATE = 0.5
+EXPLORE_RATE = 0.2
 SEED_SYNC_FREQUENCY = 100
 
 class Config:
@@ -32,7 +33,8 @@ class Config:
                  "pkglen",
                  "cmd",
                  "log_file",
-                 "sync_frequency"]
+                 "sync_frequency",
+                 "explore_rate"]
 
     def __init__(self):
         self._load_default()
@@ -76,6 +78,7 @@ class Config:
         self.discount_factor = DISCOUNT_FACTOR
         self.learning_rate = LEARNING_RATE
         self.sync_frequency = SEED_SYNC_FREQUENCY
+        self.explore_rate = EXPLORE_RATE
         # The following should obly be set by the mazerunner launcher
         self.output_dir = None
         self.afl_dir = None

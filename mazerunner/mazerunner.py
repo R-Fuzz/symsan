@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import random
 import time
 
 import afl
@@ -41,6 +42,7 @@ def check_args(args):
                 raise ValueError('{args.afl_dir} no such directory')
 
 def main():
+    random.seed(time.time())
     config = Config()
     args = parse_args()
     check_args(args)

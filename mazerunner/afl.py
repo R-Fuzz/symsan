@@ -435,17 +435,21 @@ class ExploitExecutor(Mazerunner):
     def run_target(self):
         total_time = emulation_time = solving_time = 0
         symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
+        flip_num = 0
         while True:
             try:
                 symsan.setup(self.cur_input, len(self.state.processed))
                 symsan.run()
                 symsan.process_request()
                 break
-            except Z3Solver.AbortConcolicExecution():
+            # TODO: return a status from process_request() instead of catching exception
+            except Z3Solver.AbortConcolicExecution:
                 self.agent.target_sa = self.agent.curr_state.compute_reversed_sa()
                 assert len(symsan.solver.generated_files) == 1
                 fp = os.path.join(self.my_generations, symsan.solver.generated_files[0])
                 shutil.move(fp, self.cur_input)
+                self.logger.debug(f"Abort and restart. Target SA: {self.agent.target_sa}")
+                flip_num += 1
                 continue
             finally:
                 symsan.tear_down()
@@ -458,8 +462,8 @@ class ExploitExecutor(Mazerunner):
         if self.agent.target_sa:
             self.agent.mark_sa_unreachable(self.agent.target_sa)
             self.agent.target_sa = None
-        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d"
-                     % (total_time, emulation_time, solving_time, symsan_res.returncode))
+        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, flipped=%d times"
+                     % (total_time, emulation_time, solving_time, symsan_res.returncode, flip_num))
         return symsan_res
 
     def sync_back_if_interesting(self, fp, res):

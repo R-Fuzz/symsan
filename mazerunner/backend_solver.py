@@ -438,11 +438,11 @@ class Z3Solver:
             e = (cond != result)
             if self.__solve_expr(e):
                 self.logger.debug("__solve_cond: branch solved")
-                if options & SolverFlag.SHOULD_ABORT:
-                    self.logger.debug("__solve_cond: aborting")
-                    raise Z3Solver.AbortConcolicExecution()
             else:
                 self.logger.debug("__solve_cond: branch not solvable @{}".format(addr))
+            if options & SolverFlag.SHOULD_ABORT:
+                self.logger.debug("__solve_cond: aborting")
+                raise Z3Solver.AbortConcolicExecution()
         # 3. nested branch
         if self.nested_branch_enabled:
             for off in inputs:
