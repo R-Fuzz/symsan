@@ -58,9 +58,10 @@ class TestcaseMinimizer:
             self.mazerunner_state.testscases_md5.add(md5)
             return True
 
-    def has_closer_distance(self, distance):
-        if distance < self.mazerunner_state.distance_reached:
-            self.mazerunner_state.distance_reached = distance
+    def has_closer_distance(self, distance, testcase):
+        distance_reached = self.mazerunner_state.best_seed[1]
+        if distance < distance_reached:
+            self.mazerunner_state.best_seed = (testcase, distance)
             return True
         else:
             return False

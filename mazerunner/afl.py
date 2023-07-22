@@ -4,11 +4,15 @@ import logging
 import functools
 import os
 import pickle
+import random
+import re
 import shutil
 import subprocess
 import time
 
+from backend_solver import Z3Solver
 from explore_agent import ExploreAgent
+from exploit_agent import ExploitAgent
 from executor import SymSanExecutor
 from defs import OperationUnsupportedError
 import minimizer
@@ -47,6 +51,11 @@ def get_afl_cmd(fuzzer_stats):
                 # format is "command_line: [cmd]"
                 return l.lstrip('command_line:').strip().split()
 
+# 'id:xxxx,src:yyyyy' -> 'id:xxxx'
+# 'id-xxx-xxxxxx-xx,src:yy-yyyyyy-yy' -> 'id-xxx-xxxxxx-xx'
+# 'idxxxxxxxx' -> 'idxxxxxxxx'
+get_id_from_fn = lambda s: re.compile(r'id[^,]*').findall(s)
+
 class MazerunnerState:
     def __init__(self):
         self.synced = set()
@@ -59,7 +68,7 @@ class MazerunnerState:
         self.index = 0
         self.num_error_reports = 0
         self.num_crash_reports = 0
-        self.distance_reached = float("inf")
+        self.best_seed = ("", float("inf"))
 
     def __setstate__(self, dict):
         self.__dict__ = dict
@@ -148,7 +157,7 @@ class Mazerunner:
         return os.path.join(self.my_dir, "errors")
 
     @property
-    def testcase_dir(self):
+    def my_generations(self):
         return os.path.join(self.my_dir, "generated_inputs")
 
     @property
@@ -168,14 +177,29 @@ class Mazerunner:
 
     def run_file(self, fn):
         # copy the test case
-        fp = os.path.join(self.testcase_dir, fn)
+        fp = os.path.join(self.my_generations, fn)
         shutil.copy2(fp, self.cur_input)
         self.logger.info("Run: input=%s" % fp)
-        symsan_res = self._run_target()
+        symsan_res = self.run_target()
         self.handle_return_status(symsan_res.returncode, symsan_res.stderr, fp)
         self.sync_back_if_interesting(fp, symsan_res)
-        self._check_crashes()
         self.state.processed.add(fn)
+
+    def run_target(self):
+        symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
+        symsan.setup(self.cur_input, len(self.state.processed))
+        symsan.run()
+        try:
+            symsan.process_request()
+        finally:
+            symsan.tear_down()
+        symsan_res = symsan.get_result()
+        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d"
+                     % (symsan_res.total_time,
+                        symsan_res.emulation_time,
+                        symsan_res.solving_time,
+                        symsan_res.returncode))
+        return symsan_res
 
     def sync_from_afl(self, reversed_order=True):
         files = []
@@ -183,7 +207,7 @@ class Mazerunner:
             for name in os.listdir(self.afl_queue):
                 path = os.path.join(self.afl_queue, name)
                 if os.path.isfile(path) and not name in self.state.synced:
-                    shutil.copy2(path, os.path.join(self.testcase_dir, name))
+                    shutil.copy2(path, os.path.join(self.my_generations, name))
                     files.append(name)
                     self.state.synced.add(name)
         return sorted(files,
@@ -195,7 +219,7 @@ class Mazerunner:
         for name in os.listdir(self.initial_seed_dir):
             path = os.path.join(self.initial_seed_dir, name)
             if os.path.isfile(path):
-                shutil.copy2(path, os.path.join(self.testcase_dir, name))
+                shutil.copy2(path, os.path.join(self.my_generations, name))
                 files.append(name)
         return files
 
@@ -218,27 +242,29 @@ class Mazerunner:
             self.logger.info("Sleep for getting files from AFL seed queue")
             time.sleep(5)
 
-    def _run_target(self):
-        symsan = SymSanExecutor(self.config, self.agent, self.testcase_dir)
-        symsan.setup(self.cur_input, len(self.state.processed))
-        symsan.run()
-        try:
-            symsan.process_request()
-        finally:
-            symsan.tear_down()
-        symsan_res = symsan.get_result()
-        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d"
-                     % (symsan_res.total_time,
-                        symsan_res.emulation_time,
-                        symsan_res.solving_time,
-                        symsan_res.returncode))
-        return symsan_res
+    def check_crashes(self):
+        for fuzzer in os.listdir(self.output):
+            crash_dir = os.path.join(self.output, fuzzer, "crashes")
+            if not os.path.exists(crash_dir):
+                continue
+            # initialize if it's first time to see the fuzzer
+            if not fuzzer in self.state.crashes:
+                self.state.crashes[fuzzer] = -1
+            for name in sorted(os.listdir(crash_dir)):
+                # skip readme
+                if "id:" not in name:
+                    continue
+                # read id from the format "id:000000..."
+                num = int(name[3:9])
+                if num > self.state.crashes[fuzzer]:
+                    self._report_crash(os.path.join(crash_dir, name))
+                    self.state.crashes[fuzzer] = num
 
     def _make_dirs(self):
         utils.mkdir(self.my_queue)
         utils.mkdir(self.my_hangs)
         utils.mkdir(self.my_errors)
-        utils.mkdir(self.testcase_dir)
+        utils.mkdir(self.my_generations)
 
     def _setup_logger(self, logging_level, logfile):
         self.logger = logging.getLogger(self.__class__.__qualname__)
@@ -284,24 +310,6 @@ class Mazerunner:
         except OSError:
             pass
 
-    def _check_crashes(self):
-        for fuzzer in os.listdir(self.output):
-            crash_dir = os.path.join(self.output, fuzzer, "crashes")
-            if not os.path.exists(crash_dir):
-                continue
-            # initialize if it's first time to see the fuzzer
-            if not fuzzer in self.state.crashes:
-                self.state.crashes[fuzzer] = -1
-            for name in sorted(os.listdir(crash_dir)):
-                # skip readme
-                if "id:" not in name:
-                    continue
-                # read id from the format "id:000000..."
-                num = int(name[3:9])
-                if num > self.state.crashes[fuzzer]:
-                    self._report_crash(os.path.join(crash_dir, name))
-                    self.state.crashes[fuzzer] = num
-
     def _report_error(self, fp, log):
         self.logger.debug("Error is occurred: %s\nLog:%s" % (fp, log))
         # if no mail, then stop
@@ -345,6 +353,7 @@ class QSYMExecutor(Mazerunner):
                 continue
             for fp in files:
                 self.run_file(fp)
+                self.check_crashes()
                 break
 
     def sync_back_if_interesting(self, fp, res):
@@ -376,7 +385,7 @@ class ExploreExecutor(Mazerunner):
         if not self.state.seedQ:
             files = self.sync_from_afl()
             if not files:
-                files += self.sync_from_initial_seeds()
+                files = self.sync_from_initial_seeds()
             self.state.seedQ.extend(files)
         while True:
             if (not self.state.seedQ
@@ -393,28 +402,80 @@ class ExploreExecutor(Mazerunner):
     def sync_back_if_interesting(self, fp, res):
         num_testcase = 0
         for t in res.generated_testcases:
-            testcase = os.path.join(self.testcase_dir, t)
+            testcase = os.path.join(self.my_generations, t)
             num_testcase += 1
             if not self.minimizer.is_new_file(testcase):
                 os.unlink(testcase)
                 continue
             self.state.seedQ.append(t)
-        if (self.afl_queue 
-            and (self.minimizer.has_closer_distance(res.distance)
-                 or self.minimizer.has_new_cov(fp))):
-            self.logger.info("Sync back: %s" % os.path.basename(fp))
+        fn = os.path.basename(fp)
+        is_closer = self.minimizer.has_closer_distance(res.distance, fn)
+        if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
+            self.logger.info("Sync back: %s" % fn)
             # TODO: try to infer the source of fp, check naming pattern of qsym
-            filename = os.path.join(self.my_queue, os.path.basename(fp))
+            filename = os.path.join(self.my_queue, fn)
             shutil.copy2(fp, filename)
         self.logger.info("Generated %d testcases" % num_testcase)
 
-# TODO: implement this
 class ExploitExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
+        self.agent = ExploitAgent(self.config)
 
     def run(self):
-        raise OperationUnsupportedError("ExploitExecutor not implemented")
+        while True:
+            next_seed = self.state.best_seed[0]
+            if not next_seed:
+                files = self.sync_from_afl()
+                if not files:
+                    files = self.sync_from_initial_seeds()
+                next_seed = random.choice(files)
+            self.run_file(next_seed)
+
+    def run_target(self):
+        total_time = emulation_time = solving_time = 0
+        symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
+        while True:
+            try:
+                symsan.setup(self.cur_input, len(self.state.processed))
+                symsan.run()
+                symsan.process_request()
+                break
+            except Z3Solver.AbortConcolicExecution():
+                self.agent.target_sa = self.agent.curr_state.compute_reversed_sa()
+                assert len(symsan.solver.generated_files) == 1
+                fp = os.path.join(self.my_generations, symsan.solver.generated_files[0])
+                shutil.move(fp, self.cur_input)
+                continue
+            finally:
+                symsan.tear_down()
+                symsan_res = symsan.get_result()
+                assert len(symsan_res.generated_testcases) <= 1
+                total_time += symsan_res.total_time
+                emulation_time += symsan_res.emulation_time
+                solving_time += symsan_res.solving_time
+        self.agent.replay_trace(self.agent.episode)
+        if self.agent.target_sa:
+            self.agent.mark_sa_unreachable(self.agent.target_sa)
+            self.agent.target_sa = None
+        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d"
+                     % (total_time, emulation_time, solving_time, symsan_res.returncode))
+        return symsan_res
+
+    def sync_back_if_interesting(self, fp, res):
+        assert not res.generated_testcases
+        fn = os.path.basename(fp)
+        index = self.state.tick()
+        names = get_id_from_fn(fn)
+        target = names[0] if names else fn
+        dst_fn = "id:%06d,src:%s" % (index, target)
+        dst_fp = os.path.join(self.my_generations, dst_fn)
+        shutil.copy2(self.cur_input, dst_fp)
+        is_closer = self.minimizer.has_closer_distance(res.distance, fn)
+        if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
+            self.logger.info("Sync back: %s" % fn)
+            dst_fp = os.path.join(self.my_queue, dst_fn)
+            shutil.copy2(self.cur_input, dst_fp)
 
 # TODO: implement this
 class RecordExecutor(Mazerunner):

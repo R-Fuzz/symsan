@@ -1,9 +1,7 @@
 import atexit
 
 from agent import *
-from defs import TaintFlag
 from learner import BasicQLearner
-from model import RLModel
 
 class ExploreAgent(Agent):
 
@@ -13,26 +11,17 @@ class ExploreAgent(Agent):
         assert config.mazerunner_dir is not None
         self.model = RLModel(config)
         self.model.load()
-        self.learner = BasicQLearner(self.model.Q_table, config.discount_factor, config.learning_rate)
         atexit.register(self.model.save)
+        self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
 
     def handle_new_state(self, msg, action):
-        tmp = self.last_state 
-        self.last_state = self.curr_state
-        self.curr_state = tmp if tmp else ProgramState(distance=self.max_distance)
-        has_dist = True if msg.flags & TaintFlag.F_HAS_DISTANCE else False
-        if has_dist:
-            d = msg.avg_dist
-        else:
-            d = self.max_distance
-        if d < self.min_distance:
-            self.min_distance = d
-        self.curr_state.update(msg.addr, msg.context, action, d)
-        curr_sa = self.curr_state.state + (self.curr_state.action, )
-        self.model.visited_sa.add(curr_sa)
-        self._learn(has_dist)
+        last_state = self.curr_state
+        self.update_curr_state(msg, action)
+        self.learn(last_state)
 
     def is_interesting_branch(self):
-        reversed_action = 1 if self.curr_state.action == 0 else 0
-        reversed_sa = self.curr_state.state + (reversed_action, )
+        reversed_sa = self.curr_state.compute_reversed_sa()
+        # TODO: check if target SA can be reached (testcase, target) + target_sa set
+        if reversed_sa in self.model.unreachable_sa:
+            return False
         return reversed_sa not in self.model.visited_sa

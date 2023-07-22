@@ -5,6 +5,8 @@ import subprocess
 import utils
 
 from config import Config
+from defs import TaintFlag
+from model import RLModel
 from utils import mkdir
 
 class ProgramState:
@@ -20,6 +22,10 @@ class ProgramState:
 
     def serialize(self):
         return (self.state, self.action, self.d)
+    
+    def compute_reversed_sa(self):
+        reversed_action = 1 if self.action == 0 else 0
+        return self.state + (reversed_action, )
 
 class Agent:
     def __init__(self, config: Config):
@@ -36,41 +42,73 @@ class Agent:
         return os.path.join(self.my_dir, "traces")
 
     def reset(self):
-        self.last_state = None
         self.curr_state = ProgramState(distance=self.max_distance)
         self.episode.clear()
         self.min_distance = self.max_distance
 
-    def _make_dirs(self):
-        utils.mkdir(self.my_traces)
-
+    # for fgtest
     def handle_new_state(self, msg, action):
         pass
 
+    # for fgtest
     def is_interesting_branch(self):
         return True
+
+    def mark_sa_unreachable(self, sa):
+        self.model.add_unreachable_sa(sa)
 
     def save_trace(self, log_path):
         with open(log_path, 'wb') as fd:
             pickle.dump(self.episode, fd, protocol=pickle.HIGHEST_PROTOCOL)
 
-    def _compute_reward(self, has_dist):
-        reward = 0
-        if not has_dist or self.curr_state.d > self.max_distance or self.curr_state.d < 0:
-            return reward
-        else:
-            reward = self.last_state.d - self.curr_state.d
-        return reward
+    def replay_trace(self, trace):
+        last_SA = None
+        last_reward = 0
+        last_d = self.max_distance
+        for (next_s, a, d) in trace:
+            next_sa = next_s + (a,)
+            reward = self._compute_reward(d, last_d)
+            if last_SA:
+                self.learner.learn(last_SA, next_s, last_reward)
+            last_d = d
+            last_SA = next_sa
+            last_reward = reward
 
-    def _learn(self, has_dist):
-        if self.last_state:
-            last_sa = self.last_state.state + (self.last_state.action, )
-            reward = self._compute_reward(has_dist)
+    def learn(self, last_state):
+        if last_state:
+            last_sa = last_state.state + (last_state.action, )
+            reward = self._compute_reward(self.curr_state.d, last_state.d)
             self.learner.learn(last_sa, self.curr_state.state, reward)
             self.logger.debug(f"last_SA: {last_sa}, "
-                              f"distance: {self.curr_state.d if has_dist else 'NA'}, "
+                              f"distance: {self.curr_state.d if self.curr_state.d else 'NA'}, "
                               f"reward: {reward}, "
-                              f"Q: {self.learner.Q_lookup(last_sa)}")
+                              f"Q: {self.model.Q_lookup(last_sa)}")
+    
+    def update_curr_state(self, msg, action):
+        self.curr_state = ProgramState(distance=self.max_distance)
+        has_dist = True if msg.flags & TaintFlag.F_HAS_DISTANCE else False
+        if has_dist:
+            d = msg.avg_dist
+        else:
+            d = None
+        if d and d < self.min_distance:
+            self.min_distance = d
+        self.curr_state.update(msg.addr, msg.context, action, d)
+        curr_sa = self.curr_state.state + (self.curr_state.action, )
+        self.model.visited_sa.add(curr_sa)
+
+    def _make_dirs(self):
+        utils.mkdir(self.my_traces)
+
+    def _compute_reward(self, d, last_d):
+        reward = 0
+        if d and last_d:
+            assert (d <= self.max_distance and
+                    d >= 0 and
+                    last_d <= self.max_distance and
+                    last_d >= 0)
+            reward = last_d - d
+        return reward
 
     def _import_loop_info(self):
         path = os.path.join(self.my_dir, "loops")

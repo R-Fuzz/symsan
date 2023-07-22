@@ -23,8 +23,6 @@ class Config:
                  'optimistic_solving_enabled', 
                  'discount_factor', 
                  'learning_rate',
-                 'onetime_solving_enabled',
-                 'record_replay_mode_enabled', 
                  "output_dir",
                  "afl_dir",
                  "mazerunner_dir",
@@ -79,8 +77,6 @@ class Config:
         self.learning_rate = LEARNING_RATE
         self.sync_frequency = SEED_SYNC_FREQUENCY
         # The following should obly be set by the mazerunner launcher
-        self.onetime_solving_enabled = False
-        self.record_replay_mode_enabled = False
         self.output_dir = None
         self.afl_dir = None
         self.mazerunner_dir = None

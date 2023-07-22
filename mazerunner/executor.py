@@ -9,6 +9,9 @@ import time
 from backend_solver import Z3Solver
 from defs import *
 import utils
+from exploit_agent import ExploitAgent
+from replay_agent import ReplayAgent
+from record_agent import RecordAgent
 
 # TODO: automatically infer this
 UNION_TABLE_SIZE = 0xc00000000
@@ -36,6 +39,11 @@ class SymSanExecutor:
             self.proc_start_time = 0
             self.proc_end_time = 0
             self.solving_time = 0
+        
+        def reset(self):
+            self.proc_start_time = 0
+            self.proc_end_time = 0
+            self.solving_time = 0
 
     def __init__(self, config, agent, output_dir):
         self.config = config
@@ -49,8 +57,9 @@ class SymSanExecutor:
         self.solver = None
         # options
         self.testcase_dir = output_dir
-        self.record_replay_mode_enabled = config.record_replay_mode_enabled
-        self.onetime_solving_enabled = config.onetime_solving_enabled
+        self.record_replay_mode_enabled = True if (type(agent) is ReplayAgent or type(agent) is RecordAgent) else False
+        self.onetime_solving_enabled = True if (type(agent) is ExploitAgent) else False
+        assert not (self.record_replay_mode_enabled and self.onetime_solving_enabled)
         self.gep_solver_enabled = config.gep_solver_enabled
 
     def tear_down(self):
@@ -88,6 +97,7 @@ class SymSanExecutor:
         self.solver = Z3Solver(self.config, self.shm, self.input_file, 
                                self.testcase_dir, 0, session_id)
         self.agent.reset()
+        self.timer.reset()
 
     def process_request(self):
         self.timer.solving_time = 0
