@@ -1,4 +1,3 @@
-from enum import Enum
 import ctypes
 
 class OperationUnsupportedError(SystemExit):
@@ -9,21 +8,6 @@ class TaintFlag:
     F_LOOP_EXIT = 0b0010
     F_LOOP_LATCH = 0b0100
     F_HAS_DISTANCE = 0b1000
-
-class SolverFlag:
-    # If set, solve and trace this constraint. If unset, just trace.
-    SHOULD_SOLVE = 0b0001
-    # If set, skip and forget this constraint.
-    SHOULD_SKIP = 0b0010
-    # If set, solve any interesting constraint then abort.
-    SHOULD_ABORT = 0b0100
-
-class MsgType(Enum):
-    cond_type = 0
-    gep_type = 1
-    memcmp_type = 2
-    fsize_type = 3
-    loop_type = 4
 
 class pipe_msg(ctypes.Structure):
     _pack_ = 1
@@ -74,105 +58,3 @@ class dfsan_label_info(ctypes.Structure):
                 ("op", ctypes.c_uint16),
                 ("size", ctypes.c_uint16),
                 ("hash", ctypes.c_uint32)]
-
-class Predicate(Enum):
-    bveq = 32
-    bvneq = 33
-    bvugt = 34
-    bvuge = 35
-    bvult = 36
-    bvule = 37
-    bvsgt = 38
-    bvsge = 39
-    bvslt = 40
-    bvsle = 41
-
-last_llvm_op = 67
-class LLVM_INS(Enum):
-    Input = 0
-    Not = 1
-    Neg = 2
-    # Terminator Instructions - These instructions are used to terminate a basic
-    # block of the program.   Every basic block must end with one of these
-    # instructions for it to be a well formed basic block.
-    # Ret = 1
-    # Br = 2
-    # Switch = 3
-    # IndirectBr = 4
-    # Invoke = 5
-    # Resume = 6
-    # Unreachable = 7
-    # CleanupRet = 8
-    # CatchRet = 9
-    # CatchSwitch = 10
-    # CallBr = 11
-    # # Standard unary operators...
-    # FNeg = 12
-    # Standard binary operators...
-    Add = 13
-    FAdd = 14
-    Sub = 15
-    FSub = 16
-    Mul = 17
-    FMul = 18
-    UDiv = 19
-    SDiv = 20
-    FDiv = 21
-    URem = 22
-    SRem = 23
-    FRem = 24
-    # Logical operators (integer operands)
-    Shl = 25
-    LShr = 26
-    AShr = 27
-    And = 28
-    Or = 29
-    Xor = 30
-    # Memory operators...
-    Alloca = 31
-    Load = 32
-    Store = 33
-    GetElementPtr = 34
-    Fence = 35
-    AtomicCmpXchg = 36
-    AtomicRMW = 37
-    # Cast operators ...
-    Trunc = 38
-    ZExt = 39
-    SExt = 40
-    FPToUI = 41
-    FPToSI = 42
-    UIToFP = 43
-    SIToFP = 44
-    FPTrunc = 45
-    FPExt = 46
-    PtrToInt = 47
-    IntToPtr = 48
-    BitCast = 49
-    AddrSpaceCast = 50
-    CleanupPad = 51
-    CatchPad = 52
-    # Other operators...
-    ICmp = 53
-    FCmp = 54
-    PHI = 55
-    Call = 56
-    Select = 57
-    UserOp1 = 58
-    UserOp2 = 59
-    VAArg = 60
-    ExtractElement = 61
-    InsertElement = 62
-    ShuffleVector = 63
-    ExtractValue = 64
-    InsertValue = 65
-    LandingPad = 66
-    Freeze = 67
-    # self-defined
-    Free      = last_llvm_op + 3
-    Extract   = last_llvm_op + 4
-    Concat    = last_llvm_op + 5
-    Arg       = last_llvm_op + 6
-    # higher-order
-    fmemcmp   = last_llvm_op + 7
-    fsize     = last_llvm_op + 8

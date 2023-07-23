@@ -1,13 +1,16 @@
+import atexit
 import logging
 import os
 import pickle
 import subprocess
 import utils
+import random
 
 from config import Config
 from defs import TaintFlag
 from model import RLModel
 from utils import mkdir
+from learner import BasicQLearner
 
 class ProgramState:
     def __init__(self, distance, pc=0, callstack=0, action=0, loop_counter=0):
@@ -121,3 +124,114 @@ class Agent:
                 raise RuntimeError("failed to run %s" % loop_finder)
         with open(path, 'rb') as fp:
             self._loop_info = pickle.load(fp)
+
+class RecordAgent(Agent):
+
+    def handle_new_state(self, msg, action):
+        d = msg.avg_dist
+        self.curr_state.update(msg.addr, msg.context, action, d)
+        self.episode.append(self.curr_state.serialize())
+
+    def is_interesting_branch(self):
+        return False
+
+class ReplayAgent(Agent):
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        # TODO: remove assertion after testing
+        assert config.mazerunner_dir is not None
+        self.model = RLModel(config)
+        self.model.load()
+        atexit.register(self.model.save)
+        self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
+
+    def replay_log(self, log_dir):
+        seed_traces = os.listdir(log_dir)
+        for t in seed_traces:
+            print(f'processing {t}', end='\r')
+            f = os.path.join(log_dir, t)
+            with open(f, 'rb') as fd:
+                trace = list(pickle.load(fd))
+                self.replay_trace(trace)
+
+class ExploreAgent(Agent):
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        # TODO: remove assertion after testing
+        assert config.mazerunner_dir is not None
+        self.model = RLModel(config)
+        self.model.load()
+        atexit.register(self.model.save)
+        self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
+
+    def handle_new_state(self, msg, action):
+        last_state = self.curr_state
+        self.update_curr_state(msg, action)
+        self.learn(last_state)
+
+    def is_interesting_branch(self):
+        reversed_sa = self.curr_state.compute_reversed_sa()
+        # TODO: check if target SA can be reached (testcase, target) + target_sa set
+        if reversed_sa in self.model.unreachable_sa:
+            return False
+        return reversed_sa not in self.model.visited_sa
+
+class ExploitAgent(Agent):
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        # TODO: remove assertion after testing
+        assert config.mazerunner_dir is not None
+        self.model = RLModel(config)
+        self.model.load()
+        atexit.register(self.model.save)
+        self.target_sa = None
+        self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
+        self.epsilon = config.explore_rate
+
+    def handle_new_state(self, msg, action):
+        self.update_curr_state(msg, action)
+        self.episode.append(self.curr_state.serialize())
+        curr_sa = self.curr_state.state + (self.curr_state.action, )
+        if curr_sa == self.target_sa:
+            self.target_sa = None
+        if not self.target_sa:
+            self.logger.debug(self.curr_state.serialize())
+
+    def is_interesting_branch(self):
+        if self.target_sa:
+            return False
+        reversed_sa = self.curr_state.compute_reversed_sa()
+        if reversed_sa in self.model.unreachable_sa:
+            self.logger.debug(f"not interested, unreachable sa {reversed_sa}")
+            return False
+        curr_sa = self.curr_state.state + (self.curr_state.action, )
+        if (reversed_sa not in self.model.visited_sa
+            and curr_sa not in self.model.visited_sa):
+            self.logger.debug(f"not interested, unvisited state")
+            return False
+        return self.__epsilon_greedy_policy(reversed_sa)
+
+    # Return whether the agent should visit the filpped branch.
+    def __epsilon_greedy_policy(self, reversed_sa):
+        if (reversed_sa not in self.model.visited_sa
+            and random.random() < self.epsilon):
+            return True
+        if self.__greedy_policy() == self.curr_state.action:
+            self.logger.debug(f"not interested, greedy policy")
+            return False
+        else:
+            return True
+
+    # Returns the greedy action according to the Q value.
+    def __greedy_policy(self):
+        curr_state_taken = self.model.Q_lookup(self.curr_state.state +(1,))
+        curr_state_not_taken = self.model.Q_lookup(self.curr_state.state +(0,))
+        if curr_state_taken > curr_state_not_taken:
+            return 1
+        elif curr_state_taken < curr_state_not_taken:
+            return 0
+        else:
+            return self.curr_state.action

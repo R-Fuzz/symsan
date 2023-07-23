@@ -11,8 +11,7 @@ import subprocess
 import time
 
 from backend_solver import Z3Solver
-from explore_agent import ExploreAgent
-from exploit_agent import ExploitAgent
+from agent import ExploreAgent, ExploitAgent
 from executor import SymSanExecutor
 from defs import OperationUnsupportedError
 import minimizer

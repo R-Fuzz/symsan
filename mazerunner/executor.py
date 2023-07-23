@@ -1,3 +1,4 @@
+from enum import Enum
 import os
 import sys
 from multiprocessing import shared_memory
@@ -6,15 +7,20 @@ import ctypes
 import logging
 import time
 
-from backend_solver import Z3Solver
+from backend_solver import Z3Solver, SolverFlag
 from defs import *
 import utils
-from exploit_agent import ExploitAgent
-from replay_agent import ReplayAgent
-from record_agent import RecordAgent
+from agent import ExploitAgent, ReplayAgent, RecordAgent
 
 # TODO: automatically infer this
 UNION_TABLE_SIZE = 0xc00000000
+
+class MsgType(Enum):
+    cond_type = 0
+    gep_type = 1
+    memcmp_type = 2
+    fsize_type = 3
+    loop_type = 4
 
 class ExecutorResult:
     def __init__(self, total_time, solving_time, dist, returncode, out, err, testcases):
