@@ -53,7 +53,6 @@ class MazerunnerState:
         self.processed = set()
         self.timeout = timeout
         self.crashes = set()
-        self.testscases_md5 = set()
         self.index = 0
         self.num_error_reports = 0
         self.num_crash_reports = 0
@@ -403,9 +402,6 @@ class ExploreExecutor(Mazerunner):
         for t in res.generated_testcases:
             testcase = os.path.join(self.my_generations, t)
             num_testcase += 1
-            if not self.minimizer.is_new_file(testcase):
-                os.unlink(testcase)
-                continue
             self.state.explore_queue.append(t)
         fn = os.path.basename(fp)
         is_closer = self.minimizer.has_closer_distance(res.distance, fn)
