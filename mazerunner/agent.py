@@ -105,10 +105,8 @@ class Agent:
     def _compute_reward(self, d, last_d):
         reward = 0
         if d and last_d:
-            assert (d <= self.max_distance and
-                    d >= 0 and
-                    last_d <= self.max_distance and
-                    last_d >= 0)
+            assert (d <= self.max_distance and d >= 0 and
+                    last_d <= self.max_distance and last_d >= 0)
             reward = last_d - d
         return reward
 

@@ -24,6 +24,8 @@ class RLModel:
             pickle.dump(self.Q_table, fp, protocol=pickle.HIGHEST_PROTOCOL)  
         with open(os.path.join(self.my_dir, "unreachable_branches"), 'wb') as fp:
             pickle.dump(self.unreachable_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(os.path.join(self.my_dir, "target_sa"), 'wb') as fp:
+            pickle.dump(self.target_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
     
     def load(self):
         visited_sa_path = os.path.join(self.my_dir, "visited_sa")
@@ -38,6 +40,10 @@ class RLModel:
         if os.path.isfile(unreachable_branches_path):
             with open(unreachable_branches_path, 'rb') as fp:
                 self.unreachable_sa = pickle.load(fp)
+        target_sa_path = os.path.join(self.my_dir, "target_sa")
+        if os.path.isfile(target_sa_path):
+            with open(target_sa_path, 'rb') as fp:
+                self.target_sa = pickle.load(fp)
 
     def Q_lookup(self, key):
         return self.Q_table.get(key, 0.)

@@ -10,21 +10,12 @@ import shutil
 import subprocess
 import time
 
-from backend_solver import Z3Solver
 from agent import ExploreAgent, ExploitAgent, RecordAgent, ReplayAgent
-from executor import SymSanExecutor
+from backend_solver import Z3Solver
 from defs import OperationUnsupportedError
+from executor import SymSanExecutor
 import minimizer
 import utils
-
-DEFAULT_TIMEOUT = 60
-MAX_TIMEOUT = 10 * 60 # 10 minutes
-
-MAX_ERROR_REPORTS = 30
-MAX_CRASH_REPORTS = 30
-MAX_FLIP_NUM = 512
-# minimum number of hang files to increase timeout
-MIN_HANG_FILES = 30
 
 def get_score(testcase):
     # New coverage is the best
@@ -56,14 +47,13 @@ def get_afl_cmd(fuzzer_stats):
 get_id_from_fn = lambda s: re.compile(r'id[^,]*').findall(s)
 
 class MazerunnerState:
-    def __init__(self):
+    def __init__(self, timeout):
         self.synced = set()
         self.hang = set()
         self.processed = set()
-        self.timeout = DEFAULT_TIMEOUT
+        self.timeout = timeout
         self.crashes = set()
         self.testscases_md5 = set()
-        self.seedQ = collections.deque()
         self.index = 0
         self.num_error_reports = 0
         self.num_crash_reports = 0
@@ -79,9 +69,9 @@ class MazerunnerState:
         self.processed = self.processed - self.hang
         self.hang = set()
 
-    def increase_timeout(self, logger):
+    def increase_timeout(self, logger, max_timeout):
         old_timeout = self.timeout
-        if self.timeout < MAX_TIMEOUT:
+        if self.timeout < max_timeout:
             self.timeout *= 2
             logger.debug("Increase timeout %d -> %d"
                          % (old_timeout, self.timeout))
@@ -89,7 +79,7 @@ class MazerunnerState:
             # Something bad happened, but wait until AFL resolves it
             logger.debug("Hit the maximum timeout")
             # Back to default timeout not to slow down fuzzing
-            self.timeout = DEFAULT_TIMEOUT
+            self.timeout = self.timeout
         # sleep for a minutes to wait until AFL resolves it
         time.sleep(60)
         # clear state for retesting seeds that needs more time
@@ -106,6 +96,12 @@ class MazerunnerState:
 class Mazerunner:
     def __init__(self, config):
         self.config = config
+        self.timeout = config.timeout
+        self.max_timeout = config.max_timeout
+        self.max_error_reports = config.max_error_reports
+        self.max_crash_reports = config.max_error_reports
+        self.max_flip_num = config.max_flip_num
+        self.min_hang_files = config.min_hang_files
         self.cmd = config.cmd
         self.output = config.output_dir
         self.name = config.mazerunner_dir
@@ -237,8 +233,8 @@ class Mazerunner:
             self.report_error(fp, log)
 
     def handle_empty_files(self):
-        if len(self.state.hang) > MIN_HANG_FILES:
-            self.state.increase_timeout(self.logger)
+        if len(self.state.hang) > self.min_hang_files:
+            self.state.increase_timeout(self.logger, self.max_timeout)
         else:
             # TODO: implement RL thinking: replay from the past
             self.logger.info("Sleep for getting files from AFL seed queue")
@@ -288,7 +284,7 @@ class Mazerunner:
             with open(self.metadata, "rb") as f:
                 self.state = pickle.load(f)
         else:
-            self.state = MazerunnerState()
+            self.state = MazerunnerState(self.timeout)
 
     def _send_mail(self, subject, info, attach=None):
         if attach is None:
@@ -318,7 +314,7 @@ class Mazerunner:
         if self.mail is None:
             return
         # don't do too much
-        if self.state.num_error_reports >= MAX_ERROR_REPORTS:
+        if self.state.num_error_reports >= self.max_error_reports:
             return
         self.state.num_error_reports += 1
         self._send_mail("Error found", {"LOG": log}, [fp])
@@ -329,7 +325,7 @@ class Mazerunner:
         if self.mail is None:
             return
         # don't do too much
-        if self.state.num_crash_reports >= MAX_CRASH_REPORTS:
+        if self.state.num_crash_reports >= self.max_error_reports:
             return
         self.state.num_crash_reports += 1
         info = {}
@@ -382,22 +378,23 @@ class ExploreExecutor(Mazerunner):
         super().__init__(config)
         self.agent = ExploreAgent(self.config)
         self.sync_frequency = self.config.sync_frequency
+        self.state.explore_queue = collections.deque()
 
     def run(self):
-        if not self.state.seedQ:
+        if not self.state.explore_queue:
             files = self.sync_from_afl()
             if not files:
                 files = self.sync_from_initial_seeds()
-            self.state.seedQ.extend(files)
+            self.state.explore_queue.extend(files)
         while True:
-            if (not self.state.seedQ
+            if (not self.state.explore_queue
                 or len(self.state.processed) % self.sync_frequency == 0):
                 files = self.sync_from_afl(False)
-                self.state.seedQ.extendleft(files)
-            if not self.state.seedQ:
+                self.state.explore_queue.extendleft(files)
+            if not self.state.explore_queue:
                 self.handle_empty_files()
                 continue
-            next_seed = self.state.seedQ.popleft()
+            next_seed = self.state.explore_queue.popleft()
             if not next_seed in self.state.processed:
                 self.run_file(next_seed)
 
@@ -409,7 +406,7 @@ class ExploreExecutor(Mazerunner):
             if not self.minimizer.is_new_file(testcase):
                 os.unlink(testcase)
                 continue
-            self.state.seedQ.append(t)
+            self.state.explore_queue.append(t)
         fn = os.path.basename(fp)
         is_closer = self.minimizer.has_closer_distance(res.distance, fn)
         if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
@@ -438,7 +435,7 @@ class ExploitExecutor(Mazerunner):
         total_time = emulation_time = solving_time = 0
         symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
         flip_num = 0
-        while True:
+        while flip_num < self.max_flip_num:
             try:
                 symsan.setup(self.cur_input, len(self.state.processed))
                 symsan.run()
@@ -462,7 +459,7 @@ class ExploitExecutor(Mazerunner):
                 solving_time += symsan_res.solving_time
         assert not symsan_res.generated_testcases
         self.agent.replay_trace(self.agent.episode)
-        if self.agent.target_sa:
+        if self.agent.target_sa and flip_num < self.max_flip_num:
             self.agent.mark_sa_unreachable(self.agent.target_sa)
             self.agent.target_sa = None
         self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, flipped=%d times"
