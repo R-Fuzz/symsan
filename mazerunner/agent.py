@@ -97,8 +97,6 @@ class Agent:
         if d and d < self.min_distance:
             self.min_distance = d
         self.curr_state.update(msg.addr, msg.context, action, d)
-        curr_sa = self.curr_state.state + (self.curr_state.action, )
-        self.model.visited_sa.add(curr_sa)
 
     def _make_dirs(self):
         utils.mkdir(self.my_traces)
@@ -169,14 +167,21 @@ class ExploreAgent(Agent):
     def handle_new_state(self, msg, action):
         last_state = self.curr_state
         self.update_curr_state(msg, action)
+        curr_sa = self.curr_state.state + (self.curr_state.action, )
+        self.model.add_visited_sa(curr_sa)
+        self.model.remove_target_sa(curr_sa)
         self.learn(last_state)
 
     def is_interesting_branch(self):
         reversed_sa = self.curr_state.compute_reversed_sa()
-        # TODO: check if target SA can be reached (testcase, target) + target_sa set
         if reversed_sa in self.model.unreachable_sa:
             return False
-        return reversed_sa not in self.model.visited_sa
+        if reversed_sa in self.model.target_sa:
+            return False
+        interested = reversed_sa not in self.model.visited_sa
+        if interested:
+            self.model.add_target_sa(reversed_sa)
+        return interested
 
 class ExploitAgent(Agent):
 
@@ -195,6 +200,7 @@ class ExploitAgent(Agent):
         self.update_curr_state(msg, action)
         self.episode.append(self.curr_state.serialize())
         curr_sa = self.curr_state.state + (self.curr_state.action, )
+        self.model.add_visited_sa(curr_sa)
         if curr_sa == self.target_sa:
             self.target_sa = None
         if not self.target_sa:

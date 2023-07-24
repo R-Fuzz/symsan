@@ -9,6 +9,7 @@ class RLModel:
             self.output = config.mazerunner_dir
             mkdir(self.my_dir)
         self.visited_sa = set()
+        self.target_sa = set()
         self.unreachable_sa = set()
         self.Q_table = {}
 
@@ -47,3 +48,13 @@ class RLModel:
 
     def add_unreachable_sa(self, sa):
         self.unreachable_sa.add(sa)
+
+    def add_visited_sa(self, sa):
+        self.visited_sa.add(sa)
+    
+    def add_target_sa(self, sa):
+        self.target_sa.add(sa)
+    
+    def remove_target_sa(self, sa):
+        if sa in self.target_sa:
+            self.target_sa.remove(sa)
