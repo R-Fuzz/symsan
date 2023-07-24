@@ -11,7 +11,7 @@ import subprocess
 import time
 
 from backend_solver import Z3Solver
-from agent import ExploreAgent, ExploitAgent
+from agent import ExploreAgent, ExploitAgent, RecordAgent, ReplayAgent
 from executor import SymSanExecutor
 from defs import OperationUnsupportedError
 import minimizer
@@ -199,6 +199,9 @@ class Mazerunner:
                         symsan_res.solving_time,
                         symsan_res.returncode))
         return symsan_res
+
+    def sync_back_if_interesting(self, fp, res):
+        pass
 
     def sync_from_afl(self, reversed_order=True):
         files = []
@@ -457,6 +460,7 @@ class ExploitExecutor(Mazerunner):
                 total_time += symsan_res.total_time
                 emulation_time += symsan_res.emulation_time
                 solving_time += symsan_res.solving_time
+        assert not symsan_res.generated_testcases
         self.agent.replay_trace(self.agent.episode)
         if self.agent.target_sa:
             self.agent.mark_sa_unreachable(self.agent.target_sa)
@@ -466,7 +470,6 @@ class ExploitExecutor(Mazerunner):
         return symsan_res
 
     def sync_back_if_interesting(self, fp, res):
-        assert not res.generated_testcases
         fn = os.path.basename(fp)
         index = self.state.tick()
         names = get_id_from_fn(fn)
@@ -480,21 +483,38 @@ class ExploitExecutor(Mazerunner):
             dst_fp = os.path.join(self.my_queue, dst_fn)
             shutil.copy2(self.cur_input, dst_fp)
 
-# TODO: implement this
 class RecordExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
+        self.agent = RecordAgent(config)
 
     def run(self):
-        raise OperationUnsupportedError("RecordExecutor not implemented")
+        while True:
+            files = self.sync_from_afl()
+            if not files:
+                files = self.sync_from_initial_seeds()
+            if not files:
+                self.handle_empty_files()
+                continue
+            for fp in files:
+                self.run_file(fp)
+                self.agent.save_trace(os.path.basename(fp))
+                break
 
-# TODO: implement this
 class ReplayExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
+        self.agent = ReplayAgent(config)
 
     def run(self):
-        raise OperationUnsupportedError("ReplayExecutor not implemented")
+        files = os.listdir(self.agent.my_traces)
+        round_num = 0
+        while True:
+            round_num += 1
+            self.logger.info(f"{round_num}th rounds of offline learning")
+            for fn in files:
+                fp = os.path.join(self.agent.my_traces, fn)
+                self.agent.replay_log(fp)
 
 # TODO: implement this
 class HybridExecutor(Mazerunner):

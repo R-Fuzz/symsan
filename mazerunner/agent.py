@@ -60,7 +60,8 @@ class Agent:
     def mark_sa_unreachable(self, sa):
         self.model.add_unreachable_sa(sa)
 
-    def save_trace(self, log_path):
+    def save_trace(self, fn):
+        log_path = os.path.join(self.my_traces, fn)
         with open(log_path, 'wb') as fd:
             pickle.dump(self.episode, fd, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -144,14 +145,10 @@ class ReplayAgent(Agent):
         atexit.register(self.model.save)
         self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
 
-    def replay_log(self, log_dir):
-        seed_traces = os.listdir(log_dir)
-        for t in seed_traces:
-            print(f'processing {t}', end='\r')
-            f = os.path.join(log_dir, t)
-            with open(f, 'rb') as fd:
-                trace = list(pickle.load(fd))
-                self.replay_trace(trace)
+    def replay_log(self, log_path):
+        with open(log_path, 'rb') as fd:
+            trace = list(pickle.load(fd))
+            self.replay_trace(trace)
 
 class ExploreAgent(Agent):
 
