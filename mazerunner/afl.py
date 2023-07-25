@@ -11,11 +11,18 @@ import subprocess
 import time
 
 from agent import ExploreAgent, ExploitAgent, RecordAgent, ReplayAgent
-from backend_solver import Z3Solver
-from defs import OperationUnsupportedError
+from backend_solver import AbortConcolicExecution
 from executor import SymSanExecutor
+from model import RLModel
 import minimizer
 import utils
+
+CONVERGING_THRESHOLD = 10
+WAITING_INTERVAL = 5
+# 'id:xxxx,src:yyyyy' -> 'id:xxxx'
+# 'id-xxx-xxxxxx-xx,src:yy-yyyyyy-yy' -> 'id-xxx-xxxxxx-xx'
+# 'idxxxxxxxx' -> 'idxxxxxxxx'
+get_id_from_fn = lambda s: re.compile(r'id[^,]*').findall(s)
 
 def get_score(testcase):
     # New coverage is the best
@@ -41,28 +48,52 @@ def get_afl_cmd(fuzzer_stats):
                 # format is "command_line: [cmd]"
                 return l.lstrip('command_line:').strip().split()
 
-# 'id:xxxx,src:yyyyy' -> 'id:xxxx'
-# 'id-xxx-xxxxxx-xx,src:yy-yyyyyy-yy' -> 'id-xxx-xxxxxx-xx'
-# 'idxxxxxxxx' -> 'idxxxxxxxx'
-get_id_from_fn = lambda s: re.compile(r'id[^,]*').findall(s)
-
 class MazerunnerState:
     def __init__(self, timeout):
+        self.timeout = timeout
+        self.start_ts = time.time()
+        self.end_ts = None
+        self.concolic_execution_time = 0
+        self.seed_queue = collections.deque()
         self.synced = set()
         self.hang = set()
         self.processed = set()
-        self.timeout = timeout
         self.crashes = set()
         self.index = 0
         self.num_error_reports = 0
         self.num_crash_reports = 0
-        self.best_seed = ("", float("inf"))
+        self.best_seed_info = ["", float("inf"), False] # filename, distance, is_new
 
     def __setstate__(self, dict):
         self.__dict__ = dict
 
     def __getstate__(self):
         return self.__dict__
+
+    @property
+    def processed_num(self):
+        return len(self.processed)
+
+    @property
+    def best_seed(self):
+        return self.best_seed_info[0]
+
+    @property
+    def min_distance(self):
+        return self.best_seed_info[1]
+
+    @property
+    def discovered_closer_seed(self):
+        return self.best_seed_info[2]
+    
+    def update_best_seed(self, filename, distance):
+        self.best_seed_info[0] = filename
+        self.best_seed_info[1] = distance
+        self.best_seed_info[2] = True
+
+    @discovered_closer_seed.setter
+    def discovered_closer_seed(self, value):
+        self.best_seed_info[2] = value
 
     def clear(self):
         self.processed = self.processed - self.hang
@@ -89,12 +120,11 @@ class MazerunnerState:
         self.index += 1
         return old_index
 
-    def get_num_processed(self):
-        return len(self.processed)
-
 class Mazerunner:
     def __init__(self, config):
         self.config = config
+        # check_resource_limit returns a flag that controlled by another monitor thread
+        self.check_resource_limit = lambda: False
         self.timeout = config.timeout
         self.max_timeout = config.max_timeout
         self.max_error_reports = config.max_error_reports
@@ -121,6 +151,10 @@ class Mazerunner:
         else:
             self.minimizer = minimizer.TestcaseMinimizer(
                 None, None, self.output, None, self.state)
+
+    @property
+    def reached_resource_limit(self):
+        return self.check_resource_limit()
 
     @property
     def cur_input(self):
@@ -156,7 +190,7 @@ class Mazerunner:
 
     @property
     def metadata(self):
-        return os.path.join(self.my_dir, "metadata")
+        return os.path.join(self.my_dir, f"{self.__class__.__qualname__}.metadata")
 
     @property
     def bitmap(self):
@@ -166,8 +200,11 @@ class Mazerunner:
     def dictionary(self):
         return os.path.join(self.my_dir, "dictionary")
 
-    def cleanup(self):
-        self._export_state()
+    def run(self, run_once=False):
+        while not self.reached_resource_limit:
+            self._run()
+            if run_once:
+                break
 
     def run_file(self, fn):
         # copy the test case
@@ -175,13 +212,14 @@ class Mazerunner:
         shutil.copy2(fp, self.cur_input)
         self.logger.info("Run: input=%s" % fp)
         symsan_res = self.run_target()
+        self.state.concolic_execution_time += symsan_res.total_time
         self.handle_return_status(symsan_res.returncode, symsan_res.stderr, fp)
         self.sync_back_if_interesting(fp, symsan_res)
         self.state.processed.add(fn)
 
     def run_target(self):
         symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
-        symsan.setup(self.cur_input, len(self.state.processed))
+        symsan.setup(self.cur_input, self.state.processed_num)
         symsan.run()
         try:
             symsan.process_request()
@@ -194,9 +232,6 @@ class Mazerunner:
                         symsan_res.solving_time,
                         symsan_res.returncode))
         return symsan_res
-
-    def sync_back_if_interesting(self, fp, res):
-        pass
 
     def sync_from_afl(self, reversed_order=True):
         files = []
@@ -215,10 +250,18 @@ class Mazerunner:
         files = []
         for name in os.listdir(self.initial_seed_dir):
             path = os.path.join(self.initial_seed_dir, name)
-            if os.path.isfile(path):
+            if os.path.isfile(path) and not name in self.state.synced:
                 shutil.copy2(path, os.path.join(self.my_generations, name))
                 files.append(name)
+                self.state.synced.add(name)
         return files
+
+    def init_seed_queue(self):
+        if not self.state.seed_queue:
+            files = self.sync_from_afl()
+            if not files:
+                files = self.sync_from_initial_seeds()
+            self.state.seed_queue.extend(files)
 
     def handle_return_status(self, retcode, log, fp):
         fn = os.path.basename(fp)
@@ -235,9 +278,9 @@ class Mazerunner:
         if len(self.state.hang) > self.min_hang_files:
             self.state.increase_timeout(self.logger, self.max_timeout)
         else:
-            # TODO: implement RL thinking: replay from the past
+            # TODO: offline learning, replay from past experience
             self.logger.info("Sleep for getting files from AFL seed queue")
-            time.sleep(5)
+            time.sleep(WAITING_INTERVAL)
 
     def check_crashes(self):
         for fuzzer in os.listdir(self.output):
@@ -256,6 +299,10 @@ class Mazerunner:
                 if num > self.state.crashes[fuzzer]:
                     self._report_crash(os.path.join(crash_dir, name))
                     self.state.crashes[fuzzer] = num
+
+    def cleanup(self):
+        self._export_state()
+        self.minimizer.cleanup()
 
     def _make_dirs(self):
         utils.mkdir(self.my_queue)
@@ -284,6 +331,11 @@ class Mazerunner:
                 self.state = pickle.load(f)
         else:
             self.state = MazerunnerState(self.timeout)
+
+    def _export_state(self):
+        self.state.end_ts = time.time()
+        with open(self.metadata, "wb") as fp:
+            pickle.dump(self.state, fp, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _send_mail(self, subject, info, attach=None):
         if attach is None:
@@ -333,25 +385,20 @@ class Mazerunner:
         info["STDERR"] = stderr
         self._send_mail("Crash found", info, [fp])
 
-    def _export_state(self):
-        with open(self.metadata, "wb") as fp:
-            pickle.dump(self.state, fp, protocol=pickle.HIGHEST_PROTOCOL)
-
 class QSYMExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
         self.agent = ExploreAgent(self.config)
 
-    def run(self):
-        while True:
-            files = self.sync_from_afl()
-            if not files:
-                self.handle_empty_files()
-                continue
-            for fp in files:
-                self.run_file(fp)
-                self.check_crashes()
-                break
+    def _run(self):
+        files = self.sync_from_afl()
+        if not files:
+            self.handle_empty_files()
+            return
+        for fp in files:
+            self.run_file(fp)
+            self.check_crashes()
+            break
 
     def sync_back_if_interesting(self, fp, res):
         old_idx = self.state.index
@@ -377,74 +424,85 @@ class ExploreExecutor(Mazerunner):
         super().__init__(config)
         self.agent = ExploreAgent(self.config)
         self.sync_frequency = self.config.sync_frequency
-        self.state.explore_queue = collections.deque()
+        # recover the explore seed queue from the previous run or import from AFL
+        self.init_seed_queue()
 
-    def run(self):
-        if not self.state.explore_queue:
-            files = self.sync_from_afl()
-            if not files:
-                files = self.sync_from_initial_seeds()
-            self.state.explore_queue.extend(files)
-        while True:
-            if (not self.state.explore_queue
-                or len(self.state.processed) % self.sync_frequency == 0):
-                files = self.sync_from_afl(False)
-                self.state.explore_queue.extendleft(files)
-            if not self.state.explore_queue:
-                self.handle_empty_files()
-                continue
-            next_seed = self.state.explore_queue.popleft()
-            if not next_seed in self.state.processed:
-                self.run_file(next_seed)
+    def _run(self):
+        if (not self.state.seed_queue
+            or self.state.processed_num % self.sync_frequency == 0):
+            files = self.sync_from_afl(reversed_order=False)
+            self.state.seed_queue.extendleft(files)
+        if not self.state.seed_queue:
+            self.handle_empty_files()
+            return
+        next_seed = self.state.seed_queue.popleft()
+        if not next_seed in self.state.processed:
+            self.run_file(next_seed)
 
     def sync_back_if_interesting(self, fp, res):
-        num_testcase = 0
         for t in res.generated_testcases:
-            testcase = os.path.join(self.my_generations, t)
-            num_testcase += 1
-            self.state.explore_queue.append(t)
+            self.state.seed_queue.append(t)
         fn = os.path.basename(fp)
         is_closer = self.minimizer.has_closer_distance(res.distance, fn)
+        if is_closer:
+            self.logger.info(f"Found closer seed. "
+                         f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
         if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
             self.logger.info("Sync back: %s" % fn)
             # TODO: try to infer the source of fp, check naming pattern of qsym
             filename = os.path.join(self.my_queue, fn)
             shutil.copy2(fp, filename)
-        self.logger.info("Generated %d testcases" % num_testcase)
+        self.logger.info("Generated %d testcases" % len(res.generated_testcases))
 
 class ExploitExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
         self.agent = ExploitAgent(self.config)
+        self.sync_frequency = self.config.sync_frequency
+        self.no_progress_count = 0
+        # recover the explore seed queue from the previous run or import from AFL
+        self.init_seed_queue()
 
-    def run(self):
-        while True:
-            next_seed = self.state.best_seed[0]
-            if not next_seed:
-                files = self.sync_from_afl()
-                if not files:
-                    files = self.sync_from_initial_seeds()
-                next_seed = random.choice(files)
+    @property
+    def has_converged(self):
+        return self.no_progress_count > CONVERGING_THRESHOLD
+
+    def _run(self):
+        # update queue if needed
+        if self.has_converged or self.state.processed_num % self.sync_frequency == 0:
+            files = self.sync_from_afl(reversed_order=False)
+            self.state.seed_queue.extendleft(files)
+        # select next seed
+        if self.state.discovered_closer_seed:
+            next_seed = self.state.best_seed
+            self.state.discovered_closer_seed = False
+            self.no_progress_count = 0
+        else:
+            if self.state.seed_queue:
+                next_seed = self.state.seed_queue.popleft()
+            else:
+                next_seed = self.state.best_seed
+        if not self.has_converged:
             self.run_file(next_seed)
 
     def run_target(self):
         total_time = emulation_time = solving_time = 0
         symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
-        flip_num = 0
-        while flip_num < self.max_flip_num:
+        all_targets = []
+        while len(all_targets) < self.max_flip_num:
             try:
-                symsan.setup(self.cur_input, len(self.state.processed))
+                symsan.setup(self.cur_input, self.state.processed_num)
                 symsan.run()
                 symsan.process_request()
                 break
             # TODO: return a status from process_request() instead of catching exception
-            except Z3Solver.AbortConcolicExecution:
+            except AbortConcolicExecution:
                 self.agent.target_sa = self.agent.curr_state.compute_reversed_sa()
                 assert len(symsan.solver.generated_files) == 1
                 fp = os.path.join(self.my_generations, symsan.solver.generated_files[0])
                 shutil.move(fp, self.cur_input)
                 self.logger.debug(f"Abort and restart. Target SA: {self.agent.target_sa}")
-                flip_num += 1
+                all_targets.append(self.agent.target_sa)
                 continue
             finally:
                 symsan.tear_down()
@@ -454,12 +512,21 @@ class ExploitExecutor(Mazerunner):
                 emulation_time += symsan_res.emulation_time
                 solving_time += symsan_res.solving_time
         assert not symsan_res.generated_testcases
+        symsan_res.update_time(total_time, solving_time)
+        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, flipped=%d times"
+                     % (total_time, emulation_time, solving_time, symsan_res.returncode, len(all_targets)))
+        # start RL training after episode completes
         self.agent.replay_trace(self.agent.episode)
-        if self.agent.target_sa and flip_num < self.max_flip_num:
+        # target_sa might still be reachable due to hitting max_flip_num
+        if self.agent.target_sa and len(all_targets) < self.max_flip_num:
             self.agent.mark_sa_unreachable(self.agent.target_sa)
             self.agent.target_sa = None
-        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, flipped=%d times"
-                     % (total_time, emulation_time, solving_time, symsan_res.returncode, flip_num))
+        # check if it's stuck
+        if len(all_targets) == len(self.agent.last_targets) and all_targets == self.agent.last_targets:
+            self.no_progress_count += 1
+        else:
+            self.no_progress_count = 0
+        self.agent.last_targets = all_targets
         return symsan_res
 
     def sync_back_if_interesting(self, fp, res):
@@ -469,8 +536,11 @@ class ExploitExecutor(Mazerunner):
         target = names[0] if names else fn
         dst_fn = "id:%06d,src:%s" % (index, target)
         dst_fp = os.path.join(self.my_generations, dst_fn)
-        shutil.copy2(self.cur_input, dst_fp)
-        is_closer = self.minimizer.has_closer_distance(res.distance, fn)
+        is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
+        if is_closer:
+            self.logger.info(f"Found closer seed. "
+                         f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
+            shutil.copy2(self.cur_input, dst_fp)
         if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
             self.logger.info("Sync back: %s" % fn)
             dst_fp = os.path.join(self.my_queue, dst_fn)
@@ -481,38 +551,56 @@ class RecordExecutor(Mazerunner):
         super().__init__(config)
         self.agent = RecordAgent(config)
 
-    def run(self):
-        while True:
-            files = self.sync_from_afl()
-            if not files:
-                files = self.sync_from_initial_seeds()
-            if not files:
-                self.handle_empty_files()
-                continue
-            for fp in files:
-                self.run_file(fp)
-                self.agent.save_trace(os.path.basename(fp))
-                break
+    def _run(self):
+        files = self.sync_from_afl()
+        if not files:
+            files = self.sync_from_initial_seeds()
+        if not files:
+            self.handle_empty_files()
+            return
+        for fp in files:
+            self.run_file(fp)
+            self.agent.save_trace(os.path.basename(fp))
+
+    def sync_back_if_interesting(self, fp, res):
+        pass
 
 class ReplayExecutor(Mazerunner):
     def __init__(self, config):
         super().__init__(config)
         self.agent = ReplayAgent(config)
 
-    def run(self):
+    def _run(self):
         files = os.listdir(self.agent.my_traces)
-        round_num = 0
-        while True:
-            round_num += 1
-            self.logger.info(f"{round_num}th rounds of offline learning")
-            for fn in files:
-                fp = os.path.join(self.agent.my_traces, fn)
-                self.agent.replay_log(fp)
+        round_num = self.state.tick()
+        self.logger.info(f"{round_num}th round(s) of offline learning")
+        for fn in files:
+            fp = os.path.join(self.agent.my_traces, fn)
+            self.agent.replay_log(fp)
 
-# TODO: implement this
-class HybridExecutor(Mazerunner):
+    def sync_back_if_interesting(self, fp, res):
+        pass
+
+class HybridExecutor():
     def __init__(self, config):
-        super().__init__(config)
+        config.hybrid_mode_enabled = True
+        self.explore_executor = ExploreExecutor(config)
+        self.exploit_executor = ExploitExecutor(config)
+        # Two agents share the same model
+        self.model = RLModel(config)
+        self.explore_executor.agent.model = self.model
+        self.exploit_executor.agent.model = self.model
+        # Two agents share the same best_seed_info state
+        self.explore_executor.state.best_seed_info = self.exploit_executor.state.best_seed_info
 
     def run(self):
-        raise OperationUnsupportedError("HybridExecutor not implemented")
+        while not self.reached_resource_limit:
+            if self.state.discovered_closer_seed or not self.exploit_executor.has_converged:
+                self.exploit_executor.run(run_once=True)
+                continue
+            self.explore_executor.run(run_once=True)
+
+    def cleanup(self):
+        self.model.save()
+        self.explore_executor.cleanup()
+        self.exploit_executor.cleanup()

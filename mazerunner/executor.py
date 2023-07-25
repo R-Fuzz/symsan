@@ -7,7 +7,7 @@ import ctypes
 import logging
 import time
 
-from backend_solver import Z3Solver, SolverFlag
+from backend_solver import Z3Solver, SolverFlag, ConditionUnsat
 from defs import *
 import utils
 from agent import ExploitAgent, ReplayAgent, RecordAgent
@@ -35,6 +35,10 @@ class ExecutorResult:
     @property
     def emulation_time(self):
         return self.total_time - self.solving_time
+    
+    def update_time(self, total_time, solving_time):
+        self.total_time = total_time
+        self.solving_time = solving_time
 
 class SymSanExecutor:
     class InvalidGEPMessage(Exception):
@@ -176,7 +180,11 @@ class SymSanExecutor:
                 flags |= SolverFlag.SHOULD_SOLVE
                 if self.onetime_solving_enabled:
                     flags |= SolverFlag.SHOULD_ABORT
-            self.solver.handle_cond(msg, flags)
+            try:
+                self.solver.handle_cond(msg, flags)
+            except ConditionUnsat:
+                target_sa = self.agent.curr_state.compute_reversed_sa()
+                self.agent.mark_sa_unreachable(target_sa)
         if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
             self.solver.handle_loop_exit(msg.id, msg.addr)
 

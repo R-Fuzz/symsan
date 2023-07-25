@@ -80,12 +80,9 @@ def main():
     e.reached_resource_limit = lambda: (memory_termination_event.is_set() 
                                             or disk_termination_event.is_set())
 
-    t1 = time.time()
     try:
         e.run()
     finally:
-        t2 = time.time()
-        print(f"Total time: {t2 - t1}s")
         e.cleanup()
         memory_termination_event.set()
         disk_termination_event.set()

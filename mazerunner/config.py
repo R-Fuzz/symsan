@@ -14,14 +14,14 @@ OPTIMISTIC_SOLVING_ENABLED = True
 # Learner configurations
 DISCOUNT_FACTOR = 1
 LEARNING_RATE = 0.5
-EXPLORE_RATE = 0.2
+EXPLORE_RATE = 0.5
 # Executor configurations
 SEED_SYNC_FREQUENCY = 100
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 10 * 60 # 10 minutes
 MAX_ERROR_REPORTS = 30
 MAX_CRASH_REPORTS = 30
-MAX_FLIP_NUM = 512
+MAX_FLIP_NUM = 128
 # minimum number of hang files to increase timeout
 MIN_HANG_FILES = 30
 

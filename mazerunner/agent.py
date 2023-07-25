@@ -32,6 +32,7 @@ class ProgramState:
 
 class Agent:
     def __init__(self, config: Config):
+        self.config = config
         if config.mazerunner_dir:
             self.my_dir = config.mazerunner_dir
             mkdir(self.my_traces)
@@ -122,6 +123,11 @@ class Agent:
         with open(path, 'rb') as fp:
             self._loop_info = pickle.load(fp)
 
+    def _import_model(self):
+        self.model = RLModel(self.config)
+        self.model.load()
+        atexit.register(self.model.save)
+
 class RecordAgent(Agent):
 
     def handle_new_state(self, msg, action):
@@ -138,9 +144,7 @@ class ReplayAgent(Agent):
         super().__init__(config)
         # TODO: remove assertion after testing
         assert config.mazerunner_dir is not None
-        self.model = RLModel(config)
-        self.model.load()
-        atexit.register(self.model.save)
+        self._import_model()
         self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
 
     def replay_log(self, log_path):
@@ -154,9 +158,8 @@ class ExploreAgent(Agent):
         super().__init__(config)
         # TODO: remove assertion after testing
         assert config.mazerunner_dir is not None
-        self.model = RLModel(config)
-        self.model.load()
-        atexit.register(self.model.save)
+        if not config.hybrid_mode_enabled:
+            self._import_model()
         self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
 
     def handle_new_state(self, msg, action):
@@ -184,10 +187,10 @@ class ExploitAgent(Agent):
         super().__init__(config)
         # TODO: remove assertion after testing
         assert config.mazerunner_dir is not None
-        self.model = RLModel(config)
-        self.model.load()
-        atexit.register(self.model.save)
+        if not config.hybrid_mode_enabled:
+            self._import_model()
         self.target_sa = None
+        self.last_targets = []
         self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
         self.epsilon = config.explore_rate
 

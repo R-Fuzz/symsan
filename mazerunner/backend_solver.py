@@ -11,6 +11,21 @@ CONST_LABEL = 0
 INIT_LABEL = -1
 CONST_OFFSET = 1
 
+def get_label_info(label: int, shm: shared_memory.SharedMemory):
+    offset = label * ctypes.sizeof(dfsan_label_info)
+    return dfsan_label_info.from_buffer_copy(shm.buf[offset:offset+ctypes.sizeof(dfsan_label_info)])
+
+class branch_dep_t:
+    def __init__(self):
+        self.expr_deps = set() # z3.ExprRef set
+        self.input_deps = set() # dfsan_label set
+
+class AbortConcolicExecution(Exception):
+    pass
+
+class ConditionUnsat(Exception):
+    pass
+
 class SolverFlag:
     # If set, solve and trace this constraint. If unset, just trace.
     SHOULD_SOLVE = 0b0001
@@ -120,15 +135,6 @@ class LLVM_INS(Enum):
     # higher-order
     fmemcmp   = last_llvm_op + 7
     fsize     = last_llvm_op + 8
-
-def get_label_info(label: int, shm: shared_memory.SharedMemory):
-    offset = label * ctypes.sizeof(dfsan_label_info)
-    return dfsan_label_info.from_buffer_copy(shm.buf[offset:offset+ctypes.sizeof(dfsan_label_info)])
-
-class branch_dep_t:
-    def __init__(self):
-        self.expr_deps = set() # z3.ExprRef set
-        self.input_deps = set() # dfsan_label set
 
 class Serializer:
     class InvalidData(ValueError):
@@ -331,9 +337,6 @@ class Serializer:
         return e
 
 class Z3Solver:
-    class AbortConcolicExecution(Exception):
-        pass
-
     def __init__(self, config, shm, input_file, output_dir, instance_id, session_id):
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.shm = shm
@@ -367,7 +370,8 @@ class Z3Solver:
         except Serializer.InvalidData:
             return
         self.__collect_constraints(inputs)
-        assert self.__z3_solver.check() == z3.sat
+        if self.__z3_solver.check() != z3.sat:
+            self.logger.critical(f"handle_gep: pre-condition is unsat")
         # first, check against fixed array bounds if available
         idx = z3.ZeroExt(64 - size, index_bv)
         if gmsg.num_elems > 0:
@@ -429,8 +433,8 @@ class Z3Solver:
 
     def handle_memcmp(self, msg: pipe_msg, pipe):
         info = get_label_info(msg.label, self.shm)
+        # if both operands are symbolic, no content to be read
         if info.l1 != CONST_LABEL and info.l2 != CONST_LABEL:
-            self.logger.error(f"handle_memcmp: None of memcmp label is constant")
             return
         memcmp_data = os.read(pipe, ctypes.sizeof(memcmp_msg) + msg.result)
         mmsg = memcmp_msg.from_buffer_copy(memcmp_data)
@@ -451,28 +455,27 @@ class Z3Solver:
             self.__branch_deps.extend([None] * (n + 1 - len(self.__branch_deps)))
         self.__branch_deps[n] = dep
 
-    # TODO: do not solve if the same constraint has been solved before, 
-    # retrieve the previous generation.
     def __solve_expr(self, e: z3.ExprRef):
         has_solved = False
         # set up local optmistic solver
         opt_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         opt_solver.set("timeout", 1000)
         opt_solver.add(e)
-        if opt_solver.check() == z3.sat:
-            # optimistic sat, check nested
-            self.__z3_solver.push()
-            self.__z3_solver.add(e)
-            if self.__z3_solver.check() == z3.sat:
-                m = self.__z3_solver.model()
-                self.__generate_input(m, False)
-                has_solved = True
-            else:
-                if self.optimistic_solving_enabled:
-                    m = opt_solver.model()
-                    self.__generate_input(m, True)
-            # reset
-            self.__z3_solver.pop()
+        if opt_solver.check() != z3.sat:
+            raise ConditionUnsat()
+        # optimistic sat, check nested
+        self.__z3_solver.push()
+        self.__z3_solver.add(e)
+        if self.__z3_solver.check() == z3.sat:
+            m = self.__z3_solver.model()
+            self.__generate_input(m, False)
+            has_solved = True
+        else:
+            if self.optimistic_solving_enabled:
+                m = opt_solver.model()
+                self.__generate_input(m, True)
+        # reset
+        self.__z3_solver.pop()
         return has_solved
 
     def __generate_input(self, m: z3.Model, is_optimistic: bool):
@@ -544,16 +547,17 @@ class Z3Solver:
         except Serializer.InvalidData:
             return
         self.__collect_constraints(inputs)
-        assert self.__z3_solver.check() == z3.sat
+        if self.__z3_solver.check() != z3.sat:
+            self.logger.critical(f"__solve_cond: pre-condition is unsat")
         if options & SolverFlag.SHOULD_SOLVE:
             e = (cond != result)
             if self.__solve_expr(e):
                 self.logger.debug("__solve_cond: branch solved")
             else:
-                self.logger.debug("__solve_cond: branch not solvable @{}".format(addr))
+                self.logger.debug("__solve_cond: branch cannot be solved @{}".format(addr))
             if options & SolverFlag.SHOULD_ABORT:
                 self.logger.debug("__solve_cond: aborting")
-                raise Z3Solver.AbortConcolicExecution()
+                raise AbortConcolicExecution()
         # 3. nested branch
         if self.nested_branch_enabled:
             for off in inputs:
