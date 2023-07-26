@@ -3,6 +3,8 @@ import os
 import logging
 
 LOGGING_LEVEL = logging.INFO
+MEMORY_LIMIT_PERCENTAGE = 85
+DISK_LIMIT_SIZE = 32 * (1 << 30) # 32GB
 # Solver configurations
 RANDOM_INPUT = "AAAA"
 MAX_DISTANCE = 0xFFFFFFFF
@@ -49,7 +51,10 @@ class Config:
                  "max_error_reports",
                  "max_crash_reports",
                  "max_flip_num",
-                 "min_hang_files"]
+                 "min_hang_files",
+                 "hybrid_mode_enabled",
+                 "memory_limit",
+                 "disk_limit"]
 
     def __init__(self):
         self._load_default()
@@ -100,6 +105,8 @@ class Config:
         self.max_crash_reports = MAX_CRASH_REPORTS
         self.max_flip_num = MAX_FLIP_NUM
         self.min_hang_files = MIN_HANG_FILES
+        self.memory_limit = MEMORY_LIMIT_PERCENTAGE
+        self.disk_limit = DISK_LIMIT_SIZE
         # The following should obly be set by the mazerunner launcher
         self.output_dir = None
         self.afl_dir = None
@@ -109,3 +116,4 @@ class Config:
         self.delimiter = None
         self.pkglen = None
         self.cmd = None
+        self.hybrid_mode_enabled = False

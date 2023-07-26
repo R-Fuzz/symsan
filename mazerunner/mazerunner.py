@@ -2,11 +2,12 @@
 import argparse
 import os
 import random
+import threading
 import time
 
 import afl
 from config import Config
-from utils import AT_FILE
+from utils import AT_FILE, monitor_memory, monitor_disk
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -43,18 +44,18 @@ def check_args(args):
 
 def main():
     random.seed(time.time())
-    config = Config()
     args = parse_args()
     check_args(args)
+    config = Config()
     config.load(args.config_path)
     config.reload(args)
 
-    if args.agent_type == "explore":
+    if args.agent_type == "hybrid":
+        e = afl.HybridExecutor(config)
+    elif args.agent_type == "explore":
         e = afl.ExploreExecutor(config)
     elif args.agent_type == "exploit":
         e = afl.ExploitExecutor(config)
-    elif args.agent_type == "hybrid":
-        e = afl.HybridExecutor(config)
     elif args.agent_type == "record":
         e = afl.RecordExecutor(config)
     elif args.agent_type == "replay":
@@ -63,10 +64,33 @@ def main():
         e = afl.QSYMExecutor(config)
     else:
         raise ValueError(f"unknown agent type {args.agent_type}")
+    
+    # Start a background thread to check memory usage every 10 minutes
+    memory_termination_event = threading.Event()
+    memory_monitor = threading.Thread(target=monitor_memory, 
+                                      args=(memory_termination_event, 10*60, config.memory_limit))
+    memory_monitor.start()
+    # Start a background thread to check disk usage every 10 minutes
+    disk_termination_event = threading.Event()
+    mazerunner_path = os.path.join(args.output_dir, args.mazerunner_dir)
+    disk_monitor = threading.Thread(target=monitor_disk, 
+                                    args=(disk_termination_event, 10*60, 
+                                          mazerunner_path, config.disk_limit))
+    disk_monitor.start()
+    e.reached_resource_limit = lambda: (memory_termination_event.is_set() 
+                                            or disk_termination_event.is_set())
+
+    t1 = time.time()
     try:
         e.run()
     finally:
+        t2 = time.time()
+        print(f"Total time: {t2 - t1}s")
         e.cleanup()
+        memory_termination_event.set()
+        disk_termination_event.set()
+        memory_monitor.join()
+        disk_monitor.join()
 
 if __name__ == "__main__":
     main()
