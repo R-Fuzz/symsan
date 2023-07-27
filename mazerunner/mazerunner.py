@@ -20,6 +20,7 @@ def parse_args():
     p.add_argument("-log", dest="log_file", default=None, help="Enable logging to file")
     p.add_argument("-config", dest="config_path", default=None, help="path of configuration file")
     p.add_argument("-debug", dest="debug_enabled", action="store_true", help="Enable debug mode")
+    p.add_argument("-monitor_resource", dest="resource_monitor_enabled", action="store_true", help="Enable memory and disk usage monitor")
     p.add_argument("cmd", nargs="+", help=f"cmdline, use {AT_FILE} to denote a file")
     # TODO: implement these two options
     p.add_argument("-deli", dest="deli", default=None, help="Delimiter used to split the input")
@@ -65,29 +66,30 @@ def main():
     else:
         raise ValueError(f"unknown agent type {args.agent_type}")
     
-    # Start a background thread to check memory usage every 10 minutes
-    memory_termination_event = threading.Event()
-    memory_monitor = threading.Thread(target=monitor_memory, 
-                                      args=(memory_termination_event, 10*60, config.memory_limit))
-    memory_monitor.start()
-    # Start a background thread to check disk usage every 10 minutes
-    disk_termination_event = threading.Event()
-    mazerunner_path = os.path.join(args.output_dir, args.mazerunner_dir)
-    disk_monitor = threading.Thread(target=monitor_disk, 
-                                    args=(disk_termination_event, 10*60, 
-                                          mazerunner_path, config.disk_limit))
-    disk_monitor.start()
-    e.reached_resource_limit = lambda: (memory_termination_event.is_set() 
-                                            or disk_termination_event.is_set())
-
+    if args.resource_monitor_enabled:
+        # Start a background thread to check memory usage every 10 minutes
+        memory_termination_event = threading.Event()
+        memory_monitor = threading.Thread(target=monitor_memory, 
+                                        args=(memory_termination_event, 10*60, config.memory_limit))
+        memory_monitor.start()
+        # Start a background thread to check disk usage every 10 minutes
+        disk_termination_event = threading.Event()
+        mazerunner_path = os.path.join(args.output_dir, args.mazerunner_dir)
+        disk_monitor = threading.Thread(target=monitor_disk, 
+                                        args=(disk_termination_event, 10*60, 
+                                            mazerunner_path, config.disk_limit))
+        disk_monitor.start()
+        e.check_resource_limit = lambda: (memory_termination_event.is_set() 
+                                                or disk_termination_event.is_set())
     try:
         e.run()
     finally:
         e.cleanup()
-        memory_termination_event.set()
-        disk_termination_event.set()
-        memory_monitor.join()
-        disk_monitor.join()
+        if args.resource_monitor_enabled:
+            memory_termination_event.set()
+            disk_termination_event.set()
+            memory_monitor.join()
+            disk_monitor.join()
 
 if __name__ == "__main__":
     main()
