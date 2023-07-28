@@ -74,10 +74,9 @@ def main():
         memory_monitor.start()
         # Start a background thread to check disk usage every 10 minutes
         disk_termination_event = threading.Event()
-        mazerunner_path = os.path.join(args.output_dir, args.mazerunner_dir)
         disk_monitor = threading.Thread(target=monitor_disk, 
                                         args=(disk_termination_event, 10*60, 
-                                            mazerunner_path, config.disk_limit))
+                                            config.mazerunner_dir, config.disk_limit))
         disk_monitor.start()
         e.check_resource_limit = lambda: (memory_termination_event.is_set() 
                                                 or disk_termination_event.is_set())

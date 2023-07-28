@@ -183,8 +183,7 @@ class SymSanExecutor:
             try:
                 self.solver.handle_cond(msg, flags)
             except ConditionUnsat:
-                target_sa = self.agent.curr_state.compute_reversed_sa()
-                self.agent.mark_sa_unreachable(target_sa)
+                self.agent.handle_unsat_condition()
         if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
             self.solver.handle_loop_exit(msg.id, msg.addr)
 

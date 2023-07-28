@@ -52,7 +52,6 @@ class Config:
                  "max_crash_reports",
                  "max_flip_num",
                  "min_hang_files",
-                 "hybrid_mode_enabled",
                  "memory_limit",
                  "disk_limit"]
 
@@ -78,7 +77,7 @@ class Config:
     def reload(self, args):
         self.output_dir = args.output_dir
         self.afl_dir = args.afl_dir
-        self.mazerunner_dir = args.mazerunner_dir
+        self.mazerunner_dir = os.path.join(args.output_dir, args.mazerunner_dir)
         self.initial_seed_dir = args.input
         self.mail = args.mail
         self.delimiter = args.deli
@@ -116,4 +115,3 @@ class Config:
         self.delimiter = None
         self.pkglen = None
         self.cmd = None
-        self.hybrid_mode_enabled = False

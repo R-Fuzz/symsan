@@ -5,17 +5,21 @@ from utils import mkdir
 
 class RLModel:
     def __init__(self, config):
+        self.config = config
+        self.init()
         if config.mazerunner_dir:
-            self.output = config.mazerunner_dir
             mkdir(self.my_dir)
-        self.visited_sa = set()
-        self.target_sa = set()
-        self.unreachable_sa = set()
-        self.Q_table = {}
+            self.load()
 
     @property
     def my_dir(self):
-        return os.path.join(self.output, "model")
+        return os.path.join(self.config.mazerunner_dir, "model")
+
+    def init(self):
+        self.visited_sa = set()
+        self.all_target_sa = set()
+        self.unreachable_sa = set()
+        self.Q_table = {}
 
     def save(self):
         with open(os.path.join(self.my_dir, "visited_sa"), 'wb') as fp:
@@ -25,7 +29,7 @@ class RLModel:
         with open(os.path.join(self.my_dir, "unreachable_branches"), 'wb') as fp:
             pickle.dump(self.unreachable_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
         with open(os.path.join(self.my_dir, "target_sa"), 'wb') as fp:
-            pickle.dump(self.target_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(self.all_target_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
     
     def load(self):
         visited_sa_path = os.path.join(self.my_dir, "visited_sa")
@@ -43,7 +47,7 @@ class RLModel:
         target_sa_path = os.path.join(self.my_dir, "target_sa")
         if os.path.isfile(target_sa_path):
             with open(target_sa_path, 'rb') as fp:
-                self.target_sa = pickle.load(fp)
+                self.all_target_sa = pickle.load(fp)
 
     def Q_lookup(self, key):
         return self.Q_table.get(key, 0.)
@@ -59,8 +63,8 @@ class RLModel:
         self.visited_sa.add(sa)
     
     def add_target_sa(self, sa):
-        self.target_sa.add(sa)
+        self.all_target_sa.add(sa)
     
     def remove_target_sa(self, sa):
-        if sa in self.target_sa:
-            self.target_sa.remove(sa)
+        if sa in self.all_target_sa:
+            self.all_target_sa.remove(sa)

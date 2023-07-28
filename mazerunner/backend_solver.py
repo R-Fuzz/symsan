@@ -272,7 +272,7 @@ class Serializer:
         elif op == LLVM_INS.LShr.value:
             return self.__cache_expr(label, z3.LShR(op1, op2), deps)
         elif op == LLVM_INS.AShr.value:
-            return self.__cache_expr(label, z3.AShR(op1, op2), deps)
+            return self.__cache_expr(label, op1 >> op2, deps)
         elif op == LLVM_INS.Add.value:
             return self.__cache_expr(label, op1 + op2, deps)
         elif op == LLVM_INS.Sub.value:
@@ -371,7 +371,8 @@ class Z3Solver:
             return
         self.__collect_constraints(inputs)
         if self.__z3_solver.check() != z3.sat:
-            self.logger.critical(f"handle_gep: pre-condition is unsat")
+            self.logger.error(f"handle_gep: pre-condition is unsat")
+            raise ConditionUnsat()
         # first, check against fixed array bounds if available
         idx = z3.ZeroExt(64 - size, index_bv)
         if gmsg.num_elems > 0:
@@ -548,7 +549,8 @@ class Z3Solver:
             return
         self.__collect_constraints(inputs)
         if self.__z3_solver.check() != z3.sat:
-            self.logger.critical(f"__solve_cond: pre-condition is unsat")
+            self.logger.error(f"__solve_cond: pre-condition is unsat")
+            raise ConditionUnsat()
         if options & SolverFlag.SHOULD_SOLVE:
             e = (cond != result)
             if self.__solve_expr(e):

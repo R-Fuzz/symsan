@@ -40,10 +40,28 @@ class Agent:
         self.max_distance = config.max_distance
         self.loopinfo = {}
         self.episode = []
+        self._learner = None
+        self._model = None
 
     @property
     def my_traces(self):
         return os.path.join(self.my_dir, "traces")
+
+    @property
+    def model(self):
+        if not self._model:
+            self._model = RLModel(self.config)
+            atexit.register(self._model.save)
+        return self._model
+    @model.setter
+    def model(self, m):
+        self._model = m
+
+    @property
+    def learner(self):
+        if not self._learner:
+            self._learner = BasicQLearner(self.model, self.config.discount_factor, self.config.learning_rate)
+        return self._learner
 
     def reset(self):
         self.curr_state = ProgramState(distance=self.max_distance)
@@ -53,6 +71,9 @@ class Agent:
     # for fgtest
     def handle_new_state(self, msg, action):
         pass
+    
+    def handle_unsat_condition(self):
+        self.mark_sa_unreachable(self.curr_state.compute_reversed_sa())
 
     # for fgtest
     def is_interesting_branch(self):
@@ -72,6 +93,7 @@ class Agent:
         last_d = self.max_distance
         for (next_s, a, d) in trace:
             next_sa = next_s + (a,)
+            self.model.add_visited_sa(next_sa)
             reward = self._compute_reward(d, last_d)
             if last_SA:
                 self.learner.learn(last_SA, next_s, last_reward)
@@ -123,11 +145,6 @@ class Agent:
         with open(path, 'rb') as fp:
             self._loop_info = pickle.load(fp)
 
-    def _import_model(self):
-        self.model = RLModel(self.config)
-        self.model.load()
-        atexit.register(self.model.save)
-
 class RecordAgent(Agent):
 
     def handle_new_state(self, msg, action):
@@ -140,13 +157,6 @@ class RecordAgent(Agent):
 
 class ReplayAgent(Agent):
 
-    def __init__(self, config: Config):
-        super().__init__(config)
-        # TODO: remove assertion after testing
-        assert config.mazerunner_dir is not None
-        self._import_model()
-        self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
-
     def replay_log(self, log_path):
         with open(log_path, 'rb') as fd:
             trace = list(pickle.load(fd))
@@ -154,79 +164,72 @@ class ReplayAgent(Agent):
 
 class ExploreAgent(Agent):
 
-    def __init__(self, config: Config):
-        super().__init__(config)
-        # TODO: remove assertion after testing
-        assert config.mazerunner_dir is not None
-        if not config.hybrid_mode_enabled:
-            self._import_model()
-        self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
-
     def handle_new_state(self, msg, action):
         last_state = self.curr_state
         self.update_curr_state(msg, action)
         curr_sa = self.curr_state.state + (self.curr_state.action, )
         self.model.add_visited_sa(curr_sa)
         self.model.remove_target_sa(curr_sa)
+        # TODO: do not learn or add into episode if the state count is larger than threshold
         self.learn(last_state)
 
     def is_interesting_branch(self):
         reversed_sa = self.curr_state.compute_reversed_sa()
         if reversed_sa in self.model.unreachable_sa:
             return False
-        if reversed_sa in self.model.target_sa:
+        if reversed_sa in self.model.all_target_sa:
             return False
-        interested = reversed_sa not in self.model.visited_sa
-        if interested:
+        interesting = reversed_sa not in self.model.visited_sa
+        if interesting:
             self.model.add_target_sa(reversed_sa)
-        return interested
+        return interesting
 
 class ExploitAgent(Agent):
 
     def __init__(self, config: Config):
         super().__init__(config)
-        # TODO: remove assertion after testing
-        assert config.mazerunner_dir is not None
-        if not config.hybrid_mode_enabled:
-            self._import_model()
-        self.target_sa = None
+        self.all_targets = []
         self.last_targets = []
-        self.learner = BasicQLearner(self.model, config.discount_factor, config.learning_rate)
         self.epsilon = config.explore_rate
+        self.target = (None, 0) # sa, trace_length
 
     def handle_new_state(self, msg, action):
         self.update_curr_state(msg, action)
+        # TODO: do not learn or add into episode if the state count is larger than threshold
         self.episode.append(self.curr_state.serialize())
         curr_sa = self.curr_state.state + (self.curr_state.action, )
-        self.model.add_visited_sa(curr_sa)
-        if curr_sa == self.target_sa:
-            self.target_sa = None
-        if not self.target_sa:
-            self.logger.debug(self.curr_state.serialize())
+        if curr_sa == self.target[0] and len(self.episode) == self.target[1]:
+            self.target = (None, 0) # sa, trace_length
 
     def is_interesting_branch(self):
-        if self.target_sa:
+        if self.target[0]:
             return False
         reversed_sa = self.curr_state.compute_reversed_sa()
         if reversed_sa in self.model.unreachable_sa:
-            self.logger.debug(f"not interested, unreachable sa {reversed_sa}")
+            self.logger.debug(f"not interesting, unreachable sa {reversed_sa}")
             return False
         curr_sa = self.curr_state.state + (self.curr_state.action, )
-        if (reversed_sa not in self.model.visited_sa
-            and curr_sa not in self.model.visited_sa):
-            self.logger.debug(f"not interested, unvisited state")
+        if curr_sa not in self.model.visited_sa:
+            self.logger.debug(f"not interesting, unvisited state")
             return False
-        return self.__epsilon_greedy_policy(reversed_sa)
+        interesting = self.__epsilon_greedy_policy(reversed_sa)
+        if interesting:
+            self.all_targets.append(reversed_sa)
+            self.target = (reversed_sa, len(self.episode))
+            self.logger.debug(f"Abort and restart. Target SA: {reversed_sa}")
+        return interesting
 
     # Return whether the agent should visit the filpped branch.
     def __epsilon_greedy_policy(self, reversed_sa):
         if (reversed_sa not in self.model.visited_sa
             and random.random() < self.epsilon):
+            self.logger.debug(f"interesting, epsilon-greedy policy")
             return True
         if self.__greedy_policy() == self.curr_state.action:
-            self.logger.debug(f"not interested, greedy policy")
+            self.logger.debug(f"not interesting, greedy policy")
             return False
         else:
+            self.logger.debug(f"interesting, greedy policy")
             return True
 
     # Returns the greedy action according to the Q value.
