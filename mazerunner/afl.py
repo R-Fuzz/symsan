@@ -489,7 +489,6 @@ class ExploitExecutor(Mazerunner):
         symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
         has_reached_max_flip_num = lambda: len(self.agent.all_targets) >= self.max_flip_num
         while not has_reached_max_flip_num():
-            # TODO: return a status from process_request() instead of catching exception
             try:
                 symsan.setup(self.cur_input, self.state.processed_num)
                 symsan.run(self.state.timeout)
@@ -513,9 +512,8 @@ class ExploitExecutor(Mazerunner):
         self.agent.replay_trace(self.agent.episode)
         # target might still be reachable due to hitting max_flip_num
         if self.agent.target[0] and not has_reached_max_flip_num():
-            assert not symsan_res.generated_testcases
-            self.agent.mark_sa_unreachable(self.agent.target[0])
-            self.agent.target = (None, 0) # sa, trace_length
+            assert len(symsan.solver.generated_files) == 0
+            self.agent.handle_unsat_condition()
         # check if it's stuck
         if (len(self.agent.all_targets) == len(self.agent.last_targets) 
             and self.agent.all_targets == self.agent.last_targets) or has_reached_max_flip_num():

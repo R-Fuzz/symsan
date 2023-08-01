@@ -12,7 +12,6 @@ from defs import *
 import utils
 from agent import ExploitAgent, ReplayAgent, RecordAgent
 
-# TODO: automatically infer this
 UNION_TABLE_SIZE = 0xc00000000
 
 class MsgType(Enum):
@@ -122,9 +121,10 @@ class SymSanExecutor:
     def process_request(self):
         self.timer.solving_time = 0
         should_terminate = False
-        while not should_terminate and self.proc.poll() is None:
+        while not should_terminate:
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
-            if not msg_data: break
+            if not msg_data or len(msg_data) < ctypes.sizeof(pipe_msg):
+                break
             start_time = int(time.time() * 1000)
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:

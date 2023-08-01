@@ -79,10 +79,6 @@ class Agent:
     def is_interesting_branch(self):
         return True
 
-    def mark_sa_unreachable(self, sa):
-        if sa:
-            self.model.add_unreachable_sa(sa)
-
     def save_trace(self, fn):
         log_path = os.path.join(self.my_traces, fn)
         with open(log_path, 'wb') as fd:
@@ -220,7 +216,8 @@ class ExploitAgent(Agent):
         return interesting
 
     def handle_unsat_condition(self):
-        self.mark_sa_unreachable(self.target[0])
+        self.model.add_unreachable_sa(self.target[0])
+        self.target = (None, 0)
 
     # Return whether the agent should visit the filpped branch.
     def __epsilon_greedy_policy(self, reversed_sa):
