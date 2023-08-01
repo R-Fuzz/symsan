@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import time
+from queue import PriorityQueue
 
 from agent import ExploreAgent, ExploitAgent, RecordAgent, ReplayAgent
 from executor import SymSanExecutor
@@ -53,8 +54,9 @@ class MazerunnerState:
         self.timeout = timeout
         self.start_ts = time.time()
         self.end_ts = None
-        self.concolic_execution_time = 0
-        self.seed_queue = collections.deque()
+        self.state.exploit_ce_time = 0
+        self.state.explore_ce_time = 0
+        self.seed_queue = PriorityQueue()
         self.synced = set()
         self.hang = set()
         self.processed = set()
@@ -213,7 +215,6 @@ class Mazerunner:
         shutil.copy2(fp, self.cur_input)
         self.logger.info("Run: input=%s" % fp)
         symsan_res = self.run_target()
-        self.state.concolic_execution_time += symsan_res.total_time/1000
         self.handle_return_status(symsan_res.returncode, symsan_res.stderr, fp)
         self.sync_back_if_interesting(fp, symsan_res)
 
@@ -425,7 +426,6 @@ class ExploreExecutor(Mazerunner):
         super().__init__(config, shared_state)
         self.agent = ExploreAgent(self.config)
         self.sync_frequency = self.config.sync_frequency
-        # TODO: implement prority queue based on distance
 
     def dry_run(self):
         files = self.sync_from_either()
@@ -434,6 +434,7 @@ class ExploreExecutor(Mazerunner):
             self.state.processed.add(seed)
 
     def sync_back_if_interesting(self, fp, res):
+        self.state.explore_ce_time += res.total_time/1000
         fn = os.path.basename(fp)
         # rename or delete generated testcases from fp
         for t in res.generated_testcases:
@@ -445,7 +446,7 @@ class ExploreExecutor(Mazerunner):
             target = fn[:len("id:......")]
             filename = "id:%06d,src:%s" % (index, target)
             shutil.move(testcase, os.path.join(self.my_generations, filename))
-            self.state.seed_queue.append(filename)
+            self.state.seed_queue.put((filename, res.distance))
         # syn back to AFL queue if it's interesting
         is_closer = self.minimizer.has_closer_distance(res.distance, fn)
         if is_closer:
@@ -458,14 +459,15 @@ class ExploreExecutor(Mazerunner):
         self.logger.info("Generated %d testcases" % len(res.generated_testcases))
 
     def _run(self):
-        if (not self.state.seed_queue
+        if (self.state.seed_queue.empty()
             or self.state.processed_num % self.sync_frequency == 0):
             files = self.sync_from_either()
-            self.state.seed_queue.extend(files)
-        if not self.state.seed_queue:
+            for fn in files:
+                self.state.seed_queue.put((fn, 0))
+        if self.state.seed_queue.empty():
             self.handle_empty_files()
             return
-        next_seed = self.state.seed_queue.popleft()
+        next_seed = self.state.seed_queue.get()[0]
         if not next_seed in self.state.processed:
             self.run_file(next_seed)
             self.state.processed.add(next_seed)
@@ -525,6 +527,7 @@ class ExploitExecutor(Mazerunner):
         return symsan_res
 
     def sync_back_if_interesting(self, fp, res):
+        self.state.exploit_ce_time += res.total_time/1000
         if not self.minimizer.is_new_file(self.cur_input):
             return
         fn = os.path.basename(fp)
@@ -534,7 +537,7 @@ class ExploitExecutor(Mazerunner):
         dst_fn = "id:%06d,src:%s" % (index, target)
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
-        self.state.seed_queue.append(dst_fn)
+        self.state.seed_queue.put((dst_fn, res.distance)))
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
             self.logger.info(f"Found closer seed. "

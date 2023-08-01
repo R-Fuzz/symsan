@@ -73,14 +73,15 @@ class Agent:
         pass
     
     def handle_unsat_condition(self):
-        self.mark_sa_unreachable(self.curr_state.compute_reversed_sa())
+        pass
 
     # for fgtest
     def is_interesting_branch(self):
         return True
 
     def mark_sa_unreachable(self, sa):
-        self.model.add_unreachable_sa(sa)
+        if sa:
+            self.model.add_unreachable_sa(sa)
 
     def save_trace(self, fn):
         log_path = os.path.join(self.my_traces, fn)
@@ -217,6 +218,9 @@ class ExploitAgent(Agent):
             self.target = (reversed_sa, len(self.episode))
             self.logger.debug(f"Abort and restart. Target SA: {reversed_sa}")
         return interesting
+
+    def handle_unsat_condition(self):
+        self.mark_sa_unreachable(self.target[0])
 
     # Return whether the agent should visit the filpped branch.
     def __epsilon_greedy_policy(self, reversed_sa):

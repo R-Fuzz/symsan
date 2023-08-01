@@ -14,6 +14,7 @@ if __name__ == "__main__":
         sys.exit(1)
     logging.basicConfig(level=logging.INFO)
     config = Config()
+    config.gep_solver_enabled = True
     config.cmd = [sys.argv[1], AT_FILE]
     output_seed_dir = "."
     options = os.environ['TAINT_OPTIONS']
