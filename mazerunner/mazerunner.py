@@ -39,7 +39,7 @@ def check_args(args):
     if args.afl_dir:
         afl_path = os.path.join(args.output_dir, args.afl_dir)
         if not args.input and not os.path.isdir(afl_path):
-            time.sleep(1)
+            time.sleep(5)
             if not os.path.isdir(afl_path):
                 raise ValueError('{args.afl_dir} no such directory')
 

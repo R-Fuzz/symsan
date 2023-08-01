@@ -170,7 +170,6 @@ class ExploreAgent(Agent):
         curr_sa = self.curr_state.state + (self.curr_state.action, )
         self.model.add_visited_sa(curr_sa)
         self.model.remove_target_sa(curr_sa)
-        # TODO: do not learn or add into episode if the state count is larger than threshold
         self.learn(last_state)
 
     def is_interesting_branch(self):

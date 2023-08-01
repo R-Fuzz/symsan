@@ -7,7 +7,7 @@ import ctypes
 import logging
 import time
 
-from backend_solver import Z3Solver, SolverFlag, ConditionUnsat
+from backend_solver import Z3Solver, ConditionUnsat
 from defs import *
 import utils
 from agent import ExploitAgent, ReplayAgent, RecordAgent
@@ -72,6 +72,14 @@ class SymSanExecutor:
         assert not (self.record_replay_mode_enabled and self.onetime_solving_enabled)
         self.gep_solver_enabled = config.gep_solver_enabled
 
+    @property
+    def has_terminated(self):
+        if not self.proc:
+            return True
+        if self.proc.poll() is not None:
+            return True
+        return False
+
     def tear_down(self):
         if self.pipefds:
             try:
@@ -79,13 +87,15 @@ class SymSanExecutor:
                 os.close(self.pipefds[1])
             except OSError:
                 pass
-        if self.proc and not self.proc.poll():
+            self.pipefds = None
+        if self.proc and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
             self.timer.proc_end_time = int(time.time() * 1000)
         if self.shm:
             self.shm.close()
             self.shm.unlink()
+            self.shm = None
 
     def get_result(self):
         # TODO: implement stream reader thread in case the subprocess closes
@@ -111,19 +121,21 @@ class SymSanExecutor:
 
     def process_request(self):
         self.timer.solving_time = 0
-        while not self.proc.poll():
+        should_terminate = False
+        while not should_terminate and self.proc.poll() is None:
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
             if not msg_data: break
             start_time = int(time.time() * 1000)
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:
-                self.__process_cond_request(msg)
+                if self.__process_cond_request(msg) and self.onetime_solving_enabled:
+                    should_terminate = True
             elif msg.msg_type == MsgType.gep_type.value:
                 self.__process_gep_request(msg)
             elif msg.msg_type == MsgType.memcmp_type.value:
                 self.solver.handle_memcmp(msg, self.pipefds[0])
             elif msg.msg_type == MsgType.loop_type.value:
-                self.solver.handle_loop_enter(msg.id, msg.addr)
+                self.logger.debug(f"handle_loop_enter: id={msg.id}, loop_header={hex(msg.addr)}")
             elif msg.msg_type == MsgType.fsize_type.value:
                 pass
             else:
@@ -168,24 +180,21 @@ class SymSanExecutor:
         os.close(self.pipefds[1])
 
     def __process_cond_request(self, msg):
+        is_interesting = False
         if msg.label:
             state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
             state_msg = mazerunner_msg.from_buffer_copy(state_data)
             self.agent.handle_new_state(state_msg, msg.result)
             is_interesting = self.agent.is_interesting_branch()
-            flags = 0
-            if self.record_replay_mode_enabled:
-                flags |= SolverFlag.SHOULD_SKIP
-            if is_interesting:
-                flags |= SolverFlag.SHOULD_SOLVE
-                if self.onetime_solving_enabled:
-                    flags |= SolverFlag.SHOULD_ABORT
-            try:
-                self.solver.handle_cond(msg, flags)
-            except ConditionUnsat:
-                self.agent.handle_unsat_condition()
+            if not self.record_replay_mode_enabled:
+                try:
+                    self.solver.handle_cond(msg, is_interesting)
+                except ConditionUnsat:
+                    self.agent.handle_unsat_condition()
+                    return False
         if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
-            self.solver.handle_loop_exit(msg.id, msg.addr)
+            self.logger.debug(f"Loop handle_loop_exit: id={msg.id}, target={hex(msg.addr)}")
+        return is_interesting
 
     def __process_gep_request(self, msg):
         gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))

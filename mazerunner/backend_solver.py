@@ -20,19 +20,8 @@ class branch_dep_t:
         self.expr_deps = set() # z3.ExprRef set
         self.input_deps = set() # dfsan_label set
 
-class AbortConcolicExecution(Exception):
-    pass
-
 class ConditionUnsat(Exception):
     pass
-
-class SolverFlag:
-    # If set, solve and trace this constraint. If unset, just trace.
-    SHOULD_SOLVE = 0b0001
-    # If set, skip and forget this constraint.
-    SHOULD_SKIP = 0b0010
-    # If set, solve any interesting constraint then abort.
-    SHOULD_ABORT = 0b0100
 
 class Predicate(Enum):
     bveq = 32
@@ -420,17 +409,8 @@ class Z3Solver:
                 c.input_deps.update(inputs)
                 c.expr_deps.add(index_bv == r_bv)
 
-    # TODO: implement loop tracing
-    def handle_loop_enter(self, id, addr):
-        self.logger.debug(f"handle_loop_enter: id={id}, loop_header={hex(addr)}")
-    
-    def handle_loop_exit(self, id, addr):
-        self.logger.debug(f"Loop handle_loop_exit: id={id}, target={hex(addr)}")
-        
-    def handle_cond(self, msg: pipe_msg, options: int):
-        if options & SolverFlag.SHOULD_SKIP:
-            return
-        self.__solve_cond(msg.label, msg.result, msg.addr, options)
+    def handle_cond(self, msg: pipe_msg, should_solve: bool):
+        self.__solve_cond(msg.label, msg.result, msg.addr, should_solve)
 
     def handle_memcmp(self, msg: pipe_msg, pipe):
         info = get_label_info(msg.label, self.shm)
@@ -539,7 +519,7 @@ class Z3Solver:
                         self.__z3_solver.add(expr)
 
     def __solve_cond(self, label: ctypes.c_uint32, r: ctypes.c_uint64,
-                     addr: ctypes.c_ulong, options: int):
+                     addr: ctypes.c_ulong, should_solve: bool):
         self.logger.debug(f"__solve_cond: label={label}, result={r}, addr={hex(addr)}")
         result = z3.BoolVal(r != 0, ctx=self.__z3_context)
         inputs = set()
@@ -551,15 +531,12 @@ class Z3Solver:
         if self.__z3_solver.check() != z3.sat:
             self.logger.error(f"__solve_cond: pre-condition is unsat")
             raise ConditionUnsat()
-        if options & SolverFlag.SHOULD_SOLVE:
+        if should_solve:
             e = (cond != result)
             if self.__solve_expr(e):
                 self.logger.debug("__solve_cond: branch solved")
             else:
                 self.logger.debug("__solve_cond: branch cannot be solved @{}".format(addr))
-            if options & SolverFlag.SHOULD_ABORT:
-                self.logger.debug("__solve_cond: aborting")
-                raise AbortConcolicExecution()
         # 3. nested branch
         if self.nested_branch_enabled:
             for off in inputs:

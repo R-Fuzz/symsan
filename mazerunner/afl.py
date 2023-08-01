@@ -12,7 +12,6 @@ import subprocess
 import time
 
 from agent import ExploreAgent, ExploitAgent, RecordAgent, ReplayAgent
-from backend_solver import AbortConcolicExecution
 from executor import SymSanExecutor
 from model import RLModel
 import minimizer
@@ -99,23 +98,22 @@ class MazerunnerState:
 
     def clear(self):
         self.processed = self.processed - self.hang
-        self.hang = set()
 
     def increase_timeout(self, logger, max_timeout):
         old_timeout = self.timeout
         if self.timeout < max_timeout:
             self.timeout *= 2
-            logger.debug("Increase timeout %d -> %d"
+            logger.info("Increase timeout %d -> %d"
                          % (old_timeout, self.timeout))
         else:
-            # Something bad happened, but wait until AFL resolves it
-            logger.debug("Hit the maximum timeout")
+            logger.info("Hit the maximum timeout")
             # Back to default timeout not to slow down fuzzing
             self.timeout = self.timeout
-        # sleep for a minutes to wait until AFL resolves it
-        time.sleep(60)
         # clear state for retesting seeds that needs more time
         self.clear()
+        # Something bad happened
+        logger.info("Sleeping a minute, wait until AFL resolves it")
+        time.sleep(60)
 
     def tick(self):
         old_index = self.index
@@ -222,7 +220,7 @@ class Mazerunner:
     def run_target(self):
         symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
         symsan.setup(self.cur_input, self.state.processed_num)
-        symsan.run()
+        symsan.run(self.state.timeout)
         try:
             symsan.process_request()
         finally:
@@ -455,7 +453,6 @@ class ExploreExecutor(Mazerunner):
                          f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
         if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
             self.logger.info("Sync back: %s" % fn)
-            # TODO: try to infer the source of fp, check naming pattern of qsym
             dst_fp = os.path.join(self.my_queue, fn)
             shutil.copy2(fp, dst_fp)
         self.logger.info("Generated %d testcases" % len(res.generated_testcases))
@@ -490,17 +487,16 @@ class ExploitExecutor(Mazerunner):
         symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
         has_reached_max_flip_num = lambda: len(self.agent.all_targets) >= self.max_flip_num
         while not has_reached_max_flip_num():
+            # TODO: return a status from process_request() instead of catching exception
             try:
                 symsan.setup(self.cur_input, self.state.processed_num)
-                symsan.run()
+                symsan.run(self.state.timeout)
                 symsan.process_request()
-                break
-            # TODO: return a status from process_request() instead of catching exception
-            except AbortConcolicExecution:
+                if symsan.has_terminated:
+                    break
                 assert len(symsan.solver.generated_files) == 1
                 fp = os.path.join(self.my_generations, symsan.solver.generated_files[0])
                 shutil.move(fp, self.cur_input)
-                continue
             finally:
                 symsan.tear_down()
                 symsan_res = symsan.get_result()
@@ -520,7 +516,7 @@ class ExploitExecutor(Mazerunner):
             self.agent.target = (None, 0) # sa, trace_length
         # check if it's stuck
         if (len(self.agent.all_targets) == len(self.agent.last_targets) 
-            and self.agent.all_targets == self.agent.last_targets):
+            and self.agent.all_targets == self.agent.last_targets) or has_reached_max_flip_num():
             self.no_progress_count += 1
         else:
             self.no_progress_count = 0
@@ -536,7 +532,6 @@ class ExploitExecutor(Mazerunner):
         names = get_id_from_fn(fn)
         target = names[0] if names else fn
         dst_fn = "id:%06d,src:%s" % (index, target)
-        # TODO: save, do not block and add to explore_queue
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
         self.state.seed_queue.append(dst_fn)
