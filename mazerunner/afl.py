@@ -1,5 +1,4 @@
 import atexit
-import collections
 import copy
 import logging
 import functools
@@ -10,7 +9,7 @@ import re
 import shutil
 import subprocess
 import time
-from queue import PriorityQueue
+import heapq
 
 from agent import ExploreAgent, ExploitAgent, RecordAgent, ReplayAgent
 from executor import SymSanExecutor
@@ -54,9 +53,8 @@ class MazerunnerState:
         self.timeout = timeout
         self.start_ts = time.time()
         self.end_ts = None
-        self.state.exploit_ce_time = 0
-        self.state.explore_ce_time = 0
-        self.seed_queue = PriorityQueue()
+        self.exploit_ce_time = 0
+        self.explore_ce_time = 0
         self.synced = set()
         self.hang = set()
         self.processed = set()
@@ -66,6 +64,7 @@ class MazerunnerState:
         self.num_error_reports = 0
         self.num_crash_reports = 0
         self._best_seed_info = ["", float("inf"), False] # filename, distance, is_new
+        self._seed_queue = []
 
     def __setstate__(self, dict):
         self.__dict__ = dict
@@ -85,18 +84,28 @@ class MazerunnerState:
     def min_distance(self):
         return self._best_seed_info[1]
 
-    @property
-    def discovered_closer_seed(self):
-        return self._best_seed_info[2]
-    
     def update_best_seed(self, filename, distance):
         self._best_seed_info[0] = filename
         self._best_seed_info[1] = distance
         self._best_seed_info[2] = True
 
+    @property
+    def discovered_closer_seed(self):
+        return self._best_seed_info[2]
     @discovered_closer_seed.setter
     def discovered_closer_seed(self, value):
         self._best_seed_info[2] = value
+    
+    def is_queue_empty(self):
+        return len(self._seed_queue) == 0
+
+    def put_seed(self, fn, priority):
+        if not fn or priority < 0:
+            raise ValueError("Invalid seed")
+        heapq.heappush(self._seed_queue, (priority, fn))
+
+    def get_seed(self):
+        return heapq.heappop(self._seed_queue)[1]
 
     def clear(self):
         self.processed = self.processed - self.hang
@@ -446,7 +455,7 @@ class ExploreExecutor(Mazerunner):
             target = fn[:len("id:......")]
             filename = "id:%06d,src:%s" % (index, target)
             shutil.move(testcase, os.path.join(self.my_generations, filename))
-            self.state.seed_queue.put((filename, res.distance))
+            self.state.put_seed(filename, res.distance)
         # syn back to AFL queue if it's interesting
         is_closer = self.minimizer.has_closer_distance(res.distance, fn)
         if is_closer:
@@ -459,15 +468,15 @@ class ExploreExecutor(Mazerunner):
         self.logger.info("Generated %d testcases" % len(res.generated_testcases))
 
     def _run(self):
-        if (self.state.seed_queue.empty()
+        if (self.state.is_queue_empty()
             or self.state.processed_num % self.sync_frequency == 0):
             files = self.sync_from_either()
             for fn in files:
-                self.state.seed_queue.put((fn, 0))
-        if self.state.seed_queue.empty():
+                self.state.put_seed(fn, 0)
+        if self.state.is_queue_empty():
             self.handle_empty_files()
             return
-        next_seed = self.state.seed_queue.get()[0]
+        next_seed = self.state.get_seed()
         if not next_seed in self.state.processed:
             self.run_file(next_seed)
             self.state.processed.add(next_seed)
@@ -535,7 +544,7 @@ class ExploitExecutor(Mazerunner):
         dst_fn = "id:%06d,src:%s" % (index, target)
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
-        self.state.seed_queue.put((dst_fn, res.distance)))
+        self.state.put_seed(dst_fn, res.distance)
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
             self.logger.info(f"Found closer seed. "
