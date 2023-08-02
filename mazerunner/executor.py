@@ -150,7 +150,7 @@ class SymSanExecutor:
     def run(self, timeout=None):
         # create and execute the child symsan process
         logging_level = 1 if self.logging_level == logging.DEBUG else 0
-        options = (f"taint_file={self.input_file}"
+        options = (f"taint_file=\"{self.input_file}\""
         f":shm_fd={self.shm._fd}"
         f":pipe_fd={self.pipefds[1]}"
         f":debug={logging_level}")
