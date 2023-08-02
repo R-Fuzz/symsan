@@ -1,4 +1,3 @@
-import atexit
 import logging
 import os
 import pickle
@@ -51,11 +50,13 @@ class Agent:
     def model(self):
         if not self._model:
             self._model = RLModel(self.config)
-            atexit.register(self._model.save)
         return self._model
     @model.setter
     def model(self, m):
         self._model = m
+    def save_model(self):
+        if self.config.mazerunner_dir:
+            self._model.save()
 
     @property
     def learner(self):

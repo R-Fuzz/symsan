@@ -17,6 +17,7 @@ LEARNING_RATE = 0.5
 EXPLORE_RATE = 0.5
 # Executor configurations
 SEED_SYNC_FREQUENCY = 100
+SAVE_FREQUENCY = 100 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 5 * 60 # 5 minutes
 MAX_ERROR_REPORTS = 30
@@ -53,7 +54,8 @@ class Config:
                  "max_flip_num",
                  "min_hang_files",
                  "memory_limit",
-                 "disk_limit"]
+                 "disk_limit",
+                 "save_frequency"]
 
     def __init__(self):
         self._load_default()
@@ -106,6 +108,7 @@ class Config:
         self.min_hang_files = MIN_HANG_FILES
         self.memory_limit = MEMORY_LIMIT_PERCENTAGE
         self.disk_limit = DISK_LIMIT_SIZE
+        self.save_frequency = SAVE_FREQUENCY
         # The following should obly be set by the mazerunner launcher
         self.output_dir = None
         self.afl_dir = None

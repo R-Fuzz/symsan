@@ -136,18 +136,10 @@ class Mazerunner:
         self.config = config
         # check_resource_limit returns a flag that controlled by another monitor thread
         self.check_resource_limit = lambda: False
-        self.timeout = config.timeout
-        self.max_timeout = config.max_timeout
-        self.max_error_reports = config.max_error_reports
-        self.max_crash_reports = config.max_error_reports
-        self.max_flip_num = config.max_flip_num
-        self.min_hang_files = config.min_hang_files
         self.cmd = config.cmd
         self.output = config.output_dir
-        self.mail = config.mail
-        self.initial_seed_dir = config.initial_seed_dir
-        self.filename = ".cur_input"
         self.my_dir = config.mazerunner_dir
+        self.filename = ".cur_input"
         self._make_dirs()
         if shared_state:
             self.state = shared_state
@@ -213,10 +205,14 @@ class Mazerunner:
         return os.path.join(self.my_dir, "dictionary")
 
     def run(self, run_once=False):
+        i = 0
         while not self.reached_resource_limit:
             self._run()
             if run_once:
                 break
+            if i % self.config.save_frequency == 0:
+                self._export_state()
+            i += 1
 
     def run_file(self, fn):
         # copy the test case
@@ -258,8 +254,8 @@ class Mazerunner:
 
     def sync_from_initial_seeds(self):
         files = []
-        for name in os.listdir(self.initial_seed_dir):
-            path = os.path.join(self.initial_seed_dir, name)
+        for name in os.listdir(self.config.initial_seed_dir):
+            path = os.path.join(self.config.initial_seed_dir, name)
             if os.path.isfile(path) and not name in self.state.synced:
                 shutil.copy2(path, os.path.join(self.my_generations, name))
                 files.append(name)
@@ -284,8 +280,8 @@ class Mazerunner:
             self.report_error(fp, log)
 
     def handle_empty_files(self):
-        if len(self.state.hang) > self.min_hang_files:
-            self.state.increase_timeout(self.logger, self.max_timeout)
+        if len(self.state.hang) > self.config.min_hang_files:
+            self.state.increase_timeout(self.logger, self.config.max_timeout)
         else:
             # TODO: offline learning, replay from past experience
             self.logger.info("Sleep for getting files from AFL seed queue")
@@ -338,13 +334,14 @@ class Mazerunner:
             with open(self.metadata, "rb") as f:
                 self.state = pickle.load(f)
         else:
-            self.state = MazerunnerState(self.timeout)
+            self.state = MazerunnerState(self.config.timeout)
         atexit.register(self._export_state)
 
     def _export_state(self):
         self.state.end_ts = time.time()
         with open(self.metadata, "wb") as fp:
             pickle.dump(self.state, fp, protocol=pickle.HIGHEST_PROTOCOL)
+        self.agent.save_model()
 
     def _send_mail(self, subject, info, attach=None):
         if attach is None:
@@ -353,7 +350,7 @@ class Mazerunner:
         for path in attach:
             cmd += ["-A", path]
         cmd += ["-s", "[mazerunner-report] %s" % subject]
-        cmd.append(self.mail)
+        cmd.append(self.config.mail)
         info = copy.copy(info)
         info["CMD"] = " ".join(self.cmd)
         text = "\n" # skip cc
@@ -371,10 +368,10 @@ class Mazerunner:
     def _report_error(self, fp, log):
         self.logger.debug("Error is occurred: %s\nLog:%s" % (fp, log))
         # if no mail, then stop
-        if self.mail is None:
+        if self.config.mail is None:
             return
         # don't do too much
-        if self.state.num_error_reports >= self.max_error_reports:
+        if self.state.num_error_reports >= self.config.max_error_reports:
             return
         self.state.num_error_reports += 1
         self._send_mail("Error found", {"LOG": log}, [fp])
@@ -382,10 +379,10 @@ class Mazerunner:
     def _report_crash(self, fp):
         self.logger.debug("Crash is found: %s" % fp)
         # if no mail, then stop
-        if self.mail is None:
+        if self.config.mail is None:
             return
         # don't do too much
-        if self.state.num_crash_reports >= self.max_error_reports:
+        if self.state.num_crash_reports >= self.config.max_error_reports:
             return
         self.state.num_crash_reports += 1
         info = {}
@@ -496,7 +493,7 @@ class ExploitExecutor(Mazerunner):
     def run_target(self):
         total_time = emulation_time = solving_time = 0
         symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
-        has_reached_max_flip_num = lambda: len(self.agent.all_targets) >= self.max_flip_num
+        has_reached_max_flip_num = lambda: len(self.agent.all_targets) >= self.config.max_flip_num
         while not has_reached_max_flip_num():
             try:
                 symsan.setup(self.cur_input, self.state.processed_num)
@@ -606,7 +603,7 @@ class ReplayExecutor(Mazerunner):
 
 class HybridExecutor():
     def __init__(self, config):
-        self.timeout = config.timeout
+        self.config = config
         # check_resource_limit returns a flag that controlled by another monitor thread
         self.my_dir = config.mazerunner_dir
         self.check_resource_limit = lambda: False
@@ -629,7 +626,11 @@ class HybridExecutor():
 
     def run(self):
         self.explore_executor.dry_run()
+        i = 0
         while not self.reached_resource_limit:
+            if i % self.config.save_frequency == 0:
+                self._export_state()
+            i += 1
             if (self.explore_executor.state.discovered_closer_seed 
                 or not self.exploit_executor.has_converged):
                 self.exploit_executor.run(run_once=True)
@@ -637,7 +638,6 @@ class HybridExecutor():
             self.explore_executor.run(run_once=True)
 
     def cleanup(self):
-        self.model.save()
         self._export_state()
         self.explore_executor.cleanup()
         self.exploit_executor.cleanup()
@@ -647,9 +647,10 @@ class HybridExecutor():
             with open(self.metadata, "rb") as f:
                 self.state = pickle.load(f)
         else:
-            self.state = MazerunnerState(self.timeout)
+            self.state = MazerunnerState(self.config.timeout)
 
     def _export_state(self):
         self.state.end_ts = time.time()
         with open(self.metadata, "wb") as fp:
             pickle.dump(self.state, fp, protocol=pickle.HIGHEST_PROTOCOL)
+        self.model.save()

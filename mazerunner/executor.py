@@ -123,13 +123,15 @@ class SymSanExecutor:
         should_terminate = False
         while not should_terminate:
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
-            if not msg_data or len(msg_data) < ctypes.sizeof(pipe_msg):
+            if len(msg_data) < ctypes.sizeof(pipe_msg):
                 break
             start_time = int(time.time() * 1000)
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:
                 if self.__process_cond_request(msg) and self.onetime_solving_enabled:
                     should_terminate = True
+                if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
+                    self.logger.debug(f"Loop handle_loop_exit: id={msg.id}, target={hex(msg.addr)}")
             elif msg.msg_type == MsgType.gep_type.value:
                 self.__process_gep_request(msg)
             elif msg.msg_type == MsgType.memcmp_type.value:
@@ -180,9 +182,11 @@ class SymSanExecutor:
         os.close(self.pipefds[1])
 
     def __process_cond_request(self, msg):
-        is_interesting = False
         if msg.label:
             state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
+            if len(state_data) < ctypes.sizeof(mazerunner_msg):
+                self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
+                return False
             state_msg = mazerunner_msg.from_buffer_copy(state_data)
             self.agent.handle_new_state(state_msg, msg.result)
             is_interesting = self.agent.is_interesting_branch()
@@ -192,15 +196,21 @@ class SymSanExecutor:
                 except ConditionUnsat:
                     self.agent.handle_unsat_condition()
                     return False
-        if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
-            self.logger.debug(f"Loop handle_loop_exit: id={msg.id}, target={hex(msg.addr)}")
-        return is_interesting
+                return is_interesting
+        return False
 
     def __process_gep_request(self, msg):
         gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))
+        if len(gep_data) < ctypes.sizeof(gep_msg):
+            self.logger.error(f"__process_gep_request: GEP message too small: {len(gep_data)}")
+            return
         gmsg = gep_msg.from_buffer_copy(gep_data)
         if msg.label != gmsg.index_label: # Double check
-            self.logger.error(f"process_request: Incorrect gep msg: {msg.label} "
+            self.logger.error(f"__process_gep_request: Incorrect gep msg: {msg.label} "
                               f"vs {gmsg.index_label}")
             raise SymSanExecutor.InvalidGEPMessage()
-        if self.gep_solver_enabled: self.solver.handle_gep(gmsg, msg.addr)
+        if self.gep_solver_enabled:
+            try:
+                self.solver.handle_gep(gmsg, msg.addr)
+            except ConditionUnsat:
+                self.logger.error(f"__process_gep_request: GEP condition unsat")
