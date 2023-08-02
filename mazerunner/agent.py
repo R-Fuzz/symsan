@@ -137,8 +137,11 @@ class Agent:
             program = self.cmd[0]
             loop_finder = os.path.join(os.path.dirname(__file__), 'static_anlysis.py')
             # run angr in a separate process as it overwrites logging configs
-            completed_process = subprocess.run([loop_finder, program, path], stdout=subprocess.DEVNULL)
+            completed_process = subprocess.run([loop_finder, program, path], 
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if completed_process.returncode != 0:
+                self.logger.error(completed_process.stdout)
+                self.logger.error(completed_process.stderr)
                 raise RuntimeError("failed to run %s" % loop_finder)
         with open(path, 'rb') as fp:
             self._loop_info = pickle.load(fp)

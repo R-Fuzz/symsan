@@ -19,10 +19,17 @@ import utils
 
 CONVERGING_THRESHOLD = 10
 WAITING_INTERVAL = 5
+
 # 'id:xxxx,src:yyyyy' -> 'id:xxxx'
 # 'id-xxx-xxxxxx-xx,src:yy-yyyyyy-yy' -> 'id-xxx-xxxxxx-xx'
 # 'idxxxxxxxx' -> 'idxxxxxxxx'
-get_id_from_fn = lambda s: re.compile(r'id[^,]*').findall(s)
+def get_id_from_fn(s):
+    match = re.compile(r'id[^,]*').findall(s)
+    if not match:
+        return s
+    if 'id:' in match[0] and len(match[0]) >= len("id:......"):
+        return match[0][len("id:"):len("id:......")]
+    return match[0]
 
 def get_score(testcase):
     # New coverage is the best
@@ -63,8 +70,8 @@ class MazerunnerState:
         self.index = 0
         self.num_error_reports = 0
         self.num_crash_reports = 0
-        self._best_seed_info = ["", float("inf"), False] # filename, distance, is_new
         self._seed_queue = []
+        self._best_seed_info = ["", float("inf"), False] # filename, distance, is_new
 
     def __setstate__(self, dict):
         self.__dict__ = dict
@@ -399,7 +406,7 @@ class QSYMExecutor(Mazerunner):
     def sync_back_if_interesting(self, fp, res):
         old_idx = self.state.index
         fn = os.path.basename(fp)
-        target = fn[:len("id:......")]
+        target = fn[len("id:"):len("id:......")]
         num_testcase = 0
         for testcase in res.generated_testcases():
             num_testcase += 1
@@ -449,8 +456,8 @@ class ExploreExecutor(Mazerunner):
                 os.unlink(testcase)
                 continue
             index = self.state.tick()
-            target = fn[:len("id:......")]
-            filename = "id:%06d,src:%s" % (index, target)
+            target = fn[len("id:"):len("id:......")]
+            filename = "id:%06d,src:%s,explore" % (index, target)
             shutil.move(testcase, os.path.join(self.my_generations, filename))
             self.state.put_seed(filename, res.distance)
         # syn back to AFL queue if it's interesting
@@ -536,9 +543,8 @@ class ExploitExecutor(Mazerunner):
             return
         fn = os.path.basename(fp)
         index = self.state.tick()
-        names = get_id_from_fn(fn)
-        target = names[0] if names else fn
-        dst_fn = "id:%06d,src:%s" % (index, target)
+        target = get_id_from_fn(fn)
+        dst_fn = "id:%06d,src:%s,exploit" % (index, target)
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
         self.state.put_seed(dst_fn, res.distance)
