@@ -70,7 +70,7 @@ to load the plugin and control its behavior:
 * `SYMSAN_USE_JIGSAW=1` (optional): use JIGSAW as the solver
 * `SYMSAN_USE_Z3=1` (optional): use Z3 as the solver
 
-## Some high-level desgin
+## Some high-level design
 
 The custom mutator works in two main steps:
 
