@@ -53,7 +53,7 @@ using namespace __dfsan;
 
 #define MAX_DEPTH 100
 
-static bool NestedSolving = true;
+static bool NestedSolving = false;
 
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
@@ -1369,6 +1369,10 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
   if (!getenv("SYMSAN_USE_Z3"))
     data->solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
+  // make nested solving optional too
+  if (!getenv("SYMSAN_USE_NESTED")) {
+    NestedSolving = true;
+  }
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
     FATAL(
