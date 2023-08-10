@@ -476,7 +476,8 @@ class ExploreExecutor(Mazerunner):
         if is_closer:
             self.logger.info(f"Explore agent found closer seed. "
                          f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
-        if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
+        is_interesting = is_closer or self.minimizer.has_new_sa(len(self.agent.model.visited_sa))
+        if self.afl_queue and is_interesting:
             self.logger.info("Sync back: %s" % fn)
             dst_fp = os.path.join(self.my_queue, fn)
             shutil.copy2(fp, dst_fp)
@@ -559,8 +560,10 @@ class ExploitExecutor(Mazerunner):
         if is_closer:
             self.logger.info(f"Exploit agent found closer seed. "
                             f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
+        is_interesting = is_closer or self.minimizer.has_new_sa(len(self.agent.model.visited_sa))
+        if is_interesting:
             self.state.put_seed(dst_fn, res.distance)
-        if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
+        if self.afl_queue and is_interesting:
             self.logger.info("Sync back: %s" % fn)
             dst_fp = os.path.join(self.my_queue, dst_fn)
             shutil.copy2(self.cur_input, dst_fp)

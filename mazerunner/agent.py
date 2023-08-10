@@ -151,7 +151,6 @@ class ExploreAgent(Agent):
     def handle_new_state(self, msg, action):
         self.update_curr_state(msg, action)
         curr_sa = self.curr_state.state + (self.curr_state.action, )
-        self.model.add_visited_sa(curr_sa)
         self.model.remove_target_sa(curr_sa)
         if self.curr_state.state[2] < MAX_BUCKET_SIZE:
             self.episode.append(self.curr_state.serialize())

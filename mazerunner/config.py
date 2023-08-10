@@ -14,7 +14,7 @@ OPTIMISTIC_SOLVING_ENABLED = True
 # Learner configurations
 DISCOUNT_FACTOR = 1
 LEARNING_RATE = 0.5
-EXPLORE_RATE = 0.9
+EXPLORE_RATE = 0.5
 # Executor configurations
 SEED_SYNC_FREQUENCY = 100
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
