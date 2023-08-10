@@ -444,11 +444,16 @@ class ExploreExecutor(Mazerunner):
         self.agent = ExploreAgent(self.config)
         self.sync_frequency = self.config.sync_frequency
 
+    def run_single_file(self, fn):
+        self.run_file(fn)
+        # start RL training after symsan executor finishes
+        self.agent.replay_trace(self.agent.episode)
+        self.state.processed.add(fn)
+
     def dry_run(self):
         files = self.sync_from_either()
         for seed in files:
-            self.run_file(seed)
-            self.state.processed.add(seed)
+            self.run_single_file(seed)
 
     def update_timmer(self, res):
         self.state.explore_ce_time += res.total_time/1000
@@ -469,7 +474,7 @@ class ExploreExecutor(Mazerunner):
         # syn back to AFL queue if it's interesting
         is_closer = self.minimizer.has_closer_distance(res.distance, fn)
         if is_closer:
-            self.logger.info(f"Found closer seed. "
+            self.logger.info(f"Explore agent found closer seed. "
                          f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
         if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
             self.logger.info("Sync back: %s" % fn)
@@ -488,8 +493,7 @@ class ExploreExecutor(Mazerunner):
             return
         next_seed = self.state.get_seed()
         if not next_seed in self.state.processed:
-            self.run_file(next_seed)
-            self.state.processed.add(next_seed)
+            self.run_single_file(next_seed)
 
 class ExploitExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
@@ -512,7 +516,7 @@ class ExploitExecutor(Mazerunner):
                 symsan.setup(self.cur_input, self.state.processed_num)
                 symsan.run(self.state.timeout)
                 symsan.process_request()
-                if symsan.has_terminated:
+                if symsan.has_terminated and len(symsan.solver.generated_files) == 0:
                     break
                 assert len(symsan.solver.generated_files) == 1
                 fp = os.path.join(self.my_generations, symsan.solver.generated_files[0])
@@ -520,18 +524,14 @@ class ExploitExecutor(Mazerunner):
             finally:
                 symsan.tear_down()
                 symsan_res = symsan.get_result()
-                assert len(symsan_res.generated_testcases) <= 1
                 total_time += symsan_res.total_time
                 emulation_time += symsan_res.emulation_time
                 solving_time += symsan_res.solving_time
         symsan_res.update_time(total_time, solving_time)
         self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, flipped=%d times"
                      % (total_time, emulation_time, solving_time, symsan_res.returncode, len(self.agent.all_targets)))
-        # start RL training after episode completes
-        self.agent.replay_trace(self.agent.episode)
         # target might still be reachable due to hitting max_flip_num
         if self.agent.target[0] and not has_reached_max_flip_num():
-            assert len(symsan.solver.generated_files) == 0
             self.agent.handle_unsat_condition()
         # check if it's stuck
         if (len(self.agent.all_targets) == len(self.agent.last_targets) 
@@ -555,11 +555,11 @@ class ExploitExecutor(Mazerunner):
         dst_fn = "id:%06d,src:%s,exploit" % (index, target)
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
-        self.state.put_seed(dst_fn, res.distance)
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
-            self.logger.info(f"Found closer seed. "
-                         f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
+            self.logger.info(f"Exploit agent found closer seed. "
+                            f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
+            self.state.put_seed(dst_fn, res.distance)
         if self.afl_queue and (is_closer or self.minimizer.has_new_cov(fp)):
             self.logger.info("Sync back: %s" % fn)
             dst_fp = os.path.join(self.my_queue, dst_fn)
@@ -571,6 +571,8 @@ class ExploitExecutor(Mazerunner):
             self.state.discovered_closer_seed = False
             self.no_progress_count = 0
         self.run_file(next_seed)
+        # start RL training after symsan executor finishes
+        self.agent.replay_trace(self.agent.episode)
 
     def _init_best_testcase(self):
         if not self.state.best_seed:

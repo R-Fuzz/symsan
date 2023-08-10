@@ -5,6 +5,7 @@ import subprocess
 import time
 
 AT_FILE = "@@"
+MAX_BUCKET_SIZE = 256
 COUNT_CLASS_LOOKUP = [
     i if i <= 32 else
     33 if 33 <= i <= 63 else
@@ -15,7 +16,7 @@ COUNT_CLASS_LOOKUP = [
     192 if 192 <= i <= 223 else
     224 if 224 <= i <= 255 else
     0  # default
-    for i in range(256)
+    for i in range(MAX_BUCKET_SIZE)
 ]
 
 def bucket_lookup(c):

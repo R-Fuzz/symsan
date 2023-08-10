@@ -9,7 +9,7 @@ import random
 from config import Config
 from defs import TaintFlag
 from model import RLModel
-from utils import mkdir, bucket_lookup
+from utils import mkdir, bucket_lookup, MAX_BUCKET_SIZE
 from learner import BasicQLearner
 
 class ProgramState:
@@ -99,20 +99,14 @@ class Agent:
             reward = self._compute_reward(d, last_d)
             if last_SA:
                 self.learner.learn(last_SA, next_s, last_reward)
+                self.logger.debug(f"last_SA: {last_SA}, "
+                                f"distance: {d if d else 'NA'}, "
+                                f"reward: {reward}, "
+                                f"Q: {self.model.Q_lookup(last_SA)}")
             last_d = d
             last_SA = next_sa
             last_reward = reward
 
-    def learn(self, last_state):
-        if last_state:
-            last_sa = last_state.state + (last_state.action, )
-            reward = self._compute_reward(self.curr_state.d, last_state.d)
-            self.learner.learn(last_sa, self.curr_state.state, reward)
-            self.logger.debug(f"last_SA: {last_sa}, "
-                              f"distance: {self.curr_state.d if self.curr_state.d else 'NA'}, "
-                              f"reward: {reward}, "
-                              f"Q: {self.model.Q_lookup(last_sa)}")
-    
     def update_curr_state(self, msg, action):
         has_dist = True if msg.flags & TaintFlag.F_HAS_DISTANCE else False
         if has_dist:
@@ -139,7 +133,7 @@ class RecordAgent(Agent):
     def handle_new_state(self, msg, action):
         d = msg.avg_dist
         self.curr_state.update(msg.addr, msg.context, action, d)
-        if self.curr_state.state[2] < 256:
+        if self.curr_state.state[2] < MAX_BUCKET_SIZE:
             self.episode.append(self.curr_state.serialize())
 
     def is_interesting_branch(self):
@@ -155,12 +149,12 @@ class ReplayAgent(Agent):
 class ExploreAgent(Agent):
 
     def handle_new_state(self, msg, action):
-        last_state = self.curr_state
         self.update_curr_state(msg, action)
         curr_sa = self.curr_state.state + (self.curr_state.action, )
         self.model.add_visited_sa(curr_sa)
         self.model.remove_target_sa(curr_sa)
-        self.learn(last_state)
+        if self.curr_state.state[2] < MAX_BUCKET_SIZE:
+            self.episode.append(self.curr_state.serialize())
 
     def is_interesting_branch(self):
         reversed_sa = self.curr_state.compute_reversed_sa()
@@ -184,8 +178,8 @@ class ExploitAgent(Agent):
 
     def handle_new_state(self, msg, action):
         self.update_curr_state(msg, action)
-        # TODO: do not learn or add into episode if the state count is larger than threshold
-        self.episode.append(self.curr_state.serialize())
+        if self.curr_state.state[2] < MAX_BUCKET_SIZE:
+            self.episode.append(self.curr_state.serialize())
         curr_sa = self.curr_state.state + (self.curr_state.action, )
         if curr_sa == self.target[0] and len(self.episode) == self.target[1]:
             self.target = (None, 0) # sa, trace_length
