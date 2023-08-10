@@ -228,6 +228,7 @@ class Mazerunner:
         self.logger.info("Run: input=%s" % fp)
         symsan_res = self.run_target()
         self.handle_return_status(symsan_res.returncode, symsan_res.stderr, fp)
+        self.update_timmer(symsan_res)
         self.sync_back_if_interesting(fp, symsan_res)
 
     def run_target(self):
@@ -245,6 +246,9 @@ class Mazerunner:
                         symsan_res.solving_time,
                         symsan_res.returncode))
         return symsan_res
+
+    def update_timmer(self, res):
+        pass
 
     def sync_from_afl(self, reversed_order=True):
         files = []
@@ -406,7 +410,7 @@ class QSYMExecutor(Mazerunner):
     def sync_back_if_interesting(self, fp, res):
         old_idx = self.state.index
         fn = os.path.basename(fp)
-        target = fn[len("id:"):len("id:......")]
+        target = fn[len("id:"):len("id:......")] if len(fn) >= len("id:......") else fn
         num_testcase = 0
         for testcase in res.generated_testcases():
             num_testcase += 1
@@ -446,8 +450,10 @@ class ExploreExecutor(Mazerunner):
             self.run_file(seed)
             self.state.processed.add(seed)
 
-    def sync_back_if_interesting(self, fp, res):
+    def update_timmer(self, res):
         self.state.explore_ce_time += res.total_time/1000
+    
+    def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
         # rename or delete generated testcases from fp
         for t in res.generated_testcases:
@@ -456,7 +462,7 @@ class ExploreExecutor(Mazerunner):
                 os.unlink(testcase)
                 continue
             index = self.state.tick()
-            target = fn[len("id:"):len("id:......")]
+            target = fn[len("id:"):len("id:......")] if len(fn) >= len("id:......") else fn
             filename = "id:%06d,src:%s,explore" % (index, target)
             shutil.move(testcase, os.path.join(self.my_generations, filename))
             self.state.put_seed(filename, res.distance)
@@ -537,8 +543,10 @@ class ExploitExecutor(Mazerunner):
         self.agent.all_targets = []
         return symsan_res
 
-    def sync_back_if_interesting(self, fp, res):
+    def update_timmer(self, res):
         self.state.exploit_ce_time += res.total_time/1000
+
+    def sync_back_if_interesting(self, fp, res):
         if not self.minimizer.is_new_file(self.cur_input):
             return
         fn = os.path.basename(fp)
@@ -640,6 +648,7 @@ class HybridExecutor():
             if (self.explore_executor.state.discovered_closer_seed 
                 or not self.exploit_executor.has_converged):
                 self.exploit_executor.run(run_once=True)
+                self.explore_executor.run(run_once=True)
                 continue
             self.explore_executor.run(run_once=True)
 

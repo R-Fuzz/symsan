@@ -218,12 +218,16 @@ class ExploitAgent(Agent):
             and random.random() < self.epsilon):
             self.logger.debug(f"interesting, epsilon-greedy policy")
             return True
-        if self.__greedy_policy() == self.curr_state.action:
-            self.logger.debug(f"not interesting, greedy policy")
-            return False
-        else:
+        if (reversed_sa in self.model.visited_sa
+            and random.random() < (self.epsilon ** self.model.visited_sa[reversed_sa])):
+            self.logger.debug(f"interesting, epsilon-greedy policy")
+            return True
+        if self.__greedy_policy() != self.curr_state.action:
             self.logger.debug(f"interesting, greedy policy")
             return True
+        else:
+            self.logger.debug(f"not interesting, greedy policy")
+            return False
 
     # Returns the greedy action according to the Q value.
     def __greedy_policy(self):

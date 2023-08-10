@@ -1,3 +1,4 @@
+import collections
 import os
 import pickle
 
@@ -16,7 +17,7 @@ class RLModel:
         return os.path.join(self.config.mazerunner_dir, "model")
 
     def init(self):
-        self.visited_sa = set()
+        self.visited_sa = collections.Counter()
         self.all_target_sa = set()
         self.unreachable_sa = set()
         self.Q_table = {}
@@ -60,7 +61,7 @@ class RLModel:
         self.unreachable_sa.add(sa)
 
     def add_visited_sa(self, sa):
-        self.visited_sa.add(sa)
+        self.visited_sa.update([sa])
     
     def add_target_sa(self, sa):
         self.all_target_sa.add(sa)
