@@ -5,6 +5,23 @@ import subprocess
 import time
 
 AT_FILE = "@@"
+COUNT_CLASS_LOOKUP = [
+    i if i <= 32 else
+    33 if 33 <= i <= 63 else
+    64 if 64 <= i <= 95 else
+    96 if 96 <= i <= 127 else
+    128 if 128 <= i <= 159 else
+    160 if 160 <= i <= 191 else
+    192 if 192 <= i <= 223 else
+    224 if 224 <= i <= 255 else
+    0  # default
+    for i in range(256)
+]
+
+def bucket_lookup(c):
+    if c > 256:
+        return 256
+    return COUNT_CLASS_LOOKUP[c]
 
 def mkdir(dirp):
     if not os.path.exists(dirp):

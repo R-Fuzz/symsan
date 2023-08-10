@@ -1,5 +1,6 @@
 import logging
 import os
+import collections
 import pickle
 import subprocess
 import utils
@@ -8,17 +9,21 @@ import random
 from config import Config
 from defs import TaintFlag
 from model import RLModel
-from utils import mkdir
+from utils import mkdir, bucket_lookup
 from learner import BasicQLearner
 
 class ProgramState:
-    def __init__(self, distance, pc=0, callstack=0, action=0, loop_counter=0):
-        self.state = (pc, callstack, loop_counter)
-        self.action = action
+    def __init__(self, distance):
+        self.edge = (0, 0)
+        self.state = (0,0,0)
+        self.action = 0
         self.d = distance
+        self.edge_counter = collections.Counter()
     
     def update(self, pc, callstack, action, distance):
-        self.state = (pc, callstack, self.state[2])
+        edge = (self.state[0], pc, callstack)
+        self.edge_counter.update([edge])
+        self.state = (pc, callstack, bucket_lookup(self.edge_counter[edge]))
         self.action = action
         self.d = distance
 
@@ -37,7 +42,6 @@ class Agent:
             mkdir(self.my_traces)
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.max_distance = config.max_distance
-        self.loopinfo = {}
         self.episode = []
         self._learner = None
         self._model = None
@@ -110,7 +114,6 @@ class Agent:
                               f"Q: {self.model.Q_lookup(last_sa)}")
     
     def update_curr_state(self, msg, action):
-        self.curr_state = ProgramState(distance=self.max_distance)
         has_dist = True if msg.flags & TaintFlag.F_HAS_DISTANCE else False
         if has_dist:
             d = msg.avg_dist
@@ -131,27 +134,13 @@ class Agent:
             reward = last_d - d
         return reward
 
-    def _import_loop_info(self):
-        path = os.path.join(self.my_dir, "loops")
-        if not os.path.isfile(path):
-            program = self.cmd[0]
-            loop_finder = os.path.join(os.path.dirname(__file__), 'static_anlysis.py')
-            # run angr in a separate process as it overwrites logging configs
-            completed_process = subprocess.run([loop_finder, program, path], 
-                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if completed_process.returncode != 0:
-                self.logger.error(completed_process.stdout)
-                self.logger.error(completed_process.stderr)
-                raise RuntimeError("failed to run %s" % loop_finder)
-        with open(path, 'rb') as fp:
-            self._loop_info = pickle.load(fp)
-
 class RecordAgent(Agent):
 
     def handle_new_state(self, msg, action):
         d = msg.avg_dist
         self.curr_state.update(msg.addr, msg.context, action, d)
-        self.episode.append(self.curr_state.serialize())
+        if self.curr_state.state[2] < 256:
+            self.episode.append(self.curr_state.serialize())
 
     def is_interesting_branch(self):
         return False
