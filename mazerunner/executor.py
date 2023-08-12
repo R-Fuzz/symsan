@@ -54,6 +54,10 @@ class SymSanExecutor:
             self.proc_end_time = 0
             self.solving_time = 0
 
+        def execution_timeout(self, timeout):
+            return ((int(time.time() * 1000) - self.proc_start_time)
+                    - self.solving_time >= timeout)
+
     def __init__(self, config, agent, output_dir):
         self.config = config
         self.cmd = config.cmd
@@ -120,8 +124,13 @@ class SymSanExecutor:
 
     def process_request(self):
         self.timer.solving_time = 0
-        should_terminate = False
-        while not should_terminate:
+        should_not_handle = False
+        while not should_not_handle:
+            if (self.timer.execution_timeout(self.config.timeout/10)
+                and self.proc and self.proc.poll() is None):
+                self.proc.kill()
+                self.proc.wait()
+                self.timer.proc_end_time = int(time.time() * 1000)
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
             if len(msg_data) < ctypes.sizeof(pipe_msg):
                 break
@@ -129,7 +138,7 @@ class SymSanExecutor:
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:
                 if self.__process_cond_request(msg) and self.onetime_solving_enabled:
-                    should_terminate = True
+                    should_not_handle = True
                 if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
                     self.logger.debug(f"Loop handle_loop_exit: id={msg.id}, target={hex(msg.addr)}")
             elif msg.msg_type == MsgType.gep_type.value:
