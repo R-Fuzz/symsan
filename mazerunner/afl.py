@@ -152,7 +152,7 @@ class Mazerunner:
             self.state = shared_state
         else:
             self._import_state()
-        self._setup_logger(config.logging_level, config.log_file)
+        self._setup_logger(config.logging_level)
         self.afl = ''
         if config.afl_dir:
             self.afl = config.afl_dir
@@ -325,13 +325,9 @@ class Mazerunner:
         utils.mkdir(self.my_errors)
         utils.mkdir(self.my_generations)
 
-    def _setup_logger(self, logging_level, logfile):
+    def _setup_logger(self, logging_level):
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        if logfile:
-            log_path = os.path.join(self.my_dir, logfile)
-            logging.basicConfig(filename=log_path, level=logging_level)
-        else:
-            logging.basicConfig(level=logging_level)
+        logging.basicConfig(level=logging_level)
 
     # Returns afl's cmd, afl_path, qemu_mode, cmd will be used in minimizer
     def _parse_fuzzer_stats(self):

@@ -17,7 +17,6 @@ def parse_args():
     p.add_argument("-a", dest="afl_dir", default=None, help="AFL instance name")
     p.add_argument("-i", dest="input", default=None, help="initial seed directory")
     p.add_argument("-m", dest="mail", default=None, help="Interesting result will be sent to the Email address")
-    p.add_argument("-log", dest="log_file", default=None, help="Enable logging to file")
     p.add_argument("-config", dest="config_path", default=None, help="path of configuration file")
     p.add_argument("-debug", dest="debug_enabled", action="store_true", help="Enable debug mode")
     p.add_argument("-monitor_resource", dest="resource_monitor_enabled", action="store_true", help="Enable memory and disk usage monitor")

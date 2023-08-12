@@ -44,7 +44,6 @@ class Config:
                  "delimiter",
                  "pkglen",
                  "cmd",
-                 "log_file",
                  "sync_frequency",
                  "explore_rate",
                  "timeout",
@@ -87,7 +86,6 @@ class Config:
         self.cmd = args.cmd
         if args.debug_enabled:
             self.logging_level = logging.DEBUG
-        self.log_file = args.log_file
 
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL
