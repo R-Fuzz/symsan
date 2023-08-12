@@ -68,6 +68,11 @@ class Agent:
             self._learner = BasicQLearner(self.model, self.config.discount_factor, self.config.learning_rate)
         return self._learner
 
+    def append_episode(self):
+        if (self.curr_state.state[2] < MAX_BUCKET_SIZE
+            and self.curr_state.d is not None):
+            self.episode.append(self.curr_state.serialize())
+
     def reset(self):
         self.curr_state = ProgramState(distance=self.max_distance)
         self.episode.clear()
@@ -133,8 +138,7 @@ class RecordAgent(Agent):
     def handle_new_state(self, msg, action):
         d = msg.avg_dist
         self.curr_state.update(msg.addr, msg.context, action, d)
-        if self.curr_state.state[2] < MAX_BUCKET_SIZE:
-            self.episode.append(self.curr_state.serialize())
+        self.append_episode()
 
     def is_interesting_branch(self):
         return False
@@ -152,10 +156,11 @@ class ExploreAgent(Agent):
         self.update_curr_state(msg, action)
         curr_sa = self.curr_state.state + (self.curr_state.action, )
         self.model.remove_target_sa(curr_sa)
-        if self.curr_state.state[2] < MAX_BUCKET_SIZE:
-            self.episode.append(self.curr_state.serialize())
+        self.append_episode()
 
     def is_interesting_branch(self):
+        if self.curr_state.d is None:
+            return False
         reversed_sa = self.curr_state.compute_reversed_sa()
         if reversed_sa in self.model.unreachable_sa:
             return False
@@ -177,13 +182,14 @@ class ExploitAgent(Agent):
 
     def handle_new_state(self, msg, action):
         self.update_curr_state(msg, action)
-        if self.curr_state.state[2] < MAX_BUCKET_SIZE:
-            self.episode.append(self.curr_state.serialize())
+        self.append_episode()
         curr_sa = self.curr_state.state + (self.curr_state.action, )
         if curr_sa == self.target[0] and len(self.episode) == self.target[1]:
             self.target = (None, 0) # sa, trace_length
 
     def is_interesting_branch(self):
+        if self.curr_state.d is None:
+            return False
         if self.target[0]:
             return False
         reversed_sa = self.curr_state.compute_reversed_sa()
