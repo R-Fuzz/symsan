@@ -69,8 +69,7 @@ class Agent:
         return self._learner
 
     def append_episode(self):
-        if (self.curr_state.state[2] < MAX_BUCKET_SIZE
-            and self.curr_state.d is not None):
+        if self.curr_state.state[2] < MAX_BUCKET_SIZE:
             self.episode.append(self.curr_state.serialize())
 
     def reset(self):
@@ -88,11 +87,6 @@ class Agent:
     # for fgtest
     def is_interesting_branch(self):
         return True
-
-    def save_trace(self, fn):
-        log_path = os.path.join(self.my_traces, fn)
-        with open(log_path, 'wb') as fd:
-            pickle.dump(self.episode, fd, protocol=pickle.HIGHEST_PROTOCOL)
 
     def replay_trace(self, trace):
         last_SA = None
@@ -143,6 +137,11 @@ class RecordAgent(Agent):
     def is_interesting_branch(self):
         return False
 
+    def save_trace(self, fn):
+        log_path = os.path.join(self.my_traces, fn)
+        with open(log_path, 'wb') as fd:
+            pickle.dump(self.episode, fd, protocol=pickle.HIGHEST_PROTOCOL)
+
 class ReplayAgent(Agent):
 
     def replay_log(self, log_path):
@@ -159,8 +158,6 @@ class ExploreAgent(Agent):
         self.append_episode()
 
     def is_interesting_branch(self):
-        if self.curr_state.d is None:
-            return False
         reversed_sa = self.curr_state.compute_reversed_sa()
         if reversed_sa in self.model.unreachable_sa:
             return False
@@ -188,8 +185,6 @@ class ExploitAgent(Agent):
             self.target = (None, 0) # sa, trace_length
 
     def is_interesting_branch(self):
-        if self.curr_state.d is None:
-            return False
         if self.target[0]:
             return False
         reversed_sa = self.curr_state.compute_reversed_sa()
