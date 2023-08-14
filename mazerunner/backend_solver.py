@@ -1,9 +1,9 @@
-from enum import Enum
 import os
-from multiprocessing import shared_memory
 import ctypes
 import z3
 import logging
+from enum import Enum
+from multiprocessing import shared_memory
 
 from defs import *
 

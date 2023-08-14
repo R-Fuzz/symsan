@@ -43,9 +43,9 @@ def get_score(testcase):
     score4 = testcase
     return (score1, score2, score3, score4)
 
-def testcase_compare(a, b):
-    a_score = get_score(a)
-    b_score = get_score(b)
+def testcase_compare(a, b, seed_dir):
+    a_score = get_score(os.path.join(seed_dir, a))
+    b_score = get_score(os.path.join(seed_dir, b))
     return 1 if a_score > b_score else -1
 
 def get_afl_cmd(fuzzer_stats):
@@ -260,7 +260,9 @@ class Mazerunner:
                     files.append(name)
                     self.state.synced.add(name)
         return sorted(files,
-                      key=functools.cmp_to_key(testcase_compare),
+                      key=functools.cmp_to_key(
+                          (lambda a, b: testcase_compare(a, b, self.afl_queue))
+                          ),
                       reverse=reversed_order)
 
     def sync_from_initial_seeds(self):
@@ -275,7 +277,7 @@ class Mazerunner:
 
     def sync_from_either(self):
         files = self.sync_from_afl()
-        if not files:
+        if not files and not self.afl_queue:
             files = self.sync_from_initial_seeds()
         return files
 
@@ -288,7 +290,7 @@ class Mazerunner:
         # segfault or abort
         if (retcode in [128 + 11, -11, 128 + 6, -6]):
             shutil.copy2(fp, os.path.join(self.my_errors, fn))
-            self.report_error(fp, log)
+            self._report_error(fp, log)
 
     def handle_empty_files(self):
         if len(self.state.hang) > self.config.min_hang_files:
@@ -472,7 +474,8 @@ class ExploreExecutor(Mazerunner):
         if is_closer:
             self.logger.info(f"Explore agent found closer seed. "
                          f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
-        is_interesting = is_closer or self.minimizer.has_new_sa(len(self.agent.model.visited_sa))
+        is_interesting = fn not in self.state.synced and (is_closer 
+                          or self.minimizer.has_new_sa(len(self.agent.model.visited_sa)))
         if self.afl_queue and is_interesting:
             self.logger.info("Sync back: %s" % fn)
             dst_fp = os.path.join(self.my_queue, fn)
@@ -587,6 +590,9 @@ class RecordExecutor(Mazerunner):
         self.agent = RecordAgent(config)
 
     def sync_back_if_interesting(self, fp, res):
+        pass
+
+    def handle_return_status(self, retcode, log, fp):
         pass
 
     def _run(self):

@@ -20,7 +20,7 @@ COUNT_CLASS_LOOKUP = [
 ]
 
 def bucket_lookup(c):
-    if c > 256:
+    if c > 255:
         return 256
     return COUNT_CLASS_LOOKUP[c]
 

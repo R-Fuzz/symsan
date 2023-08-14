@@ -59,7 +59,7 @@ class Agent:
     def model(self, m):
         self._model = m
     def save_model(self):
-        if self.config.mazerunner_dir:
+        if self.config.mazerunner_dir and self._model:
             self._model.save()
 
     @property

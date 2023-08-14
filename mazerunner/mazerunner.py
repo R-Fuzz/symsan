@@ -36,11 +36,11 @@ def check_args(args):
     if not os.path.isdir(args.output_dir):
         raise ValueError('{args.output} no such directory')
     if args.afl_dir:
+        # wait for afl fuzzer to start and initialize itself
+        time.sleep(5)
         afl_path = os.path.join(args.output_dir, args.afl_dir)
         if not args.input and not os.path.isdir(afl_path):
-            time.sleep(5)
-            if not os.path.isdir(afl_path):
-                raise ValueError('{args.afl_dir} no such directory')
+            raise ValueError('{args.afl_dir} no such directory')
 
 def main():
     random.seed(time.time())
