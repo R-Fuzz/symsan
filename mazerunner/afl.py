@@ -68,6 +68,7 @@ class MazerunnerState:
         self.crashes = set()
         self.testscases_md5 = set()
         self.index = 0
+        self.execs = 0
         self.num_error_reports = 0
         self.num_crash_reports = 0
         self._seed_queue = []
@@ -212,16 +213,15 @@ class Mazerunner:
         return os.path.join(self.my_dir, "dictionary")
 
     def run(self, run_once=False):
-        i = 0
         while not self.reached_resource_limit:
             self._run()
             if run_once:
                 break
-            if i % self.config.save_frequency == 0:
+            if self.state.execs % self.config.save_frequency == 0:
                 self._export_state()
-            i += 1
 
     def run_file(self, fn):
+        self.state.execs += 1
         # copy the test case
         fp = os.path.join(self.my_generations, fn)
         shutil.copy2(fp, self.cur_input)
@@ -442,22 +442,17 @@ class ExploreExecutor(Mazerunner):
         self.agent = ExploreAgent(self.config)
         self.sync_frequency = self.config.sync_frequency
 
-    def run_single_file(self, fn):
-        self.run_file(fn)
-        # start RL training after symsan executor finishes
-        self.agent.replay_trace(self.agent.episode)
-        self.state.processed.add(fn)
-
     def dry_run(self):
         files = self.sync_from_either()
         for seed in files:
-            self.run_single_file(seed)
+            self._run_single_file(seed)
 
     def update_timmer(self, res):
         self.state.explore_ce_time += res.total_time/1000
     
     def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
+        ts = int(time.time() - self.state.start_ts)
         # rename or delete generated testcases from fp
         for t in res.generated_testcases:
             testcase = os.path.join(self.my_generations, t)
@@ -466,14 +461,14 @@ class ExploreExecutor(Mazerunner):
                 continue
             index = self.state.tick()
             target = fn[len("id:"):len("id:......")] if len(fn) >= len("id:......") else fn
-            filename = "id:%06d,src:%s,explore" % (index, target)
+            filename = f"id:{index:06},src:{target},time:{ts},execs:{self.state.execs},explore"
             shutil.move(testcase, os.path.join(self.my_generations, filename))
             self.state.put_seed(filename, res.distance)
         # syn back to AFL queue if it's interesting
         is_closer = self.minimizer.has_closer_distance(res.distance, fn)
         if is_closer:
             self.logger.info(f"Explore agent found closer seed. "
-                         f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
+                         f"fn: {fn}, distance: {res.distance}, ts: {ts}")
         is_interesting = fn not in self.state.synced and (is_closer 
                           or self.minimizer.has_new_sa(len(self.agent.model.visited_sa)))
         if self.afl_queue and is_interesting:
@@ -493,7 +488,13 @@ class ExploreExecutor(Mazerunner):
             return
         next_seed = self.state.get_seed()
         if not next_seed in self.state.processed:
-            self.run_single_file(next_seed)
+            self._run_single_file(next_seed)
+
+    def _run_single_file(self, fn):
+        self.run_file(fn)
+        # start RL training after symsan executor finishes
+        self.agent.replay_trace(self.agent.episode)
+        self.state.processed.add(fn)
 
 class ExploitExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
@@ -552,13 +553,14 @@ class ExploitExecutor(Mazerunner):
         fn = os.path.basename(fp)
         index = self.state.tick()
         target = get_id_from_fn(fn)
-        dst_fn = "id:%06d,src:%s,exploit" % (index, target)
+        ts = int(time.time() - self.state.start_ts)
+        dst_fn = f"id:{index:06},src:{target},time:{ts},execs:{self.state.execs},exploit"
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
             self.logger.info(f"Exploit agent found closer seed. "
-                            f"fn: {fn}, distance: {res.distance}, ts: {time.time()}")
+                            f"fn: {fn}, distance: {res.distance}, ts: {ts}")
         is_interesting = is_closer or self.minimizer.has_new_sa(len(self.agent.model.visited_sa))
         if is_interesting:
             self.state.put_seed(dst_fn, res.distance)
@@ -648,11 +650,9 @@ class HybridExecutor():
 
     def run(self):
         self.explore_executor.dry_run()
-        i = 0
         while not self.reached_resource_limit:
-            if i % self.config.save_frequency == 0:
+            if self.state.execs % self.config.save_frequency == 0:
                 self._export_state()
-            i += 1
             if (self.explore_executor.state.discovered_closer_seed 
                 or not self.exploit_executor.has_converged):
                 self.exploit_executor.run(run_once=True)
