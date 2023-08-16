@@ -2,8 +2,6 @@ import logging
 import os
 import collections
 import pickle
-import subprocess
-import utils
 import random
 
 from config import Config
@@ -117,7 +115,7 @@ class Agent:
         self.curr_state.update(msg.addr, msg.context, action, d)
 
     def _make_dirs(self):
-        utils.mkdir(self.my_traces)
+        mkdir(self.my_traces)
 
     def _compute_reward(self, d, last_d):
         reward = 0

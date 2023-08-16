@@ -15,9 +15,15 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     config = Config()
     config.gep_solver_enabled = True
-    config.cmd = [sys.argv[1], AT_FILE]
+    config.cmd = [sys.argv[1]]
+    if 'BIN_ARGS' in os.environ:
+        xargs = os.environ['BIN_ARGS'].split(' ')
+        config.cmd += xargs
+    config.cmd.append(AT_FILE)
     output_seed_dir = "."
     options = os.environ['TAINT_OPTIONS']
+    if "debug=1" in options:
+        logging.basicConfig(level=logging.DEBUG)
     if "output_dir=" in options:
         output_seed_dir = options.split("output_dir=")[1].split(":")[0].split(" ")[0]
     fastgen_agent = Agent(config)
