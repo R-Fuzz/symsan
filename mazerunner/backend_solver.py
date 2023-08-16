@@ -358,6 +358,9 @@ class Z3Solver:
             index_bv = self.serializer.to_z3_expr(gmsg.index_label, inputs)
         except Serializer.InvalidData:
             return
+        except Exception as e:
+            self.logger.critical(f"handle_gep: unknown error={e}")
+            return
         self.__collect_constraints(inputs)
         if self.__z3_solver.check() != z3.sat:
             self.logger.error(f"handle_gep: pre-condition is unsat")
@@ -386,11 +389,17 @@ class Z3Solver:
                         bs = self.serializer.to_z3_expr(bounds.l2, dummy)  # size label
                     except Serializer.InvalidData:
                         return
+                    except Exception as e:
+                        self.logger.critical(f"handle_gep: unknown error={e}")
+                        return
                     if bounds.l1:
                         dummy.clear()
                         try:
                             be = self.serializer.to_z3_expr(bounds.l1, dummy)  # elements label
                         except Serializer.InvalidData:
+                            return
+                        except Exception as e:
+                            self.logger.critical(f"handle_gep: unknown error={e}")
                             return
                         bs = bs * be
                     e = z3.UGT(idx * es * co, bs)  # unsigned greater than
@@ -526,6 +535,9 @@ class Z3Solver:
         try:
             cond = self.serializer.to_z3_expr(label, inputs)
         except Serializer.InvalidData:
+            return
+        except Exception as e:
+            self.logger.critical(f"__solve_cond: unknown error={e}")
             return
         self.__collect_constraints(inputs)
         if self.__z3_solver.check() != z3.sat:
