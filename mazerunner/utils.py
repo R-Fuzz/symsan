@@ -5,6 +5,7 @@ import subprocess
 import time
 
 AT_FILE = "@@"
+MILLION_SECONDS_SCALE = 1000
 MAX_BUCKET_SIZE = 256
 COUNT_CLASS_LOOKUP = [
     i if i <= 32 else

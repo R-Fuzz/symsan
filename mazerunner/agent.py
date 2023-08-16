@@ -128,8 +128,7 @@ class Agent:
 class RecordAgent(Agent):
 
     def handle_new_state(self, msg, action):
-        d = msg.avg_dist
-        self.curr_state.update(msg.addr, msg.context, action, d)
+        self.update_curr_state(msg, action)
         self.append_episode()
 
     def is_interesting_branch(self):

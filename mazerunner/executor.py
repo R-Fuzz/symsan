@@ -13,7 +13,6 @@ import utils
 from agent import ExploitAgent, ReplayAgent, RecordAgent
 
 UNION_TABLE_SIZE = 0xc00000000
-MILLION_SECONDS_SCALE = 1000
 
 class MsgType(Enum):
     cond_type = 0
@@ -56,8 +55,8 @@ class SymSanExecutor:
             self.solving_time = 0
 
         def execution_timeout(self, timeout):
-            return ((int(time.time() * MILLION_SECONDS_SCALE) - self.proc_start_time)
-                    - self.solving_time >= timeout * MILLION_SECONDS_SCALE)
+            return ((int(time.time() * utils.MILLION_SECONDS_SCALE) - self.proc_start_time)
+                    - self.solving_time >= timeout * utils.MILLION_SECONDS_SCALE)
 
     def __init__(self, config, agent, output_dir):
         self.config = config
@@ -102,7 +101,7 @@ class SymSanExecutor:
         if self.proc and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
-            self.timer.proc_end_time = int(time.time() * MILLION_SECONDS_SCALE)
+            self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
 
     def get_result(self):
         # TODO: implement stream reader thread in case the subprocess closes
@@ -138,7 +137,7 @@ class SymSanExecutor:
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
             if len(msg_data) < ctypes.sizeof(pipe_msg):
                 break
-            start_time = int(time.time() * MILLION_SECONDS_SCALE)
+            start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:
                 if self.__process_cond_request(msg) and self.onetime_solving_enabled:
@@ -156,9 +155,9 @@ class SymSanExecutor:
             else:
                 self.logger.error(f"process_request: Unknown message type: {msg.msg_type}",
                                   file=sys.stderr)
-            end_time = int(time.time() * MILLION_SECONDS_SCALE)
+            end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             self.timer.solving_time += end_time - start_time
-        self.timer.proc_end_time = int(time.time() * MILLION_SECONDS_SCALE)
+        self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
 
     def run(self, timeout=None):
         # create and execute the child symsan process
@@ -172,7 +171,7 @@ class SymSanExecutor:
             cmd = ["timeout", "-k", str(5), str(timeout)] + cmd
         try:
             self.logger.debug("Executing %s" % ' '.join(cmd))
-            self.timer.proc_start_time = int(time.time() * MILLION_SECONDS_SCALE)
+            self.timer.proc_start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             if stdin:
                 # the symsan proc reads the input from stdin
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,

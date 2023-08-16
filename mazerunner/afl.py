@@ -240,11 +240,12 @@ class Mazerunner:
         finally:
             symsan.tear_down()
         symsan_res = symsan.get_result()
-        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d"
+        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, distance=%d"
                      % (symsan_res.total_time,
                         symsan_res.emulation_time,
                         symsan_res.solving_time,
-                        symsan_res.returncode))
+                        symsan_res.returncode,
+                        symsan_res.distance))
         return symsan_res
 
     def update_timmer(self, res):
@@ -452,7 +453,7 @@ class ExploreExecutor(Mazerunner):
     
     def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
-        ts = int(time.time() - self.state.start_ts)
+        ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
         # rename or delete generated testcases from fp
         for t in res.generated_testcases:
             testcase = os.path.join(self.my_generations, t)
@@ -529,8 +530,13 @@ class ExploitExecutor(Mazerunner):
                 emulation_time += symsan_res.emulation_time
                 solving_time += symsan_res.solving_time
         symsan_res.update_time(total_time, solving_time)
-        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, flipped=%d times"
-                     % (total_time, emulation_time, solving_time, symsan_res.returncode, len(self.agent.all_targets)))
+        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, Distance=%d, flipped=%d times"
+                     % (total_time,
+                        emulation_time,
+                        solving_time,
+                        symsan_res.returncode,
+                        symsan_res.distance,
+                        len(self.agent.all_targets)))
         # target might still be reachable due to hitting max_flip_num
         if self.agent.target[0] and not has_reached_max_flip_num():
             self.agent.handle_unsat_condition()
@@ -553,7 +559,7 @@ class ExploitExecutor(Mazerunner):
         fn = os.path.basename(fp)
         index = self.state.tick()
         target = get_id_from_fn(fn)
-        ts = int(time.time() - self.state.start_ts)
+        ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
         dst_fn = f"id:{index:06},src:{target},time:{ts},execs:{self.state.execs},exploit"
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)

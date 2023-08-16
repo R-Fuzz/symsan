@@ -10,7 +10,7 @@ NEW = 0
 OLD = 1
 CRASH = 2
 
-TIMEOUT = 5 * 1000
+TIMEOUT = 5 * utils.MILLION_SECONDS_SCALE
 MAP_SIZE = 65536
 
 def read_bitmap_file(bitmap_file):

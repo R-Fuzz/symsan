@@ -12,7 +12,7 @@ if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: {} target input".format(sys.argv[0]), file=sys.stderr)
         sys.exit(1)
-    logging.basicConfig(level=logging.INFO)
+
     config = Config()
     config.gep_solver_enabled = True
     config.cmd = [sys.argv[1]]
@@ -20,12 +20,16 @@ if __name__ == "__main__":
         xargs = os.environ['BIN_ARGS'].split(' ')
         config.cmd += xargs
     config.cmd.append(AT_FILE)
-    output_seed_dir = "."
+
     options = os.environ['TAINT_OPTIONS']
     if "debug=1" in options:
         logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+    output_seed_dir = "."
     if "output_dir=" in options:
         output_seed_dir = options.split("output_dir=")[1].split(":")[0].split(" ")[0]
+
     fastgen_agent = Agent(config)
     symsan = SymSanExecutor(config, fastgen_agent, output_seed_dir)
     symsan.setup(sys.argv[2])
