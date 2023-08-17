@@ -7,7 +7,10 @@ from utils import mkdir
 class RLModel:
     def __init__(self, config):
         self.config = config
-        self.init()
+        self.visited_sa = collections.Counter()
+        self.all_target_sa = set()
+        self.unreachable_sa = set()
+        self.Q_table = {}
         if config.mazerunner_dir:
             mkdir(self.my_dir)
             self.load()
@@ -15,12 +18,6 @@ class RLModel:
     @property
     def my_dir(self):
         return os.path.join(self.config.mazerunner_dir, "model")
-
-    def init(self):
-        self.visited_sa = collections.Counter()
-        self.all_target_sa = set()
-        self.unreachable_sa = set()
-        self.Q_table = {}
 
     def save(self):
         with open(os.path.join(self.my_dir, "visited_sa"), 'wb') as fp:

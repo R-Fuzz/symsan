@@ -31,7 +31,7 @@ def check_args(args):
         raise ValueError("no cmd provided")
     if args.agent_type == "qsym" and not args.afl_dir:
         raise ValueError("You must provide -a option")
-    if not args.input and not args.afl_dir:
+    if args.agent_type != "replay" and not args.input and not args.afl_dir:
         raise ValueError("You must provide either -i or -a option")
     if not os.path.isdir(args.output_dir):
         raise ValueError('{args.output} no such directory')
