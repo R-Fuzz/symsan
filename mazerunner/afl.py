@@ -218,7 +218,7 @@ class Mazerunner:
             if run_once:
                 break
             if self.state.execs % self.config.save_frequency == 0:
-                self._export_state()
+                self.export_state()
 
     def run_file(self, fn):
         self.state.execs += 1
@@ -322,6 +322,12 @@ class Mazerunner:
     def cleanup(self):
         self.minimizer.cleanup()
 
+    def export_state(self):
+        self.state.end_ts = time.time()
+        with open(self.metadata, "wb") as fp:
+            pickle.dump(self.state, fp, protocol=pickle.HIGHEST_PROTOCOL)
+        self.agent.save_model()
+
     def _make_dirs(self):
         utils.mkdir(self.my_queue)
         utils.mkdir(self.my_hangs)
@@ -345,13 +351,7 @@ class Mazerunner:
                 self.state = pickle.load(f)
         else:
             self.state = MazerunnerState(self.config.timeout)
-        atexit.register(self._export_state)
-
-    def _export_state(self):
-        self.state.end_ts = time.time()
-        with open(self.metadata, "wb") as fp:
-            pickle.dump(self.state, fp, protocol=pickle.HIGHEST_PROTOCOL)
-        self.agent.save_model()
+        atexit.register(self.export_state)
 
     def _send_mail(self, subject, info, attach=None):
         if attach is None:
@@ -629,7 +629,10 @@ class ReplayExecutor(Mazerunner):
         for fn in files:
             fp = os.path.join(self.agent.my_traces, fn)
             self.agent.replay_log(fp)
-            self.state.processed.add(fn)
+            self.state.execs += 1
+            if self.state.execs % self.config.save_frequency == 0:
+                self.export_state()
+        self.state.execs = 0
 
 class HybridExecutor():
     def __init__(self, config):
