@@ -109,7 +109,8 @@ class Agent:
         if has_dist:
             d = msg.avg_dist
         else:
-            d = None
+            # msg.bb_dist and msg.avg_dist are zero, assign the last distance available
+            d = self.curr_state.d
         if d and d < self.min_distance:
             self.min_distance = d
         self.curr_state.update(msg.addr, msg.context, action, d)
@@ -118,11 +119,9 @@ class Agent:
         mkdir(self.my_traces)
 
     def _compute_reward(self, d, last_d):
-        reward = 0
-        if d and last_d:
-            assert (d <= self.max_distance and d >= 0 and
-                    last_d <= self.max_distance and last_d >= 0)
-            reward = last_d - d
+        assert (d <= self.max_distance and d >= 0 and
+                last_d <= self.max_distance and last_d >= 0)
+        reward = last_d - d
         return reward
 
 class RecordAgent(Agent):
