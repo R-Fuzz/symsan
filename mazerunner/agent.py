@@ -16,12 +16,11 @@ class ProgramState:
         self.state = (0,0,0)
         self.action = 0
         self.d = distance
-        self.edge_counter = collections.Counter()
+        self.pc_counter = collections.Counter()
     
     def update(self, pc, callstack, action, distance):
-        edge = (self.state[0], pc, callstack)
-        self.edge_counter.update([edge])
-        self.state = (pc, callstack, bucket_lookup(self.edge_counter[edge]))
+        self.pc_counter.update([(pc, callstack)])
+        self.state = (pc, callstack, bucket_lookup(self.pc_counter[(pc, callstack)]))
         self.action = action
         self.d = distance
 

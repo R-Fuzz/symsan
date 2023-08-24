@@ -270,7 +270,7 @@ class Mazerunner:
         files = []
         for name in os.listdir(self.config.initial_seed_dir):
             path = os.path.join(self.config.initial_seed_dir, name)
-            if os.path.isfile(path) and not name in self.state.synced:
+            if os.path.isfile(path) and not name in self.state.processed:
                 shutil.copy2(path, os.path.join(self.my_generations, name))
                 files.append(name)
                 self.state.synced.add(name)
@@ -481,7 +481,7 @@ class ExploreExecutor(Mazerunner):
     def _run(self):
         if (self.state.is_queue_empty()
             or self.state.processed_num % self.sync_frequency == 0):
-            files = self.sync_from_either()
+            files = self.sync_from_afl()
             for fn in files:
                 self.state.put_seed(fn, 0)
         if self.state.is_queue_empty():
@@ -609,6 +609,7 @@ class RecordExecutor(Mazerunner):
             self.handle_empty_files()
             return
         for fn in files:
+            self.state.timeout = self.config.timeout / 6
             self.run_file(fn)
             self.state.processed.add(fn)
             self.agent.save_trace(fn)
