@@ -127,8 +127,8 @@ class SymSanExecutor:
 
     def process_request(self):
         self.timer.solving_time = 0
-        should_not_handle = False
-        while not should_not_handle:
+        should_handle = True
+        while should_handle and (self.proc and self.proc.poll() is None):
             if self.timer.execution_timeout(self.config.timeout/10):
                 self.kill_proc()
                 exec_time = self.timer.proc_end_time - self.timer.proc_start_time - self.timer.solving_time
@@ -141,7 +141,7 @@ class SymSanExecutor:
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:
                 if self.__process_cond_request(msg) and self.onetime_solving_enabled:
-                    should_not_handle = True
+                    should_handle = False
                 if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
                     self.logger.debug(f"Loop handle_loop_exit: id={msg.id}, target={hex(msg.addr)}")
             elif msg.msg_type == MsgType.gep_type.value:
@@ -194,22 +194,23 @@ class SymSanExecutor:
         os.close(self.pipefds[1])
 
     def __process_cond_request(self, msg):
-        if msg.label:
-            state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
-            if len(state_data) < ctypes.sizeof(mazerunner_msg):
-                self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
-                return False
-            state_msg = mazerunner_msg.from_buffer_copy(state_data)
-            self.agent.handle_new_state(state_msg, msg.result)
-            is_interesting = self.agent.is_interesting_branch()
-            if not self.record_replay_mode_enabled:
-                try:
-                    self.solver.handle_cond(msg, is_interesting)
-                except ConditionUnsat:
-                    self.agent.handle_unsat_condition()
-                    return False
-                return is_interesting
-        return False
+        if not msg.label:
+            return False
+        state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
+        if len(state_data) < ctypes.sizeof(mazerunner_msg):
+            self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
+            return False
+        state_msg = mazerunner_msg.from_buffer_copy(state_data)
+        self.agent.handle_new_state(state_msg, msg.result)
+        if self.record_replay_mode_enabled:
+            return False
+        is_interesting = self.agent.is_interesting_branch()
+        try:
+            self.solver.handle_cond(msg, is_interesting)
+        except ConditionUnsat:
+            self.agent.handle_unsat_condition()
+            return False
+        return is_interesting
 
     def __process_gep_request(self, msg):
         gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))

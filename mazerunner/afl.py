@@ -609,7 +609,6 @@ class RecordExecutor(Mazerunner):
             self.handle_empty_files()
             return
         for fn in files:
-            self.state.timeout = 3
             self.run_file(fn)
             self.state.processed.add(fn)
             self.agent.save_trace(fn)
