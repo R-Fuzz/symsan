@@ -1,6 +1,7 @@
 from enum import Enum
 import os
 import sys
+import fcntl
 from multiprocessing import shared_memory
 import subprocess
 import ctypes
@@ -13,6 +14,7 @@ import utils
 from agent import ExploitAgent, ReplayAgent, RecordAgent
 
 UNION_TABLE_SIZE = 0xc00000000
+PIPE_CAPACITY = 1048576 # 1 MB
 
 class MsgType(Enum):
     cond_type = 0
@@ -55,8 +57,10 @@ class SymSanExecutor:
             self.solving_time = 0
 
         def execution_timeout(self, timeout):
-            return ((int(time.time() * utils.MILLION_SECONDS_SCALE) - self.proc_start_time)
-                    - self.solving_time >= timeout * utils.MILLION_SECONDS_SCALE)
+            curr_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            total_time = curr_time - self.proc_start_time
+            emulation_time = total_time - self.solving_time 
+            return total_time >= timeout or emulation_time >= (timeout / 10) * utils.MILLION_SECONDS_SCALE
 
     def __init__(self, config, agent, output_dir):
         self.config = config
@@ -120,6 +124,10 @@ class SymSanExecutor:
             sys.exit(1)
         # pipefds[0] for read, pipefds[1] for write
         self.pipefds = os.pipe()
+        # increasing pipe capacity requires higher privilege
+        # use '--security-opt seccomp=unconfined' flag to run docker container
+        fcntl.fcntl(self.pipefds[0], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
+        fcntl.fcntl(self.pipefds[1], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
         self.solver = Z3Solver(self.config, self.shm, self.input_file, 
                                self.testcase_dir, 0, session_id)
         self.agent.reset()
@@ -128,8 +136,8 @@ class SymSanExecutor:
     def process_request(self):
         self.timer.solving_time = 0
         should_handle = True
-        while should_handle and (self.proc and self.proc.poll() is None):
-            if self.timer.execution_timeout(self.config.timeout/10):
+        while should_handle:
+            if self.timer.execution_timeout(self.config.timeout):
                 self.kill_proc()
                 exec_time = self.timer.proc_end_time - self.timer.proc_start_time - self.timer.solving_time
                 self.logger.info(f"sym_proc timeout {exec_time}ms, process killed")
