@@ -59,8 +59,9 @@ class SymSanExecutor:
         def execution_timeout(self, timeout):
             curr_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             total_time = curr_time - self.proc_start_time
-            emulation_time = total_time - self.solving_time 
-            return total_time >= timeout or emulation_time >= (timeout / 10) * utils.MILLION_SECONDS_SCALE
+            emulation_time = total_time - self.solving_time
+            return (total_time >= timeout * utils.MILLION_SECONDS_SCALE
+                    or emulation_time >= (timeout / 10) * utils.MILLION_SECONDS_SCALE)
 
     def __init__(self, config, agent, output_dir):
         self.config = config
