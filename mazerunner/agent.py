@@ -89,10 +89,15 @@ class Agent:
         last_SA = None
         last_reward = 0
         last_d = self.max_distance
-        for (next_s, a, d) in trace:
+        min_distance = self.max_distance
+        for i, (next_s, a, d) in enumerate(trace):
             next_sa = next_s + (a,)
             self.model.add_visited_sa(next_sa)
             reward = self._compute_reward(d, last_d)
+            if d < min_distance:
+                min_distance = d
+            if i == len(trace) - 2 and min_distance > 0:
+                reward = -self.max_distance
             if last_SA:
                 self.learner.learn(last_SA, next_s, last_reward)
                 self.logger.debug(f"last_SA: {last_SA}, "
