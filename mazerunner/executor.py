@@ -1,12 +1,12 @@
-from enum import Enum
 import os
 import sys
 import fcntl
-from multiprocessing import shared_memory
 import subprocess
 import ctypes
 import logging
 import time
+from enum import Enum
+from multiprocessing import shared_memory
 
 from backend_solver import Z3Solver, ConditionUnsat
 from defs import *
@@ -14,7 +14,7 @@ import utils
 from agent import ExploitAgent, ReplayAgent, RecordAgent
 
 UNION_TABLE_SIZE = 0xc00000000
-PIPE_CAPACITY = 1048576 # 1 MB
+PIPE_CAPACITY = 4 * 1024 * 1024
 
 class MsgType(Enum):
     cond_type = 0
@@ -24,11 +24,13 @@ class MsgType(Enum):
     loop_type = 4
 
 class ExecutorResult:
-    def __init__(self, total_time, solving_time, dist, returncode, out, err, testcases):
-        self.returncode = returncode
+    def __init__(self, total_time, solving_time, dist,
+                 returncode, msg_num, testcases, out, err):
         self.total_time = total_time
         self.solving_time = solving_time
         self.distance = dist
+        self.returncode = returncode
+        self.symsan_msg_num = msg_num
         self.generated_testcases = testcases
         self.stdout = out.read() if out else "Output not available"
         self.stderr = err.read() if err else "Unknown error"
@@ -59,15 +61,14 @@ class SymSanExecutor:
         def execution_timeout(self, timeout):
             curr_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             total_time = curr_time - self.proc_start_time
-            emulation_time = total_time - self.solving_time
-            return (total_time >= timeout * utils.MILLION_SECONDS_SCALE
-                    or emulation_time >= (timeout / 10) * utils.MILLION_SECONDS_SCALE)
+            return total_time >= timeout * utils.MILLION_SECONDS_SCALE
 
     def __init__(self, config, agent, output_dir):
         self.config = config
         self.cmd = config.cmd
         self.agent = agent
         self.timer = SymSanExecutor.Timer()
+        self.msg_num = 0
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logging_level = config.logging_level
         # resources
@@ -106,14 +107,14 @@ class SymSanExecutor:
         if self.proc and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
-            self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+        self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
 
     def get_result(self):
         # TODO: implement stream reader thread in case the subprocess closes
             return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
                                   self.timer.solving_time, self.agent.min_distance, 
-                                  self.proc.returncode, self.proc.stdin,
-                                  self.proc.stderr, self.solver.generated_files)
+                                  self.proc.returncode, self.msg_num, 
+                                  self.solver.generated_files, self.proc.stdin, self.proc.stderr)
 
     def setup(self, input_file, session_id=0):
         self.input_file = input_file
@@ -123,38 +124,67 @@ class SymSanExecutor:
         except:
             self.logger.critical(f"setup: Failed to map shm({self.shm._fd}), size(shm.size)")
             sys.exit(1)
-        # pipefds[0] for read, pipefds[1] for write
-        self.pipefds = os.pipe()
-        # increasing pipe capacity requires higher privilege
-        # use '--security-opt seccomp=unconfined' flag to run docker container
-        fcntl.fcntl(self.pipefds[0], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
-        fcntl.fcntl(self.pipefds[1], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
+        self._setup_pipe()
         self.solver = Z3Solver(self.config, self.shm, self.input_file, 
                                self.testcase_dir, 0, session_id)
         self.agent.reset()
         self.timer.reset()
 
+    def run(self, timeout=None):
+        # create and execute the child symsan process
+        logging_level = 1 if self.logging_level == logging.DEBUG else 0
+        options = (f"taint_file=\"{self.input_file}\""
+        f":shm_fd={self.shm._fd}"
+        f":pipe_fd={self.pipefds[1]}"
+        f":debug={logging_level}")
+        cmd, stdin = utils.fix_at_file(self.cmd, self.input_file)
+        if timeout:
+            cmd = ["timeout", "-k", str(1), str(timeout)] + cmd
+        try:
+            self.logger.debug("Executing %s" % ' '.join(cmd))
+            self.timer.proc_start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            if stdin:
+                # the symsan proc reads the input from stdin
+                self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             env={"TAINT_OPTIONS": options},
+                                             pass_fds=(self.shm._fd, self.pipefds[1]))
+                self.proc.stdin.write(stdin.encode())
+                self.proc.stdin.flush()
+            else:
+                # the symsan proc reads the input from file stream
+                self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             env={"TAINT_OPTIONS": options},
+                                             pass_fds=(self.shm._fd, self.pipefds[1]))
+        except:
+            self.logger.critical(f"run: Failed to execute subprocess, "
+                                 f"input: {self.input_file}, cmd: {' '.join(cmd)}")
+            self.tear_down()
+            sys.exit(1)
+        os.close(self.pipefds[1])
+
     def process_request(self):
         self.timer.solving_time = 0
         should_handle = True
+        self.msg_num = 0
         while should_handle:
             if self.timer.execution_timeout(self.config.timeout):
                 self.kill_proc()
-                exec_time = self.timer.proc_end_time - self.timer.proc_start_time - self.timer.solving_time
-                self.logger.info(f"sym_proc timeout {exec_time}ms, process killed")
-                return
+                self.logger.info(f"symsan proc timeout, process killed")
+                break
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
             if len(msg_data) < ctypes.sizeof(pipe_msg):
                 break
             start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             msg = pipe_msg.from_buffer_copy(msg_data)
             if msg.msg_type == MsgType.cond_type.value:
-                if self.__process_cond_request(msg) and self.onetime_solving_enabled:
+                if self._process_cond_request(msg) and self.onetime_solving_enabled:
                     should_handle = False
                 if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
                     self.logger.debug(f"Loop handle_loop_exit: id={msg.id}, target={hex(msg.addr)}")
             elif msg.msg_type == MsgType.gep_type.value:
-                self.__process_gep_request(msg)
+                self._process_gep_request(msg)
             elif msg.msg_type == MsgType.memcmp_type.value:
                 self.solver.handle_memcmp(msg, self.pipefds[0])
             elif msg.msg_type == MsgType.loop_type.value:
@@ -166,43 +196,9 @@ class SymSanExecutor:
                                   file=sys.stderr)
             end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             self.timer.solving_time += end_time - start_time
-        self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            self.msg_num += 1
 
-    def run(self, timeout=None):
-        # create and execute the child symsan process
-        logging_level = 1 if self.logging_level == logging.DEBUG else 0
-        options = (f"taint_file=\"{self.input_file}\""
-        f":shm_fd={self.shm._fd}"
-        f":pipe_fd={self.pipefds[1]}"
-        f":debug={logging_level}")
-        cmd, stdin = utils.fix_at_file(self.cmd, self.input_file)
-        if timeout:
-            cmd = ["timeout", "-k", str(5), str(timeout)] + cmd
-        try:
-            self.logger.debug("Executing %s" % ' '.join(cmd))
-            self.timer.proc_start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
-            if stdin:
-                # the symsan proc reads the input from stdin
-                self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                             env={"TAINT_OPTIONS": options},
-                                             pass_fds=(self.shm._fd, self.pipefds[1]))
-                self.proc.stdin.write(stdin.encode())
-                self.proc.stdin.flush()
-            else:
-                # the symsan proc reads the input from file stream
-                self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                             env={"TAINT_OPTIONS": options},
-                                             pass_fds=(self.shm._fd, self.pipefds[1]))
-        except:
-            self.logger.critical(f"run: Failed to execute subprocess, "
-                                 f"input: {self.input_file}, cmd: {' '.join(cmd)}")
-            self.tear_down()
-            sys.exit(1)
-        os.close(self.pipefds[1])
-
-    def __process_cond_request(self, msg):
+    def _process_cond_request(self, msg):
         if not msg.label:
             return False
         state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
@@ -221,7 +217,7 @@ class SymSanExecutor:
             return False
         return is_interesting
 
-    def __process_gep_request(self, msg):
+    def _process_gep_request(self, msg):
         gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))
         if len(gep_data) < ctypes.sizeof(gep_msg):
             self.logger.error(f"__process_gep_request: GEP message too small: {len(gep_data)}")
@@ -236,3 +232,17 @@ class SymSanExecutor:
                 self.solver.handle_gep(gmsg, msg.addr)
             except ConditionUnsat:
                 self.logger.error(f"__process_gep_request: GEP condition unsat")
+
+    def _setup_pipe(self):
+        # pipefds[0] for read, pipefds[1] for write
+        self.pipefds = os.pipe()
+        pipe_capacity = fcntl.fcntl(self.pipefds[0], fcntl.F_GETPIPE_SZ)
+        if pipe_capacity >= PIPE_CAPACITY:
+            return
+        try:
+            fcntl.fcntl(self.pipefds[0], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
+            fcntl.fcntl(self.pipefds[1], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
+        except PermissionError:
+            self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. "
+                                f"Try to use '--security-opt seccomp=unconfined' flag "
+                                f"if running inside docker container")

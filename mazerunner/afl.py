@@ -240,12 +240,15 @@ class Mazerunner:
         finally:
             symsan.tear_down()
         symsan_res = symsan.get_result()
-        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, distance=%d"
-                     % (symsan_res.total_time,
-                        symsan_res.emulation_time,
-                        symsan_res.solving_time,
-                        symsan_res.returncode,
-                        symsan_res.distance))
+        self.logger.info(
+            f"Total={symsan_res.total_time}ms, "
+            f"Emulation={symsan_res.emulation_time}ms, "
+            f"Solver={symsan_res.solving_time}ms, "
+            f"Return={symsan_res.returncode}, "
+            f"Distance={symsan_res.distance}, "
+            f"Episode_length={len(self.agent.episode)}, "
+            f"Msg_count={symsan_res.symsan_msg_num}. "
+        )
         return symsan_res
 
     def update_timmer(self, res):
@@ -481,7 +484,7 @@ class ExploreExecutor(Mazerunner):
     def _run(self):
         if (self.state.is_queue_empty()
             or self.state.processed_num % self.sync_frequency == 0):
-            files = self.sync_from_afl()
+            files = self.sync_from_either()
             for fn in files:
                 self.state.put_seed(fn, 0)
         if self.state.is_queue_empty():
@@ -530,13 +533,16 @@ class ExploitExecutor(Mazerunner):
                 emulation_time += symsan_res.emulation_time
                 solving_time += symsan_res.solving_time
         symsan_res.update_time(total_time, solving_time)
-        self.logger.info("Total=%dms, Emulation=%dms, Solver=%dms, Return=%d, Distance=%d, flipped=%d times"
-                     % (total_time,
-                        emulation_time,
-                        solving_time,
-                        symsan_res.returncode,
-                        symsan_res.distance,
-                        len(self.agent.all_targets)))
+        self.logger.info(
+            f"Total={total_time}ms, "
+            f"Emulation={emulation_time}ms, "
+            f"Solver={solving_time}ms, "
+            f"Return={symsan_res.returncode}, "
+            f"Distance={symsan_res.distance}, "
+            f"Episode_length={len(self.agent.episode)}, "
+            f"Msg_count={symsan_res.symsan_msg_num}, "
+            f"flipped={len(self.agent.all_targets)} times. "
+        )
         # target might still be reachable due to hitting max_flip_num
         if self.agent.target[0] and not has_reached_max_flip_num():
             self.agent.handle_unsat_condition()

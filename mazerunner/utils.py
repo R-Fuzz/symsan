@@ -21,8 +21,8 @@ COUNT_CLASS_LOOKUP = [
 ]
 
 def bucket_lookup(c):
-    if c > 255:
-        return 256
+    if c >= MAX_BUCKET_SIZE:
+        return MAX_BUCKET_SIZE
     return COUNT_CLASS_LOOKUP[c]
 
 def mkdir(dirp):
