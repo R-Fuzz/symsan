@@ -94,7 +94,7 @@ class MazerunnerState:
 
     def update_best_seed(self, filename, distance):
         self._best_seed_info[0] = filename
-        self._best_seed_info[1] = distance
+        self._best_seed_info[1] = int(distance)
         self._best_seed_info[2] = True
 
     @property
@@ -121,18 +121,14 @@ class MazerunnerState:
     def increase_timeout(self, logger, max_timeout):
         old_timeout = self.timeout
         if self.timeout < max_timeout:
-            self.timeout *= 2
+            t = self.timeout * 2
+            self.timeout = t if t < max_timeout else max_timeout
             logger.info("Increase timeout %d -> %d"
                          % (old_timeout, self.timeout))
         else:
             logger.info("Hit the maximum timeout")
-            # Back to default timeout not to slow down fuzzing
-            self.timeout = self.timeout
         # clear state for retesting seeds that needs more time
         self.clear()
-        # Something bad happened
-        logger.info("Sleeping a minute, wait until AFL resolves it")
-        time.sleep(60)
 
     def tick(self):
         old_index = self.index
@@ -296,13 +292,15 @@ class Mazerunner:
             shutil.copy2(fp, os.path.join(self.my_errors, fn))
             self._report_error(fp, log)
 
-    def handle_empty_files(self):
+    def handle_hang_files(self):
         if len(self.state.hang) > self.config.min_hang_files:
             self.state.increase_timeout(self.logger, self.config.max_timeout)
+            for fn in self.state.hang:
+                self.state.put_seed(fn, self.state.min_distance << 1)
+            self.state.hang.clear()
         else:
             # TODO: offline learning, replay from past experience
             self.logger.info("Sleep for getting files from AFL seed queue")
-            time.sleep(WAITING_INTERVAL)
 
     def check_crashes(self):
         for fuzzer in os.listdir(self.output):
@@ -432,7 +430,8 @@ class QSYMExecutor(Mazerunner):
     def _run(self):
         files = self.sync_from_afl()
         if not files:
-            self.handle_empty_files()
+            self.handle_hang_files()
+            time.sleep(WAITING_INTERVAL)
             return
         for fn in files:
             self.run_file(fn)
@@ -486,9 +485,10 @@ class ExploreExecutor(Mazerunner):
             or self.state.processed_num % self.sync_frequency == 0):
             files = self.sync_from_either()
             for fn in files:
-                self.state.put_seed(fn, 0)
+                self.state.put_seed(fn, self.state.min_distance << 1)
+            self.handle_hang_files()
         if self.state.is_queue_empty():
-            self.handle_empty_files()
+            time.sleep(WAITING_INTERVAL)
             return
         next_seed = self.state.get_seed()
         if not next_seed in self.state.processed:
@@ -606,16 +606,14 @@ class RecordExecutor(Mazerunner):
     def sync_back_if_interesting(self, fp, res):
         pass
 
-    def handle_return_status(self, retcode, log, fp):
-        pass
-
     def _run(self):
         files = self.sync_from_either()
         if not files:
-            self.handle_empty_files()
+            self.handle_hang_files()
+            time.sleep(WAITING_INTERVAL)
             return
         for fn in files:
-            self.state.timeout = self.config.timeout / 6
+            self.state.timeout = self.config.timeout / 10
             self.run_file(fn)
             self.state.processed.add(fn)
             self.agent.save_trace(fn)
