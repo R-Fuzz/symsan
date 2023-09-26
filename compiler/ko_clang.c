@@ -255,8 +255,12 @@ static void edit_params(u32 argc, char **argv) {
   }
 
   if (!maybe_assembler) {
-    add_taint_pass();
-    add_aflgo_pass();
+    if (getenv("AFLGO_PREPROCESSING")) {
+      add_aflgo_pass();
+    }else{
+      add_taint_pass();
+      add_aflgo_pass();
+    }
   }
 
   cc_params[cc_par_cnt++] = "-pie";
@@ -291,6 +295,9 @@ static void edit_params(u32 argc, char **argv) {
     cc_params[cc_par_cnt++] = "-g";
     cc_params[cc_par_cnt++] = "-O3";
     cc_params[cc_par_cnt++] = "-funroll-loops";
+  }else{
+    cc_params[cc_par_cnt++] = "-g";
+    cc_params[cc_par_cnt++] = "-O0";
   }
 
   if (is_cxx && !getenv("KO_USE_NATIVE_LIBCXX")) {

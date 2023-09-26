@@ -81,12 +81,20 @@ cl::opt<std::string> OutDirectory(
 
 namespace llvm {
 
+std::string getMangledName(const Function *F) {
+    std::string mangledName = std::to_string(F->getReturnType()->getTypeID()) + "_" + F->getName().str();
+    for (auto &A : F->args()) {
+        mangledName += "_" + std::to_string(A.getType()->getTypeID());
+    }
+    return mangledName;
+}
+
 template<>
 struct DOTGraphTraits<Function*> : public DefaultDOTGraphTraits {
   DOTGraphTraits(bool isSimple=true) : DefaultDOTGraphTraits(isSimple) {}
 
   static std::string getGraphName(Function *F) {
-    return "CFG for '" + F->getName().str() + "' function";
+    return "CFG for '" + getMangledName(F) + "' function";
   }
 
   std::string getNodeLabel(BasicBlock *Node, Function *Graph) {
@@ -125,7 +133,7 @@ namespace {
 
 char AFLCoverage::ID = 0;
 
-static void getDebugLoc(const Instruction *I, std::string &Filename,
+static void getInsDebugLoc(const Instruction *I, std::string &Filename,
                         unsigned &Line) {
 #ifdef LLVM_OLD_DEBUG_API
   DebugLoc Loc = I->getDebugLoc();
@@ -157,6 +165,48 @@ static void getDebugLoc(const Instruction *I, std::string &Filename,
 #endif /* LLVM_OLD_DEBUG_API */
 }
 
+static void getFuncDebugLoc(const Function *F, std::string &Filename, unsigned &Line) {
+  if (F == nullptr || F->empty()) return;
+#ifdef LLVM_OLD_DEBUG_API
+    // Assuming the debug location is attached to the first instruction of the function.
+    const BasicBlock &entry = F->getEntryBlock();
+    if (entry.empty()) return;
+    const Instruction *I = entry.getFirstNonPHIOrDbg();
+    if (I == nullptr) return;
+    DebugLoc Loc = I->getDebugLoc();
+    if (!Loc.isUnknown()) {
+        DILocation cDILoc(Loc.getAsMDNode(F->getContext()));
+        DILocation oDILoc = cDILoc.getOrigLocation();
+
+        Line = oDILoc.getLineNumber();
+        Filename = oDILoc.getFilename().str();
+
+        if (Filename.empty()) {
+            Line = cDILoc.getLineNumber();
+            Filename = cDILoc.getFilename().str();
+        }
+    }
+#else
+    // Again assuming the debug location is attached to the first instruction of the function.
+    const BasicBlock &entry = F->getEntryBlock();
+    if (entry.empty()) return;
+    const Instruction *I = entry.getFirstNonPHIOrDbg();
+    if (I == nullptr) return;
+    if (DILocation *Loc = I->getDebugLoc()) {
+        Line = Loc->getLine();
+        Filename = Loc->getFilename().str();
+
+        if (Filename.empty()) {
+            DILocation *oDILoc = Loc->getInlinedAt();
+            if (oDILoc) {
+                Line = oDILoc->getLine();
+                Filename = oDILoc->getFilename().str();
+            }
+        }
+    }
+#endif /* LLVM_OLD_DEBUG_API */
+}
+
 static bool isBlacklisted(const Function *F) {
   static const SmallVector<std::string, 8> Blacklist = {
     "asan.",
@@ -166,7 +216,9 @@ static bool isBlacklisted(const Function *F) {
     "free",
     "malloc",
     "calloc",
-    "realloc"
+    "realloc",
+    "llvm.dbg.declare",
+    "llvm.dbg.value"
   };
 
   for (auto const &BlacklistFunc : Blacklist) {
@@ -286,9 +338,7 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   if (is_aflgo_preprocessing) {
 
-    std::ofstream bbnames(OutDirectory + "/BBnames.txt", std::ofstream::out | std::ofstream::app);
-    std::ofstream bbcalls(OutDirectory + "/BBcalls.txt", std::ofstream::out | std::ofstream::app);
-    std::ofstream fnames(OutDirectory + "/Fnames.txt", std::ofstream::out | std::ofstream::app);
+    std::ofstream bbcalls(OutDirectory + "/direct_calls.txt", std::ofstream::out | std::ofstream::app);
     std::ofstream ftargets(OutDirectory + "/Ftargets.txt", std::ofstream::out | std::ofstream::app);
 
     /* Create dot-files directory */
@@ -300,7 +350,7 @@ bool AFLCoverage::runOnModule(Module &M) {
     for (auto &F : M) {
 
       bool has_BBs = false;
-      std::string funcName = F.getName().str();
+      std::string funcName = getMangledName(&F);
 
       /* Black list of function names */
       if (isBlacklisted(&F)) {
@@ -315,7 +365,7 @@ bool AFLCoverage::runOnModule(Module &M) {
         unsigned line;
 
         for (auto &I : BB) {
-          getDebugLoc(&I, filename, line);
+          getInsDebugLoc(&I, filename, line);
 
           /* Don't worry about external libs */
           static const std::string Xlibs("/usr/");
@@ -353,11 +403,23 @@ bool AFLCoverage::runOnModule(Module &M) {
               if (found != std::string::npos)
                 filename = filename.substr(found + 1);
 
-              if (auto *CalledF = c->getCalledFunction()) {
-                if (!isBlacklisted(CalledF))
-                  bbcalls << bb_name << "," << CalledF->getName().str() << "\n";
+            if (auto *CalledF = c->getCalledFunction()) {
+              if (!isBlacklisted(CalledF)) {
+                // Getting the mangled name of the function.
+                std::string mangledName = getMangledName(CalledF);
+
+                // Getting the debug location of the first instruction of the called function.
+                std::string calle_filename = "";
+                unsigned calle_line = 0;
+                getFuncDebugLoc(CalledF, calle_filename, calle_line);
+                if (calle_filename != "" && calle_line) { // Check if debug information is available.
+                  bbcalls << bb_name << "," << mangledName << "," << calle_filename << ":" << calle_line << "\n";
+                } else {
+                  bbcalls << bb_name << "," << mangledName << ",<no file>:<no line>\n";
+                }
               }
             }
+          }
         }
 
         if (!bb_name.empty()) {
@@ -372,7 +434,6 @@ bool AFLCoverage::runOnModule(Module &M) {
             BB.setValueName(ValueName::Create(NameRef, Allocator));
           }
 
-          bbnames << BB.getName().str() << "\n";
           has_BBs = true;
 
 #ifdef AFLGO_TRACING
@@ -392,8 +453,14 @@ bool AFLCoverage::runOnModule(Module &M) {
       }
 
       if (has_BBs) {
+        std::string filename = "";
+        unsigned line = 0;
+        getFuncDebugLoc(&F, filename, line);
         /* Print CFG */
         std::string cfgFileName = dotfiles + "/cfg." + funcName + ".dot";
+        if (filename != "" && line){
+          cfgFileName = dotfiles + "/cfg." + filename + ":" + std::to_string(line) + "." + funcName + ".dot";
+        }
         std::error_code EC;
         raw_fd_ostream cfgFile(cfgFileName, EC, sys::fs::F_None);
         if (!EC) {
@@ -401,8 +468,7 @@ bool AFLCoverage::runOnModule(Module &M) {
         }
 
         if (is_target)
-          ftargets << F.getName().str() << "\n";
-        fnames << F.getName().str() << "\n";
+          ftargets << funcName << "\n";
       }
     }
 
@@ -452,7 +518,7 @@ bool AFLCoverage::runOnModule(Module &M) {
           for (auto &I : BB) {
             std::string filename;
             unsigned line;
-            getDebugLoc(&I, filename, line);
+            getInsDebugLoc(&I, filename, line);
 
             if (filename.empty() || line == 0)
               continue;
