@@ -79,6 +79,12 @@ cl::opt<std::string> OutDirectory(
     cl::desc("Output directory where Ftargets.txt, Fnames.txt, and BBnames.txt are generated."),
     cl::value_desc("outdir"));
 
+cl::opt<std::string> IndirectCallsFile(
+    "indirect_calls",
+    cl::desc("Input file containing the indirect callers and calles."),
+    cl::value_desc("filename")
+);
+
 namespace llvm {
 
 std::string getMangledName(const Function *F) {
@@ -89,51 +95,7 @@ std::string getMangledName(const Function *F) {
     return mangledName;
 }
 
-template<>
-struct DOTGraphTraits<Function*> : public DefaultDOTGraphTraits {
-  DOTGraphTraits(bool isSimple=true) : DefaultDOTGraphTraits(isSimple) {}
-
-  static std::string getGraphName(Function *F) {
-    return "CFG for '" + getMangledName(F) + "' function";
-  }
-
-  std::string getNodeLabel(BasicBlock *Node, Function *Graph) {
-    if (!Node->getName().empty()) {
-      return Node->getName().str();
-    }
-
-    std::string Str;
-    raw_string_ostream OS(Str);
-
-    Node->printAsOperand(OS, false);
-    return OS.str();
-  }
-};
-
-} // namespace llvm
-
-namespace {
-
-  class AFLCoverage : public ModulePass {
-
-    public:
-
-      static char ID;
-      AFLCoverage() : ModulePass(ID) { }
-
-      bool runOnModule(Module &M) override;
-
-      // StringRef getPassName() const override {
-      //  return "American Fuzzy Lop Instrumentation";
-      // }
-
-  };
-
-}
-
-char AFLCoverage::ID = 0;
-
-static void getInsDebugLoc(const Instruction *I, std::string &Filename,
+void getInsDebugLoc(const Instruction *I, std::string &Filename,
                         unsigned &Line) {
 #ifdef LLVM_OLD_DEBUG_API
   DebugLoc Loc = I->getDebugLoc();
@@ -165,47 +127,78 @@ static void getInsDebugLoc(const Instruction *I, std::string &Filename,
 #endif /* LLVM_OLD_DEBUG_API */
 }
 
-static void getFuncDebugLoc(const Function *F, std::string &Filename, unsigned &Line) {
+void getFuncDebugLoc(const Function *F, std::string &Filename, unsigned &Line) {
   if (F == nullptr || F->empty()) return;
-#ifdef LLVM_OLD_DEBUG_API
-    // Assuming the debug location is attached to the first instruction of the function.
-    const BasicBlock &entry = F->getEntryBlock();
-    if (entry.empty()) return;
-    const Instruction *I = entry.getFirstNonPHIOrDbg();
-    if (I == nullptr) return;
-    DebugLoc Loc = I->getDebugLoc();
-    if (!Loc.isUnknown()) {
-        DILocation cDILoc(Loc.getAsMDNode(F->getContext()));
-        DILocation oDILoc = cDILoc.getOrigLocation();
-
-        Line = oDILoc.getLineNumber();
-        Filename = oDILoc.getFilename().str();
-
-        if (Filename.empty()) {
-            Line = cDILoc.getLineNumber();
-            Filename = cDILoc.getFilename().str();
-        }
-    }
-#else
     // Again assuming the debug location is attached to the first instruction of the function.
     const BasicBlock &entry = F->getEntryBlock();
     if (entry.empty()) return;
     const Instruction *I = entry.getFirstNonPHIOrDbg();
     if (I == nullptr) return;
-    if (DILocation *Loc = I->getDebugLoc()) {
-        Line = Loc->getLine();
-        Filename = Loc->getFilename().str();
-
-        if (Filename.empty()) {
-            DILocation *oDILoc = Loc->getInlinedAt();
-            if (oDILoc) {
-                Line = oDILoc->getLine();
-                Filename = oDILoc->getFilename().str();
-            }
-        }
-    }
-#endif /* LLVM_OLD_DEBUG_API */
+    getInsDebugLoc(I, Filename, Line);
 }
+
+template<>
+struct DOTGraphTraits<Function*> : public DefaultDOTGraphTraits {
+  DOTGraphTraits(bool isSimple=true) : DefaultDOTGraphTraits(isSimple) {}
+
+  static std::string getGraphName(Function *F) {
+    return "CFG for '" + getMangledName(F) + "' function";
+  }
+
+  std::string getNodeLabel(BasicBlock *Node, Function *Graph) {
+    if (!Node->getName().empty()) {
+      return Node->getName().str();
+    }
+    std::string bb_name("");
+    std::string filename;
+    unsigned line;
+    for (auto &I : *Node) {
+      getInsDebugLoc(&I, filename, line);
+      /* Don't worry about external libs */
+      static const std::string Xlibs("/usr/");
+      if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
+        continue;
+      if (bb_name.empty()) {
+        std::size_t found = filename.find_last_of("/\\");
+        if (found != std::string::npos)
+          filename = filename.substr(found + 1);
+        bb_name = filename + ":" + std::to_string(line);
+        break;
+      }
+    }
+    if (!bb_name.empty())
+      return "{" + bb_name + ":}";
+
+    std::string Str;
+    raw_string_ostream OS(Str);
+
+    Node->printAsOperand(OS, false);
+    return OS.str();
+  }
+};
+
+} // namespace llvm
+
+namespace {
+
+  class AFLCoverage : public ModulePass {
+
+    public:
+
+      static char ID;
+      AFLCoverage() : ModulePass(ID) { }
+
+      bool runOnModule(Module &M) override;
+
+      // StringRef getPassName() const override {
+      //  return "American Fuzzy Lop Instrumentation";
+      // }
+
+  };
+
+}
+
+char AFLCoverage::ID = 0;
 
 static bool isBlacklisted(const Function *F) {
   static const SmallVector<std::string, 8> Blacklist = {
@@ -243,6 +236,7 @@ bool AFLCoverage::runOnModule(Module &M) {
   std::list<std::string> targets;
   std::map<std::string, int> bb_to_dis;
   std::vector<std::string> basic_blocks;
+  std::map<std::string, std::vector<std::string>> indirect_calls;
 
   if (!TargetsFile.empty()) {
 
@@ -259,6 +253,19 @@ bool AFLCoverage::runOnModule(Module &M) {
 
     is_aflgo_preprocessing = true;
 
+    if (!IndirectCallsFile.empty()){
+      std::ifstream indirectcalls(IndirectCallsFile);
+      line = "";
+      while (std::getline(indirectcalls, line)){
+        std::istringstream iss(line);
+        std::string caller_loc, callee_loc;
+        if (std::getline(iss, caller_loc, ',') && std::getline(iss, callee_loc, ',')) {
+            indirect_calls[caller_loc].push_back(callee_loc);
+        }
+      }
+      indirectcalls.close();
+    }
+
   } else if (!DistanceFile.empty()) {
 
     std::ifstream cf(DistanceFile);
@@ -269,7 +276,7 @@ bool AFLCoverage::runOnModule(Module &M) {
 
         std::size_t pos = line.find(",");
         std::string bb_name = line.substr(0, pos);
-        int bb_dis = (int) (100.0 * atof(line.substr(pos + 1, line.length()).c_str()));
+        int bb_dis = (int) atof(line.substr(pos + 1, line.length()).c_str());
 
         bb_to_dis.emplace(bb_name, bb_dis);
         basic_blocks.push_back(bb_name);
@@ -339,7 +346,9 @@ bool AFLCoverage::runOnModule(Module &M) {
   if (is_aflgo_preprocessing) {
 
     std::ofstream bbcalls(OutDirectory + "/direct_calls.txt", std::ofstream::out | std::ofstream::app);
+    std::ofstream bbcalls_indirect(OutDirectory + "/indirect_calls.txt", std::ofstream::out | std::ofstream::app);
     std::ofstream ftargets(OutDirectory + "/Ftargets.txt", std::ofstream::out | std::ofstream::app);
+    std::ofstream bbtargets(TargetsFile, std::ofstream::out | std::ofstream::app);
 
     /* Create dot-files directory */
     std::string dotfiles(OutDirectory + "/dot-files");
@@ -364,6 +373,7 @@ bool AFLCoverage::runOnModule(Module &M) {
         std::string filename;
         unsigned line;
 
+        /* Find bb_name */
         for (auto &I : BB) {
           getInsDebugLoc(&I, filename, line);
 
@@ -372,15 +382,44 @@ bool AFLCoverage::runOnModule(Module &M) {
           if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
             continue;
 
+          std::size_t found = filename.find_last_of("/\\");
+          if (found != std::string::npos)
+            filename = filename.substr(found + 1);
+          std::string line_name = filename + ":" + std::to_string(line);
           if (bb_name.empty()) {
-
-            std::size_t found = filename.find_last_of("/\\");
-            if (found != std::string::npos)
-              filename = filename.substr(found + 1);
-
-            bb_name = filename + ":" + std::to_string(line);
+            bb_name = line_name;
           }
+        }
 
+        for (auto &I : BB) {
+          getInsDebugLoc(&I, filename, line);
+
+          /* Don't worry about external libs */
+          static const std::string Xlibs("/usr/");
+          if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
+            continue;
+
+          std::size_t found = filename.find_last_of("/\\");
+          if (found != std::string::npos)
+            filename = filename.substr(found + 1);
+          std::string line_name = filename + ":" + std::to_string(line);
+
+          /* handle direct calls */
+          if (auto *c = dyn_cast<CallInst>(&I)) {
+            if (auto *CalledF = c->getCalledFunction()) {
+              if (!isBlacklisted(CalledF) && !bb_name.empty()) {
+                // Getting the mangled name of the function.
+                std::string mangledName = getMangledName(CalledF);
+                bbcalls << bb_name << "," << mangledName << std::endl;
+              }
+            }
+          }
+          /* handle indirect calls */
+          if (indirect_calls.find(line_name) != indirect_calls.end() && !bb_name.empty()) {
+            for(const std::string& callee : indirect_calls[line_name]) {
+              bbcalls_indirect << bb_name << "," << callee << "\n";
+            }
+          }
           if (!is_target) {
               for (auto &target : targets) {
                 std::size_t found = target.find_last_of("/\\");
@@ -395,32 +434,10 @@ bool AFLCoverage::runOnModule(Module &M) {
                   is_target = true;
 
               }
-            }
-
-            if (auto *c = dyn_cast<CallInst>(&I)) {
-
-              std::size_t found = filename.find_last_of("/\\");
-              if (found != std::string::npos)
-                filename = filename.substr(found + 1);
-
-            if (auto *CalledF = c->getCalledFunction()) {
-              if (!isBlacklisted(CalledF)) {
-                // Getting the mangled name of the function.
-                std::string mangledName = getMangledName(CalledF);
-
-                // Getting the debug location of the first instruction of the called function.
-                std::string calle_filename = "";
-                unsigned calle_line = 0;
-                getFuncDebugLoc(CalledF, calle_filename, calle_line);
-                if (calle_filename != "" && calle_line) { // Check if debug information is available.
-                  bbcalls << bb_name << "," << mangledName << "," << calle_filename << ":" << calle_line << "\n";
-                } else {
-                  bbcalls << bb_name << "," << mangledName << ",<no file>:<no line>\n";
-                }
-              }
-            }
           }
         }
+
+        if (is_target && !bb_name.empty()) bbtargets << bb_name << "\n";
 
         if (!bb_name.empty()) {
 
@@ -455,12 +472,8 @@ bool AFLCoverage::runOnModule(Module &M) {
       if (has_BBs) {
         std::string filename = "";
         unsigned line = 0;
-        getFuncDebugLoc(&F, filename, line);
         /* Print CFG */
         std::string cfgFileName = dotfiles + "/cfg." + funcName + ".dot";
-        if (filename != "" && line){
-          cfgFileName = dotfiles + "/cfg." + filename + ":" + std::to_string(line) + "." + funcName + ".dot";
-        }
         std::error_code EC;
         raw_fd_ostream cfgFile(cfgFileName, EC, sys::fs::F_None);
         if (!EC) {
@@ -469,9 +482,12 @@ bool AFLCoverage::runOnModule(Module &M) {
 
         if (is_target)
           ftargets << funcName << "\n";
-      }
+        }
     }
-
+    bbcalls.close();
+    ftargets.close();
+    bbtargets.close();
+    bbcalls_indirect.close();
   } else {
     /* Distance instrumentation */
 

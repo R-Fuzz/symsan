@@ -154,6 +154,8 @@ static void add_aflgo_pass() {
     if (getenv("AFLGO_PREPROCESSING")) {
       cc_params[cc_par_cnt++] = "-mllvm";
       cc_params[cc_par_cnt++] = alloc_printf("-targets=%s/BBtargets.txt", target_dir);
+      cc_params[cc_par_cnt++] = "-mllvm";
+      cc_params[cc_par_cnt++] = alloc_printf("-indirect_calls=%s/indirect.txt", target_dir);
     }else{
       cc_params[cc_par_cnt++] = "-mllvm";
       cc_params[cc_par_cnt++] = alloc_printf("-distance=%s/distance.cfg.txt", target_dir);
