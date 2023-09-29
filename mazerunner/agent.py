@@ -94,10 +94,13 @@ class Agent:
             next_sa = next_s + (a,)
             self.model.add_visited_sa(next_sa)
             reward = self._compute_reward(d, last_d)
-            if d < min_distance:
+            if 0 <= d < min_distance:
                 min_distance = d
-            if i == len(trace) - 2 and min_distance > 0:
+            if ((i == len(trace) - 1 or d == -1)
+                and min_distance > 0):
+                # Did not reach the target, punish the agent
                 reward = -self.max_distance
+                break
             if last_SA:
                 self.learner.learn(last_SA, next_s, last_reward)
                 self.logger.debug(f"last_SA: {last_SA}, "
@@ -115,7 +118,7 @@ class Agent:
         else:
             # msg.bb_dist and msg.avg_dist are zero, assign the last distance available
             d = self.curr_state.d
-        if d and d < self.min_distance:
+        if 0 <= d <= self.max_distance and d < self.min_distance:
             self.min_distance = d
         self.curr_state.update(msg.addr, msg.context, action, d)
 
@@ -123,6 +126,9 @@ class Agent:
         mkdir(self.my_traces)
 
     def _compute_reward(self, d, last_d):
+        if d == -1 or last_d == -1:
+            # Did not reach the target, punish the agent
+            return -self.max_distance
         assert (d <= self.max_distance and d >= 0 and
                 last_d <= self.max_distance and last_d >= 0)
         reward = last_d - d

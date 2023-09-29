@@ -85,6 +85,7 @@ static inline void __handle_new_state(u32 cid, void *addr, u8 result, u8 loop_fl
   #endif
     AOUT("CallStack: 0x%x, BB distance: %llu, Avg distance: %llu \n", __taint_trace_callstack_addr, bb_dist, avg_dist);
   }
+  if (bb_dist == (u64)-1) avg_dist = bb_dist;
 
   mazerunner_msg mmsg = {
     .flags = flags,

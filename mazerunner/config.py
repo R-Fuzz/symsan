@@ -86,6 +86,8 @@ class Config:
         self.cmd = args.cmd
         if args.debug_enabled:
             self.logging_level = logging.DEBUG
+        if args.distance_file and os.path.isfile(args.distance_file):
+            self.max_distance = self._load_distance_file(args.distance_file)
 
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL
@@ -116,3 +118,10 @@ class Config:
         self.delimiter = None
         self.pkglen = None
         self.cmd = None
+
+    def _load_distance_file(self, fp):
+        max_distance = MAX_DISTANCE
+        with open(fp, 'r') as file:
+            lines = file.readlines()
+            max_distance = int(lines[-1].strip().split(',')[-1])
+        return max_distance
