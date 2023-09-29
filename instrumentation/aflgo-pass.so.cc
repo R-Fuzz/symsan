@@ -235,7 +235,6 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   std::list<std::string> targets;
   std::map<std::string, int> bb_to_dis;
-  std::vector<std::string> basic_blocks;
   std::map<std::string, std::vector<std::string>> indirect_calls;
 
   if (!TargetsFile.empty()) {
@@ -278,8 +277,7 @@ bool AFLCoverage::runOnModule(Module &M) {
         std::string bb_name = line.substr(0, pos);
         int bb_dis = (int) atof(line.substr(pos + 1, line.length()).c_str());
 
-        bb_to_dis.emplace(bb_name, bb_dis);
-        basic_blocks.push_back(bb_name);
+        bb_to_dis[bb_name] = bb_dis;
 
       }
       cf.close();
@@ -307,37 +305,6 @@ bool AFLCoverage::runOnModule(Module &M) {
 
 
   } else be_quiet = 1;
-
-  /* Decide instrumentation ratio */
-
-  char* inst_ratio_str = getenv("AFL_INST_RATIO");
-  unsigned int inst_ratio = 100;
-
-  if (inst_ratio_str) {
-
-    if (sscanf(inst_ratio_str, "%u", &inst_ratio) != 1 || !inst_ratio ||
-        inst_ratio > 100)
-      FATAL("Bad value of AFL_INST_RATIO (must be between 1 and 100)");
-
-  }
-
-  /* Default: Not selective */
-  char* is_selective_str = getenv("AFLGO_SELECTIVE");
-  unsigned int is_selective = 0;
-
-  if (is_selective_str && sscanf(is_selective_str, "%u", &is_selective) != 1)
-    FATAL("Bad value of AFLGO_SELECTIVE (must be 0 or 1)");
-
-  char* dinst_ratio_str = getenv("AFLGO_INST_RATIO");
-  unsigned int dinst_ratio = 100;
-
-  if (dinst_ratio_str) {
-
-    if (sscanf(dinst_ratio_str, "%u", &dinst_ratio) != 1 || !dinst_ratio ||
-        dinst_ratio > 100)
-      FATAL("Bad value of AFLGO_INST_RATIO (must be between 1 and 100)");
-
-  }
 
   /* Instrument all the things! */
 
@@ -452,20 +419,6 @@ bool AFLCoverage::runOnModule(Module &M) {
           }
 
           has_BBs = true;
-
-#ifdef AFLGO_TRACING
-          auto *TI = BB.getTerminator();
-          IRBuilder<> Builder(TI);
-
-          Value *bbnameVal = Builder.CreateGlobalStringPtr(bb_name);
-          Type *Args[] = {
-              Type::getInt8PtrTy(M.getContext()) //uint8_t* bb_name
-          };
-          FunctionType *FTy = FunctionType::get(Type::getVoidTy(M.getContext()), Args, false);
-          Constant *instrumented = M.getOrInsertFunction("llvm_profiling_call", FTy);
-          Builder.CreateCall(instrumented, {bbnameVal});
-#endif
-
         }
       }
 
@@ -482,7 +435,7 @@ bool AFLCoverage::runOnModule(Module &M) {
 
         if (is_target)
           ftargets << funcName << "\n";
-        }
+      }
     }
     bbcalls.close();
     ftargets.close();
@@ -514,11 +467,6 @@ bool AFLCoverage::runOnModule(Module &M) {
     GlobalVariable *AFLMapPtr =
         new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
                            GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
-#ifdef AFL_COV_TRACE
-    GlobalVariable *AFLPrevLoc = new GlobalVariable(
-        M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_loc",
-        0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
-#endif
 
     for (auto &F : M) {
 
@@ -526,7 +474,7 @@ bool AFLCoverage::runOnModule(Module &M) {
 
       for (auto &BB : F) {
 
-        distance = -1;
+        distance = -2;
 
         if (is_aflgo) {
 
@@ -546,67 +494,15 @@ bool AFLCoverage::runOnModule(Module &M) {
             break;
           }
 
-          if (!bb_name.empty()) {
-
-            if (find(basic_blocks.begin(), basic_blocks.end(), bb_name) == basic_blocks.end()) {
-
-              if (is_selective)
-                continue;
-
-            } else {
-
-              /* Find distance for BB */
-
-              if (AFL_R(100) < dinst_ratio) {
-                std::map<std::string,int>::iterator it;
-                for (it = bb_to_dis.begin(); it != bb_to_dis.end(); ++it)
-                  if (it->first.compare(bb_name) == 0)
-                    distance = it->second;
-
-              }
-            }
+          if (!bb_name.empty() && bb_to_dis.find(bb_name) != bb_to_dis.end()) {
+            /* Find distance for BB */
+            distance = bb_to_dis[bb_name];
           }
         }
 
         BasicBlock::iterator IP = BB.getFirstInsertionPt();
         IRBuilder<> IRB(&(*IP));
 
-#ifdef AFL_COV_TRACE
-        if (AFL_R(100) >= inst_ratio) continue;
-
-        /* Make up cur_loc */
-
-        unsigned int cur_loc = AFL_R(MAP_SIZE);
-
-        ConstantInt *CurLoc = ConstantInt::get(Int32Ty, cur_loc);
-
-        /* Load prev_loc */
-
-        LoadInst *PrevLoc = IRB.CreateLoad(AFLPrevLoc);
-        PrevLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-        Value *PrevLocCasted = IRB.CreateZExt(PrevLoc, IRB.getInt32Ty());
-
-        /* Load SHM pointer */
-
-        LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
-        MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-        Value *MapPtrIdx =
-            IRB.CreateGEP(MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
-
-        /* Update bitmap */
-
-        LoadInst *Counter = IRB.CreateLoad(MapPtrIdx);
-        Counter->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-        Value *Incr = IRB.CreateAdd(Counter, ConstantInt::get(Int8Ty, 1));
-        IRB.CreateStore(Incr, MapPtrIdx)
-           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-
-        /* Set prev_loc to cur_loc >> 1 */
-
-        StoreInst *Store =
-            IRB.CreateStore(ConstantInt::get(Int32Ty, cur_loc >> 1), AFLPrevLoc);
-        Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-#endif
         if (distance >= 0) {
 
           /* set BB distance to shm[MAPSIZE] */
@@ -641,8 +537,9 @@ bool AFLCoverage::runOnModule(Module &M) {
                 llvm::Type::getVoidTy(M.getContext()), Int32Ty, false));
           IRB.CreateCall(exitFunc, {IRB.getInt32(0)});
         }
-
-        inst_blocks++;
+        if (distance >= 0 || distance == -1) {
+          inst_blocks++;
+        }
 
       }
     }
@@ -653,13 +550,12 @@ bool AFLCoverage::runOnModule(Module &M) {
   if (!is_aflgo_preprocessing && !be_quiet) {
 
     if (!inst_blocks) WARNF("No instrumentation targets found.");
-    else OKF("Instrumented %u locations (%s mode, ratio %u%%, dist. ratio %u%%).",
+    else OKF("Instrumented %u locations (%s mode).",
              inst_blocks,
              getenv("AFL_HARDEN")
              ? "hardened"
              : ((getenv("AFL_USE_ASAN") || getenv("AFL_USE_MSAN"))
-               ? "ASAN/MSAN" : "non-hardened"),
-             inst_ratio, dinst_ratio);
+               ? "ASAN/MSAN" : "non-hardened"));
 
   }
 
