@@ -243,6 +243,6 @@ class SymSanExecutor:
             fcntl.fcntl(self.pipefds[0], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
             fcntl.fcntl(self.pipefds[1], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
         except PermissionError:
-            self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. "
-                                f"Try to use '--security-opt seccomp=unconfined' flag "
-                                f"if running inside docker container")
+            self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. \n"
+                                f"Please try to set it manually with: "
+                                f"'echo {PIPE_CAPACITY} | sudo tee /proc/sys/fs/pipe-max-size' ")

@@ -223,7 +223,7 @@ class Mazerunner:
         shutil.copy2(fp, self.cur_input)
         self.logger.info("Run: input=%s" % fp)
         symsan_res = self.run_target()
-        self.handle_return_status(symsan_res.returncode, symsan_res.stderr, fp)
+        self.handle_return_status(symsan_res, fp)
         self.update_timmer(symsan_res)
         self.sync_back_if_interesting(fp, symsan_res)
 
@@ -281,7 +281,15 @@ class Mazerunner:
             files = self.sync_from_initial_seeds()
         return files
 
-    def handle_return_status(self, retcode, log, fp):
+    def handle_return_status(self, result, fp):
+        msg_count = result.symsan_msg_num
+        if msg_count == 0:
+            self.logger.warning("No message is received from the symsan process")
+        trace_len = len(self.agent.episode)
+        if trace_len == 0:
+            self.logger.warning("No episode infomation during the execution")
+        
+        retcode = result.returncode
         fn = os.path.basename(fp)
         if retcode in [124, -9]: # killed
             shutil.copy2(fp, os.path.join(self.my_hangs, fn))
@@ -290,7 +298,7 @@ class Mazerunner:
         # segfault or abort
         if (retcode in [128 + 11, -11, 128 + 6, -6]):
             shutil.copy2(fp, os.path.join(self.my_errors, fn))
-            self._report_error(fp, log)
+            self._report_error(fp, result.stderr)
 
     def handle_hang_files(self):
         if len(self.state.hang) > self.config.min_hang_files:
