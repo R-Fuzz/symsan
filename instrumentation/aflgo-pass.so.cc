@@ -50,6 +50,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Analysis/CFGPrinter.h"
+#include "llvm/Support/DJB.h"
 
 #if defined(LLVM34)
 #include "llvm/DebugInfo.h"
@@ -127,6 +128,25 @@ void getInsDebugLoc(const Instruction *I, std::string &Filename,
 #endif /* LLVM_OLD_DEBUG_API */
 }
 
+void getBBDebugLoc(const BasicBlock *BB, std::string &Filename, unsigned &Line) {
+  std::string bb_name("");
+  std::string filename;
+  unsigned line;
+  for (auto &I : *BB) {
+    getInsDebugLoc(&I, filename, line);
+    /* Don't worry about external libs */
+    static const std::string Xlibs("/usr/");
+    if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
+      continue;
+    std::size_t found = filename.find_last_of("/\\");
+    if (found != std::string::npos)
+      filename = filename.substr(found + 1);
+    Filename = filename;
+    Line = line;
+    break;
+  }
+}
+
 void getFuncDebugLoc(const Function *F, std::string &Filename, unsigned &Line) {
   if (F == nullptr || F->empty()) return;
     // Again assuming the debug location is attached to the first instruction of the function.
@@ -139,35 +159,20 @@ void getFuncDebugLoc(const Function *F, std::string &Filename, unsigned &Line) {
 
 template<>
 struct DOTGraphTraits<Function*> : public DefaultDOTGraphTraits {
-  DOTGraphTraits(bool isSimple=true) : DefaultDOTGraphTraits(isSimple) {}
+  DOTGraphTraits(bool isSimple=false) : DefaultDOTGraphTraits(isSimple) {}
 
   static std::string getGraphName(Function *F) {
     return "CFG for '" + getMangledName(F) + "' function";
+  }
+
+  static std::string getNodeIdentifierLabel(BasicBlock *Node, Function *Graph) {
+    return std::to_string(djbHash(Node->getName()));
   }
 
   std::string getNodeLabel(BasicBlock *Node, Function *Graph) {
     if (!Node->getName().empty()) {
       return Node->getName().str();
     }
-    std::string bb_name("");
-    std::string filename;
-    unsigned line;
-    for (auto &I : *Node) {
-      getInsDebugLoc(&I, filename, line);
-      /* Don't worry about external libs */
-      static const std::string Xlibs("/usr/");
-      if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
-        continue;
-      if (bb_name.empty()) {
-        std::size_t found = filename.find_last_of("/\\");
-        if (found != std::string::npos)
-          filename = filename.substr(found + 1);
-        bb_name = filename + ":" + std::to_string(line);
-        break;
-      }
-    }
-    if (!bb_name.empty())
-      return "{" + bb_name + ":}";
 
     std::string Str;
     raw_string_ostream OS(Str);
@@ -341,22 +346,9 @@ bool AFLCoverage::runOnModule(Module &M) {
         unsigned line;
 
         /* Find bb_name */
-        for (auto &I : BB) {
-          getInsDebugLoc(&I, filename, line);
-
-          /* Don't worry about external libs */
-          static const std::string Xlibs("/usr/");
-          if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
-            continue;
-
-          std::size_t found = filename.find_last_of("/\\");
-          if (found != std::string::npos)
-            filename = filename.substr(found + 1);
-          std::string line_name = filename + ":" + std::to_string(line);
-          if (bb_name.empty()) {
-            bb_name = line_name;
-          }
-        }
+        getBBDebugLoc(&BB, filename, line);
+        if (!filename.empty() && line != 0 )
+          bb_name = filename + ":" + std::to_string(line);
 
         for (auto &I : BB) {
           getInsDebugLoc(&I, filename, line);
@@ -423,8 +415,6 @@ bool AFLCoverage::runOnModule(Module &M) {
       }
 
       if (has_BBs) {
-        std::string filename = "";
-        unsigned line = 0;
         /* Print CFG */
         std::string cfgFileName = dotfiles + "/cfg." + funcName + ".dot";
         std::error_code EC;
@@ -548,15 +538,22 @@ bool AFLCoverage::runOnModule(Module &M) {
   /* Say something nice. */
 
   if (!is_aflgo_preprocessing && !be_quiet) {
-
-    if (!inst_blocks) WARNF("No instrumentation targets found.");
-    else OKF("Instrumented %u locations (%s mode).",
-             inst_blocks,
-             getenv("AFL_HARDEN")
-             ? "hardened"
-             : ((getenv("AFL_USE_ASAN") || getenv("AFL_USE_MSAN"))
-               ? "ASAN/MSAN" : "non-hardened"));
-
+    std::ofstream debugfile(OutDirectory + "/debug.txt", std::ofstream::out | std::ofstream::app);
+    std::string moduleName = M.getName().str();
+    if (!inst_blocks) {
+      WARNF("No instrumentation targets found for %s.", moduleName.c_str());
+      debugfile << "No instrumentation targets found for " << moduleName << std::endl;
+    }else {
+      const char* mode = "non-hardened";
+      if (getenv("AFL_HARDEN")) {
+          mode = "hardened";
+      } else if (getenv("AFL_USE_ASAN") || getenv("AFL_USE_MSAN")) {
+          mode = "ASAN/MSAN";
+      }
+      OKF("Instrumented %u locations (%s mode) to %s", inst_blocks, mode, moduleName.c_str());
+      debugfile << "Instrumented " << inst_blocks << " locations (" << mode << " mode) to " << moduleName << std::endl;
+    }
+    debugfile.close();
   }
 
   return true;

@@ -10,7 +10,10 @@ from utils import AT_FILE
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: {} target input".format(sys.argv[0]), file=sys.stderr)
+        print(
+            'Usage: BIN_ARGS="other cmdline args" TAINT_OPTIONS="output_dir=/path:debug=1" {} target input'
+            .format(sys.argv[0]),
+            file=sys.stderr)
         sys.exit(1)
 
     config = Config()
