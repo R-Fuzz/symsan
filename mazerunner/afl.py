@@ -304,7 +304,9 @@ class Mazerunner:
         if len(self.state.hang) > self.config.min_hang_files:
             self.state.increase_timeout(self.logger, self.config.max_timeout)
             for fn in self.state.hang:
-                self.state.put_seed(fn, self.state.min_distance << 1)
+                d = utils.get_distance_from_fn(fn)
+                d = self.config.max_distance if d is None else d
+                self.state.put_seed(fn, d)
             self.state.hang.clear()
         else:
             # TODO: offline learning, replay from past experience
@@ -472,7 +474,7 @@ class ExploreExecutor(Mazerunner):
                 continue
             index = self.state.tick()
             target = fn[len("id:"):len("id:......")] if len(fn) >= len("id:......") else fn
-            filename = f"id:{index:06},src:{target},time:{ts},execs:{self.state.execs},explore"
+            filename = f"id:{index:06},src:{target},ts:{ts},dis:{res.distance:06},execs:{self.state.execs},explore"
             shutil.move(testcase, os.path.join(self.my_generations, filename))
             self.state.put_seed(filename, res.distance)
         # syn back to AFL queue if it's interesting
@@ -493,7 +495,9 @@ class ExploreExecutor(Mazerunner):
             or self.state.processed_num % self.sync_frequency == 0):
             files = self.sync_from_either()
             for fn in files:
-                self.state.put_seed(fn, self.state.min_distance << 1)
+                d = utils.get_distance_from_fn(fn)
+                d = self.config.max_distance if d is None else d
+                self.state.put_seed(fn, d)
             self.handle_hang_files()
         if self.state.is_queue_empty():
             time.sleep(WAITING_INTERVAL)
@@ -574,7 +578,7 @@ class ExploitExecutor(Mazerunner):
         index = self.state.tick()
         target = get_id_from_fn(fn)
         ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
-        dst_fn = f"id:{index:06},src:{target},time:{ts},execs:{self.state.execs},exploit"
+        dst_fn = f"id:{index:06},src:{target},ts:{ts},dis:{res.distance:06},execs:{self.state.execs},exploit"
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)

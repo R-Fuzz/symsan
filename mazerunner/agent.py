@@ -7,7 +7,7 @@ import random
 from config import Config
 from defs import TaintFlag
 from model import RLModel
-from utils import mkdir, bucket_lookup, MAX_BUCKET_SIZE
+from utils import mkdir, bucket_lookup, MAX_BUCKET_SIZE, get_distance_from_fn
 from learner import BasicQLearner
 
 class ProgramState:
@@ -89,15 +89,12 @@ class Agent:
         last_SA = None
         last_reward = 0
         last_d = self.max_distance
-        min_distance = self.max_distance
         for i, (next_s, a, d) in enumerate(trace):
             next_sa = next_s + (a,)
             self.model.add_visited_sa(next_sa)
             reward = self._compute_reward(d, last_d)
-            if 0 <= d < min_distance:
-                min_distance = d
             if ((i == len(trace) - 1 or d == -1)
-                and min_distance > 0):
+                and self.min_distance > 0):
                 # Did not reach the target, punish the agent
                 reward = -self.max_distance
                 break
@@ -118,8 +115,7 @@ class Agent:
         else:
             # msg.bb_dist and msg.avg_dist are zero, assign the last distance available
             d = self.curr_state.d
-        if 0 <= d <= self.max_distance and d < self.min_distance:
-            self.min_distance = d
+        self.min_distance = msg.bb_dist
         self.curr_state.update(msg.addr, msg.context, action, d)
 
     def _make_dirs(self):
@@ -151,6 +147,10 @@ class RecordAgent(Agent):
 class ReplayAgent(Agent):
 
     def replay_log(self, log_path):
+        self.reset()
+        d = get_distance_from_fn(log_path)
+        d = self.config.max_distance if d is None else d
+        self.min_distance = d
         with open(log_path, 'rb') as fd:
             trace = list(pickle.load(fd))
             self.replay_trace(trace)

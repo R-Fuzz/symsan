@@ -3,6 +3,7 @@ import psutil
 import copy
 import subprocess
 import time
+import re
 
 AT_FILE = "@@"
 MILLION_SECONDS_SCALE = 1000
@@ -39,6 +40,10 @@ def fix_at_file(cmd, testcase):
         with open(testcase, "rb") as f:
             stdin = f.read()
     return cmd, stdin
+
+def get_distance_from_fn(filename):
+    match = re.search(r'dis:(\d+)', filename)
+    return None if not match else int(match.group(1))
 
 def run_command(cmd, testcase):
     cmd, stdin = fix_at_file(cmd, testcase)
