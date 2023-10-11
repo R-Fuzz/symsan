@@ -108,6 +108,20 @@ class Agent:
             last_SA = next_sa
             last_reward = reward
 
+    def replay_log(self, log_path):
+        self.reset()
+        d = get_distance_from_fn(log_path)
+        d = self.config.max_distance if d is None else d
+        self.min_distance = d
+        with open(log_path, 'rb') as fd:
+            trace = list(pickle.load(fd))
+            self.replay_trace(trace)
+
+    def save_trace(self, fn):
+        log_path = os.path.join(self.my_traces, fn)
+        with open(log_path, 'wb') as fd:
+            pickle.dump(self.episode, fd, protocol=pickle.HIGHEST_PROTOCOL)
+
     def update_curr_state(self, msg, action):
         has_dist = True if msg.flags & TaintFlag.F_HAS_DISTANCE else False
         if has_dist:
@@ -138,22 +152,6 @@ class RecordAgent(Agent):
 
     def is_interesting_branch(self):
         return False
-
-    def save_trace(self, fn):
-        log_path = os.path.join(self.my_traces, fn)
-        with open(log_path, 'wb') as fd:
-            pickle.dump(self.episode, fd, protocol=pickle.HIGHEST_PROTOCOL)
-
-class ReplayAgent(Agent):
-
-    def replay_log(self, log_path):
-        self.reset()
-        d = get_distance_from_fn(log_path)
-        d = self.config.max_distance if d is None else d
-        self.min_distance = d
-        with open(log_path, 'rb') as fd:
-            trace = list(pickle.load(fd))
-            self.replay_trace(trace)
 
 class ExploreAgent(Agent):
 

@@ -11,7 +11,7 @@ import subprocess
 import time
 import heapq
 
-from agent import ExploreAgent, ExploitAgent, RecordAgent, ReplayAgent
+from agent import Agent, ExploreAgent, ExploitAgent, RecordAgent
 from executor import SymSanExecutor
 from model import RLModel
 import minimizer
@@ -633,7 +633,7 @@ class RecordExecutor(Mazerunner):
 class ReplayExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
-        self.agent = ReplayAgent(config)
+        self.agent = Agent(config)
 
     def sync_back_if_interesting(self, fp, res):
         pass
