@@ -2,6 +2,8 @@ import json
 import os
 import logging
 
+from model import RLModelType
+
 LOGGING_LEVEL = logging.INFO
 MEMORY_LIMIT_PERCENTAGE = 85
 DISK_LIMIT_SIZE = 32 * (1 << 30) # 32GB
@@ -25,9 +27,13 @@ MAX_CRASH_REPORTS = 30
 MAX_FLIP_NUM = 128
 # minimum number of hang files to increase timeout
 MIN_HANG_FILES = 30
+# Model configurations
+MODEL_TYPE = "reachability" # "distance"
+DECIMAL_PRECISION = 200
 
 class Config:
-    __slots__ = ['__dict__', '__weakref__',
+    __slots__ = ['__dict__',
+                 '__weakref__',
                  'logging_level', 
                  'random_input', 
                  'max_distance', 
@@ -54,7 +60,10 @@ class Config:
                  "min_hang_files",
                  "memory_limit",
                  "disk_limit",
-                 "save_frequency"]
+                 "save_frequency",
+                 "model_type",
+                 "decimal_precision",
+    ]
 
     def __init__(self):
         self._load_default()
@@ -109,6 +118,14 @@ class Config:
         self.memory_limit = MEMORY_LIMIT_PERCENTAGE
         self.disk_limit = DISK_LIMIT_SIZE
         self.save_frequency = SAVE_FREQUENCY
+        self.model_type = RLModelType.reachability
+        if MODEL_TYPE == "distance":
+            self.model_type = RLModelType.distance
+        elif MODEL_TYPE == "reachability":
+            self.model_type = RLModelType.reachability
+        else:
+            self.model_type = RLModelType.unknown
+        self.decimal_precision = DECIMAL_PRECISION
         # The following should obly be set by the mazerunner launcher
         self.output_dir = None
         self.afl_dir = None

@@ -283,7 +283,7 @@ class Serializer:
         else:
             # Should never reach here
             self.logger.error("to_z3_expr: Unsupported op: {}".format(info.op))
-            raise OperationUnsupportedError("Unsupported op: {}".format(info.op))
+            raise NotImplementedError("Unsupported op: {}".format(info.op))
 
     def __get_cmd(self, lhs: z3.ExprRef, rhs: z3.ExprRef, predicate: int):
         if predicate == Predicate.bveq.value:
@@ -308,7 +308,7 @@ class Serializer:
             return lhs <= rhs
         else:
             self.logger.error(f"__get_cmd: unsupported predicate: {predicate}")
-            raise OperationUnsupportedError("unsupported predicate")
+            raise NotImplementedError("unsupported predicate")
 
     def __read_concrete(self, label: int, size: int):
         if(not label in self.memcmp_cache):

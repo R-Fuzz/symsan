@@ -61,31 +61,32 @@ static inline void __handle_new_state(u32 cid, void *addr, u8 result, u8 loop_fl
     if (loop_flag & 0x1) flags |= F_LOOP_EXIT;
   }
 
-  u64 bb_dist = 0;
-  u64 avg_dist = 0;
-  if (__afl_area_ptr){
+  long bb_dist = -2;
+  long avg_dist = -2;
+  if (!__afl_area_ptr)
+    return;
   #ifdef __x86_64__
     unsigned long counter = *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16);
     if (counter){
       flags |= F_HAS_DISTANCE;
-      bb_dist = (u64)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
-      avg_dist = (u64)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) / counter);
+      avg_dist = (long)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) / counter);
     }
+    bb_dist = (long)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
     *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = 0;
     *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
   #else
     unsigned int counter = *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8);
     if (counter){
       flags |= F_HAS_DISTANCE;
-      bb_dist = (u64)*(unsigned int*)(__afl_area_ptr+MAP_SIZE);
-      avg_dist = (u64)(*(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) / counter);
+      avg_dist = (long)(*(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) / counter);
     }
+    bb_dist = (long)*(unsigned int*)(__afl_area_ptr+MAP_SIZE);
     *(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) = 0;
     *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8) = 0;
   #endif
-    AOUT("CallStack: 0x%x, BB distance: %llu, Avg distance: %llu \n", __taint_trace_callstack_addr, bb_dist, avg_dist);
-  }
-  if (bb_dist == (u64)-1) avg_dist = bb_dist;
+    AOUT("pc: 0x%x, BB distance: %llu, avg distance: %llu \n", (uptr)addr, bb_dist, avg_dist);
+
+  if (bb_dist == 0) avg_dist = bb_dist;
 
   mazerunner_msg mmsg = {
     .flags = flags,

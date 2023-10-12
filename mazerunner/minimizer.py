@@ -2,6 +2,7 @@ import hashlib
 import os
 import subprocess
 import tempfile
+import atexit
 
 import utils
 
@@ -40,6 +41,7 @@ class TestcaseMinimizer:
         self.crash_bitmap = self.initialize_bitmap(self.crash_bitmap_file, map_size)
         self.mazerunner_state = state
         self.mazerunner_sa_num = 0
+        atexit.register(self.cleanup)
 
     def initialize_bitmap(self, filename, map_size):
         if os.path.exists(filename):
@@ -59,7 +61,7 @@ class TestcaseMinimizer:
 
     def has_closer_distance(self, distance, testcase):
         distance_reached = self.mazerunner_state.min_distance
-        if distance <= distance_reached:
+        if distance < distance_reached:
             self.mazerunner_state.update_best_seed(testcase, distance)
             return True
         else:
@@ -115,4 +117,5 @@ class TestcaseMinimizer:
         return interesting
 
     def cleanup(self):
-        os.unlink(self.temp_file)
+        if os.path.exists(self.temp_file):
+            os.unlink(self.temp_file)

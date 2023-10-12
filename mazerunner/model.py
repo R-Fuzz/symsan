@@ -2,11 +2,21 @@ import collections
 import os
 import pickle
 
+from decimal import Decimal, getcontext
+from enum import Enum
 from utils import mkdir
 
+class RLModelType(Enum):
+    unknown = 0
+    distance = 1
+    reachability = 2
+
+
 class RLModel:
+
     def __init__(self, config):
         self.config = config
+        getcontext().prec = config.decimal_precision
         self.visited_sa = collections.Counter()
         self.all_target_sa = set()
         self.unreachable_sa = set()
@@ -47,13 +57,6 @@ class RLModel:
             with open(target_sa_path, 'rb') as fp:
                 self.all_target_sa = pickle.load(fp)
 
-    def Q_lookup(self, key):
-        return self.Q_table.get(key, 0.)
-    
-    def Q_update(self, key, value):
-        if value != 0.:
-            self.Q_table[key] = value
-
     def add_unreachable_sa(self, sa):
         self.unreachable_sa.add(sa)
 
@@ -66,3 +69,49 @@ class RLModel:
     def remove_target_sa(self, sa):
         if sa in self.all_target_sa:
             self.all_target_sa.remove(sa)
+
+
+class DistanceModel(RLModel):
+    def Q_lookup(self, key):
+        return self.Q_table.get(key, 0.)
+
+    def Q_update(self, key, value):
+        if value != 0.:
+            self.Q_table[key] = value
+
+
+class ReachabilityModel(RLModel):
+    # Constants
+    ZERO = Decimal(0)
+    ONE = Decimal(1)
+    TWO = Decimal(2)
+
+    @staticmethod
+    def distance_to_prob(d):
+        """
+        Converts a distance to a probability.
+        Returns: 1 / 2 ** d
+        """
+        if d == -1.:
+            return ReachabilityModel.ZERO
+        return ReachabilityModel.ONE / (ReachabilityModel.TWO ** Decimal(d))
+
+    @staticmethod
+    def prob_to_distance(p):
+        """
+        Converts a probability to a distance.
+        Returns: -log_2(p)
+        """
+        if p == ReachabilityModel.ZERO:
+            return -1.
+        res = - (p.ln() / ReachabilityModel.TWO.ln())
+        return float(res)
+
+    def Q_lookup(self, key):
+        value = self.Q_table.get(key, 0.)
+        return ReachabilityModel.distance_to_prob(value)
+
+    def Q_update(self, key, value):
+        if value != 0.:
+            d = ReachabilityModel.prob_to_distance(value)
+            self.Q_table[key] = d

@@ -11,7 +11,7 @@ from multiprocessing import shared_memory
 from backend_solver import Z3Solver, ConditionUnsat
 from defs import *
 import utils
-from agent import ExploitAgent, ReplayAgent, RecordAgent
+from agent import ExploitAgent, RecordAgent
 
 UNION_TABLE_SIZE = 0xc00000000
 PIPE_CAPACITY = 4 * 1024 * 1024
@@ -48,11 +48,6 @@ class SymSanExecutor:
         pass
     
     class Timer:
-        def __init__(self):
-            self.proc_start_time = 0
-            self.proc_end_time = 0
-            self.solving_time = 0
-        
         def reset(self):
             self.proc_start_time = 0
             self.proc_end_time = 0
@@ -68,7 +63,6 @@ class SymSanExecutor:
         self.cmd = config.cmd
         self.agent = agent
         self.timer = SymSanExecutor.Timer()
-        self.msg_num = 0
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logging_level = config.logging_level
         # resources
@@ -76,10 +70,16 @@ class SymSanExecutor:
         self.solver = None
         # options
         self.testcase_dir = output_dir
-        self.record_replay_mode_enabled = True if (type(agent) is ReplayAgent or type(agent) is RecordAgent) else False
+        self.record_mode_enabled = True if type(agent) is RecordAgent else False
         self.onetime_solving_enabled = True if (type(agent) is ExploitAgent) else False
-        assert not (self.record_replay_mode_enabled and self.onetime_solving_enabled)
         self.gep_solver_enabled = config.gep_solver_enabled
+        try:
+            self._setup_pipe()
+        except PermissionError:
+            self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. \n"
+                                f"Please try to set it manually with: "
+                                f"'echo {PIPE_CAPACITY} | sudo tee /proc/sys/fs/pipe-max-size' ")
+        self.tear_down()
 
     @property
     def has_terminated(self):
@@ -104,10 +104,10 @@ class SymSanExecutor:
             self.shm = None
 
     def kill_proc(self):
-        if self.proc and self.proc.poll() is None:
+        if not self.has_terminated:
             self.proc.kill()
             self.proc.wait()
-        self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
 
     def get_result(self):
         # TODO: implement stream reader thread in case the subprocess closes
@@ -118,13 +118,17 @@ class SymSanExecutor:
 
     def setup(self, input_file, session_id=0):
         self.input_file = input_file
+        self.msg_num = 0
         # Create and map shared memory
         try:
             self.shm = shared_memory.SharedMemory(create=True, size=UNION_TABLE_SIZE)
         except:
             self.logger.critical(f"setup: Failed to map shm({self.shm._fd}), size(shm.size)")
             sys.exit(1)
-        self._setup_pipe()
+        try:
+            self._setup_pipe()
+        except PermissionError:
+            pass
         self.solver = Z3Solver(self.config, self.shm, self.input_file, 
                                self.testcase_dir, 0, session_id)
         self.agent.reset()
@@ -207,7 +211,7 @@ class SymSanExecutor:
             return False
         state_msg = mazerunner_msg.from_buffer_copy(state_data)
         self.agent.handle_new_state(state_msg, msg.result)
-        if self.record_replay_mode_enabled:
+        if self.record_mode_enabled:
             return False
         is_interesting = self.agent.is_interesting_branch()
         try:
@@ -239,10 +243,5 @@ class SymSanExecutor:
         pipe_capacity = fcntl.fcntl(self.pipefds[0], fcntl.F_GETPIPE_SZ)
         if pipe_capacity >= PIPE_CAPACITY:
             return
-        try:
-            fcntl.fcntl(self.pipefds[0], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
-            fcntl.fcntl(self.pipefds[1], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
-        except PermissionError:
-            self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. \n"
-                                f"Please try to set it manually with: "
-                                f"'echo {PIPE_CAPACITY} | sudo tee /proc/sys/fs/pipe-max-size' ")
+        fcntl.fcntl(self.pipefds[0], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
+        fcntl.fcntl(self.pipefds[1], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)

@@ -228,14 +228,13 @@ class Mazerunner:
         self.sync_back_if_interesting(fp, symsan_res)
 
     def run_target(self):
-        symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
-        symsan.setup(self.cur_input, self.state.processed_num)
-        symsan.run(self.state.timeout)
+        self.symsan.setup(self.cur_input, self.state.processed_num)
+        self.symsan.run(self.state.timeout)
         try:
-            symsan.process_request()
+            self.symsan.process_request()
         finally:
-            symsan.tear_down()
-        symsan_res = symsan.get_result()
+            self.symsan.tear_down()
+        symsan_res = self.symsan.get_result()
         self.logger.info(
             f"Total={symsan_res.total_time}ms, "
             f"Emulation={symsan_res.emulation_time}ms, "
@@ -308,9 +307,7 @@ class Mazerunner:
                 d = self.config.max_distance if d is None else d
                 self.state.put_seed(fn, d)
             self.state.hang.clear()
-        else:
-            # TODO: offline learning, replay from past experience
-            self.logger.info("Sleep for getting files from AFL seed queue")
+        # TODO: offline learning, replay from past experience
 
     def check_crashes(self):
         for fuzzer in os.listdir(self.output):
@@ -416,6 +413,7 @@ class QSYMExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = ExploreAgent(self.config)
+        self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
 
     def sync_back_if_interesting(self, fp, res):
         old_idx = self.state.index
@@ -453,6 +451,7 @@ class ExploreExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = ExploreAgent(self.config)
+        self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
         self.sync_frequency = self.config.sync_frequency
 
     def dry_run(self):
@@ -516,6 +515,7 @@ class ExploitExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = ExploitAgent(self.config)
+        self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
         self.no_progress_count = 0
         if not shared_state:
             self._init_best_testcase()
@@ -526,21 +526,20 @@ class ExploitExecutor(Mazerunner):
 
     def run_target(self):
         total_time = emulation_time = solving_time = 0
-        symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
         has_reached_max_flip_num = lambda: len(self.agent.all_targets) >= self.config.max_flip_num
         while not has_reached_max_flip_num():
             try:
-                symsan.setup(self.cur_input, self.state.processed_num)
-                symsan.run(self.state.timeout)
-                symsan.process_request()
-                if symsan.has_terminated and len(symsan.solver.generated_files) == 0:
+                self.symsan.setup(self.cur_input, self.state.processed_num)
+                self.symsan.run(self.state.timeout)
+                self.symsan.process_request()
+                if self.symsan.has_terminated and len(self.symsan.solver.generated_files) == 0:
                     break
-                assert len(symsan.solver.generated_files) == 1
-                fp = os.path.join(self.my_generations, symsan.solver.generated_files[0])
+                assert len(self.symsan.solver.generated_files) == 1
+                fp = os.path.join(self.my_generations, self.symsan.solver.generated_files[0])
                 shutil.move(fp, self.cur_input)
             finally:
-                symsan.tear_down()
-                symsan_res = symsan.get_result()
+                self.symsan.tear_down()
+                symsan_res = self.symsan.get_result()
                 total_time += symsan_res.total_time
                 emulation_time += symsan_res.emulation_time
                 solving_time += symsan_res.solving_time
@@ -614,6 +613,7 @@ class RecordExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = RecordAgent(config)
+        self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
 
     def sync_back_if_interesting(self, fp, res):
         pass
@@ -634,6 +634,7 @@ class ReplayExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = Agent(config)
+        self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
 
     def sync_back_if_interesting(self, fp, res):
         pass
@@ -661,7 +662,7 @@ class HybridExecutor():
         self.explore_executor = ExploreExecutor(config, self.state)
         self.exploit_executor = ExploitExecutor(config, self.state)
         # Two agents share the same model
-        self.model = RLModel(config)
+        self.model = Agent.create_model(self.config)
         self.explore_executor.agent.model = self.model
         self.exploit_executor.agent.model = self.model
 

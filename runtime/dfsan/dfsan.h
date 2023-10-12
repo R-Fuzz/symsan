@@ -241,8 +241,8 @@ struct mazerunner_msg {
   u32 id;
   uptr addr;
   u32 context;
-  u64 bb_dist;
-  u64 avg_dist;
+  long bb_dist;
+  long avg_dist;
 } __attribute__((packed));
 
 #endif  // DFSAN_H

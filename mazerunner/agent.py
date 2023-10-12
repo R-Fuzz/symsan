@@ -4,11 +4,10 @@ import collections
 import pickle
 import random
 
-from config import Config
+import model
+from decimal import Decimal
 from defs import TaintFlag
-from model import RLModel
 from utils import mkdir, bucket_lookup, MAX_BUCKET_SIZE, get_distance_from_fn
-from learner import BasicQLearner
 
 class ProgramState:
     def __init__(self, distance):
@@ -31,14 +30,77 @@ class ProgramState:
         reversed_action = 1 if self.action == 0 else 0
         return self.state + (reversed_action, )
 
+
+class RewardCalculator:
+    def __init__(self, config, min_distance, trace):
+        self.config = config
+        self.min_distance = min_distance
+        self.trace = trace
+
+    def compute_reward(self, i):
+        raise NotImplementedError("This method should be overridden by subclass")
+
+
+class DistanceRewardCalculator(RewardCalculator):
+    def __init__(self, config, min_distance, trace):
+        super().__init__(config, min_distance, trace)
+        self.last_d = self.config.max_distance
+
+    def compute_reward(self, i):
+        if i >= len(self.trace):
+            if self.min_distance == 0:
+                return self.last_d
+            else:
+                return -self.config.max_distance
+        s, a, d = self.trace[i]
+        if d == -1 or self.last_d == -1:
+            return -self.config.max_distance
+        r = self.last_d - d
+        self.last_d = d
+        return r
+
+
+class ReachabilityRewardCalculator(RewardCalculator):
+    def compute_reward(self, i):
+        if i >= len(self.trace):
+            if self.min_distance == 0:
+                return Decimal(1)
+            else:
+                return Decimal(0)
+        s, a, d = self.trace[i]
+        if d == 0:
+            return Decimal(1)
+        return Decimal(0)
+
+class BasicQLearner:
+    def __init__(self, m: model.RLModel, df, lr):
+        self.model = m
+        self.discount_factor = df
+        self.learning_rate = lr
+
+    def learn(self, last_SA, next_s, last_reward):
+        last_Q = self.model.Q_lookup(last_SA)
+        curr_state_taken = self.model.Q_lookup(next_s + (1,))
+        curr_state_not_taken = self.model.Q_lookup(next_s + (0,))
+        if curr_state_taken >= curr_state_not_taken:
+            chosen_Q = curr_state_taken
+        else:
+            chosen_Q = curr_state_not_taken
+        if next_s == ("Terminal",):
+            last_Q = last_Q + self.learning_rate * (last_reward - last_Q)
+        else:
+            last_Q = (last_Q + self.learning_rate 
+                * (last_reward + self.discount_factor * chosen_Q - last_Q))
+        self.model.Q_update(last_SA, last_Q)
+
+
 class Agent:
-    def __init__(self, config: Config):
+    def __init__(self, config):
         self.config = config
         if config.mazerunner_dir:
             self.my_dir = config.mazerunner_dir
             mkdir(self.my_traces)
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.max_distance = config.max_distance
         self.episode = []
         self._learner = None
         self._model = None
@@ -50,7 +112,7 @@ class Agent:
     @property
     def model(self):
         if not self._model:
-            self._model = RLModel(self.config)
+            self._model = Agent.create_model(self.config)
         return self._model
     @model.setter
     def model(self, m):
@@ -62,17 +124,40 @@ class Agent:
     @property
     def learner(self):
         if not self._learner:
-            self._learner = BasicQLearner(self.model, self.config.discount_factor, self.config.learning_rate)
+            lr = self.config.learning_rate
+            df = self.config.discount_factor
+            if self.config.model_type == model.RLModelType.reachability:
+                lr = Decimal(self.config.learning_rate)
+                df = Decimal(self.config.discount_factor)
+            self._learner = BasicQLearner(self.model, df, lr)
         return self._learner
+
+    @staticmethod
+    def create_reward_calculator(config, episode, min_distance):
+        if config.model_type == model.RLModelType.distance:
+            return DistanceRewardCalculator(config, min_distance, episode)
+        elif config.model_type == model.RLModelType.reachability:
+            return ReachabilityRewardCalculator(config, min_distance, episode)
+        else:
+            raise NotImplementedError()
+
+    @staticmethod
+    def create_model(config):
+        if config.model_type == model.RLModelType.distance:
+            return model.DistanceModel(config)
+        elif config.model_type == model.RLModelType.reachability:
+            return model.ReachabilityModel(config)
+        else:
+            raise NotImplementedError()
 
     def append_episode(self):
         if self.curr_state.state[2] < MAX_BUCKET_SIZE:
             self.episode.append(self.curr_state.serialize())
 
     def reset(self):
-        self.curr_state = ProgramState(distance=self.max_distance)
+        self.curr_state = ProgramState(distance=self.config.max_distance)
         self.episode.clear()
-        self.min_distance = self.max_distance
+        self.min_distance = self.config.max_distance
 
     # for fgtest
     def handle_new_state(self, msg, action):
@@ -86,27 +171,22 @@ class Agent:
         return True
 
     def replay_trace(self, trace):
-        last_SA = None
-        last_reward = 0
-        last_d = self.max_distance
-        for i, (next_s, a, d) in enumerate(trace):
-            next_sa = next_s + (a,)
-            self.model.add_visited_sa(next_sa)
-            reward = self._compute_reward(d, last_d)
-            if ((i == len(trace) - 1 or d == -1)
-                and self.min_distance > 0):
-                # Did not reach the target, punish the agent
-                reward = -self.max_distance
-                break
-            if last_SA:
-                self.learner.learn(last_SA, next_s, last_reward)
-                self.logger.debug(f"last_SA: {last_SA}, "
-                                f"distance: {d if d else 'NA'}, "
-                                f"reward: {reward}, "
-                                f"Q: {self.model.Q_lookup(last_SA)}")
-            last_d = d
-            last_SA = next_sa
-            last_reward = reward
+        assert 0 <= self.min_distance <= self.config.max_distance
+        reward_calculator = Agent.create_reward_calculator(self.config, trace, self.min_distance)
+        for i, (s, a, d) in enumerate(reversed(trace)):
+            sa = s + (a,)
+            self.model.add_visited_sa(sa)
+            i = len(trace) - i - 1
+            if i >= len(trace) - 1:
+                next_s = ("Terminal",)
+            else:
+                next_s = trace[i+1][0]
+            reward = reward_calculator.compute_reward(i+1)
+            self.learner.learn(sa, next_s, reward)
+            self.logger.debug(f"SA: {sa}, "
+                            f"distance: {d if d else 'NA'}, "
+                            f"reward: {reward}, "
+                            f"Q: {self.model.Q_lookup(sa)}")
 
     def replay_log(self, log_path):
         self.reset()
@@ -127,22 +207,19 @@ class Agent:
         if has_dist:
             d = msg.avg_dist
         else:
-            # msg.bb_dist and msg.avg_dist are zero, assign the last distance available
+            # msg.avg_dist is zero, assign the last distance available
             d = self.curr_state.d
         self.min_distance = msg.bb_dist
+        assert (d == -1 
+                or (self.min_distance <= d <= self.config.max_distance))
         self.curr_state.update(msg.addr, msg.context, action, d)
+        self.logger.debug(f"SA: {(msg.addr, msg.context, action)}, "
+                        f"distance: {d if d else 'NA'}, "
+                        f"min_distance: {self.min_distance} ")
 
     def _make_dirs(self):
         mkdir(self.my_traces)
 
-    def _compute_reward(self, d, last_d):
-        if d == -1 or last_d == -1:
-            # Did not reach the target, punish the agent
-            return -self.max_distance
-        assert (d <= self.max_distance and d >= 0 and
-                last_d <= self.max_distance and last_d >= 0)
-        reward = last_d - d
-        return reward
 
 class RecordAgent(Agent):
 
@@ -152,6 +229,7 @@ class RecordAgent(Agent):
 
     def is_interesting_branch(self):
         return False
+
 
 class ExploreAgent(Agent):
 
@@ -172,9 +250,10 @@ class ExploreAgent(Agent):
             self.model.add_target_sa(reversed_sa)
         return interesting
 
+
 class ExploitAgent(Agent):
 
-    def __init__(self, config: Config):
+    def __init__(self, config):
         super().__init__(config)
         self.all_targets = []
         self.last_targets = []
