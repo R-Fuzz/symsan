@@ -94,7 +94,7 @@ class ReachabilityModel(RLModel):
         """
         if d == -1.:
             return ReachabilityModel.ZERO
-        return ReachabilityModel.ONE / (ReachabilityModel.TWO ** Decimal(d))
+        return ReachabilityModel.ONE / (ReachabilityModel.TWO ** Decimal(float(d) / 1000))
 
     @staticmethod
     def prob_to_distance(p):
@@ -105,7 +105,7 @@ class ReachabilityModel(RLModel):
         if p == ReachabilityModel.ZERO:
             return -1.
         res = - (p.ln() / ReachabilityModel.TWO.ln())
-        return float(res)
+        return float(res) * 1000
 
     def Q_lookup(self, key):
         value = self.Q_table.get(key, 0.)

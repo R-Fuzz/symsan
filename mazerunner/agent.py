@@ -48,16 +48,18 @@ class DistanceRewardCalculator(RewardCalculator):
 
     def compute_reward(self, i):
         if i >= len(self.trace):
-            if self.min_distance == 0:
-                return self.last_d
-            else:
+            if self.min_distance > 0:
                 return -self.config.max_distance
+            else:
+                return 0
         s, a, d = self.trace[i]
         if d == -1 or self.last_d == -1:
             return -self.config.max_distance
+        if d == 0 and self.last_d > 0:
+            return self.config.max_distance
         r = self.last_d - d
         self.last_d = d
-        return r
+        return r if r < 0 else 0
 
 
 class ReachabilityRewardCalculator(RewardCalculator):
@@ -205,11 +207,11 @@ class Agent:
     def update_curr_state(self, msg, action):
         has_dist = True if msg.flags & TaintFlag.F_HAS_DISTANCE else False
         if has_dist:
-            d = msg.avg_dist
+            d = float(msg.avg_dist)
         else:
             # msg.avg_dist is zero, assign the last distance available
             d = self.curr_state.d
-        self.min_distance = msg.bb_dist
+        self.min_distance = float(msg.bb_dist)
         assert (d == -1 
                 or (self.min_distance <= d <= self.config.max_distance))
         self.curr_state.update(msg.addr, msg.context, action, d)

@@ -9,7 +9,7 @@ MEMORY_LIMIT_PERCENTAGE = 85
 DISK_LIMIT_SIZE = 32 * (1 << 30) # 32GB
 # Solver configurations
 RANDOM_INPUT = "AAAA"
-MAX_DISTANCE = 0xFFFFFFFF
+MAX_DISTANCE = float(0xFFFF)
 NESTED_BRANCH_ENABLED = True
 GEP_SOLVER_ENABLED = False
 OPTIMISTIC_SOLVING_ENABLED = True
@@ -137,8 +137,8 @@ class Config:
         self.cmd = None
 
     def _load_distance_file(self, fp):
-        max_distance = MAX_DISTANCE
+        max_distance = -float('inf')
         with open(fp, 'r') as file:
             lines = file.readlines()
-            max_distance = int(lines[-1].strip().split(',')[-1])
+            max_distance = max(float(lines[-1].strip().split(',')[-1]), max_distance)
         return max_distance
