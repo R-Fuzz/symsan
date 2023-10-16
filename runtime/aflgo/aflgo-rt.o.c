@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <assert.h>
+#include <limits.h>
 
 #include <sys/mman.h>
 #include <sys/shm.h>
@@ -262,12 +263,15 @@ void __afl_manual_init(void) {
 /* Proper initialization routine. */
 
 __attribute__((constructor(CONST_PRIO))) void __afl_auto_init(void) {
+  memset(__afl_area_ptr, 0, MAP_SIZE + 8 + 8 + 8);
+  u64 max = INT_MAX;
+  memcpy(__afl_area_ptr+MAP_SIZE, &max, sizeof(u64));
+  memcpy(__afl_area_ptr+MAP_SIZE+8, &max, sizeof(u64));
+  // is_persistent = !!getenv(PERSIST_ENV_VAR);
 
-  is_persistent = !!getenv(PERSIST_ENV_VAR);
+  // if (getenv(DEFER_ENV_VAR)) return;
 
-  if (getenv(DEFER_ENV_VAR)) return;
-
-  __afl_manual_init();
+  // __afl_manual_init();
 
 }
 

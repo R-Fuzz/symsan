@@ -15,6 +15,7 @@
      http://www.apache.org/licenses/LICENSE-2.0
 
  */
+#include <climits>
 
 #include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_file.h"
@@ -61,40 +62,27 @@ static inline void __handle_new_state(u32 cid, void *addr, u8 result, u8 loop_fl
     if (loop_flag & 0x1) flags |= F_LOOP_EXIT;
   }
 
-  long bb_dist = -2;
-  long avg_dist = -2;
+  long global_min_dist = -2;
+  long local_min_dist = -2;
   if (!__afl_area_ptr)
     return;
-  #ifdef __x86_64__
-    unsigned long counter = *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16);
-    if (counter){
-      flags |= F_HAS_DISTANCE;
-      avg_dist = (long)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) / counter);
-    }
-    bb_dist = (long)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
-    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = 0;
-    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
-  #else
-    unsigned int counter = *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8);
-    if (counter){
-      flags |= F_HAS_DISTANCE;
-      avg_dist = (long)(*(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) / counter);
-    }
-    bb_dist = (long)*(unsigned int*)(__afl_area_ptr+MAP_SIZE);
-    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+4) = 0;
-    *(unsigned int*)(__afl_area_ptr+MAP_SIZE+8) = 0;
-  #endif
-    AOUT("pc: 0x%x, BB distance: %llu, avg distance: %llu \n", (uptr)addr, bb_dist, avg_dist);
-
-  if (bb_dist == 0) avg_dist = bb_dist;
+  unsigned long counter = *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16);
+  if (counter){
+    flags |= F_HAS_DISTANCE;
+    local_min_dist = (long)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8));
+  }
+  global_min_dist = (long)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
+  *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = INT_MAX;
+  *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
+  AOUT("pc: 0x%x, BB distance: %llu, avg distance: %llu \n", (uptr)addr, global_min_dist, local_min_dist);
 
   mazerunner_msg mmsg = {
     .flags = flags,
     .id = cid,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack_addr,
-    .bb_dist = bb_dist,
-    .avg_dist = avg_dist
+    .global_min_dist = global_min_dist,
+    .local_min_dist = local_min_dist
   };
   internal_write(__pipe_fd, &mmsg, sizeof(mmsg));
 }

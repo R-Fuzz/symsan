@@ -38,8 +38,8 @@ class mazerunner_msg(ctypes.Structure):
                 ("id", ctypes.c_uint32),
                 ("addr", ctypes.c_ulong),
                 ("context", ctypes.c_uint32),
-                ("bb_dist", ctypes.c_int64),
-                ("avg_dist", ctypes.c_int64)]
+                ("global_min_dist", ctypes.c_int64),
+                ("local_min_dist", ctypes.c_int64)]
 
 class concrete_value(ctypes.Union):
     _fields_ = [("i", ctypes.c_uint64),

@@ -500,7 +500,7 @@ bool AFLCoverage::runOnModule(Module &M) {
           ConstantInt *Distance = ConstantInt::get(LargestType, (unsigned) distance);
           ConstantInt *Zero = ConstantInt::get(LargestType, (unsigned) 0);
 
-          /* Store minimal BB distance to shm[MAPSIZE]
+          /* Store global minimal BB distance to shm[MAPSIZE]
           *  sub = distance - map_dist
           *  lshr = sign(sub) 
           *  shm[MAPSIZE] = lshr * distance + (1 - lshr) * map_dist
@@ -521,14 +521,22 @@ bool AFLCoverage::runOnModule(Module &M) {
           IRB.CreateStore(Incr, MapDistPtr)
            ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
-          /* Add accumulated distance to shm[MAPSIZE + (4 or 8)] */
+          /* Store local minimal distance to shm[MAPSIZE + (4 or 8)] */
           Value *MapDistSumPtr = IRB.CreateBitCast(
               IRB.CreateGEP(MapPtr, MapDistSumLoc), LargestType->getPointerTo());
-          LoadInst *MapDistSum = IRB.CreateLoad(MapDistSumPtr);
-          MapDistSum->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-          Value *IncrDist = IRB.CreateAdd(MapDistSum, Distance);
-          IRB.CreateStore(IncrDist, MapDistSumPtr)
-              ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+          MapDist = IRB.CreateLoad(MapDistSumPtr);
+          MapDist->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+          Sub = IRB.CreateSub(Distance, MapDist);
+          Bits = ConstantInt::get(LargestType, 63);
+          Lshr = IRB.CreateLShr(Sub, Bits);
+          Mul1 = IRB.CreateMul(Lshr, Distance);
+          Sub1 = IRB.CreateSub(One, Lshr);
+          Mul2 = IRB.CreateMul(Sub1, MapDist);
+          Incr = IRB.CreateAdd(Mul1, Mul2);
+
+          IRB.CreateStore(Incr, MapDistSumPtr)
+           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
           /* Increase count at shm[MAPSIZE + (4 or 8) + (4 or 8)] */
           Value *MapCntPtr = IRB.CreateBitCast(

@@ -73,10 +73,10 @@ class RLModel:
 
 class DistanceModel(RLModel):
     def Q_lookup(self, key):
-        return self.Q_table.get(key, 0.)
+        return self.Q_table.get(key, -1.)
 
     def Q_update(self, key, value):
-        if value != 0.:
+        if value != -1.:
             self.Q_table[key] = value
 
 
@@ -108,10 +108,10 @@ class ReachabilityModel(RLModel):
         return float(res) * 1000
 
     def Q_lookup(self, key):
-        value = self.Q_table.get(key, 0.)
+        value = self.Q_table.get(key, -1.)
         return ReachabilityModel.distance_to_prob(value)
 
     def Q_update(self, key, value):
-        if value != 0.:
+        if value != -1.:
             d = ReachabilityModel.prob_to_distance(value)
             self.Q_table[key] = d
