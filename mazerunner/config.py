@@ -1,4 +1,5 @@
 import json
+import pickle
 import os
 import logging
 
@@ -34,13 +35,12 @@ DECIMAL_PRECISION = 200
 class Config:
     __slots__ = ['__dict__',
                  '__weakref__',
-                 'logging_level', 
-                 'random_input', 
-                 'max_distance', 
-                 'nested_branch_enabled', 
-                 'gep_solver_enabled', 
-                 'optimistic_solving_enabled', 
-                 'discount_factor', 
+                 'logging_level',
+                 'random_input',
+                 'nested_branch_enabled',
+                 'gep_solver_enabled',
+                 'optimistic_solving_enabled',
+                 'discount_factor',
                  'learning_rate',
                  "output_dir",
                  "afl_dir",
@@ -63,6 +63,9 @@ class Config:
                  "save_frequency",
                  "model_type",
                  "decimal_precision",
+                 'max_distance',
+                 'initial_policy',
+                 'static_result_folder',
     ]
 
     def __init__(self):
@@ -84,19 +87,42 @@ class Config:
         with open(path, 'w') as file:
             json.save(self.__dict__, file)
 
-    def reload(self, args):
-        self.output_dir = args.output_dir
-        self.afl_dir = args.afl_dir
-        self.mazerunner_dir = os.path.join(args.output_dir, args.mazerunner_dir)
-        self.initial_seed_dir = args.input
-        self.mail = args.mail
-        self.delimiter = args.deli
-        self.pkglen = args.pkglen
-        self.cmd = args.cmd
+    def load_args(self, args):
+        if args.output_dir:
+            self.output_dir = args.output_dir
+        if args.afl_dir:
+            self.afl_dir = args.afl_dir
+        if args.mazerunner_dir:
+            self.mazerunner_dir = os.path.join(args.output_dir, args.mazerunner_dir)
+        if args.input:
+            self.initial_seed_dir = args.input
+        if args.mail:
+            self.mail = args.mail
+        if args.deli:
+            self.delimiter = args.deli
+        if args.pkglen:
+            self.pkglen = args.pkglen
+        if args.cmd:
+            self.cmd = args.cmd
         if args.debug_enabled:
             self.logging_level = logging.DEBUG
-        if args.distance_file and os.path.isfile(args.distance_file):
-            self.max_distance = self._load_distance_file(args.distance_file)
+        if args.static_result_folder:
+            self.static_result_folder = args.static_result_folder
+        if self.static_result_folder:
+            distance_file = os.path.join(self.static_result_folder, "distance.cfg.txt")
+            self.max_distance = self._load_distance_file(distance_file)
+            policy_file = os.path.join(self.static_result_folder, "policy.pkl")
+            self.initial_policy = self._load_initial_policy(policy_file)
+
+    def validate(self):
+        if not self.cmd:
+            raise ValueError("no cmd provided")
+        if self.agent_type == "qsym" and not self.afl_dir:
+            raise ValueError("You must provide -a option")
+        if self.agent_type != "replay" and not self.initial_seed_dir and not self.afl_dir:
+            raise ValueError("You must provide either -i or -a option")
+        if not os.path.isdir(self.output_dir):
+            raise ValueError('{self.output_dir} no such directory')
 
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL
@@ -126,15 +152,7 @@ class Config:
         else:
             self.model_type = RLModelType.unknown
         self.decimal_precision = DECIMAL_PRECISION
-        # The following should obly be set by the mazerunner launcher
-        self.output_dir = None
-        self.afl_dir = None
-        self.mazerunner_dir = None
-        self.initial_seed_dir = None
-        self.mail = None
-        self.delimiter = None
-        self.pkglen = None
-        self.cmd = None
+        # The other configurations need to be set explicitly by config file or cmd arguments
 
     def _load_distance_file(self, fp):
         max_distance = -float('inf')
@@ -142,3 +160,8 @@ class Config:
             lines = file.readlines()
             max_distance = max(float(lines[-1].strip().split(',')[-1]), max_distance)
         return max_distance
+
+    def _load_initial_policy(self, fp):
+        with open(fp, 'rb') as file:
+            policy = pickle.load(file)
+        return policy

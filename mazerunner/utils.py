@@ -1,5 +1,4 @@
 import os
-import psutil
 import copy
 import subprocess
 import time
@@ -60,22 +59,3 @@ def get_folder_size(dir_path):
             elif entry.is_dir():
                 total += get_folder_size(entry.path)
     return total
-
-def monitor_disk(termination_event, interval, dir_path, disk_limit):
-    while not termination_event.is_set():
-        folder_size = get_folder_size(dir_path)
-        if folder_size > disk_limit:
-            print(f"Disk usage is {folder_size / 2**30}GB - terminating")
-            termination_event.set()
-        time.sleep(interval)
-
-def monitor_memory(termination_event, interval, memory_limit):
-    total_memory = psutil.virtual_memory().total # in bytes
-    process = psutil.Process(os.getpid())
-    while not termination_event.is_set():
-        process_memory = process.memory_info().rss  # in bytes
-        percent_memory_used = (process_memory / total_memory) * 100
-        if percent_memory_used > memory_limit:
-            print(f"Memory usage is {percent_memory_used}% - terminating")
-            termination_event.set()
-        time.sleep(interval)
