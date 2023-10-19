@@ -72,7 +72,7 @@ class MazerunnerState:
         self.num_error_reports = 0
         self.num_crash_reports = 0
         self._seed_queue = []
-        self._best_seed_info = ["", float("inf"), False] # filename, distance, is_new
+        self._best_seed_info = [None, float("inf"), False] # filename, distance, is_new
 
     def __setstate__(self, dict):
         self.__dict__ = dict
@@ -113,6 +113,8 @@ class MazerunnerState:
         heapq.heappush(self._seed_queue, (priority, fn))
 
     def get_seed(self):
+        if self.is_queue_empty():
+            return None
         return heapq.heappop(self._seed_queue)[1]
 
     def clear(self):
@@ -249,7 +251,7 @@ class Mazerunner:
     def update_timmer(self, res):
         pass
 
-    def sync_from_afl(self, reversed_order=True):
+    def sync_from_afl(self, reversed_order=True, need_sort=False):
         files = []
         if self.afl_queue and os.path.exists(self.afl_queue):
             for name in os.listdir(self.afl_queue):
@@ -258,11 +260,12 @@ class Mazerunner:
                     shutil.copy2(path, os.path.join(self.my_generations, name))
                     files.append(name)
                     self.state.synced.add(name)
-        return sorted(files,
-                      key=functools.cmp_to_key(
-                          (lambda a, b: testcase_compare(a, b, self.afl_queue))
-                          ),
-                      reverse=reversed_order)
+        if need_sort:
+            return sorted(files,
+                        key=functools.cmp_to_key(
+                            (lambda a, b: testcase_compare(a, b, self.afl_queue))),
+                        reverse=reversed_order)
+        return files
 
     def sync_from_initial_seeds(self):
         files = []
@@ -279,6 +282,16 @@ class Mazerunner:
         if not files and not self.afl_queue:
             files = self.sync_from_initial_seeds()
         return files
+
+    def sync_from_fuzzer(self):
+        if self.state.execs % self.config.sync_frequency == 0:
+            files = self.sync_from_either()
+            for fn in files:
+                d = utils.get_distance_from_fn(fn)
+                d = self.config.max_distance if d is None else d
+                self.state.put_seed(fn, d)
+            if self.state.is_queue_empty():
+                self.handle_hang_files()
 
     def handle_return_status(self, result, fp):
         msg_count = result.symsan_msg_num
@@ -436,7 +449,7 @@ class QSYMExecutor(Mazerunner):
         self.logger.info("%d testcases are new" % (self.state.index - old_idx))
 
     def _run(self):
-        files = self.sync_from_afl()
+        files = self.sync_from_afl(need_sort=True)
         if not files:
             self.handle_hang_files()
             time.sleep(WAITING_INTERVAL)
@@ -452,7 +465,6 @@ class ExploreExecutor(Mazerunner):
         super().__init__(config, shared_state)
         self.agent = ExploreAgent(self.config)
         self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
-        self.sync_frequency = self.config.sync_frequency
 
     def dry_run(self):
         files = self.sync_from_either()
@@ -490,20 +502,15 @@ class ExploreExecutor(Mazerunner):
         self.logger.info("Generated %d testcases" % len(res.generated_testcases))
 
     def _run(self):
-        if (self.state.is_queue_empty()
-            or self.state.processed_num % self.sync_frequency == 0):
-            files = self.sync_from_either()
-            for fn in files:
-                d = utils.get_distance_from_fn(fn)
-                d = self.config.max_distance if d is None else d
-                self.state.put_seed(fn, d)
-            self.handle_hang_files()
-        if self.state.is_queue_empty():
-            time.sleep(WAITING_INTERVAL)
-            return
+        if self.config.agent_type == "explore":
+            self.sync_from_fuzzer()
         next_seed = self.state.get_seed()
-        if not next_seed in self.state.processed:
-            self._run_single_file(next_seed)
+        if not next_seed is None:
+            if next_seed not in self.state.processed:
+                self._run_single_file(next_seed)
+        else:
+            self.logger.info("Sleeping for getting seeds from AFL")
+            time.sleep(WAITING_INTERVAL)
 
     def _run_single_file(self, fn):
         self.run_file(fn)
@@ -517,8 +524,6 @@ class ExploitExecutor(Mazerunner):
         self.agent = ExploitAgent(self.config)
         self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
         self.no_progress_count = 0
-        if not shared_state:
-            self._init_best_testcase()
 
     @property
     def has_converged(self):
@@ -558,8 +563,7 @@ class ExploitExecutor(Mazerunner):
         if self.agent.target[0] and not has_reached_max_flip_num():
             self.agent.handle_unsat_condition()
         # check if it's stuck
-        if (len(self.agent.all_targets) == len(self.agent.last_targets) 
-            and self.agent.all_targets == self.agent.last_targets) or has_reached_max_flip_num():
+        if self.agent.all_targets == self.agent.last_targets or has_reached_max_flip_num():
             self.no_progress_count += 1
         else:
             self.no_progress_count = 0
@@ -593,21 +597,22 @@ class ExploitExecutor(Mazerunner):
             shutil.copy2(self.cur_input, dst_fp)
 
     def _run(self):
-        next_seed = self.state.best_seed
-        if self.state.discovered_closer_seed:
-            self.state.discovered_closer_seed = False
-            self.no_progress_count = 0
-        self.run_file(next_seed)
-        # start RL training after symsan executor finishes
-        self.agent.replay_trace(self.agent.episode)
-
-    def _init_best_testcase(self):
-        if not self.state.best_seed:
-            files = list(self.state.synced)
-            if not files:
-                files = self.sync_from_either()
-            fn = random.choice(files)
-            self.state.update_best_seed(fn, self.config.max_distance)
+        if self.config.agent_type == "exploit":
+            self.sync_from_fuzzer()
+        next_seed = None
+        if self.has_converged or not self.state.best_seed:
+            next_seed = self.state.get_seed()
+        if next_seed is None:
+            next_seed = self.state.best_seed
+            if self.state.discovered_closer_seed:
+                self.state.discovered_closer_seed = False
+                self.no_progress_count = 0
+        if next_seed:
+            self.run_file(next_seed)
+            self.agent.replay_trace(self.agent.episode)
+        else:
+            self.logger.info("Sleeping for getting seeds from AFL")
+            time.sleep(WAITING_INTERVAL)
 
 class RecordExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
@@ -679,11 +684,11 @@ class HybridExecutor():
         while not self.reached_resource_limit:
             if self.state.execs % self.config.save_frequency == 0:
                 self._export_state()
-            if (self.explore_executor.state.discovered_closer_seed 
+            if (self.state.discovered_closer_seed 
                 or not self.exploit_executor.has_converged):
                 self.exploit_executor.run(run_once=True)
-                self.explore_executor.run(run_once=True)
                 continue
+            self.explore_executor.sync_from_fuzzer()
             self.explore_executor.run(run_once=True)
 
     def cleanup(self):
