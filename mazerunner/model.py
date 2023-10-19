@@ -98,7 +98,7 @@ class ReachabilityModel(RLModel):
     def distance_to_prob(d):
         """
         Converts a distance to a probability.
-        Returns: 1 / 2 ** d
+        Returns: 1 / 2 ** (d / 1000)
         """
         if d == -1.:
             return ReachabilityModel.ZERO
@@ -108,7 +108,7 @@ class ReachabilityModel(RLModel):
     def prob_to_distance(p):
         """
         Converts a probability to a distance.
-        Returns: -log_2(p)
+        Returns: -log_2(p) * 1000
         """
         if p == ReachabilityModel.ZERO:
             return -1.

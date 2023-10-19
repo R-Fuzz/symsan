@@ -28,7 +28,7 @@ class ExecutorResult:
                  returncode, msg_num, testcases, out, err):
         self.total_time = total_time
         self.solving_time = solving_time
-        self.distance = dist
+        self.distance = int(dist)
         self.returncode = returncode
         self.symsan_msg_num = msg_num
         self.generated_testcases = testcases

@@ -273,11 +273,7 @@ class ExploitAgent(Agent):
         if reversed_sa in self.model.unreachable_sa:
             self.logger.debug(f"not interesting, unreachable sa {reversed_sa}")
             return False
-        curr_sa = self.curr_state.state + (self.curr_state.action, )
-        if curr_sa not in self.model.visited_sa:
-            self.logger.debug(f"not interesting, unvisited state")
-            return False
-        interesting = self.__epsilon_greedy_policy(reversed_sa)
+        interesting = self.__greedy_policy() != self.curr_state.action
         if interesting:
             self.all_targets.append(reversed_sa)
             self.target = (reversed_sa, len(self.episode))
