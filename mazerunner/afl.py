@@ -337,7 +337,6 @@ class Mazerunner:
                 # read id from the format "id:000000..."
                 num = int(name[3:9])
                 if num > self.state.crashes[fuzzer]:
-                    self._report_crash(os.path.join(crash_dir, name))
                     self.state.crashes[fuzzer] = num
 
     def cleanup(self):
@@ -374,53 +373,8 @@ class Mazerunner:
             self.state = MazerunnerState(self.config.timeout)
         atexit.register(self.export_state)
 
-    def _send_mail(self, subject, info, attach=None):
-        if attach is None:
-            attach = []
-        cmd = ["mail"]
-        for path in attach:
-            cmd += ["-A", path]
-        cmd += ["-s", "[mazerunner-report] %s" % subject]
-        cmd.append(self.config.mail)
-        info = copy.copy(info)
-        info["CMD"] = " ".join(self.cmd)
-        text = "\n" # skip cc
-        for k, v in info.items():
-            text += "%s\n" % k
-            text += "-" * 30 + "\n"
-            text += "%s" % v + "\n" * 3
-        try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, 
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            proc.communicate(text.encode())
-        except OSError:
-            pass
-
     def _report_error(self, fp, log):
-        self.logger.debug("Error is occurred: %s\nLog:%s" % (fp, log))
-        # if no mail, then stop
-        if self.config.mail is None:
-            return
-        # don't do too much
-        if self.state.num_error_reports >= self.config.max_error_reports:
-            return
-        self.state.num_error_reports += 1
-        self._send_mail("Error found", {"LOG": log}, [fp])
-
-    def _report_crash(self, fp):
-        self.logger.debug("Crash is found: %s" % fp)
-        # if no mail, then stop
-        if self.config.mail is None:
-            return
-        # don't do too much
-        if self.state.num_crash_reports >= self.config.max_error_reports:
-            return
-        self.state.num_crash_reports += 1
-        info = {}
-        stdout, stderr = utils.run_command(["timeout", "-k", "5", "5"] + self.afl_cmd, fp)
-        info["STDOUT"] = stdout
-        info["STDERR"] = stderr
-        self._send_mail("Crash found", info, [fp])
+        self.logger.info("Symsan process error: %s\nLog:%s" % (fp, log))
 
 class QSYMExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):

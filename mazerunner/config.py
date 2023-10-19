@@ -29,7 +29,6 @@ MAX_FLIP_NUM = 128
 # minimum number of hang files to increase timeout
 MIN_HANG_FILES = 30
 # Model configurations
-MODEL_TYPE = "reachability" # "distance"
 DECIMAL_PRECISION = 200
 
 class Config:
@@ -47,9 +46,6 @@ class Config:
                  "afl_dir",
                  "mazerunner_dir",
                  "initial_seed_dir",
-                 "mail",
-                 "delimiter",
-                 "pkglen",
                  "cmd",
                  "sync_frequency",
                  "explore_rate",
@@ -91,20 +87,21 @@ class Config:
     def load_args(self, args):
         if args.agent_type:
             self.agent_type = args.agent_type
+        if args.model_type:
+            if args.model_type == "distance":
+                self.model_type = RLModelType.distance
+            elif args.model_type == "reachability":
+                self.model_type = RLModelType.reachability
+            else:
+                self.model_type = RLModelType.unknown
         if args.output_dir:
             self.output_dir = args.output_dir
-        if args.afl_dir:
-            self.afl_dir = args.afl_dir
+        if args.fuzzer_dir:
+            self.afl_dir = args.fuzzer_dir
         if args.mazerunner_dir:
             self.mazerunner_dir = os.path.join(args.output_dir, args.mazerunner_dir)
         if args.input:
             self.initial_seed_dir = args.input
-        if args.mail:
-            self.mail = args.mail
-        if args.deli:
-            self.delimiter = args.deli
-        if args.pkglen:
-            self.pkglen = args.pkglen
         if args.cmd:
             self.cmd = args.cmd
         if args.debug_enabled:
@@ -147,15 +144,9 @@ class Config:
         self.memory_limit = MEMORY_LIMIT_PERCENTAGE
         self.disk_limit = DISK_LIMIT_SIZE
         self.save_frequency = SAVE_FREQUENCY
-        self.model_type = RLModelType.reachability
-        if MODEL_TYPE == "distance":
-            self.model_type = RLModelType.distance
-        elif MODEL_TYPE == "reachability":
-            self.model_type = RLModelType.reachability
-        else:
-            self.model_type = RLModelType.unknown
         self.decimal_precision = DECIMAL_PRECISION
         # The other configurations need to be set explicitly by config file or cmd arguments
+        self.model_type = RLModelType.unknown
 
     def _load_distance_file(self, fp):
         max_distance = -float('inf')

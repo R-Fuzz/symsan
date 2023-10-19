@@ -31,27 +31,24 @@ def monitor_memory(termination_event, interval, memory_limit):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("-agent", dest="agent_type", default=None, help="RL agent type")
+    p.add_argument("-a", dest="agent_type", default=None, help="RL agent type")
+    p.add_argument("-m", dest="model_type", default="reachability", help="RL model type")
     p.add_argument("-o", dest="output_dir", default=None, help="hybrid fuzzing output path")
     p.add_argument("-s", dest="static_result_folder", default=None, help="static analysis results folder that saves the distance information and initial policy")
-    p.add_argument("-a", dest="afl_dir", default=None, help="AFL instance name")
+    p.add_argument("-f", dest="fuzzer_dir", default=None, help="AFL fuzzer instance name")
     p.add_argument("-n", dest="mazerunner_dir", default="mazerunner", help="mazerunner instance name")
     p.add_argument("-i", dest="input", default=None, help="initial seed directory")
-    p.add_argument("-m", dest="mail", default=None, help="Interesting result will be sent to the Email address")
     p.add_argument("-config", dest="config_path", default=None, help="path of configuration file")
     p.add_argument("-debug", dest="debug_enabled", action="store_true", help="Enable debug mode")
     p.add_argument("-monitor_resource", dest="resource_monitor_enabled", action="store_true", help="Enable memory and disk usage monitor")
     p.add_argument("cmd", nargs="+", help=f"cmdline, use {AT_FILE} to denote a file")
-    # TODO: implement these two options
-    p.add_argument("-deli", dest="deli", default=None, help="Delimiter used to split the input")
-    p.add_argument("-pkglen", dest="pkglen", default=None, help="length of how many bytes used to split the input")
     return p.parse_args()
 
 def main():
     random.seed(time.time())
     args = parse_args()
     if (args.config_path is None
-        and any(arg is None for arg in [args.agent_type, args.output_dir, args.static_result_folder, args.afl_dir])):
+        and any(arg is None for arg in [args.agent_type, args.output_dir, args.static_result_folder, args.fuzzer_dir])):
         raise ValueError("You must provide either -config or -agent -o -s -a options")
     config = Config()
     config.load(args.config_path)
