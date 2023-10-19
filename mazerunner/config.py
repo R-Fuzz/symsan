@@ -35,6 +35,7 @@ DECIMAL_PRECISION = 200
 class Config:
     __slots__ = ['__dict__',
                  '__weakref__',
+                 'agent_type',
                  'logging_level',
                  'random_input',
                  'nested_branch_enabled',
@@ -88,6 +89,8 @@ class Config:
             json.save(self.__dict__, file)
 
     def load_args(self, args):
+        if args.agent_type:
+            self.agent_type = args.agent_type
         if args.output_dir:
             self.output_dir = args.output_dir
         if args.afl_dir:
@@ -119,8 +122,8 @@ class Config:
             raise ValueError("no cmd provided")
         if self.agent_type == "qsym" and not self.afl_dir:
             raise ValueError("You must provide -a option")
-        if self.agent_type != "replay" and not self.initial_seed_dir and not self.afl_dir:
-            raise ValueError("You must provide either -i or -a option")
+        if self.agent_type == "replay" and not self.afl_dir:
+            raise ValueError("You must provide -a option")
         if not os.path.isdir(self.output_dir):
             raise ValueError('{self.output_dir} no such directory')
 

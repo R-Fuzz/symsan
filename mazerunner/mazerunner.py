@@ -61,20 +61,20 @@ def main():
         # wait for afl fuzzer to start and initialize itself
         time.sleep(5)
 
-    if args.agent_type == "hybrid":
+    if config.agent_type == "hybrid":
         e = afl.HybridExecutor(config)
-    elif args.agent_type == "explore":
+    elif config.agent_type == "explore":
         e = afl.ExploreExecutor(config)
-    elif args.agent_type == "exploit":
+    elif config.agent_type == "exploit":
         e = afl.ExploitExecutor(config)
-    elif args.agent_type == "record":
+    elif config.agent_type == "record":
         e = afl.RecordExecutor(config)
-    elif args.agent_type == "replay":
+    elif config.agent_type == "replay":
         e = afl.ReplayExecutor(config)
-    elif args.agent_type == "qsym":
+    elif config.agent_type == "qsym":
         e = afl.QSYMExecutor(config)
     else:
-        raise ValueError(f"unknown agent type {args.agent_type}")
+        raise ValueError(f"unknown agent type {config.agent_type}")
     
     if args.resource_monitor_enabled:
         # Start a background thread to check memory usage every 10 minutes
