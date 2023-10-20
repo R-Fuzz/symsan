@@ -49,6 +49,8 @@ def testcase_compare(a, b, seed_dir):
     return 1 if a_score > b_score else -1
 
 def get_afl_cmd(fuzzer_stats):
+    while not os.path.exists(fuzzer_stats):
+        time.sleep(1)
     with open(fuzzer_stats) as f:
         for l in f:
             if l.startswith("command_line"):
@@ -217,6 +219,8 @@ class Mazerunner:
                 break
             if self.state.execs % self.config.save_frequency == 0:
                 self.export_state()
+        if not run_once:
+            self.logger.error("Reached resource limit, exiting...")
 
     def run_file(self, fn):
         self.state.execs += 1
@@ -644,6 +648,7 @@ class HybridExecutor():
                 continue
             self.explore_executor.sync_from_fuzzer()
             self.explore_executor.run(run_once=True)
+        logging.getLogger(self.__class__.__qualname__).error("Reached resource limit, exiting...")
 
     def cleanup(self):
         self._export_state()

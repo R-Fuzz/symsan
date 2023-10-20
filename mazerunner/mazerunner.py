@@ -4,6 +4,7 @@ import random
 import threading
 import time
 import psutil
+import sys
 import os
 
 import afl
@@ -45,6 +46,8 @@ def parse_args():
     return p.parse_args()
 
 def main():
+    print("[*] spinning up mazerunner: " + " ".join(sys.argv))
+    
     random.seed(time.time())
     args = parse_args()
     if (args.config_path is None
@@ -54,9 +57,6 @@ def main():
     config.load(args.config_path)
     config.load_args(args)
     config.validate()
-    if config.afl_dir:
-        # wait for afl fuzzer to start and initialize itself
-        time.sleep(5)
 
     if config.agent_type == "hybrid":
         e = afl.HybridExecutor(config)
