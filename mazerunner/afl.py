@@ -49,6 +49,8 @@ def testcase_compare(a, b, seed_dir):
     return 1 if a_score > b_score else -1
 
 def get_afl_cmd(fuzzer_stats):
+    while not os.path.exists(fuzzer_stats):
+        time.sleep(1)
     with open(fuzzer_stats) as f:
         for l in f:
             if l.startswith("command_line"):
