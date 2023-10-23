@@ -495,7 +495,9 @@ class ExploitExecutor(Mazerunner):
                 self.symsan.setup(self.cur_input, self.state.processed_num)
                 self.symsan.run(self.state.timeout)
                 self.symsan.process_request()
-                if self.symsan.has_terminated and len(self.symsan.solver.generated_files) == 0:
+                # (1) symsan proc has nomarlly terminated and self.cur_input is on policy
+                # (2) the solver is not able to solve the branch condition
+                if len(self.symsan.solver.generated_files) == 0:
                     break
                 assert len(self.symsan.solver.generated_files) == 1
                 fp = os.path.join(self.my_generations, self.symsan.solver.generated_files[0])

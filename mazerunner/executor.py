@@ -32,8 +32,8 @@ class ExecutorResult:
         self.returncode = returncode
         self.symsan_msg_num = msg_num
         self.generated_testcases = testcases
-        self.stdout = out.read() if out else "Output not available"
-        self.stderr = err.read() if err else "Unknown error"
+        self.stdout = out if out else "Output not available"
+        self.stderr = err if err else "Unknown error"
 
     @property
     def emulation_time(self):
@@ -114,7 +114,7 @@ class SymSanExecutor:
             return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
                                   self.timer.solving_time, self.agent.min_distance, 
                                   self.proc.returncode, self.msg_num, 
-                                  self.solver.generated_files, self.proc.stdin, self.proc.stderr)
+                                  self.solver.generated_files, self.proc.stdout, self.proc.stderr)
 
     def setup(self, input_file, session_id=0):
         self.input_file = input_file
@@ -153,7 +153,7 @@ class SymSanExecutor:
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                              env={"TAINT_OPTIONS": options},
                                              pass_fds=(self.shm._fd, self.pipefds[1]))
-                self.proc.stdin.write(stdin.encode())
+                self.proc.stdin.write(stdin)
                 self.proc.stdin.flush()
             else:
                 # the symsan proc reads the input from file stream
