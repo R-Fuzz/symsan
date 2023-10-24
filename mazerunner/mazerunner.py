@@ -45,18 +45,31 @@ def parse_args():
     p.add_argument("cmd", nargs="+", help=f"cmdline, use {AT_FILE} to denote a file")
     return p.parse_args()
 
+def validate_args(args):
+    if not args.cmd:
+        raise ValueError("no cmd provided")
+    if (args.config_path is None
+        and any(arg is None for arg in [args.agent_type, args.output_dir, args.static_result_folder])):
+        raise ValueError("You must provide either -config or -o -s -a options")
+    if args.fuzzer_dir is None:
+        if args.agent_type == "record":
+            if args.input is None:
+                raise ValueError("You must provide either -i or -f option")
+        else:
+            raise ValueError("You must provide -f option")
+    if not os.path.isdir(args.output_dir):
+        raise ValueError(f'{args.output_dir} no such directory')
+
 def main():
     print("[*] spinning up mazerunner: " + " ".join(sys.argv))
     
     random.seed(time.time())
     args = parse_args()
-    if (args.config_path is None
-        and any(arg is None for arg in [args.agent_type, args.output_dir, args.static_result_folder, args.fuzzer_dir])):
-        raise ValueError("You must provide either -config or -agent -o -s -a options")
+    validate_args(args)
     config = Config()
     config.load(args.config_path)
     config.load_args(args)
-    config.validate()
+    validate_args(args)
 
     if config.agent_type == "hybrid":
         e = afl.HybridExecutor(config)

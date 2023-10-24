@@ -114,16 +114,6 @@ class Config:
             policy_file = os.path.join(self.static_result_folder, "policy.pkl")
             self.initial_policy = self._load_initial_policy(policy_file)
 
-    def validate(self):
-        if not self.cmd:
-            raise ValueError("no cmd provided")
-        if self.agent_type == "qsym" and not self.afl_dir:
-            raise ValueError("You must provide -a option")
-        if self.agent_type == "replay" and not self.afl_dir:
-            raise ValueError("You must provide -a option")
-        if not os.path.isdir(self.output_dir):
-            raise ValueError('{self.output_dir} no such directory')
-
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL
         self.random_input = RANDOM_INPUT
@@ -147,6 +137,13 @@ class Config:
         self.decimal_precision = DECIMAL_PRECISION
         # The other configurations need to be set explicitly by config file or cmd arguments
         self.model_type = RLModelType.unknown
+        self.afl_dir = ''
+        self.agent_type = ''
+        self.output_dir = ''
+        self.mazerunner_dir = ''
+        self.initial_seed_dir = ''
+        self.cmd = ''
+        self.static_result_folder = ''
 
     def _load_distance_file(self, fp):
         max_distance = -float('inf')

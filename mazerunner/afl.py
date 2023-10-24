@@ -1,13 +1,10 @@
 import atexit
-import copy
 import logging
 import functools
 import os
 import pickle
-import random
 import re
 import shutil
-import subprocess
 import time
 import heapq
 
@@ -154,9 +151,8 @@ class Mazerunner:
         else:
             self._import_state()
         self._setup_logger(config.logging_level)
-        self.afl = ''
-        if config.afl_dir:
-            self.afl = config.afl_dir
+        self.afl = config.afl_dir
+        if self.afl:
             self.afl_cmd, afl_path, qemu_mode = self._parse_fuzzer_stats()
             self.minimizer = minimizer.TestcaseMinimizer(
                 self.afl_cmd, afl_path, self.output, qemu_mode, self.state)
@@ -581,7 +577,14 @@ class RecordExecutor(Mazerunner):
         self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
 
     def sync_back_if_interesting(self, fp, res):
-        pass
+        fn = os.path.basename(fp)
+        dir_name = os.path.dirname(fp)
+        if 'dis:' not in fn:
+            fn = fn + ',dis:' + str(res.distance)
+        if 'time:' in fn and 'ts:' not in fn:
+            fn = fn.replace('time:', 'ts:')
+        shutil.move(fp, os.path.join(dir_name, fn))
+        self.agent.save_trace(fn)
 
     def _run(self):
         files = self.sync_from_either()
@@ -593,7 +596,6 @@ class RecordExecutor(Mazerunner):
             self.state.timeout = self.config.timeout / 10
             self.run_file(fn)
             self.state.processed.add(fn)
-            self.agent.save_trace(fn)
 
 class ReplayExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
