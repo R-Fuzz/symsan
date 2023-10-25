@@ -426,7 +426,7 @@ class ExploreExecutor(Mazerunner):
             self._run_single_file(seed)
 
     def update_timmer(self, res):
-        self.state.explore_ce_time += res.total_time/1000
+        self.state.explore_ce_time += res.total_time / utils.MILLION_SECONDS_SCALE
     
     def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
@@ -528,7 +528,7 @@ class ExploitExecutor(Mazerunner):
         return symsan_res
 
     def update_timmer(self, res):
-        self.state.exploit_ce_time += res.total_time/1000
+        self.state.exploit_ce_time += res.total_time / utils.MILLION_SECONDS_SCALE
 
     def sync_back_if_interesting(self, fp, res):
         if not self.minimizer.is_new_file(self.cur_input):

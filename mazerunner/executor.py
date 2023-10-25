@@ -49,8 +49,8 @@ class SymSanExecutor:
     
     class Timer:
         def reset(self):
-            self.proc_start_time = 0
-            self.proc_end_time = 0
+            self.proc_start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            self.proc_end_time = self.proc_start_time
             self.solving_time = 0
 
         def execution_timeout(self, timeout):
@@ -107,7 +107,7 @@ class SymSanExecutor:
         if not self.has_terminated:
             self.proc.kill()
             self.proc.wait()
-            self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+        self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
 
     def get_result(self):
         # TODO: implement stream reader thread in case the subprocess closes
@@ -146,7 +146,6 @@ class SymSanExecutor:
             cmd = ["timeout", "-k", str(1), str(timeout)] + cmd
         try:
             self.logger.debug("Executing %s" % ' '.join(cmd))
-            self.timer.proc_start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             if stdin:
                 # the symsan proc reads the input from stdin
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
