@@ -14,7 +14,6 @@ from model import RLModel
 import minimizer
 import utils
 
-CONVERGING_THRESHOLD = 10
 WAITING_INTERVAL = 5
 
 # 'id:xxxx,src:yyyyy' -> 'id:xxxx'
@@ -446,7 +445,7 @@ class ExploreExecutor(Mazerunner):
         is_closer = self.minimizer.has_closer_distance(res.distance, fn)
         if is_closer:
             self.logger.info(f"Explore agent found closer seed. "
-                         f"fn: {fn}, distance: {res.distance}, ts: {ts}")
+                         f"distance: {res.distance}, ts: {ts}")
         is_interesting = fn not in self.state.synced and (is_closer 
                           or self.minimizer.has_new_sa(len(self.agent.model.visited_sa)))
         if self.afl_queue and is_interesting:
@@ -477,11 +476,6 @@ class ExploitExecutor(Mazerunner):
         super().__init__(config, shared_state)
         self.agent = ExploitAgent(self.config)
         self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
-        self.no_progress_count = 0
-
-    @property
-    def has_converged(self):
-        return self.no_progress_count > CONVERGING_THRESHOLD
 
     def run_target(self):
         total_time = emulation_time = solving_time = 0
@@ -518,13 +512,7 @@ class ExploitExecutor(Mazerunner):
         # target might still be reachable due to hitting max_flip_num
         if self.agent.target[0] and not has_reached_max_flip_num():
             self.agent.handle_unsat_condition()
-        # check if it's stuck
-        if self.agent.all_targets == self.agent.last_targets or has_reached_max_flip_num():
-            self.no_progress_count += 1
-        else:
-            self.no_progress_count = 0
-        self.agent.last_targets = self.agent.all_targets
-        self.agent.all_targets = []
+        self.agent.all_targets.clear()
         return symsan_res
 
     def update_timmer(self, res):
@@ -543,7 +531,7 @@ class ExploitExecutor(Mazerunner):
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
             self.logger.info(f"Exploit agent found closer seed. "
-                            f"fn: {fn}, distance: {res.distance}, ts: {ts}")
+                            f"distance: {res.distance}, ts: {ts}")
         is_interesting = is_closer or self.minimizer.has_new_sa(len(self.agent.model.visited_sa))
         if is_interesting:
             self.state.put_seed(dst_fn, res.distance)
@@ -555,9 +543,7 @@ class ExploitExecutor(Mazerunner):
     def _run(self):
         if self.config.agent_type == "exploit":
             self.sync_from_fuzzer()
-        next_seed = None
-        if self.has_converged or not self.state.best_seed:
-            next_seed = self.state.get_seed()
+        next_seed = self.state.get_seed()
         if next_seed is None:
             next_seed = self.state.best_seed
             if self.state.discovered_closer_seed:
@@ -646,12 +632,11 @@ class HybridExecutor():
         while not self.reached_resource_limit:
             if self.state.execs % self.config.save_frequency == 0:
                 self._export_state()
-            if (self.state.discovered_closer_seed 
-                or not self.exploit_executor.has_converged):
+            if self.state.discovered_closer_seed:
                 self.exploit_executor.run(run_once=True)
                 continue
             self.explore_executor.sync_from_fuzzer()
-            self.explore_executor.run(run_once=True)
+            self.exploit_executor.run(run_once=True)
         logging.getLogger(self.__class__.__qualname__).error("Reached resource limit, exiting...")
 
     def cleanup(self):
