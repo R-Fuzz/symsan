@@ -11,7 +11,6 @@ from utils import mkdir, bucket_lookup, MAX_BUCKET_SIZE, get_distance_from_fn
 
 class ProgramState:
     def __init__(self, distance):
-        self.edge = (0, 0)
         self.state = (0,0,0)
         self.action = 0
         self.d = distance
@@ -47,19 +46,14 @@ class DistanceRewardCalculator(RewardCalculator):
         self.last_d = self.config.max_distance
 
     def compute_reward(self, i):
-        if i >= len(self.trace):
-            if self.min_distance > 0:
-                return -self.config.max_distance
-            else:
-                return 0
+        if i >= len(self.trace) and self.min_distance > 0:
+                return self.config.max_distance
         s, a, d = self.trace[i]
-        if d == -1 or self.last_d == -1:
+        if d == 0:
             return -self.config.max_distance
-        if d == 0 and self.last_d > 0:
-            return self.config.max_distance
-        r = self.last_d - d
+        r = d - self.last_d
         self.last_d = d
-        return r if r < 0 else 0
+        return r
 
 
 class ReachabilityRewardCalculator(RewardCalculator):
@@ -185,7 +179,7 @@ class Agent:
             self.logger.debug(f"SA: {sa}, "
                             f"distance: {d if d else 'NA'}, "
                             f"reward: {reward}, "
-                            f"Q: {self.model.Q_lookup(sa)}")
+                            f"d_sa: {self.model.get_distance(sa)}")
 
     def replay_log(self, log_path):
         self.reset()
@@ -209,8 +203,7 @@ class Agent:
             # msg.local_min_dist is zero, assign the last distance available
             d = self.curr_state.d
         self.min_distance = float(msg.global_min_dist)
-        assert (d == -1 
-                or (self.min_distance <= d <= self.config.max_distance))
+        assert (self.min_distance <= d <= self.config.max_distance)
         self.curr_state.update(msg.addr, msg.context, action, d)
         self.logger.debug(f"SA: {(msg.addr, msg.context, action)}, "
                         f"distance: {d if d else 'NA'}, "
@@ -273,7 +266,7 @@ class ExploitAgent(Agent):
         if reversed_sa in self.model.unreachable_sa:
             self.logger.debug(f"not interesting, unreachable sa {reversed_sa}")
             return False
-        interesting = self.__greedy_policy() != self.curr_state.action
+        interesting = self._weighted_probabilistic_policy() != self.curr_state.action
         if interesting:
             self.all_targets.append(reversed_sa)
             self.target = (reversed_sa, len(self.episode))
@@ -285,7 +278,7 @@ class ExploitAgent(Agent):
         self.target = (None, 0)
 
     # Return whether the agent should visit the filpped branch.
-    def __epsilon_greedy_policy(self, reversed_sa):
+    def _epsilon_greedy_policy(self, reversed_sa):
         if (reversed_sa not in self.model.visited_sa
             and random.random() < self.epsilon):
             self.logger.debug(f"interesting, epsilon-greedy policy")
@@ -294,7 +287,7 @@ class ExploitAgent(Agent):
             and random.random() < (self.epsilon ** self.model.visited_sa[reversed_sa])):
             self.logger.debug(f"interesting, epsilon-greedy policy")
             return True
-        if self.__greedy_policy() != self.curr_state.action:
+        if self._greedy_policy() != self.curr_state.action:
             self.logger.debug(f"interesting, greedy policy")
             return True
         else:
@@ -302,12 +295,36 @@ class ExploitAgent(Agent):
             return False
 
     # Returns the greedy action according to the Q value.
-    def __greedy_policy(self):
-        curr_state_taken = self.model.Q_lookup(self.curr_state.state +(1,))
-        curr_state_not_taken = self.model.Q_lookup(self.curr_state.state +(0,))
-        if curr_state_taken > curr_state_not_taken:
+    def _greedy_policy(self):
+        d_taken = self.model.get_distance(self.curr_state.state + (1,))
+        d_not_taken = self.model.get_distance(self.curr_state.state + (0,))
+        if d_taken == d_not_taken: 
+            return self.curr_state.action
+        if d_taken > d_not_taken or d_not_taken == 0 or d_taken == self.config.max_distance:
+            return 0
+        elif d_taken < d_not_taken or d_taken == 0 or d_not_taken == self.config.max_distance:
             return 1
-        elif curr_state_taken < curr_state_not_taken:
+        else:
+            return self.curr_state.action
+    
+    def _weighted_probabilistic_policy(self):
+        d_taken = self.model.get_distance(self.curr_state.state + (1,))
+        d_not_taken = self.model.get_distance(self.curr_state.state + (0,))
+        total = d_taken + d_not_taken
+        p = random.random()
+        if d_taken == d_not_taken: 
+            return self.curr_state.action
+        if p < d_taken / total or d_taken == 0 or d_not_taken == self.config.max_distance:
+            return 1
+        elif p < d_not_taken / total or d_not_taken == 0 or d_taken == self.config.max_distance:
             return 0
         else:
             return self.curr_state.action
+
+    def __debug_policy(self):
+        distance_taken = self.model.get_distance(self.curr_state.state + (1,))
+        distance_not_taken = self.model.get_distance(self.curr_state.state + (0,))
+        self.logger.info(f"curr_sad={self.curr_state.serialize()}, "
+                        f"visited_times={self.model.visited_sa.get(self.curr_state.state + (self.curr_state.action,), 0)}, "
+                        f"distance_taken={distance_taken}, "
+                        f"distance_not_taken={distance_not_taken}, ")
