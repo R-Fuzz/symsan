@@ -60,7 +60,8 @@ class RLModel:
 
     def get_distance(self, key):
         if key not in self.Q_table:
-            value = self.config.initial_policy.get((key[0], key[-1]), self.default_q)
+            value = self.config.initial_policy.get((key[0], key[-1]), None)
+            value = self.default_q if value is None else value
         else:
             value = self.Q_table[key]
         return float(value)

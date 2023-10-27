@@ -3,6 +3,7 @@ import logging
 import functools
 import os
 import pickle
+import random
 import re
 import shutil
 import time
@@ -58,8 +59,6 @@ class MazerunnerState:
         self.timeout = timeout
         self.start_ts = time.time()
         self.end_ts = None
-        self.exploit_ce_time = 0
-        self.explore_ce_time = 0
         self.synced = set()
         self.hang = set()
         self.processed = set()
@@ -93,14 +92,6 @@ class MazerunnerState:
     def update_best_seed(self, filename, distance):
         self._best_seed_info[0] = filename
         self._best_seed_info[1] = int(distance)
-        self._best_seed_info[2] = True
-
-    @property
-    def discovered_closer_seed(self):
-        return self._best_seed_info[2]
-    @discovered_closer_seed.setter
-    def discovered_closer_seed(self, value):
-        self._best_seed_info[2] = value
     
     def is_queue_empty(self):
         return len(self._seed_queue) == 0
@@ -419,13 +410,12 @@ class ExploreExecutor(Mazerunner):
         self.agent = ExploreAgent(self.config)
         self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
 
-    def dry_run(self):
-        files = self.sync_from_either()
-        for seed in files:
-            self._run_single_file(seed)
 
     def update_timmer(self, res):
-        self.state.explore_ce_time += res.total_time / utils.MILLION_SECONDS_SCALE
+        try:
+            self.state.explore_time += res.total_time / utils.MILLION_SECONDS_SCALE
+        except AttributeError:
+            self.state.explore_time = res.total_time / utils.MILLION_SECONDS_SCALE
     
     def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
@@ -446,8 +436,7 @@ class ExploreExecutor(Mazerunner):
         if is_closer:
             self.logger.info(f"Explore agent found closer seed. "
                          f"distance: {res.distance}, ts: {ts}")
-        is_interesting = fn not in self.state.synced and (is_closer 
-                          or self.minimizer.has_new_sa(len(self.agent.model.visited_sa)))
+        is_interesting = is_closer or self.minimizer.has_new_sa(len(self.agent.model.visited_sa))
         if self.afl_queue and is_interesting:
             self.logger.info("Sync back: %s" % fn)
             dst_fp = os.path.join(self.my_queue, fn)
@@ -460,16 +449,14 @@ class ExploreExecutor(Mazerunner):
         next_seed = self.state.get_seed()
         if not next_seed is None:
             if next_seed not in self.state.processed:
-                self._run_single_file(next_seed)
+                self.run_file(next_seed)
+                # start RL training after symsan executor finishes
+                self.agent.replay_trace(self.agent.episode)
+                self.state.processed.add(next_seed)
         else:
             self.logger.info("Sleeping for getting seeds from AFL")
             time.sleep(WAITING_INTERVAL)
 
-    def _run_single_file(self, fn):
-        self.run_file(fn)
-        # start RL training after symsan executor finishes
-        self.agent.replay_trace(self.agent.episode)
-        self.state.processed.add(fn)
 
 class ExploitExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
@@ -516,7 +503,10 @@ class ExploitExecutor(Mazerunner):
         return symsan_res
 
     def update_timmer(self, res):
-        self.state.exploit_ce_time += res.total_time / utils.MILLION_SECONDS_SCALE
+        try:
+            self.state.exploit_time += res.total_time / utils.MILLION_SECONDS_SCALE
+        except AttributeError:
+            self.state.exploit_time = res.total_time / utils.MILLION_SECONDS_SCALE
 
     def sync_back_if_interesting(self, fp, res):
         if not self.minimizer.is_new_file(self.cur_input):
@@ -528,17 +518,16 @@ class ExploitExecutor(Mazerunner):
         dst_fn = f"id:{index:06},src:{target},ts:{ts},dis:{res.distance:06},execs:{self.state.execs},exploit"
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
-        is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
-        if is_closer:
+        is_interesting = self.minimizer.has_closer_distance(res.distance, dst_fn)
+        if is_interesting:
             self.logger.info(f"Exploit agent found closer seed. "
                             f"distance: {res.distance}, ts: {ts}")
-        is_interesting = is_closer or self.minimizer.has_new_sa(len(self.agent.model.visited_sa))
         if is_interesting:
-            self.state.put_seed(dst_fn, res.distance)
-        if self.afl_queue and is_interesting:
-            self.logger.info("Sync back: %s" % fn)
-            dst_fp = os.path.join(self.my_queue, dst_fn)
-            shutil.copy2(self.cur_input, dst_fp)
+            self.agent.save_trace(dst_fn)
+            if self.afl_queue:
+                self.logger.info("Sync back: %s" % fn)
+                dst_fp = os.path.join(self.my_queue, dst_fn)
+                shutil.copy2(self.cur_input, dst_fp)
 
     def _run(self):
         if self.config.agent_type == "exploit":
@@ -546,9 +535,6 @@ class ExploitExecutor(Mazerunner):
         next_seed = self.state.get_seed()
         if next_seed is None:
             next_seed = self.state.best_seed
-            if self.state.discovered_closer_seed:
-                self.state.discovered_closer_seed = False
-                self.no_progress_count = 0
         if next_seed:
             self.run_file(next_seed)
             self.agent.replay_trace(self.agent.episode)
@@ -563,21 +549,31 @@ class RecordExecutor(Mazerunner):
         self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
 
     def sync_back_if_interesting(self, fp, res):
-        fn = os.path.basename(fp)
+        fn_orgin = os.path.basename(fp)
         dir_name = os.path.dirname(fp)
-        if 'dis:' not in fn:
-            fn = fn + ',dis:' + str(res.distance)
-        if 'time:' in fn and 'ts:' not in fn:
-            fn = fn.replace('time:', 'ts:')
-        shutil.move(fp, os.path.join(dir_name, fn))
+        if 'dis:' not in fn_orgin:
+            fn = fn_orgin + ',dis:' + str(res.distance)
+        elif 'time:' in fn_orgin and 'ts:' not in fn_orgin:
+            fn = fn_orgin.replace('time:', 'ts:')
+        else:
+            fn = fn_orgin
+        if fn != fn_orgin:
+            shutil.move(fp, os.path.join(dir_name, fn))
+        d = utils.get_distance_from_fn(fn)
+        is_interesting = self.minimizer.has_closer_distance(d, fn)
+        if is_interesting:
+            self.logger.info(f"Record agent found closer seed. "
+                            f"distance: {res.distance}")
         self.agent.save_trace(fn)
+
+    def update_timmer(self, res):
+        try:
+            self.state.record_time += res.total_time / utils.MILLION_SECONDS_SCALE
+        except AttributeError:
+            self.state.record_time = res.total_time / utils.MILLION_SECONDS_SCALE
 
     def _run(self):
         files = self.sync_from_either()
-        if not files:
-            self.handle_hang_files()
-            time.sleep(WAITING_INTERVAL)
-            return
         for fn in files:
             self.state.timeout = self.config.timeout / 10
             self.run_file(fn)
@@ -587,10 +583,15 @@ class ReplayExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = Agent(config)
-        self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
 
-    def sync_back_if_interesting(self, fp, res):
-        pass
+    def offline_learning(self):
+        iteration_num = 1
+        files = os.listdir(self.agent.my_traces)
+        if len(files) > 10:
+            iteration_num = int(len(files) / 10)
+        for _ in range(iteration_num):
+            picked_fp = os.path.join(self.agent.my_traces, random.choice(files))
+            self.agent.replay_log(picked_fp)
 
     def _run(self):
         files = os.listdir(self.agent.my_traces)
@@ -610,14 +611,16 @@ class HybridExecutor():
         # check_resource_limit returns a flag that controlled by another monitor thread
         self.my_dir = config.mazerunner_dir
         self.check_resource_limit = lambda: False
-        # Two agents share the same state
+        # All agents share the same state
         self._import_state()
-        self.explore_executor = ExploreExecutor(config, self.state)
+        self.record_executor = RecordExecutor(config, self.state)
         self.exploit_executor = ExploitExecutor(config, self.state)
-        # Two agents share the same model
+        self.replay_executor = ReplayExecutor(config, self.state)
+        # All agents share the same model
         self.model = Agent.create_model(self.config)
-        self.explore_executor.agent.model = self.model
+        self.record_executor.agent.model = self.model
         self.exploit_executor.agent.model = self.model
+        self.replay_executor.agent.model = self.model
 
     @property
     def metadata(self):
@@ -628,21 +631,17 @@ class HybridExecutor():
         return self.check_resource_limit()
 
     def run(self):
-        self.explore_executor.dry_run()
         while not self.reached_resource_limit:
             if self.state.execs % self.config.save_frequency == 0:
                 self._export_state()
-            if self.state.discovered_closer_seed:
-                self.exploit_executor.run(run_once=True)
-                continue
-            self.explore_executor.sync_from_fuzzer()
+            if self.state.execs % self.config.sync_frequency == 0:
+                self.record_executor.run(run_once=True)
             self.exploit_executor.run(run_once=True)
+            self.replay_executor.offline_learning()
         logging.getLogger(self.__class__.__qualname__).error("Reached resource limit, exiting...")
 
     def cleanup(self):
         self._export_state()
-        self.explore_executor.cleanup()
-        self.exploit_executor.cleanup()
 
     def _import_state(self):
         if os.path.exists(self.metadata):
