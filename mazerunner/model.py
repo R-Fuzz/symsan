@@ -17,6 +17,7 @@ class RLModel:
     def __init__(self, config):
         self.config = config
         getcontext().prec = config.decimal_precision
+        self.default_q = self.config.max_distance / 2
         self.visited_sa = collections.Counter()
         self.all_target_sa = set()
         self.unreachable_sa = set()
@@ -57,6 +58,13 @@ class RLModel:
             with open(target_sa_path, 'rb') as fp:
                 self.all_target_sa = pickle.load(fp)
 
+    def get_distance(self, key):
+        if key not in self.Q_table:
+            value = self.config.initial_policy.get((key[0], key[-1]), self.default_q)
+        else:
+            value = self.Q_table[key]
+        return float(value)
+
     def add_unreachable_sa(self, sa):
         self.unreachable_sa.add(sa)
 
@@ -73,17 +81,14 @@ class RLModel:
 
 class DistanceModel(RLModel):
     def Q_lookup(self, key):
-        if key not in self.Q_table:
-            value = self.config.initial_policy.get((key[0], key[-1]), None)
-            if value is not None: value = -value
-        else:
-            value = self.Q_table[key]
-        if value is None:
-            value = -self.config.max_distance
-        return float(value)
+        return self.get_distance(key)
 
     def Q_update(self, key, value):
-        if value == -self.config.max_distance:
+        if value >= self.config.max_distance:
+            self.Q_table[key] = self.config.max_distance
+            return
+        if value <= 0:
+            self.Q_table[key] = 0.
             return
         self.Q_table[key] = value
 
@@ -116,16 +121,15 @@ class ReachabilityModel(RLModel):
         return float(res) * 1000
 
     def Q_lookup(self, key):
-        if key not in self.Q_table:
-            value = self.config.initial_policy.get((key[0], key[-1]), None)
-        else:
-            value = self.Q_table[key]
-        if value is None:
-            value = self.config.max_distance
-        return ReachabilityModel.distance_to_prob(value)
+        d = self.get_distance(key)
+        return ReachabilityModel.distance_to_prob(d)
 
     def Q_update(self, key, value):
         d = ReachabilityModel.prob_to_distance(value)
-        if d == self.config.max_distance:
+        if d >= self.config.max_distance:
+            self.Q_table[key] = self.config.max_distance
+            return
+        if d <= 0:
+            self.Q_table[key] = 0.
             return
         self.Q_table[key] = d
