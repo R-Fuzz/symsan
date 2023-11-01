@@ -92,9 +92,6 @@ class MazerunnerState:
     def update_best_seed(self, filename, distance):
         self._best_seed_info[0] = filename
         self._best_seed_info[1] = int(distance)
-    
-    def is_queue_empty(self):
-        return len(self._seed_queue) == 0
 
     def put_seed(self, fn, priority):
         if not fn or priority < 0:
@@ -102,24 +99,21 @@ class MazerunnerState:
         heapq.heappush(self._seed_queue, (priority, fn))
 
     def get_seed(self):
-        if self.is_queue_empty():
+        if not self._seed_queue:
             return None
         return heapq.heappop(self._seed_queue)[1]
-
-    def clear(self):
-        self.processed = self.processed - self.hang
 
     def increase_timeout(self, logger, max_timeout):
         old_timeout = self.timeout
         if self.timeout < max_timeout:
             t = self.timeout * 2
             self.timeout = t if t < max_timeout else max_timeout
-            logger.info("Increase timeout %d -> %d"
-                         % (old_timeout, self.timeout))
+            logger.info("Increase timeout %d -> %d" % (old_timeout, self.timeout))
+            self.processed = self.processed - self.hang
+            return True
         else:
-            logger.info("Hit the maximum timeout")
-        # clear state for retesting seeds that needs more time
-        self.clear()
+            logger.warn("Hit the maximum timeout")
+            return False
 
     def tick(self):
         old_index = self.index
@@ -221,7 +215,10 @@ class Mazerunner:
 
     def run_target(self):
         self.symsan.setup(self.cur_input, self.state.processed_num)
-        self.symsan.run(self.state.timeout)
+        timeout = self.state.timeout
+        if self.symsan.record_mode_enabled:
+            timeout = self.config.timeout / 10
+        self.symsan.run(timeout)
         try:
             self.symsan.process_request()
         finally:
@@ -273,16 +270,6 @@ class Mazerunner:
             files = self.sync_from_initial_seeds()
         return files
 
-    def sync_from_fuzzer(self):
-        if self.state.execs % self.config.sync_frequency == 0:
-            files = self.sync_from_either()
-            for fn in files:
-                d = utils.get_distance_from_fn(fn)
-                d = self.config.max_distance if d is None else d
-                self.state.put_seed(fn, d)
-            if self.state.is_queue_empty():
-                self.handle_hang_files()
-
     def handle_return_status(self, result, fp):
         msg_count = result.symsan_msg_num
         if msg_count == 0:
@@ -304,13 +291,12 @@ class Mazerunner:
 
     def handle_hang_files(self):
         if len(self.state.hang) > self.config.min_hang_files:
-            self.state.increase_timeout(self.logger, self.config.max_timeout)
-            for fn in self.state.hang:
-                d = utils.get_distance_from_fn(fn)
-                d = self.config.max_distance if d is None else d
-                self.state.put_seed(fn, d)
-            self.state.hang.clear()
-        # TODO: offline learning, replay from past experience
+            if self.state.increase_timeout(self.logger, self.config.max_timeout):
+                for fn in self.state.hang:
+                    d = utils.get_distance_from_fn(fn)
+                    d = self.config.max_distance if d is None else d
+                    self.state.put_seed(fn, d)
+                self.state.hang.clear()
 
     def check_crashes(self):
         for fuzzer in os.listdir(self.output):
@@ -437,15 +423,13 @@ class ExploreExecutor(Mazerunner):
             self.logger.info(f"Explore agent found closer seed. "
                          f"distance: {res.distance}, ts: {ts}")
         is_interesting = is_closer or self.minimizer.has_new_sa(len(self.agent.model.visited_sa))
-        if self.afl_queue and is_interesting:
+        if is_interesting:
             self.logger.info("Sync back: %s" % fn)
             dst_fp = os.path.join(self.my_queue, fn)
             shutil.copy2(fp, dst_fp)
         self.logger.info("Generated %d testcases" % len(res.generated_testcases))
 
     def _run(self):
-        if self.config.agent_type == "explore":
-            self.sync_from_fuzzer()
         next_seed = self.state.get_seed()
         if not next_seed is None:
             if next_seed not in self.state.processed:
@@ -522,16 +506,12 @@ class ExploitExecutor(Mazerunner):
         if is_interesting:
             self.logger.info(f"Exploit agent found closer seed. "
                             f"distance: {res.distance}, ts: {ts}")
-        if is_interesting:
             self.agent.save_trace(dst_fn)
-            if self.afl_queue:
-                self.logger.info("Sync back: %s" % fn)
-                dst_fp = os.path.join(self.my_queue, dst_fn)
-                shutil.copy2(self.cur_input, dst_fp)
+            self.logger.info("Sync back: %s" % fn)
+            dst_fp = os.path.join(self.my_queue, dst_fn)
+            shutil.copy2(self.cur_input, dst_fp)
 
     def _run(self):
-        if self.config.agent_type == "exploit":
-            self.sync_from_fuzzer()
         next_seed = self.state.get_seed()
         if next_seed is None:
             next_seed = self.state.best_seed
@@ -547,6 +527,7 @@ class RecordExecutor(Mazerunner):
         super().__init__(config, shared_state)
         self.agent = RecordAgent(config)
         self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
+        self.is_hybrid_mode = shared_state is not None
 
     def sync_back_if_interesting(self, fp, res):
         fn_orgin = os.path.basename(fp)
@@ -572,11 +553,19 @@ class RecordExecutor(Mazerunner):
         except AttributeError:
             self.state.record_time = res.total_time / utils.MILLION_SECONDS_SCALE
 
+    def update_seed_queue(self, fn):
+        d = utils.get_distance_from_fn(fn)
+        d = self.config.max_distance if d is None else d
+        self.state.put_seed(fn, d)
+
     def _run(self):
         files = self.sync_from_either()
+        if self.is_hybrid_mode and not files and not self.state._seed_queue:
+            self.handle_hang_files()
         for fn in files:
-            self.state.timeout = self.config.timeout / 10
             self.run_file(fn)
+            if self.is_hybrid_mode:
+                self.update_seed_queue()
             self.state.processed.add(fn)
 
 class ReplayExecutor(Mazerunner):
@@ -606,21 +595,26 @@ class ReplayExecutor(Mazerunner):
         self.state.execs = 0
 
 class HybridExecutor():
-    def __init__(self, config):
+    def __init__(self, config, agent_type):
         self.config = config
         # check_resource_limit returns a flag that controlled by another monitor thread
         self.my_dir = config.mazerunner_dir
         self.check_resource_limit = lambda: False
-        # All agents share the same state
+        # All executors share the same state and All agents share the same model
         self._import_state()
-        self.record_executor = RecordExecutor(config, self.state)
-        self.exploit_executor = ExploitExecutor(config, self.state)
-        self.replay_executor = ReplayExecutor(config, self.state)
-        # All agents share the same model
+        self.synchronizer = RecordExecutor(config, self.state)
+        self.replayer = ReplayExecutor(config, self.state)
         self.model = Agent.create_model(self.config)
-        self.record_executor.agent.model = self.model
+        self.synchronizer.agent.model = self.model
+        self.replayer.agent.model = self.model
         self.exploit_executor.agent.model = self.model
-        self.replay_executor.agent.model = self.model
+        if agent_type == "exploit":
+            self.concolic_executor = ExploitExecutor(config, self.state)
+        elif agent_type == "explore":
+            self.concolic_executor = ExploreExecutor(config, self.state)
+        else:
+            raise NotImplementedError()
+        self.concolic_executor.agent.model = self.model
 
     @property
     def metadata(self):
@@ -635,9 +629,9 @@ class HybridExecutor():
             if self.state.execs % self.config.save_frequency == 0:
                 self._export_state()
             if self.state.execs % self.config.sync_frequency == 0:
-                self.record_executor.run(run_once=True)
-            self.exploit_executor.run(run_once=True)
-            self.replay_executor.offline_learning()
+                self.synchronizer.run(run_once=True)
+            self.concolic_executor.run(run_once=True)
+            self.replayer.offline_learning()
         logging.getLogger(self.__class__.__qualname__).error("Reached resource limit, exiting...")
 
     def cleanup(self):

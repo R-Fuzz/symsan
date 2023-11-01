@@ -71,12 +71,10 @@ def main():
     config.load_args(args)
     validate_args(args)
 
-    if config.agent_type == "hybrid":
-        e = afl.HybridExecutor(config)
-    elif config.agent_type == "explore":
-        e = afl.ExploreExecutor(config)
+    if config.agent_type == "explore":
+        e = afl.HybridExecutor(config, "explore")
     elif config.agent_type == "exploit":
-        e = afl.ExploitExecutor(config)
+        e = afl.HybridExecutor(config, "exploit")
     elif config.agent_type == "record":
         e = afl.RecordExecutor(config)
     elif config.agent_type == "replay":
