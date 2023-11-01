@@ -4,7 +4,7 @@ import pickle
 
 from decimal import Decimal, getcontext
 from enum import Enum
-from utils import mkdir
+from utils import mkdir, find_bottom_numbers
 
 class RLModelType(Enum):
     unknown = 0
@@ -17,7 +17,6 @@ class RLModel:
     def __init__(self, config):
         self.config = config
         getcontext().prec = config.decimal_precision
-        self.default_q = self.config.max_distance / 2
         self.visited_sa = collections.Counter()
         self.all_target_sa = set()
         self.unreachable_sa = set()
@@ -58,13 +57,10 @@ class RLModel:
             with open(target_sa_path, 'rb') as fp:
                 self.all_target_sa = pickle.load(fp)
 
-    def get_distance(self, key):
-        if key not in self.Q_table:
-            value = self.config.initial_policy.get((key[0], key[-1]), None)
-            value = self.default_q if value is None else value
-        else:
-            value = self.Q_table[key]
-        return float(value)
+    def get_default_distance(self, key):
+        value = self.config.initial_policy.get((key[0], key[-1]), None)
+        value = self.config.max_distance if value is None else value
+        return value
 
     def add_unreachable_sa(self, sa):
         self.unreachable_sa.add(sa)
@@ -81,24 +77,42 @@ class RLModel:
 
 
 class DistanceModel(RLModel):
+    @staticmethod
+    def create_reward_calculator(config, episode, min_distance):
+        return DistanceRewardCalculator(config, min_distance, episode)
+
+    @staticmethod
+    def distance_to_q(d):
+        return -d
+
+    @staticmethod
+    def q_to_distance(p):
+        return -p
+
+    def get_distance(self, key):
+        if key not in self.Q_table:
+            return self.get_default_distance(key)
+        else:
+            return DistanceModel.q_to_distance(self.Q_table[key])
+
     def Q_lookup(self, key):
-        return self.get_distance(key)
+        if key not in self.Q_table:
+            d = self.get_default_distance(key)
+            return DistanceModel.distance_to_q(d)
+        return self.Q_table[key]
 
     def Q_update(self, key, value):
-        if value >= self.config.max_distance:
-            self.Q_table[key] = self.config.max_distance
-            return
-        if value <= 0:
-            self.Q_table[key] = 0.
-            return
         self.Q_table[key] = value
-
 
 class ReachabilityModel(RLModel):
     # Constants
     ZERO = Decimal(0)
     ONE = Decimal(1)
     TWO = Decimal(2)
+
+    @staticmethod
+    def create_reward_calculator(config, episode, min_distance):
+        return ReachabilityRewardCalculator(config, min_distance, episode)
 
     @staticmethod
     def distance_to_prob(d):
@@ -118,8 +132,16 @@ class ReachabilityModel(RLModel):
         """
         if p == ReachabilityModel.ZERO:
             return -1.
+        if p == ReachabilityModel.ONE:
+            return 0.
         res = - (p.ln() / ReachabilityModel.TWO.ln())
         return float(res) * 1000
+
+    def get_distance(self, key):
+        if key not in self.Q_table:
+            return self.get_default_distance(key)
+        else:
+            return self.Q_table[key]
 
     def Q_lookup(self, key):
         d = self.get_distance(key)
@@ -127,10 +149,43 @@ class ReachabilityModel(RLModel):
 
     def Q_update(self, key, value):
         d = ReachabilityModel.prob_to_distance(value)
-        if d >= self.config.max_distance:
-            self.Q_table[key] = self.config.max_distance
-            return
         if d <= 0:
             self.Q_table[key] = 0.
             return
         self.Q_table[key] = d
+
+class RewardCalculator:
+    def __init__(self, config, min_distance, trace):
+        self.config = config
+        self.min_distance = min_distance
+        self.trace = trace
+
+    def compute_reward(self, i):
+        raise NotImplementedError("This method should be overridden by subclass")
+
+
+class DistanceRewardCalculator(RewardCalculator):
+    def __init__(self, config, min_distance, trace):
+        super().__init__(config, min_distance, trace)
+        self.local_min_indices = find_bottom_numbers([d for (_, _, d)in trace])
+
+    def compute_reward(self, i):
+        if i >= len(self.trace) and self.min_distance > 0:
+                return -self.config.max_distance
+        _, _, d = self.trace[i]
+        if d == 0:
+            return self.config.max_distance
+        r = 0
+        if i in self.local_min_indices:
+            r = (1000 / d) * (1000 / d) * self.config.max_distance
+        return r
+
+
+class ReachabilityRewardCalculator(RewardCalculator):
+    def compute_reward(self, i):
+        if i >= len(self.trace):
+            return Decimal(0)
+        s, a, d = self.trace[i]
+        if d == 0:
+            return Decimal(1)
+        return Decimal(0)

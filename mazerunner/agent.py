@@ -29,42 +29,6 @@ class ProgramState:
         reversed_action = 1 if self.action == 0 else 0
         return self.state + (reversed_action, )
 
-
-class RewardCalculator:
-    def __init__(self, config, min_distance, trace):
-        self.config = config
-        self.min_distance = min_distance
-        self.trace = trace
-
-    def compute_reward(self, i):
-        raise NotImplementedError("This method should be overridden by subclass")
-
-
-class DistanceRewardCalculator(RewardCalculator):
-    def __init__(self, config, min_distance, trace):
-        super().__init__(config, min_distance, trace)
-        self.last_d = self.config.max_distance
-
-    def compute_reward(self, i):
-        if i >= len(self.trace) and self.min_distance > 0:
-                return self.config.max_distance
-        s, a, d = self.trace[i]
-        if d == 0:
-            return -self.config.max_distance
-        r = d - self.last_d
-        self.last_d = d
-        return r
-
-
-class ReachabilityRewardCalculator(RewardCalculator):
-    def compute_reward(self, i):
-        if i >= len(self.trace):
-            return Decimal(0)
-        s, a, d = self.trace[i]
-        if d == 0:
-            return Decimal(1)
-        return Decimal(0)
-
 class BasicQLearner:
     def __init__(self, m: model.RLModel, df, lr):
         self.model = m
@@ -126,15 +90,6 @@ class Agent:
         return self._learner
 
     @staticmethod
-    def create_reward_calculator(config, episode, min_distance):
-        if config.model_type == model.RLModelType.distance:
-            return DistanceRewardCalculator(config, min_distance, episode)
-        elif config.model_type == model.RLModelType.reachability:
-            return ReachabilityRewardCalculator(config, min_distance, episode)
-        else:
-            raise NotImplementedError()
-
-    @staticmethod
     def create_model(config):
         if config.model_type == model.RLModelType.distance:
             return model.DistanceModel(config)
@@ -165,7 +120,7 @@ class Agent:
 
     def replay_trace(self, trace):
         assert 0 <= self.min_distance <= self.config.max_distance
-        reward_calculator = Agent.create_reward_calculator(self.config, trace, self.min_distance)
+        reward_calculator = self.model.create_reward_calculator(self.config, trace, self.min_distance)
         for i, (s, a, d) in enumerate(reversed(trace)):
             sa = s + (a,)
             self.model.add_visited_sa(sa)
@@ -237,11 +192,13 @@ class ExploreAgent(Agent):
             return False
         if reversed_sa in self.model.all_target_sa:
             return False
-        interesting = reversed_sa not in self.model.visited_sa
+        interesting = self._curious_policy(reversed_sa)
         if interesting:
             self.model.add_target_sa(reversed_sa)
         return interesting
 
+    def _curious_policy(self, sa):
+        return sa not in self.model.visited_sa
 
 class ExploitAgent(Agent):
 
@@ -266,7 +223,7 @@ class ExploitAgent(Agent):
         if reversed_sa in self.model.unreachable_sa:
             self.logger.debug(f"not interesting, unreachable sa {reversed_sa}")
             return False
-        interesting = self._weighted_probabilistic_policy() != self.curr_state.action
+        interesting = self._greedy_policy() != self.curr_state.action
         if interesting:
             self.all_targets.append(reversed_sa)
             self.target = (reversed_sa, len(self.episode))
@@ -298,11 +255,9 @@ class ExploitAgent(Agent):
     def _greedy_policy(self):
         d_taken = self.model.get_distance(self.curr_state.state + (1,))
         d_not_taken = self.model.get_distance(self.curr_state.state + (0,))
-        if d_taken == d_not_taken: 
-            return self.curr_state.action
-        if d_taken > d_not_taken or d_not_taken == 0 or d_taken == self.config.max_distance:
+        if d_taken > d_not_taken:
             return 0
-        elif d_taken < d_not_taken or d_taken == 0 or d_not_taken == self.config.max_distance:
+        elif d_taken < d_not_taken:
             return 1
         else:
             return self.curr_state.action
@@ -312,11 +267,9 @@ class ExploitAgent(Agent):
         d_not_taken = self.model.get_distance(self.curr_state.state + (0,))
         total = d_taken + d_not_taken
         p = random.random()
-        if d_taken == d_not_taken: 
-            return self.curr_state.action
-        if p < d_taken / total or d_taken == 0 or d_not_taken == self.config.max_distance:
+        if p < d_taken / total:
             return 1
-        elif p < d_not_taken / total or d_not_taken == 0 or d_taken == self.config.max_distance:
+        elif p < d_not_taken / total:
             return 0
         else:
             return self.curr_state.action
