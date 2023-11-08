@@ -213,9 +213,8 @@ class Serializer:
             return self.__cache_expr(label, e, deps)
 
         elif info.op == LLVM_INS.fsize.value:
-            symbol = z3.String("fsize") # file size
             sort = z3.BitVecSort(info.size, self.__z3_context)
-            base = z3.Const(symbol, sort)
+            base = z3.Const("fsize", sort)
             # don't cache because of deps
             if info.op1.i:
                 # minus the offset stored in op1
@@ -480,7 +479,18 @@ class Z3Solver:
         fp = open(path, "r+b")
         for decl in m:
             name = decl.name()
-            if decl.kind() == z3.Z3_OP_UNINTERPRETED:
+            if name == "fsize":
+                size = m[decl].as_long()
+                size_to_grow = size - len(self.input_buf)
+                if size_to_grow > 0 and size_to_grow < len(self.input_buf) * 10:
+                    with open(path, "a+b") as f:
+                        self.logger.debug(f"Grow filesize to {size}")
+                        f.write(b"\x00" * size_to_grow)
+                elif size_to_grow < 0 and size > 0:
+                    self.logger.debug(f"Shrink file to {size}")
+                    with open(path, "r+b") as f:
+                        f.truncate(size)
+            else:
                 offset = int(name)
                 value = m[decl].as_long()
                 self.logger.debug(f"offset {offset} = {value}")
@@ -489,17 +499,6 @@ class Z3Solver:
                     raise SystemExit("offset is out of file size")
                 fp.seek(offset)
                 fp.write(bytes([value]))
-            else:  # string symbol
-                if name == "fsize":
-                    size = m[decl].as_long()
-                    if size > len(self.input_buf):
-                        with open(path, "a+b") as f:
-                            self.logger.info(f"Grow filesize to {size}")
-                            f.write(b"\x00" * (size - len(self.input_buf)))
-                    else:
-                        self.logger.info(f"Shrink file to {size}")
-                        with open(path, "r+b") as f:
-                            f.truncate(size)
         fp.close()
         self.generated_files.append(fname)
 
@@ -539,6 +538,9 @@ class Z3Solver:
         except Exception as e:
             self.logger.critical(f"__solve_cond: unknown error={e}")
             return
+        if type(cond) != z3.BoolRef:
+            self.logger.error(f"__solve_cond: invalid expression type={type(cond)}")
+            raise ConditionUnsat()
         self.__collect_constraints(inputs)
         if self.__z3_solver.check() == z3.unsat:
             self.logger.error(f"__solve_cond: pre-condition is unsat")

@@ -181,6 +181,13 @@ class SymSanExecutor:
                 break
             start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             msg = pipe_msg.from_buffer_copy(msg_data)
+            self.logger.debug(
+                "process_request: received msg. "
+                "msg_type=%s, flags=%s, instance_id=%s, addr=%s, context=%s, "
+                "id=%s, label=%s, result=%s",
+                msg.msg_type, msg.flags, msg.instance_id, hex(msg.addr),
+                msg.context, msg.id, msg.label, msg.result
+            )
             if msg.msg_type == MsgType.cond_type.value:
                 if self._process_cond_request(msg) and self.onetime_solving_enabled:
                     should_handle = False
@@ -195,8 +202,7 @@ class SymSanExecutor:
             elif msg.msg_type == MsgType.fsize_type.value:
                 pass
             else:
-                self.logger.error(f"process_request: Unknown message type: {msg.msg_type}",
-                                  file=sys.stderr)
+                self.logger.error(f"process_request: Unknown message type: {msg.msg_type}")
             end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             self.timer.solving_time += end_time - start_time
             self.msg_num += 1
