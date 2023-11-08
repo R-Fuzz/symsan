@@ -338,8 +338,9 @@ bool AFLCoverage::runOnModule(Module &M) {
         continue;
       }
 
-      bool is_target = false;
+      bool is_fun_target = false;
       for (auto &BB : F) {
+        bool is_target = false;
 
         std::string bb_name("");
         std::string filename;
@@ -393,6 +394,8 @@ bool AFLCoverage::runOnModule(Module &M) {
                   is_target = true;
 
               }
+          }else{
+            is_fun_target = true;
           }
         }
 
@@ -423,7 +426,7 @@ bool AFLCoverage::runOnModule(Module &M) {
           WriteGraph(cfgFile, &F, true);
         }
 
-        if (is_target)
+        if (is_fun_target)
           ftargets << funcName << "\n";
       }
     }

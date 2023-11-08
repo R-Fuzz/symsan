@@ -64,16 +64,17 @@ static inline void __handle_new_state(u32 cid, void *addr, u8 result, u8 loop_fl
 
   long global_min_dist = -2;
   long local_min_dist = -2;
-  if (!__afl_area_ptr)
-    return;
-  unsigned long counter = *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16);
-  if (counter){
-    flags |= F_HAS_DISTANCE;
-    local_min_dist = (long)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8));
+  unsigned long counter = 0;
+  if (__afl_area_ptr){
+    counter = *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16);
+    if (counter){
+      flags |= F_HAS_DISTANCE;
+      local_min_dist = (long)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8));
+    }
+    global_min_dist = (long)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
+    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = INT_MAX;
+    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
   }
-  global_min_dist = (long)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
-  *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = INT_MAX;
-  *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
   AOUT("pc: 0x%x, BB distance: %llu, avg distance: %llu \n", (uptr)addr, global_min_dist, local_min_dist);
 
   mazerunner_msg mmsg = {
