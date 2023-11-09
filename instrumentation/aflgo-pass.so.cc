@@ -162,7 +162,7 @@ struct DOTGraphTraits<Function*> : public DefaultDOTGraphTraits {
   DOTGraphTraits(bool isSimple=false) : DefaultDOTGraphTraits(isSimple) {}
 
   static std::string getGraphName(Function *F) {
-    return "CFG for '" + getMangledName(F) + "' function";
+    return "CFG for '" + F->getName().str() + "' function";
   }
 
   static std::string getNodeIdentifierLabel(BasicBlock *Node, Function *Graph) {
@@ -385,24 +385,20 @@ bool AFLCoverage::runOnModule(Module &M) {
                 std::size_t found = target.find_last_of("/\\");
                 if (found != std::string::npos)
                   target = target.substr(found + 1);
-
                 std::size_t pos = target.find_last_of(":");
                 std::string target_file = target.substr(0, pos);
                 unsigned int target_line = atoi(target.substr(pos + 1).c_str());
-
-                if (!target_file.compare(filename) && target_line == line)
+                if (!target_file.compare(filename) && target_line == line){
                   is_target = true;
-
+                  break;
+                }
               }
-          }else{
-            is_fun_target = true;
           }
         }
-
+        
+        if (is_target) is_fun_target = true;
         if (is_target && !bb_name.empty()) bbtargets << bb_name << "\n";
-
         if (!bb_name.empty()) {
-
           BB.setName(bb_name + ":");
           if (!BB.hasName()) {
             std::string newname = bb_name + ":";
@@ -412,7 +408,6 @@ bool AFLCoverage::runOnModule(Module &M) {
             MallocAllocator Allocator;
             BB.setValueName(ValueName::Create(NameRef, Allocator));
           }
-
           has_BBs = true;
         }
       }
