@@ -80,12 +80,6 @@ cl::opt<std::string> OutDirectory(
     cl::desc("Output directory where Ftargets.txt, Fnames.txt, and BBnames.txt are generated."),
     cl::value_desc("outdir"));
 
-cl::opt<std::string> IndirectCallsFile(
-    "indirect_calls",
-    cl::desc("Input file containing the indirect callers and calles."),
-    cl::value_desc("filename")
-);
-
 namespace llvm {
 
 std::string getMangledName(const Function *F) {
@@ -240,7 +234,6 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   std::list<std::string> targets;
   std::map<std::string, int> bb_to_dis;
-  std::map<std::string, std::vector<std::string>> indirect_calls;
 
   if (!TargetsFile.empty()) {
 
@@ -256,19 +249,6 @@ bool AFLCoverage::runOnModule(Module &M) {
     targetsfile.close();
 
     is_aflgo_preprocessing = true;
-
-    if (!IndirectCallsFile.empty()){
-      std::ifstream indirectcalls(IndirectCallsFile);
-      line = "";
-      while (std::getline(indirectcalls, line)){
-        std::istringstream iss(line);
-        std::string caller_loc, callee_loc;
-        if (std::getline(iss, caller_loc, ',') && std::getline(iss, callee_loc, ',')) {
-            indirect_calls[caller_loc].push_back(callee_loc);
-        }
-      }
-      indirectcalls.close();
-    }
 
   } else if (!DistanceFile.empty()) {
 
@@ -318,7 +298,6 @@ bool AFLCoverage::runOnModule(Module &M) {
   if (is_aflgo_preprocessing) {
 
     std::ofstream bbcalls(OutDirectory + "/direct_calls.txt", std::ofstream::out | std::ofstream::app);
-    std::ofstream bbcalls_indirect(OutDirectory + "/indirect_calls.txt", std::ofstream::out | std::ofstream::app);
     std::ofstream ftargets(OutDirectory + "/Ftargets.txt", std::ofstream::out | std::ofstream::app);
     std::ofstream bbtargets(TargetsFile, std::ofstream::out | std::ofstream::app);
 
@@ -374,12 +353,6 @@ bool AFLCoverage::runOnModule(Module &M) {
               }
             }
           }
-          /* handle indirect calls */
-          if (indirect_calls.find(line_name) != indirect_calls.end() && !bb_name.empty()) {
-            for(const std::string& callee : indirect_calls[line_name]) {
-              bbcalls_indirect << bb_name << "," << callee << "\n";
-            }
-          }
           if (!is_target) {
               for (auto &target : targets) {
                 std::size_t found = target.find_last_of("/\\");
@@ -395,7 +368,7 @@ bool AFLCoverage::runOnModule(Module &M) {
               }
           }
         }
-        
+
         if (is_target) is_fun_target = true;
         if (is_target && !bb_name.empty()) bbtargets << bb_name << "\n";
         if (!bb_name.empty()) {
@@ -428,7 +401,6 @@ bool AFLCoverage::runOnModule(Module &M) {
     bbcalls.close();
     ftargets.close();
     bbtargets.close();
-    bbcalls_indirect.close();
   } else {
     /* Distance instrumentation */
 
