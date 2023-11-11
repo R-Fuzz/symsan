@@ -326,6 +326,7 @@ class Serializer:
 
 class Z3Solver:
     def __init__(self, config, shm, input_file, output_dir, instance_id, session_id):
+        self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.shm = shm
         # for output
@@ -339,8 +340,6 @@ class Z3Solver:
             self.input_buf = f.read()
         # for z3
         self.output_dir = output_dir
-        self.optimistic_solving_enabled = config.optimistic_solving_enabled
-        self.nested_branch_enabled = config.nested_branch_enabled
         self.__z3_context = z3.Context()
         self.__z3_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         # list of branch_dep_t dependencies
@@ -417,8 +416,8 @@ class Z3Solver:
                 c.input_deps.update(inputs)
                 c.expr_deps.add(index_bv == r_bv)
 
-    def handle_cond(self, msg: pipe_msg, should_solve: bool):
-        self.__solve_cond(msg.label, msg.result, msg.addr, should_solve)
+    def handle_cond(self, msg: pipe_msg, should_solve: bool, score: str):
+        return self.__solve_cond(msg.label, msg.result, msg.addr, should_solve, score)
 
     def handle_memcmp(self, msg: pipe_msg, pipe):
         info = get_label_info(msg.label, self.shm)
@@ -444,7 +443,7 @@ class Z3Solver:
             self.__branch_deps.extend([None] * (n + 1 - len(self.__branch_deps)))
         self.__branch_deps[n] = dep
 
-    def __solve_expr(self, e: z3.ExprRef):
+    def __solve_expr(self, e: z3.ExprRef, score=''):
         has_solved = False
         # set up local optmistic solver
         opt_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
@@ -457,20 +456,22 @@ class Z3Solver:
         self.__z3_solver.add(e)
         if self.__z3_solver.check() == z3.sat:
             m = self.__z3_solver.model()
-            self.__generate_input(m, False)
+            self.__generate_input(m, False, score)
             has_solved = True
         else:
-            if self.optimistic_solving_enabled:
+            if self.config.optimistic_solving_enabled:
                 m = opt_solver.model()
-                self.__generate_input(m, True)
+                self.__generate_input(m, True, score)
         # reset
         self.__z3_solver.pop()
         return has_solved
 
-    def __generate_input(self, m: z3.Model, is_optimistic: bool):
+    def __generate_input(self, m: z3.Model, is_optimistic: bool, score=''):
         fname = f"id-{self.__instance_id}-{self.__session_id}-{self.__current_index}"
         if is_optimistic:
             fname += "-opt"
+        if score:
+            fname += "," + score
         path = os.path.join(self.output_dir, fname)
         self.__current_index += 1
         with open(path, "wb") as f:
@@ -527,17 +528,18 @@ class Z3Solver:
                         self.__z3_solver.add(expr)
 
     def __solve_cond(self, label: ctypes.c_uint32, r: ctypes.c_uint64,
-                     addr: ctypes.c_ulong, should_solve: bool):
+                     addr: ctypes.c_ulong, should_solve: bool, score=''):
         self.logger.debug(f"__solve_cond: label={label}, result={r}, addr={hex(addr)}")
+        has_solved = False
         result = z3.BoolVal(r != 0, ctx=self.__z3_context)
         inputs = set()
         try:
             cond = self.serializer.to_z3_expr(label, inputs)
         except Serializer.InvalidData:
-            return
+            return has_solved
         except Exception as e:
             self.logger.critical(f"__solve_cond: unknown error={e}")
-            return
+            return has_solved
         if type(cond) != z3.BoolRef:
             self.logger.error(f"__solve_cond: invalid expression type={type(cond)}")
             raise ConditionUnsat()
@@ -547,12 +549,13 @@ class Z3Solver:
             raise ConditionUnsat()
         if should_solve:
             e = (cond != result)
-            if self.__solve_expr(e):
+            if self.__solve_expr(e, score):
                 self.logger.debug("__solve_cond: branch solved")
+                has_solved = True
             else:
                 self.logger.debug("__solve_cond: branch cannot be solved @{}".format(addr))
         # 3. nested branch
-        if self.nested_branch_enabled:
+        if self.config.nested_branch_enabled:
             for off in inputs:
                 c = self.__get_branch_dep(off)
                 if not c:
@@ -563,6 +566,7 @@ class Z3Solver:
                 else:
                     c.input_deps.update(inputs)
                     c.expr_deps.add(cond == result)
+        return has_solved
 
     def __solve_gep(self, index: z3.ExprRef, lb: int, ub: int, step: int, addr: int):
         # enumerate indices

@@ -107,18 +107,19 @@ class Agent:
         self.episode.clear()
         self.min_distance = self.config.max_distance
 
-    # for fgtest
     def handle_new_state(self, msg, action):
         pass
     
     def handle_unsat_condition(self):
         pass
 
-    # for fgtest
     def is_interesting_branch(self):
         return True
+    
+    def compute_branch_score(self):
+        return ''
 
-    def replay_trace(self, trace):
+    def train(self, trace):
         assert 0 <= self.min_distance <= self.config.max_distance
         reward_calculator = self.model.create_reward_calculator(self.config, trace, self.min_distance)
         for i, (s, a, d) in enumerate(reversed(trace)):
@@ -143,7 +144,7 @@ class Agent:
         self.min_distance = d
         with open(log_path, 'rb') as fd:
             trace = list(pickle.load(fd))
-            self.replay_trace(trace)
+            self.train(trace)
 
     def save_trace(self, fn):
         log_path = os.path.join(self.my_traces, fn)
@@ -167,6 +168,24 @@ class Agent:
     def _make_dirs(self):
         mkdir(self.my_traces)
 
+    def greedy_policy(self):
+        d_taken = self.model.get_distance(self.curr_state.state + (1,))
+        d_not_taken = self.model.get_distance(self.curr_state.state + (0,))
+        if d_taken > d_not_taken:
+            return 0
+        elif d_taken < d_not_taken:
+            return 1
+        else:
+            return self.curr_state.action
+
+    def __debug_policy(self):
+        distance_taken = self.model.get_distance(self.curr_state.state + (1,))
+        distance_not_taken = self.model.get_distance(self.curr_state.state + (0,))
+        self.logger.info(f"curr_sad={self.curr_state.serialize()}, "
+                        f"visited_times={self.model.visited_sa.get(self.curr_state.state + (self.curr_state.action,), 0)}, "
+                        f"distance_taken={distance_taken}, "
+                        f"distance_not_taken={distance_not_taken}, ")
+
 
 class RecordAgent(Agent):
 
@@ -185,17 +204,20 @@ class ExploreAgent(Agent):
         curr_sa = self.curr_state.state + (self.curr_state.action, )
         self.model.remove_target_sa(curr_sa)
         self.append_episode()
+        self.reversed_sa = self.curr_state.compute_reversed_sa()
 
     def is_interesting_branch(self):
-        reversed_sa = self.curr_state.compute_reversed_sa()
-        if reversed_sa in self.model.unreachable_sa:
+        if self.reversed_sa in self.model.unreachable_sa:
             return False
-        if reversed_sa in self.model.all_target_sa:
+        if self.reversed_sa in self.model.all_target_sa:
             return False
-        interesting = self._curious_policy(reversed_sa)
+        interesting = self.greedy_policy() != self.curr_state.action
         if interesting:
-            self.model.add_target_sa(reversed_sa)
+            self.model.add_target_sa(self.reversed_sa)
         return interesting
+
+    def compute_branch_score(self):
+        return str(int(self.model.get_distance(self.reversed_sa)))
 
     def _curious_policy(self, sa):
         return sa not in self.model.visited_sa
@@ -223,7 +245,7 @@ class ExploitAgent(Agent):
         if reversed_sa in self.model.unreachable_sa:
             self.logger.debug(f"not interesting, unreachable sa {reversed_sa}")
             return False
-        interesting = self._greedy_policy() != self.curr_state.action
+        interesting = self.greedy_policy() != self.curr_state.action
         if interesting:
             self.all_targets.append(reversed_sa)
             self.target = (reversed_sa, len(self.episode))
@@ -244,23 +266,12 @@ class ExploitAgent(Agent):
             and random.random() < (self.epsilon ** self.model.visited_sa[reversed_sa])):
             self.logger.debug(f"interesting, epsilon-greedy policy")
             return True
-        if self._greedy_policy() != self.curr_state.action:
+        if self.greedy_policy() != self.curr_state.action:
             self.logger.debug(f"interesting, greedy policy")
             return True
         else:
             self.logger.debug(f"not interesting, greedy policy")
             return False
-
-    # Returns the greedy action according to the Q value.
-    def _greedy_policy(self):
-        d_taken = self.model.get_distance(self.curr_state.state + (1,))
-        d_not_taken = self.model.get_distance(self.curr_state.state + (0,))
-        if d_taken > d_not_taken:
-            return 0
-        elif d_taken < d_not_taken:
-            return 1
-        else:
-            return self.curr_state.action
     
     def _weighted_probabilistic_policy(self):
         d_taken = self.model.get_distance(self.curr_state.state + (1,))
@@ -274,10 +285,3 @@ class ExploitAgent(Agent):
         else:
             return self.curr_state.action
 
-    def __debug_policy(self):
-        distance_taken = self.model.get_distance(self.curr_state.state + (1,))
-        distance_not_taken = self.model.get_distance(self.curr_state.state + (0,))
-        self.logger.info(f"curr_sad={self.curr_state.serialize()}, "
-                        f"visited_times={self.model.visited_sa.get(self.curr_state.state + (self.curr_state.action,), 0)}, "
-                        f"distance_taken={distance_taken}, "
-                        f"distance_not_taken={distance_not_taken}, ")

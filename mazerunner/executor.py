@@ -208,23 +208,26 @@ class SymSanExecutor:
             self.msg_num += 1
 
     def _process_cond_request(self, msg):
+        has_solved = False
         if not msg.label:
-            return False
+            return has_solved
         state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
         if len(state_data) < ctypes.sizeof(mazerunner_msg):
             self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
-            return False
+            return has_solved
         state_msg = mazerunner_msg.from_buffer_copy(state_data)
         self.agent.handle_new_state(state_msg, msg.result)
         if self.record_mode_enabled:
-            return False
+            return has_solved
         is_interesting = self.agent.is_interesting_branch()
         try:
-            self.solver.handle_cond(msg, is_interesting)
+            score = self.agent.compute_branch_score() if is_interesting else ''
+            has_solved = self.solver.handle_cond(msg, is_interesting, score)
         except ConditionUnsat:
             self.agent.handle_unsat_condition()
-            return False
-        return is_interesting
+        if has_solved:
+            assert self.solver.generated_files
+        return has_solved
 
     def _process_gep_request(self, msg):
         gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))

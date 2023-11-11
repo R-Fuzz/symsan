@@ -58,7 +58,8 @@ class RLModel:
                 self.all_target_sa = pickle.load(fp)
 
     def get_default_distance(self, key):
-        value = self.config.initial_policy.get((key[0], key[-1]), None)
+        context_insensitive_sa = (key[0], key[-1])
+        value = self.config.initial_policy.get(context_insensitive_sa, None)
         value = self.config.max_distance if value is None else value
         return value
 
@@ -120,8 +121,10 @@ class ReachabilityModel(RLModel):
         Converts a distance to a probability.
         Returns: 1 / 2 ** (d / 1000)
         """
-        if d == -1.:
+        if d == float('inf'):
             return ReachabilityModel.ZERO
+        if d == 0.:
+            return ReachabilityModel.ONE
         return ReachabilityModel.ONE / (ReachabilityModel.TWO ** Decimal(float(d) / 1000))
 
     @staticmethod
@@ -131,7 +134,7 @@ class ReachabilityModel(RLModel):
         Returns: -log_2(p) * 1000
         """
         if p == ReachabilityModel.ZERO:
-            return -1.
+            return float('inf')
         if p == ReachabilityModel.ONE:
             return 0.
         res = - (p.ln() / ReachabilityModel.TWO.ln())
@@ -149,9 +152,6 @@ class ReachabilityModel(RLModel):
 
     def Q_update(self, key, value):
         d = ReachabilityModel.prob_to_distance(value)
-        if d <= 0:
-            self.Q_table[key] = 0.
-            return
         self.Q_table[key] = d
 
 class RewardCalculator:

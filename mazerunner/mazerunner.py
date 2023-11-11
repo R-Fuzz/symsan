@@ -51,14 +51,12 @@ def validate_args(args):
     if (args.config_path is None
         and any(arg is None for arg in [args.agent_type, args.output_dir, args.static_result_folder])):
         raise ValueError("You must provide either -config or -o -s -a options")
-    if args.fuzzer_dir is None:
-        if args.agent_type == "record":
-            if args.input is None:
-                raise ValueError("You must provide either -i or -f option")
-        else:
-            raise ValueError("You must provide -f option")
     if not os.path.isdir(args.output_dir):
         raise ValueError(f'{args.output_dir} no such directory')
+    if args.fuzzer_dir is None and args.agent_type != "record":
+        raise ValueError("You must provide -f option")
+    if args.fuzzer_dir is None and args.agent_type == "record" and args.input is None:
+        raise ValueError("You must provide either -i or -f option")
 
 def main():
     print("[*] spinning up mazerunner: " + " ".join(sys.argv))
