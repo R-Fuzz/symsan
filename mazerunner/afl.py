@@ -8,6 +8,7 @@ import re
 import shutil
 import time
 import heapq
+import numpy as np
 
 from agent import Agent, ExploreAgent, ExploitAgent, RecordAgent
 from executor import SymSanExecutor
@@ -16,6 +17,50 @@ import minimizer
 import utils
 
 WAITING_INTERVAL = 5
+
+class SeedScheduler:
+    def __init__(self, q):
+        self._seed_queue = q
+        self._max = float('-inf')
+        self._weights_need_update = True
+
+    def _update_weights(self):
+        if not self._seed_queue:
+            self._weights = []
+            return
+        min_priority = self._seed_queue[0][0]
+        max_priority = self._max
+        mid_val = (min_priority + max_priority) / 2
+        self._weights = [self._logistic_function(priority, 1, mid_val) for priority, _ in self._seed_queue]
+        self._weights /= np.sum(self._weights)
+        self._weights_need_update = False
+
+    def _logistic_function(self, x, k, mid):
+        return 1 / (1 + np.exp(k * (x - mid)))
+
+    def put(self, fn, priority):
+        if not fn:
+            raise ValueError("Invalid seed")
+        heapq.heappush(self._seed_queue, (priority, fn))
+        self._max = max(self._max, priority)
+        self._weights_need_update = True
+
+    def pop(self):
+        if not self._seed_queue:
+            return None
+        _, removed_seed = heapq.heappop(self._seed_queue)
+        if removed_seed == self._max and self._seed_queue:
+            self._max = max(self._seed_queue, key=lambda x: x[0])[0]
+        self._weights_need_update = True
+        return removed_seed
+
+    def pick(self):
+        if not self._seed_queue:
+            return None
+        if self._weights_need_update:
+            self._update_weights()
+        chosen_index = np.random.choice(range(len(self._seed_queue)), p=self._weights)
+        return self._seed_queue[chosen_index][1]
 
 # 'id:xxxx,src:yyyyy' -> 'id:xxxx'
 # 'id-xxx-xxxxxx-xx,src:yy-yyyyyy-yy' -> 'id-xxx-xxxxxx-xx'
@@ -68,7 +113,7 @@ class MazerunnerState:
         self.execs = 0
         self.num_error_reports = 0
         self.num_crash_reports = 0
-        self._seed_queue = []
+        self.seed_queue = []
         self._best_seed_info = [None, float("inf"), False] # filename, distance, is_new
 
     def __setstate__(self, dict):
@@ -92,21 +137,6 @@ class MazerunnerState:
     def update_best_seed(self, filename, distance):
         self._best_seed_info[0] = filename
         self._best_seed_info[1] = int(distance)
-
-    def put_seed(self, fn, priority):
-        if not fn:
-            raise ValueError("Invalid seed")
-        heapq.heappush(self._seed_queue, (priority, fn))
-
-    def get_seed(self):
-        if not self._seed_queue:
-            return None
-        return heapq.heappop(self._seed_queue)[1]
-    
-    def get_top_seed(self):
-        if not self._seed_queue:
-            return None
-        return self._seed_queue[0][1]
 
     def increase_timeout(self, logger, max_timeout):
         old_timeout = self.timeout
@@ -139,6 +169,7 @@ class Mazerunner:
             self.state = shared_state
         else:
             self._import_state()
+        seed_scheduler = SeedScheduler(self.state.seed_queue)
         self._setup_logger(config.logging_level)
         self.afl = config.afl_dir
         if self.afl:
@@ -312,7 +343,7 @@ class Mazerunner:
                 for fn in self.state.hang:
                     d = utils.get_distance_from_fn(fn)
                     d = self.config.max_distance if d is None else d
-                    self.state.put_seed(fn, d)
+                    self.seed_scheduler.put(fn, d)
                 self.state.hang.clear()
 
     def check_crashes(self):
@@ -436,7 +467,7 @@ class ExploreExecutor(Mazerunner):
             filename = f"id:{index:06},src:{target},ts:{ts},execs:{self.state.execs}"
             shutil.move(testcase, os.path.join(self.my_generations, filename))
             t_d = int(t.split(',')[-1].strip())
-            self.state.put_seed(filename, t_d)
+            self.seed_scheduler.put(filename, t_d)
         # syn back to AFL queue if it's interesting
         is_interesting = self.minimizer.has_closer_distance(res.distance, fn)
         if is_interesting:
@@ -447,7 +478,7 @@ class ExploreExecutor(Mazerunner):
             shutil.copy2(fp, dst_fp)
 
     def _run(self):
-        next_seed = self.state.get_seed()
+        next_seed = self.seed_scheduler.pop()
         if not next_seed is None and next_seed not in self.state.processed:
             self.run_file(next_seed)
             # start RL training after symsan executor finishes
@@ -518,8 +549,9 @@ class ExploitExecutor(Mazerunner):
         dst_fn = f"id:{index:06},src:{target},ts:{ts},dis:{res.distance:06},execs:{self.state.execs},exploit"
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
-        self.agent.save_trace(dst_fn)
-        self.state.put_seed(dst_fn, res.distance)
+        if self.minimizer.has_new_sa(len(self.agent.visited_sa)):
+            self.agent.save_trace(dst_fn)
+            self.seed_scheduler.put(dst_fn, res.distance)
         is_interesting = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_interesting:
             self.logger.info(f"Exploit agent found closer seed. "
@@ -529,7 +561,7 @@ class ExploitExecutor(Mazerunner):
             shutil.copy2(self.cur_input, dst_fp)
 
     def _run(self):
-        next_seed = self.state.get_top_seed()
+        next_seed = self.seed_scheduler.pick()
         if next_seed:
             self.run_file(next_seed)
             self.agent.train(self.agent.episode)
@@ -562,11 +594,11 @@ class RecordExecutor(Mazerunner):
     def update_seed_queue(self, fn):
         d = utils.get_distance_from_fn(fn)
         d = self.config.max_distance if d is None else d
-        self.state.put_seed(fn, d)
+        self.seed_scheduler.put(fn, d)
 
     def _run(self):
         files = self.sync_from_either()
-        if self.is_hybrid_mode and not files and not self.state._seed_queue:
+        if self.is_hybrid_mode and not files and not self.state.seed_queue:
             self.handle_hang_files()
         for fn in files:
             self.run_file(fn)
