@@ -169,7 +169,7 @@ class Mazerunner:
             self.state = shared_state
         else:
             self._import_state()
-        seed_scheduler = SeedScheduler(self.state.seed_queue)
+        self.seed_scheduler = SeedScheduler(self.state.seed_queue)
         self._setup_logger(config.logging_level)
         self.afl = config.afl_dir
         if self.afl:
@@ -549,11 +549,11 @@ class ExploitExecutor(Mazerunner):
         dst_fn = f"id:{index:06},src:{target},ts:{ts},dis:{res.distance:06},execs:{self.state.execs},exploit"
         dst_fp = os.path.join(self.my_generations, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
-        if self.minimizer.has_new_sa(len(self.agent.visited_sa)):
-            self.agent.save_trace(dst_fn)
+        self.agent.save_trace(dst_fn)
+        is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
+        if is_closer or self.minimizer.has_new_sa(len(self.agent.visited_sa)):
             self.seed_scheduler.put(dst_fn, res.distance)
-        is_interesting = self.minimizer.has_closer_distance(res.distance, dst_fn)
-        if is_interesting:
+        if is_closer:
             self.logger.info(f"Exploit agent found closer seed. "
                             f"distance: {res.distance}, ts: {ts}")
             self.logger.info("Sync back: %s" % fn)

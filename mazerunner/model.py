@@ -4,7 +4,7 @@ import pickle
 
 from decimal import Decimal, getcontext
 from enum import Enum
-from utils import mkdir, find_bottom_numbers
+from utils import mkdir, find_local_min
 
 class RLModelType(Enum):
     unknown = 0
@@ -167,7 +167,7 @@ class RewardCalculator:
 class DistanceRewardCalculator(RewardCalculator):
     def __init__(self, config, min_distance, trace):
         super().__init__(config, min_distance, trace)
-        self.local_min_indices = find_bottom_numbers([d for (_, _, d)in trace])
+        self.local_min_indices = find_local_min([d for (_, _, d)in trace])
 
     def compute_reward(self, i):
         if i >= len(self.trace) and self.min_distance > 0:

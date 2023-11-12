@@ -60,37 +60,28 @@ def get_folder_size(dir_path):
                 total += get_folder_size(entry.path)
     return total
 
-# find the bottom numbers in the given list
-# test_cases = {
-#     "case1": ([1, 2, 3], [0]),
-#     "case2": ([3, 2, 1], [2]),
-#     "case3": ([2, 1, 3], [1]),
-#     "case4": ([2, 1, 3, 0, 4], [1, 3]),
-#     "case5": ([0, 2, 1, 4, 5, 6, -1], [0, 2, 6]),
-#     "case6": ([-1., -2.5], [1]),
-#     "case7": ([0], [0]),
-#     "case8": ([1, 1, 1, 1, 1], [0]),
-#     "case9": ([1, 1, 1, 0, 1], [3]),
-# }
-def find_bottom_numbers(nums):
+def find_local_min(nums):
     assert nums
     if len(nums) == 1:
         return [0]
-    min_val = nums[0]
+    local_min = nums[0]
+    global_min = nums[0]
     min_vals = set()
     min_indices = []
     
     for i, num in enumerate(nums):
         if i == 0:
             if num < nums[i+1]:
-                min_vals.add(min_val)
+                min_vals.add(local_min)
             continue
         if num <= nums[i-1]:
-            min_val = num
-        if i < len(nums) - 1 and num <= nums[i-1] and num < nums[i+1]:
-            min_vals.add(min_val)
-        if i == len(nums) - 1 and num <= nums[i-1]:
-            min_vals.add(min_val)
+            local_min = num
+        if i < len(nums) - 1 and num <= nums[i-1] and num < nums[i+1] and num < global_min:
+            min_vals.add(local_min)
+        if i == len(nums) - 1 and num <= nums[i-1] and num < global_min:
+            min_vals.add(local_min)
+        if num < global_min:
+            global_min = num
 
     for i, num in enumerate(nums):
         if num in min_vals:

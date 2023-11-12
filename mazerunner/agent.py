@@ -148,6 +148,8 @@ class Agent:
 
     def save_trace(self, fn):
         log_path = os.path.join(self.my_traces, fn)
+        if os.path.exists(log_path):
+            return
         with open(log_path, 'wb') as fd:
             pickle.dump(self.episode, fd, protocol=pickle.HIGHEST_PROTOCOL)
 
