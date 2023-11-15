@@ -1,4 +1,5 @@
 import collections
+import logging
 import os
 import pickle
 
@@ -16,6 +17,7 @@ class RLModel:
 
     def __init__(self, config):
         self.config = config
+        self.logger = logging.getLogger(self.__class__.__qualname__)
         getcontext().prec = config.decimal_precision
         self.visited_sa = collections.Counter()
         self.all_target_sa = set()
@@ -57,10 +59,11 @@ class RLModel:
             with open(target_sa_path, 'rb') as fp:
                 self.all_target_sa = pickle.load(fp)
 
-    def get_default_distance(self, key):
-        context_insensitive_sa = (key[0], key[-1])
-        value = self.config.initial_policy.get(context_insensitive_sa, None)
+    def get_default_distance(self, bid, action):
+        assert action == 0 or action == 1
+        value = self.config.initial_policy.get(bid, None)[action]
         value = self.config.max_distance if value is None else value
+        self.logger.debug(f"get_default_distance: bid={bid}, action={action}, value={value}")
         return value
 
     def add_unreachable_sa(self, sa):
@@ -90,15 +93,17 @@ class DistanceModel(RLModel):
     def q_to_distance(p):
         return -p
 
-    def get_distance(self, key):
+    def get_distance(self, state, action):
+        key = state.sa
         if key not in self.Q_table:
-            return self.get_default_distance(key)
+            return self.get_default_distance(state.bid, action)
         else:
             return DistanceModel.q_to_distance(self.Q_table[key])
 
-    def Q_lookup(self, key):
+    def Q_lookup(self, state, action):
+        key = state.sa
         if key not in self.Q_table:
-            d = self.get_default_distance(key)
+            d = self.get_default_distance(state.bid, action)
             return DistanceModel.distance_to_q(d)
         return self.Q_table[key]
 
@@ -140,14 +145,15 @@ class ReachabilityModel(RLModel):
         res = - (p.ln() / ReachabilityModel.TWO.ln())
         return float(res) * 1000
 
-    def get_distance(self, key):
+    def get_distance(self, state, action):
+        key = state.sa
         if key not in self.Q_table:
-            return self.get_default_distance(key)
+            return self.get_default_distance(state.bid, action)
         else:
             return self.Q_table[key]
 
-    def Q_lookup(self, key):
-        d = self.get_distance(key)
+    def Q_lookup(self, state, action):
+        d = self.get_distance(state, action)
         return ReachabilityModel.distance_to_prob(d)
 
     def Q_update(self, key, value):
@@ -167,7 +173,7 @@ class RewardCalculator:
 class DistanceRewardCalculator(RewardCalculator):
     def __init__(self, config, min_distance, trace):
         super().__init__(config, min_distance, trace)
-        self.local_min_indices = find_local_min([d for (_, _, d)in trace])
+        self.local_min_indices = find_local_min([s.d for s in trace])
 
     def compute_reward(self, i):
         if i >= len(self.trace) and self.min_distance > 0:
@@ -185,7 +191,7 @@ class ReachabilityRewardCalculator(RewardCalculator):
     def compute_reward(self, i):
         if i >= len(self.trace):
             return Decimal(0)
-        s, a, d = self.trace[i]
+        d = self.trace[i].d
         if d == 0:
             return Decimal(1)
         return Decimal(0)

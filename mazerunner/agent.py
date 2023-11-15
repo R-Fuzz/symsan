@@ -14,13 +14,19 @@ class ProgramState:
         self.state = (0,0,0)
         self.action = 0
         self.d = distance
+        self.bid = 0
         self.pc_counter = collections.Counter()
     
-    def update(self, pc, callstack, action, distance):
+    @property
+    def sa(self):
+        return self.state + (self.action,)
+    
+    def update(self, pc, callstack, bid, action, distance):
         self.pc_counter.update([(pc, callstack)])
         self.state = (pc, callstack, bucket_lookup(self.pc_counter[(pc, callstack)]))
         self.action = action
         self.d = distance
+        self.bid = bid
 
     def serialize(self):
         return (self.state, self.action, self.d)
@@ -35,20 +41,20 @@ class BasicQLearner:
         self.discount_factor = df
         self.learning_rate = lr
 
-    def learn(self, last_SA, next_s, last_reward):
-        last_Q = self.model.Q_lookup(last_SA)
-        curr_state_taken = self.model.Q_lookup(next_s + (1,))
-        curr_state_not_taken = self.model.Q_lookup(next_s + (0,))
+    def learn(self, last_s, next_s, last_reward):
+        last_Q = self.model.Q_lookup(last_s, last_s.action)
+        curr_state_taken = self.model.Q_lookup(next_s, 1)
+        curr_state_not_taken = self.model.Q_lookup(next_s, 0)
         if curr_state_taken >= curr_state_not_taken:
             chosen_Q = curr_state_taken
         else:
             chosen_Q = curr_state_not_taken
-        if next_s == ("Terminal",):
+        if next_s == "Terminal":
             last_Q = last_Q + self.learning_rate * (last_reward - last_Q)
         else:
             last_Q = (last_Q + self.learning_rate 
                 * (last_reward + self.discount_factor * chosen_Q - last_Q))
-        self.model.Q_update(last_SA, last_Q)
+        self.model.Q_update(last_s.sa, last_Q)
 
 
 class Agent:
@@ -100,7 +106,7 @@ class Agent:
 
     def append_episode(self):
         if self.curr_state.state[2] < MAX_BUCKET_SIZE:
-            self.episode.append(self.curr_state.serialize())
+            self.episode.append(self.curr_state)
 
     def reset(self):
         self.curr_state = ProgramState(distance=self.config.max_distance)
@@ -122,20 +128,19 @@ class Agent:
     def train(self, trace):
         assert 0 <= self.min_distance <= self.config.max_distance
         reward_calculator = self.model.create_reward_calculator(self.config, trace, self.min_distance)
-        for i, (s, a, d) in enumerate(reversed(trace)):
-            sa = s + (a,)
-            self.model.add_visited_sa(sa)
+        for i, s in enumerate(reversed(trace)):
+            self.model.add_visited_sa(s.sa)
             i = len(trace) - i - 1
             if i >= len(trace) - 1:
-                next_s = ("Terminal",)
+                next_s = "Terminal"
             else:
-                next_s = trace[i+1][0]
+                next_s = trace[i+1]
             reward = reward_calculator.compute_reward(i+1)
-            self.learner.learn(sa, next_s, reward)
-            self.logger.debug(f"SA: {sa}, "
-                            f"distance: {d if d else 'NA'}, "
+            self.learner.learn(s, next_s, reward)
+            self.logger.debug(f"SA: {s.sa}, "
+                            f"distance: {s.d if s.d else 'NA'}, "
                             f"reward: {reward}, "
-                            f"d_sa: {self.model.get_distance(sa)}")
+                            f"d_sa: {self.model.get_distance(s, s.action)}")
 
     def replay_log(self, log_path):
         self.reset()
@@ -162,7 +167,7 @@ class Agent:
             d = self.curr_state.d
         self.min_distance = float(msg.global_min_dist)
         assert (self.min_distance <= d <= self.config.max_distance)
-        self.curr_state.update(msg.addr, msg.context, action, d)
+        self.curr_state.update(msg.addr, msg.context, msg.id, action, d)
         self.logger.debug(f"SA: {(msg.addr, msg.context, action)}, "
                         f"distance: {d if d else 'NA'}, "
                         f"min_distance: {self.min_distance} ")
@@ -171,8 +176,8 @@ class Agent:
         mkdir(self.my_traces)
 
     def greedy_policy(self):
-        d_taken = self.model.get_distance(self.curr_state.state + (1,))
-        d_not_taken = self.model.get_distance(self.curr_state.state + (0,))
+        d_taken = self.model.get_distance(self.curr_state.state, 1)
+        d_not_taken = self.model.get_distance(self.curr_state.state, 0)
         if d_taken > d_not_taken:
             return 0
         elif d_taken < d_not_taken:
@@ -181,10 +186,10 @@ class Agent:
             return self.curr_state.action
 
     def __debug_policy(self):
-        distance_taken = self.model.get_distance(self.curr_state.state + (1,))
-        distance_not_taken = self.model.get_distance(self.curr_state.state + (0,))
+        distance_taken = self.model.get_distance(self.curr_state.state, 1)
+        distance_not_taken = self.model.get_distance(self.curr_state.state, 0)
         self.logger.info(f"curr_sad={self.curr_state.serialize()}, "
-                        f"visited_times={self.model.visited_sa.get(self.curr_state.state + (self.curr_state.action,), 0)}, "
+                        f"visited_times={self.model.visited_sa.get(self.curr_state.state.sa, 0)}, "
                         f"distance_taken={distance_taken}, "
                         f"distance_not_taken={distance_not_taken}, ")
 
@@ -203,23 +208,23 @@ class ExploreAgent(Agent):
 
     def handle_new_state(self, msg, action):
         self.update_curr_state(msg, action)
-        curr_sa = self.curr_state.state + (self.curr_state.action, )
-        self.model.remove_target_sa(curr_sa)
+        self.model.remove_target_sa(self.curr_state.sa)
         self.append_episode()
-        self.reversed_sa = self.curr_state.compute_reversed_sa()
 
     def is_interesting_branch(self):
-        if self.reversed_sa in self.model.unreachable_sa:
+        reversed_sa = self.curr_state.compute_reversed_sa()
+        if reversed_sa in self.model.unreachable_sa:
             return False
-        if self.reversed_sa in self.model.all_target_sa:
+        if reversed_sa in self.model.all_target_sa:
             return False
         interesting = self.greedy_policy() != self.curr_state.action
         if interesting:
-            self.model.add_target_sa(self.reversed_sa)
+            self.model.add_target_sa(reversed_sa)
         return interesting
 
     def compute_branch_score(self):
-        return str(int(self.model.get_distance(self.reversed_sa)))
+        reversed_action = 1 if self.curr_state.action == 0 else 0
+        return str(int(self.model.get_distance(self.curr_state.state, reversed_action)))
 
     def _curious_policy(self, sa):
         return sa not in self.model.visited_sa
@@ -236,8 +241,7 @@ class ExploitAgent(Agent):
     def handle_new_state(self, msg, action):
         self.update_curr_state(msg, action)
         self.append_episode()
-        curr_sa = self.curr_state.state + (self.curr_state.action, )
-        if curr_sa == self.target[0] and len(self.episode) == self.target[1]:
+        if self.curr_state.state.sa == self.target[0] and len(self.episode) == self.target[1]:
             self.target = (None, 0) # sa, trace_length
 
     def is_interesting_branch(self):
@@ -276,8 +280,8 @@ class ExploitAgent(Agent):
             return False
     
     def _weighted_probabilistic_policy(self):
-        d_taken = self.model.get_distance(self.curr_state.state + (1,))
-        d_not_taken = self.model.get_distance(self.curr_state.state + (0,))
+        d_taken = self.model.get_distance(self.curr_state.state, 1)
+        d_not_taken = self.model.get_distance(self.curr_state.state, 0)
         total = d_taken + d_not_taken
         p = random.random()
         if p < d_taken / total:

@@ -91,43 +91,29 @@ std::string getMangledName(const Function *F) {
 }
 
 void getInsDebugLoc(const Instruction *I, std::string &Filename,
-                        unsigned &Line) {
-#ifdef LLVM_OLD_DEBUG_API
-  DebugLoc Loc = I->getDebugLoc();
-  if (!Loc.isUnknown()) {
-    DILocation cDILoc(Loc.getAsMDNode(M.getContext()));
-    DILocation oDILoc = cDILoc.getOrigLocation();
-
-    Line = oDILoc.getLineNumber();
-    Filename = oDILoc.getFilename().str();
-
-    if (filename.empty()) {
-      Line = cDILoc.getLineNumber();
-      Filename = cDILoc.getFilename().str();
-    }
-  }
-#else
+                        unsigned &Line, unsigned &Col) {
   if (DILocation *Loc = I->getDebugLoc()) {
     Line = Loc->getLine();
     Filename = Loc->getFilename().str();
-
+    Col = Loc->getColumn();
     if (Filename.empty()) {
       DILocation *oDILoc = Loc->getInlinedAt();
       if (oDILoc) {
         Line = oDILoc->getLine();
+        Col = oDILoc->getColumn();
         Filename = oDILoc->getFilename().str();
       }
     }
   }
-#endif /* LLVM_OLD_DEBUG_API */
 }
 
-void getBBDebugLoc(const BasicBlock *BB, std::string &Filename, unsigned &Line) {
+void getBBDebugLoc(const BasicBlock *BB, std::string &Filename, unsigned &Line, unsigned &Col) {
   std::string bb_name("");
   std::string filename;
-  unsigned line;
+  unsigned line = 0;
+  unsigned col = 0;
   for (auto &I : *BB) {
-    getInsDebugLoc(&I, filename, line);
+    getInsDebugLoc(&I, filename, line, col);
     /* Don't worry about external libs */
     static const std::string Xlibs("/usr/");
     if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
@@ -137,6 +123,7 @@ void getBBDebugLoc(const BasicBlock *BB, std::string &Filename, unsigned &Line) 
       filename = filename.substr(found + 1);
     Filename = filename;
     Line = line;
+    Col = col;
     break;
   }
 }
@@ -148,7 +135,8 @@ void getFuncDebugLoc(const Function *F, std::string &Filename, unsigned &Line) {
     if (entry.empty()) return;
     const Instruction *I = entry.getFirstNonPHIOrDbg();
     if (I == nullptr) return;
-    getInsDebugLoc(I, Filename, Line);
+    unsigned col = 0;
+    getInsDebugLoc(I, Filename, Line, col);
 }
 
 template<>
@@ -159,20 +147,27 @@ struct DOTGraphTraits<Function*> : public DefaultDOTGraphTraits {
     return "CFG for '" + F->getName().str() + "' function";
   }
 
-  static std::string getNodeIdentifierLabel(BasicBlock *Node, Function *Graph) {
-    return std::to_string(djbHash(Node->getName()));
-  }
-
   std::string getNodeLabel(BasicBlock *Node, Function *Graph) {
+    std::string label = "id:" + std::to_string(djbHash(Node->getName()));
+    auto *TI = Node->getTerminator();
+    if (TI && TI->getNumSuccessors() == 2) {
+      BranchInst *branch_inst = dyn_cast<BranchInst>(TI);
+      if (branch_inst && branch_inst->isConditional()) {
+        auto *TT = TI->getSuccessor(0);
+        label += ", T:" + std::to_string(djbHash(TT->getName()));
+        auto *FT = TI->getSuccessor(1);
+        label += ", F:" + std::to_string(djbHash(FT->getName()));
+      }
+    }
     if (!Node->getName().empty()) {
-      return Node->getName().str();
+      return Node->getName().str() + ", " + label;
     }
 
     std::string Str;
     raw_string_ostream OS(Str);
 
     Node->printAsOperand(OS, false);
-    return OS.str();
+    return OS.str() + ", " + label;
   }
 };
 
@@ -223,7 +218,7 @@ static bool isBlacklisted(const Function *F) {
 }
 
 bool AFLCoverage::runOnModule(Module &M) {
-
+  static uint32_t unamed = 0;
   bool is_aflgo = false;
   bool is_aflgo_preprocessing = false;
 
@@ -322,26 +317,26 @@ bool AFLCoverage::runOnModule(Module &M) {
         bool is_target = false;
 
         std::string bb_name("");
+        std::string bb_name_with_col("");
         std::string filename;
-        unsigned line;
+        unsigned line = 0;
+        unsigned col = 0;
 
         /* Find bb_name */
-        getBBDebugLoc(&BB, filename, line);
-        if (!filename.empty() && line != 0 )
+        getBBDebugLoc(&BB, filename, line, col);
+        if (!filename.empty() && line != 0 ){
           bb_name = filename + ":" + std::to_string(line);
-
+          bb_name_with_col = filename + ":" + std::to_string(line) + ":" + std::to_string(col);
+        }else{
+          bb_name = M.getSourceFileName() + "unamed:" + std::to_string(unamed++);
+          bb_name_with_col = bb_name;
+        }
         for (auto &I : BB) {
-          getInsDebugLoc(&I, filename, line);
-
+          getInsDebugLoc(&I, filename, line, col);
           /* Don't worry about external libs */
           static const std::string Xlibs("/usr/");
           if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
             continue;
-
-          std::size_t found = filename.find_last_of("/\\");
-          if (found != std::string::npos)
-            filename = filename.substr(found + 1);
-          std::string line_name = filename + ":" + std::to_string(line);
 
           /* handle direct calls */
           if (auto *c = dyn_cast<CallInst>(&I)) {
@@ -372,9 +367,9 @@ bool AFLCoverage::runOnModule(Module &M) {
         if (is_target) is_fun_target = true;
         if (is_target && !bb_name.empty()) bbtargets << bb_name << "\n";
         if (!bb_name.empty()) {
-          BB.setName(bb_name + ":");
+          BB.setName(bb_name_with_col);
           if (!BB.hasName()) {
-            std::string newname = bb_name + ":";
+            std::string newname = bb_name;
             Twine t(newname);
             SmallString<256> NameData;
             StringRef NameRef = t.toStringRef(NameData);
@@ -441,8 +436,9 @@ bool AFLCoverage::runOnModule(Module &M) {
           std::string bb_name;
           for (auto &I : BB) {
             std::string filename;
-            unsigned line;
-            getInsDebugLoc(&I, filename, line);
+            unsigned line = 0;
+            unsigned col = 0;
+            getInsDebugLoc(&I, filename, line, col);
 
             if (filename.empty() || line == 0)
               continue;
