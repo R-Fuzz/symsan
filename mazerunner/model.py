@@ -61,7 +61,8 @@ class RLModel:
 
     def get_default_distance(self, bid, action):
         assert action == 0 or action == 1
-        value = self.config.initial_policy.get(bid, None)[action]
+        initial_distances = self.config.initial_policy.get(str(bid), None)
+        value = initial_distances[action] if initial_distances else None
         value = self.config.max_distance if value is None else value
         self.logger.debug(f"get_default_distance: bid={bid}, action={action}, value={value}")
         return value
@@ -178,7 +179,7 @@ class DistanceRewardCalculator(RewardCalculator):
     def compute_reward(self, i):
         if i >= len(self.trace) and self.min_distance > 0:
                 return -self.config.max_distance
-        _, _, d = self.trace[i]
+        d = self.trace[i].d
         if d == 0:
             return self.config.max_distance
         r = 0

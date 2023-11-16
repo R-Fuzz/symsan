@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 import collections
@@ -43,15 +44,16 @@ class BasicQLearner:
 
     def learn(self, last_s, next_s, last_reward):
         last_Q = self.model.Q_lookup(last_s, last_s.action)
-        curr_state_taken = self.model.Q_lookup(next_s, 1)
-        curr_state_not_taken = self.model.Q_lookup(next_s, 0)
-        if curr_state_taken >= curr_state_not_taken:
-            chosen_Q = curr_state_taken
-        else:
-            chosen_Q = curr_state_not_taken
-        if next_s == "Terminal":
+        # Terminal state
+        if next_s.state == (0,0,0):
             last_Q = last_Q + self.learning_rate * (last_reward - last_Q)
         else:
+            curr_state_taken = self.model.Q_lookup(next_s, 1)
+            curr_state_not_taken = self.model.Q_lookup(next_s, 0)
+            if curr_state_taken >= curr_state_not_taken:
+                chosen_Q = curr_state_taken
+            else:
+                chosen_Q = curr_state_not_taken
             last_Q = (last_Q + self.learning_rate 
                 * (last_reward + self.discount_factor * chosen_Q - last_Q))
         self.model.Q_update(last_s.sa, last_Q)
@@ -106,7 +108,7 @@ class Agent:
 
     def append_episode(self):
         if self.curr_state.state[2] < MAX_BUCKET_SIZE:
-            self.episode.append(self.curr_state)
+            self.episode.append(copy.copy(self.curr_state))
 
     def reset(self):
         self.curr_state = ProgramState(distance=self.config.max_distance)
@@ -132,7 +134,7 @@ class Agent:
             self.model.add_visited_sa(s.sa)
             i = len(trace) - i - 1
             if i >= len(trace) - 1:
-                next_s = "Terminal"
+                next_s = ProgramState(distance=self.config.max_distance)
             else:
                 next_s = trace[i+1]
             reward = reward_calculator.compute_reward(i+1)
@@ -176,8 +178,8 @@ class Agent:
         mkdir(self.my_traces)
 
     def greedy_policy(self):
-        d_taken = self.model.get_distance(self.curr_state.state, 1)
-        d_not_taken = self.model.get_distance(self.curr_state.state, 0)
+        d_taken = self.model.get_distance(self.curr_state, 1)
+        d_not_taken = self.model.get_distance(self.curr_state, 0)
         if d_taken > d_not_taken:
             return 0
         elif d_taken < d_not_taken:
@@ -186,10 +188,10 @@ class Agent:
             return self.curr_state.action
 
     def __debug_policy(self):
-        distance_taken = self.model.get_distance(self.curr_state.state, 1)
-        distance_not_taken = self.model.get_distance(self.curr_state.state, 0)
+        distance_taken = self.model.get_distance(self.curr_state, 1)
+        distance_not_taken = self.model.get_distance(self.curr_state, 0)
         self.logger.info(f"curr_sad={self.curr_state.serialize()}, "
-                        f"visited_times={self.model.visited_sa.get(self.curr_state.state.sa, 0)}, "
+                        f"visited_times={self.model.visited_sa.get(self.curr_state.sa, 0)}, "
                         f"distance_taken={distance_taken}, "
                         f"distance_not_taken={distance_not_taken}, ")
 
@@ -224,7 +226,7 @@ class ExploreAgent(Agent):
 
     def compute_branch_score(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
-        return str(int(self.model.get_distance(self.curr_state.state, reversed_action)))
+        return str(int(self.model.get_distance(self.curr_state, reversed_action)))
 
     def _curious_policy(self, sa):
         return sa not in self.model.visited_sa
@@ -241,7 +243,7 @@ class ExploitAgent(Agent):
     def handle_new_state(self, msg, action):
         self.update_curr_state(msg, action)
         self.append_episode()
-        if self.curr_state.state.sa == self.target[0] and len(self.episode) == self.target[1]:
+        if self.curr_state.sa == self.target[0] and len(self.episode) == self.target[1]:
             self.target = (None, 0) # sa, trace_length
 
     def is_interesting_branch(self):
@@ -280,8 +282,8 @@ class ExploitAgent(Agent):
             return False
     
     def _weighted_probabilistic_policy(self):
-        d_taken = self.model.get_distance(self.curr_state.state, 1)
-        d_not_taken = self.model.get_distance(self.curr_state.state, 0)
+        d_taken = self.model.get_distance(self.curr_state, 1)
+        d_not_taken = self.model.get_distance(self.curr_state, 0)
         total = d_taken + d_not_taken
         p = random.random()
         if p < d_taken / total:

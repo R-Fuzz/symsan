@@ -154,20 +154,20 @@ struct DOTGraphTraits<Function*> : public DefaultDOTGraphTraits {
       BranchInst *branch_inst = dyn_cast<BranchInst>(TI);
       if (branch_inst && branch_inst->isConditional()) {
         auto *TT = TI->getSuccessor(0);
-        label += ", T:" + std::to_string(djbHash(TT->getName()));
+        label += ",T:" + std::to_string(djbHash(TT->getName()));
         auto *FT = TI->getSuccessor(1);
-        label += ", F:" + std::to_string(djbHash(FT->getName()));
+        label += ",F:" + std::to_string(djbHash(FT->getName()));
       }
     }
     if (!Node->getName().empty()) {
-      return Node->getName().str() + ", " + label;
+      return Node->getName().str() + "," + label;
     }
 
     std::string Str;
     raw_string_ostream OS(Str);
 
     Node->printAsOperand(OS, false);
-    return OS.str() + ", " + label;
+    return OS.str() + "," + label;
   }
 };
 
@@ -328,7 +328,11 @@ bool AFLCoverage::runOnModule(Module &M) {
           bb_name = filename + ":" + std::to_string(line);
           bb_name_with_col = filename + ":" + std::to_string(line) + ":" + std::to_string(col);
         }else{
-          bb_name = M.getSourceFileName() + "unamed:" + std::to_string(unamed++);
+          filename = M.getSourceFileName();
+          std::size_t found = filename.find_last_of("/\\");
+          if (found != std::string::npos)
+            filename = filename.substr(found + 1);
+          bb_name = filename + ":unamed:" + std::to_string(unamed++);
           bb_name_with_col = bb_name;
         }
         for (auto &I : BB) {
@@ -369,7 +373,7 @@ bool AFLCoverage::runOnModule(Module &M) {
         if (!bb_name.empty()) {
           BB.setName(bb_name_with_col);
           if (!BB.hasName()) {
-            std::string newname = bb_name;
+            std::string newname = bb_name_with_col;
             Twine t(newname);
             SmallString<256> NameData;
             StringRef NameRef = t.toStringRef(NameData);

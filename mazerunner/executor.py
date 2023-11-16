@@ -143,7 +143,7 @@ class SymSanExecutor:
         f":debug={logging_level}")
         cmd, stdin = utils.fix_at_file(self.cmd, self.input_file)
         if timeout:
-            cmd = ["timeout", "-k", str(1), str(timeout)] + cmd
+            cmd = ["timeout", "-k", str(1), str(int(timeout))] + cmd
         try:
             self.logger.debug("Executing %s" % ' '.join(cmd))
             if stdin:
@@ -172,10 +172,6 @@ class SymSanExecutor:
         should_handle = True
         self.msg_num = 0
         while should_handle:
-            if self.timer.execution_timeout(self.config.timeout):
-                self.kill_proc()
-                self.logger.info(f"symsan proc timeout, process killed")
-                break
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
             if len(msg_data) < ctypes.sizeof(pipe_msg):
                 break

@@ -718,7 +718,11 @@ uint32_t Taint::getBasicblockId(BasicBlock *BB) {
   if (!filename.empty() && line != 0 ){
     bb_name_with_col = filename + ":" + std::to_string(line) + ":" + std::to_string(col);
   }else{
-    bb_name_with_col = Mod->getSourceFileName() + "unamed:" + std::to_string(unamed++);
+    filename = Mod->getSourceFileName();
+    std::size_t found = filename.find_last_of("/\\");
+    if (found != std::string::npos)
+      filename = filename.substr(found + 1);
+    bb_name_with_col = filename + ":unamed:" + std::to_string(unamed++);
   }
   return djbHash(bb_name_with_col);
 }

@@ -40,7 +40,6 @@ class TestcaseMinimizer:
         self.bitmap = self.initialize_bitmap(self.bitmap_file, map_size)
         self.crash_bitmap = self.initialize_bitmap(self.crash_bitmap_file, map_size)
         self.mazerunner_state = state
-        self.mazerunner_sa_num = 0
         atexit.register(self.cleanup)
 
     def initialize_bitmap(self, filename, map_size):
@@ -63,13 +62,6 @@ class TestcaseMinimizer:
         distance_reached = self.mazerunner_state.min_distance
         if distance < distance_reached:
             self.mazerunner_state.update_best_seed(testcase, distance)
-            return True
-        else:
-            return False
-
-    def has_new_sa(self, sa_num):
-        if sa_num > self.mazerunner_sa_num:
-            self.mazerunner_sa_num = sa_num
             return True
         else:
             return False
