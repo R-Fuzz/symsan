@@ -179,16 +179,6 @@ class Agent:
     def _make_dirs(self):
         mkdir(self.my_traces)
 
-    def greedy_policy(self):
-        d_taken = self.model.get_distance(self.curr_state, 1)
-        d_not_taken = self.model.get_distance(self.curr_state, 0)
-        if d_taken > d_not_taken:
-            return 0
-        elif d_taken < d_not_taken:
-            return 1
-        else:
-            return self.curr_state.action
-
     def __debug_policy(self):
         distance_taken = self.model.get_distance(self.curr_state, 1)
         distance_not_taken = self.model.get_distance(self.curr_state, 0)
@@ -221,7 +211,7 @@ class ExploreAgent(Agent):
             return False
         if reversed_sa in self.model.all_target_sa:
             return False
-        interesting = self.greedy_policy() != self.curr_state.action
+        interesting = self._greedy_policy()
         if interesting:
             self.model.add_target_sa(reversed_sa)
         return interesting
@@ -230,8 +220,18 @@ class ExploreAgent(Agent):
         reversed_action = 1 if self.curr_state.action == 0 else 0
         return str(int(self.model.get_distance(self.curr_state, reversed_action)))
 
-    def _curious_policy(self, sa):
-        return sa not in self.model.visited_sa
+    def _greedy_policy(self):
+        d_curr = self.model.get_distance(self.curr_state, self.curr_state.action)
+        reversed_action = 1 if self.curr_state.action == 0 else 0
+        d_reverse = self.model.get_distance(self.curr_state, reversed_action)
+        if d_curr > d_reverse:
+            return True
+        elif d_curr < d_reverse:
+            return False
+        return self._curious_policy()
+
+    def _curious_policy(self):
+        return self.curr_state.compute_reversed_sa() not in self.model.visited_sa
 
 class ExploitAgent(Agent):
 
@@ -255,7 +255,7 @@ class ExploitAgent(Agent):
         if reversed_sa in self.model.unreachable_sa:
             self.logger.debug(f"not interesting, unreachable sa {reversed_sa}")
             return False
-        interesting = self.greedy_policy() != self.curr_state.action
+        interesting = self._greedy_policy() != self.curr_state.action
         if interesting:
             self.all_targets.append(reversed_sa)
             self.target = (reversed_sa, len(self.episode))
@@ -265,6 +265,16 @@ class ExploitAgent(Agent):
     def handle_unsat_condition(self):
         self.model.add_unreachable_sa(self.target[0])
         self.target = (None, 0)
+
+    def _greedy_policy(self):
+        d_taken = self.model.get_distance(self.curr_state, 1)
+        d_not_taken = self.model.get_distance(self.curr_state, 0)
+        if d_taken > d_not_taken:
+            return 0
+        elif d_taken < d_not_taken:
+            return 1
+        else:
+            return self.curr_state.action
 
     # Return whether the agent should visit the filpped branch.
     def _epsilon_greedy_policy(self, reversed_sa):
@@ -276,7 +286,7 @@ class ExploitAgent(Agent):
             and random.random() < (self.epsilon ** self.model.visited_sa[reversed_sa])):
             self.logger.debug(f"interesting, epsilon-greedy policy")
             return True
-        if self.greedy_policy() != self.curr_state.action:
+        if self._greedy_policy() != self.curr_state.action:
             self.logger.debug(f"interesting, greedy policy")
             return True
         else:
