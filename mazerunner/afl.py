@@ -653,13 +653,13 @@ class HybridExecutor():
         if agent_type == "exploit":
             self.concolic_executor = ExploitExecutor(config, self.state)
             self.synchronizer = RecordExecutor(config, shared_state=self.state, record_enabled=True)
+            self.synchronizer.agent.model = self.model
         elif agent_type == "explore":
             self.concolic_executor = ExploreExecutor(config, self.state)
             self.synchronizer = RecordExecutor(config, shared_state=self.state, record_enabled=False)
         else:
             raise NotImplementedError()
         self.replayer.agent.model = self.model
-        self.synchronizer.agent.model = self.model
         self.concolic_executor.agent.model = self.model
         self.concolic_executor.seed_scheduler = self.seed_scheduler
         self.synchronizer.seed_scheduler = self.seed_scheduler

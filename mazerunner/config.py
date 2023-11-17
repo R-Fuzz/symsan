@@ -148,8 +148,8 @@ class Config:
     def _load_distance_file(self, fp):
         max_distance = -float('inf')
         with open(fp, 'r') as file:
-            lines = file.readlines()
-            max_distance = max(float(lines[-1].strip().split(',')[-1]), max_distance)
+            for l in file.readlines():
+                max_distance = max(float(l.strip().split(',')[-1]), max_distance)
         return max_distance
 
     def _load_initial_policy(self, fp):
