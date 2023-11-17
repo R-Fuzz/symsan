@@ -44,6 +44,7 @@ class BasicQLearner:
 
     def learn(self, last_s, next_s, last_reward):
         last_Q = self.model.Q_lookup(last_s, last_s.action)
+        if last_Q == -float('inf'): return
         # Terminal state
         if next_s.state == (0,0,0):
             last_Q = last_Q + self.learning_rate * (last_reward - last_Q)
@@ -218,7 +219,8 @@ class ExploreAgent(Agent):
 
     def compute_branch_score(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
-        return str(int(self.model.get_distance(self.curr_state, reversed_action)))
+        d = self.model.get_distance(self.curr_state, reversed_action)
+        return str(int(d))
 
     def _greedy_policy(self):
         d_curr = self.model.get_distance(self.curr_state, self.curr_state.action)
@@ -227,6 +229,8 @@ class ExploreAgent(Agent):
         if d_curr > d_reverse:
             return True
         elif d_curr < d_reverse:
+            return False
+        if d_reverse == float('inf'):
             return False
         return self._curious_policy()
 
@@ -255,7 +259,7 @@ class ExploitAgent(Agent):
         if reversed_sa in self.model.unreachable_sa:
             self.logger.debug(f"not interesting, unreachable sa {reversed_sa}")
             return False
-        interesting = self._epsilon_greedy_policy(reversed_sa)
+        interesting = self._greedy_policy() != self.curr_state.action
         if interesting:
             self.all_targets.append(reversed_sa)
             self.target = (reversed_sa, len(self.episode))
@@ -269,6 +273,8 @@ class ExploitAgent(Agent):
     def _greedy_policy(self):
         d_taken = self.model.get_distance(self.curr_state, 1)
         d_not_taken = self.model.get_distance(self.curr_state, 0)
+        if d_taken == float('inf') and d_not_taken == float('inf'):
+            return self.curr_state.action
         if d_taken > d_not_taken:
             return 0
         elif d_taken < d_not_taken:

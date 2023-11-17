@@ -178,7 +178,7 @@ class DistanceRewardCalculator(RewardCalculator):
 
     def compute_reward(self, i):
         if i >= len(self.trace) and self.min_distance > 0:
-                return -self.config.max_distance
+                return -float('inf')
         d = self.trace[i].d
         if d == 0:
             return self.config.max_distance
