@@ -32,6 +32,7 @@ class ExecutorResult:
         self.returncode = returncode
         self.symsan_msg_num = msg_num
         self.generated_testcases = testcases
+        self.flipped_times = 0
         self.stdout = out if out else "Output not available"
         self.stderr = err if err else "Unknown error"
 

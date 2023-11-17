@@ -49,11 +49,30 @@ class SeedScheduler:
     def pop(self):
         if not self._seed_queue:
             return None
-        _, removed_seed = heapq.heappop(self._seed_queue)
-        if removed_seed == self._max and self._seed_queue:
+        p_to_remove, removed_seed = heapq.heappop(self._seed_queue)
+        if p_to_remove == self._max and self._seed_queue:
             self._max = max(self._seed_queue, key=lambda x: x[0])[0]
         self._weights_need_update = True
         return removed_seed
+
+    def remove(self, fn):
+        if not self._seed_queue:
+            return
+        index_to_remove = None
+        p_to_remove = float('-inf')
+        for i, (p, seed_fn) in enumerate(self._seed_queue):
+            if seed_fn == fn:
+                index_to_remove = i
+                p_to_remove = p
+                break
+        if index_to_remove is not None:
+            self._seed_queue.pop(index_to_remove)
+            heapq.heapify(self._seed_queue)
+            if self._seed_queue and self._max == p_to_remove:
+                self._max = max(self._seed_queue, key=lambda x: x[0])[0]
+            if not self._seed_queue:
+                self._max = float('-inf')
+            self._weights_need_update = True
 
     def pick(self):
         if not self._seed_queue:
@@ -524,6 +543,7 @@ class ExploitExecutor(Mazerunner):
                 emulation_time += symsan_res.emulation_time
                 solving_time += symsan_res.solving_time
         symsan_res.update_time(total_time, solving_time)
+        symsan_res.flipped_times = len(self.agent.all_targets)
         self.logger.info(
             f"Total={total_time}ms, "
             f"Emulation={emulation_time}ms, "
@@ -532,7 +552,7 @@ class ExploitExecutor(Mazerunner):
             f"Distance={symsan_res.distance}, "
             f"Episode_length={len(self.agent.episode)}, "
             f"Msg_count={symsan_res.symsan_msg_num}, "
-            f"flipped={len(self.agent.all_targets)} times. "
+            f"flipped={symsan_res.flipped_times} times. "
         )
         # target might still be reachable due to hitting max_flip_num
         if self.agent.target[0] and not has_reached_max_flip_num():
@@ -547,9 +567,11 @@ class ExploitExecutor(Mazerunner):
             self.state.exploit_time = res.total_time / utils.MILLION_SECONDS_SCALE
 
     def sync_back_if_interesting(self, fp, res):
+        fn = os.path.basename(fp)
+        if res.flipped_times == 0:
+            self.seed_scheduler.remove(os.path.basename(fn))
         if not self.minimizer.is_new_file(self.cur_input):
             return
-        fn = os.path.basename(fp)
         index = self.state.tick()
         target = get_id_from_fn(fn)
         ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
