@@ -1,5 +1,6 @@
 import copy
 import logging
+import math
 import os
 import collections
 import pickle
@@ -44,10 +45,9 @@ class BasicQLearner:
 
     def learn(self, last_s, next_s, last_reward):
         last_Q = self.model.Q_lookup(last_s, last_s.action)
-        if last_Q == -float('inf'): return
-        # Terminal state
+        # check for Terminal state
         if next_s.state == (0,0,0):
-            last_Q = last_Q + self.learning_rate * (last_reward - last_Q)
+            updated_Q = last_Q + self.learning_rate * (last_reward - last_Q)
         else:
             curr_state_taken = self.model.Q_lookup(next_s, 1)
             curr_state_not_taken = self.model.Q_lookup(next_s, 0)
@@ -55,8 +55,14 @@ class BasicQLearner:
                 chosen_Q = curr_state_taken
             else:
                 chosen_Q = curr_state_not_taken
-            last_Q = (last_Q + self.learning_rate 
+            updated_Q = (last_Q + self.learning_rate 
                 * (last_reward + self.discount_factor * chosen_Q - last_Q))
+        # Handle NaN values
+        if math.isnan(updated_Q):
+            if next_s.state == (0,0,0):
+                last_Q = last_reward
+            else:
+                last_Q = (last_reward + chosen_Q) if not math.isnan(chosen_Q) else last_Q
         self.model.Q_update(last_s.sa, last_Q)
 
 
