@@ -37,7 +37,7 @@ class ProgramState:
         reversed_action = 1 if self.action == 0 else 0
         return self.state + (reversed_action, )
 
-class BasicQLearner:
+class MaxQLearner:
     def __init__(self, m: model.RLModel, df, lr):
         self.model = m
         self.discount_factor = df
@@ -63,8 +63,35 @@ class BasicQLearner:
                 last_Q = last_reward
             else:
                 last_Q = (last_reward + chosen_Q) if not math.isnan(chosen_Q) else last_Q
+        else:
+            last_Q = updated_Q
         self.model.Q_update(last_s.sa, last_Q)
 
+class AvgQLearner:
+    def __init__(self, m: model.RLModel, df, lr):
+        self.model = m
+        self.discount_factor = df
+        self.learning_rate = lr
+
+    def learn(self, last_s, next_s, last_reward):
+        last_Q = self.model.Q_lookup(last_s, last_s.action)
+        # check for Terminal state
+        if next_s.state == (0,0,0):
+            updated_Q = last_Q + self.learning_rate * (last_reward - last_Q)
+        else:
+            curr_state_taken = self.model.Q_lookup(next_s, 1)
+            curr_state_not_taken = self.model.Q_lookup(next_s, 0)
+            avg_Q = (curr_state_taken + curr_state_not_taken) / 2
+            updated_Q = last_Q + self.learning_rate * (self.discount_factor * avg_Q - last_Q)
+        # Handle NaN values
+        if math.isnan(updated_Q):
+            if next_s.state == (0,0,0):
+                last_Q = last_reward
+            else:
+                last_Q = avg_Q if not math.isnan(avg_Q) else last_Q
+        else:
+            last_Q = updated_Q
+        self.model.Q_update(last_s.sa, last_Q)
 
 class Agent:
     def __init__(self, config):
@@ -95,13 +122,18 @@ class Agent:
 
     @property
     def learner(self):
-        if not self._learner:
-            lr = self.config.learning_rate
-            df = self.config.discount_factor
-            if self.config.model_type == model.RLModelType.reachability:
-                lr = Decimal(self.config.learning_rate)
-                df = Decimal(self.config.discount_factor)
-            self._learner = BasicQLearner(self.model, df, lr)
+        if self._learner:
+            return self._learner
+        lr = self.config.learning_rate
+        df = self.config.discount_factor
+        if self.config.model_type == model.RLModelType.reachability:
+            lr = Decimal(self.config.learning_rate)
+            df = Decimal(self.config.discount_factor)
+            self._learner = AvgQLearner(self.model, df, lr)
+        elif self.config.model_type == model.RLModelType.distance:
+            self._learner = MaxQLearner(self.model, df, lr)
+        else:
+            raise NotImplementedError()
         return self._learner
 
     @staticmethod
@@ -147,9 +179,9 @@ class Agent:
             reward = reward_calculator.compute_reward(i+1)
             self.learner.learn(s, next_s, reward)
             self.logger.debug(f"SA: {s.sa}, "
-                            f"distance: {s.d if s.d else 'NA'}, "
                             f"reward: {reward}, "
-                            f"d_sa: {self.model.get_distance(s, s.action)}")
+                            f"d_static: {s.d if s.d else 'NA'}, "
+                            f"d_dynamic: {self.model.get_distance(s, s.action)}")
 
     def replay_log(self, log_path):
         self.reset()
@@ -186,7 +218,7 @@ class Agent:
     def _make_dirs(self):
         mkdir(self.my_traces)
 
-    def __debug_policy(self):
+    def debug_policy(self):
         distance_taken = self.model.get_distance(self.curr_state, 1)
         distance_not_taken = self.model.get_distance(self.curr_state, 0)
         self.logger.info(f"curr_sad={self.curr_state.serialize()}, "
