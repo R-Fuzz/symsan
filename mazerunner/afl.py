@@ -20,18 +20,18 @@ WAITING_INTERVAL = 5
 
 class SeedScheduler:
     def __init__(self, q):
-        self._seed_queue = q
+        self.queue = q
         self._max = float('-inf')
         self._weights_need_update = True
 
     def _update_weights(self):
-        if not self._seed_queue:
+        if not self.queue:
             self._weights = []
             return
-        min_priority = self._seed_queue[0][0]
+        min_priority = self.queue[0][0]
         max_priority = self._max
         mid_val = (min_priority + max_priority) / 2
-        self._weights = [self._logistic_function(priority, 1, mid_val) for priority, _ in self._seed_queue]
+        self._weights = [self._logistic_function(priority, 1, mid_val) for priority, _ in self.queue]
         self._weights /= np.sum(self._weights)
         self._weights_need_update = False
 
@@ -42,47 +42,47 @@ class SeedScheduler:
         if not fn:
             raise ValueError("Invalid seed")
         priority = int(p/1000)
-        heapq.heappush(self._seed_queue, (priority, fn))
+        heapq.heappush(self.queue, (priority, fn))
         self._max = max(self._max, priority)
         self._weights_need_update = True
 
     def pop(self):
-        if not self._seed_queue:
+        if not self.queue:
             return None
-        p_to_remove, removed_seed = heapq.heappop(self._seed_queue)
-        if p_to_remove == self._max and self._seed_queue:
-            self._max = max(self._seed_queue, key=lambda x: x[0])[0]
+        p_to_remove, removed_seed = heapq.heappop(self.queue)
+        if p_to_remove == self._max and self.queue:
+            self._max = max(self.queue, key=lambda x: x[0])[0]
         self._weights_need_update = True
         return removed_seed
 
     def remove(self, fn):
-        if not self._seed_queue:
+        if not self.queue:
             return
         index_to_remove = None
         p_to_remove = float('-inf')
-        for i, (p, seed_fn) in enumerate(self._seed_queue):
+        for i, (p, seed_fn) in enumerate(self.queue):
             if seed_fn == fn:
                 index_to_remove = i
                 p_to_remove = p
                 break
         if index_to_remove is not None:
-            self._seed_queue.pop(index_to_remove)
-            heapq.heapify(self._seed_queue)
-            if self._seed_queue and self._max == p_to_remove:
-                self._max = max(self._seed_queue, key=lambda x: x[0])[0]
-            if not self._seed_queue:
+            self.queue.pop(index_to_remove)
+            heapq.heapify(self.queue)
+            if self.queue and self._max == p_to_remove:
+                self._max = max(self.queue, key=lambda x: x[0])[0]
+            if not self.queue:
                 self._max = float('-inf')
             self._weights_need_update = True
 
     def pick(self):
-        if not self._seed_queue:
+        if not self.queue:
             return None
-        if len(self._seed_queue) == 1:
-            return self._seed_queue[0][1]
+        if len(self.queue) == 1:
+            return self.queue[0][1]
         if self._weights_need_update:
             self._update_weights()
-        chosen_index = np.random.choice(range(len(self._seed_queue)), p=self._weights)
-        return self._seed_queue[chosen_index][1]
+        chosen_index = np.random.choice(range(len(self.queue)), p=self._weights)
+        return self.queue[chosen_index][1]
 
 # 'id:xxxx,src:yyyyy' -> 'id:xxxx'
 # 'id-xxx-xxxxxx-xx,src:yy-yyyyyy-yy' -> 'id-xxx-xxxxxx-xx'
@@ -699,7 +699,7 @@ class HybridExecutor():
         while not self.reached_resource_limit:
             if self.state.execs % self.config.save_frequency == 0:
                 self._export_state()
-            if self.state.execs % self.config.sync_frequency == 0:
+            if not self.seed_scheduler.queue or self.state.execs % self.config.sync_frequency == 0:
                 self.synchronizer.run(run_once=True)
             self.concolic_executor.run(run_once=True)
             self.replayer.offline_learning()
