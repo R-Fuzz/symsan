@@ -63,15 +63,18 @@ class RLModel:
         assert a == 0 or a == 1
         initial_distances = self.config.initial_policy.get(str(bid), None)
         value = initial_distances[a] if initial_distances else None
-        value = self.config.max_distance if value is None else value
+        value = float('inf') if value is None else value
         self.logger.debug(f"get_default_distance: bid={bid}, action={a}, value={value}")
         return value
 
     def add_unreachable_sa(self, sa):
         self.unreachable_sa.add(sa)
+        self._update_unreachable_Q(sa)
 
     def add_visited_sa(self, sa):
         self.visited_sa.update([sa])
+        if sa in self.unreachable_sa:
+            self.unreachable_sa.remove(sa)
     
     def add_target_sa(self, sa):
         self.all_target_sa.add(sa)
@@ -79,6 +82,9 @@ class RLModel:
     def remove_target_sa(self, sa):
         if sa in self.all_target_sa:
             self.all_target_sa.remove(sa)
+    
+    def _update_unreachable_Q(self, sa):
+        raise NotImplementedError("This method should be overridden by subclass")
 
 
 class DistanceModel(RLModel):
@@ -110,6 +116,10 @@ class DistanceModel(RLModel):
 
     def Q_update(self, key, value):
         self.Q_table[key] = value
+        self.logger.debug(f"Q_update: key={key}, value={value}")
+
+    def _update_unreachable_Q(self, sa):
+        self.Q_update(sa, -float('inf'))
 
 class ReachabilityModel(RLModel):
     # Constants
@@ -160,6 +170,10 @@ class ReachabilityModel(RLModel):
     def Q_update(self, key, value):
         d = ReachabilityModel.prob_to_distance(value)
         self.Q_table[key] = d
+        self.logger.debug(f"Q_update: key={key}, value={d}")
+
+    def _update_unreachable_Q(self, sa):
+        self.Q_update(sa, ReachabilityModel.ZERO)
 
 class RewardCalculator:
     def __init__(self, config, min_distance, trace):

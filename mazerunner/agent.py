@@ -58,11 +58,11 @@ class MaxQLearner:
             updated_Q = (last_Q + self.learning_rate 
                 * (last_reward + self.discount_factor * chosen_Q - last_Q))
         # Handle NaN values
-        if math.isnan(updated_Q):
+        if math.isnan(updated_Q) or last_Q == -float('inf'):
             if next_s.state == (0,0,0):
                 last_Q = last_reward
             else:
-                last_Q = (last_reward + chosen_Q) if not math.isnan(chosen_Q) else last_Q
+                last_Q = (last_reward + self.discount_factor * chosen_Q) if not math.isnan(chosen_Q) else last_Q
         else:
             last_Q = updated_Q
         self.model.Q_update(last_s.sa, last_Q)
@@ -84,7 +84,7 @@ class AvgQLearner:
             avg_Q = (curr_state_taken + curr_state_not_taken) / 2
             updated_Q = last_Q + self.learning_rate * (self.discount_factor * avg_Q - last_Q)
         # Handle NaN values
-        if math.isnan(updated_Q):
+        if math.isnan(updated_Q) or last_Q == -float('inf'):
             if next_s.state == (0,0,0):
                 last_Q = last_reward
             else:
@@ -211,9 +211,6 @@ class Agent:
             self.min_distance = msg.global_min_dist
         assert (self.min_distance <= d <= self.config.max_distance)
         self.curr_state.update(msg.addr, msg.context, msg.id, action, d)
-        self.logger.debug(f"SA: {(msg.addr, msg.context, action)}, "
-                        f"distance: {d if d else 'NA'}, "
-                        f"min_distance: {self.min_distance} ")
 
     def _make_dirs(self):
         mkdir(self.my_traces)
@@ -221,10 +218,14 @@ class Agent:
     def debug_policy(self):
         distance_taken = self.model.get_distance(self.curr_state, 1)
         distance_not_taken = self.model.get_distance(self.curr_state, 0)
+        reversed_sa = self.curr_state.compute_reversed_sa()
         self.logger.info(f"curr_sad={self.curr_state.serialize()}, "
                         f"visited_times={self.model.visited_sa.get(self.curr_state.sa, 0)}, "
-                        f"distance_taken={distance_taken}, "
-                        f"distance_not_taken={distance_not_taken}, ")
+                        f"d_t={distance_taken}, "
+                        f"d_nt={distance_not_taken}, "
+                        f"is_unreachable={reversed_sa in self.model.unreachable_sa}, "
+                        f"is_target={reversed_sa in self.model.all_target_sa}, "
+                        )
 
 
 class RecordAgent(Agent):
