@@ -59,12 +59,12 @@ class RLModel:
             with open(target_sa_path, 'rb') as fp:
                 self.all_target_sa = pickle.load(fp)
 
-    def get_default_distance(self, bid, action):
-        assert action == 0 or action == 1
+    def get_default_distance(self, bid, a):
+        assert a == 0 or a == 1
         initial_distances = self.config.initial_policy.get(str(bid), None)
-        value = initial_distances[action] if initial_distances else None
+        value = initial_distances[a] if initial_distances else None
         value = self.config.max_distance if value is None else value
-        self.logger.debug(f"get_default_distance: bid={bid}, action={action}, value={value}")
+        self.logger.debug(f"get_default_distance: bid={bid}, action={a}, value={value}")
         return value
 
     def add_unreachable_sa(self, sa):
@@ -94,17 +94,17 @@ class DistanceModel(RLModel):
     def q_to_distance(p):
         return -p
 
-    def get_distance(self, state, action):
-        key = state.sa
+    def get_distance(self, s, a):
+        key = s.state + (a,)
         if key not in self.Q_table:
-            return self.get_default_distance(state.bid, action)
+            return self.get_default_distance(s.bid, a)
         else:
             return DistanceModel.q_to_distance(self.Q_table[key])
 
-    def Q_lookup(self, state, action):
-        key = state.sa
+    def Q_lookup(self, s, a):
+        key = s.state + (a,)
         if key not in self.Q_table:
-            d = self.get_default_distance(state.bid, action)
+            d = self.get_default_distance(s.bid, a)
             return DistanceModel.distance_to_q(d)
         return self.Q_table[key]
 
@@ -146,15 +146,15 @@ class ReachabilityModel(RLModel):
         res = - (p.ln() / ReachabilityModel.TWO.ln())
         return float(res) * 1000
 
-    def get_distance(self, state, action):
-        key = state.sa
+    def get_distance(self, s, a):
+        key = s.state + (a,)
         if key not in self.Q_table:
-            return self.get_default_distance(state.bid, action)
+            return self.get_default_distance(s.bid, a)
         else:
             return self.Q_table[key]
 
-    def Q_lookup(self, state, action):
-        d = self.get_distance(state, action)
+    def Q_lookup(self, s, a):
+        d = self.get_distance(s, a)
         return ReachabilityModel.distance_to_prob(d)
 
     def Q_update(self, key, value):
