@@ -556,7 +556,7 @@ class ExploitExecutor(Mazerunner):
         )
         # target might still be reachable due to hitting max_flip_num
         if self.agent.target[0] and not has_reached_max_flip_num():
-            self.agent.handle_unsat_condition()
+            self.logger.debug(f"Did not reach the target {self.agent.target[0]}")
         self.agent.all_targets.clear()
         return symsan_res
 
