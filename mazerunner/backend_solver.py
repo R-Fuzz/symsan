@@ -449,8 +449,11 @@ class Z3Solver:
         opt_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         opt_solver.set("timeout", 1000)
         opt_solver.add(e)
-        if opt_solver.check() != z3.sat:
+        if opt_solver.check() == z3.unsat:
             raise ConditionUnsat()
+        elif opt_solver.check() == z3.unknown:
+            self.logger.warning(f"__solve_expr: timeout for {e}")
+            return has_solved
         # optimistic sat, check nested
         self.__z3_solver.push()
         self.__z3_solver.add(e)
