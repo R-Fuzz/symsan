@@ -17,25 +17,26 @@ class ProgramState:
         self.action = 0
         self.d = distance
         self.bid = 0
-        self.pc_counter = collections.Counter()
     
     @property
     def sa(self):
         return self.state + (self.action,)
     
-    def update(self, pc, callstack, bid, action, distance):
-        self.pc_counter.update([(pc, callstack)])
-        self.state = (pc, callstack, bucket_lookup(self.pc_counter[(pc, callstack)]))
+    @property
+    def reversed_sa(self):
+        reversed_action = 1 if self.action == 0 else 0
+        return self.state + (reversed_action, )
+    
+    def update(self, pc, callstack, bid, action, distance, counter):
+        counter.update([(pc, callstack)])
+        self.state = (pc, callstack, bucket_lookup(counter[(pc, callstack)]))
         self.action = action
         self.d = distance
         self.bid = bid
 
     def serialize(self):
         return (self.state, self.action, self.d)
-    
-    def compute_reversed_sa(self):
-        reversed_action = 1 if self.action == 0 else 0
-        return self.state + (reversed_action, )
+
 
 class MaxQLearner:
     def __init__(self, m: model.RLModel, df, lr):
@@ -101,6 +102,7 @@ class Agent:
             mkdir(self.my_traces)
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.episode = []
+        self.pc_counter = collections.Counter()
         self._learner = None
         self._model = None
 
@@ -152,6 +154,7 @@ class Agent:
     def reset(self):
         self.curr_state = ProgramState(distance=self.config.max_distance)
         self.episode.clear()
+        self.pc_counter.clear()
         self.min_distance = self.config.max_distance
 
     def handle_new_state(self, msg, action):
@@ -210,7 +213,7 @@ class Agent:
         if msg.global_min_dist <= self.config.max_distance:
             self.min_distance = msg.global_min_dist
         assert (self.min_distance <= d <= self.config.max_distance)
-        self.curr_state.update(msg.addr, msg.context, msg.id, action, d)
+        self.curr_state.update(msg.addr, msg.context, msg.id, action, d, self.pc_counter)
 
     def _make_dirs(self):
         mkdir(self.my_traces)
@@ -218,13 +221,12 @@ class Agent:
     def debug_policy(self):
         distance_taken = self.model.get_distance(self.curr_state, 1)
         distance_not_taken = self.model.get_distance(self.curr_state, 0)
-        reversed_sa = self.curr_state.compute_reversed_sa()
         self.logger.info(f"curr_sad={self.curr_state.serialize()}, "
                         f"visited_times={self.model.visited_sa.get(self.curr_state.sa, 0)}, "
                         f"d_t={distance_taken}, "
                         f"d_nt={distance_not_taken}, "
-                        f"is_unreachable={reversed_sa in self.model.unreachable_sa}, "
-                        f"is_target={reversed_sa in self.model.all_target_sa}, "
+                        f"is_unreachable={self.curr_state.reversed_sa in self.model.unreachable_sa}, "
+                        f"is_target={self.curr_state.reversed_sa in self.model.all_target_sa}, "
                         )
 
 
@@ -246,15 +248,19 @@ class ExploreAgent(Agent):
         self.append_episode()
 
     def is_interesting_branch(self):
-        reversed_sa = self.curr_state.compute_reversed_sa()
-        if reversed_sa in self.model.unreachable_sa:
+        if self.curr_state.reversed_sa in self.model.unreachable_sa:
             return False
-        if reversed_sa in self.model.all_target_sa:
+        if self.curr_state.reversed_sa in self.model.all_target_sa:
             return False
         interesting = self._greedy_policy()
         if interesting:
-            self.model.add_target_sa(reversed_sa)
+            self.model.add_target_sa(self.curr_state.reversed_sa)
+            self.logger.debug(f"Target SA: {self.curr_state.reversed_sa}")
         return interesting
+
+    def handle_unsat_condition(self):
+        self.model.add_unreachable_sa(self.curr_state.reversed_sa)
+        self.model.remove_target_sa(self.curr_state.reversed_sa)
 
     def compute_branch_score(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
@@ -274,7 +280,7 @@ class ExploreAgent(Agent):
         return self._curious_policy()
 
     def _curious_policy(self):
-        return self.curr_state.compute_reversed_sa() not in self.model.visited_sa
+        return self.curr_state.reversed_sa not in self.model.visited_sa
 
 class ExploitAgent(Agent):
 
@@ -294,15 +300,14 @@ class ExploitAgent(Agent):
     def is_interesting_branch(self):
         if self.target[0]:
             return False
-        reversed_sa = self.curr_state.compute_reversed_sa()
-        if reversed_sa in self.model.unreachable_sa:
-            self.logger.debug(f"not interesting, unreachable sa {reversed_sa}")
+        if self.curr_state.reversed_sa in self.model.unreachable_sa:
+            self.logger.debug(f"not interesting, unreachable sa {self.curr_state.reversed_sa}")
             return False
         interesting = self._greedy_policy() != self.curr_state.action
         if interesting:
-            self.all_targets.append(reversed_sa)
-            self.target = (reversed_sa, len(self.episode))
-            self.logger.debug(f"Abort and restart. Target SA: {reversed_sa}")
+            self.all_targets.append(self.curr_state.reversed_sa)
+            self.target = (self.curr_state.reversed_sa, len(self.episode))
+            self.logger.debug(f"Target SA: {self.curr_state.reversed_sa}")
         return interesting
 
     def handle_unsat_condition(self):
@@ -322,13 +327,13 @@ class ExploitAgent(Agent):
             return self.curr_state.action
 
     # Return whether the agent should visit the filpped branch.
-    def _epsilon_greedy_policy(self, reversed_sa):
-        if (reversed_sa not in self.model.visited_sa
+    def _epsilon_greedy_policy(self):
+        if (self.curr_state.reversed_sa not in self.model.visited_sa
             and random.random() < self.epsilon):
             self.logger.debug(f"interesting, epsilon-greedy policy")
             return True
-        if (reversed_sa in self.model.visited_sa
-            and random.random() < (self.epsilon ** self.model.visited_sa[reversed_sa])):
+        if (self.curr_state.reversed_sa in self.model.visited_sa
+            and random.random() < (self.epsilon ** self.model.visited_sa[self.curr_state.reversed_sa])):
             self.logger.debug(f"interesting, epsilon-greedy policy")
             return True
         if self._greedy_policy() != self.curr_state.action:
