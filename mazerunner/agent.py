@@ -264,7 +264,7 @@ class ExploreAgent(Agent):
 
     def compute_branch_score(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
-        d = self.model.get_distance(self.curr_state, reversed_action)
+        d = self.model.get_default_distance(self.curr_state.bid, reversed_action)
         return str(int(d))
 
     def _greedy_policy(self):
