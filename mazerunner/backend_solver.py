@@ -191,7 +191,9 @@ class Serializer:
                 self.logger.error(f"to_z3_expr: Invalid Not operation {label}")
                 raise Serializer.InvalidData("Invalid Not operation")
             e = self.to_z3_expr(info.l2, deps)
-            if z3.is_bool(e):
+            if z3.is_bv(e) and e.sort().size() == 1:
+                e = (e == z3.BitVecVal(1, 1, self.__z3_context))
+            if not z3.is_bool(e):
                 self.logger.error(f"to_z3_expr: Only LNot should be recorded {label}")
                 raise Serializer.InvalidData("Only LNot should be recorded")
             return self.__cache_expr(label, z3.Not(e), deps)
