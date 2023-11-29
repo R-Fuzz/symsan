@@ -157,7 +157,7 @@ class Agent:
         self.pc_counter.clear()
         self.min_distance = self.config.max_distance
 
-    def handle_new_state(self, msg, action):
+    def handle_new_state(self, msg, action, is_symbranch):
         pass
     
     def handle_unsat_condition(self):
@@ -170,9 +170,9 @@ class Agent:
         return ''
 
     def train(self, trace):
-        assert 0 <= self.min_distance <= self.config.max_distance
         reward_calculator = self.model.create_reward_calculator(self.config, trace, self.min_distance)
         for i, s in enumerate(reversed(trace)):
+            assert 0 <= self.min_distance <= s.d <= self.config.max_distance
             self.model.add_visited_sa(s.sa)
             i = len(trace) - i - 1
             if i >= len(trace) - 1:
@@ -209,10 +209,7 @@ class Agent:
         else:
             # msg.local_min_dist is zero, assign the last distance available
             d = self.curr_state.d
-        self.min_distance = min(self.min_distance, d)
-        if msg.global_min_dist <= self.config.max_distance:
-            self.min_distance = msg.global_min_dist
-        assert (self.min_distance <= d <= self.config.max_distance)
+        self.min_distance = min([self.min_distance, d, msg.global_min_dist])
         self.curr_state.update(msg.addr, msg.context, msg.id, action, d, self.pc_counter)
 
     def _make_dirs(self):
@@ -232,9 +229,10 @@ class Agent:
 
 class RecordAgent(Agent):
 
-    def handle_new_state(self, msg, action):
-        self.update_curr_state(msg, action)
-        self.append_episode()
+    def handle_new_state(self, msg, action, is_symbranch):
+        if is_symbranch or self.config.model_type == model.RLModelType.distance:
+            self.update_curr_state(msg, action)
+            self.append_episode()
 
     def is_interesting_branch(self):
         return False
@@ -242,10 +240,11 @@ class RecordAgent(Agent):
 
 class ExploreAgent(Agent):
 
-    def handle_new_state(self, msg, action):
-        self.update_curr_state(msg, action)
-        self.model.remove_target_sa(self.curr_state.sa)
-        self.append_episode()
+    def handle_new_state(self, msg, action, is_symbranch):
+        if is_symbranch or self.config.model_type == model.RLModelType.distance:
+            self.update_curr_state(msg, action)
+            self.model.remove_target_sa(self.curr_state.sa)
+            self.append_episode()
 
     def is_interesting_branch(self):
         if self.curr_state.reversed_sa in self.model.unreachable_sa:
@@ -291,11 +290,12 @@ class ExploitAgent(Agent):
         self.epsilon = config.explore_rate
         self.target = (None, 0) # sa, trace_length
 
-    def handle_new_state(self, msg, action):
-        self.update_curr_state(msg, action)
-        self.append_episode()
-        if self.curr_state.sa == self.target[0] and len(self.episode) == self.target[1]:
-            self.target = (None, 0) # sa, trace_length
+    def handle_new_state(self, msg, action, is_symbranch):
+        if is_symbranch or self.config.model_type == model.RLModelType.distance:
+            self.update_curr_state(msg, action)
+            self.append_episode()
+            if self.curr_state.sa == self.target[0] and len(self.episode) == self.target[1]:
+                self.target = (None, 0) # sa, trace_length
 
     def is_interesting_branch(self):
         if self.target[0]:

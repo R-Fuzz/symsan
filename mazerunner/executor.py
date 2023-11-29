@@ -206,14 +206,14 @@ class SymSanExecutor:
 
     def _process_cond_request(self, msg):
         has_solved = False
-        if not msg.label:
-            return has_solved
         state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
         if len(state_data) < ctypes.sizeof(mazerunner_msg):
             self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
             return has_solved
         state_msg = mazerunner_msg.from_buffer_copy(state_data)
-        self.agent.handle_new_state(state_msg, msg.result)
+        self.agent.handle_new_state(state_msg, msg.result, msg.label)
+        if not msg.label:
+            return has_solved
         if self.record_mode_enabled:
             return has_solved
         is_interesting = self.agent.is_interesting_branch()
@@ -240,7 +240,7 @@ class SymSanExecutor:
             try:
                 self.solver.handle_gep(gmsg, msg.addr)
             except ConditionUnsat:
-                self.logger.error(f"__process_gep_request: GEP condition unsat")
+                self.logger.warn(f"__process_gep_request: GEP condition unsat")
 
     def _setup_pipe(self):
         # pipefds[0] for read, pipefds[1] for write

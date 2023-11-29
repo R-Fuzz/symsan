@@ -92,6 +92,7 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
                                 u8 loop_flag, u32 cid, void *addr) {
 
   u16 flags = 0;
+#ifdef __LOOP_TRACING__
   if (add_nested) flags |= F_ADD_CONS;
   // set the loop flags according to branching results
   if (result) {
@@ -103,7 +104,7 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
     if (loop_flag & 0x1) flags |= F_LOOP_EXIT;
     if (loop_flag & 0x4) flags |= F_LOOP_LATCH;
   }
-
+#endif
   // send info
   pipe_msg msg = {
     .msg_type = cond_type,
@@ -115,10 +116,9 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
     .label = label,
     .result = result
   };
-
   internal_write(__pipe_fd, &msg, sizeof(msg));
-  if (label)
-    __handle_new_state(cid, addr, result, loop_flag);
+  // mazerunner msg
+  __handle_new_state(cid, addr, result, loop_flag);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -207,9 +207,9 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_loop(u32 bid) {
   void *addr = __builtin_return_address(0);
-
   AOUT("loop header: %u @%p\n", bid, addr);
 
+#ifdef __LOOP_TRACING__
   pipe_msg msg = {
     .msg_type = loop_type,
     .flags = 0,
@@ -222,7 +222,7 @@ __taint_trace_loop(u32 bid) {
   };
 
   internal_write(__pipe_fd, &msg, sizeof(msg));
-
+#endif
   return;
 }
 
