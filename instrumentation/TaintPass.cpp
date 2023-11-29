@@ -2351,12 +2351,16 @@ void TaintVisitor::visitPHINode(PHINode &PN) {
 
 static inline bool isLoopLatch(const BasicBlock *BB, const BasicBlock *Header) {
   const BasicBlock *Succ = nullptr;
-  if (BB == Header)
-    return true;
-  else if ((Succ = BB->getSingleSuccessor()) != nullptr)
-    return isLoopLatch(Succ, Header);
-  else
-    return false;
+  SmallVector<const BasicBlock*> Visited;
+  while (BB != Header) {
+    Visited.push_back(BB);
+    if ((Succ = BB->getSingleSuccessor()) == nullptr)
+      return false;
+    BB = Succ;
+    if (Visited.end() != std::find(Visited.begin(), Visited.end(), BB))
+      return false; // found a cycle
+  }
+  return true;
 }
 
 void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
