@@ -45,6 +45,25 @@
 
 using namespace __dfsan;
 
+extern "C" {
+SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSolver, void) {}
+
+// Default empty implementations (weak) for hooks
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
+                             u32, u32, u64, u64, u32) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, u8, u8, u32) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop, u32) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
+                             dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
+                             unsigned) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_fini) {}
+SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
+SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack_addr;
+}  // extern "C"
+
 typedef atomic_uint32_t atomic_dfsan_label;
 
 static atomic_dfsan_label __dfsan_last_label;
@@ -743,6 +762,7 @@ static void InitializePlatformEarly() {
 }
 
 static void dfsan_fini() {
+  __taint_trace_fini();
   if (internal_strcmp(flags().dump_labels_at_exit, "") != 0) {
     fd_t fd = OpenFile(flags().dump_labels_at_exit, WrOnly);
     if (fd == kInvalidFd) {
@@ -827,21 +847,3 @@ if (flags().shm_fd != -1) {
 __attribute__((section(".preinit_array"), used))
 static void (*dfsan_init_ptr)(int, char **, char **) = dfsan_init;
 #endif
-
-extern "C" {
-SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSolver, void) {}
-
-// Default empty implementations (weak) for hooks
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
-                             u32, u32, u64, u64, u32) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, u8, u8, u32) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop, u32) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
-                             dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
-                             unsigned) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
-SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
-SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack_addr;
-}  // extern "C"

@@ -266,6 +266,29 @@ __taint_trace_memcmp(dfsan_label label) {
   return;
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_fini(){
+
+  long global_min_dist = -2;
+  if (__afl_area_ptr){
+    global_min_dist = (long)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
+  }
+  AOUT("global min distance: %llu\n", global_min_dist);
+
+  pipe_msg msg = {
+    .msg_type = fini_type,
+    .flags = 0,
+    .instance_id = 0,
+    .addr = (uptr)0,
+    .context = 0,
+    .label = 0,
+    .result = (u64)global_min_dist
+  };
+
+  internal_write(__pipe_fd, &msg, sizeof(msg));
+  return;
+}
+
 extern "C" void InitializeSolver() {
   __instance_id = flags().instance_id;
   __session_id = flags().session_id;

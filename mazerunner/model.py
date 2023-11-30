@@ -191,12 +191,15 @@ class DistanceRewardCalculator(RewardCalculator):
         self.local_min_indices = find_local_min([s.d for s in trace])
 
     def compute_reward(self, i):
+        # Did not reach the target
         if i >= len(self.trace) and self.min_distance > 0:
                 return -float('inf')
         d = self.trace[i].d
-        if d == 0:
+        # Reached the target
+        if d == 0 or (i >= len(self.trace) and self.min_distance == 0):
             return self.config.max_distance
         r = 0
+        # found local optimum
         if i in self.local_min_indices:
             r = (1000 / d) * (1000 / d) * self.config.max_distance
         return r
@@ -204,9 +207,12 @@ class DistanceRewardCalculator(RewardCalculator):
 
 class ReachabilityRewardCalculator(RewardCalculator):
     def compute_reward(self, i):
-        if i >= len(self.trace):
+        # Did not reach the target at the end
+        if i >= len(self.trace) and self.min_distance > 0:
             return Decimal(0)
         d = self.trace[i].d
-        if d == 0:
+        # Reached the target
+        if d == 0 or (i >= len(self.trace) and self.min_distance == 0):
             return Decimal(1)
+        # Default reward
         return Decimal(0)

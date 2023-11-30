@@ -36,7 +36,7 @@ if __name__ == "__main__":
     fastgen_agent = Agent(config)
     symsan = SymSanExecutor(config, fastgen_agent, output_seed_dir)
     symsan.setup(sys.argv[2])
-    symsan.run(timeout=3)
+    symsan.run()
     try:
         symsan.process_request()
     finally:

@@ -103,6 +103,7 @@ class Agent:
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.episode = []
         self.pc_counter = collections.Counter()
+        self._min_distance = None
         self._learner = None
         self._model = None
 
@@ -121,6 +122,17 @@ class Agent:
     def save_model(self):
         if self.config.mazerunner_dir and self._model:
             self._model.save()
+    
+    @property
+    def min_distance(self):
+        if not self._min_distance:
+            self._min_distance = self.config.max_distance
+        return self._min_distance
+    @min_distance.setter
+    def min_distance(self, d):
+        if d < 0:
+            return
+        self._min_distance = min(self.min_distance, d)
 
     @property
     def learner(self):
@@ -209,7 +221,7 @@ class Agent:
         else:
             # msg.local_min_dist is zero, assign the last distance available
             d = self.curr_state.d
-        self.min_distance = min([self.min_distance, d, msg.global_min_dist])
+        self.min_distance = msg.global_min_dist
         self.curr_state.update(msg.addr, msg.context, msg.id, action, d, self.pc_counter)
 
     def _make_dirs(self):

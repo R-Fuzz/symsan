@@ -22,6 +22,7 @@ class MsgType(Enum):
     memcmp_type = 2
     fsize_type = 3
     loop_type = 4
+    fini_type = 5
 
 class ExecutorResult:
     def __init__(self, total_time, solving_time, dist,
@@ -198,6 +199,8 @@ class SymSanExecutor:
                 self.logger.debug(f"handle_loop_enter: id={msg.id}, loop_header={hex(msg.addr)}")
             elif msg.msg_type == MsgType.fsize_type.value:
                 pass
+            elif msg.msg_type == MsgType.fini_type.value:
+                self.agent.min_distance = msg.result
             else:
                 self.logger.error(f"process_request: Unknown message type: {msg.msg_type}")
             end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
