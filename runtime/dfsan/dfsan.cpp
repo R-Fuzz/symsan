@@ -467,9 +467,10 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __dfsan_nonzero_label() {
 // handling these at the moment.
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __dfsan_vararg_wrapper(const char *fname) {
-  Report("FATAL: DataFlowSanitizer: unsupported indirect call to vararg "
+  Report("WARNING: DataFlowSanitizer: unsupported indirect call to vararg "
          "function %s\n", fname);
-  Die();
+  // FIXME: vararg functions do used as indirect call targets
+  // Die();
 }
 
 // Like __dfsan_union, but for use from the client or custom functions.  Hence

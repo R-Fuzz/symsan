@@ -1276,6 +1276,12 @@ bool Taint::runOnModule(Module &M) {
         addGlobalNamePrefix(&F);
       }
     } else if (!IsZeroArgsVoidRet || getWrapperKind(&F) == WK_Custom) {
+      if (FT->isVarArg() && F.isDeclaration() && F.hasAddressTaken() && 
+      !isInstrumented(&F)) {
+        // FIXME: vararg functions do used as indirect call targets
+        *i = nullptr;
+        continue;
+      }
       // Build a wrapper function for F.  The wrapper simply calls F, and is
       // added to FnsToInstrument so that any instrumentation according to its
       // WrapperKind is done in the second pass below.
