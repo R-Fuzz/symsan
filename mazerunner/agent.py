@@ -188,6 +188,7 @@ class Agent:
             self.model.add_visited_sa(s.sa)
             i = len(trace) - i - 1
             if i >= len(trace) - 1:
+                # the next state is terminal state
                 next_s = ProgramState(distance=self.config.max_distance)
             else:
                 next_s = trace[i+1]
@@ -227,15 +228,15 @@ class Agent:
     def _make_dirs(self):
         mkdir(self.my_traces)
 
-    def debug_policy(self):
-        distance_taken = self.model.get_distance(self.curr_state, 1)
-        distance_not_taken = self.model.get_distance(self.curr_state, 0)
-        self.logger.info(f"curr_sad={self.curr_state.serialize()}, "
-                        f"visited_times={self.model.visited_sa.get(self.curr_state.sa, 0)}, "
+    def debug_policy(self, state):
+        distance_taken = self.model.get_distance(state, 1)
+        distance_not_taken = self.model.get_distance(state, 0)
+        self.logger.info(f"curr_sad={state.serialize()}, "
+                        f"visited_times={self.model.visited_sa.get(state.sa, 0)}, "
                         f"d_t={distance_taken}, "
                         f"d_nt={distance_not_taken}, "
-                        f"is_unreachable={self.curr_state.reversed_sa in self.model.unreachable_sa}, "
-                        f"is_target={self.curr_state.reversed_sa in self.model.all_target_sa}, "
+                        f"is_unreachable={state.reversed_sa in self.model.unreachable_sa}, "
+                        f"is_target={state.reversed_sa in self.model.all_target_sa}, "
                         )
 
 

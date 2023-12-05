@@ -451,20 +451,26 @@ class Z3Solver:
         opt_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         opt_solver.set("timeout", 1000)
         opt_solver.add(e)
-        if opt_solver.check() == z3.unsat:
+        r = opt_solver.check()
+        if r == z3.unsat:
             raise ConditionUnsat()
-        elif opt_solver.check() == z3.unknown:
-            self.logger.warning(f"__solve_expr: timeout for {e}")
+        elif r == z3.unknown:
+            self.logger.warning(f"__solve_expr: opt solving timeout for {e}")
             return has_solved
         # optimistic sat, check nested
         self.__z3_solver.push()
         self.__z3_solver.add(e)
-        if self.__z3_solver.check() == z3.sat:
+        r = self.__z3_solver.check()
+        if r == z3.sat:
             m = self.__z3_solver.model()
             self.__generate_input(m, False, score)
             has_solved = True
         else:
-            if self.config.optimistic_solving_enabled:
+            if r == z3.unknown:
+                self.logger.warning(f"__solve_expr: nested solving timeout for {e}")
+            elif r == z3.unsat and self.config.optimistic_solving_enabled:
+                self.logger.debug(f"__solve_expr: nested solving unsat for {e}")
+                # TODO: back propagate this info along the dependency input tree
                 m = opt_solver.model()
                 self.__generate_input(m, True, score)
         # reset
