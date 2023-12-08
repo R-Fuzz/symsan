@@ -175,6 +175,9 @@ class Agent:
     def handle_unsat_condition(self):
         pass
 
+    def handle_nested_unsat_condition(self, state_deps):
+        pass
+
     def is_interesting_branch(self):
         return True
     
@@ -273,6 +276,10 @@ class ExploreAgent(Agent):
     def handle_unsat_condition(self):
         self.model.add_unreachable_sa(self.curr_state.reversed_sa)
         self.model.remove_target_sa(self.curr_state.reversed_sa)
+    
+    def handle_nested_unsat_condition(self, state_deps):
+        for s in state_deps:
+            self.model.reset(s)
 
     def compute_branch_score(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
@@ -326,6 +333,10 @@ class ExploitAgent(Agent):
     def handle_unsat_condition(self):
         self.model.add_unreachable_sa(self.target[0])
         self.target = (None, 0)
+    
+    def handle_nested_unsat_condition(self, state_deps):
+        for s in state_deps:
+            self.model.reset(s)
 
     def _greedy_policy(self):
         d_taken = self.model.get_distance(self.curr_state, 1)

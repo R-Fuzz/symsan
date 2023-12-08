@@ -82,7 +82,10 @@ class RLModel:
     def remove_target_sa(self, sa):
         if sa in self.all_target_sa:
             self.all_target_sa.remove(sa)
-    
+
+    def reset(self, s):
+        raise NotImplementedError("This method should be overridden by subclass")
+
     def _update_unreachable_Q(self, sa):
         raise NotImplementedError("This method should be overridden by subclass")
 
@@ -99,6 +102,10 @@ class DistanceModel(RLModel):
     @staticmethod
     def q_to_distance(p):
         return -p
+    
+    def reset(self, s):
+        d = self.config.max_distance
+        self.Q_update(s.sa, DistanceModel.distance_to_q(d))
 
     def get_distance(self, s, a):
         key = s.state + (a,)
@@ -155,6 +162,10 @@ class ReachabilityModel(RLModel):
             return 0.
         res = - (p.ln() / ReachabilityModel.TWO.ln())
         return float(res) * 1000
+
+    def reset(self, s):
+        d = self.config.max_distance
+        self.Q_table[s.sa] = d
 
     def get_distance(self, s, a):
         key = s.state + (a,)

@@ -222,11 +222,11 @@ class SymSanExecutor:
         is_interesting = self.agent.is_interesting_branch()
         try:
             score = self.agent.compute_branch_score() if is_interesting else ''
-            has_solved = self.solver.handle_cond(msg, is_interesting, score)
+            has_solved = self.solver.handle_cond(msg, is_interesting, self.agent.curr_state, score)
         except ConditionUnsat:
             self.agent.handle_unsat_condition()
-        if has_solved:
-            assert self.solver.generated_files
+        if is_interesting and not has_solved:
+            self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
         return has_solved
 
     def _process_gep_request(self, msg):

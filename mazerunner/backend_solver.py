@@ -6,6 +6,7 @@ from enum import Enum
 from multiprocessing import shared_memory
 
 from defs import *
+import agent
 
 CONST_LABEL = 0
 INIT_LABEL = -1
@@ -19,6 +20,7 @@ class branch_dep_t:
     def __init__(self):
         self.expr_deps = set() # z3.ExprRef set
         self.input_deps = set() # dfsan_label set
+        self.state_deps = set() # (state, action) dependency set
 
 class ConditionUnsat(Exception):
     pass
@@ -340,6 +342,7 @@ class Z3Solver:
         with open(input_file, "rb") as f:
             self.input_size = os.path.getsize(input_file)
             self.input_buf = f.read()
+        self._dep_input_offsets = set()
         # for z3
         self.output_dir = output_dir
         self.__z3_context = z3.Context()
@@ -418,8 +421,8 @@ class Z3Solver:
                 c.input_deps.update(inputs)
                 c.expr_deps.add(index_bv == r_bv)
 
-    def handle_cond(self, msg: pipe_msg, should_solve: bool, score: str):
-        return self.__solve_cond(msg.label, msg.result, msg.addr, should_solve, score)
+    def handle_cond(self, msg: pipe_msg, should_solve: bool, s: agent.ProgramState, score: str):
+        return self.__solve_cond(msg.label, msg.result, s, should_solve, score)
 
     def handle_memcmp(self, msg: pipe_msg, pipe):
         info = get_label_info(msg.label, self.shm)
@@ -434,6 +437,15 @@ class Z3Solver:
             self.logger.error(f"handle_memcmp: Incorrect memcmp msg: {msg.label} vs {mmsg.label}")
             return
         self.serializer.memcmp_cache[msg.label] = mmsg
+    
+    def get_sa_dep(self):
+        s_deps = set()
+        for off in self._dep_input_offsets:
+            c = self.__get_branch_dep(off)
+            if c:
+                for s in c.state_deps:
+                    s_deps.add(s)
+        return s_deps
 
     def __get_branch_dep(self, n: int):
         if n >= len(self.__branch_deps):
@@ -514,23 +526,23 @@ class Z3Solver:
         fp.close()
         self.generated_files.append(fname)
 
-    def __collect_constraints(self, inputs: set):
+    def __collect_constraints(self):
         # collect additional input deps
-        worklist = list(inputs)
+        worklist = list(self._dep_input_offsets)
         while worklist:
             off = worklist.pop()
             deps = self.__get_branch_dep(off)
             if deps:
                 for i in deps.input_deps:
-                    if i not in inputs:
-                        inputs.add(i)
+                    if i not in self._dep_input_offsets:
+                        self._dep_input_offsets.add(i)
                         worklist.append(i)
         # set up the global solver with nested constraints
         self.__z3_solver.reset()
         self.__z3_solver.set("timeout", 5000)
         # 2. add constraints
         added = set()
-        for off in inputs:
+        for off in self._dep_input_offsets:
             deps = self.__get_branch_dep(off)
             if deps:
                 for expr in deps.expr_deps:
@@ -539,13 +551,14 @@ class Z3Solver:
                         self.__z3_solver.add(expr)
 
     def __solve_cond(self, label: ctypes.c_uint32, r: ctypes.c_uint64,
-                     addr: ctypes.c_ulong, should_solve: bool, score=''):
+                     s: agent.ProgramState, should_solve: bool, score=''):
+        addr = s.state[0]
         self.logger.debug(f"__solve_cond: label={label}, result={r}, addr={hex(addr)}")
         has_solved = False
         result = z3.BoolVal(r != 0, ctx=self.__z3_context)
-        inputs = set()
+        self._dep_input_offsets.clear()
         try:
-            cond = self.serializer.to_z3_expr(label, inputs)
+            cond = self.serializer.to_z3_expr(label, self._dep_input_offsets)
         except Serializer.InvalidData:
             return has_solved
         except Exception as e:
@@ -554,7 +567,7 @@ class Z3Solver:
         if type(cond) != z3.BoolRef:
             self.logger.error(f"__solve_cond: invalid expression type={type(cond)}")
             raise ConditionUnsat()
-        self.__collect_constraints(inputs)
+        self.__collect_constraints()
         if self.__z3_solver.check() == z3.unsat:
             self.logger.error(f"__solve_cond: pre-condition is unsat")
             raise ConditionUnsat()
@@ -567,7 +580,7 @@ class Z3Solver:
                 self.logger.debug("__solve_cond: branch cannot be solved @{}".format(addr))
         # 3. nested branch
         if self.config.nested_branch_enabled:
-            for off in inputs:
+            for off in self._dep_input_offsets:
                 c = self.__get_branch_dep(off)
                 if not c:
                     c = branch_dep_t()
@@ -575,8 +588,9 @@ class Z3Solver:
                 if not c:
                     self.logger.warning("__solve_cond: out of memory")
                 else:
-                    c.input_deps.update(inputs)
+                    c.input_deps.update(self._dep_input_offsets)
                     c.expr_deps.add(cond == result)
+                    c.state_deps.add(s)
         return has_solved
 
     def __solve_gep(self, index: z3.ExprRef, lb: int, ub: int, step: int, addr: int):
