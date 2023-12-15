@@ -1,3 +1,4 @@
+import copy
 import os
 import ctypes
 import z3
@@ -22,8 +23,17 @@ class branch_dep_t:
         self.input_deps = set() # dfsan_label set
         self.state_deps = set() # (state, action) dependency set
 
-class ConditionUnsat(Exception):
-    pass
+class SolvingStatus(Enum):
+    SOLVED_NESTED = 0
+    SOLVED_OPT = 1
+    UNSOLVED_UNINTERESTING_SAT = 2
+    UNSOLVED_PRE_UNSAT = 3
+    UNSOLVED_OPT_UNSAT = 4
+    UNSOLVED_TIMEOUT = 5
+    UNSOLVED_INVALID_EXPR = 6
+    UNSOLVED_INVALID_MSG = 7
+    UNSOLVED_UNINTERESTING_COND = 8
+    UNSOLVED_UNKNOWN = 9
 
 class Predicate(Enum):
     bveq = 32
@@ -360,18 +370,18 @@ class Z3Solver:
         try:
             index_bv = self.serializer.to_z3_expr(gmsg.index_label, inputs)
         except Serializer.InvalidData:
-            return
+            return SolvingStatus.UNSOLVED_INVALID_EXPR
         except Exception as e:
             self.logger.critical(f"handle_gep: unknown error={e}")
-            return
+            return SolvingStatus.UNSOLVED_UNKNOWN
         self.__collect_constraints(inputs)
         if self.__z3_solver.check() == z3.unsat:
             self.logger.error(f"handle_gep: pre-condition is unsat")
-            raise ConditionUnsat()
+            return SolvingStatus.UNSOLVED_PRE_UNSAT
         # first, check against fixed array bounds if available
         idx = z3.ZeroExt(64 - size, index_bv)
         if gmsg.num_elems > 0:
-            self.__solve_gep(idx, 0, gmsg.num_elems, 1, addr)
+            status = self.__solve_gep(idx, 0, gmsg.num_elems, 1, addr)
         else:
             bounds = get_label_info(gmsg.ptr_label, self.shm)
             # if the array is not with fixed size, check bound info
@@ -383,7 +393,7 @@ class Z3Solver:
                     # when the size of the buffer is fixed
                     p = z3.BitVecVal(gmsg.ptr, 64, self.__z3_context)
                     np = idx * es + co + p
-                    self.__solve_gep(np, bounds.op1.i, bounds.op2.i, gmsg.elem_size, addr)
+                    status = self.__solve_gep(np, bounds.op1.i, bounds.op2.i, gmsg.elem_size, addr)
                 else:
                     # if the buffer size is input-dependent (not fixed)
                     # check if over flow is possible
@@ -391,23 +401,22 @@ class Z3Solver:
                     try:
                         bs = self.serializer.to_z3_expr(bounds.l2, dummy)  # size label
                     except Serializer.InvalidData:
-                        return
+                        return SolvingStatus.UNSOLVED_INVALID_EXPR
                     except Exception as e:
                         self.logger.critical(f"handle_gep: unknown error={e}")
-                        return
+                        return SolvingStatus.UNSOLVED_UNKNOWN
                     if bounds.l1:
                         dummy.clear()
                         try:
                             be = self.serializer.to_z3_expr(bounds.l1, dummy)  # elements label
                         except Serializer.InvalidData:
-                            return
+                            return SolvingStatus.UNSOLVED_INVALID_EXPR
                         except Exception as e:
                             self.logger.critical(f"handle_gep: unknown error={e}")
-                            return
+                            return SolvingStatus.UNSOLVED_UNKNOWN
                         bs = bs * be
                     e = z3.UGT(idx * es * co, bs)  # unsigned greater than
-                    if self.__solve_expr(e):
-                        self.logger.debug(f"index >= buffer size feasible @{addr}")
+                    status = self.__solve_expr(e)
         # always preserve
         r_bv = z3.BitVecVal(gmsg.index, size, self.__z3_context)
         for off in inputs:
@@ -420,6 +429,7 @@ class Z3Solver:
             else:
                 c.input_deps.update(inputs)
                 c.expr_deps.add(index_bv == r_bv)
+        return status
 
     def handle_cond(self, msg: pipe_msg, should_solve: bool, s: agent.ProgramState, score: str):
         return self.__solve_cond(msg.label, msg.result, s, should_solve, score)
@@ -458,36 +468,41 @@ class Z3Solver:
         self.__branch_deps[n] = dep
 
     def __solve_expr(self, e: z3.ExprRef, score=''):
-        has_solved = False
         # set up local optmistic solver
         opt_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         opt_solver.set("timeout", 1000)
         opt_solver.add(e)
         r = opt_solver.check()
         if r == z3.unsat:
-            raise ConditionUnsat()
+            return SolvingStatus.UNSOLVED_OPT_UNSAT
         elif r == z3.unknown:
             self.logger.warning(f"__solve_expr: opt solving timeout for {e}")
-            return has_solved
+            return SolvingStatus.UNSOLVED_TIMEOUT
         # optimistic sat, check nested
         self.__z3_solver.push()
         self.__z3_solver.add(e)
         r = self.__z3_solver.check()
         if r == z3.sat:
             m = self.__z3_solver.model()
-            self.__generate_input(m, False, score)
-            has_solved = True
+            has_generated = self.__generate_input(m, False, score)
+            if not has_generated:
+                status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
+            else:
+                status = SolvingStatus.SOLVED_NESTED
         else:
             if r == z3.unknown:
                 self.logger.warning(f"__solve_expr: nested solving timeout for {e}")
             elif r == z3.unsat and self.config.optimistic_solving_enabled:
-                self.logger.debug(f"__solve_expr: nested solving unsat for {e}")
-                # TODO: back propagate this info along the dependency input tree
+                self.logger.warning(f"__solve_expr: nested solving unsat for {e}")
                 m = opt_solver.model()
-                self.__generate_input(m, True, score)
+                has_generated = self.__generate_input(m, True, score)
+                if not has_generated:
+                    status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
+                else:
+                    status = SolvingStatus.SOLVED_OPT
         # reset
         self.__z3_solver.pop()
-        return has_solved
+        return status
 
     def __generate_input(self, m: z3.Model, is_optimistic: bool, score=''):
         fname = f"id-{self.__instance_id}-{self.__session_id}-{self.__current_index}"
@@ -505,6 +520,9 @@ class Z3Solver:
             name = decl.name()
             if name == "fsize":
                 size = m[decl].as_long()
+                if size < 0:
+                    fp.close()
+                    return False
                 size_to_grow = size - len(self.input_buf)
                 if size_to_grow > 0 and size_to_grow < len(self.input_buf) * 10:
                     with open(path, "a+b") as f:
@@ -525,6 +543,7 @@ class Z3Solver:
                 fp.write(bytes([value]))
         fp.close()
         self.generated_files.append(fname)
+        return True
 
     def __collect_constraints(self):
         # collect additional input deps
@@ -554,30 +573,26 @@ class Z3Solver:
                      s: agent.ProgramState, should_solve: bool, score=''):
         addr = s.state[0]
         self.logger.debug(f"__solve_cond: label={label}, result={r}, addr={hex(addr)}")
-        has_solved = False
         result = z3.BoolVal(r != 0, ctx=self.__z3_context)
         self._dep_input_offsets.clear()
         try:
             cond = self.serializer.to_z3_expr(label, self._dep_input_offsets)
         except Serializer.InvalidData:
-            return has_solved
+            return SolvingStatus.UNSOLVED_INVALID_EXPR
         except Exception as e:
             self.logger.critical(f"__solve_cond: unknown error={e}")
-            return has_solved
+            return SolvingStatus.UNSOLVED_UNKNOWN
         if type(cond) != z3.BoolRef:
             self.logger.error(f"__solve_cond: invalid expression type={type(cond)}")
-            raise ConditionUnsat()
+            return SolvingStatus.UNSOLVED_INVALID_EXPR
         self.__collect_constraints()
         if self.__z3_solver.check() == z3.unsat:
             self.logger.error(f"__solve_cond: pre-condition is unsat")
-            raise ConditionUnsat()
+            return SolvingStatus.UNSOLVED_PRE_UNSAT
+        solving_status = None
         if should_solve:
             e = (cond != result)
-            if self.__solve_expr(e, score):
-                self.logger.debug("__solve_cond: branch solved")
-                has_solved = True
-            else:
-                self.logger.debug("__solve_cond: branch cannot be solved @{}".format(addr))
+            solving_status = self.__solve_expr(e, score)
         # 3. nested branch
         if self.config.nested_branch_enabled:
             for off in self._dep_input_offsets:
@@ -590,8 +605,8 @@ class Z3Solver:
                 else:
                     c.input_deps.update(self._dep_input_offsets)
                     c.expr_deps.add(cond == result)
-                    c.state_deps.add(s)
-        return has_solved
+                    c.state_deps.add(copy.copy(s))
+        return solving_status
 
     def __solve_gep(self, index: z3.ExprRef, lb: int, ub: int, step: int, addr: int):
         # enumerate indices

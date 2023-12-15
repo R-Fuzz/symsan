@@ -8,7 +8,7 @@ import time
 from enum import Enum
 from multiprocessing import shared_memory
 
-from backend_solver import Z3Solver, ConditionUnsat
+from backend_solver import Z3Solver, SolvingStatus
 from defs import *
 import utils
 from agent import ExploitAgent, RecordAgent
@@ -187,7 +187,13 @@ class SymSanExecutor:
                 msg.context, msg.id, msg.label, msg.result
             )
             if msg.msg_type == MsgType.cond_type.value:
-                if self._process_cond_request(msg) and self.onetime_solving_enabled:
+                solving_status = self._process_cond_request(msg)
+                has_solved = (solving_status == SolvingStatus.SOLVED_NESTED 
+                              or solving_status == SolvingStatus.SOLVED_OPT)
+                if has_solved and self.onetime_solving_enabled:
+                    should_handle = False
+                if (solving_status == SolvingStatus.UNSOLVED_INVALID_MSG 
+                    or solving_status == SolvingStatus.UNSOLVED_UNKNOWN):
                     should_handle = False
                 if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
                     self.logger.debug(f"Loop handle_loop_exit: id={msg.id}, target={hex(msg.addr)}")
@@ -208,42 +214,43 @@ class SymSanExecutor:
             self.msg_num += 1
 
     def _process_cond_request(self, msg):
-        has_solved = False
         state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
         if len(state_data) < ctypes.sizeof(mazerunner_msg):
             self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
-            return has_solved
+            return SolvingStatus.UNSOLVED_INVALID_MSG
         state_msg = mazerunner_msg.from_buffer_copy(state_data)
         self.agent.handle_new_state(state_msg, msg.result, msg.label)
         if not msg.label:
-            return has_solved
+            return SolvingStatus.UNSOLVED_INVALID_EXPR
         if self.record_mode_enabled:
-            return has_solved
+            return SolvingStatus.UNSOLVED_UNINTERESTING_COND
         is_interesting = self.agent.is_interesting_branch()
-        try:
-            score = self.agent.compute_branch_score() if is_interesting else ''
-            has_solved = self.solver.handle_cond(msg, is_interesting, self.agent.curr_state, score)
-        except ConditionUnsat:
+        score = self.agent.compute_branch_score() if is_interesting else ''
+        solving_status = self.solver.handle_cond(msg, is_interesting, self.agent.curr_state, score)
+        if not is_interesting:
+            return SolvingStatus.UNSOLVED_UNINTERESTING_COND
+        if (solving_status == SolvingStatus.UNSOLVED_OPT_UNSAT or
+            solving_status == SolvingStatus.UNSOLVED_TIMEOUT):
             self.agent.handle_unsat_condition()
-        if is_interesting and not has_solved:
+        if solving_status == SolvingStatus.UNSOLVED_UNINTERESTING_SAT:
+            # TODO: inform agent that sovler thinks the solution does not make sense
+            pass
+        if solving_status == SolvingStatus.SOLVED_OPT:
             self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
-        return has_solved
+        return solving_status
 
     def _process_gep_request(self, msg):
         gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))
         if len(gep_data) < ctypes.sizeof(gep_msg):
             self.logger.error(f"__process_gep_request: GEP message too small: {len(gep_data)}")
-            return
+            return SolvingStatus.UNSOLVED_INVALID_MSG
         gmsg = gep_msg.from_buffer_copy(gep_data)
         if msg.label != gmsg.index_label: # Double check
             self.logger.error(f"__process_gep_request: Incorrect gep msg: {msg.label} "
                               f"vs {gmsg.index_label}")
             raise SymSanExecutor.InvalidGEPMessage()
         if self.gep_solver_enabled:
-            try:
-                self.solver.handle_gep(gmsg, msg.addr)
-            except ConditionUnsat:
-                self.logger.warn(f"__process_gep_request: GEP condition unsat")
+            return self.solver.handle_gep(gmsg, msg.addr)
 
     def _setup_pipe(self):
         # pipefds[0] for read, pipefds[1] for write
