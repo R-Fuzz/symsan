@@ -8,7 +8,7 @@ import random
 
 import model
 from decimal import Decimal
-from defs import TaintFlag
+from defs import TaintFlag, SolvingStatus
 from utils import *
 
 class ProgramState:
@@ -250,7 +250,7 @@ class Agent:
     def handle_new_state(self, msg, action, is_symbranch):
         pass
     
-    def handle_unsat_condition(self):
+    def handle_unsat_condition(self, solving_status):
         pass
 
     def handle_nested_unsat_condition(self, state_deps):
@@ -356,10 +356,12 @@ class ExploreAgent(Agent):
             self.logger.debug(f"Target SA: {self.curr_state.reversed_sa}")
         return interesting
 
-    def handle_unsat_condition(self):
+    def handle_unsat_condition(self, solving_status):
+        self.model.remove_target_sa(self.curr_state.reversed_sa)
+        if solving_status == solving_status.UNSOLVED_UNINTERESTING_SAT:
+            return
         self.logger.debug(f"unreachable_sa={self.curr_state.reversed_sa}")
         self.model.add_unreachable_sa(self.curr_state.reversed_sa)
-        self.model.remove_target_sa(self.curr_state.reversed_sa)
 
     def compute_branch_score(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
@@ -412,11 +414,13 @@ class ExploitAgent(Agent):
             self.logger.debug(f"target_sa={self.curr_state.reversed_sa}, trace_length={len(self.episode)}")
         return interesting
 
-    def handle_unsat_condition(self):
-        self.logger.debug(f"unreachable_sa={self.target[0]}")
-        self.model.add_unreachable_sa(self.target[0])
+    def handle_unsat_condition(self, solving_status):
         self.target = (None, 0)
         self.all_targets.pop()
+        if solving_status == solving_status.UNSOLVED_UNINTERESTING_SAT:
+            return
+        self.logger.debug(f"unreachable_sa={self.target[0]}")
+        self.model.add_unreachable_sa(self.target[0])
 
     def _greedy_policy(self):
         d_taken = self.model.get_distance(self.curr_state, 1)

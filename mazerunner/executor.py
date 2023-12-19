@@ -8,7 +8,7 @@ import time
 from enum import Enum
 from multiprocessing import shared_memory
 
-from backend_solver import Z3Solver, SolvingStatus
+from backend_solver import Z3Solver
 from defs import *
 import utils
 from agent import ExploitAgent, RecordAgent
@@ -229,13 +229,9 @@ class SymSanExecutor:
         solving_status = self.solver.handle_cond(msg, is_interesting, self.agent.curr_state, score)
         if not is_interesting:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
-        if (solving_status == SolvingStatus.UNSOLVED_OPT_UNSAT or
-            solving_status == SolvingStatus.UNSOLVED_TIMEOUT):
-            self.agent.handle_unsat_condition()
-        if solving_status == SolvingStatus.UNSOLVED_UNINTERESTING_SAT:
-            # TODO: inform agent that sovler thinks the solution does not make sense
-            pass
-        if solving_status == SolvingStatus.SOLVED_OPT:
+        if solving_status != SolvingStatus.SOLVED_NESTED or solving_status != SolvingStatus.SOLVED_OPT:
+            self.agent.handle_unsat_condition(solving_status)
+        if solving_status == SolvingStatus.SOLVED_OPT and self.onetime_solving_enabled:
             self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
         return solving_status
 

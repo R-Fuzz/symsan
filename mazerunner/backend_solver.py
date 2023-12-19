@@ -23,18 +23,6 @@ class branch_dep_t:
         self.input_deps = set() # dfsan_label set
         self.state_deps = set() # (state, action) dependency set
 
-class SolvingStatus(Enum):
-    SOLVED_NESTED = 0
-    SOLVED_OPT = 1
-    UNSOLVED_UNINTERESTING_SAT = 2
-    UNSOLVED_PRE_UNSAT = 3
-    UNSOLVED_OPT_UNSAT = 4
-    UNSOLVED_TIMEOUT = 5
-    UNSOLVED_INVALID_EXPR = 6
-    UNSOLVED_INVALID_MSG = 7
-    UNSOLVED_UNINTERESTING_COND = 8
-    UNSOLVED_UNKNOWN = 9
-
 class Predicate(Enum):
     bveq = 32
     bvneq = 33
@@ -493,7 +481,7 @@ class Z3Solver:
             if r == z3.unknown:
                 self.logger.warning(f"__solve_expr: nested solving timeout for {e}")
             elif r == z3.unsat and self.config.optimistic_solving_enabled:
-                self.logger.warning(f"__solve_expr: nested solving unsat for {e}")
+                self.logger.debug(f"__solve_expr: nested solving unsat for {e}")
                 m = opt_solver.model()
                 has_generated = self.__generate_input(m, True, score)
                 if not has_generated:
@@ -532,6 +520,8 @@ class Z3Solver:
                     self.logger.debug(f"Shrink file to {size}")
                     with open(path, "r+b") as f:
                         f.truncate(size)
+                else:
+                    return False
             else:
                 offset = int(name)
                 value = m[decl].as_long()
