@@ -5,7 +5,7 @@ import pickle
 
 from decimal import Decimal, getcontext
 from enum import Enum
-from utils import mkdir, find_local_min
+from utils import mkdir
 
 class RLModelType(Enum):
     unknown = 0
@@ -69,7 +69,7 @@ class RLModel:
 
     def add_unreachable_sa(self, sa):
         self.unreachable_sa.add(sa)
-        self._update_unreachable_Q(sa)
+        self.update_unreachable_Q(sa)
 
     def add_visited_sa(self, sa):
         self.visited_sa.update([sa])
@@ -83,17 +83,8 @@ class RLModel:
         if sa in self.all_target_sa:
             self.all_target_sa.remove(sa)
 
-    def reset(self, s):
-        raise NotImplementedError("This method should be overridden by subclass")
-
-    def _update_unreachable_Q(self, sa):
-        raise NotImplementedError("This method should be overridden by subclass")
-
 
 class DistanceModel(RLModel):
-    @staticmethod
-    def create_reward_calculator(config, episode, min_distance):
-        return DistanceRewardCalculator(config, min_distance, episode)
 
     @staticmethod
     def distance_to_q(d):
@@ -102,10 +93,6 @@ class DistanceModel(RLModel):
     @staticmethod
     def q_to_distance(p):
         return -p
-    
-    def reset(self, s):
-        d = self.config.max_distance
-        self.Q_update(s.sa, DistanceModel.distance_to_q(d))
 
     def get_distance(self, s, a):
         key = s.state + (a,)
@@ -125,7 +112,7 @@ class DistanceModel(RLModel):
         self.Q_table[key] = value
         self.logger.debug(f"Q_update: key={key}, value={value}")
 
-    def _update_unreachable_Q(self, sa):
+    def update_unreachable_Q(self, sa):
         self.Q_update(sa, -float('inf'))
 
 class ReachabilityModel(RLModel):
@@ -133,10 +120,6 @@ class ReachabilityModel(RLModel):
     ZERO = Decimal(0)
     ONE = Decimal(1)
     TWO = Decimal(2)
-
-    @staticmethod
-    def create_reward_calculator(config, episode, min_distance):
-        return ReachabilityRewardCalculator(config, min_distance, episode)
 
     @staticmethod
     def distance_to_prob(d):
@@ -163,10 +146,6 @@ class ReachabilityModel(RLModel):
         res = - (p.ln() / ReachabilityModel.TWO.ln())
         return float(res) * 1000
 
-    def reset(self, s):
-        d = self.config.max_distance
-        self.Q_table[s.sa] = d
-
     def get_distance(self, s, a):
         key = s.state + (a,)
         if key not in self.Q_table:
@@ -180,50 +159,10 @@ class ReachabilityModel(RLModel):
 
     def Q_update(self, key, value):
         d = ReachabilityModel.prob_to_distance(value)
+        if d > self.config.max_distance * 2:
+            d = float('inf')
         self.Q_table[key] = d
         self.logger.debug(f"Q_update: key={key}, value={d}")
 
-    def _update_unreachable_Q(self, sa):
+    def update_unreachable_Q(self, sa):
         self.Q_update(sa, ReachabilityModel.ZERO)
-
-class RewardCalculator:
-    def __init__(self, config, min_distance, trace):
-        self.config = config
-        self.min_distance = min_distance
-        self.trace = trace
-
-    def compute_reward(self, i):
-        raise NotImplementedError("This method should be overridden by subclass")
-
-
-class DistanceRewardCalculator(RewardCalculator):
-    def __init__(self, config, min_distance, trace):
-        super().__init__(config, min_distance, trace)
-        self.local_min_indices = find_local_min([s.d for s in trace])
-
-    def compute_reward(self, i):
-        # Did not reach the target
-        if i >= len(self.trace) and self.min_distance > 0:
-                return -float('inf')
-        d = self.trace[i].d
-        # Reached the target
-        if d == 0 or (i >= len(self.trace) and self.min_distance == 0):
-            return self.config.max_distance
-        r = 0
-        # found local optimum
-        if i in self.local_min_indices:
-            r = (1000 / d) * (1000 / d) * self.config.max_distance
-        return r
-
-
-class ReachabilityRewardCalculator(RewardCalculator):
-    def compute_reward(self, i):
-        # Did not reach the target at the end
-        if i >= len(self.trace) and self.min_distance > 0:
-            return Decimal(0)
-        d = self.trace[i].d
-        # Reached the target
-        if d == 0 or (i >= len(self.trace) and self.min_distance == 0):
-            return Decimal(1)
-        # Default reward
-        return Decimal(0)

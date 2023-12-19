@@ -9,7 +9,7 @@ import random
 import model
 from decimal import Decimal
 from defs import TaintFlag
-from utils import mkdir, bucket_lookup, MAX_BUCKET_SIZE, get_distance_from_fn
+from utils import *
 
 class ProgramState:
     def __init__(self, distance):
@@ -17,7 +17,16 @@ class ProgramState:
         self.action = 0
         self.d = distance
         self.bid = 0
-    
+
+    @staticmethod
+    def deserialize(s):
+        state, action, d, bid = s
+        ps = ProgramState(d)
+        ps.state = state
+        ps.action = action
+        ps.bid = bid
+        return ps
+
     @property
     def sa(self):
         return self.state + (self.action,)
@@ -33,10 +42,55 @@ class ProgramState:
         self.action = action
         self.d = distance
         self.bid = bid
-
+    
     def serialize(self):
-        return (self.state, self.action, self.d)
+        return (self.state, self.action, self.d, self.bid)
 
+
+class RewardCalculator:
+    def __init__(self, config, min_distance, trace, nested_cond_unsat_sas):
+        self.config = config
+        self.min_distance = min_distance
+        self.trace = trace
+        self.nested_cond_unsat_sas = nested_cond_unsat_sas
+
+    def compute_reward(self, i):
+        raise NotImplementedError("This method should be overridden by subclass")
+
+
+class DistanceRewardCalculator(RewardCalculator):
+    def __init__(self, config, min_distance, trace, nested_cond_unsat_sas):
+        super().__init__(config, min_distance, trace, nested_cond_unsat_sas)
+        self.local_min_indices = find_local_min([s.d for s in trace])
+
+    def compute_reward(self, i):
+        # Did not reach the target
+        if i >= len(self.trace) and self.min_distance > 0:
+                return -float('inf')
+        d = self.trace[i].d
+        # Reached the target
+        if d == 0 or (i >= len(self.trace) and self.min_distance == 0):
+            return self.config.max_distance
+        # found local optimum
+        if i in self.local_min_indices:
+            return (1000 / d) * (1000 / d) * self.config.max_distance
+        sa = self.trace[i].sa
+        if sa in self.nested_cond_unsat_sas:
+            return -d
+        return 0
+
+
+class ReachabilityRewardCalculator(RewardCalculator):
+    def compute_reward(self, i):
+        # Did not reach the target at the end
+        if i >= len(self.trace) and self.min_distance > 0:
+            return Decimal(0)
+        d = self.trace[i].d
+        # Reached the target
+        if d == 0 or (i >= len(self.trace) and self.min_distance == 0):
+            return Decimal(1)
+        # Default reward
+        return Decimal(0)
 
 class MaxQLearner:
     def __init__(self, m: model.RLModel, df, lr):
@@ -46,6 +100,7 @@ class MaxQLearner:
 
     def learn(self, last_s, next_s, last_reward):
         last_Q = self.model.Q_lookup(last_s, last_s.action)
+        last_distance = self.model.get_distance(last_s, last_s.action)
         # check for Terminal state
         if next_s.state == (0,0,0):
             updated_Q = last_Q + self.learning_rate * (last_reward - last_Q)
@@ -58,8 +113,8 @@ class MaxQLearner:
                 chosen_Q = curr_state_not_taken
             updated_Q = (last_Q + self.learning_rate 
                 * (last_reward + self.discount_factor * chosen_Q - last_Q))
-        # Handle NaN values
-        if math.isnan(updated_Q) or last_Q == -float('inf'):
+
+        if math.isnan(updated_Q) or last_distance == float('inf'):
             if next_s.state == (0,0,0):
                 last_Q = last_reward
             else:
@@ -76,6 +131,7 @@ class AvgQLearner:
 
     def learn(self, last_s, next_s, last_reward):
         last_Q = self.model.Q_lookup(last_s, last_s.action)
+        last_distance = self.model.get_distance(last_s, last_s.action)
         # check for Terminal state
         if next_s.state == (0,0,0):
             updated_Q = last_Q + self.learning_rate * (last_reward - last_Q)
@@ -84,8 +140,8 @@ class AvgQLearner:
             curr_state_not_taken = self.model.Q_lookup(next_s, 0)
             avg_Q = (curr_state_taken + curr_state_not_taken) / 2
             updated_Q = last_Q + self.learning_rate * (self.discount_factor * avg_Q - last_Q)
-        # Handle NaN values
-        if math.isnan(updated_Q) or last_Q == -float('inf'):
+
+        if math.isnan(updated_Q) or last_distance == float('inf'):
             if next_s.state == (0,0,0):
                 last_Q = last_reward
             else:
@@ -97,11 +153,13 @@ class AvgQLearner:
 class Agent:
     def __init__(self, config):
         self.config = config
+        # for fgtest compatibility
         if config.mazerunner_dir:
             self.my_dir = config.mazerunner_dir
             mkdir(self.my_traces)
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.episode = []
+        self.nested_cond_unsat_sas = set()
         self.pc_counter = collections.Counter()
         self._min_distance = None
         self._learner = None
@@ -114,7 +172,7 @@ class Agent:
     @property
     def model(self):
         if not self._model:
-            self._model = Agent.create_model(self.config)
+            self._model = self.create_model(self.config)
         return self._model
     @model.setter
     def model(self, m):
@@ -138,16 +196,7 @@ class Agent:
     def learner(self):
         if self._learner:
             return self._learner
-        lr = self.config.learning_rate
-        df = self.config.discount_factor
-        if self.config.model_type == model.RLModelType.reachability:
-            lr = Decimal(self.config.learning_rate)
-            df = Decimal(self.config.discount_factor)
-            self._learner = AvgQLearner(self.model, df, lr)
-        elif self.config.model_type == model.RLModelType.distance:
-            self._learner = MaxQLearner(self.model, df, lr)
-        else:
-            raise NotImplementedError()
+        self._learner = self.create_learner()
         return self._learner
 
     @staticmethod
@@ -158,6 +207,26 @@ class Agent:
             return model.ReachabilityModel(config)
         else:
             raise NotImplementedError()
+
+    def create_learner(self):
+        lr = self.config.learning_rate
+        df = self.config.discount_factor
+        if self.config.model_type == model.RLModelType.distance:
+            return MaxQLearner(self.model, df, lr)
+        elif self.config.model_type == model.RLModelType.reachability:
+            return AvgQLearner(self.model, Decimal(df), Decimal(lr))
+        else:
+            raise NotImplementedError()
+    
+    def create_reward_calculator(self):
+        if self.config.model_type == model.RLModelType.distance:
+            return DistanceRewardCalculator(self.config, self.min_distance, 
+                                            self.episode, self.nested_cond_unsat_sas)
+        elif self.config.model_type == model.RLModelType.reachability:
+            return ReachabilityRewardCalculator(self.config, self.min_distance, 
+                                                self.episode, self.nested_cond_unsat_sas)
+        else:
+            raise NotImplementedError()        
 
     def append_episode(self):
         if self.curr_state.state[2] < MAX_BUCKET_SIZE:
@@ -176,7 +245,11 @@ class Agent:
         pass
 
     def handle_nested_unsat_condition(self, state_deps):
-        pass
+        for s in state_deps:
+            if s.sa == self.curr_state.sa or s.sa in self.nested_cond_unsat_sas:
+                continue
+            self.logger.info(f"handle_nested_unsat_condition: {s.sa}")
+            self.nested_cond_unsat_sas.add(s.sa)
 
     def is_interesting_branch(self):
         return True
@@ -184,17 +257,17 @@ class Agent:
     def compute_branch_score(self):
         return ''
 
-    def train(self, trace):
-        reward_calculator = self.model.create_reward_calculator(self.config, trace, self.min_distance)
-        for i, s in enumerate(reversed(trace)):
+    def train(self):
+        reward_calculator = self.create_reward_calculator()
+        for i, s in enumerate(reversed(self.episode)):
             assert 0 <= self.min_distance <= s.d <= self.config.max_distance
             self.model.add_visited_sa(s.sa)
-            i = len(trace) - i - 1
-            if i >= len(trace) - 1:
+            i = len(self.episode) - i - 1
+            if i >= len(self.episode) - 1:
                 # the next state is terminal state
                 next_s = ProgramState(distance=self.config.max_distance)
             else:
-                next_s = trace[i+1]
+                next_s = self.episode[i+1]
             reward = reward_calculator.compute_reward(i+1)
             self.learner.learn(s, next_s, reward)
             self.logger.debug(f"SA: {s.sa}, "
@@ -208,8 +281,8 @@ class Agent:
         d = self.config.max_distance if d is None else d
         self.min_distance = d
         with open(log_path, 'rb') as fd:
-            trace = list(pickle.load(fd))
-            self.train(trace)
+            self.episode = list(pickle.load(fd))
+            self.train()
 
     def save_trace(self, fn):
         log_path = os.path.join(self.my_traces, fn)
@@ -234,12 +307,13 @@ class Agent:
     def debug_policy(self, state):
         distance_taken = self.model.get_distance(state, 1)
         distance_not_taken = self.model.get_distance(state, 0)
-        self.logger.info(f"curr_sad={state.serialize()}, "
+        s = state.serialize()
+        self.logger.info(f"sad={(s[0],s[1],s[2])}, "
                         f"visited_times={self.model.visited_sa.get(state.sa, 0)}, "
                         f"d_t={distance_taken}, "
                         f"d_nt={distance_not_taken}, "
                         f"is_unreachable={state.reversed_sa in self.model.unreachable_sa}, "
-                        f"is_target={state.reversed_sa in self.model.all_target_sa}, "
+                        f"episode_len={len(self.episode)}, "
                         )
 
 
@@ -274,12 +348,9 @@ class ExploreAgent(Agent):
         return interesting
 
     def handle_unsat_condition(self):
+        self.logger.debug(f"unreachable_sa={self.curr_state.reversed_sa}")
         self.model.add_unreachable_sa(self.curr_state.reversed_sa)
         self.model.remove_target_sa(self.curr_state.reversed_sa)
-    
-    def handle_nested_unsat_condition(self, state_deps):
-        for s in state_deps:
-            self.model.reset(s)
 
     def compute_branch_score(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
@@ -306,37 +377,36 @@ class ExploitAgent(Agent):
     def __init__(self, config):
         super().__init__(config)
         self.all_targets = []
-        self.last_targets = []
-        self.epsilon = config.explore_rate
         self.target = (None, 0) # sa, trace_length
 
     def handle_new_state(self, msg, action, is_symbranch):
         if is_symbranch or self.config.model_type == model.RLModelType.distance:
             self.update_curr_state(msg, action)
             self.append_episode()
-            if self.curr_state.sa == self.target[0] and len(self.episode) == self.target[1]:
+            if self.curr_state.sa == self.target[0]:
+                self.logger.debug(f"Target reached. sa={self.target[0]}, trace_length={self.target[1]}")
                 self.target = (None, 0) # sa, trace_length
+    
+    def clear_targets(self):
+        self.target = (None, 0)
+        self.all_targets.clear()
 
     def is_interesting_branch(self):
         if self.target[0]:
             return False
         if self.curr_state.reversed_sa in self.model.unreachable_sa:
-            self.logger.debug(f"not interesting, unreachable sa {self.curr_state.reversed_sa}")
             return False
         interesting = self._greedy_policy() != self.curr_state.action
         if interesting:
             self.all_targets.append(self.curr_state.reversed_sa)
             self.target = (self.curr_state.reversed_sa, len(self.episode))
-            self.logger.debug(f"Target SA: {self.curr_state.reversed_sa}")
+            self.logger.debug(f"target_sa={self.curr_state.reversed_sa}, trace_length={len(self.episode)}")
         return interesting
 
     def handle_unsat_condition(self):
+        self.logger.debug(f"unreachable_sa={self.target[0]}")
         self.model.add_unreachable_sa(self.target[0])
         self.target = (None, 0)
-    
-    def handle_nested_unsat_condition(self, state_deps):
-        for s in state_deps:
-            self.model.reset(s)
 
     def _greedy_policy(self):
         d_taken = self.model.get_distance(self.curr_state, 1)
@@ -352,19 +422,16 @@ class ExploitAgent(Agent):
 
     # Return whether the agent should visit the filpped branch.
     def _epsilon_greedy_policy(self):
+        epsilon = self.config.explore_rate
         if (self.curr_state.reversed_sa not in self.model.visited_sa
-            and random.random() < self.epsilon):
-            self.logger.debug(f"interesting, epsilon-greedy policy")
+            and random.random() < epsilon):
             return True
         if (self.curr_state.reversed_sa in self.model.visited_sa
-            and random.random() < (self.epsilon ** self.model.visited_sa[self.curr_state.reversed_sa])):
-            self.logger.debug(f"interesting, epsilon-greedy policy")
+            and random.random() < (epsilon ** self.model.visited_sa[self.curr_state.reversed_sa])):
             return True
         if self._greedy_policy() != self.curr_state.action:
-            self.logger.debug(f"interesting, greedy policy")
             return True
         else:
-            self.logger.debug(f"not interesting, greedy policy")
             return False
     
     def _weighted_probabilistic_policy(self):

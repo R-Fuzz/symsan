@@ -492,13 +492,13 @@ class ExploreExecutor(Mazerunner):
             index = self.state.tick()
             filename = f"id:{index:06},src:{get_id_from_fn(fn)},ts:{ts},execs:{self.state.execs}"
             shutil.move(testcase, os.path.join(self.my_generations, filename))
+            self.logger.debug(f"save testcase: {filename}")
             t_d = int(t.split(',')[-1].strip())
             self.seed_scheduler.put(filename, t_d)
         # syn back to AFL queue if it's interesting
         is_interesting = self.minimizer.has_closer_distance(res.distance, fn)
         if is_interesting and 'sync' not in fn:
             self.logger.info(f"Explore agent found closer distance={res.distance}, ts: {ts}")
-            self.logger.info("Sync back: %s" % fn)
             dst_fp = os.path.join(self.my_queue, fn)
             shutil.copy2(fp, dst_fp)
 
@@ -508,7 +508,7 @@ class ExploreExecutor(Mazerunner):
             fp = self.run_file(next_seed)
             next_seed = os.path.basename(fp)
             # start RL training after symsan executor finishes
-            self.agent.train(self.agent.episode)
+            self.agent.train()
             self.state.processed.add(next_seed)
         else:
             self.logger.info("Sleeping for getting seeds from AFL")
@@ -557,7 +557,7 @@ class ExploitExecutor(Mazerunner):
         # target might still be reachable due to hitting max_flip_num
         if self.agent.target[0] and not has_reached_max_flip_num():
             self.logger.debug(f"Did not reach the target {self.agent.target[0]}")
-        self.agent.all_targets.clear()
+        self.agent.clear_targets()
         return symsan_res
 
     def update_timmer(self, res):
@@ -577,13 +577,13 @@ class ExploitExecutor(Mazerunner):
         ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
         dst_fn = f"id:{index:06},src:{target},ts:{ts},dis:{res.distance:06},execs:{self.state.execs}"
         dst_fp = os.path.join(self.my_generations, dst_fn)
+        self.logger.debug(f"save testcase: {dst_fn}")
         shutil.copy2(self.cur_input, dst_fp)
         self.agent.save_trace(dst_fn)
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
             self.seed_scheduler.put(dst_fn, res.distance)
             self.logger.info(f"Exploit agent found closer distance={res.distance}, ts: {ts}")
-            self.logger.info("Sync back: %s" % fn)
             dst_fp = os.path.join(self.my_queue, dst_fn)
             shutil.copy2(self.cur_input, dst_fp)
 
@@ -591,7 +591,7 @@ class ExploitExecutor(Mazerunner):
         next_seed = self.seed_scheduler.pick()
         if next_seed:
             self.run_file(next_seed)
-            self.agent.train(self.agent.episode)
+            self.agent.train()
         else:
             self.logger.info("Sleeping for getting seeds from AFL")
             time.sleep(WAITING_INTERVAL)
