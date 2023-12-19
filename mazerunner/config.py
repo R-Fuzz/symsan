@@ -8,6 +8,8 @@ from model import RLModelType
 LOGGING_LEVEL = logging.INFO
 MEMORY_LIMIT_PERCENTAGE = 85
 DISK_LIMIT_SIZE = 32 * (1 << 30) # 32GB
+SEED_SYNC_FREQUENCY = 100
+SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 # Solver configurations
 RANDOM_INPUT = "AAAA"
 MAX_DISTANCE = float(0x7FFFFFFFFFFFFFFF)
@@ -19,13 +21,12 @@ DISCOUNT_FACTOR = 1
 LEARNING_RATE = 1
 EXPLORE_RATE = 0.5
 # Executor configurations
-SEED_SYNC_FREQUENCY = 100
-SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 20 * 60
 MAX_ERROR_REPORTS = 30
 MAX_CRASH_REPORTS = 30
 MAX_FLIP_NUM = 128
+MAX_BRANCH_NUM = 33
 # minimum number of hang files to increase timeout
 MIN_HANG_FILES = 30
 # Model configurations
@@ -135,6 +136,7 @@ class Config:
         self.disk_limit = DISK_LIMIT_SIZE
         self.save_frequency = SAVE_FREQUENCY
         self.decimal_precision = DECIMAL_PRECISION
+        self.max_branch_num = MAX_BRANCH_NUM
         # The other configurations need to be set explicitly by config file or cmd arguments
         self.model_type = RLModelType.unknown
         self.afl_dir = ''

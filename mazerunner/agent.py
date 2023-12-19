@@ -158,6 +158,7 @@ class Agent:
             self.my_dir = config.mazerunner_dir
             mkdir(self.my_traces)
         self.logger = logging.getLogger(self.__class__.__qualname__)
+        # self.logger.setLevel(logging.DEBUG)
         self.episode = []
         self.nested_cond_unsat_sas = set()
         self.pc_counter = collections.Counter()
@@ -214,7 +215,7 @@ class Agent:
         if self.config.model_type == model.RLModelType.distance:
             return MaxQLearner(self.model, df, lr)
         elif self.config.model_type == model.RLModelType.reachability:
-            return AvgQLearner(self.model, Decimal(df), Decimal(lr))
+            return MaxQLearner(self.model, Decimal(df), Decimal(lr))
         else:
             raise NotImplementedError()
     
@@ -229,8 +230,16 @@ class Agent:
             raise NotImplementedError()        
 
     def append_episode(self):
-        if self.curr_state.state[2] < MAX_BUCKET_SIZE:
+        is_state_in_small_bucket = self.curr_state.state[2] <= self.config.max_branch_num
+        is_state_not_repeated = (len(self.episode) == 0 or self.episode[-1].sa != self.curr_state.sa)
+        if is_state_in_small_bucket and is_state_not_repeated:
             self.episode.append(copy.copy(self.curr_state))
+        if not is_state_in_small_bucket:
+            # inherit the experience from the smaller state that has smaller branch number
+            pc = self.curr_state.state[0]
+            callstack = self.curr_state.state[1]
+            inherited_state = (pc, callstack, bucket_lookup(self.config.max_branch_num))
+            self.curr_state.state = inherited_state
 
     def reset(self):
         self.curr_state = ProgramState(distance=self.config.max_distance)
@@ -354,7 +363,7 @@ class ExploreAgent(Agent):
 
     def compute_branch_score(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
-        d = self.model.get_default_distance(self.curr_state.bid, reversed_action)
+        d = self.model.get_distance(self.curr_state, reversed_action)
         return str(int(d))
 
     def _greedy_policy(self):
@@ -407,6 +416,7 @@ class ExploitAgent(Agent):
         self.logger.debug(f"unreachable_sa={self.target[0]}")
         self.model.add_unreachable_sa(self.target[0])
         self.target = (None, 0)
+        self.all_targets.pop()
 
     def _greedy_policy(self):
         d_taken = self.model.get_distance(self.curr_state, 1)
