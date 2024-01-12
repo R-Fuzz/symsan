@@ -480,6 +480,7 @@ class Z3Solver:
         else:
             if r == z3.unknown:
                 self.logger.warning(f"__solve_expr: nested solving timeout for {e}")
+                status = SolvingStatus.UNSOLVED_TIMEOUT
             elif r == z3.unsat and self.config.optimistic_solving_enabled:
                 self.logger.debug(f"__solve_expr: nested solving unsat for {e}")
                 m = opt_solver.model()
