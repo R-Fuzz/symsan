@@ -17,6 +17,7 @@ NESTED_BRANCH_ENABLED = True
 GEP_SOLVER_ENABLED = False
 OPTIMISTIC_SOLVING_ENABLED = True
 # Learner configurations
+OFFLINE_LEARNING_ENABLED = False
 DISCOUNT_FACTOR = 1
 LEARNING_RATE = 1
 EXPLORE_RATE = 0.5
@@ -64,6 +65,7 @@ class Config:
                  'max_distance',
                  'initial_policy',
                  'static_result_folder',
+                 'offline_learning_enabled',
     ]
 
     def __init__(self):
@@ -137,6 +139,7 @@ class Config:
         self.save_frequency = SAVE_FREQUENCY
         self.decimal_precision = DECIMAL_PRECISION
         self.max_branch_num = MAX_BRANCH_NUM
+        self.offline_learning_enabled = OFFLINE_LEARNING_ENABLED
         # The other configurations need to be set explicitly by config file or cmd arguments
         self.model_type = RLModelType.unknown
         self.afl_dir = ''

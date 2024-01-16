@@ -194,7 +194,7 @@ class Mazerunner:
         else:
             self._import_state()
             self.seed_scheduler = SeedScheduler(self.state.seed_queue)
-        self._setup_logger(config.logging_level)
+        self.logger = logging.getLogger(self.__class__.__qualname__)
         self.afl = config.afl_dir
         if self.afl:
             self.afl_cmd, afl_path, qemu_mode = self._parse_fuzzer_stats()
@@ -404,10 +404,6 @@ class Mazerunner:
         utils.mkdir(self.my_hangs)
         utils.mkdir(self.my_errors)
         utils.mkdir(self.my_generations)
-
-    def _setup_logger(self, logging_level):
-        self.logger = logging.getLogger(self.__class__.__qualname__)
-        logging.basicConfig(level=logging_level)
 
     # Returns afl's cmd, afl_path, qemu_mode, cmd will be used in minimizer
     def _parse_fuzzer_stats(self):
@@ -702,7 +698,8 @@ class HybridExecutor():
             if not self.seed_scheduler.queue or self.state.execs % self.config.sync_frequency == 0:
                 self.synchronizer.run(run_once=True)
             self.concolic_executor.run(run_once=True)
-            self.replayer.offline_learning()
+            if self.config.offline_learning_enabled:
+                self.replayer.offline_learning()
         logging.getLogger(self.__class__.__qualname__).error("Reached resource limit, exiting...")
 
     def cleanup(self):
