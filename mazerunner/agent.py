@@ -215,7 +215,7 @@ class Agent:
         if self.config.model_type == model.RLModelType.distance:
             return MaxQLearner(self.model, df, lr)
         elif self.config.model_type == model.RLModelType.reachability:
-            return MaxQLearner(self.model, Decimal(df), Decimal(lr))
+            return AvgQLearner(self.model, Decimal(df), Decimal(lr))
         else:
             raise NotImplementedError()
     
@@ -240,6 +240,7 @@ class Agent:
             callstack = self.curr_state.state[1]
             inherited_state = (pc, callstack, bucket_lookup(self.config.max_branch_num))
             self.curr_state.state = inherited_state
+        self.debug_policy(self.curr_state)
 
     def reset(self):
         self.curr_state = ProgramState(distance=self.config.max_distance)
@@ -257,7 +258,7 @@ class Agent:
         for s in state_deps:
             if s.sa == self.curr_state.sa or s.sa in self.nested_cond_unsat_sas:
                 continue
-            self.logger.info(f"handle_nested_unsat_condition: {s.sa}")
+            self.logger.debug(f"handle_nested_unsat_condition: {s.sa}")
             self.nested_cond_unsat_sas.add(s.sa)
 
     def is_interesting_branch(self):
@@ -415,11 +416,11 @@ class ExploitAgent(Agent):
         return interesting
 
     def handle_unsat_condition(self, solving_status):
+        self.logger.warning(f"handle_unsat_condition: unreachable_sa={self.target[0]}")
         self.target = (None, 0)
         self.all_targets.pop()
         if solving_status == solving_status.UNSOLVED_UNINTERESTING_SAT:
             return
-        self.logger.debug(f"unreachable_sa={self.target[0]}")
         self.model.add_unreachable_sa(self.target[0])
 
     def _greedy_policy(self):
