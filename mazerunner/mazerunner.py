@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import logging
 import random
 import threading
 import time
@@ -59,8 +60,6 @@ def validate_args(args):
         raise ValueError("You must provide either -i or -f option")
 
 def main():
-    print("[*] spinning up mazerunner: " + " ".join(sys.argv))
-    
     random.seed(time.time())
     args = parse_args()
     validate_args(args)
@@ -68,6 +67,9 @@ def main():
     config.load(args.config_path)
     config.load_args(args)
     validate_args(args)
+    
+    logging.basicConfig(level=config.logging_level)
+    logging.getLogger('Launcher').info("[*] spinning up mazerunner: " + " ".join(sys.argv))
 
     if config.agent_type == "explore":
         e = afl.HybridExecutor(config, "explore")
