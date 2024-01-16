@@ -192,8 +192,11 @@ class SymSanExecutor:
                               or solving_status == SolvingStatus.SOLVED_OPT)
                 if has_solved and self.onetime_solving_enabled:
                     should_handle = False
-                if (solving_status == SolvingStatus.UNSOLVED_INVALID_MSG 
-                    or solving_status == SolvingStatus.UNSOLVED_UNKNOWN):
+                if (solving_status == SolvingStatus.UNSOLVED_UNKNOWN
+                    or solving_status == SolvingStatus.UNSOLVED_INVALID_EXPR
+                    or solving_status == SolvingStatus.UNSOLVED_PRE_UNSAT):
+                    self.logger.error(f"process_request: slover panic and stop processing, "
+                                      f"solving_status={solving_status}")
                     should_handle = False
                 if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
                     self.logger.debug(f"Loop handle_loop_exit: id={msg.id}, target={hex(msg.addr)}")
@@ -221,7 +224,7 @@ class SymSanExecutor:
         state_msg = mazerunner_msg.from_buffer_copy(state_data)
         self.agent.handle_new_state(state_msg, msg.result, msg.label)
         if not msg.label:
-            return SolvingStatus.UNSOLVED_INVALID_EXPR
+            return SolvingStatus.UNSOLVED_INVALID_MSG
         if self.record_mode_enabled:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
         is_interesting = self.agent.is_interesting_branch()
@@ -229,7 +232,7 @@ class SymSanExecutor:
         solving_status = self.solver.handle_cond(msg, is_interesting, self.agent.curr_state, score)
         if not is_interesting:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
-        if solving_status != SolvingStatus.SOLVED_NESTED or solving_status != SolvingStatus.SOLVED_OPT:
+        if solving_status == SolvingStatus.UNSOLVED_OPT_UNSAT:
             self.agent.handle_unsat_condition(solving_status)
         if solving_status == SolvingStatus.SOLVED_OPT and self.onetime_solving_enabled:
             self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
