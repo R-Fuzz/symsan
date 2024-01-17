@@ -162,7 +162,7 @@ class Agent:
         self.episode = []
         self.nested_cond_unsat_sas = set()
         self.pc_counter = collections.Counter()
-        self._min_distance = None
+        self.min_distance = self.config.max_distance
         self._learner = None
         self._model = None
 
@@ -181,17 +181,6 @@ class Agent:
     def save_model(self):
         if self.config.mazerunner_dir and self._model:
             self._model.save()
-    
-    @property
-    def min_distance(self):
-        if not self._min_distance:
-            self._min_distance = self.config.max_distance
-        return self._min_distance
-    @min_distance.setter
-    def min_distance(self, d):
-        if d < 0:
-            return
-        self._min_distance = min(self.min_distance, d)
 
     @property
     def learner(self):
@@ -308,7 +297,7 @@ class Agent:
         else:
             # msg.local_min_dist is zero, assign the last distance available
             d = self.curr_state.d
-        self.min_distance = msg.global_min_dist
+        self.min_distance = min([msg.global_min_dist, d, self.min_distance])
         self.curr_state.update(msg.addr, msg.context, msg.id, action, d, self.pc_counter)
 
     def _make_dirs(self):
@@ -319,11 +308,12 @@ class Agent:
         distance_not_taken = self.model.get_distance(state, 0)
         s = state.serialize()
         self.logger.info(f"sad={(s[0],s[1],s[2])}, "
-                        f"visited_times={self.model.visited_sa.get(state.sa, 0)}, "
+                        f"hit_tn={self.model.visited_sa.get(state.sa, 0)}, "
                         f"d_t={distance_taken}, "
                         f"d_nt={distance_not_taken}, "
-                        f"is_unreachable={state.reversed_sa in self.model.unreachable_sa}, "
-                        f"episode_len={len(self.episode)}, "
+                        f"unreachale={state.reversed_sa in self.model.unreachable_sa}, "
+                        f"trace_len={len(self.episode)}, "
+                        f"min_d={self.min_distance}"
                         )
 
 

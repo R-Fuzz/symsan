@@ -209,7 +209,7 @@ class SymSanExecutor:
             elif msg.msg_type == MsgType.fsize_type.value:
                 pass
             elif msg.msg_type == MsgType.fini_type.value:
-                self.agent.min_distance = msg.result
+                self.agent.min_distance = min(msg.result, self.agent.min_distance)
             else:
                 self.logger.error(f"process_request: Unknown message type: {msg.msg_type}")
             end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
