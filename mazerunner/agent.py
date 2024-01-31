@@ -257,6 +257,9 @@ class Agent:
         return ''
 
     def train(self):
+        if not self.episode:
+            self.logger.warning("No episode to train")
+            return
         reward_calculator = self.create_reward_calculator()
         for i, s in enumerate(reversed(self.episode)):
             assert 0 <= self.min_distance <= s.d <= self.config.max_distance
@@ -320,7 +323,7 @@ class Agent:
 class RecordAgent(Agent):
 
     def handle_new_state(self, msg, action, is_symbranch):
-        if is_symbranch or self.config.model_type == model.RLModelType.distance:
+        if is_symbranch:
             self.update_curr_state(msg, action)
             self.append_episode()
 
@@ -331,7 +334,7 @@ class RecordAgent(Agent):
 class ExploreAgent(Agent):
 
     def handle_new_state(self, msg, action, is_symbranch):
-        if is_symbranch or self.config.model_type == model.RLModelType.distance:
+        if is_symbranch:
             self.update_curr_state(msg, action)
             self.model.remove_target_sa(self.curr_state.sa)
             self.append_episode()
@@ -382,7 +385,7 @@ class ExploitAgent(Agent):
         self.target = (None, 0) # sa, trace_length
 
     def handle_new_state(self, msg, action, is_symbranch):
-        if is_symbranch or self.config.model_type == model.RLModelType.distance:
+        if is_symbranch:
             self.update_curr_state(msg, action)
             self.append_episode()
             if self.curr_state.sa == self.target[0]:

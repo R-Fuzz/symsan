@@ -671,7 +671,6 @@ class HybridExecutor():
         if agent_type == "exploit":
             self.concolic_executor = ExploitExecutor(config, self.state)
             self.synchronizer = RecordExecutor(config, shared_state=self.state, record_enabled=True)
-            self.synchronizer.agent.model = self.model
         elif agent_type == "explore":
             self.concolic_executor = ExploreExecutor(config, self.state)
             self.synchronizer = RecordExecutor(config, shared_state=self.state, record_enabled=False)
