@@ -354,15 +354,15 @@ class Z3Solver:
               f"index_label={gmsg.index_label}, index={gmsg.index}, num_elems={gmsg.num_elems}, "
               f"elem_size={gmsg.elem_size}, current_offset={gmsg.current_offset}, addr={addr}")
         size = get_label_info(gmsg.index_label, self.shm).size
-        inputs = set()
+        self._dep_input_offsets = set()
         try:
-            index_bv = self.serializer.to_z3_expr(gmsg.index_label, inputs)
+            index_bv = self.serializer.to_z3_expr(gmsg.index_label, self._dep_input_offsets)
         except Serializer.InvalidData:
             return SolvingStatus.UNSOLVED_INVALID_EXPR
         except Exception as e:
             self.logger.critical(f"handle_gep: unknown error={e}")
             return SolvingStatus.UNSOLVED_UNKNOWN
-        self.__collect_constraints(inputs)
+        self.__collect_constraints()
         if self.__z3_solver.check() == z3.unsat:
             self.logger.error(f"handle_gep: pre-condition is unsat")
             return SolvingStatus.UNSOLVED_PRE_UNSAT
@@ -407,7 +407,7 @@ class Z3Solver:
                     status = self.__solve_expr(e)
         # always preserve
         r_bv = z3.BitVecVal(gmsg.index, size, self.__z3_context)
-        for off in inputs:
+        for off in self._dep_input_offsets:
             c = self.__get_branch_dep(off)
             if not c:
                 c = branch_dep_t()
@@ -415,7 +415,7 @@ class Z3Solver:
             if not c:
                 self.logger.warning("handle_gep: out of memory")
             else:
-                c.input_deps.update(inputs)
+                c.input_deps.update(self._dep_input_offsets)
                 c.expr_deps.add(index_bv == r_bv)
         return status
 
@@ -565,7 +565,7 @@ class Z3Solver:
         addr = s.state[0]
         self.logger.debug(f"__solve_cond: label={label}, result={r}, addr={hex(addr)}")
         result = z3.BoolVal(r != 0, ctx=self.__z3_context)
-        self._dep_input_offsets.clear()
+        self._dep_input_offsets = set()
         try:
             cond = self.serializer.to_z3_expr(label, self._dep_input_offsets)
         except Serializer.InvalidData:
