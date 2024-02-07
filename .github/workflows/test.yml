@@ -17,11 +17,11 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    - name: install clang-12
-      run: |
-        wget https://apt.llvm.org/llvm.sh
-        chmod +x llvm.sh
-        sudo ./llvm.sh 12 all
+    # - name: install clang-12
+    #   run: |
+    #     wget https://apt.llvm.org/llvm.sh
+    #     chmod +x llvm.sh
+    #     sudo ./llvm.sh 12 all
 
     - name: get aflpp
       uses: actions/checkout@v3
