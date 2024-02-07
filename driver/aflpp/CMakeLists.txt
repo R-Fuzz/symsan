@@ -12,8 +12,8 @@ if (NOT LLVM_FOUND)
   message(FATAL_ERROR "You haven't install LLVM !")
 endif()
 
-if (NOT DEFINED AFLPP_PATH OR NOT AFLPP_PATH)
-  message(FATAL_ERROR "AFL++ directory not defined !")
+if (NOT IS_DIRECTORY "${AFLPP_PATH}/include")
+  message(FATAL_ERROR "Invalid AFL++ directory path!")
 endif()
 
 add_subdirectory(jigsaw)
