@@ -17,7 +17,8 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    # - name: install clang-12
+    - name: install clang-12
+      run: sudo apt-get update && sudo apt-get install -y llvm-12 clang-12 libc++-12-dev libc++abi-12-dev python3-minimal libz3-dev libgoogle-perftools-dev
     #   run: |
     #     wget https://apt.llvm.org/llvm.sh
     #     chmod +x llvm.sh
@@ -30,8 +31,7 @@ jobs:
         path: ${{ github.workspace }}/aflpp
 
     - name: configure
-      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install \
-        -DAFLPP_ROOT=${{ github.workspace }}/aflpp
+      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install -DAFLPP_ROOT=${{ github.workspace }}/aflpp
 
     - name: build
       run: CC=clang-12 CXX=clang++-12 cmake --build ${{ github.workspace }}/build
