@@ -38,7 +38,7 @@ static dfsan_label_info *__dfsan_label_info;
 static char *input_buf;
 static size_t input_size;
 
-static const char *shm_name = "/symsan_union_table";
+static const char *shm_prefix = "/symsan_union_table";
 
 dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
   return &__dfsan_label_info[label];
@@ -615,7 +615,10 @@ int main(int argc, char* const argv[]) {
   close(fd);
 
   // setup shmem and pipe
-  int shmfd = shm_open(shm_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+  int length = snprintf(NULL, 0, "%s-%d", shm_prefix, getpid());
+  char shm_name[length + 1];
+  snprintf(shm_name, length + 1, "%s-%d", shm_prefix, getpid());
+  int shmfd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
   if (shmfd == -1) {
     fprintf(stderr, "Failed to open shmem: %s\n", strerror(errno));
     exit(1);
@@ -642,8 +645,8 @@ int main(int argc, char* const argv[]) {
   }
 
   // prepare the env and fork
-  int length = snprintf(NULL, 0, "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=1",
-                        input, shmfd, pipefds[1]);
+  length = snprintf(NULL, 0, "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=1",
+                    input, shmfd, pipefds[1]);
   options = (char *)malloc(length + 1);
   snprintf(options, length + 1, "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=1",
            input, shmfd, pipefds[1]);

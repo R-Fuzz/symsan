@@ -40,7 +40,6 @@ $ make install
 
 ```
 docker build -t symsan .
-docker run  --rm --ulimit core=0 symsan bash -c 'cd /workdir/symsan && ./check.sh 2>/dev/null'
 ```
 
 ### LIBCXX
