@@ -12,7 +12,7 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
     - uses: actions/checkout@v3
@@ -23,8 +23,15 @@ jobs:
         chmod +x llvm.sh
         sudo ./llvm.sh 12 all
 
+    - name: get aflpp
+      uses: actions/checkout@v3
+      with:
+        repository: AFLplusplus/AFLplusplus
+        path: ${{ github.workspace }}/aflpp
+
     - name: configure
-      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
+      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install \
+        -DAFLPP_ROOT=${{ github.workspace }}/aflpp
 
     - name: build
       run: CC=clang-12 CXX=clang++-12 cmake --build ${{ github.workspace }}/build
