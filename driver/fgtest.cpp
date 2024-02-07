@@ -598,6 +598,17 @@ int main(int argc, char* const argv[]) {
     __output_dir = strndup(output, n);
   }
 
+  int is_stdin = 0;
+  char *taint_file = strstr(options, "taint_file=");
+  if (taint_file) {
+    taint_file += strlen("taint_file="); // skip "taint_file="
+    char *end = strchr(taint_file, ':');
+    if (end == NULL) end = strchr(taint_file, ' ');
+    size_t n = end == NULL? strlen(taint_file) : (size_t)(end - taint_file);
+    if (n == 5 && !strncmp(taint_file, "stdin", 5))
+      is_stdin = 1;
+  }
+
   // load input file
   struct stat st;
   int fd = open(input, O_RDONLY);
@@ -645,11 +656,12 @@ int main(int argc, char* const argv[]) {
   }
 
   // prepare the env and fork
+  const char *input_file = is_stdin ? "stdin" : input;
   length = snprintf(NULL, 0, "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=1",
-                    input, shmfd, pipefds[1]);
+                    input_file, shmfd, pipefds[1]);
   options = (char *)malloc(length + 1);
   snprintf(options, length + 1, "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=1",
-           input, shmfd, pipefds[1]);
+           input_file, shmfd, pipefds[1]);
   
   int pid = fork();
   if (pid < 0) {
@@ -664,6 +676,11 @@ int main(int argc, char* const argv[]) {
     args[0] = program;
     args[1] = input;
     args[2] = NULL;
+    if (is_stdin) {
+      fd = open(input, O_RDONLY);
+      dup2(fd, 0);
+      close(fd);
+    }
     execv(program, args);
     exit(0);
   }

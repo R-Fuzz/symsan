@@ -702,7 +702,7 @@ static void InitializeTaintFile() {
   if (internal_strcmp(filename, "stdin") == 0) {
     tainted.fd = 0;
     // try to get the size, as stdin may be a file
-    if (!fstat(0, &st)) {
+    if (!fstat(0, &st) && S_ISREG(st.st_mode)) {
       tainted.size = st.st_size;
       tainted.is_stdin = 0;
       // map a copy
