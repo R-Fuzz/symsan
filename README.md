@@ -18,8 +18,7 @@ To learn more, checkout our [paper](https://www.usenix.org/conference/usenixsecu
 ## Building
 
 Because SymSan leverages the shadow memory implementation from LLVM's sanitizers,
-it has more strict dependency on the LLVM version. Right now only LLVM 12 is
-tested.
+it has more strict dependency on the LLVM version. Right now only LLVM 12 is tested.
 
 ### Build Requirements
 
@@ -88,7 +87,8 @@ $ lit tests
 ### Hybrid Fuzzing
 
 SymSan needs a driver to perform hybrid fuzzing, like [FastGen](https://github.com/R-Fuzz/fastgen).
-It could also be used as a custom mutator for [AFL++](https://github.com/AFLplusplus/AFLplusplus).
+It could also be used as a custom mutator for [AFL++](https://github.com/AFLplusplus/AFLplusplus)
+(check the [plugin readme](driver/aflpp/README.md)).
 
 ## Documentation
 
