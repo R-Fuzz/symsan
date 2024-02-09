@@ -69,6 +69,7 @@ class Config:
     ]
 
     def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__qualname__)
         self._load_default()
 
     def load(self, path):
@@ -111,11 +112,14 @@ class Config:
             self.logging_level = logging.DEBUG
         if args.static_result_folder:
             self.static_result_folder = args.static_result_folder
-        if self.static_result_folder:
             distance_file = os.path.join(self.static_result_folder, "distance.cfg.txt")
             self.max_distance = self._load_distance_file(distance_file)
             policy_file = os.path.join(self.static_result_folder, "policy.pkl")
             self.initial_policy = self._load_initial_policy(policy_file)
+        
+    def validate_config(self):
+        # TODO: validate the configurations after loading
+        pass
 
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL
@@ -152,12 +156,17 @@ class Config:
 
     def _load_distance_file(self, fp):
         max_distance = -float('inf')
+        if not os.path.isfile(fp):
+            raise ValueError(f"distance file {fp} does not exist.")
         with open(fp, 'r') as file:
             for l in file.readlines():
                 max_distance = max(float(l.strip().split(',')[-1]), max_distance)
         return max_distance
 
     def _load_initial_policy(self, fp):
+        if not os.path.isfile(fp):
+            self.logger.warning(f"policy file {fp} does not exist, using random policy.")
+            return {}
         with open(fp, 'rb') as file:
             policy = pickle.load(file)
         return policy
