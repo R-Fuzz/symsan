@@ -11,7 +11,6 @@ DISK_LIMIT_SIZE = 32 * (1 << 30) # 32GB
 SEED_SYNC_FREQUENCY = 100
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 # Solver configurations
-RANDOM_INPUT = "AAAA"
 MAX_DISTANCE = float(0x7FFFFFFFFFFFFFFF)
 NESTED_BRANCH_ENABLED = True
 GEP_SOLVER_ENABLED = False
@@ -38,7 +37,6 @@ class Config:
                  '__weakref__',
                  'agent_type',
                  'logging_level',
-                 'random_input',
                  'nested_branch_enabled',
                  'gep_solver_enabled',
                  'optimistic_solving_enabled',
@@ -104,8 +102,8 @@ class Config:
             self.afl_dir = args.fuzzer_dir
         if args.mazerunner_dir:
             self.mazerunner_dir = os.path.join(args.output_dir, args.mazerunner_dir)
-        if args.input:
-            self.initial_seed_dir = args.input
+        if args.input_dir:
+            self.initial_seed_dir = args.input_dir
         if args.cmd:
             self.cmd = args.cmd
         if args.debug_enabled:
@@ -123,7 +121,6 @@ class Config:
 
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL
-        self.random_input = RANDOM_INPUT
         self.max_distance = MAX_DISTANCE
         self.nested_branch_enabled = NESTED_BRANCH_ENABLED
         self.gep_solver_enabled = GEP_SOLVER_ENABLED

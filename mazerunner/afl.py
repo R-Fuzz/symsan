@@ -314,19 +314,20 @@ class Mazerunner:
 
     def sync_from_afl(self, reversed_order=True, need_sort=False):
         files = []
-        if self.afl_queue and os.path.exists(self.afl_queue):
-            for name in os.listdir(self.afl_queue):
-                path = os.path.join(self.afl_queue, name)
-                new_name = "id:" + get_id_from_fn(name) + f',sync:{self.afl}'
-                if os.path.isfile(path) and not new_name in self.state.synced:
-                    shutil.copy2(path, os.path.join(self.my_generations, new_name))
-                    files.append(new_name)
-                    self.state.synced.add(new_name)
+        for name in os.listdir(self.afl_queue):
+            path = os.path.join(self.afl_queue, name)
+            new_name = "id:" + get_id_from_fn(name) + f',sync:{self.afl}'
+            if os.path.isfile(path) and not new_name in self.state.synced:
+                shutil.copy2(path, os.path.join(self.my_generations, new_name))
+                files.append(new_name)
+                self.state.synced.add(new_name)
         if need_sort:
             return sorted(files,
                         key=functools.cmp_to_key(
                             (lambda a, b: testcase_compare(a, b, self.afl_queue))),
                         reverse=reversed_order)
+        if not files:
+            self.logger.info("No new testcases from AFL")
         return files
 
     def sync_from_initial_seeds(self):
@@ -340,10 +341,10 @@ class Mazerunner:
         return files
 
     def sync_from_either(self):
-        files = self.sync_from_afl()
-        if not files and not self.afl_queue:
-            files = self.sync_from_initial_seeds()
-        return files
+        if self.afl_queue and os.path.exists(self.afl_queue):
+            return self.sync_from_afl()
+        else:
+            return self.sync_from_initial_seeds()
 
     def handle_return_status(self, result, fp):
         msg_count = result.symsan_msg_num
@@ -564,8 +565,6 @@ class ExploitExecutor(Mazerunner):
 
     def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
-        if res.flipped_times == 0:
-            self.seed_scheduler.remove(os.path.basename(fn))
         if not self.minimizer.is_new_file(self.cur_input):
             return
         index = self.state.tick()
