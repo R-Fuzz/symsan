@@ -53,7 +53,7 @@ using namespace __dfsan;
 
 #define PRINT_STATS 1
 
-#define MAX_DEPTH 100
+#define MAX_AST_SIZE 200
 
 static bool NestedSolving = false;
 
@@ -797,13 +797,43 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
           node->set_bits(1);
           if (likely(node->children_size() == 0)) {
             // if the node has no children, it's a leaf node
-            auto itr = OP_MAP.find(info->op);
-            assert(itr != OP_MAP.end());
-            node->set_kind(itr->second.first);
-            node->set_label(curr);
+            // check size, concretize if too large
+            auto size = ast_size_cache.at(curr);
+            uint8_t concretize = 0;
+            if (size > MAX_AST_SIZE) {
+              DEBUGF("AST size too large: %d = %u\n", curr, size);
+              auto left_size = ast_size_cache.at(info->l1);
+              auto right_size = ast_size_cache.at(info->l2);
+              if (left_size > MAX_AST_SIZE) {
+                // concretize left
+                concretize |= 1;
+                // update new size
+                size -= (left_size - 1);
+              }
+              if (right_size > MAX_AST_SIZE) {
+                // concretize right
+                concretize |= 2;
+                // update new size
+                size -= (right_size - 1);
+              }
+              DEBUGF("new size: %d = %u\n", curr, size);
+              ast_size_cache[curr] = size;
+              concretize_node[curr] = concretize;
+            }
+
+            if (concretize == 3) {
+              // well, both sides have been concretized, simplify the node
+              node->set_kind(rgd::Bool);
+              node->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
+            } else {
+              auto itr = OP_MAP.find(info->op);
+              assert(itr != OP_MAP.end());
+              node->set_kind(itr->second.first);
+              node->set_label(curr);
 #ifdef DEBUG
-            subroots.insert(curr);
+              subroots.insert(curr);
 #endif
+            }
           } else if (node->children_size() == 1) {
             // one side has another icmp, must be simplifiable
             assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
