@@ -268,7 +268,7 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   }
 
   dfsan_label_info *info = get_label_info(label);
-  DEBUGF("%u = (l1:%u, l2:%u, op:%u, size:%u, op1:%lu, op2:%lu)\n",
+  DEBUGF("do_uta_real: %u = (l1:%u, l2:%u, op:%u, size:%u, op1:%lu, op2:%lu)\n",
          label, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i);
 
   // we can't really reuse AST nodes across constraints,
@@ -821,7 +821,11 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
               concretize_node[curr] = concretize;
             }
 
-            if (concretize == 3) {
+            // check for concrete ops
+            uint8_t concrete_ops = concretize;
+            concrete_ops |= info->l1 == 0 ? 1 : 0;
+            concrete_ops |= info->l2 == 0 ? 2 : 0;
+            if (concrete_ops == 3) {
               // well, both sides have been concretized, simplify the node
               node->set_kind(rgd::Bool);
               node->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
@@ -847,14 +851,12 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
                     node->CopyFrom(*left);
                   } else { // checking bool == false
                     node->set_kind(rgd::LNot);
-                    node->clear_children(1);
                   }
                 } else { // bvneq
                   if (info->op2.i == 0) { // checking bool != false
                     node->CopyFrom(*left);
                   } else { // checking bool != true
                     node->set_kind(rgd::LNot);
-                    node->clear_children(1);
                   }
                 }
               } else {
@@ -875,14 +877,12 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
                     node->CopyFrom(*right);
                   } else { // checking false == bool
                     node->set_kind(rgd::LNot);
-                    node->clear_children(0);
                   }
                 } else { // bvneq
                   if (info->op1.i == 0) { // checking false != bool
                     node->CopyFrom(*right);
                   } else { // checking true != bool
                     node->set_kind(rgd::LNot);
-                    node->clear_children(0);
                   }
                 }
               } else {
@@ -904,7 +904,7 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
           assert(node->children_size() == 0 && "memcmp should not have additional icmp");
           node->set_bits(1); // XXX: treat memcmp as a boolean
           node->set_kind(rgd::Memcmp); // fix later
-          node->set_label(label);
+          node->set_label(curr);
 #ifdef DEBUG
           subroots.insert(curr);
 #endif
@@ -1026,7 +1026,7 @@ static void scan_labels(dfsan_label label, size_t buf_size) {
   for (size_t i = ast_size_cache.size(); i <= label; i++) {
     if (i == 0) { // the constant label
       ast_size_cache.push_back(1); // constant takes one node too
-      branch_to_inputs.emplace_back(input_dep_t());
+      branch_to_inputs.emplace_back(input_dep_t(buf_size));
       nested_cmp_cache.push_back(0);
       continue;
     }
