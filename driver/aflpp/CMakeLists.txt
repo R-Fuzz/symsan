@@ -4,6 +4,8 @@ cmake_minimum_required(VERSION 3.5.1)
 
 project(SymSanMutator C CXX)
 
+find_package(Boost REQUIRED COMPONENTS container)
+
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 14)
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
@@ -34,6 +36,7 @@ target_include_directories(SymSanMutator PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime
   ${AFLPP_PATH}/include
+  ${Boost_INCLUDE_DIRS}
 )
 
 target_link_libraries(SymSanMutator
@@ -41,6 +44,7 @@ target_link_libraries(SymSanMutator
   z3
   jigsaw
   profiler
+  Boost::container
 )
 if (ASAN_BUILD)
   target_link_libraries(SymSanMutator

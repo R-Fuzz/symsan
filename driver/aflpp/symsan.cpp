@@ -1,6 +1,6 @@
 /*
   a custom mutator for AFL++
-  (c) 2023 by Chengyu Song <csong@cs.ucr.edu>
+  (c) 2023 - 2024 by Chengyu Song <csong@cs.ucr.edu>
   License: Apache 2.0
 */
 
@@ -15,6 +15,8 @@
 extern "C" {
 #include "afl-fuzz.h"
 }
+
+#include "boost/dynamic_bitset.hpp"
 
 #include <atomic>
 #include <unordered_map>
@@ -65,11 +67,11 @@ static bool NestedSolving = false;
     _tmp; \
   })
 
-typedef std::shared_ptr<rgd::AstNode> expr_t;
-typedef std::shared_ptr<rgd::Constraint> constraint_t;
-typedef std::shared_ptr<rgd::SearchTask> task_t;
-typedef std::shared_ptr<rgd::Solver> solver_t;
-typedef std::shared_ptr<rgd::BranchContext> branch_ctx_t;
+using expr_t = std::shared_ptr<rgd::AstNode>;
+using constraint_t = std::shared_ptr<rgd::Constraint> ;
+using task_t = std::shared_ptr<rgd::SearchTask>;
+using solver_t = std::shared_ptr<rgd::Solver>;
+using branch_ctx_t = std::shared_ptr<rgd::BranchContext>;
 
 enum mutation_state_t {
   MUTATION_INVALID,
@@ -197,9 +199,11 @@ static inline bool eval_icmp(uint16_t op, uint64_t op1, uint64_t op2) {
 // FIXME: global caches
 static std::unordered_map<dfsan_label, expr_t> root_expr_cache;
 static std::unordered_map<dfsan_label, constraint_t> constraint_cache;
-static std::unordered_map<dfsan_label, std::unordered_set<size_t> > branch_to_inputs;
+using input_dep_t = boost::dynamic_bitset<>;
+static std::vector<input_dep_t> branch_to_inputs;
 static std::unordered_map<dfsan_label, std::unique_ptr<uint8_t[]>> memcmp_cache;
-static std::unordered_map<dfsan_label, size_t> ast_size_cache;
+static std::vector<uint32_t> ast_size_cache;
+static std::vector<uint8_t> nested_cmp_cache;
 static std::unordered_map<dfsan_label, uint8_t> concretize_node;
 // FIXME: global input dependency forests
 static rgd::UnionFind data_flow_deps;
@@ -218,6 +222,7 @@ static void reset_global_caches(size_t buf_size) {
   branch_to_inputs.clear();
   memcmp_cache.clear();
   ast_size_cache.clear();
+  nested_cmp_cache.clear();
   concretize_node.clear();
   data_flow_deps.reset(buf_size);
   for (auto &s: input_to_branches) {
@@ -496,10 +501,11 @@ parse_constraint(dfsan_label label, const u8 *buf, size_t buf_size) {
   assert(((info->op & 0xff) == __dfsan::ICmp) || (info->op == __dfsan::fmemcmp));
 
   // retrieve the ast size
-  auto itr = ast_size_cache.find(label);
-  assert(itr != ast_size_cache.end() && itr->second > 0);
+  assert(ast_size_cache.size() > label);
+  auto size = ast_size_cache.at(label);
+  assert(size > 0);
   std::unordered_set<dfsan_label> visited;
-  constraint_t constraint = std::make_shared<rgd::Constraint>(itr->second);
+  constraint_t constraint = std::make_shared<rgd::Constraint>(size);
   if (!do_uta_rel(label, constraint->ast.get(), buf, buf_size, constraint, visited)) {
     return nullptr;
   }
@@ -534,504 +540,356 @@ static task_t construct_task(std::vector<const rgd::AstNode*> clause,
   return nullptr;
 }
 
-static int find_roots(dfsan_label label, rgd::AstNode *ret,
-                      size_t &tree_size, size_t depth,
-                      std::unordered_set<size_t> &input_deps,
-                      std::unordered_set<dfsan_label> &subroots,
-                      std::unordered_set<dfsan_label> &visited);
-
 // sometimes llvm will zext bool
 static dfsan_label strip_zext(dfsan_label label) {
   dfsan_label_info *info = get_label_info(label);
   while (info->op == __dfsan::ZExt) {
-    info = get_label_info(info->l1);
+    dfsan_label child = info->l1;
+    info = get_label_info(child);
     if (info->size == 1) {
       // extending a boolean value
-      return info->l1;
-    } else if (info->op == __dfsan::fmemcmp) {
-      // extending the result of memcmp
-      return info->l1;
+      return child;
+    } else if ((info->op & 0xff) == __dfsan::ICmp || info->op == __dfsan::fmemcmp) {
+      // extending the result of icmp or memcmp
+      return child;
     }
   }
   return label;
 }
 
-static int simplify_land(dfsan_label_info *info, rgd::AstNode *ret,
-                         size_t &tree_size, size_t depth,
-                         std::unordered_set<size_t> &input_deps,
-                         std::unordered_set<dfsan_label> &subroots,
-                         std::unordered_set<dfsan_label> &visited) {
-  // try some simplification, 0 LAnd x = 0, 1 LAnd x = x
-  // symsan always keeps rhs as symbolic
-  dfsan_label lhs = info->l1 >= CONST_OFFSET ? strip_zext(info->l1) : 0;
-  dfsan_label rhs = strip_zext(info->l2);
-  if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
-    // if nothing go stripped, we can't simplify
-    int r = find_roots(rhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
-    if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
-    }
-    tree_size += 2;
-    return r;
-  }
-
-  // by communicative, we can parse the rhs first
-  DEBUGF("simplify land: %d LAnd %d, %d\n", lhs, rhs, info->size);
-  assert(ret->children_size() == 0);
-  rgd::AstNode *right = ret->add_children();
-  tree_size += 1;
-  int rr = find_roots(rhs, right, tree_size, depth, input_deps, subroots, visited);
-  assert(right->bits() == 1); // rhs must be a boolean after parsing
-  // if nothing added, rhs must be a constant
-  if (unlikely(rr == NONE_CMP_NODE)) {
-    assert(right->kind() == rgd::Bool);
-    if (right->boolvalue() == 0) { // x LAnd 0 = 0
-      ret->set_kind(rgd::Bool);
-      ret->set_boolvalue(0);
-      ret->clear_children();
-      return NONE_CMP_NODE;
-    } // rhs is 1, fall through
-  }
-  if (unlikely(lhs == 0)) {
-    // lhs is a constant
-    if (info->op1.i == 0) { // 0 LAnd x = 0
-      ret->set_kind(rgd::Bool);
-      ret->set_boolvalue(0);
-      ret->clear_children();
-      return NONE_CMP_NODE;
-    } else {
-      assert(info->op1.i == 1); // 1 LAnd x = x
-      ret->CopyFrom(*right);
-      return rr;
-    }
-  } else {
-    rgd::AstNode *left = ret->add_children();
-    tree_size += 1;
-    int lr = find_roots(lhs, left, tree_size, depth, input_deps, subroots, visited);
-    assert(left->bits() == 1); // lhs must be a boolean after parsing
-    // if nothing added, lhs must be a constant
-    if (unlikely(lr == NONE_CMP_NODE)) {
-      assert(left->kind() == rgd::Bool);
-      if (left->boolvalue() == 0) { // 0 LAnd x = 0
-        ret->set_kind(rgd::Bool);
-        ret->set_boolvalue(0);
-        ret->clear_children();
-        return NONE_CMP_NODE;
-      } else if (rr == NONE_CMP_NODE) {
-        // both lhs and rhs are constants
-        ret->set_kind(rgd::Bool);
-        ret->set_boolvalue(1); // 1 LAnd 1 = 1 // rhs == 0 has returned earlier
-        ret->clear_children();
-        return NONE_CMP_NODE;
-      } else { // 1 LAnd x = x
-        // lhs is 1, rhs is not
-        ret->CopyFrom(*right);
-        return rr;
-      }
-    } else if (rr == NONE_CMP_NODE) {
-      // rhs is 1, lhs is not
-      ret->CopyFrom(*left);
-      return lr;
-    }
-  }
-
-  ret->set_kind(rgd::LAnd);
-  assert(ret->children_size() == 2);
-  ret->set_bits(1);
-  return CMP_NODE;
-}
-
-static int simplify_lor(dfsan_label_info *info, rgd::AstNode *ret,
-                        size_t &tree_size, size_t depth,
-                        std::unordered_set<size_t> &input_deps,
-                        std::unordered_set<dfsan_label> &subroots,
-                        std::unordered_set<dfsan_label> &visited) {
-  // try some simplification, x LOr 0 = x, x LOr 1 = 1
-  // symsan always keeps rhs as symbolic
-  dfsan_label lhs = info->l1 >= CONST_OFFSET ? strip_zext(info->l1) : 0;
-  dfsan_label rhs = strip_zext(info->l2);
-  if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
-    // if nothing go stripped, we can't simplify
-    int r = find_roots(rhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
-    if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
-    }
-    tree_size += 2;
-    return r;
-  }
-
-  // by communicative, we can parse the rhs first
-  DEBUGF("simplify land: %d LOr %d, %d\n", lhs, rhs, info->size);
-  assert(ret->children_size() == 0);
-  rgd::AstNode *right = ret->add_children();
-  tree_size += 1;
-  int rr = find_roots(rhs, right, tree_size, depth, input_deps, subroots, visited);
-  assert(right->bits() == 1); // rhs must be a boolean after parsing
-  // if nothing added, rhs must be a constant
-  if (unlikely(rr == NONE_CMP_NODE)) {
-    assert(right->kind() == rgd::Bool);
-    if (right->boolvalue() == 1) { // x LOr 1 = 1
-      ret->set_kind(rgd::Bool);
-      ret->set_boolvalue(1);
-      ret->clear_children();
-      return NONE_CMP_NODE;
-    } // rhs is 0, fall through
-  }
-  if (unlikely(lhs == 0)) {
-    // lhs is a constant
-    if (info->op1.i == 1) { // x LOr 1 = 1
-      ret->set_kind(rgd::Bool);
-      ret->set_boolvalue(1);
-      ret->clear_children();
-      return NONE_CMP_NODE;
-    } else { // 0 LOr x = x
-      assert(info->op1.i == 0);
-      ret->CopyFrom(*right);
-      return rr;
-    }
-  } else {
-    rgd::AstNode *left = ret->add_children();
-    tree_size += 1;
-    int lr = find_roots(lhs, left, tree_size, depth, input_deps, subroots, visited);
-    assert(left->bits() == 1); // lhs must be a boolean after parsing
-    // if nothing added, lhs must be a constant
-    if (unlikely(lr == NONE_CMP_NODE)) {
-      assert(left->kind() == rgd::Bool);
-      if (left->boolvalue() == 1) { // 1 LOr x = 1
-        ret->set_kind(rgd::Bool);
-        ret->set_boolvalue(1);
-        ret->clear_children();
-        return NONE_CMP_NODE;
-      } else if (rr == NONE_CMP_NODE) {
-        // both lhs and rhs are constants
-        ret->set_kind(rgd::Bool);
-        ret->set_boolvalue(0); // 0 LOr 0 = 0 // rhs == 1 has returned earlier
-        ret->clear_children();
-        return NONE_CMP_NODE;
-      } else { // 0 LOr x = x
-        // lhs is 0, rhs is not
-        ret->CopyFrom(*right);
-        return rr;
-      }
-    } else if (rr == NONE_CMP_NODE) {
-      // rhs is 0, lhs is not
-      ret->CopyFrom(*left);
-      return lr;
-    }
-  }
-
-  ret->set_kind(rgd::LOr);
-  ret->set_bits(1);
-  return CMP_NODE;
-}
-
-static int simplify_xor(dfsan_label_info *info, rgd::AstNode *ret,
-                        size_t &tree_size, size_t depth,
-                        std::unordered_set<size_t> &input_deps,
-                        std::unordered_set<dfsan_label> &subroots,
-                        std::unordered_set<dfsan_label> &visited) {
-  // llvm uses xor to do LNot
-  // symsan always keeps rhs as symbolic
-  dfsan_label lhs = info->l1 >= CONST_OFFSET ? strip_zext(info->l1) : 0;
-  dfsan_label rhs = strip_zext(info->l2);
-  if (likely(rhs == info->l2 && lhs == info->l1 && info->size != 1)) {
-    // if nothing go stripped, we can't simplify
-    int r = find_roots(rhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
-    if (lhs >= CONST_OFFSET) {
-      r |= find_roots(lhs, ret, tree_size, depth + 1, input_deps, subroots, visited);
-    }
-    tree_size += 2;
-    return r;
-  }
-
-  // by communicative, we can parse the rhs first
-  DEBUGF("simplify land: %d LXor %d, %d\n", lhs, rhs, info->size);
-  assert(ret->children_size() == 0);
-  rgd::AstNode *right = ret->add_children();
-  tree_size += 1;
-  int rr = find_roots(rhs, right, tree_size, depth, input_deps, subroots, visited);
-  assert(right->bits() == 1); // rhs must be a boolean after parsing
-  ret->set_bits(1);
-  // if nothing added, rhs must be a constant
-  if (unlikely(rr == NONE_CMP_NODE)) {
-    // if nothing added, rhs must be a constant
-    assert(right->kind() == rgd::Bool);
-    ret->set_kind(rgd::Bool);
-    if (likely(lhs == 0)) { // left is a constant
-      ret->set_boolvalue(right->boolvalue() ^ (uint32_t)info->op1.i);
-      ret->clear_children();
-      return NONE_CMP_NODE;
-    } // left is symbolic, fall through
-  }
-  
-  if (likely(lhs == 0)) {
-    // when reach here, rhs must not be a constant
-    if (info->op1.i == 1) { // 1 LXor x = LNot x
-      ret->set_kind(rgd::LNot);
-      return CMP_NODE;
-    } else { // 0 LXor x = x
-      ret->CopyFrom(*right);
-      return rr;
-    }
-  } else {
-    rgd::AstNode *left = ret->add_children();
-    tree_size += 1;
-    int lr = find_roots(lhs, left, tree_size, depth, input_deps, subroots, visited);
-    // if nothing added, lhs must be a constant
-    if (unlikely(lr == NONE_CMP_NODE)) {
-      // if nothing added, lhs must be a constant
-      assert(left->kind() == rgd::Bool);
-      if (left->boolvalue() == 0) { // 0 LXor x = x
-        ret->CopyFrom(*right);
-      } else if (rr == NONE_CMP_NODE) {
-        // both lhs and rhs are constants
-        ret->set_kind(rgd::Bool);
-        ret->set_boolvalue(right->boolvalue() ^ left->boolvalue());
-        ret->clear_children();
-      } else { // 1 LXor x = LNot x
-        ret->set_kind(rgd::LNot);
-      }
-      return rr;
-    } else if (rr == NONE_CMP_NODE) {
-      // rhs is constant, lhs is not
-      if (right->boolvalue() == 0) { // x LXor 0 = x
-        ret->CopyFrom(*left);
-      } else { // x LXor 1 = LNot x
-        ret->set_kind(rgd::LNot);
-      }
-      return lr;
-    }
-  }
-
-  ret->set_kind(rgd::Xor);
-  return CMP_NODE;
-}
-
 static int find_roots(dfsan_label label, rgd::AstNode *ret,
-                      size_t &tree_size, size_t depth,
-                      std::unordered_set<size_t> &input_deps,
-                      std::unordered_set<dfsan_label> &subroots,
-                      std::unordered_set<dfsan_label> &visited) {
+                      std::unordered_set<dfsan_label> &subroots) {
   if (label < CONST_OFFSET || label == kInitializingLabel) {
     WARNF("invalid label: %d\n", label);
     return INVALID_NODE;
   }
 
-  dfsan_label_info *info = get_label_info(label);
+  std::vector<dfsan_label> stack;
+  dfsan_label root = label;
+  dfsan_label prev = 0;
+  std::vector<rgd::AstNode*> node_stack;
+  rgd::AstNode *root_node = ret;
+  std::unordered_set<dfsan_label> visited;
 
-  if (info->op == 0) {
-    tree_size += 1;
-    input_deps.insert(info->op1.i);
-    return NONE_CMP_NODE;
-  } else if (info->op == __dfsan::Load) {
-    tree_size += 1;
-    uint64_t offset = get_label_info(info->l1)->op1.i;
-    for (size_t i = 0; i < info->l2; ++i)
-      input_deps.insert(offset + i);
-    return NONE_CMP_NODE;
-  }
-
-  // check for visited after input deps have been added
-  if (visited.count(label)) {
-    tree_size += 1;
-    return NONE_CMP_NODE;
-  }
-  visited.insert(label);
-
-  if (depth > MAX_DEPTH) {
-    WARNF("exceed max depth: %zu\n", depth);
-    return CONCRETIZE_NODE;
-  }
-
-  // possible boolean operations
-  if (info->op == __dfsan::And) {
-    return simplify_land(info, ret, tree_size, depth, input_deps, subroots, visited);
-  } else if (info->op == __dfsan::Or) {
-    return simplify_lor(info, ret, tree_size, depth, input_deps, subroots, visited);
-  } else if (info->op == __dfsan::Xor) {
-    return simplify_xor(info, ret, tree_size, depth, input_deps, subroots, visited);
-  } else if ((info->op & 0xff) == __dfsan::ICmp) {
-    // if it's a comparison, we need to make sure both operands don't
-    // contain any additional comparison operator
-    int lr = NONE_CMP_NODE, rr = NONE_CMP_NODE;
-    rgd::AstNode *left = ret->add_children();
-    rgd::AstNode *right = ret->add_children();
-    size_t left_size = 0, right_size = 0;
-    std::unordered_set<size_t> left_deps, right_deps;
-    visited.clear(); // don't carry visited info across subtrees, to properly collect input deps
-    auto &deps = branch_to_inputs[label]; // get the input deps of this branch
-    if (info->l1 >= CONST_OFFSET) {
-      lr = find_roots(strip_zext(info->l1), left, left_size, 1, left_deps, subroots, visited);
-      // if something wrong happens, concretize the whole subtree
-      if (unlikely(((lr & INVALID_NODE) != 0) || ((lr & CONCRETIZE_NODE) != 0))) {
-        left->set_kind(rgd::Constant);
-        left_size = 1;
-        left_deps.clear();
-        lr = NONE_CMP_NODE;
-        visited.clear(); // needs to clear the visited nodes so the AST size is correct
-        // record the info
-        concretize_node[label] = 1;
+  while (root != 0 || !stack.empty()) {
+    if (root != 0) {
+      // check if the node has been visited before
+      if (visited.find(root) != visited.end()) {
+        // already visited, skip the subtree
+        prev = root;
+        root = 0;
+        continue;
       }
-    } else {
-      left->set_kind(rgd::Constant);
-      left_size = 1;
-    }
-    if (info->l2 >= CONST_OFFSET) {
-      rr = find_roots(strip_zext(info->l2), right, right_size, 1, right_deps, subroots, visited);
-      if (unlikely(((rr & INVALID_NODE) != 0) || ((rr & CONCRETIZE_NODE) != 0))) {
-        right->set_kind(rgd::Constant);
-        right_size = 1;
-        right_deps.clear();
-        rr = NONE_CMP_NODE;
-        // record the info
-        concretize_node[label] = 2;
-      }
-    } else {
-      right->set_kind(rgd::Constant);
-      right_size = 1;
-    }
-    // if both sides are constants, set it as a constant boolean
-    if (unlikely(left->kind() == rgd::Constant && right->kind() == rgd::Constant)) {
-      ret->set_kind(rgd::Bool);
-      ret->set_bits(1);
-      ret->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
-      ret->clear_children();
-      return NONE_CMP_NODE;
-    }
-    deps.insert(left_deps.begin(), left_deps.end()); // propagate input deps
-    deps.insert(right_deps.begin(), right_deps.end()); // propagate input deps
-    input_deps.insert(deps.begin(), deps.end()); // propagate input deps
-    if (unlikely(lr)) {
-      // if there are additional icmp in lhs, this icmp must be simplifiable
-      assert(left->bits() == 1);
-      assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
-      if (likely(info->l2 == 0)) {
-        if (is_rel_cmp(info->op, __dfsan::bveq)) {
-          if (info->op2.i == 1) { // checking bool == true
-            ret->CopyFrom(*left);
-          } else { // checking bool == false
-            ret->set_kind(rgd::LNot);
-            ret->set_bits(1);
-            ret->clear_children(1);
-          }
-        } else { // bvneq
-          if (info->op2.i == 0) { // checking bool != false
-            ret->CopyFrom(*left);
-          } else { // checking bool != true
-            ret->set_kind(rgd::LNot);
-            ret->set_bits(1);
-            ret->clear_children(1);
-          }
-        }
-        tree_size += left_size;
-        return CMP_NODE;
+      // mark to be visit in the future, for in-order and post-order visitors
+      stack.push_back(root);
+      node_stack.push_back(root_node);
+      auto *info = get_label_info(root);
+      if (nested_cmp_cache[info->l1] == 0) {
+        // no nested comparison in the left child, stop going down
+        // again, we only collect a partial AST with comparison nodes as leafs
+        // so the traversal should stop before reaching any actual leaf node
+        root = 0;
       } else {
-        // bool icmp bool ?!
-        WARNF("bool icmp bool ?!\n");
-        ret->set_kind(rgd::Bool);
-        ret->set_bits(1);
-        ret->set_boolvalue(0);
-        ret->clear_children();
-        return NONE_CMP_NODE;
-      }
-    } else if (unlikely(rr)) {
-      // if there are additional icmp in rhs, this icmp must be simplifiable
-      assert(right->bits() == 1);
-      assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
-      if (likely(info->l1 == 0)) {
-        if (is_rel_cmp(info->op, __dfsan::bveq)) {
-          if (info->op1.i == 1) { // checking true == bool
-            ret->CopyFrom(*right);
-          } else { // checking false == bool
-            ret->set_kind(rgd::LNot);
-            ret->set_bits(1);
-            ret->clear_children(0);
-          }
-        } else { // bvneq
-          if (info->op1.i == 0) { // checking false != bool
-            ret->CopyFrom(*right);
-          } else { // checking true != bool
-            ret->set_kind(rgd::LNot);
-            ret->set_bits(1);
-            ret->clear_children(0);
-          }
+        root = strip_zext(info->l1);
+        if (root) {
+          // create a child node before going down
+          root_node = root_node->add_children();
         }
-        tree_size += right_size;
-        return CMP_NODE;
-      } else {
-        // bool icmp bool ?!
-        WARNF("bool icmp bool ?!\n");
-        ret->set_kind(rgd::Bool);
-        ret->set_bits(1);
-        ret->set_boolvalue(0);
-        ret->clear_children();
-        return NONE_CMP_NODE;
       }
     } else {
-      // !lr && !rr when reach here
-      ret->set_bits(1);
-      auto itr = OP_MAP.find(info->op);
-      assert(itr != OP_MAP.end());
-      ret->set_kind(itr->second.first);
-      ret->set_label(label);
-      ret->clear_children();
-      // true subroot, save the size of this subtree
-      ast_size_cache.insert({label, left_size + right_size});
+      // we have reached some leaf node, going up the tree
+      auto curr = stack.back();
+      auto info = __dfsan::get_label_info(curr);
+      auto zsl2 = strip_zext(info->l2);
+      if (nested_cmp_cache[zsl2] > 0 && prev != zsl2) {
+        // we have a right child, and we haven't visited it yet,
+        // and there is a nested comparison, going down the right tree
+        root = zsl2;
+        root_node = node_stack.back()->add_children();
+      } else {
+        DEBUGF("label %d, l1 %d, l2 %d, op %d, size %d, op1 %ld, op2 %ld\n",
+               curr, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i);
+        // both children nodes have been visited, process the node (post-order)
+        auto node = node_stack.back();
+
+        if (info->op == __dfsan::And) {
+          // if And apprears, it must be LAnd, try to simplify
+          DEBUGF("simplify land: %d LAnd %d, %d\n", info->l1, info->l2, info->size);
+          assert(node->children_size() != 0);
+          assert(info->size == 1);
+          uint32_t child = 0;
+          rgd::AstNode *left = nullptr;
+          rgd::AstNode *right = nullptr;
+          if (nested_cmp_cache[info->l1] > 0) {
+            left = node->mutable_children(0);
+            child = 1; // if left child exists, rhs will be child 1
+          }
+          if (nested_cmp_cache[info->l2] > 0) {
+            right = node->mutable_children(child);
+          }
+          node->set_bits(1);
+
+          if (unlikely(info->l1 == 0)) {
+            // lhs is a constant
+            if (info->op1.i == 0) { // 0 LAnd x = 0
+              node->set_kind(rgd::Bool);
+              node->set_boolvalue(0);
+              node->clear_children();
+            } else {
+              assert(info->op1.i == 1); // 1 LAnd x = x
+              assert(right != nullptr);
+              node->CopyFrom(*right);
+            }
+          } else {
+            assert(left != nullptr);
+            assert(right != nullptr);
+            // check for constant
+            if (left->kind() == rgd::Bool) {
+              if (left->boolvalue() == 0) { // 0 LAnd x = 0
+                node->set_kind(rgd::Bool);
+                node->set_boolvalue(0);
+                node->clear_children();
+              } else if (right->kind() == rgd::Bool) {
+                // both lhs and rhs are constants
+                node->set_kind(rgd::Bool);
+                node->set_boolvalue(right->boolvalue()); // 1 LAnd b = b
+                node->clear_children();
+              } else { // 1 LAnd x = x
+                // lhs is 1, rhs is not
+                node->CopyFrom(*right);
+              }
+            } else if (right->kind() == rgd::Bool) {
+              // lhs is not a constant, check rhs
+              if (right->boolvalue() == 0) { // x LAnd 0 = 0
+                node->set_kind(rgd::Bool);
+                node->set_boolvalue(0);
+                node->clear_children();
+              } else { // x LAnd 1 = x
+                // rhs is 1, lhs is not
+                node->CopyFrom(*left);
+              }
+            } else {
+              // both sides are symbolic
+              node->set_kind(rgd::LAnd);
+            }
+          }
+        } else if (info->op == __dfsan::Or) {
+          DEBUGF("simplify lor: %d LOr %d, %d\n", info->l1, info->l2, info->size);
+          assert(node->children_size() != 0);
+          assert(info->size == 1);
+          uint32_t child = 0;
+          rgd::AstNode *left = nullptr;
+          rgd::AstNode *right = nullptr;
+          if (nested_cmp_cache[info->l1] > 0) {
+            left = node->mutable_children(0);
+            child = 1; // if left child exists, rhs will be child 1
+          }
+          if (nested_cmp_cache[info->l2] > 0) {
+            right = node->mutable_children(child);
+          }
+          node->set_bits(1);
+
+          if (unlikely(info->l1 == 0)) {
+            // lhs is a constant
+            if (info->op1.i == 1) { // x LOr 1 = 1
+              node->set_kind(rgd::Bool);
+              node->set_boolvalue(1);
+              node->clear_children();
+            } else { // 0 LOr x = x
+              assert(info->op1.i == 0);
+              assert(right != nullptr);
+              node->CopyFrom(*right);
+            }
+          } else {
+            assert(left != nullptr);
+            assert(right != nullptr);
+            // check for constant
+            if (left->kind() == rgd::Bool) {
+              if (left->boolvalue() == 1) { // 1 LOr x = 1
+                node->set_kind(rgd::Bool);
+                node->set_boolvalue(1);
+                node->clear_children();
+              } else if (right->kind() == rgd::Bool) {
+                // both lhs and rhs are constants
+                node->set_kind(rgd::Bool);
+                node->set_boolvalue(right->boolvalue()); // 0 LOr b = b
+                node->clear_children();
+              } else { // 0 LOr x = x
+                // lhs is 0, rhs is not
+                node->CopyFrom(*right);
+              }
+            } else if (right->kind() == rgd::Bool) {
+              if (right->boolvalue() == 1) { // x LOr 1 = 1
+                node->set_kind(rgd::Bool);
+                node->set_boolvalue(1);
+                node->clear_children();
+              } else { // x LOr 0 = x
+                // rhs is 0, lhs is not
+                node->CopyFrom(*left);
+              }
+            } else {
+              // both sides are symbolic
+              node->set_kind(rgd::LOr);
+            }
+          }
+        } else if (info->op == __dfsan::Xor) {
+          DEBUGF("simplify lxor: %d LXOr %d, %d\n", info->l1, info->l2, info->size);
+          assert(node->children_size() != 0);
+          assert(info->size == 1);
+          uint32_t child = 0;
+          rgd::AstNode *left = nullptr;
+          rgd::AstNode *right = nullptr;
+          if (nested_cmp_cache[info->l1] > 0) {
+            left = node->mutable_children(0);
+            child = 1; // if left child exists, rhs will be child 1
+          }
+          if (nested_cmp_cache[info->l2] > 0) {
+            right = node->mutable_children(child);
+          }
+          node->set_bits(1);
+
+          if (likely(info->l1 == 0)) {
+            // lhs is a constant
+            assert(right != nullptr);
+            if (unlikely(right->kind() == rgd::Bool)) {
+              // rhs is a constant
+              node->set_kind(rgd::Bool);
+              node->set_boolvalue(right->boolvalue() ^ (uint32_t)info->op1.i);
+              node->clear_children();
+            } else {
+              // rhs is symbolic
+              if (info->op1.i == 1) { // 1 LXor x = LNot x
+                node->set_kind(rgd::LNot);
+              } else { // 0 LXor x = x
+                node->CopyFrom(*right);
+              }
+            }
+          } else {
+            assert(left != nullptr);
+            assert(right != nullptr);
+
+            // check for constant
+            if (unlikely(left->kind() == rgd::Bool)) {
+              if (unlikely(right->kind() == rgd::Bool)) {
+                // both lhs and rhs are constants
+                node->set_kind(rgd::Bool);
+                node->set_boolvalue(right->boolvalue() ^ left->boolvalue());
+                node->clear_children();
+              } else if (left->boolvalue() == 0) { // 0 LXor x = x
+                node->CopyFrom(*right);
+              } else { // 1 LXor x = LNot x
+                node->set_kind(rgd::LNot);
+              }
+            } else if (unlikely(right->kind() == rgd::Bool)) {
+              // rhs is constant, lhs is not
+              if (right->boolvalue() == 0) { // x LXor 0 = x
+                node->CopyFrom(*left);
+              } else { // x LXor 1 = LNot x
+                node->set_kind(rgd::LNot);
+              }
+            } else {
+              // both sides are symbolic
+              node->set_kind(rgd::Xor);
+            }
+          }
+        } else if ((info->op & 0xff) == __dfsan::ICmp) {
+          // cmp node
+          node->set_bits(1);
+          if (likely(node->children_size() == 0)) {
+            // if the node has no children, it's a leaf node
+            auto itr = OP_MAP.find(info->op);
+            assert(itr != OP_MAP.end());
+            node->set_kind(itr->second.first);
+            node->set_label(curr);
 #ifdef DEBUG
-      subroots.insert(label);
+            subroots.insert(curr);
 #endif
-      return CMP_NODE;
-    }
-  } else if (info->op == __dfsan::fmemcmp) {
-    // memcmp is also considered as a root node (relational comparison)
-    int s1_r = NONE_CMP_NODE, s2_r = NONE_CMP_NODE;
-    rgd::AstNode *s1 = ret->add_children();
-    rgd::AstNode *s2 = ret->add_children();
-    size_t s1_size = 0, s2_size = 0;
-    std::unordered_set<size_t> s1_deps, s2_deps;
-    visited.clear(); // don't carry visited info across subtrees
-    auto &deps = branch_to_inputs[label]; // get the input deps of this branch
-    if (info->l1 >= CONST_OFFSET) {
-      s1_r = find_roots(info->l1, s1, s1_size, 1, s1_deps, subroots, visited);
-      // if something wrong happens, return error, as the concrete value is not
-      // available
-      if (unlikely(((s1_r & INVALID_NODE) != 0) || ((s1_r & CONCRETIZE_NODE) != 0))) {
-        return s1_r;
+          } else if (node->children_size() == 1) {
+            // one side has another icmp, must be simplifiable
+            assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
+            if (nested_cmp_cache[info->l1]) {
+              // nested icmp in the lhs
+              rgd::AstNode *left = node->mutable_children(0);
+              assert(left->bits() == 1);
+              if (likely(info->l2 == 0)) {
+                if (is_rel_cmp(info->op, __dfsan::bveq)) {
+                  if (info->op2.i == 1) { // checking bool == true
+                    node->CopyFrom(*left);
+                  } else { // checking bool == false
+                    node->set_kind(rgd::LNot);
+                    node->clear_children(1);
+                  }
+                } else { // bvneq
+                  if (info->op2.i == 0) { // checking bool != false
+                    node->CopyFrom(*left);
+                  } else { // checking bool != true
+                    node->set_kind(rgd::LNot);
+                    node->clear_children(1);
+                  }
+                }
+              } else {
+                // l2 != 0, bool icmp bool ?!
+                WARNF("bool icmp bool ?!\n");
+                node->set_kind(rgd::Bool);
+                node->set_boolvalue(0);
+                node->clear_children();
+              }
+            } else {
+              // nested icmp in the rhs
+              assert(nested_cmp_cache[info->l2] > 0);
+              rgd::AstNode *right = node->mutable_children(0);
+              assert(right->bits() == 1);
+              if (likely(info->l1 == 0)) {
+                if (is_rel_cmp(info->op, __dfsan::bveq)) {
+                  if (info->op1.i == 1) { // checking true == bool
+                    node->CopyFrom(*right);
+                  } else { // checking false == bool
+                    node->set_kind(rgd::LNot);
+                    node->clear_children(0);
+                  }
+                } else { // bvneq
+                  if (info->op1.i == 0) { // checking false != bool
+                    node->CopyFrom(*right);
+                  } else { // checking true != bool
+                    node->set_kind(rgd::LNot);
+                    node->clear_children(0);
+                  }
+                }
+              } else {
+                // l1 != 0, bool icmp bool ?!
+                WARNF("bool icmp bool ?!\n");
+                node->set_kind(rgd::Bool);
+                node->set_boolvalue(0);
+                node->clear_children();
+              }
+            }
+          } else {
+            // both sides have another icmp, set as a constant boolean
+            node->set_kind(rgd::Bool);
+            node->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
+            node->clear_children();
+          }
+        } else if (info->op == __dfsan::fmemcmp) {
+          // memcmp is also considered as a root node (relational comparison)
+          assert(node->children_size() == 0 && "memcmp should not have additional icmp");
+          node->set_bits(1); // XXX: treat memcmp as a boolean
+          node->set_kind(rgd::Memcmp); // fix later
+          node->set_label(label);
+#ifdef DEBUG
+          subroots.insert(curr);
+#endif
+        }
+
+        // mark as visited and pop from stack
+        visited.insert(curr);
+        prev = curr;
+        stack.pop_back();
+        node_stack.pop_back();
       }
-    } else { s1_size = 1;}
-    assert(info->l2 >= CONST_OFFSET);
-    s2_r = find_roots(info->l2, s2, s2_size, 1, s2_deps, subroots, visited);
-    // if something wrong happens, return error, as the concrete value is not
-    // available
-    if (unlikely(((s2_r & INVALID_NODE) != 0) || ((s2_r & CONCRETIZE_NODE) != 0))) {
-      return s2_r;
     }
-    deps.insert(s1_deps.begin(), s1_deps.end()); // propagate input deps
-    deps.insert(s2_deps.begin(), s2_deps.end()); // propagate input deps
-    input_deps.insert(deps.begin(), deps.end()); // propagate input deps
-    assert(!s1_r && !s2_r && "memcmp should not have additional icmp");
-    ret->set_bits(1); // XXX: treat memcmp as a boolean
-    ret->set_kind(rgd::Memcmp); // fix later
-    ret->set_label(label);
-    ret->clear_children();
-    // true subroot, save the size of this subtree
-    ast_size_cache.insert({label, s1_size + s2_size});
-#ifdef DEBUG
-    subroots.insert(label);
-#endif
-    return CMP_NODE;
   }
 
-  // for all other cases, just visit the operands
-  int r = NONE_CMP_NODE;
-  if (info->l1 >= CONST_OFFSET) {
-    r |= find_roots(info->l1, ret, tree_size, depth + 1, input_deps, subroots, visited);
-  }
-  if (likely(info->l2 >= CONST_OFFSET)) {
-    r |= find_roots(info->l2, ret, tree_size, depth + 1, input_deps, subroots, visited);
-  }
-  tree_size += 2; // count two children to be conservative
-  return r;
+  return 0;
 }
 
 static void printAst(const rgd::AstNode *node, int indent) {
@@ -1102,7 +960,7 @@ static void to_nnf(bool expected_r, rgd::AstNode *node) {
   }
 }
 
-typedef std::vector<std::vector<const rgd::AstNode*> > formula_t;
+using formula_t = std::vector<std::vector<const rgd::AstNode*> > ;
 
 static void to_dnf(const rgd::AstNode *node, formula_t &formula) {
   if (node->kind() == rgd::LAnd) {
@@ -1131,23 +989,92 @@ static void to_dnf(const rgd::AstNode *node, formula_t &formula) {
   }
 }
 
-static inline expr_t get_root_expr(dfsan_label label) {
+static void scan_labels(dfsan_label label, size_t buf_size) {
+  // assuming label has been checked by caller
+  // assuming the last label scanned is the size of the cache
+  // turns out linear scan is way faster than tree traversal
+  for (size_t i = ast_size_cache.size(); i <= label; i++) {
+    if (i == 0) { // the constant label
+      ast_size_cache.push_back(1); // constant takes one node too
+      branch_to_inputs.emplace_back(input_dep_t());
+      nested_cmp_cache.push_back(0);
+      continue;
+    }
+    dfsan_label_info *info = get_label_info(i);
+    if (info->op == 0) {
+      // AST nodes
+      ast_size_cache.push_back(1); // one Read node
+      // input deps
+      branch_to_inputs.emplace_back(input_dep_t(buf_size));
+      auto &itr = branch_to_inputs[i];
+      itr.set(info->op1.i); // input offset
+      assert(branch_to_inputs[i].find_first() == info->op1.i);
+      // nested cmp?
+      nested_cmp_cache.push_back(0);
+    } else if (info->op == __dfsan::Load) {
+      // AST nodes
+      ast_size_cache.push_back(1); // one Read node
+      // input deps
+      branch_to_inputs.emplace_back(input_dep_t(buf_size));
+      auto &itr = branch_to_inputs[i];
+      auto offset = get_label_info(info->l1)->op1.i;
+      for (size_t n = 0; n < info->l2; ++n) {
+        // DEBUGF("adding input: %lu <- %lu\n", i, offset + n);
+        itr.set(offset + n); // input offsets
+      }
+      assert(branch_to_inputs[i].find_first() == offset);
+      // nested cmp?
+      nested_cmp_cache.push_back(0);
+    } else {
+      // AST nodes
+      uint32_t left  = info->l1 == 0? 1 : ast_size_cache[info->l1];
+      uint32_t right = info->l2 == 0? 1 : ast_size_cache[info->l2];
+      ast_size_cache.push_back(left + right + 1);
+      // input deps
+      branch_to_inputs.emplace_back(input_dep_t(buf_size));
+      auto &itr = branch_to_inputs[i];
+      if (info->l1 != 0) itr |= branch_to_inputs[info->l1];
+      if (info->l2 != 0) itr |= branch_to_inputs[info->l2];
+      // nested cmp?
+      uint8_t nested = 0;
+      nested += info->l1 == 0? 0 : nested_cmp_cache[info->l1];
+      nested += info->l2 == 0? 0 : nested_cmp_cache[info->l2];
+      if (info->op == __dfsan::fmemcmp || (info->op & 0xff) == __dfsan::ICmp)
+        nested += 1;
+      nested_cmp_cache.push_back(nested);
+    }
+  }
+#if DEBUG
+  DEBUGF("ast_size: %d = %u\n", label, ast_size_cache[label]);
+  DEBUGF("input deps %d:", label);
+  auto &itr = branch_to_inputs[label];
+  for (auto i = itr.find_first(); i != input_dep_t::npos; i = itr.find_next(i)) {
+    DEBUGF("%lu ", i);
+  }
+  DEBUGF("\n");
+  DEBUGF("nested cmp: %d = %d\n", label, nested_cmp_cache[label]);
+#endif
+}
+
+static inline expr_t get_root_expr(dfsan_label label, size_t buf_size) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) {
+    WARNF("invalid label: %d\n", label);
+    return nullptr;
+  }
+
   expr_t root = nullptr;
   auto itr = root_expr_cache.find(label);
   if (itr != root_expr_cache.end()) {
     root = itr->second;
   } else {
+    // update ast_size and branch_to_inputs caches
+    scan_labels(label, buf_size);
     root = std::make_shared<rgd::AstNode>();
     std::unordered_set<dfsan_label> subroots;
-    std::unordered_set<dfsan_label> visited;
-    size_t tree_size = 0;
-    // FIXME: implicitly updated here, not very clean
-    auto &deps = branch_to_inputs[label];
     // we start by constructing a boolean formula with relational expressions
     // as leaf nodes
-    find_roots(label, root.get(), tree_size, 0, deps, subroots, visited);
+    find_roots(label, root.get(), subroots);
     root_expr_cache.insert({label, root});
-    ast_size_cache.insert({label, tree_size});
 #if DEBUG
     for (auto const& subroot : subroots) {
       DEBUGF("subroot: %d\n", subroot);
@@ -1168,7 +1095,7 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
   // given a condition, we want to parse them into a DNF form of
   // relational sub-expressions, where each sub-expression only contains
   // one relational operator at the root
-  expr_t orig_root = get_root_expr(label);
+  expr_t orig_root = get_root_expr(label, buf_size);
   if (orig_root->kind() == rgd::Bool) {
     // if the simplified formula is a boolean constant, nothing to do
     return false;
@@ -1207,13 +1134,15 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
       // then, iterate each var in the clause
       for (auto const& var: clause) {
         const dfsan_label l = var->label();
-        auto itr = branch_to_inputs.find(l);
-        assert(itr != branch_to_inputs.end());
-        assert(itr->second.size() > 0);
+        assert(branch_to_inputs.size() > l);
+        auto &itr = branch_to_inputs[l];
+        assert(itr.find_first() != input_dep_t::npos);
         // for each input byte used in the var, we collect additional constraints
         // first, we use union find to add additional related input bytes
         std::unordered_set<size_t> related_inputs;
-        for (auto input: itr->second) {
+        // for (auto input: itr->second) {
+        for (auto input = itr.find_first(); input != input_dep_t::npos;
+             input = itr.find_next(input)) {
           data_flow_deps.get_set(input, related_inputs);
         }
         // then, we collect the branch constraints for each related input byte
@@ -1248,7 +1177,7 @@ static bool add_data_flow_constraints(bool direction, dfsan_label label,
   // similar to solving tasks, we parse the original branch constraint
   // into a DNF form of relational sub-expressions, where each sub-expression
   // only contains one relational operator at the root
-  expr_t orig_root = get_root_expr(label);
+  expr_t orig_root = get_root_expr(label, buf_size);
   if (orig_root->kind() == rgd::Bool) {
     // if the simplified formula is a boolean constant, nothing to do
     return false;
@@ -1279,16 +1208,17 @@ static bool add_data_flow_constraints(bool direction, dfsan_label label,
       expr_t node = std::make_shared<rgd::AstNode>();
       node->CopyFrom(*var);
       const dfsan_label l = node->label();
-      auto itr = branch_to_inputs.find(l);
-      assert(itr != branch_to_inputs.end());
-      assert(itr->second.size() > 0);
+      assert(branch_to_inputs.size() > l);
+      auto &itr = branch_to_inputs[l];
+      auto root = itr.find_first();
+      assert(root != input_dep_t::npos);
       // update uion find
-      size_t root = *(itr->second.begin());
-      for (auto iitr = ++itr->second.begin(); iitr != itr->second.end(); ++iitr) {
+      for (auto input = itr.find_next(root); input != input_dep_t::npos;
+           input = itr.find_next(input)) {
 #if DEBUG
-        DEBUGF("union input bytes: (%zu, %zu)\n", root, *iitr);
+        DEBUGF("union input bytes: (%zu, %zu)\n", root, input);
 #endif
-        root = data_flow_deps.merge(root, *iitr);
+        root = data_flow_deps.merge(root, input);
       }
       // add the constraint
       auto &bucket = input_to_branches[root];
