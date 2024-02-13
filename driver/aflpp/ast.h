@@ -126,7 +126,7 @@ namespace rgd {
 
   class AstNode {
   public:
-    AstNode(int size=32) : child0_(0), child1_(0), kind_(0), bits_(0), index_(0),
+    AstNode(size_t size=32) : child0_(0), child1_(0), kind_(0), bits_(0), index_(0),
       boolvalue_(0), is_root_(1), label_(0), hash_(0) {
       root_ = new std::vector<AstNode>(); // only allocate if is root
       root_->reserve(size + 1); // default capacity, +1 for dummy root
