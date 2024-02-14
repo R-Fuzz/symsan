@@ -843,57 +843,64 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
             }
           } else if (node->children_size() == 1) {
             // one side has another icmp, must be simplifiable
-            assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
-            if (nested_cmp_cache[info->l1]) {
-              // nested icmp in the lhs
-              rgd::AstNode *left = node->mutable_children(0);
-              assert(left->bits() == 1);
-              if (likely(info->l2 == 0)) {
-                if (is_rel_cmp(info->op, __dfsan::bveq)) {
-                  if (info->op2.i == 1) { // checking bool == true
-                    node->CopyFrom(*left);
-                  } else { // checking bool == false
-                    node->set_kind(rgd::LNot);
-                  }
-                } else { // bvneq
-                  if (info->op2.i == 0) { // checking bool != false
-                    node->CopyFrom(*left);
-                  } else { // checking bool != true
-                    node->set_kind(rgd::LNot);
-                  }
-                }
-              } else {
-                // l2 != 0, bool icmp bool ?!
-                WARNF("bool icmp bool ?!\n");
-                node->set_kind(rgd::Bool);
-                node->set_boolvalue(0);
-                node->clear_children();
-              }
+            // assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
+            if (!is_rel_cmp(info->op, __dfsan::bveq) && !is_rel_cmp(info->op, __dfsan::bvneq)) {
+              WARNF("unexpected icmp: %d\n", info->op);
+              // unexpected icmp, set as a constant boolean
+              node->set_kind(rgd::Bool);
+              node->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
             } else {
-              // nested icmp in the rhs
-              assert(nested_cmp_cache[info->l2] > 0);
-              rgd::AstNode *right = node->mutable_children(0);
-              assert(right->bits() == 1);
-              if (likely(info->l1 == 0)) {
-                if (is_rel_cmp(info->op, __dfsan::bveq)) {
-                  if (info->op1.i == 1) { // checking true == bool
-                    node->CopyFrom(*right);
-                  } else { // checking false == bool
-                    node->set_kind(rgd::LNot);
+              if (nested_cmp_cache[info->l1]) {
+                // nested icmp in the lhs
+                rgd::AstNode *left = node->mutable_children(0);
+                assert(left->bits() == 1);
+                if (likely(info->l2 == 0)) {
+                  if (is_rel_cmp(info->op, __dfsan::bveq)) {
+                    if (info->op2.i == 1) { // checking bool == true
+                      node->CopyFrom(*left);
+                    } else { // checking bool == false
+                      node->set_kind(rgd::LNot);
+                    }
+                  } else { // bvneq
+                    if (info->op2.i == 0) { // checking bool != false
+                      node->CopyFrom(*left);
+                    } else { // checking bool != true
+                      node->set_kind(rgd::LNot);
+                    }
                   }
-                } else { // bvneq
-                  if (info->op1.i == 0) { // checking false != bool
-                    node->CopyFrom(*right);
-                  } else { // checking true != bool
-                    node->set_kind(rgd::LNot);
-                  }
+                } else {
+                  // l2 != 0, bool icmp bool ?!
+                  WARNF("bool icmp bool ?!\n");
+                  node->set_kind(rgd::Bool);
+                  node->set_boolvalue(0);
+                  node->clear_children();
                 }
               } else {
-                // l1 != 0, bool icmp bool ?!
-                WARNF("bool icmp bool ?!\n");
-                node->set_kind(rgd::Bool);
-                node->set_boolvalue(0);
-                node->clear_children();
+                // nested icmp in the rhs
+                assert(nested_cmp_cache[info->l2] > 0);
+                rgd::AstNode *right = node->mutable_children(0);
+                assert(right->bits() == 1);
+                if (likely(info->l1 == 0)) {
+                  if (is_rel_cmp(info->op, __dfsan::bveq)) {
+                    if (info->op1.i == 1) { // checking true == bool
+                      node->CopyFrom(*right);
+                    } else { // checking false == bool
+                      node->set_kind(rgd::LNot);
+                    }
+                  } else { // bvneq
+                    if (info->op1.i == 0) { // checking false != bool
+                      node->CopyFrom(*right);
+                    } else { // checking true != bool
+                      node->set_kind(rgd::LNot);
+                    }
+                  }
+                } else {
+                  // l1 != 0, bool icmp bool ?!
+                  WARNF("bool icmp bool ?!\n");
+                  node->set_kind(rgd::Bool);
+                  node->set_boolvalue(0);
+                  node->clear_children();
+                }
               }
             }
           } else {
