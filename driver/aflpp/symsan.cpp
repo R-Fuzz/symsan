@@ -41,7 +41,7 @@ extern "C" {
 using namespace __dfsan;
 
 #ifndef DEBUG
-#define DEBUG 1
+#define DEBUG 0
 #endif
 
 #if !DEBUG
@@ -799,7 +799,10 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
             // if the node has no children, it's a leaf node
             // check size, concretize if too large
             auto size = ast_size_cache.at(curr);
-            uint8_t concretize = 0;
+            // load previous value as previous concretization could have
+            // changed the ast size used for allocation
+            auto itr = concretize_node.find(curr);
+            uint8_t concretize = itr != concretize_node.end() ? itr->second : 0;
             if (size > MAX_AST_SIZE) {
               DEBUGF("AST size too large: %d = %u\n", curr, size);
               auto left_size = ast_size_cache.at(info->l1);
@@ -1166,11 +1169,20 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
         const dfsan_label l = var->label();
         assert(branch_to_inputs.size() > l);
         auto &itr = branch_to_inputs[l];
+        auto citr = concretize_node.find(l);
+        if (unlikely(citr != concretize_node.end())) {
+          if (citr->second == 1) {
+            // if the lhs is concretized, use the rhs deps only
+            itr = branch_to_inputs[get_label_info(l)->l2];
+          } else if (citr->second == 2) {
+            // if the rhs is concretized, use the lhs deps only
+            itr = branch_to_inputs[get_label_info(l)->l1];
+          }
+        }
         assert(itr.find_first() != input_dep_t::npos);
         // for each input byte used in the var, we collect additional constraints
         // first, we use union find to add additional related input bytes
         std::unordered_set<size_t> related_inputs;
-        // for (auto input: itr->second) {
         for (auto input = itr.find_first(); input != input_dep_t::npos;
              input = itr.find_next(input)) {
           data_flow_deps.get_set(input, related_inputs);
@@ -1240,6 +1252,16 @@ static bool add_data_flow_constraints(bool direction, dfsan_label label,
       const dfsan_label l = node->label();
       assert(branch_to_inputs.size() > l);
       auto &itr = branch_to_inputs[l];
+      auto citr = concretize_node.find(l);
+      if (unlikely(citr != concretize_node.end())) {
+        if (citr->second == 1) {
+          // if the lhs is concretized, use the rhs deps only
+          itr = branch_to_inputs[get_label_info(l)->l2];
+        } else if (citr->second == 2) {
+          // if the rhs is concretized, use the lhs deps only
+          itr = branch_to_inputs[get_label_info(l)->l1];
+        }
+      }
       auto root = itr.find_first();
       assert(root != input_dep_t::npos);
       // update uion find
