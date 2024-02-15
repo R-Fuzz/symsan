@@ -19,7 +19,8 @@ from optparse import OptionParser
 def defined_function_list(object):
   functions = []
   readelf_proc = subprocess.Popen(['readelf', '-s', '-W', object],
-                                  stdout=subprocess.PIPE)
+                                  stdout=subprocess.PIPE,
+                                  universal_newlines=True)
   readelf = readelf_proc.communicate()[0].split('\n')
   if readelf_proc.returncode != 0:
     raise subprocess.CalledProcessError(readelf_proc.returncode, 'readelf')
@@ -45,7 +46,7 @@ p.add_option('--libgcc-dso-path', metavar='PATH',
              default='/lib/x86_64-linux-gnu')
 p.add_option('--libgcc-archive-path', metavar='PATH',
              help='path to libgcc archive directory',
-             default='/usr/lib/gcc/x86_64-linux-gnu/7.4.0')
+             default='/usr/lib/gcc/x86_64-linux-gnu/11')
 
 p.add_option('--with-libstdcxx', action='store_true',
              dest='with_libstdcxx',
@@ -98,10 +99,10 @@ for l in libs:
   if os.path.exists(l):
     functions += defined_function_list(l)
   else:
-    print >> sys.stderr, 'warning: library %s not found' % l
+    print('warning: library %s not found' % l, file=sys.stderr)
 
 functions = list(set(functions))
 functions.sort()
 
 for f in functions:
-  print 'fun:%s=uninstrumented' % f
+  print('fun:%s=uninstrumented' % f)
