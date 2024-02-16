@@ -176,6 +176,7 @@ enum operators {
   // higher-order
   fmemcmp   = last_llvm_op + 7,
   fsize     = last_llvm_op + 8,
+  fatoi     = last_llvm_op + 9,
 };
 
 enum predicate {

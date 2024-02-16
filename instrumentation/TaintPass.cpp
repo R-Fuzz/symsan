@@ -492,7 +492,7 @@ struct TaintFunction {
   void visitCondition(Value *Cond, Instruction *I);
   void visitGEPInst(GetElementPtrInst *I);
   Value *visitAllocaInst(AllocaInst *I);
-  void checkBounds(Value *Ptr, Instruction *Pos);
+  void checkBounds(Value *Ptr, Value *Size, Instruction *Pos);
 
   /// XXX: because we never collapse taint labels for aggregate types,
   ///      we also do not expand taint labels from an aggreated primitive
@@ -861,7 +861,7 @@ bool Taint::doInitialization(Module &M) {
   TaintTraceAllocaFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintTraceAllocaArgs, false);
   TaintCheckBoundsFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), { PrimitiveShadowTy, Int64Ty }, false);
+      Type::getVoidTy(*Ctx), { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy, Int64Ty }, false);
 
   TaintDebugFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
       {PrimitiveShadowTy, PrimitiveShadowTy, PrimitiveShadowTy,
@@ -1568,13 +1568,15 @@ Value *TaintFunction::combineCmpInstShadows(CmpInst *CI,
   return Shadow;
 }
 
-void TaintFunction::checkBounds(Value *Ptr, Instruction *Pos) {
+void TaintFunction::checkBounds(Value *Ptr, Value* Size, Instruction *Pos) {
   IRBuilder<> IRB(Pos);
   Value *PtrShadow = getShadow(Ptr);
+  Value *SizeShadow = getShadow(Size);
   // ptr shadow only exists for array and heap object
   if (!TT.isZeroShadow(PtrShadow)) {
     Value *Addr = IRB.CreatePtrToInt(Ptr, TT.Int64Ty);
-    IRB.CreateCall(TT.TaintCheckBoundsFn, {PtrShadow, Addr});
+    Value *Size64 = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
+    IRB.CreateCall(TT.TaintCheckBoundsFn, {PtrShadow, Addr, SizeShadow, Size});
   }
 }
 
@@ -1705,7 +1707,7 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
   if (!TF.TT.isZeroShadow(Shadow))
     TF.NonZeroChecks.push_back(Shadow);
   if (ClTraceBound)
-    TF.checkBounds(LI.getPointerOperand(), &LI);
+    TF.checkBounds(LI.getPointerOperand(), ConstantInt::get(TF.TT.Int64Ty, Size), &LI);
 
   TF.setShadow(&LI, Shadow);
 }
@@ -1824,7 +1826,7 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
 #endif
   TF.storeShadow(SI.getPointerOperand(), Size, Alignment, Shadow, &SI);
   if (ClTraceBound)
-    TF.checkBounds(SI.getPointerOperand(), &SI);
+    TF.checkBounds(SI.getPointerOperand(), ConstantInt::get(TF.TT.Int64Ty, Size), &SI);
 }
 
 //void TaintVisitor::visitUnaryOperator(UnaryOperator &UO) {
@@ -2072,6 +2074,10 @@ void TaintVisitor::visitSelectInst(SelectInst &I) {
 }
 
 void TaintVisitor::visitMemSetInst(MemSetInst &I) {
+  // check bounds before memset
+  if (ClTraceBound) {
+    TF.checkBounds(I.getDest(), I.getLength(), &I);
+  }
   IRBuilder<> IRB(&I);
   Value *ValShadow = TF.getShadow(I.getValue());
   IRB.CreateCall(TF.TT.TaintSetLabelFn,
@@ -2081,6 +2087,10 @@ void TaintVisitor::visitMemSetInst(MemSetInst &I) {
 }
 
 void TaintVisitor::visitMemTransferInst(MemTransferInst &I) {
+  // check bounds before memcpy
+  if (ClTraceBound) {
+    TF.checkBounds(I.getDest(), I.getLength(), &I);
+  }
   IRBuilder<> IRB(&I);
   Value *DestShadow = TF.TT.getShadowAddress(I.getDest(), IRB);
   Value *SrcShadow = TF.TT.getShadowAddress(I.getSource(), IRB);
