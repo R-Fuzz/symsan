@@ -217,6 +217,9 @@ fun:getrusage=custom
 fun:nanosleep=custom
 fun:pread=custom
 fun:read=custom
+fun:recv=custom
+fun:recv_from=custom
+fun:recv_msg=custom
 fun:socketpair=custom
 fun:stat=custom
 fun:time=custom
@@ -310,6 +313,7 @@ fun:lseek=custom
 fun:fseek=custom
 fun:fseeko=custom
 fun:fseeko64=custom
+fun:connect=custom
 
 # for LAVA
 fun:utmpxname=custom

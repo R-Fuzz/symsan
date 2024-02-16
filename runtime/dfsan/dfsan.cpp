@@ -32,16 +32,19 @@
 #include "union_util.h"
 #include "union_hashtable.h"
 
+#include <assert.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <assert.h>
-#include <fcntl.h>
-#include <string.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 using namespace __dfsan;
 
@@ -60,6 +63,7 @@ static int __current_saved_stack_index = 0;
 
 // taint source
 struct taint_file __dfsan::tainted;
+struct taint_socket __dfsan::tainted_socket;
 
 // Hash table
 static const uptr hashtable_size = (1ULL << 32);
@@ -450,7 +454,7 @@ void __taint_check_bounds(dfsan_label l, uptr addr) {
       if (addr < info->op1.i || addr >= info->op2.i) {
         AOUT("ERROR: OOB detected %p = %d @%p\n", addr, l, __builtin_return_address(0));
       }
-    } else {
+    } else if (l != 0) {
       AOUT("WARNING: incorrect label %p = %d @%p\n", addr, l, __builtin_return_address(0));
     }
   }
@@ -677,6 +681,62 @@ taint_get_offset_label() {
   return tainted.offset_label;
 }
 
+SANITIZER_INTERFACE_ATTRIBUTE void
+taint_set_socket(const void *addr, unsigned addrlen, int fd) {
+  const struct sockaddr *sa = (struct sockaddr *)addr;
+  AOUT("taint host %s:%d\n", tainted_socket.host, tainted_socket.port);
+  if (sa->sa_family != tainted_socket.family) return;
+
+  if (sa->sa_family == AF_INET) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+    if (tainted_socket.port != ntohs(sin->sin_port)) return;
+    struct in_addr addr;
+    inet_pton(AF_INET, tainted_socket.host, &addr);
+    if (addr.s_addr != sin->sin_addr.s_addr) return;
+    // family, port, and address match
+    AOUT("taint sockfd %d\n", fd);
+    tainted_socket.fd = fd;
+  } else if (sa->sa_family == AF_INET6) {
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+    if (tainted_socket.port != ntohs(sin6->sin6_port)) return;
+    struct in6_addr addr;
+    inet_pton(AF_INET6, tainted_socket.host, &addr);
+    if (internal_memcmp(&addr, &sin6->sin6_addr, sizeof(addr)) != 0) return;
+    // family, port, and address match
+    AOUT("taint sockfd %d\n", fd);
+    tainted_socket.fd = fd;
+  } else if (sa->sa_family == AF_UNIX) {
+    struct sockaddr_un *sun = (struct sockaddr_un *)sa;
+    if (internal_strncmp(tainted_socket.host, sun->sun_path, sizeof(tainted_socket.host)) == 0) {
+      AOUT("taint sockfd %d\n", fd);
+      tainted_socket.fd = fd;
+    }
+  }
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE off_t
+taint_get_socket(int fd) {
+  if (tainted_socket.fd == fd) {
+    return tainted_socket.offset;
+  } else {
+    return -1;
+  }
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE void
+taint_update_socket_offset(int fd, size_t size) {
+  if (tainted_socket.fd == fd)
+    tainted_socket.offset += size;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE void
+taint_close_socket(int fd) {
+  if (tainted_socket.fd == fd) {
+    AOUT("close tainted_socket.fd: %d\n", tainted_socket.fd);
+    tainted_socket.fd = -1;
+  }
+}
+
 void Flags::SetDefaults() {
 #define DFSAN_FLAG(Type, Name, DefaultValue, Description) Name = DefaultValue;
 #include "dfsan_flags.inc"
@@ -691,11 +751,6 @@ static void RegisterDfsanFlags(FlagParser *parser, Flags *f) {
 }
 
 static void InitializeTaintFile() {
-  for (long i = 1; i < CONST_OFFSET; i++) {
-    // for synthesis
-    dfsan_label label = dfsan_create_label(i);
-    assert(label == i);
-  }
   struct stat st;
   const char *filename = flags().taint_file;
   int err;
@@ -742,6 +797,51 @@ static void InitializeTaintFile() {
       dfsan_label label = dfsan_create_label(i);
       dfsan_check_label(label);
     }
+  }
+}
+
+static void InitializeTaintSocket() {
+  const char *host = flags().taint_socket;
+  internal_memset(tainted_socket.host, 0, sizeof(tainted_socket.host));
+  tainted_socket.family = -1;
+  tainted_socket.port = -1;
+  tainted_socket.fd = -1;
+  if (internal_strstr(host, "tcp@") == host || internal_strstr(host, "udp@") == host) {
+    char *port = internal_strchr(host + 4, '@');
+    if (port) {
+      tainted_socket.family = AF_INET;
+      size_t addr_len = (uptr)port - (uptr)host - 4;
+      internal_memcpy(tainted_socket.host, host + 4, addr_len);
+      tainted_socket.host[addr_len] = '\0';
+      tainted_socket.port = atoi(port + 1);
+    } else {
+      Report("FATAL: invalid inet socket %s\n", host);
+      Die();
+    }
+  } else if (internal_strstr(host, "tcp6@") == host || internal_strstr(host, "udp6@") == host) {
+    char *port = internal_strchr(host + 5, '@');
+    if (port) {
+      tainted_socket.family = AF_INET6;
+      size_t addr_len = (uptr)port - (uptr)host - 5;
+      internal_memcpy(tainted_socket.host, host + 5, addr_len);
+      tainted_socket.host[addr_len] = '\0';
+      tainted_socket.port = atoi(port + 1);
+    } else {
+      Report("FATAL: invalid inet6 socket %s\n", host);
+      Die();
+    }
+  } else if (internal_strstr(host, "unix@") == host) {
+    tainted_socket.family = AF_UNIX;
+    uptr len = internal_strlen(host + 5);
+    if (len < sizeof(tainted_socket.host)) {
+      internal_memcpy(tainted_socket.host, host + 5, len);
+    } else {
+      Report("FATAL: invalid unix socket %s\n", host);
+      Die();
+    }
+  } else if (internal_strcmp(host, "")) {
+    Report("FATAL: unsupported taint socket %s\n", host);
+    Die();
   }
 }
 
@@ -849,6 +949,8 @@ if (flags().shm_fd != -1) {
   InitializeInterceptors();
 
   InitializeTaintFile();
+
+  InitializeTaintSocket();
 
   InitializeSolver();
 

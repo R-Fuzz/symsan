@@ -31,6 +31,8 @@ DFSAN_FLAG(const char *, dump_labels_at_exit, "", "The path of the file where "
                                                   "program terminates.")
 DFSAN_FLAG(const char *, taint_file, "", "The path of the file which "
                                          "will be tainted.")
+DFSAN_FLAG(const char *, taint_socket, "", "The network source which "
+                                          "will be tainted.")
 DFSAN_FLAG(const char *, union_table, "union.txt", "union table.")
 DFSAN_FLAG(int, shm_fd, -1, "shared union table.")
 DFSAN_FLAG(int, pipe_fd, -1, "communication fd.")
