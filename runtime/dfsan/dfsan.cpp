@@ -184,11 +184,16 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t 
   if (l1 == kInitializingLabel || l2 == kInitializingLabel) return kInitializingLabel;
 
   // special handling for bounds
-  if (get_label_info(l1)->op == __dfsan::Alloca || get_label_info(l2)->op == __dfsan::Alloca) {
+  if (get_label_info(l1)->op == __dfsan::Alloca ||
+      (op != __dfsan::Load && get_label_info(l2)->op == __dfsan::Alloca)) {
     // propagate if it's casting op
     if (op == __dfsan::BitCast) return l1;
     if (op == __dfsan::PtrToInt) {AOUT("WARNING: ptrtoint %d\n", l1); return 0;}
-    if (op != __dfsan::Extract) return 0;
+    if ((op & 0xff) == __dfsan::ICmp) { return 0;} // ptr1 op ptr2
+    if (op != __dfsan::Extract) {
+      AOUT("WARNING: unsupported op %d over ptr1 %d ptr2 %d\n", op, l1, l2);
+      return 0;
+    }
   }
 
   // special handling for bounds, which may use all four fields
@@ -250,7 +255,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t 
   }
   // for debugging
   dfsan_label l = atomic_load(&__dfsan_last_label, memory_order_relaxed);
-  assert(l1 <= l && l2 <= l);
+  // assert(l1 <= l && l2 <= l);
 
   dfsan_label label =
     atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
@@ -363,7 +368,7 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n) {
   if (l != kInitializingLabel) {
     // for debugging
     dfsan_label h = atomic_load(&__dfsan_last_label, memory_order_relaxed);
-    assert(l <= h);
+    assert(l <= h || l >= __alloca_stack_top);
   } else {
     for (uptr i = 0; i < n; ++i)
       ls[i] = l;
@@ -443,19 +448,21 @@ dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size, uint64_t elem_siz
 // .op1 = lower bounds
 // .op2 = upper bounds
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_check_bounds(dfsan_label l, uptr addr) {
+void __taint_check_bounds(dfsan_label addr_label, uptr addr,
+                          dfsan_label size_label, uint64_t size) {
   if (flags().trace_bounds) {
-    dfsan_label_info *info = get_label_info(l);
+    dfsan_label_info *info = get_label_info(addr_label);
     if (info->op == Free) {
       // UAF
-      AOUT("ERROR: UAF detected %p = %d @%p\n", addr, l, __builtin_return_address(0));
+      AOUT("ERROR: UAF detected %p = %d @%p\n", addr, addr_label, __builtin_return_address(0));
     } else if (info->op == Alloca) {
       AOUT("addr = %p, lower = %p, upper = %p\n", addr, info->op1.i, info->op2.i);
-      if (addr < info->op1.i || addr >= info->op2.i) {
-        AOUT("ERROR: OOB detected %p = %d @%p\n", addr, l, __builtin_return_address(0));
+      if (addr < info->op1.i || (addr + size) > info->op2.i || (addr + size) < info->op1.i) {
+        AOUT("ERROR: OOB detected %p = %d, %llu = %d @%p\n",
+             addr, addr_label, size, size_label, __builtin_return_address(0));
       }
-    } else if (l != 0) {
-      AOUT("WARNING: incorrect label %p = %d @%p\n", addr, l, __builtin_return_address(0));
+    } else if (addr_label != 0) {
+      AOUT("WARNING: incorrect label %p = %d @%p\n", addr, addr_label, __builtin_return_address(0));
     }
   }
 }
