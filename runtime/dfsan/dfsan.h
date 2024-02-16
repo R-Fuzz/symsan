@@ -72,6 +72,14 @@ struct taint_file {
   uptr buf_size;
 };
 
+struct taint_socket {
+  int family;
+  int port;
+  int fd;
+  off_t offset;
+  char host[PATH_MAX];
+};
+
 extern "C" {
 void dfsan_add_label(dfsan_label label, uint8_t op, void *addr, uptr size);
 void dfsan_set_label(dfsan_label label, void *addr, uptr size);
@@ -97,6 +105,11 @@ off_t get_utmp_offset(void);
 void set_utmp_offset(off_t offset);
 int is_utmp_taint(void);
 
+// taint source socket
+void taint_set_socket(const void *addr, unsigned addrlen, int fd);
+off_t taint_get_socket(int fd);
+void taint_update_socket_offset(int fd, size_t size);
+void taint_close_socket(int fd);
 }  // extern "C"
 
 template <typename T>
@@ -139,6 +152,7 @@ inline Flags &flags() {
 
 // taint source
 extern struct taint_file tainted;
+extern struct taint_socket tainted_socket;
 
 enum operators {
   Not       = 1,
