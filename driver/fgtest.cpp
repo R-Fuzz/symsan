@@ -235,6 +235,20 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<uint32_t> &deps)
     } else {
       return base;
     }
+  } else if (info->op == fatoi) {
+    // string to integer conversion
+    assert(info->l1 == 0 && info->l2 >= CONST_OFFSET);
+    dfsan_label_info *src = get_label_info(info->l2);
+    assert(src->op == Load);
+    uint64_t offset = get_label_info(src->l1)->op1.i;
+    // FIXME: dependencies?
+    tsize_cache[label] = 1; // lazy init
+    // XXX: hacky, avoid string theory
+    char name[36];
+    snprintf(name, 36, "atoi-%lu-%ld", offset, info->op1.i);
+    z3::symbol symbol = __z3_context.str_symbol(name);
+    z3::sort sort = __z3_context.bv_sort(info->size);
+    return __z3_context.constant(symbol, sort);
   }
 
   // common ops
@@ -333,6 +347,23 @@ static void generate_input(z3::model &m) {
         }
         // don't remember size constraints
         throw z3::exception("skip fsize constraints");
+      } else if (name.str().find("atoi") == 0) {
+        off_t offset;
+        int base;
+        sscanf(name.str().c_str(), "atoi-%ld-%d", &offset, &base);
+        AOUT("atoi: %s, offset = %ld, base = %d\n", name.str().c_str(), offset, base);
+        lseek(fd, offset, SEEK_SET);
+        const char *format = NULL;
+        switch (base) {
+          case 2: format = "%lb"; break;
+          case 8: format = "%lo"; break;
+          case 10: format = "%ld"; break;
+          case 16: format = "%lx"; break;
+          default: throw z3::exception("unsupported base");
+        }
+        dprintf(fd, format, (int)e.get_numeral_int());
+      } else {
+        AOUT("WARNING: unknown symbol: %s\n", name.str().c_str());
       }
     }
   }
@@ -587,26 +618,29 @@ int main(int argc, char* const argv[]) {
   char *program = argv[1];
   char *input = argv[2];
 
-  // setup output dir
-  char *options = getenv("TAINT_OPTIONS");
-  char *output = strstr(options, "output_dir=");
-  if (output) {
-    output += 11; // skip "output_dir="
-    char *end = strchr(output, ':'); // try ':' first, then ' '
-    if (end == NULL) end = strchr(output, ' ');
-    size_t n = end == NULL? strlen(output) : (size_t)(end - output);
-    __output_dir = strndup(output, n);
-  }
-
   int is_stdin = 0;
-  char *taint_file = strstr(options, "taint_file=");
-  if (taint_file) {
-    taint_file += strlen("taint_file="); // skip "taint_file="
-    char *end = strchr(taint_file, ':');
-    if (end == NULL) end = strchr(taint_file, ' ');
-    size_t n = end == NULL? strlen(taint_file) : (size_t)(end - taint_file);
-    if (n == 5 && !strncmp(taint_file, "stdin", 5))
-      is_stdin = 1;
+  char *options = getenv("TAINT_OPTIONS");
+  if (options) {
+    // setup output dir
+    char *output = strstr(options, "output_dir=");
+    if (output) {
+      output += 11; // skip "output_dir="
+      char *end = strchr(output, ':'); // try ':' first, then ' '
+      if (end == NULL) end = strchr(output, ' ');
+      size_t n = end == NULL? strlen(output) : (size_t)(end - output);
+      __output_dir = strndup(output, n);
+    }
+
+    // check if input is stdin
+    char *taint_file = strstr(options, "taint_file=");
+    if (taint_file) {
+      taint_file += strlen("taint_file="); // skip "taint_file="
+      char *end = strchr(taint_file, ':');
+      if (end == NULL) end = strchr(taint_file, ' ');
+      size_t n = end == NULL? strlen(taint_file) : (size_t)(end - taint_file);
+      if (n == 5 && !strncmp(taint_file, "stdin", 5))
+        is_stdin = 1;
+    }
   }
 
   // load input file

@@ -701,37 +701,66 @@ char *__dfsw_strcpy(char *dest, const char *src, dfsan_label dst_label,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
-long int __dfsw_strtol(const char *nptr, char **endptr, int base,
-                       dfsan_label nptr_label, dfsan_label endptr_label,
-                       dfsan_label base_label, dfsan_label *ret_label) {
+int __dfsw_atoi(const char *nptr, dfsan_label nptr_label, dfsan_label *ret_label) {
+  int ret = atoi(nptr);
+  size_t len = strlen(nptr);
+  if (nptr_label != 0) {
+    // len may be too large, try to limit if we know the size of the buffer
+    dfsan_label_info *info = dfsan_get_label_info(nptr_label);
+    if (info->op == __dfsan::Alloca) {
+      size_t buff_s = info->op2.i - info->op1.i;
+      len = len > buff_s ? buff_s : len;
+    }
+  }
+  dfsan_label n = dfsan_read_label(nptr, len);
+  *ret_label = dfsan_union(0, n, fatoi, sizeof(ret) * 8, 10, len);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+long __dfsw_strtol(const char *nptr, char **endptr, int base,
+                   dfsan_label nptr_label, dfsan_label endptr_label,
+                   dfsan_label base_label, dfsan_label *ret_label) {
   char *tmp_endptr;
-  long int ret = strtol(nptr, &tmp_endptr, base);
+  long ret = strtol(nptr, &tmp_endptr, base);
   if (endptr) {
     *endptr = tmp_endptr;
   }
-  *ret_label = 0;
+  uptr len = (uptr)tmp_endptr - (uptr)nptr;
+  if (len > 0) {
+    dfsan_label n = dfsan_read_label(nptr, len);
+    *ret_label = dfsan_union(0, n, fatoi, sizeof(ret) * 8, base, len);
+  } else {
+    // well, no byte get consumed, handle specially
+    dfsan_label l = shadow_for(nptr)[0];
+    if (l >= CONST_OFFSET) {
+      dfsan_label load = dfsan_union(l, 0, Load, 0, 0, 0);
+      l = dfsan_union(0, load, fatoi, sizeof(ret) * 8, base, 0);
+    }
+    *ret_label = l;
+  }
   return ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
 double __dfsw_strtod(const char *nptr, char **endptr,
-                       dfsan_label nptr_label, dfsan_label endptr_label,
-                       dfsan_label *ret_label) {
+                     dfsan_label nptr_label, dfsan_label endptr_label,
+                     dfsan_label *ret_label) {
   char *tmp_endptr;
   double ret = strtod(nptr, &tmp_endptr);
   if (endptr) {
     *endptr = tmp_endptr;
   }
-  *ret_label = 0;
+  *ret_label = 0; // TODO: implement
   return ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
-long long int __dfsw_strtoll(const char *nptr, char **endptr, int base,
-                       dfsan_label nptr_label, dfsan_label endptr_label,
-                       dfsan_label base_label, dfsan_label *ret_label) {
+long long __dfsw_strtoll(const char *nptr, char **endptr, int base,
+                         dfsan_label nptr_label, dfsan_label endptr_label,
+                         dfsan_label base_label, dfsan_label *ret_label) {
   char *tmp_endptr;
-  long long int ret = strtoll(nptr, &tmp_endptr, base);
+  long long ret = strtoll(nptr, &tmp_endptr, base);
   if (endptr) {
     *endptr = tmp_endptr;
   }
@@ -739,38 +768,68 @@ long long int __dfsw_strtoll(const char *nptr, char **endptr, int base,
   uptr len = (uptr)tmp_endptr - (uptr)nptr;
   if (len > 0) {
     dfsan_label n = dfsan_read_label(nptr, len);
-    *ret_label = dfsan_union(n, 0, fatoi, sizeof(ret) * 8, ret, len);
+    *ret_label = dfsan_union(0, n, fatoi, sizeof(ret) * 8, base, len);
   } else {
-    *ret_label = 0;
+    // well, no byte get consumed, handle specially
+    dfsan_label l = shadow_for(nptr)[0];
+    if (l >= CONST_OFFSET) {
+      dfsan_label load = dfsan_union(l, 0, Load, 0, 0, 0);
+      l = dfsan_union(0, load, fatoi, sizeof(ret) * 8, base, 0);
+    }
+    *ret_label = l;
   }
   return ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
-unsigned long int __dfsw_strtoul(const char *nptr, char **endptr, int base,
-                       dfsan_label nptr_label, dfsan_label endptr_label,
-                       dfsan_label base_label, dfsan_label *ret_label) {
+unsigned long __dfsw_strtoul(const char *nptr, char **endptr, int base,
+                             dfsan_label nptr_label, dfsan_label endptr_label,
+                             dfsan_label base_label, dfsan_label *ret_label) {
   char *tmp_endptr;
-  unsigned long int ret = strtoul(nptr, &tmp_endptr, base);
+  unsigned long ret = strtoul(nptr, &tmp_endptr, base);
   if (endptr) {
     *endptr = tmp_endptr;
   }
-  *ret_label = 0;
+  uptr len = (uptr)tmp_endptr - (uptr)nptr;
+  if (len > 0) {
+    dfsan_label n = dfsan_read_label(nptr, len);
+    *ret_label = dfsan_union(0, n, fatoi, sizeof(ret) * 8, base, len);
+  } else {
+    // well, no byte get consumed, handle specially
+    dfsan_label l = shadow_for(nptr)[0];
+    if (l >= CONST_OFFSET) {
+      dfsan_label load = dfsan_union(l, 0, Load, 0, 0, 0);
+      l = dfsan_union(0, load, fatoi, sizeof(ret) * 8, base, 0);
+    }
+    *ret_label = l;
+  }
   return ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
-long long unsigned int __dfsw_strtoull(const char *nptr, char **endptr,
-                                       dfsan_label nptr_label,
-                                       int base, dfsan_label endptr_label,
-                                       dfsan_label base_label,
-                                       dfsan_label *ret_label) {
+unsigned long long __dfsw_strtoull(const char *nptr, char **endptr,
+                                   dfsan_label nptr_label,
+                                   int base, dfsan_label endptr_label,
+                                   dfsan_label base_label,
+                                   dfsan_label *ret_label) {
   char *tmp_endptr;
-  long long unsigned int ret = strtoull(nptr, &tmp_endptr, base);
+  unsigned long long ret = strtoull(nptr, &tmp_endptr, base);
   if (endptr) {
     *endptr = tmp_endptr;
   }
-  *ret_label = 0;
+  uptr len = (uptr)tmp_endptr - (uptr)nptr;
+  if (len > 0) {
+    dfsan_label n = dfsan_read_label(nptr, len);
+    *ret_label = dfsan_union(0, n, fatoi, sizeof(ret) * 8, base, len);
+  } else {
+    // well, no byte get consumed, handle specially
+    dfsan_label l = shadow_for(nptr)[0];
+    if (l >= CONST_OFFSET) {
+      dfsan_label load = dfsan_union(l, 0, Load, 0, 0, 0);
+      l = dfsan_union(0, load, fatoi, sizeof(ret) * 8, base, 0);
+    }
+    *ret_label = l;
+  }
   return ret;
 }
 
