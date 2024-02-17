@@ -123,6 +123,10 @@ class MaxQLearner:
             last_Q = updated_Q
         self.model.Q_update(last_s.sa, last_Q)
 
+    def punish_state(self, reversed_state):
+        terminal_state = ProgramState(distance=self.config.max_distance)
+        self.learner.learn(reversed_state, terminal_state, -self.config.max_distance)
+
 class AvgQLearner:
     def __init__(self, m: model.RLModel, df, lr):
         self.model = m
@@ -149,6 +153,10 @@ class AvgQLearner:
         else:
             last_Q = updated_Q
         self.model.Q_update(last_s.sa, last_Q)
+
+    def punish_state(self, reversed_state):
+        terminal_state = ProgramState(distance=self.config.max_distance)
+        self.learner.learn(reversed_state, terminal_state, Decimal(0))
 
 class Agent:
     def __init__(self, config):
@@ -229,7 +237,7 @@ class Agent:
             callstack = self.curr_state.state[1]
             inherited_state = (pc, callstack, bucket_lookup(self.config.max_branch_num))
             self.curr_state.state = inherited_state
-        self.debug_policy(self.curr_state)
+        # self.debug_policy(self.curr_state)
 
     def reset(self):
         self.curr_state = ProgramState(distance=self.config.max_distance)
@@ -249,6 +257,10 @@ class Agent:
                 continue
             self.logger.debug(f"handle_nested_unsat_condition: {s.sa}")
             self.nested_cond_unsat_sas.add(s.sa)
+        reversed_action = 1 if self.curr_state.action == 0 else 0
+        reversed_state = copy.copy(self.curr_state)
+        reversed_state.action = reversed_action
+        self.learner.punish_state(reversed_state)
 
     def is_interesting_branch(self):
         return True

@@ -39,7 +39,7 @@ def parse_args():
     p.add_argument("-s", dest="static_result_folder", default=None, help="static analysis results folder that saves the distance information and initial policy")
     p.add_argument("-f", dest="fuzzer_dir", default=None, help="AFL fuzzer instance name")
     p.add_argument("-n", dest="mazerunner_dir", default="mazerunner", help="mazerunner instance name")
-    p.add_argument("-i", dest="input", default=None, help="initial seed directory")
+    p.add_argument("-i", dest="input_dir", default=None, help="initial seed directory")
     p.add_argument("-config", dest="config_path", default=None, help="path of configuration file")
     p.add_argument("-debug", dest="debug_enabled", action="store_true", help="Enable debug mode")
     p.add_argument("-monitor_resource", dest="resource_monitor_enabled", action="store_true", help="Enable memory and disk usage monitor")
@@ -54,10 +54,8 @@ def validate_args(args):
         raise ValueError("You must provide either -config or -o -s -a options")
     if not os.path.isdir(args.output_dir):
         raise ValueError(f'{args.output_dir} no such directory')
-    if args.fuzzer_dir is None and args.agent_type != "record":
-        raise ValueError("You must provide -f option")
-    if args.fuzzer_dir is None and args.agent_type == "record" and args.input is None:
-        raise ValueError("You must provide either -i or -f option")
+    if args.agent_type == "record" and args.fuzzer_dir is None and args.input_dir is None:
+        raise ValueError("You must provide either -i or -f option for record agent")
 
 def main():
     random.seed(time.time())
