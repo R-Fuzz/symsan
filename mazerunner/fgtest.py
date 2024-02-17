@@ -53,4 +53,16 @@ if __name__ == "__main__":
     try:
         symsan.process_request()
     finally:
+        if "debug=1" in options:
+            symsan_res = symsan.get_result()
+            print(
+                f"Total={symsan_res.total_time}ms, "
+                f"Emulation={symsan_res.emulation_time}ms, "
+                f"Solver={symsan_res.solving_time}ms, "
+                f"Return={symsan_res.returncode}, "
+                f"Distance={symsan_res.distance}, "
+                f"Msg_count={symsan_res.symsan_msg_num}. "
+                f"stdout:\n{symsan_res.stdout}\n"
+                f"stderr:\n{symsan_res.stderr}\n"
+            )
         symsan.tear_down()

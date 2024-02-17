@@ -1,5 +1,5 @@
 import ctypes
-from enum import Enum
+from enum import Enum, auto
 
 class TaintFlag:
     F_ADD_CONS = 0b0001
@@ -58,14 +58,14 @@ class dfsan_label_info(ctypes.Structure):
                 ("hash", ctypes.c_uint32)]
 
 class SolvingStatus(Enum):
-    SOLVED_NESTED = 0
-    SOLVED_OPT_NESTED_UNSAT = 1
-    SOLVED_OPT_NESTED_TIMEOUT = 2
-    UNSOLVED_UNINTERESTING_SAT = 3
-    UNSOLVED_PRE_UNSAT = 4
-    UNSOLVED_OPT_UNSAT = 5
-    UNSOLVED_TIMEOUT = 6
-    UNSOLVED_INVALID_EXPR = 7
-    UNSOLVED_INVALID_MSG = 8
-    UNSOLVED_UNINTERESTING_COND = 9
-    UNSOLVED_UNKNOWN = 10
+    SOLVED_NESTED = auto()
+    SOLVED_OPT_NESTED_UNSAT = auto()
+    SOLVED_OPT_NESTED_TIMEOUT = auto()
+    UNSOLVED_UNINTERESTING_SAT = auto()
+    UNSOLVED_PRE_UNSAT = auto()
+    UNSOLVED_OPT_UNSAT = auto()
+    UNSOLVED_TIMEOUT = auto()
+    UNSOLVED_INVALID_EXPR = auto()
+    UNSOLVED_INVALID_MSG = auto()
+    UNSOLVED_UNINTERESTING_COND = auto()
+    UNSOLVED_UNKNOWN = auto()

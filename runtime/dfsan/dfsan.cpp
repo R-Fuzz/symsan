@@ -620,7 +620,7 @@ is_taint_file(const char *filename) {
 SANITIZER_INTERFACE_ATTRIBUTE off_t
 taint_get_file(int fd) {
   AOUT("fd: %d\n", fd);
-  AOUT("tainted.fd: %d\n", tainted.fd);
+  AOUT("tainted.fd: %d %d\n", tainted.fd, tainted.is_stdin);
   return tainted.fd == fd ? tainted.size : 0;
 }
 
@@ -687,14 +687,14 @@ static void InitializeTaintFile() {
   if (internal_strcmp(filename, "stdin") == 0) {
     tainted.fd = 0;
     // try to get the size, as stdin may be a file
-    if (!fstat(0, &st)) {
+    if (!fstat(0, &st) && S_ISREG(st.st_mode)) {
       tainted.size = st.st_size;
       tainted.is_stdin = 0;
       // map a copy
       tainted.buf_size = RoundUpTo(st.st_size, GetPageSizeCached());
       uptr map = internal_mmap(nullptr, tainted.buf_size, PROT_READ, MAP_PRIVATE, 0, 0);
       if (internal_iserror(map)) {
-        Printf("FATAL: failed to map a copy of input file\n");
+        Printf("FATAL: failed to map a copy of stdin file, size = %d\n", st.st_size);
         Die();
       }
       tainted.buf = reinterpret_cast<char *>(map);

@@ -139,11 +139,14 @@ class SymSanExecutor:
     def run(self, timeout=None):
         # create and execute the child symsan process
         logging_level = 1 if self.logging_level == logging.DEBUG else 0
-        options = (f"taint_file=\"{self.input_file}\""
+        cmd, stdin = utils.fix_at_file(self.cmd, self.input_file)
+        taint_file = "stdin" if stdin else self.input_file
+        options = (f"taint_file=\"{taint_file}\""
         f":shm_fd={self.shm._fd}"
         f":pipe_fd={self.pipefds[1]}"
         f":debug={logging_level}")
-        cmd, stdin = utils.fix_at_file(self.cmd, self.input_file)
+        current_env = os.environ.copy()
+        current_env["TAINT_OPTIONS"] = options
         if timeout:
             cmd = ["timeout", "-k", str(1), str(int(timeout))] + cmd
         try:
@@ -152,7 +155,7 @@ class SymSanExecutor:
                 # the symsan proc reads the input from stdin
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                             env={"TAINT_OPTIONS": options},
+                                             env=current_env,
                                              pass_fds=(self.shm._fd, self.pipefds[1]))
                 self.proc.stdin.write(stdin)
                 self.proc.stdin.flush()
@@ -160,11 +163,12 @@ class SymSanExecutor:
                 # the symsan proc reads the input from file stream
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                             env={"TAINT_OPTIONS": options},
+                                             env=current_env,
                                              pass_fds=(self.shm._fd, self.pipefds[1]))
-        except:
-            self.logger.critical(f"run: Failed to execute subprocess, "
-                                 f"input: {self.input_file}, cmd: {' '.join(cmd)}")
+        except Exception as e:
+            self.logger.critical(f"Failed to execute subprocess, error: \n{e}\n"
+                                 f"Input: {self.input_file}\n"
+                                 f"CMD: {' '.join(cmd)}")
             self.tear_down()
             sys.exit(1)
         os.close(self.pipefds[1])
@@ -188,14 +192,12 @@ class SymSanExecutor:
             )
             if msg.msg_type == MsgType.cond_type.value:
                 solving_status = self._process_cond_request(msg)
-                has_solved = (solving_status == SolvingStatus.SOLVED_NESTED 
-                              or solving_status == SolvingStatus.SOLVED_OPT)
-                if has_solved and self.onetime_solving_enabled:
+                if ((solving_status == SolvingStatus.SOLVED_NESTED or solving_status == SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT) 
+                    and self.onetime_solving_enabled):
                     should_handle = False
                 if (solving_status == SolvingStatus.UNSOLVED_UNKNOWN
-                    or solving_status == SolvingStatus.UNSOLVED_INVALID_EXPR
-                    or solving_status == SolvingStatus.UNSOLVED_PRE_UNSAT):
-                    self.logger.error(f"process_request: slover panic and stop processing, "
+                    or solving_status == SolvingStatus.UNSOLVED_INVALID_EXPR):
+                    self.logger.error(f"process_request: slover panic, stop processing. "
                                       f"solving_status={solving_status}")
                     should_handle = False
                 if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
@@ -234,7 +236,7 @@ class SymSanExecutor:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
         if solving_status == SolvingStatus.UNSOLVED_OPT_UNSAT:
             self.agent.handle_unsat_condition(solving_status)
-        if solving_status == SolvingStatus.SOLVED_OPT and self.onetime_solving_enabled:
+        if solving_status == SolvingStatus.SOLVED_OPT_NESTED_UNSAT and self.onetime_solving_enabled:
             self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
         return solving_status
 

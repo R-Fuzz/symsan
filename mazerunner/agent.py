@@ -8,7 +8,7 @@ import random
 
 import model
 from decimal import Decimal
-from defs import TaintFlag, SolvingStatus
+from defs import TaintFlag
 from utils import *
 
 class ProgramState:

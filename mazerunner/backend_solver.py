@@ -460,17 +460,17 @@ class Z3Solver:
         opt_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         opt_solver.set("timeout", 1000)
         opt_solver.add(e)
-        r = opt_solver.check()
-        if r == z3.unsat:
+        r_opt = opt_solver.check()
+        if r_opt == z3.unsat:
             return SolvingStatus.UNSOLVED_OPT_UNSAT
-        elif r == z3.unknown:
+        elif r_opt == z3.unknown:
             self.logger.warning(f"__solve_expr: opt solving timeout for {e}")
             return SolvingStatus.UNSOLVED_TIMEOUT
         # optimistic sat, check nested
         self.__z3_solver.push()
         self.__z3_solver.add(e)
-        r = self.__z3_solver.check()
-        if r == z3.sat:
+        r_nested = self.__z3_solver.check()
+        if r_nested == z3.sat:
             m = self.__z3_solver.model()
             has_generated = self.__generate_input(m, False, score)
             if not has_generated:
@@ -478,16 +478,21 @@ class Z3Solver:
             else:
                 status = SolvingStatus.SOLVED_NESTED
         else:
+            if not self.config.optimistic_solving_enabled:
+                self.__z3_solver.pop()
+                return SolvingStatus.UNSOLVED_PRE_UNSAT
             m = opt_solver.model()
             has_generated = self.__generate_input(m, True, score)
             if not has_generated:
                 status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
-            elif r == z3.unknown:
+            elif r_nested == z3.unknown:
                 self.logger.warning(f"__solve_expr: nested solving timeout for {e}")
                 status = SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT
-            elif r == z3.unsat and self.config.optimistic_solving_enabled:
+            elif r_nested == z3.unsat:
                 self.logger.debug(f"__solve_expr: nested solving unsat for {e}")
                 status = SolvingStatus.SOLVED_OPT_NESTED_UNSAT
+            else:
+                status = SolvingStatus.UNSOLVED_UNKNOWN
         # reset
         self.__z3_solver.pop()
         return status
