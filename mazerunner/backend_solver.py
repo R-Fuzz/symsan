@@ -478,17 +478,16 @@ class Z3Solver:
             else:
                 status = SolvingStatus.SOLVED_NESTED
         else:
-            if r == z3.unknown:
+            m = opt_solver.model()
+            has_generated = self.__generate_input(m, True, score)
+            if not has_generated:
+                status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
+            elif r == z3.unknown:
                 self.logger.warning(f"__solve_expr: nested solving timeout for {e}")
-                status = SolvingStatus.UNSOLVED_TIMEOUT
+                status = SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT
             elif r == z3.unsat and self.config.optimistic_solving_enabled:
                 self.logger.debug(f"__solve_expr: nested solving unsat for {e}")
-                m = opt_solver.model()
-                has_generated = self.__generate_input(m, True, score)
-                if not has_generated:
-                    status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
-                else:
-                    status = SolvingStatus.SOLVED_OPT
+                status = SolvingStatus.SOLVED_OPT_NESTED_UNSAT
         # reset
         self.__z3_solver.pop()
         return status
