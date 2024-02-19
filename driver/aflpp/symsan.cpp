@@ -375,6 +375,51 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_name("memcmp");
 #endif
     return true;
+  } else if (info->op == __dfsan::fatoi) {
+    assert(info->l1 == 0 && info->l2 >= CONST_OFFSET);
+    dfsan_label_info *src = get_label_info(info->l2);
+    assert(src->op == Load);
+    visited.insert(info->l2);
+    uint64_t offset = get_label_info(src->l1)->op1.i;
+    assert(offset < buf_size);
+    ret->set_bits(info->size);
+    ret->set_label(label);
+    ret->set_index(offset);
+    // special handling for atoi, we are introducing the result/output of
+    // atoi as fake inputs, and solve constraints over the output,
+    // once solved, we convert it back to string
+    // however, because the input is fake, we need to map it specially
+    ret->set_kind(rgd::Read);
+    auto itr = constraint->local_map.find(offset);
+    if (itr != constraint->local_map.end()) {
+      WARNF("atoi inputs should not be involved in other constraints\n");
+      return false;
+    }
+    uint32_t hash = 0;
+    uint32_t length = info->size / 8; // bits to bytes
+    // record the offset, base, and original length
+    constraint->atoi_info[offset] = std::make_tuple(length, (uint32_t)info->op1.i, (uint32_t)info->op2.i);
+    for (uint32_t i = 0; i < length; ++i, ++offset) {
+      u8 val = 0; // XXX: use 0 as initial value?
+      // because this is fake input, we always map it to a new index
+      uint32_t arg_index = (uint32_t)constraint->input_args.size();
+      constraint->inputs.insert({offset, val});
+      constraint->local_map[offset] = arg_index;
+      constraint->input_args.push_back(std::make_pair(true, 0)); // 0 is to be filled in the aggragation
+      if (i == 0) {
+        constraint->shapes[offset] = length;
+        // from solver's perspective, atoi and read are the same
+        // they both introduce a new symbolic input as arg_index
+        hash = rgd::xxhash(length * 8, rgd::Read, arg_index);
+      } else {
+        constraint->shapes[offset] = 0;
+      }
+    }
+    ret->set_hash(hash);
+#if NEED_OFFLINE
+    ret->set_name("atoi");
+#endif
+    return true;
   }
 
   // common ops, make sure no special ops
@@ -1048,7 +1093,9 @@ static void scan_labels(dfsan_label label, size_t buf_size) {
       branch_to_inputs.emplace_back(input_dep_t(buf_size));
       auto &itr = branch_to_inputs[i];
       itr.set(info->op1.i); // input offset
+#if DEBUG
       assert(branch_to_inputs[i].find_first() == info->op1.i);
+#endif
       // nested cmp?
       nested_cmp_cache.push_back(0);
     } else if (info->op == __dfsan::Load) {
@@ -1062,7 +1109,10 @@ static void scan_labels(dfsan_label label, size_t buf_size) {
         // DEBUGF("adding input: %lu <- %lu\n", i, offset + n);
         itr.set(offset + n); // input offsets
       }
-      assert(branch_to_inputs[i].find_first() == offset);
+#if DEBUG
+      if (likely(info->l2 > 0))
+        assert(branch_to_inputs[i].find_first() == offset);
+#endif
       // nested cmp?
       nested_cmp_cache.push_back(0);
     } else {
@@ -1270,7 +1320,11 @@ static bool add_data_flow_constraints(bool direction, dfsan_label label,
         }
       }
       auto root = itr.find_first();
-      assert(root != input_dep_t::npos);
+      if (root == input_dep_t::npos) {
+        // not actual input dependency, skip
+        // this can happen for atoi
+        continue;
+      }
       // update uion find
       for (auto input = itr.find_next(root); input != input_dep_t::npos;
            input = itr.find_next(input)) {
