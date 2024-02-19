@@ -299,6 +299,37 @@ Z3Solver::solve(std::shared_ptr<SearchTask> task,
       out_size = in_size;
       z3::model m = solver_.get_model();
       extract_model(m, out_buf, out_size, task->solution);
+      if (unlikely(!task->atoi_info.empty())) {
+        // if there are atoi bytes, handle them
+        for (auto const &[offset, info] : task->atoi_info) {
+          uint64_t val = 0;
+          uint32_t length = std::get<0>(info);
+          memcpy(out_buf + offset, in_buf + offset, length); // restore?
+          for (auto i = length; i != 0; --i) {
+            DEBUGF("generate_input atoi offset:%d => %lu\n", offset + i - 1, val);
+            auto itr = task->solution.find(offset + i - 1);
+            if (itr != task->solution.end())
+              val |= itr->second << (8 * (i - 1));
+            else
+              val |= 0 << (8 * (i - 1));
+          }
+          uint32_t base = std::get<1>(info);
+          uint32_t orig_len = std::get<2>(info);
+          DEBUGF("generate_input atoi offset:%d => %lu, base = %d, original len = %d\n",
+              offset, val, base, orig_len);
+          const char *format = nullptr;
+          switch (base) {
+            case 2: format = "%lb"; break;
+            case 8: format = "%lo"; break;
+            case 10: format = "%ld"; break;
+            case 16: format = "%lx"; break;
+            default: WARNF("unsupported base %d\n", base);
+          }
+          if (format) {
+            snprintf((char*)out_buf + offset, in_size - offset, format, val);
+          }
+        }
+      }
       task->solved = true;
       return SOLVER_SAT;
     } else if (ret == z3::unsat) {

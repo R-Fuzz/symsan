@@ -121,23 +121,22 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
     DEBUGF("solved\n");
     out_size = in_size;
     memcpy(out_buf, in_buf, in_size);
-#if DEBUG
     for (auto const &[offset, value] : task->solution) {
       DEBUGF("generate_input offset:%zu => %u\n", offset, value);
+      out_buf[offset] = value;
     }
-#endif
+    // handle atoi bytes
     if (unlikely(!task->atoi_info.empty())) {
-      // if there are atoi bytes, handle them first
+      // if there are atoi bytes, handle them
       for (auto const &[offset, info] : task->atoi_info) {
         uint64_t val = 0;
         uint32_t length = std::get<0>(info);
+        memcpy(out_buf + offset, in_buf + offset, length); // restore??
         for (auto i = length; i != 0; --i) {
           DEBUGF("generate_input atoi offset:%d => %lu\n", offset + i - 1, val);
           auto itr = task->solution.find(offset + i - 1);
           assert(itr != task->solution.end());
           val |= itr->second << (8 * (i - 1));
-          // remove from the solution
-          task->solution.erase(itr);
         }
         uint32_t base = std::get<1>(info);
         uint32_t orig_len = std::get<2>(info);
@@ -155,10 +154,6 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
           snprintf((char*)out_buf + offset, in_size - offset, format, val);
         }
       }
-    }
-    for (auto const &[offset, value] : task->solution) {
-      // DEBUGF("generate_input offset:%zu => %u\n", offset, value);
-      out_buf[offset] = value;
     }
     num_solved++;
     return SOLVER_SAT;
