@@ -1,12 +1,14 @@
 #pragma once
 
 #include <stdint.h>
-#include <vector>
+
+#include <bitset>
 #include <map>
 #include <memory>
-#include <unordered_map>
-#include <bitset>
 #include <queue>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
 
 #include "ast.h"
 #include "cov.h"
@@ -46,6 +48,8 @@ struct Constraint {
   std::unordered_map<uint32_t, uint8_t> inputs;
   // shape information about the input (e.g., 1, 2, 4, 8 bytes)
   std::unordered_map<uint32_t, uint32_t> shapes;
+  // special infomation for atoi: offset -> (base, length)
+  std::unordered_map<uint32_t, std::tuple<uint32_t, uint32_t, uint32_t>> atoi_info;
   // number of constant in the input array
   uint32_t const_num;
   // recorded comparison operands
@@ -80,6 +84,8 @@ struct SearchTask {
   std::vector<std::pair<uint32_t, uint8_t>> inputs;
   // shape information at each offset
   std::unordered_map<uint32_t, uint32_t> shapes;
+  // aggreated atoi info
+  std::unordered_map<uint32_t, std::tuple<uint32_t, uint32_t, uint32_t>> atoi_info;
   // max number of constants in the input array
   uint32_t max_const_num;
   // record constraints that use a certain input byte
@@ -157,6 +163,24 @@ struct SearchTask {
       }
       // save the last set of consecutive input bytes
       cm->i2s_candidates.push_back({last_offset + 1 - size, size});
+
+      // process atoi
+      for (const auto& [offset, info] : constraints[i]->atoi_info) {
+        // check dependencies
+        uint32_t length = std::get<2>(info);
+        for (auto j = 0; j < length; ++j) {
+          auto ditr = cmap.find(offset + j);
+          if (ditr != cmap.end()) {
+            fprintf(stderr, "atoi bytes (%d) used in other constraints\n", offset + j);
+          }
+        }
+        auto itr = atoi_info.find(offset);
+        if (itr != atoi_info.end()) {
+          fprintf(stderr, "atoi bytes (%d) already exists\n", offset);
+          assert(info == itr->second);
+        }
+        atoi_info[offset] = info;
+      }
 
       // update the number of required constants in the input array
       if (max_const_num < constraints[i]->const_num)
