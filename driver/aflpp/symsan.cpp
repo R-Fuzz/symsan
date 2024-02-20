@@ -51,7 +51,7 @@ using namespace __dfsan;
 
 #define NEED_OFFLINE 0
 
-#define PRINT_STATS 1
+#define PRINT_STATS 0
 
 #define MAX_AST_SIZE 200
 
@@ -1369,7 +1369,9 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
     // add the tasks to the task manager
     for (auto const& task : tasks) {
       my_mutator->task_mgr->add_task(neg_ctx, task);
+#if PRINT_STATS
       task_size_dist[task->constraints.size()] += 1;
+#endif
     }
 
     total_tasks += tasks.size();
@@ -1377,11 +1379,6 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
   }
 
   if (NestedSolving && (msg.flags & F_ADD_CONS)) {
-    // add the current branch direction as nested conditions
-    add_data_flow_constraints(ctx->direction, msg.label, buf, buf_size);
-  }
-
-  if (msg.flags & F_ADD_CONS) {
     // add the current branch direction as nested conditions
     add_data_flow_constraints(ctx->direction, msg.label, buf, buf_size);
   }
@@ -1547,6 +1544,7 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
   if (pid == 0) {
     close(pipefds[0]); // close the read fd
     setenv("TAINT_OPTIONS", (char*)options, 1);
+    unsetenv("LD_PRELOAD"); // don't preload anything
     if (data->afl->fsrv.use_stdin) {
       close(0);
       lseek(data->out_fd, 0, SEEK_SET);
