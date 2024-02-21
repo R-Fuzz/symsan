@@ -115,31 +115,78 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       if (s > 8) {
         continue;
       }
-      // size can be not a power of 2
-      memcpy(&value, &in_buf[offset], s);
-      value = SWAP64(value) >> (64 - s * 8);
-      if (c->op1 == value) {
-        matches++;
-        r = get_i2s_value(comparison, c->op2, false);
-      } else if (c->op2 == value) {
-        matches++;
-        r = get_i2s_value(comparison, c->op1, true);
-      } else if (c->op1 == value_r) {
-        matches++;
-        r = get_i2s_value(comparison, c->op2, false);
-        r = SWAP64(r) >> (64 - s * 8);
-      } else if (c->op2 == value_r) {
-        matches++;
-        r = get_i2s_value(comparison, c->op1, true);
-        r = SWAP64(r) >> (64 - s * 8);
+      auto atoi = c->atoi_info.find(offset);
+      if (likely(atoi == c->atoi_info.end())) {
+        // size can be not a power of 2
+        memcpy(&value, &in_buf[offset], s);
+        value = SWAP64(value) >> (64 - s * 8);
+        if (c->op1 == value) {
+          matches++;
+          r = get_i2s_value(comparison, c->op2, false);
+        } else if (c->op2 == value) {
+          matches++;
+          r = get_i2s_value(comparison, c->op1, true);
+        } else if (c->op1 == value_r) {
+          matches++;
+          r = get_i2s_value(comparison, c->op2, false);
+          r = SWAP64(r) >> (64 - s * 8);
+        } else if (c->op2 == value_r) {
+          matches++;
+          r = get_i2s_value(comparison, c->op1, true);
+          r = SWAP64(r) >> (64 - s * 8);
+        } else {
+          continue; // next offset
+        }
+        DEBUGF("i2s: %lu = %lx\n", offset, r);
+        memcpy(out_buf, in_buf, in_size);
+        out_size = in_size;
+        memcpy(&out_buf[offset], &r, s);
+        return SOLVER_SAT;
       } else {
-        continue; // next offset
+        uint32_t base = std::get<1>(atoi->second);
+        uint32_t old_len = std::get<2>(atoi->second);
+        long num = 0;
+        unsigned long unum = 0;
+        bool is_signed = false;
+        if (old_len > 0) {
+          char buf[old_len + 1];
+          memcpy(buf, &in_buf[offset], old_len);
+          buf[old_len] = 0;
+          is_signed = (buf[0] == '-');
+          unum = strtoul(buf, NULL, base); // all operands are unsgined in symsan
+        }
+        if (c->op1 == unum) {
+          matches++;
+          r = get_i2s_value(comparison, c->op2, false);
+        } else if (c->op2 == unum) {
+          matches++;
+          r = get_i2s_value(comparison, c->op1, true);
+        } else {
+          continue; // next offset
+        }
+        DEBUGF("i2s-atoi: %lu = %lx\n", offset, r);
+        const char *format = nullptr;
+        switch (base) {
+          case 2: format = "%lb"; break;
+          case 8: format = "%lo"; break;
+          case 10: format = is_signed ? "%ld" : "%lu"; break;
+          case 16: format = "%lx"; break;
+          default: {
+            WARNF("unsupported base %d\n", base);
+            continue;
+          }
+        }
+        memcpy(out_buf, in_buf, offset); // extend size as in cmplog
+        size_t num_len;
+        if (is_signed) {
+          num_len = snprintf((char*)out_buf + offset, 64, format, (long)r);
+        } else {
+          num_len = snprintf((char*)out_buf + offset, 64, format, r);
+        }
+        memcpy(out_buf + offset + num_len, in_buf + offset + old_len, in_size - offset - old_len);
+        out_size = in_size + num_len - old_len;
+        return SOLVER_SAT;
       }
-      DEBUGF("i2s: %lu = %lx\n", offset, r);
-      memcpy(out_buf, in_buf, in_size);
-      out_size = in_size;
-      memcpy(&out_buf[offset], &r, s);
-      return SOLVER_SAT;
     }
   } else if (comparison == rgd::Memcmp) {
     DEBUGF("i2s: try memcmp\n");
