@@ -260,6 +260,47 @@ fun:strrchr=custom
 fun:strstr=custom
 fun:bcmp=custom
 
+# from afl++
+# memcmp-like
+fun:CRYPTO_memcmp=memcmp
+fun:OPENSSL_memcmp=memcmp
+fun:memcmp_const_time=memcmp
+fun:memcmpct=memcmp
+
+# strcmp-like
+fun:xmlStrcmp=strcmp
+fun:xmlStrEqual=strcmp
+fun:g_strcmp0=strcmp
+fun:curl_strequal=strcmp
+fun:strcsequal=strcmp
+fun:stricmp=strcmp
+fun:ap_cstr_casecmp=strcmp
+fun:OPENSSL_strcasecmp=strcmp
+fun:xmlStrcasecmp=strcmp
+fun:g_strcasecmp=strcmp
+fun:g_ascii_strcasecmp=strcmp
+fun:Curl_strcasecompare=strcmp
+fun:Curl_safe_strcasecompare=strcmp
+fun:cmsstrcasecmp=strcmp
+# FIXME: strstr??
+fun:g_strstr_len=strcmp
+fun:ap_strcasestr=strcmp
+fun:xmlStrstr=strcmp
+fun:xmlStrcasestr=strcmp
+fun:g_str_has_prefix=strcmp
+fun:g_str_has_suffix=strcmp
+
+# strncmp-like
+fun:xmlStrncmp=strncmp
+fun:curl_strnequal=strncmp
+fun:strnicmp=strncmp
+fun:ap_cstr_casecmpn=strncmp
+fun:OPENSSL_strncasecmp=strncmp
+fun:xmlStrncasecmp=strncmp
+fun:g_ascii_strncasecmp=strcmp
+fun:Curl_strncasecompare=strncmp
+fun:g_strncasecmp=strncmp
+
 # Functions which take action based on global state, such as running a callback
 # set by a separate function.
 fun:write=custom

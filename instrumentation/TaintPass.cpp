@@ -315,7 +315,12 @@ class Taint : public ModulePass {
     /// pass the return value shadow in a register, while WK_Custom uses an
     /// extra pointer argument to return the shadow.  This allows the wrapped
     /// form of the function type to be expressed in C.
-    WK_Custom
+    WK_Custom,
+
+    /// Special cases for memcmp, strcmp, strncmp like functions
+    WK_Memcmp,
+    WK_Strcmp,
+    WK_Strncmp,
   };
 
   Module *Mod;
@@ -349,6 +354,9 @@ class Taint : public ModulePass {
   FunctionType *TaintPopStackFrameFnTy;
   FunctionType *TaintTraceAllocaFnTy;
   FunctionType *TaintCheckBoundsFnTy;
+  FunctionType *TaintMemcmpFnTy;
+  FunctionType *TaintStrcmpFnTy;
+  FunctionType *TaintStrncmpFnTy;
   FunctionType *TaintDebugFnTy;
   FunctionCallee TaintUnionFn;
   FunctionCallee TaintCheckedUnionFn;
@@ -366,6 +374,9 @@ class Taint : public ModulePass {
   FunctionCallee TaintPopStackFrameFn;
   FunctionCallee TaintTraceAllocaFn;
   FunctionCallee TaintCheckBoundsFn;
+  FunctionCallee TaintMemcmpFn;
+  FunctionCallee TaintStrcmpFn;
+  FunctionCallee TaintStrncmpFn;
   FunctionCallee TaintDebugFn;
   Constant *CallStack;
   MDNode *ColdCallWeights;
@@ -863,6 +874,13 @@ bool Taint::doInitialization(Module &M) {
   TaintCheckBoundsFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy, Int64Ty }, false);
 
+  TaintMemcmpFnTy = FunctionType::get(
+      PrimitiveShadowTy, { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx), Int64Ty }, false);
+  TaintStrcmpFnTy = FunctionType::get(
+      PrimitiveShadowTy, { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx) }, false);
+  TaintStrncmpFnTy = FunctionType::get(
+      PrimitiveShadowTy, { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx), Int64Ty }, false);
+
   TaintDebugFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
       {PrimitiveShadowTy, PrimitiveShadowTy, PrimitiveShadowTy,
        PrimitiveShadowTy, PrimitiveShadowTy}, false);
@@ -887,6 +905,12 @@ Taint::WrapperKind Taint::getWrapperKind(Function *F) {
   // priority custom
   if (ABIList.isIn(*F, "custom"))
     return WK_Custom;
+  if (ABIList.isIn(*F, "memcmp"))
+    return WK_Memcmp;
+  if (ABIList.isIn(*F, "strcmp"))
+    return WK_Strcmp;
+  if (ABIList.isIn(*F, "strncmp"))
+    return WK_Strncmp;
   if (ABIList.isIn(*F, "functional"))
     return WK_Functional;
   if (ABIList.isIn(*F, "discard"))
@@ -1112,6 +1136,29 @@ void Taint::initializeCallbackFunctions(Module &M) {
     TaintCheckBoundsFn =
         Mod->getOrInsertFunction("__taint_check_bounds", TaintCheckBoundsFnTy, AL);
   }
+  {
+    AttributeList AL;
+    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
+                         Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
+    TaintMemcmpFn =
+        Mod->getOrInsertFunction("__taint_memcmp", TaintMemcmpFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
+                         Attribute::NoUnwind);
+    TaintStrcmpFn =
+        Mod->getOrInsertFunction("__taint_strcmp", TaintStrcmpFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
+                         Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
+    TaintStrncmpFn =
+        Mod->getOrInsertFunction("__taint_strncmp", TaintStrncmpFnTy, AL);
+  }
 
 }
 
@@ -1173,6 +1220,9 @@ bool Taint::runOnModule(Module &M) {
         &i != TaintPopStackFrameFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceAllocaFn.getCallee()->stripPointerCasts() &&
         &i != TaintCheckBoundsFn.getCallee()->stripPointerCasts() &&
+        &i != TaintMemcmpFn.getCallee()->stripPointerCasts() &&
+        &i != TaintStrcmpFn.getCallee()->stripPointerCasts() &&
+        &i != TaintStrncmpFn.getCallee()->stripPointerCasts() &&
         &i != TaintDebugFn.getCallee()->stripPointerCasts()) {
       FnsToInstrument.push_back(&i);
     }
@@ -2090,6 +2140,7 @@ void TaintVisitor::visitMemTransferInst(MemTransferInst &I) {
   // check bounds before memcpy
   if (ClTraceBound) {
     TF.checkBounds(I.getDest(), I.getLength(), &I);
+    TF.checkBounds(I.getSource(), I.getLength(), &I);
   }
   IRBuilder<> IRB(&I);
   Value *DestShadow = TF.TT.getShadowAddress(I.getDest(), IRB);
@@ -2127,7 +2178,6 @@ void TaintVisitor::visitMemTransferInst(MemTransferInst &I) {
     MTI->setSourceAlignment(Align(TF.TT.ShadowWidthBytes));
   }
 #endif
-  // FIXME trace memcpy
 }
 
 void TaintVisitor::visitReturnInst(ReturnInst &RI) {
@@ -2210,6 +2260,7 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       TF.TT.UnwrappedFnMap.find(CB.getCalledOperand());
   if (i != TF.TT.UnwrappedFnMap.end()) {
     Function *F = i->second;
+    Value *Shadow = nullptr;
     switch (TF.TT.getWrapperKind(F)) {
     case Taint::WK_Warning:
       CB.setCalledFunction(F);
@@ -2225,6 +2276,31 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       CB.setCalledFunction(F);
       //FIXME:
       // visitOperandShadowInst(CS);
+      return;
+    case Taint::WK_Memcmp:
+      CB.setCalledFunction(F);
+      assert(CB.arg_size() == 3);
+      Shadow = IRB.CreateCall(TF.TT.TaintMemcmpFn,
+                             {CB.getArgOperand(0),
+                              CB.getArgOperand(1),
+                              CB.getArgOperand(2)});
+      TF.setShadow(&CB, Shadow);
+      return;
+    case Taint::WK_Strcmp:
+      CB.setCalledFunction(F);
+      assert(CB.arg_size() == 2);
+      Shadow = IRB.CreateCall(TF.TT.TaintStrcmpFn,
+                             {CB.getArgOperand(0), CB.getArgOperand(1)});
+      TF.setShadow(&CB, Shadow);
+      return;
+    case Taint::WK_Strncmp:
+      CB.setCalledFunction(F);
+      assert(CB.arg_size() == 3);
+      Shadow = IRB.CreateCall(TF.TT.TaintStrncmpFn,
+                             {CB.getArgOperand(0),
+                              CB.getArgOperand(1),
+                              CB.getArgOperand(2)});
+      TF.setShadow(&CB, Shadow);
       return;
     case Taint::WK_Custom:
       // Don't try to handle invokes of custom functions, it's too complicated.
