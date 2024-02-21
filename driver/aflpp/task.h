@@ -48,7 +48,7 @@ struct Constraint {
   std::unordered_map<uint32_t, uint8_t> inputs;
   // shape information about the input (e.g., 1, 2, 4, 8 bytes)
   std::unordered_map<uint32_t, uint32_t> shapes;
-  // special infomation for atoi: offset -> (base, length)
+  // special infomation for atoi: offset -> (result_length, base, str_length)
   std::unordered_map<uint32_t, std::tuple<uint32_t, uint32_t, uint32_t>> atoi_info;
   // number of constant in the input array
   uint32_t const_num;

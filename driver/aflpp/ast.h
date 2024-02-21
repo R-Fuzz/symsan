@@ -124,6 +124,13 @@ namespace rgd {
     }
   }
 
+  static inline bool isSignedCmp(uint16_t kind) {
+    if (kind >= Slt && kind <= Sge)
+      return true;
+    else
+      return false;
+  }
+
   class AstNode {
   public:
     AstNode(size_t size=32) : child0_(0), child1_(0), kind_(0), bits_(0), index_(0),
