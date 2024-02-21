@@ -205,6 +205,15 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
   return const_cast<char *>(ret);
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_memcmp(const void *s1, const void *s2, size_t n) {
+  dfsan_label l1 = dfsan_read_label(s1, n);
+  dfsan_label l2 = dfsan_read_label(s2, n);
+  dfsan_label ret = dfsan_union(l1, l2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
+  if (ret) __taint_trace_memcmp(ret);
+  return ret;
+}
+
 DECLARE_WEAK_INTERCEPTOR_HOOK(dfsan_weak_hook_memcmp, uptr caller_pc,
                               const void *s1, const void *s2, size_t n,
                               dfsan_label s1_label, dfsan_label s2_label,
@@ -221,11 +230,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
   __taint_check_bounds(s2_label, (uptr)s2, n_label, n);
   int ret = memcmp(s1, s2, n);
   //AOUT("memcmp: n = %d\n", n);
-  dfsan_label ls1 = dfsan_read_label(s1, n);
-  dfsan_label ls2 = dfsan_read_label(s2, n);
-  // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
-  if (*ret_label) __taint_trace_memcmp(*ret_label);
+  *ret_label = __taint_memcmp(s1, s2, n);
   return ret;
 }
 
@@ -238,11 +243,20 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   __taint_check_bounds(s2_label, (uptr)s2, n_label, n);
   int ret = bcmp(s1, s2, n);
   //AOUT("bcmp: n = %d\n", n);
-  dfsan_label ls1 = dfsan_read_label(s1, n);
-  dfsan_label ls2 = dfsan_read_label(s2, n);
+  *ret_label = __taint_memcmp(s1, s2, n);
+  return ret;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_strcmp(const char *s1, const char *s2) {
+  size_t n = strlen(s1) + 1; // including tailing '\0'
+  if (dfsan_get_label(s1) != 0)
+    n = strlen(s2) + 1; // including tailing '\0'
+  dfsan_label l1 = dfsan_read_label(s1, n);
+  dfsan_label l2 = dfsan_read_label(s2, n);
   // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
-  if (*ret_label) __taint_trace_memcmp(*ret_label);
+  dfsan_label ret = dfsan_union(l1, l2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
+  if (ret) __taint_trace_memcmp(ret);
   return ret;
 }
 
@@ -259,14 +273,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
   int ret = strcmp(s1, s2);
   // check which one is tainted
   //AOUT("strcmp: %s <=> %s\n", s1, s2);
-  size_t size = strlen(s1) + 1; // including tailing '\0'
-  if (dfsan_get_label(s1) != 0)
-    size = strlen(s2) + 1; // including tailing '\0'
-  dfsan_label ls1 = dfsan_read_label(s1, size);
-  dfsan_label ls2 = dfsan_read_label(s2, size);
-  // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, size, (uint64_t)s1, (uint64_t)s2);
-  if (*ret_label) __taint_trace_memcmp(*ret_label);
+  *ret_label = __taint_strcmp(s1, s2);
   return ret;
 }
 
@@ -277,14 +284,22 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
   // doing an optimistic solving, hoping we can get the same case
   // check which one is tainted
   //AOUT("strcasecmp: %s <=> %s\n", s1, s2);
-  size_t size = strlen(s1) + 1; // including tailing '\0'
-  if (dfsan_get_label(s1) != 0)
-    size = strlen(s2) + 1; // including tailing '\0'
-  dfsan_label ls1 = dfsan_read_label(s1, size);
-  dfsan_label ls2 = dfsan_read_label(s2, size);
+  *ret_label = __taint_strcmp(s1, s2);
+  return ret;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_strncmp(const char *s1, const char *s2, size_t n) {
+  if (n == 0) return 0;
+  if (dfsan_get_label(s1) == 0 && strlen(s1) < (n - 1))
+    n = strlen(s1) + 1;
+  if (dfsan_get_label(s2) == 0 && strlen(s2) < (n - 1))
+    n = strlen(s2) + 1;
+  dfsan_label l1 = dfsan_read_label(s1, n);
+  dfsan_label l2 = dfsan_read_label(s2, n);
   // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, size, (uint64_t)s1, (uint64_t)s2);
-  if (*ret_label) __taint_trace_memcmp(*ret_label);
+  dfsan_label ret = dfsan_union(l1, l2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
+  if (ret) __taint_trace_memcmp(ret);
   return ret;
 }
 
@@ -308,15 +323,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
 
   int ret = strncmp(s1, s2, n);
   //AOUT("strncmp: %s <=> %s\n", s1, s2);
-  if (dfsan_get_label(s1) == 0 && strlen(s1) < (n - 1))
-    n = strlen(s1) + 1;
-  if (dfsan_get_label(s2) == 0 && strlen(s2) < (n - 1))
-    n = strlen(s2) + 1;
-  dfsan_label ls1 = dfsan_read_label(s1, n);
-  dfsan_label ls2 = dfsan_read_label(s2, n);
-  // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
-  if (*ret_label) __taint_trace_memcmp(*ret_label);
+  *ret_label = __taint_strncmp(s1, s2, n);
   return ret;
 }
 
@@ -332,15 +339,7 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
   int ret = strncasecmp(s1, s2, n);
   // doing an optimistic solving here too, hoping the case can be the seame
   //AOUT("strncmp: %s <=> %s\n", s1, s2);
-  if (dfsan_get_label(s1) == 0 && strlen(s1) < (n - 1))
-    n = strlen(s1) + 1;
-  if (dfsan_get_label(s2) == 0 && strlen(s2) < (n - 1))
-    n = strlen(s2) + 1;
-  dfsan_label ls1 = dfsan_read_label(s1, n);
-  dfsan_label ls2 = dfsan_read_label(s2, n);
-  // ugly hack ...
-  *ret_label = dfsan_union(ls1, ls2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
-  if (*ret_label) __taint_trace_memcmp(*ret_label);
+  *ret_label = __taint_strncmp(s1, s2, n);
   return ret;
 }
 
