@@ -56,8 +56,8 @@ public:
   const std::shared_ptr<BranchContext>
   add_branch(void *addr, uint32_t id, bool direction, uint32_t context, bool is_loop_header, bool is_loop_exit) override {
     auto &itr = branches[addr];
-    itr.first = direction? true : false;
-    itr.second = direction? false : true;
+    itr.first |= direction? true : false;
+    itr.second |= direction? false : true;
     _ctx->addr = addr;
     _ctx->direction = direction;
     return _ctx;
