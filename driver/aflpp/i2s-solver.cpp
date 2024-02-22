@@ -11,27 +11,11 @@ using namespace rgd;
 #define DEBUGF(_str...) do { } while (0)
 #endif
 
-#define SWAP16(_x)                    \
-  ({                                  \
-                                      \
-    u16 _ret = (_x);                  \
-    (u16)((_ret << 8) | (_ret >> 8)); \
-                                      \
-  })
-
-#define SWAP32(_x)                                                   \
-  ({                                                                 \
-                                                                     \
-    u32 _ret = (_x);                                                 \
-    (u32)((_ret << 24) | (_ret >> 24) | ((_ret << 8) & 0x00FF0000) | \
-          ((_ret >> 8) & 0x0000FF00));                               \
-                                                                     \
-  })
-
+#undef SWAP64
 #define SWAP64(_x)                                                             \
   ({                                                                           \
                                                                                \
-    u64 _ret = (_x);                                                           \
+    uint64_t _ret = (_x);                                                           \
     _ret =                                                                     \
         (_ret & 0x00000000FFFFFFFF) << 32 | (_ret & 0xFFFFFFFF00000000) >> 32; \
     _ret =                                                                     \
@@ -92,6 +76,89 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
   return v;
 }
 
+static inline uint64_t _get_binop_value(uint64_t v1, uint64_t v2, uint16_t kind) {
+  switch (kind) {
+    case rgd::Add: return v1 + v2;
+    case rgd::Sub: return v1 - v2;
+    case rgd::Mul: return v1 * v2;
+    case rgd::UDiv: return v2 ? v1 / v2 : 0;
+    case rgd::SDiv: return v2 ? (int64_t)v1 / (int64_t)v2 : 0;
+    case rgd::URem: return v2 ? v1 % v2 : 0;
+    case rgd::SRem: return v2 ? (int64_t)v1 % (int64_t)v2 : 0;
+    case rgd::And: return v1 & v2;
+    case rgd::Or: return v1 | v2;
+    case rgd::Xor: return v1 ^ v2;
+    case rgd::Shl: return v1 << v2;
+    case rgd::LShr: return v1 >> v2;
+    case rgd::AShr: return (int64_t)v1 >> v2;
+    default: assert(false && "Non-binary op!");
+  }
+  return 0;
+}
+
+static inline uint64_t _get_binop_value_r(uint64_t r, uint64_t const_op, uint16_t kind, bool rhs) {
+  // we aim to reverse the binary operation
+  // if rhs:              const_op op v = r
+  // if lhs (i.e., !rhs): v op const_op = r
+  switch (kind) {
+    case rgd::Add: return r - const_op; // v = r - const_op
+    case rgd::Sub: return rhs ? const_op - r : r + const_op; // rhs: v = const_op - r; lhs: v = r + const_op
+    case rgd::Mul: return r / const_op; // v = r / const_op
+    case rgd::UDiv: return rhs ? const_op / r : r * const_op; // rhs: v = const_op / r; lhs: v = r * const_op
+    case rgd::SDiv: return rhs ? (int64_t)const_op / (int64_t)r : (int64_t)r * (int64_t)const_op;
+    case rgd::URem:
+      if (rhs) {
+        assert(const_op >= r && "URem rhs");
+        // const_op % v = r
+        // if const_op > r, const_op % (const_op - r) = r
+        // if const_op == r, const_op % (const_op + 1) = const_op = r
+        // if const_op < r, not possible
+        return const_op > r ? const_op - r : const_op + 1;
+      } else {
+        // XXX: (v % const_op) % const_op == v % const_op = r
+        return r;
+      }
+    case rgd::SRem:
+      if (rhs) {
+        assert((int64_t)const_op >= (int64_t)r && "SRem rhs");
+        return (int64_t)const_op > (int64_t)r ? (int64_t)const_op - (int64_t)r : (int64_t)const_op + 1;
+      } else {
+        return r;
+      }
+    case rgd::And: return r; // XXX: when r = v & const_op, (r) & const_op = (v & const_op) & const_op = v & const_op = r
+    case rgd::Or: return r;  // XXX: (a | b) | b == a | b
+    case rgd::Xor: return r ^ const_op; // v = r ^ const_op
+    case rgd::Shl:
+      assert(!rhs && "Shl rhs not supported");
+      return r >> const_op; // v = r >> const_op
+    case rgd::LShr:
+      assert(!rhs && "LShr rhs not supported");
+      return r << const_op; // v = r << diff
+    case rgd::AShr:
+      assert(!rhs && "AShr rhs not supported");
+      return (int64_t)r << const_op;
+    default: assert(false && "Non-binary op!");
+  }
+  return 0;
+}
+
+static uint64_t get_binop_value(std::shared_ptr<const Constraint> constraint,
+    const AstNode &node, uint64_t value, uint64_t &const_op, bool &rhs) {
+  auto &left = node.children(0);
+  auto &right = node.children(1);
+  uint64_t r = 0;
+  if (left.kind() == Constant) {
+    const_op = constraint->input_args[left.index()].second;
+    r = _get_binop_value(const_op, value, node.kind());
+    rhs = true;
+  } else if (right.kind() == Constant) {
+    const_op = constraint->input_args[right.index()].second;
+    r = _get_binop_value(value, const_op, node.kind());
+    rhs = false;
+  }
+  return r;
+}
+
 I2SSolver::I2SSolver(): matches(0), mismatches(0) {}
 
 solver_result_t
@@ -119,7 +186,7 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       if (likely(atoi == c->atoi_info.end())) {
         // size can be not a power of 2
         memcpy(&value, &in_buf[offset], s);
-        value = SWAP64(value) >> (64 - s * 8);
+        DEBUGF("i2s: try %lu, length %u = %016lx\n", offset, s, value);
         if (c->op1 == value) {
           matches++;
           r = get_i2s_value(comparison, c->op2, false);
@@ -135,7 +202,47 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
           r = get_i2s_value(comparison, c->op1, true);
           r = SWAP64(r) >> (64 - s * 8);
         } else {
-          continue; // next offset
+          // try some simple binary operations
+          auto &left = c->get_root()->children(0);
+          auto &right = c->get_root()->children(1);
+          uint64_t const_op = 0;
+          uint64_t mask = (1ULL << (s * 8)) - 1;
+          uint16_t kind = 0;
+          // true if the input is on the right hand side of the comparison
+          bool rhs = false;
+          // true if the input is on the right hand side of the binary operation
+          // NOTE, not the right hand side of the comparison
+          bool bop_rhs = false;
+          // check if lhs of the comparison is a simple binary operation with a constant
+          if (isBinaryOperation(left.kind())) {
+            r = get_binop_value(c, left, value, const_op, bop_rhs);
+            r &= mask; // mask the result to avoid overflow
+            DEBUGF("i2s: binop (lhs) %lx (%d) %lx = %lx =? %lx\n", value, left.kind(), const_op, r, c->op1);
+            if (r == c->op1) {
+              // binop result matches op1 of the comparison
+              kind = left.kind();
+              rhs = false;
+            } else { const_op = 0; }
+          }
+          if (isBinaryOperation(right.kind())) {
+            r = get_binop_value(c, right, value, const_op, bop_rhs);
+            r &= mask; // mask the result to avoid overflow
+            DEBUGF("i2s: binop (rhs) %lx (%d) %lx = %lx =? %lx\n", value, right.kind(), const_op, r, c->op2);
+            if (r == c->op2) {
+              // binop result matches op2 of the comparison
+              kind = right.kind();
+              rhs = true;
+            } else { const_op = 0; }
+          }
+          if (const_op == 0) {
+            continue; // nothing matches next offset
+          }
+          matches++;
+          // get the expected value
+          r = get_i2s_value(comparison, rhs ? c->op1 : c->op2, rhs);
+          // apply the diff
+          r = _get_binop_value_r(r, const_op, kind, bop_rhs);
+          r &= mask; // mask the result to avoid overflow
         }
         DEBUGF("i2s: %lu = %lx\n", offset, r);
         memcpy(out_buf, in_buf, in_size);
@@ -145,6 +252,7 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       } else {
         uint32_t base = std::get<1>(atoi->second);
         uint32_t old_len = std::get<2>(atoi->second);
+        DEBUGF("i2s: try atoi %lu, base %u, old_len %u\n", offset, base, old_len);
         long num = 0;
         unsigned long unum = 0;
         bool is_signed = false;
