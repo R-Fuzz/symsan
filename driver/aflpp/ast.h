@@ -108,6 +108,13 @@ namespace rgd {
       return false;
   }
 
+  static inline bool isBinaryOperation(uint16_t kind) {
+    if (kind >= Add && kind <= AShr && kind != Neg && kind != Not)
+      return true;
+    else
+      return false;
+  }
+
   static inline uint16_t negate_cmp(uint16_t kind) {
     switch (kind) {
       case Equal: return Distinct;
