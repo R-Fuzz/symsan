@@ -435,6 +435,9 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   ret->set_name(op_itr->second.second);
 #endif
 
+  // record op
+  constraint->ops[ret->kind()] = true;
+
   // in case we needs concretization
   uint8_t needs_concretization = 0;
   auto node_itr = concretize_node.find(label);
