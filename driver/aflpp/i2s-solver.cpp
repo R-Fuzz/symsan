@@ -1,10 +1,14 @@
 #include "solver.h"
 
+#include "dfsan/dfsan.h"
+
 extern "C" {
 #include "afl-fuzz.h"
 }
 
 using namespace rgd;
+
+#define DEBUG 0
 
 #if !DEBUG
 #undef DEBUGF
@@ -315,20 +319,114 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
     assert(size == c->local_map.size() && "input size mismatch");
     uint64_t value = 0;
     int i = 0;
-    for (size_t o = offset; o < offset + size; o++) {
-      if (i == 0)
-        value = c->input_args[const_index].second;
-      uint8_t v = ((value >> i) & 0xff);
-      out_buf[o] = v;
-      DEBUGF("  %lu = %u\n", o, v);
-      i += 8;
-      if (i == 64) {
-        const_index++; // move on to the next 64-bit chunk
-        i = 0;
+    auto &right = c->get_root()->children(1);
+    if (likely(right.kind() == rgd::Read)) {
+      // the memcmp argument is directly from input
+      for (size_t o = offset; o < offset + size; o++) {
+        if (i == 0)
+          value = c->input_args[const_index].second;
+        uint8_t v = ((value >> i) & 0xff);
+        out_buf[o] = v;
+        DEBUGF("  %lu = %u\n", o, v);
+        i += 8;
+        if (i == 64) {
+          const_index++; // move on to the next 64-bit chunk
+          i = 0;
+        }
+      }
+      out_size = in_size;
+      return SOLVER_SAT;
+    } else {
+      // there could be transformations on the input
+      auto *info = __dfsan::get_label_info(c->get_root()->label());
+      uint64_t sample = info->op2.i;
+      uint16_t sample_len = info->size > 8 ? 8 : info->size;
+      uint8_t sample_buf[sample_len];
+      memcpy(sample_buf, &sample, sample_len);
+#if DEBUG
+      memcpy(&value, &in_buf[offset], size > 8 ? 8 : size);
+      DEBUGF("i2s: memcmp encoded: %016lx => %016lx\n", value, sample);
+#endif
+      uint8_t encode_val = 0, touppwer = 0, tolower = 0;
+
+      // we only have one sample, so we cannot to reliable guessing purely
+      // based on input-output pairs, instead, we leverage the symbolic AST
+      // to guide the guessing
+      uint16_t kind = 0;
+      for (uint16_t i = rgd::Add; i < rgd::Shl; ++i) {
+        if (c->ops.test(i)) {
+          if (kind != 0) {
+            kind = 0;
+            break;
+          } else {
+            kind = i;
+          }
+        }
+      }
+      if (kind != 0) {
+        // XXX: always assumes const_op is the rhs?
+        encode_val = (uint8_t)_get_binop_value_r(sample_buf[0], in_buf[offset], kind, false);
+      } else {
+        for (auto i = 0; i < sample_len; ++i) {
+          // check simple encoding
+          touppwer = ((in_buf[offset + i] | 0x20) == sample_buf[i]) ? 1 : 0;
+          tolower = ((in_buf[offset + i] & 0x5f) == sample_buf[i]) ? 1 : 0;
+        }
+      }
+
+      if (encode_val) {
+        DEBUGF("i2s: memcmp try encode val = %02x, op = %d\n", encode_val, kind);
+        for (size_t o = offset; o < offset + size; o++) {
+          if (i == 0)
+            value = c->input_args[const_index].second;
+          uint8_t v = ((value >> i) & 0xff);
+          out_buf[o] = (uint8_t)_get_binop_value_r(v, encode_val, kind, false);
+          DEBUGF("  %lu = %u\n", o, v);
+          i += 8;
+          if (i == 64) {
+            const_index++; // move on to the next 64-bit chunk
+            i = 0;
+          }
+        }
+        out_size = in_size;
+        return SOLVER_SAT;
+      } else if (touppwer) {
+        DEBUGF("i2s: memcmp try touppwer\n");
+        for (size_t o = offset; o < offset + size; o++) {
+          if (i == 0)
+            value = c->input_args[const_index].second;
+          uint8_t v = ((value >> i) & 0xff);
+          out_buf[o] = v | 0x20;
+          DEBUGF("  %lu = %u\n", o, v);
+          i += 8;
+          if (i == 64) {
+            const_index++; // move on to the next 64-bit chunk
+            i = 0;
+          }
+        }
+        out_size = in_size;
+        return SOLVER_SAT;
+      } else if (tolower) {
+        DEBUGF("i2s: memcmp try tolower\n");
+        for (size_t o = offset; o < offset + size; o++) {
+          if (i == 0)
+            value = c->input_args[const_index].second;
+          uint8_t v = ((value >> i) & 0xff);
+          out_buf[o] = v & 0x5f;
+          DEBUGF("  %lu = %u\n", o, v);
+          i += 8;
+          if (i == 64) {
+            const_index++; // move on to the next 64-bit chunk
+            i = 0;
+          }
+        }
+        out_size = in_size;
+        return SOLVER_SAT;
+      } else {
+        mismatches++;
+        return SOLVER_TIMEOUT;
       }
     }
-    out_size = in_size;
-    return SOLVER_SAT;
   }
   mismatches++;
   return SOLVER_TIMEOUT;

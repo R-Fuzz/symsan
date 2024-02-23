@@ -57,6 +57,9 @@ namespace rgd {
     Load, // 36    to be worked with TT-Fuzzer
     Memcmp, //37
     MemcmpN, // 38
+
+    // Last
+    LastOp
   };
 
   static const char* AstKindName[] = {

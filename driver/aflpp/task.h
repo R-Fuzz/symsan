@@ -50,6 +50,8 @@ struct Constraint {
   std::unordered_map<uint32_t, uint32_t> shapes;
   // special infomation for atoi: offset -> (result_length, base, str_length)
   std::unordered_map<uint32_t, std::tuple<uint32_t, uint32_t, uint32_t>> atoi_info;
+  // record the involved operations
+  std::bitset<rgd::LastOp> ops;
   // number of constant in the input array
   uint32_t const_num;
   // recorded comparison operands
