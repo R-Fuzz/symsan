@@ -406,6 +406,20 @@ void *__dfsw_memset(void *s, int c, size_t n,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw_tolower(int c, dfsan_label c_label, dfsan_label *ret_label) {
+  int ret = tolower(c);
+  *ret_label = dfsan_union(0, c_label, __dfsan::Or, 8, 0x20, 0);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw_toupper(int c, dfsan_label c_label, dfsan_label *ret_label) {
+  int ret = toupper(c);
+  *ret_label = dfsan_union(0, c_label, __dfsan::And, 8, 0x5f, 0);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
 char *__dfsw_strcat(char *dest, const char *src, dfsan_label d_label,
                     dfsan_label s_label, dfsan_label *ret_label) {
   size_t len = strlen(dest);
@@ -701,19 +715,22 @@ char *__dfsw_strcpy(char *dest, const char *src, dfsan_label dst_label,
 
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_atoi(const char *nptr, dfsan_label nptr_label, dfsan_label *ret_label) {
-  int ret = atoi(nptr);
-  size_t len = strlen(nptr);
-  if (nptr_label != 0) {
-    // len may be too large, try to limit if we know the size of the buffer
-    dfsan_label_info *info = dfsan_get_label_info(nptr_label);
-    if (info->op == __dfsan::Alloca) {
-      size_t buff_s = info->op2.i - info->op1.i;
-      len = len > buff_s ? buff_s : len;
+  char *tmp_endptr;
+  long ret = strtol(nptr, &tmp_endptr, 10);
+  uptr len = (uptr)tmp_endptr - (uptr)nptr;
+  if (len > 0) {
+    dfsan_label n = dfsan_read_label(nptr, len);
+    *ret_label = dfsan_union(0, n, fatoi, sizeof(ret) * 8, 10, len);
+  } else {
+    // well, no byte get consumed, handle specially
+    dfsan_label l = shadow_for(nptr)[0];
+    if (l >= CONST_OFFSET) {
+      dfsan_label load = dfsan_union(l, 0, Load, 0, 0, 0);
+      l = dfsan_union(0, load, fatoi, sizeof(ret) * 8, 10, 0);
     }
+    *ret_label = l;
   }
-  dfsan_label n = dfsan_read_label(nptr, len);
-  *ret_label = dfsan_union(0, n, fatoi, sizeof(ret) * 8, 10, len);
-  return ret;
+  return (int)ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
