@@ -354,6 +354,8 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       // to guide the guessing
       uint16_t kind = 0;
       for (uint16_t i = rgd::Add; i < rgd::Shl; ++i) {
+        if (i == rgd::Not || i == rgd::Neg || i == rgd::And || i == rgd::Or)
+          continue; // we cannot reverse bitwise And and Or
         if (c->ops.test(i)) {
           if (kind != 0) {
             kind = 0;
@@ -369,8 +371,8 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       } else {
         for (auto i = 0; i < sample_len; ++i) {
           // check simple encoding
-          touppwer = ((in_buf[offset + i] | 0x20) == sample_buf[i]) ? 1 : 0;
-          tolower = ((in_buf[offset + i] & 0x5f) == sample_buf[i]) ? 1 : 0;
+          tolower = ((in_buf[offset + i] | 0x20) == sample_buf[i]) ? 1 : 0;
+          touppwer = ((in_buf[offset + i] & 0x5f) == sample_buf[i]) ? 1 : 0;
         }
       }
 
