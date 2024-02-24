@@ -496,12 +496,12 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
     case rgd::Distinct:
     case rgd::Ugt:
     case rgd::Sgt:
-      if (rhs) return v + 1;
-      else return v - 1;
-    case rgd::Ult:
-    case rgd::Slt:
       if (rhs) return v - 1;
       else return v + 1;
+    case rgd::Ult:
+    case rgd::Slt:
+      if (rhs) return v + 1;
+      else return v - 1;
     default:
       assert(false && "Non-relational op!");
   }
