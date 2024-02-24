@@ -68,12 +68,12 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
     case rgd::Distinct:
     case rgd::Ugt:
     case rgd::Sgt:
-      if (rhs) return v + 1;
-      else return v - 1;
-    case rgd::Ult:
-    case rgd::Slt:
       if (rhs) return v - 1;
       else return v + 1;
+    case rgd::Ult:
+    case rgd::Slt:
+      if (rhs) return v + 1;
+      else return v - 1;
     default:
       assert(false && "Non-relational op!");
   }
@@ -190,7 +190,8 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       if (likely(atoi == c->atoi_info.end())) {
         // size can be not a power of 2
         memcpy(&value, &in_buf[offset], s);
-        DEBUGF("i2s: try %lu, length %u = %016lx\n", offset, s, value);
+        DEBUGF("i2s: try %lu, length %u = 0x%016lx, comparison = %d\n",
+            offset, s, value, comparison);
         if (c->op1 == value) {
           matches++;
           r = get_i2s_value(comparison, c->op2, false);
@@ -248,7 +249,7 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
           r = _get_binop_value_r(r, const_op, kind, bop_rhs);
           r &= mask; // mask the result to avoid overflow
         }
-        DEBUGF("i2s: %lu = %lx\n", offset, r);
+        DEBUGF("i2s: %lu = 0x%lx\n", offset, r);
         memcpy(out_buf, in_buf, in_size);
         out_size = in_size;
         memcpy(&out_buf[offset], &r, s);
