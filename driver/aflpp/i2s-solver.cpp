@@ -6,6 +6,8 @@ extern "C" {
 #include "afl-fuzz.h"
 }
 
+#include <cmath>
+
 using namespace rgd;
 
 #define DEBUG 0
@@ -133,8 +135,17 @@ static inline uint64_t _get_binop_value_r(uint64_t r, uint64_t const_op, uint16_
     case rgd::Or: return r;  // XXX: (a | b) | b == a | b
     case rgd::Xor: return r ^ const_op; // v = r ^ const_op
     case rgd::Shl:
-      assert(!rhs && "Shl rhs not supported");
-      return r >> const_op; // v = r >> const_op
+      if (rhs) {
+        if (const_op == 1) {
+          double log2 = std::log2(r);
+          return static_cast<uint64_t>(log2);
+        } else {
+          WARNF("unsupported Shl (rhs) const_op %lu\n", const_op);
+          return 0;
+        }
+      } else {
+        return r >> const_op; // v = r >> const_op
+      }
     case rgd::LShr:
       assert(!rhs && "LShr rhs not supported");
       return r << const_op; // v = r << diff
