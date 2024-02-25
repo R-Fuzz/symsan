@@ -163,7 +163,21 @@ static uint64_t get_binop_value(std::shared_ptr<const Constraint> constraint,
   return r;
 }
 
-I2SSolver::I2SSolver(): matches(0), mismatches(0) {}
+I2SSolver::I2SSolver(): matches(0), mismatches(0) {
+  binop_mask.set(rgd::Add);
+  binop_mask.set(rgd::Sub);
+  binop_mask.set(rgd::Mul);
+  binop_mask.set(rgd::UDiv);
+  binop_mask.set(rgd::SDiv);
+  binop_mask.set(rgd::URem);
+  binop_mask.set(rgd::SRem);
+  binop_mask.set(rgd::And);
+  // binop_mask.set(rgd::Or);
+  binop_mask.set(rgd::Xor);
+  // binop_mask.set(rgd::Shl);
+  binop_mask.set(rgd::LShr);
+  binop_mask.set(rgd::AShr);
+}
 
 solver_result_t
 I2SSolver::solve(std::shared_ptr<SearchTask> task,
@@ -190,8 +204,9 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       if (likely(atoi == c->atoi_info.end())) {
         // size can be not a power of 2
         memcpy(&value, &in_buf[offset], s);
-        DEBUGF("i2s: try %lu, length %u = 0x%016lx, comparison = %d\n",
-            offset, s, value, comparison);
+        value_r = SWAP64(value) >> (64 - s * 8);
+        DEBUGF("i2s: try %lu, length %u = 0x%016lx, 0x%016lx, comparison = %d\n",
+            offset, s, value, value_r, comparison);
         if (c->op1 == value) {
           matches++;
           r = get_i2s_value(comparison, c->op2, false);
@@ -206,7 +221,7 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
           matches++;
           r = get_i2s_value(comparison, c->op1, true);
           r = SWAP64(r) >> (64 - s * 8);
-        } else {
+        } else if ((binop_mask & c->ops).count() == 1) {
           // try some simple binary operations
           auto &left = c->get_root()->children(0);
           auto &right = c->get_root()->children(1);
@@ -218,6 +233,8 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
           // true if the input is on the right hand side of the binary operation
           // NOTE, not the right hand side of the comparison
           bool bop_rhs = false;
+          // check reverse too
+          bool is_reversed = false;
           // check if lhs of the comparison is a simple binary operation with a constant
           if (isBinaryOperation(left.kind())) {
             r = get_binop_value(c, left, value, const_op, bop_rhs);
@@ -227,7 +244,19 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
               // binop result matches op1 of the comparison
               kind = left.kind();
               rhs = false;
-            } else { const_op = 0; }
+            } else {
+              // check value_r
+              r = get_binop_value(c, left, value_r, const_op, bop_rhs);
+              r &= mask; // mask the result to avoid overflow
+              DEBUGF("i2s: binop (lhs) %lx (%d) %lx = %lx =? %lx\n", value_r, left.kind(), const_op, r, c->op1);
+              if (r == c->op1) {
+                kind = left.kind();
+                rhs = false;
+                is_reversed = true;
+              } else {
+                const_op = 0;
+              }
+            }
           }
           if (isBinaryOperation(right.kind())) {
             r = get_binop_value(c, right, value, const_op, bop_rhs);
@@ -237,7 +266,19 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
               // binop result matches op2 of the comparison
               kind = right.kind();
               rhs = true;
-            } else { const_op = 0; }
+            } else {
+              // check value_r
+              r = get_binop_value(c, right, value_r, const_op, bop_rhs);
+              r &= mask; // mask the result to avoid overflow
+              DEBUGF("i2s: binop (lhs) %lx (%d) %lx = %lx =? %lx\n", value_r, left.kind(), const_op, r, c->op1);
+              if (r == c->op2) {
+                kind = right.kind();
+                rhs = true;
+                is_reversed = true;
+              } else {
+                const_op = 0;
+              }
+            }
           }
           if (const_op == 0) {
             continue; // nothing matches next offset
@@ -248,6 +289,12 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
           // apply the diff
           r = _get_binop_value_r(r, const_op, kind, bop_rhs);
           r &= mask; // mask the result to avoid overflow
+          // reverse the result if necessary
+          if (is_reversed) {
+            r = SWAP64(r) >> (64 - s * 8);
+          }
+        } else {
+          continue; // next offset
         }
         DEBUGF("i2s: %lu = 0x%lx\n", offset, r);
         memcpy(out_buf, in_buf, in_size);
@@ -430,6 +477,14 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
         return SOLVER_TIMEOUT;
       }
     }
+  } else if (comparison == rgd::MemcmpN) {
+    DEBUGF("i2s: try memcmpN\n");
+    memcpy(out_buf, in_buf, in_size);
+    size_t offset = cm->i2s_candidates[0].first;
+    uint32_t size = cm->i2s_candidates[0].second;
+    out_buf[offset] = in_buf[offset] + 8;
+    out_size = in_size;
+    return SOLVER_SAT;
   }
   mismatches++;
   return SOLVER_TIMEOUT;
