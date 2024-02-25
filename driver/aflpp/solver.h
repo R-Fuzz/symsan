@@ -78,6 +78,7 @@ public:
 private:
   uint64_t matches;
   uint64_t mismatches;
+  std::bitset<rgd::LastOp> binop_mask;
 };
 
 }; // namespace rgd
