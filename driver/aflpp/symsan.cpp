@@ -1189,7 +1189,7 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
   // relational sub-expressions, where each sub-expression only contains
   // one relational operator at the root
   expr_t orig_root = get_root_expr(label, buf_size);
-  if (orig_root->kind() == rgd::Bool) {
+  if (orig_root == nullptr || orig_root->kind() == rgd::Bool) {
     // if the simplified formula is a boolean constant, nothing to do
     return false;
   }
@@ -1280,7 +1280,7 @@ static bool add_data_flow_constraints(bool direction, dfsan_label label,
   // into a DNF form of relational sub-expressions, where each sub-expression
   // only contains one relational operator at the root
   expr_t orig_root = get_root_expr(label, buf_size);
-  if (orig_root->kind() == rgd::Bool) {
+  if (orig_root == nullptr || orig_root->kind() == rgd::Bool) {
     // if the simplified formula is a boolean constant, nothing to do
     return false;
   }
