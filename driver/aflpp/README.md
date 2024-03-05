@@ -32,7 +32,7 @@ cd /workdir/aflpp && CC=clang-12 CXX=clang++-12 make source-only && make install
 Next, download symsan and build
 
 ```
-git clone -b aflpp https://github.com/R-Fuzz/symsan /workdir/symsan
+git clone https://github.com/R-Fuzz/symsan /workdir/symsan
 cd symsan/ && mkdir -p build && \
   cd build && CC=clang-12 CXX=clang++-12 cmake -DAFLPP_PATH=/workdir/aflpp ../  && \
   make -j && make install
@@ -69,6 +69,7 @@ to load the plugin and control its behavior:
 * `SYMSAN_OUTPUT_DIR=/none/default/dir` (optional): a different directory to store temporary outputs from SymSan
 * `SYMSAN_USE_JIGSAW=1` (optional): use JIGSAW as the solver
 * `SYMSAN_USE_Z3=1` (optional): use Z3 as the solver
+* `SYMSAN_USE_NESTED=1` (optional): consider nested branches when constructing a solving task
 
 ## Some high-level design
 
@@ -99,8 +100,9 @@ interfaces that can be customized:
 * `rgd::Solver` is in charge of solving a solving task. Right now there are three
   solvers, which works in a layered manner (i2s->jigsaw->z3):
   if a task is solved by an earlier solver, it will skip the next solver; otherwise the next solver is invoked.
-    * A simple I2S solver, which uses tracing results to map input bytes to comparison
+    * The default one is a simple I2S solver, which uses tracing results to map input bytes to comparison
       operands and generate a solution based on potential
       [input-to-state correspondence](https://www.ndss-symposium.org/ndss-paper/redqueen-fuzzing-with-input-to-state-correspondence/).
     * JIGSAW, which is our [JIT-based constraint solver](https://github.com/R-Fuzz/jigsaw).
     * Z3
+
