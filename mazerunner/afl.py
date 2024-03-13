@@ -234,7 +234,7 @@ class Mazerunner:
 
     @property
     def my_errors(self):
-        return os.path.join(self.my_dir, "errors")
+        return os.path.join(self.my_dir, "crashes")
 
     @property
     def my_generations(self):
