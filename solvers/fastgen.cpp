@@ -143,8 +143,10 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cond(dfsan_label label, u8 r, u8 flag, u32 cid) {
   if (label == 0) {
+    #ifdef __LOOP_TRACING__
     // check for real loop exits
     if (!(((flag & 0x1) && !r) || ((flag & 0x2) && r)))
+    #endif
       return;
   }
 

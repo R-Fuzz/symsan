@@ -164,8 +164,11 @@ static cl::opt<bool> ClTraceBound(
 static cl::opt<bool> ClTraceLoop(
     "taint-trace-loop",
     cl::desc("Trace loop entering and exiting."),
+#ifdef __LOOP_TRACING__
     cl::Hidden, cl::init(true));
-
+#else
+    cl::Hidden, cl::init(false));
+#endif
 static StringRef GetGlobalTypeString(const GlobalValue &G) {
   // Types of GlobalVariables are always pointer types.
   Type *GType = G.getValueType();
