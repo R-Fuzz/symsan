@@ -214,9 +214,14 @@ enum pipe_msg_type {
   gep_type = 1,
   memcmp_type = 2,
   fsize_type = 3,
+  memerr_type = 4,
 };
 
 #define F_ADD_CONS  0x1
+
+#define F_MEMERR_UAF 0x1
+#define F_MEMERR_OLB 0x2
+#define F_MEMERR_OUB 0x4
 
 struct pipe_msg {
   uint16_t msg_type;
