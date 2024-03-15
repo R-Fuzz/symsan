@@ -449,6 +449,9 @@ dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size, uint64_t elem_siz
   }
 }
 
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memerr, dfsan_label, uptr, dfsan_label,
+                             uint64_t, uint16_t, void*) {}
+
 // NOTES: for Alloca, or buffer buounds info
 // .l1 = num of elements label, for calloc style allocators
 // .l2 = (element) size label
@@ -459,14 +462,24 @@ void __taint_check_bounds(dfsan_label addr_label, uptr addr,
                           dfsan_label size_label, uint64_t size) {
   if (flags().trace_bounds) {
     dfsan_label_info *info = get_label_info(addr_label);
+    void *retaddr = __builtin_return_address(0);
     if (info->op == Free) {
       // UAF
-      AOUT("ERROR: UAF detected %p = %d @%p\n", addr, addr_label, __builtin_return_address(0));
+      AOUT("ERROR: UAF detected %p = %d @%p\n", addr, addr_label, retaddr);
+      __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_UAF, retaddr);
+      if (flags().exit_on_memerror) Die();
     } else if (info->op == Alloca) {
       AOUT("addr = %p, lower = %p, upper = %p\n", addr, info->op1.i, info->op2.i);
-      if (addr < info->op1.i || (addr + size) > info->op2.i || (addr + size) < info->op1.i) {
+      if (addr < info->op1.i) {
+        AOUT("ERROR: OOB detected %p = %d, %llu = %d @%p\n",
+             addr, addr_label, size, size_label, retaddr);
+        __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_OLB, retaddr);
+        if (flags().exit_on_memerror) Die();
+      } else if ((addr + size) > info->op2.i || (addr + size) < info->op1.i) {
         AOUT("ERROR: OOB detected %p = %d, %llu = %d @%p\n",
              addr, addr_label, size, size_label, __builtin_return_address(0));
+        __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_OUB, retaddr);
+        if (flags().exit_on_memerror) Die();
       }
     } else if (addr_label != 0) {
       AOUT("WARNING: incorrect label %p = %d @%p\n", addr, addr_label, __builtin_return_address(0));

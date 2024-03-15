@@ -188,6 +188,33 @@ __taint_trace_memcmp(dfsan_label label) {
   return;
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
+                     uint64_t size, uint16_t flag, void *addr) {
+  if (ptr_label == 0 || size_label == 0)
+    return;
+
+  uint64_t r = 0;
+  switch(flag) {
+    case F_MEMERR_UAF: r = ptr; break;
+    case F_MEMERR_OLB: r = ptr; break;
+    case F_MEMERR_OUB: r = ptr + size; break;
+    default: return;
+  }
+
+  pipe_msg msg = {
+    .msg_type = memerr_type,
+    .flags = flag,
+    .instance_id = __instance_id,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack,
+    .label = ptr_label, // just in case
+    .result = r
+  };
+
+  internal_write(__pipe_fd, &msg, sizeof(msg));
+}
+
 extern "C" void InitializeSolver() {
   __instance_id = flags().instance_id;
   __session_id = flags().session_id;
