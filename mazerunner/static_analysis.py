@@ -201,14 +201,31 @@ class CFGraph:
 
     def _get_targets(self):
         self.targets = set()
-        targets = []
+        targets_loc = set()
         with open(target_BB_file, 'r') as fd:
             for l in fd.readlines():
                 if '.c:' not in l: continue
-                targets.append(l.strip())
-        targets = list(set(targets))
-        assert (len(targets) > 0), "no target in the BBtargets.txt"
-        t = {node for node in self.cfg.nodes if self.extract_location(node) in targets}
+                targets_loc.add(l.strip())
+        assert (len(targets_loc) > 0), "no target in the BBtargets.txt"
+        t = {node for node in self.cfg.nodes if self.extract_location(node) in targets_loc}
+        # if the target location not found in the CFG, 
+        # this could be due to optimization or inlining, 
+        # we may still find the target by matching the basic block name in the CFG
+        if not t:
+            all_locs = collections.defaultdict(set)
+            for node in self.cfg.nodes:
+                n_loc = self.extract_location(node)
+                if ':' in n_loc:
+                    all_locs[n_loc].add(node)
+            for t_loc in targets_loc:
+                fn_t, l_t = t_loc.split(':')
+                l_t = int(l_t)
+                for line in range(l_t, l_t - 10, -1):
+                    protential_loc = f"{fn_t}:{line}"
+                    if protential_loc in all_locs:
+                        print(f'adding {protential_loc} into targets')
+                        t.update(all_locs[protential_loc])
+                        break
         for node in t:
             # delete return nodes
             if self.cfg.out_degree(node) > 0:
