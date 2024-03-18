@@ -131,8 +131,8 @@ static inline uint64_t _get_binop_value_r(uint64_t r, uint64_t const_op, uint16_
       } else {
         return r;
       }
-    case rgd::And: return r; // XXX: when r = v & const_op, (r) & const_op = (v & const_op) & const_op = v & const_op = r
-    case rgd::Or: return r;  // XXX: (a | b) | b == a | b
+    case rgd::And: return (r & const_op) == r ? r : const_op; // XXX: when r = v & const_op, (r) & const_op = (v & const_op) & const_op = v & const_op = r
+    case rgd::Or: return (r | const_op) == r ? r : const_op;  // XXX: (a | b) | b == a | b
     case rgd::Xor: return r ^ const_op; // v = r ^ const_op
     case rgd::Shl:
       if (rhs) {
