@@ -2,8 +2,9 @@
 
 #include <stdint.h>
 #include <assert.h>
-#include <vector>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace rgd {
   enum AstKind {
@@ -175,28 +176,29 @@ namespace rgd {
     }
 
     inline const AstNode& children(uint32_t i) const {
-      assert(i < 2);
+      if (i >= 2) throw std::out_of_range("children index out of range");
       return i == 0 ? root_->at(child0_) : root_->at(child1_);
     }
 
     inline AstNode* mutable_children(uint32_t i) {
-      assert(i < 2);
+      if (i >= 2) throw std::out_of_range("children index out of range");
       return i == 0 ? &root_->at(child0_) : &root_->at(child1_);
     }
 
     AstNode* add_children() {
       size_t size = root_->size();
-      assert(size < root_->capacity() && "cannot resize");
+      // assert(size < root_->capacity() && "cannot resize");
+      if (size >= root_->capacity()) return nullptr;
       if (child0_ == 0) child0_ = size;
       else if (child1_ == 0) child1_ = size;
-      else assert(false && "too many children");
+      else return nullptr; //assert(false && "too many children");
       root_->emplace_back(AstNode(root_));
       return &root_->back();
     }
 
     inline void clear_children() { child0_ = child1_ = 0; }
     inline void clear_children(uint32_t i) {
-      assert(i < 2);
+      if (i >= 2) throw std::out_of_range("children index out of range");
       if (i == 1) child1_ = 0;
       else child0_ = child1_; // pop child1 to child0
     }
