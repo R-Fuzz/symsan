@@ -474,8 +474,13 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_check_bounds(dfsan_label addr_label, uptr addr,
                           dfsan_label size_label, uint64_t size) {
   if (flags().trace_bounds) {
-    dfsan_label_info *info = get_label_info(addr_label);
     void *retaddr = __builtin_return_address(0);
+    if (addr_label == kInitializingLabel) {
+      AOUT("WARNING: uninitialized memory %p = %d @%p\n", addr, addr_label, retaddr);
+      __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_UBI, retaddr);
+      if (flags().exit_on_memerror) Die();
+    }
+    dfsan_label_info *info = get_label_info(addr_label);
     if (info->op == Free) {
       // UAF
       AOUT("ERROR: UAF detected %p = %d @%p\n", addr, addr_label, retaddr);
