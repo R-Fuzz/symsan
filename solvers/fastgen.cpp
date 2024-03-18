@@ -6,7 +6,7 @@
    Written by Chengyu Song <csong@cs.ucr.edu> and
               Ju Chen <jchen757@ucr.edu>
 
-   Copyright 2021,2022 UC Riverside. All rights reserved.
+   Copyright 2021-2024 UC Riverside. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -49,6 +49,9 @@ static uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predicate) {
 
 static inline void __solve_cond(dfsan_label label, uint8_t result, uint8_t add_nested, uint32_t cid, void *addr) {
 
+  if (__pipe_fd < 0)
+    return;
+
   uint16_t flags = 0;
   if (add_nested) flags |= F_ADD_CONS;
 
@@ -64,7 +67,9 @@ static inline void __solve_cond(dfsan_label label, uint8_t result, uint8_t add_n
     .result = result
   };
 
-  internal_write(__pipe_fd, &msg, sizeof(msg));
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -119,6 +124,9 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
   AOUT("tainted GEP index: %lld = %d, ne: %lld, es: %lld, offset: %lld\n",
       index, index_label, num_elems, elem_size, current_offset);
 
+  if (__pipe_fd < 0)
+    return;
+
   // send gep info, in two pieces
   pipe_msg msg = {
     .msg_type = gep_type,
@@ -130,7 +138,9 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
     .result = (uint64_t)index
   };
 
-  internal_write(__pipe_fd, &msg, sizeof(msg));
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
 
   gep_msg gmsg = {
     .ptr_label = ptr_label,
@@ -143,7 +153,9 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
   };
 
   // FIXME: assuming single writer so msg will arrive in the same order
-  internal_write(__pipe_fd, &gmsg, sizeof(gmsg));
+  if (internal_write(__pipe_fd, &gmsg, sizeof(gmsg)) < 0) {
+    Die();
+  }
 
   return; 
 }
@@ -161,6 +173,11 @@ __taint_trace_memcmp(dfsan_label label) {
   void *addr = __builtin_return_address(0);
   dfsan_label_info *info = get_label_info(label);
 
+  AOUT("tainted memcmp: %d, size: %d\n", label, info->size);
+
+  if (__pipe_fd < 0)
+    return;
+
   pipe_msg msg = {
     .msg_type = memcmp_type,
     .flags = 0,
@@ -171,7 +188,9 @@ __taint_trace_memcmp(dfsan_label label) {
     .result = (uint64_t)info->size
   };
 
-  internal_write(__pipe_fd, &msg, sizeof(msg));
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
 
   // if both operands are symbolic, skip sending the content
   if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
@@ -183,7 +202,9 @@ __taint_trace_memcmp(dfsan_label label) {
   internal_memcpy(mmsg->content, (void*)info->op1.i, info->size); // concrete oprand is always in op1
 
   // FIXME: assuming single writer so msg will arrive in the same order
-  internal_write(__pipe_fd, mmsg, msg_size);
+  if (internal_write(__pipe_fd, mmsg, msg_size) < 0) {
+    Die();
+  }
 
   return;
 }
@@ -191,7 +212,10 @@ __taint_trace_memcmp(dfsan_label label) {
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
                      uint64_t size, uint16_t flag, void *addr) {
-  if (ptr_label == 0 || size_label == 0)
+  if (ptr_label == 0 && size_label == 0)
+    return;
+
+  if (__pipe_fd < 0)
     return;
 
   uint64_t r = 0;
@@ -199,6 +223,7 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
     case F_MEMERR_UAF: r = ptr; break;
     case F_MEMERR_OLB: r = ptr; break;
     case F_MEMERR_OUB: r = ptr + size; break;
+    case F_MEMERR_UBI: r = ptr; break;
     default: return;
   }
 
@@ -212,7 +237,9 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
     .result = r
   };
 
-  internal_write(__pipe_fd, &msg, sizeof(msg));
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
 }
 
 extern "C" void InitializeSolver() {
