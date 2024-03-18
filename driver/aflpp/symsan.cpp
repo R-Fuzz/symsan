@@ -32,8 +32,10 @@ extern "C" {
 
 #include <sys/ipc.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -55,7 +57,12 @@ using namespace __dfsan;
 
 #define MAX_AST_SIZE 200
 
+#define MIN_TIMEOUT 50U
+
+#define MAX_LOCAL_BRANCH_COUNTER 128
+
 static bool NestedSolving = false;
+static int TraceBounds = 0;
 
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
@@ -134,8 +141,12 @@ struct my_mutator_t {
 
 // FIXME: find another way to make the union table hash work
 static dfsan_label_info *__dfsan_label_info;
+static const size_t MAX_LABEL = uniontable_size / sizeof(dfsan_label_info);
 
 dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
+  if (unlikely(label >= MAX_LABEL)) {
+    throw std::out_of_range("label too large " + std::to_string(label));
+  }
   return &__dfsan_label_info[label];
 }
 
@@ -205,6 +216,7 @@ static std::unordered_map<dfsan_label, std::unique_ptr<uint8_t[]>> memcmp_cache;
 static std::vector<uint32_t> ast_size_cache;
 static std::vector<uint8_t> nested_cmp_cache;
 static std::unordered_map<dfsan_label, uint8_t> concretize_node;
+static std::unordered_map<uint32_t, uint8_t> local_counter;
 // FIXME: global input dependency forests
 static rgd::UnionFind data_flow_deps;
 static std::vector<std::vector<expr_t> > input_to_branches;
@@ -224,6 +236,7 @@ static void reset_global_caches(size_t buf_size) {
   ast_size_cache.clear();
   nested_cmp_cache.clear();
   concretize_node.clear();
+  local_counter.clear();
   data_flow_deps.reset(buf_size);
   for (auto &s: input_to_branches) {
     s.clear();
@@ -262,7 +275,7 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
                        std::shared_ptr<rgd::Constraint> constraint,
                        std::unordered_set<dfsan_label> &visited) {
 
-  if (label < CONST_OFFSET || label == kInitializingLabel) {
+  if (label < CONST_OFFSET || label == kInitializingLabel || label >= MAX_LABEL) {
     WARNF("invalid label: %d\n", label);
     return false;
   }
@@ -287,7 +300,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_bits(8);
     ret->set_label(label);
     uint64_t offset = info->op1.i;
-    assert(offset < buf_size);
+    if (unlikely(offset >= buf_size)) {
+      WARNF("invalid offset: %lu >= %lu\n", offset, buf_size);
+      return false;
+    }
     ret->set_index(offset);
     // map arg
     uint32_t hash = map_arg(buf, offset, 1, constraint);
@@ -304,7 +320,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_bits(info->l2 * 8);
     ret->set_label(label);
     uint64_t offset = get_label_info(info->l1)->op1.i;
-    assert(offset + info->l2 <= buf_size);
+    if (unlikely(offset + info->l2 > buf_size)) {
+      WARNF("invalid offset: %lu + %u > %lu\n", offset, info->l2, buf_size);
+      return false;
+    }
     ret->set_index(offset);
     // map arg
     uint32_t hash = map_arg(buf, offset, info->l2, constraint);
@@ -318,6 +337,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     return true;
   } else if (info->op == __dfsan::fmemcmp) {
     rgd::AstNode *s1 = ret->add_children();
+    if (unlikely(s1 == nullptr)) {
+      WARNF("failed to add children\n");
+      return false;
+    }
     if (info->l1 >= CONST_OFFSET) {
       if (!do_uta_rel(info->l1, s1, buf, buf_size, constraint, visited)) {
         return false;
@@ -330,7 +353,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       s1->set_label(0);
       // use constant args to pass the array
       auto itr = memcmp_cache.find(label);
-      assert(itr != memcmp_cache.end());
+      if (unlikely(itr == memcmp_cache.end())) {
+        WARNF("memcmp target not found for label %u\n", label);
+        return false;
+      }
       uint32_t arg_index = (uint32_t)constraint->input_args.size();
       s1->set_index(arg_index);
       uint16_t chunks = info->size / 8;
@@ -360,8 +386,11 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       ret->set_name("constant");
 #endif
     }
-    assert(info->l2 >= CONST_OFFSET);
     rgd::AstNode *s2 = ret->add_children();
+    if (unlikely(s2 == nullptr)) {
+      WARNF("failed to add children\n");
+      return false;
+    }
     if (!do_uta_rel(info->l2, s2, buf, buf_size, constraint, visited)) {
       return false;
     }
@@ -376,12 +405,21 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
 #endif
     return true;
   } else if (info->op == __dfsan::fatoi) {
-    assert(info->l1 == 0 && info->l2 >= CONST_OFFSET);
+    if (unlikely(info->l1 != 0 || info->l2 < CONST_OFFSET)) {
+      WARNF("invalid atoi label %u\n", label);
+      return false;
+    }
     dfsan_label_info *src = get_label_info(info->l2);
-    assert(src->op == Load);
+    if (unlikely(src->op != Load)) {
+      WARNF("invalid atoi source label %u, op = %u\n", info->l2, src->op);
+      return false;
+    }
     visited.insert(info->l2);
     uint64_t offset = get_label_info(src->l1)->op1.i;
-    assert(offset < buf_size);
+    if (unlikely(offset >= buf_size)) {
+      WARNF("invalid offset: %lu >= %lu\n", offset, buf_size);
+      return false;
+    }
     ret->set_bits(info->size);
     ret->set_label(label);
     ret->set_index(offset);
@@ -447,6 +485,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
 
   // now we visit the children
   rgd::AstNode *left = ret->add_children();
+  if (unlikely(left == nullptr)) {
+    WARNF("failed to add children\n");
+    return false;
+  }
   if (likely(needs_concretization != 1) && (info->l1 >= CONST_OFFSET)) {
     if (!do_uta_rel(info->l1, left, buf, buf_size, constraint, visited)) {
       return false;
@@ -454,7 +496,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     visited.insert(info->l1);
   } else {
     if (unlikely(needs_concretization)) {
-      assert(rgd::isRelationalKind(ret->kind()) && "invalid kind for concretization");
+      if (unlikely(!rgd::isRelationalKind(ret->kind()))) {
+        WARNF("invalid kind for concretization %u\n", ret->kind());
+        return false;
+      }
     }
     // constant
     left->set_kind(rgd::Constant);
@@ -492,6 +537,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   }
 
   rgd::AstNode *right = ret->add_children();
+  if (unlikely(right == nullptr)) {
+    WARNF("failed to add children\n");
+    return false;
+  }
   if (likely(needs_concretization != 2) && (info->l2 >= CONST_OFFSET)) {
     if (!do_uta_rel(info->l2, right, buf, buf_size, constraint, visited)) {
       return false;
@@ -545,19 +594,37 @@ static constraint_t
 parse_constraint(dfsan_label label, const u8 *buf, size_t buf_size) {
   DEBUGF("constructing constraint for label %u\n", label);
   // make sure root is a comparison node
+  // XXX: root should never go oob?
   dfsan_label_info *info = get_label_info(label);
-  assert(((info->op & 0xff) == __dfsan::ICmp) || (info->op == __dfsan::fmemcmp));
-
-  // retrieve the ast size
-  assert(ast_size_cache.size() > label);
-  auto size = ast_size_cache.at(label);
-  assert(size > 0);
-  std::unordered_set<dfsan_label> visited;
-  constraint_t constraint = std::make_shared<rgd::Constraint>(size);
-  if (!do_uta_rel(label, constraint->ast.get(), buf, buf_size, constraint, visited)) {
+  if (unlikely(((info->op & 0xff) != __dfsan::ICmp) && (info->op != __dfsan::fmemcmp))) {
+    WARNF("invalid root node %u, non-comparison root op: %u\n", label, info->op);
     return nullptr;
   }
-  return constraint;
+
+  // retrieve the ast size
+  if (unlikely(ast_size_cache.size() <= label)) {
+    WARNF("invalid label %u, larger than ast_size_cache: %lu\n", label, ast_size_cache.size());
+    return nullptr;
+  }
+  auto size = ast_size_cache.at(label);
+  if (unlikely(size == 0)) {
+    WARNF("invalid label %u, ast_size_cache is 0\n", label);
+    return nullptr;
+  }
+  std::unordered_set<dfsan_label> visited;
+  try {
+    constraint_t constraint = std::make_shared<rgd::Constraint>(size);
+    if (!do_uta_rel(label, constraint->ast.get(), buf, buf_size, constraint, visited)) {
+      return nullptr;
+    }
+    return constraint;
+  } catch (std::bad_alloc &e) {
+    WARNF("failed to allocate memory for constraint\n");
+    return nullptr;
+  } catch (std::out_of_range &e) {
+    WARNF("AST %u goes out of range at %s\n", label, e.what());
+    return nullptr;
+  }
 }
 
 static task_t construct_task(std::vector<const rgd::AstNode*> clause,
@@ -619,6 +686,7 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
   rgd::AstNode *root_node = ret;
   std::unordered_set<dfsan_label> visited;
 
+  try {
   while (root != 0 || !stack.empty()) {
     if (root != 0) {
       // check if the node has been visited before
@@ -642,25 +710,46 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
         if (root) {
           // create a child node before going down
           root_node = root_node->add_children();
+          if (unlikely(root_node == nullptr)) {
+            WARNF("failed to add children\n");
+            return INVALID_NODE;
+          }
         }
       }
     } else {
       // we have reached some leaf node, going up the tree
       auto curr = stack.back();
-      auto info = __dfsan::get_label_info(curr);
+      auto info = get_label_info(curr);
       auto zsl2 = strip_zext(info->l2);
       if (nested_cmp_cache[zsl2] > 0 && prev != zsl2) {
         // we have a right child, and we haven't visited it yet,
         // and there is a nested comparison, going down the right tree
         root = zsl2;
         root_node = node_stack.back()->add_children();
+        if (unlikely(root_node == nullptr)) {
+          WARNF("failed to add children\n");
+          return INVALID_NODE;
+        }
       } else {
         DEBUGF("label %d, l1 %d, l2 %d, op %d, size %d, op1 %ld, op2 %ld\n",
                curr, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i);
         // both children nodes have been visited, process the node (post-order)
         auto node = node_stack.back();
 
-        if (info->op == __dfsan::And) {
+        if (info->op == __dfsan::Not) {
+          DEBUGF("simplify not: %d, %d\n", info->l2, info->size);
+          assert(node->children_size() == 1);
+          assert(info->size == 1);
+          rgd::AstNode *child = node->mutable_children(0);
+          node->set_bits(1);
+          if (child->kind() == rgd::Bool) {
+            node->set_kind(rgd::Bool);
+            node->set_boolvalue(!child->boolvalue());
+            node->clear_children();
+          } else {
+            node->set_kind(rgd::LNot);
+          }
+        } else if (info->op == __dfsan::And) {
           // if And apprears, it must be LAnd, try to simplify
           DEBUGF("simplify land: %d LAnd %d, %d\n", info->l1, info->l2, info->size);
           assert(node->children_size() != 0);
@@ -966,6 +1055,9 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
 #ifdef DEBUG
           subroots.insert(curr);
 #endif
+        } else {
+          WARNF("Invalid AST node: op = %d\n", info->op);
+          return INVALID_NODE;
         }
 
         // mark as visited and pop from stack
@@ -975,6 +1067,10 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
         node_stack.pop_back();
       }
     }
+  }
+  } catch (std::out_of_range &e) {
+    WARNF("AST %u goes out of range at %s\n", label, e.what());
+    return INVALID_NODE;
   }
 
   return 0;
@@ -1077,7 +1173,7 @@ static void to_dnf(const rgd::AstNode *node, formula_t &formula) {
   }
 }
 
-static void scan_labels(dfsan_label label, size_t buf_size) {
+static bool scan_labels(dfsan_label label, size_t buf_size) {
   // assuming label has been checked by caller
   // assuming the last label scanned is the size of the cache
   // turns out linear scan is way faster than tree traversal
@@ -1094,6 +1190,11 @@ static void scan_labels(dfsan_label label, size_t buf_size) {
       ast_size_cache.push_back(1); // one Read node
       // input deps
       branch_to_inputs.emplace_back(input_dep_t(buf_size));
+      // skip if invalid
+      if (unlikely(info->op1.i >= buf_size)) {
+        WARNF("invalid input offset: %lu\n", info->op1.i);
+        return false;
+      }
       auto &itr = branch_to_inputs[i];
       itr.set(info->op1.i); // input offset
 #if DEBUG
@@ -1108,6 +1209,11 @@ static void scan_labels(dfsan_label label, size_t buf_size) {
       branch_to_inputs.emplace_back(input_dep_t(buf_size));
       auto &itr = branch_to_inputs[i];
       auto offset = get_label_info(info->l1)->op1.i;
+      // skip if invalid
+      if (unlikely(offset + info->l2 > buf_size)) {
+        WARNF("invalid input offset: %lu + %u > %lu\n", offset, info->l2, buf_size);
+        return false;
+      }
       for (size_t n = 0; n < info->l2; ++n) {
         // DEBUGF("adding input: %lu <- %lu\n", i, offset + n);
         itr.set(offset + n); // input offsets
@@ -1147,10 +1253,11 @@ static void scan_labels(dfsan_label label, size_t buf_size) {
   DEBUGF("\n");
   DEBUGF("nested cmp: %d = %d\n", label, nested_cmp_cache[label]);
 #endif
+  return true;
 }
 
 static inline expr_t get_root_expr(dfsan_label label, size_t buf_size) {
-  if (label < CONST_OFFSET || label == kInitializingLabel) {
+  if (label < CONST_OFFSET || label == kInitializingLabel || label >= MAX_LABEL) {
     WARNF("invalid label: %d\n", label);
     return nullptr;
   }
@@ -1161,12 +1268,16 @@ static inline expr_t get_root_expr(dfsan_label label, size_t buf_size) {
     root = itr->second;
   } else {
     // update ast_size and branch_to_inputs caches
-    scan_labels(label, buf_size);
+    if (!scan_labels(label, buf_size)) {
+      return nullptr;
+    }
     root = std::make_shared<rgd::AstNode>();
     std::unordered_set<dfsan_label> subroots;
     // we start by constructing a boolean formula with relational expressions
     // as leaf nodes
-    find_roots(label, root.get(), subroots);
+    if (find_roots(label, root.get(), subroots) != 0) {
+      return nullptr;
+    }
     root_expr_cache.insert({label, root});
 #if DEBUG
     for (auto const& subroot : subroots) {
@@ -1214,6 +1325,8 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
     task_t task = construct_task(clause, buf, buf_size);
     if (task != nullptr) {
       tasks.push_back(task);
+    } else {
+      continue; // skip the nested task if the current task is invalid
     }
 
     if (NestedSolving) {
@@ -1353,9 +1466,20 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
                         my_mutator_t *my_mutator) {
   if (unlikely(msg.label == 0)) {
     return;
+  } else if (unlikely(msg.label == kInitializingLabel)) {
+    WARNF("UBI branch cond @%p\n", (void*)msg.addr);
+    return;
   }
 
   total_branches += 1;
+
+  // apply a local (per input) branch filter
+  auto &lc = local_counter[msg.id];
+  if (lc > MAX_LOCAL_BRANCH_COUNTER) {
+    return;
+  } else {
+    lc += 1;
+  }
 
   const branch_ctx_t ctx = my_mutator->cov_mgr->add_branch((void*)msg.addr,
       msg.id, msg.result != 0, msg.context, false, false);
@@ -1420,6 +1544,10 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   // make nested solving optional too
   if (getenv("SYMSAN_USE_NESTED")) {
     NestedSolving = true;
+  }
+  // enable trace bounds?
+  if (getenv("SYMSAN_TRACE_BOUNDS")) {
+    TraceBounds = 1;
   }
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
@@ -1537,8 +1665,8 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
 
   // setup the env vars for SYMSAN
   const char *taint_file = data->afl->fsrv.use_stdin ? "stdin" : data->out_file;
-  char *options = alloc_printf("taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=%d",
-                                taint_file, data->shm_fd, pipefds[1], DEBUG);
+  char *options = alloc_printf("taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=%d:trace_bound=%d",
+                                taint_file, data->shm_fd, pipefds[1], DEBUG, TraceBounds);
 #if DEBUG
   DEBUGF("TAINT_OPTIONS=%s\n", options);
 #endif
@@ -1573,6 +1701,31 @@ static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size
 
 }
 
+static ssize_t timed_read(int fd, void *buf, size_t count, uint32_t timeout, bool &timedout) {
+  fd_set rfds;
+  struct timeval tv;
+  ssize_t ret;
+
+  FD_ZERO(&rfds);
+  FD_SET(fd, &rfds);
+
+  tv.tv_sec = (timeout / 1000);
+  tv.tv_usec = (timeout % 1000) * 1000;
+  timedout = false;
+
+  ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+  if (ret == -1) {
+    WARNF("Failed to select: %s\n", strerror(errno));
+    return -1;
+  } else if (ret == 0) {
+    WARNF("Timeout\n");
+    timedout = true;
+    return -1;
+  }
+
+  return read(fd, buf, count);
+}
+
 /// @brief the trace stage for symsan
 /// @param data the custom mutator state
 /// @param buf input buffer
@@ -1585,6 +1738,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   // we don't use the afl_custom_queue_new_entry() because we may not
   // want to solve all the tasks
   u32 input_id = data->afl->queue_cur->id;
+  u32 timeout = std::min(MIN_TIMEOUT, data->afl->fsrv.exec_tmout);
   if (data->fuzzed_inputs.find(input_id) != data->fuzzed_inputs.end()) {
     return 0;
   }
@@ -1617,11 +1771,15 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   size_t msg_size;
   std::unique_ptr<uint8_t[]> memcmp_const;
   u32 num_tasks = 0;
+  u32 num_msgs = 0;
+  bool timedout = false;
+  struct timeval start, end;
+  gettimeofday(&start, NULL);
 
   // clear all caches
   reset_global_caches(buf_size);
 
-  while (read(pipefds[0], &msg, sizeof(msg)) > 0) {
+  while (timed_read(pipefds[0], &msg, sizeof(msg), timeout, timedout) > 0) {
     // create solving tasks
     switch (msg.msg_type) {
       // conditional branch
@@ -1641,6 +1799,10 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
         handle_gep(gmsg, msg);
         break;
       case memcmp_type:
+        if (msg.label == 0 || msg.label >= MAX_LABEL) {
+          WARNF("Invalid memcmp label: %d\n", msg.label);
+          break;
+        }
         info = get_label_info(msg.label);
         // if both operands are symbolic, no content to be read
         if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
@@ -1666,9 +1828,28 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
         break;
       case fsize_type:
         break;
+      case memerr_type:
+        WARNF("Memory error detected @%p, type = %d\n", (void*)msg.addr, msg.flags);
+        break;
       default:
         break;
     }
+    // naive deadloop detection
+    num_msgs += 1;
+    if (unlikely((num_msgs & 0xffffe000) != 0)) {
+      gettimeofday(&end, NULL);
+      if ((end.tv_sec - start.tv_sec) * 10 > timeout) {
+        // allow 100x slowdown, sec * 1000 > ms * 100
+        WARNF("Possible deadloop, break\n");
+        timedout = true;
+        break;
+      }
+    }
+  }
+
+  if (timedout) {
+    // kill the child process
+    kill(pid, SIGKILL);
   }
 
   pid = waitpid(pid, NULL, 0);
