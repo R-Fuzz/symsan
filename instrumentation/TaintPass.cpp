@@ -334,6 +334,7 @@ class Taint : public ModulePass {
   IntegerType *PrimitiveShadowTy;
   PointerType *PrimitiveShadowPtrTy;
   ConstantInt *ZeroPrimitiveShadow;
+  ConstantInt *UninitializedPrimitiveShadow;
   ConstantInt *ShadowPtrMask;
   ConstantInt *ShadowPtrMul;
   Constant *ArgTLS;
@@ -821,6 +822,7 @@ bool Taint::doInitialization(Module &M) {
   PrimitiveShadowPtrTy = PointerType::getUnqual(PrimitiveShadowTy);
   IntptrTy = DL.getIntPtrType(*Ctx);
   ZeroPrimitiveShadow = ConstantInt::getSigned(PrimitiveShadowTy, 0);
+  UninitializedPrimitiveShadow = ConstantInt::getSigned(PrimitiveShadowTy, -1);
   ShadowPtrMul = ConstantInt::getSigned(IntptrTy, ShadowWidthBytes);
   if (IsX86_64)
     ShadowPtrMask = ConstantInt::getSigned(IntptrTy, ~0x700000000000LL);
@@ -1524,7 +1526,7 @@ Value *TaintFunction::combineBinaryOperatorShadows(BinaryOperator *BO,
       BO->getOpcode() == Instruction::Xor &&
       (isConstantOne(BO->getOperand(1)) ||
        isConstantOne(BO->getOperand(0)))) {
-    op = 1;
+    op = 1; // __dfsan::Not
   }
   // else if (BinaryOperator::isNeg(BO))
   //   op = 2;
@@ -2091,14 +2093,35 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
     IRBuilder<> IRB(&I);
     AllocaInst *AI = IRB.CreateAlloca(TF.TT.PrimitiveShadowTy);
     TF.AllocaShadowMap[&I] = AI;
+    if (ClTraceBound) {
+      // set shadow to uninit
+      IRB.CreateStore(TF.TT.UninitializedPrimitiveShadow, AI);
+    }
   }
-  Type *T = I.getAllocatedType();
-  bool isArray = I.isArrayAllocation() | T->isArrayTy();
-  if (!ClTraceBound || !isArray) {
+  if (!ClTraceBound) {
     TF.setShadow(&I, TF.TT.ZeroPrimitiveShadow);
   } else {
-    Value *Bounds = TF.visitAllocaInst(&I);
-    TF.setShadow(&I, Bounds);
+    Type *T = I.getAllocatedType();
+    bool isArray = I.isArrayAllocation() | T->isArrayTy();
+    if (isArray) {
+      // array could be VLA, rely on runtime
+      Value *Bounds = TF.visitAllocaInst(&I);
+      TF.setShadow(&I, Bounds);
+    } else {
+      TF.setShadow(&I, TF.TT.ZeroPrimitiveShadow); // no bounds
+      if (!AllLoadsStores) {
+        // handle not all loads and stores cases here
+        IRBuilder<> IRB(I.getNextNode());
+        auto DL = I.getModule()->getDataLayout();
+        auto size = I.getAllocationSizeInBits(DL);
+        assert(size != None);
+        Value *Size = ConstantInt::get(TF.TT.IntptrTy, (size->getValue() + 7) >> 3);
+        IRB.CreateCall(TF.TT.TaintSetLabelFn,
+                       {TF.TT.UninitializedPrimitiveShadow,
+                        IRB.CreateBitCast(&I, Type::getInt8PtrTy(*TF.TT.Ctx)),
+                        Size});
+      }
+    }
   }
 }
 

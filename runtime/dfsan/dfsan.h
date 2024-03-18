@@ -177,6 +177,7 @@ enum operators {
   fmemcmp   = last_llvm_op + 7,
   fsize     = last_llvm_op + 8,
   fatoi     = last_llvm_op + 9,
+  LastOp    = last_llvm_op + 10,
 };
 
 enum predicate {
