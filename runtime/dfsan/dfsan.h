@@ -223,6 +223,7 @@ enum pipe_msg_type {
 #define F_MEMERR_UAF 0x1
 #define F_MEMERR_OLB 0x2
 #define F_MEMERR_OUB 0x4
+#define F_MEMERR_UBI 0x8
 
 struct pipe_msg {
   uint16_t msg_type;
