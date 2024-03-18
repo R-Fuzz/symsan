@@ -172,9 +172,18 @@ static inline bool is_kind_of_label(dfsan_label label, uint16_t kind) {
 
 static bool isZeroOrPowerOfTwo(uint16_t x) { return (x & (x - 1)) == 0; }
 
+static inline bool is_valid_op(uint16_t op) {
+  op &= 0xff;
+  return op >= __dfsan::Add && op < __dfsan::LastOp || op == __dfsan::Not;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
                           uint64_t op1, uint64_t op2) {
+  if (!is_valid_op(op)) {
+    AOUT("WARNING: invalid op %d\n", op);
+    return 0;
+  }
   if (l1 > l2 && is_commutative(op)) {
     // needs to swap both labels and concretes
     Swap(l1, l2);
@@ -226,8 +235,9 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t 
         return l2;
     }
   } else if (op1_is_all_one) {
-    if (op == __dfsan::And) return l2; // 11..1b & x = x
-    else if (op == __dfsan::Or) return 0; // 11..1b | x = 11..1b
+    if (op == __dfsan::And) return l2; // 0b11..1 & x = x
+    else if (op == __dfsan::Or) return 0; // 0b11..1 | x = 11..1b
+    else if (op == __dfsan::Xor && size == 1) op = __dfsan::Not; // 0b1 ^ x = !x
   }
   if (op2_is_zero) {
     if (op == __dfsan::Sub) return l1; // x - 0 = x
@@ -442,6 +452,9 @@ dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size, uint64_t elem_siz
     info->size  = sizeof(void*) * 8;
     info->op1.i = base;
     info->op2.i = base + size * elem_size;
+
+    // set uninit label
+    dfsan_set_label(kInitializingLabel, (void*)base, size * elem_size);
 
     return __alloca_stack_top;
   } else {
