@@ -337,10 +337,10 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n) {
     dfsan_label parent = get_label_info(label0)->l1;
     uptr offset = 0;
     for (uptr i = 0; i < n; i++) {
-      dfsan_label_info *info = get_label_info(ls[i]);
-      if (!is_kind_of_label(ls[i], Extract)
-            || offset != info->op2.i
-            || parent != info->l1) {
+      dfsan_label next_label = ls[i];
+      if (next_label == kInitializingLabel) return kInitializingLabel;
+      dfsan_label_info *info = get_label_info(next_label);
+      if (info->op != Extract || offset != info->op2.i || parent != info->l1) {
         break;
       }
       offset += info->size;
@@ -356,6 +356,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n) {
   dfsan_label label = label0;
   for (uptr i = get_label_info(label0)->size / 8; i < n;) {
     dfsan_label next_label = ls[i];
+    if (next_label == kInitializingLabel) return kInitializingLabel;
     uint16_t next_size = get_label_info(next_label)->size;
     AOUT("next label=%u, size=%u\n", next_label, next_size);
     if (!is_constant_label(next_label)) {
@@ -617,6 +618,7 @@ dfsan_label_info *dfsan_get_label_info(dfsan_label label) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
 dfsan_has_label(dfsan_label label, dfsan_label elem) {
+  if (label == kInitializingLabel || elem == kInitializingLabel) return false;
   if (label == elem)
     return true;
   const dfsan_label_info *info = dfsan_get_label_info(label);
