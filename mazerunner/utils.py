@@ -1,7 +1,6 @@
 import os
 import copy
 import subprocess
-import time
 import re
 
 AT_FILE = "@@"

@@ -256,6 +256,8 @@ class SymSanExecutor:
     def _setup_pipe(self):
         # pipefds[0] for read, pipefds[1] for write
         self.pipefds = os.pipe()
+        if not hasattr(fcntl, 'F_GETPIPE_SZ'):
+            return
         pipe_capacity = fcntl.fcntl(self.pipefds[0], fcntl.F_GETPIPE_SZ)
         if pipe_capacity >= PIPE_CAPACITY:
             return

@@ -17,3 +17,4 @@ auto/
 .DS_Store
 /build/
 __pycache__/
+.python-version
