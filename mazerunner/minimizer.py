@@ -2,7 +2,6 @@ import hashlib
 import os
 import subprocess
 import tempfile
-import atexit
 
 import utils
 
@@ -40,7 +39,6 @@ class TestcaseMinimizer:
         self.bitmap = self.initialize_bitmap(self.bitmap_file, map_size)
         self.crash_bitmap = self.initialize_bitmap(self.crash_bitmap_file, map_size)
         self.mazerunner_state = state
-        atexit.register(self.cleanup)
 
     def initialize_bitmap(self, filename, map_size):
         if os.path.exists(filename):

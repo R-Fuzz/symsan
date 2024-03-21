@@ -1,4 +1,3 @@
-import atexit
 import logging
 import functools
 import os
@@ -6,6 +5,7 @@ import pickle
 import random
 import re
 import shutil
+import sys
 import time
 import heapq
 import numpy as np
@@ -188,6 +188,7 @@ class Mazerunner:
         self.output = config.output_dir
         self.my_dir = config.mazerunner_dir
         self.filename = ".cur_input"
+        self.symsan = None
         self._make_dirs()
         if shared_state:
             self.state = shared_state
@@ -334,7 +335,7 @@ class Mazerunner:
         files = []
         for name in os.listdir(self.config.initial_seed_dir):
             path = os.path.join(self.config.initial_seed_dir, name)
-            if os.path.isfile(path) and not name in self.state.processed:
+            if os.path.isfile(path) and not name in self.state.synced:
                 shutil.copy2(path, os.path.join(self.my_generations, name))
                 files.append(name)
                 self.state.synced.add(name)
@@ -393,6 +394,13 @@ class Mazerunner:
 
     def cleanup(self):
         self.minimizer.cleanup()
+        if self.symsan:
+            self.symsan.tear_down()
+
+    def signal_handler(self, signum, frame):
+        self.logger.info(f"Received signal {signum}, cleaning up...")
+        self.cleanup()
+        sys.exit(signum)
 
     def export_state(self):
         self.state.end_ts = time.time()
@@ -419,7 +427,6 @@ class Mazerunner:
                 self.state = pickle.load(f)
         else:
             self.state = MazerunnerState(self.config.timeout)
-        atexit.register(self.export_state)
 
     def _report_error(self, fp, log):
         self.logger.warn("Symsan process error: %s\nLog:%s" % (fp, log))
@@ -702,6 +709,14 @@ class HybridExecutor():
 
     def cleanup(self):
         self._export_state()
+        self.replayer.cleanup()
+        self.concolic_executor.cleanup()
+        self.synchronizer.cleanup()
+
+    def signal_handler(self, signum, frame):
+        self.logger.info(f"Received signal {signum}, cleaning up...")
+        self.cleanup()
+        sys.exit(signum)
 
     def _import_state(self):
         if os.path.exists(self.metadata):

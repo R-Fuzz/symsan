@@ -81,7 +81,6 @@ class SymSanExecutor:
             self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. \n"
                                 f"Please try to set it manually with: "
                                 f"'echo {PIPE_CAPACITY} | sudo tee /proc/sys/fs/pipe-max-size' ")
-        self.tear_down()
 
     @property
     def has_terminated(self):
@@ -93,12 +92,7 @@ class SymSanExecutor:
 
     def tear_down(self):
         if self.pipefds:
-            try:
-                os.close(self.pipefds[0])
-                os.close(self.pipefds[1])
-            except OSError:
-                pass
-            self.pipefds = None
+            self._close_pipe()
         self.kill_proc()
         if self.shm:
             self.shm.close()
@@ -172,6 +166,7 @@ class SymSanExecutor:
             self.tear_down()
             sys.exit(1)
         os.close(self.pipefds[1])
+        self.pipefds[1] = None
 
     def process_request(self):
         self.timer.solving_time = 0
@@ -254,9 +249,26 @@ class SymSanExecutor:
         if self.gep_solver_enabled:
             return self.solver.handle_gep(gmsg, msg.addr)
 
+    def _close_pipe(self):
+        if self.pipefds[0] is not None:
+            try:
+                os.close(self.pipefds[0])
+                self.pipefds[0] = None
+            except OSError:
+                self.logger.warning("Failed to close pipefds[0] for read")
+        if self.pipefds[1] is not None:
+            try:
+                os.close(self.pipefds[1])
+                self.pipefds[1] = None
+            except OSError:
+                self.logger.warning("Failed to close pipefds[1] for write")
+        self.pipefds = None
+
     def _setup_pipe(self):
+        if self.pipefds:
+            self._close_pipe()
         # pipefds[0] for read, pipefds[1] for write
-        self.pipefds = os.pipe()
+        self.pipefds = list(os.pipe())
         if not hasattr(fcntl, 'F_GETPIPE_SZ'):
             return
         pipe_capacity = fcntl.fcntl(self.pipefds[0], fcntl.F_GETPIPE_SZ)

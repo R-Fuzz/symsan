@@ -2,6 +2,7 @@
 import argparse
 import logging
 import random
+import signal
 import threading
 import time
 import psutil
@@ -96,6 +97,9 @@ def main():
         disk_monitor.start()
         e.check_resource_limit = lambda: (memory_termination_event.is_set() 
                                                 or disk_termination_event.is_set())
+
+    for sig in (signal.SIGABRT, signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, e.signal_handler)
     try:
         e.run()
     finally:
