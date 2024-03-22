@@ -199,11 +199,13 @@ enum pipe_msg_type {
   memcmp_type = 2,
   fsize_type = 3,
   loop_type = 4,
+  fini_type = 5,
 };
 
 #define F_ADD_CONS  0x1
 #define F_LOOP_EXIT 0x2
 #define F_LOOP_LATCH 0x4
+#define F_HAS_DISTANCE 0x8
 
 struct pipe_msg {
   u16 msg_type;
@@ -234,5 +236,14 @@ struct memcmp_msg {
 } __attribute__((packed));
 
 }  // namespace __dfsan
+
+struct mazerunner_msg {
+  u16 flags;
+  u32 id;
+  uptr addr;
+  u32 context;
+  long global_min_dist;
+  long local_min_dist;
+} __attribute__((packed));
 
 #endif  // DFSAN_H

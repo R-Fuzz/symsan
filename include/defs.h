@@ -60,6 +60,16 @@
 #define RRR(x) (random() % (x))
 #endif
 
+#define VERSION             "2.52b"
+#ifdef AFL_LLVM_PASS
+#  define AFL_R(x) (random() % (x))
+#else
+#  define R(x) (random() % (x))
+#endif /* ^AFL_LLVM_PASS */
+
+#define SHM_ENV_VAR         "__AFL_SHM_ID"
+#define FORKSRV_FD          198
+
 #include <stdint.h>
 #include <stdlib.h>
 

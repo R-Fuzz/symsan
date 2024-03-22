@@ -55,9 +55,11 @@ using namespace __dfsan;
 #define DECLARE_WEAK_INTERCEPTOR_HOOK(f, ...) \
 SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE void f(__VA_ARGS__);
 
+static off_t current_stdin_offset = 0;
+
 static inline dfsan_label get_label_for(int fd, off_t offset) {
   // check if fd is stdin, if so, the label hasn't been pre-allocated
-  if (is_stdin_taint()) return dfsan_create_label(offset);
+  if (is_stdin_taint()) return dfsan_create_label(current_stdin_offset++);
   // if fd is a tainted file, the label should have been pre-allocated
   else return (offset + CONST_OFFSET);
 }

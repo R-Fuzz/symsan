@@ -1,4 +1,5 @@
 .vscode
+test.py
 *.taint
 *.o
 *.so
@@ -15,3 +16,5 @@ auto/
 /bin/
 .DS_Store
 /build/
+__pycache__/
+.python-version

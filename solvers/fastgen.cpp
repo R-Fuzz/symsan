@@ -15,6 +15,7 @@
      http://www.apache.org/licenses/LICENSE-2.0
 
  */
+#include <climits>
 
 #include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_file.h"
@@ -27,8 +28,11 @@ static u32 __instance_id;
 static u32 __session_id;
 static int __pipe_fd;
 
+SANITIZER_WEAK_ATTRIBUTE u8* __afl_area_ptr=nullptr;
+
 // filter?
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack_addr;
 
 static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
   switch (predicate) {
@@ -47,22 +51,60 @@ static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
   return 0;
 }
 
+static inline void __handle_new_state(u32 cid, void *addr, u8 result, u8 loop_flag) {
+  u16 flags = 0;
+  // set the loop flags according to branching results
+  if (result) {
+    // True branch for loop exit
+    if (loop_flag & 0x2) flags |= F_LOOP_EXIT;
+  } else {
+    // False branch for loop exit
+    if (loop_flag & 0x1) flags |= F_LOOP_EXIT;
+  }
+
+  long global_min_dist = -2;
+  long local_min_dist = -2;
+  unsigned long counter = 0;
+  if (__afl_area_ptr){
+    counter = *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16);
+    if (counter){
+      flags |= F_HAS_DISTANCE;
+      local_min_dist = (long)(*(unsigned long*)(__afl_area_ptr+MAP_SIZE+8));
+    }
+    global_min_dist = (long)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
+    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = INT_MAX;
+    *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
+  }
+  AOUT("pc: 0x%x, BB distance: %llu, avg distance: %llu \n", (uptr)addr, global_min_dist, local_min_dist);
+
+  mazerunner_msg mmsg = {
+    .flags = flags,
+    .id = cid,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack_addr,
+    .global_min_dist = global_min_dist,
+    .local_min_dist = local_min_dist
+  };
+  internal_write(__pipe_fd, &mmsg, sizeof(mmsg));
+}
+
 static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
                                 u8 loop_flag, u32 cid, void *addr) {
 
   u16 flags = 0;
+#ifdef __LOOP_TRACING__
   if (add_nested) flags |= F_ADD_CONS;
   // set the loop flags according to branching results
   if (result) {
-    // true branch
+    // True branch for loop exit
     if (loop_flag & 0x2) flags |= F_LOOP_EXIT;
     if (loop_flag & 0x8) flags |= F_LOOP_LATCH;
   } else {
-    // false branch
+    // False branch for loop exit
     if (loop_flag & 0x1) flags |= F_LOOP_EXIT;
     if (loop_flag & 0x4) flags |= F_LOOP_LATCH;
   }
-
+#endif
   // send info
   pipe_msg msg = {
     .msg_type = cond_type,
@@ -74,8 +116,9 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested,
     .label = label,
     .result = result
   };
-
   internal_write(__pipe_fd, &msg, sizeof(msg));
+  // mazerunner msg
+  __handle_new_state(cid, addr, result, loop_flag);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -100,16 +143,16 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cond(dfsan_label label, u8 r, u8 flag, u32 cid) {
   if (label == 0) {
-    // check for real loop loop exits
+    #ifdef __LOOP_TRACING__
+    // check for real loop exits
     if (!(((flag & 0x1) && !r) || ((flag & 0x2) && r)))
+    #endif
       return;
   }
 
   void *addr = __builtin_return_address(0);
-
   AOUT("solving cond: %u %u 0x%x 0x%x 0x%x %p\n",
        label, r, flag, __taint_trace_callstack, cid, addr);
-
   // always add nested
   __solve_cond(label, r, 1, flag, cid, addr);
 }
@@ -166,9 +209,9 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_loop(u32 bid) {
   void *addr = __builtin_return_address(0);
-
   AOUT("loop header: %u @%p\n", bid, addr);
 
+#ifdef __LOOP_TRACING__
   pipe_msg msg = {
     .msg_type = loop_type,
     .flags = 0,
@@ -181,7 +224,7 @@ __taint_trace_loop(u32 bid) {
   };
 
   internal_write(__pipe_fd, &msg, sizeof(msg));
-
+#endif
   return;
 }
 
@@ -222,6 +265,29 @@ __taint_trace_memcmp(dfsan_label label) {
   // FIXME: assuming single writer so msg will arrive in the same order
   internal_write(__pipe_fd, mmsg, msg_size);
 
+  return;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_fini(){
+
+  long global_min_dist = -2;
+  if (__afl_area_ptr){
+    global_min_dist = (long)*(unsigned long*)(__afl_area_ptr+MAP_SIZE);
+  }
+  AOUT("global min distance: %llu\n", global_min_dist);
+
+  pipe_msg msg = {
+    .msg_type = fini_type,
+    .flags = 0,
+    .instance_id = 0,
+    .addr = (uptr)0,
+    .context = 0,
+    .label = 0,
+    .result = (u64)global_min_dist
+  };
+
+  internal_write(__pipe_fd, &msg, sizeof(msg));
   return;
 }
 

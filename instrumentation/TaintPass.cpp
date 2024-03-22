@@ -77,6 +77,10 @@
 
 using namespace llvm;
 
+// Number of bits to discard when computing the call stack hash.
+// This must be in the range of 1-32.
+static const unsigned kContextSensitiveGranularity = 4;
+
 // This must be consistent with ShadowWidthBits.
 static const Align kShadowTLSAlignment = Align(4);
 
@@ -160,8 +164,11 @@ static cl::opt<bool> ClTraceBound(
 static cl::opt<bool> ClTraceLoop(
     "taint-trace-loop",
     cl::desc("Trace loop entering and exiting."),
+#ifdef __LOOP_TRACING__
     cl::Hidden, cl::init(true));
-
+#else
+    cl::Hidden, cl::init(false));
+#endif
 static StringRef GetGlobalTypeString(const GlobalValue &G) {
   // Types of GlobalVariables are always pointer types.
   Type *GType = G.getValueType();
@@ -375,6 +382,7 @@ class Taint : public ModulePass {
   FunctionCallee TaintCheckBoundsFn;
   FunctionCallee TaintDebugFn;
   Constant *CallStack;
+  Constant *CallStackAddr;
   MDNode *ColdCallWeights;
   TaintABIList ABIList;
   DenseMap<Value *, Function *> UnwrappedFnMap;
@@ -401,6 +409,7 @@ class Taint : public ModulePass {
   void initializeRuntimeFunctions(Module &M);
   void initializeCallbackFunctions(Module &M);
   uint32_t getInstructionId(Instruction *Inst);
+  uint32_t getBasicblockId(BasicBlock *BB);
 
   /// Returns a zero constant with the shadow type of OrigTy.
   ///
@@ -664,6 +673,63 @@ uint32_t Taint::getInstructionId(Instruction *Inst) {
   return djbHash(SourceInfo);
 }
 
+static inline void getInsDebugLoc(const Instruction *I, std::string &Filename,
+                        unsigned &Line, unsigned &Col) {
+  if (DILocation *Loc = I->getDebugLoc()) {
+    Line = Loc->getLine();
+    Filename = Loc->getFilename().str();
+    Col = Loc->getColumn();
+    if (Filename.empty()) {
+      DILocation *oDILoc = Loc->getInlinedAt();
+      if (oDILoc) {
+        Line = oDILoc->getLine();
+        Col = oDILoc->getColumn();
+        Filename = oDILoc->getFilename().str();
+      }
+    }
+  }
+}
+
+static inline void getBBDebugLoc(const BasicBlock *BB, std::string &Filename, unsigned &Line, unsigned &Col) {
+  std::string bb_name("");
+  std::string filename;
+  unsigned line = 0;
+  unsigned col = 0;
+  for (auto &I : *BB) {
+    getInsDebugLoc(&I, filename, line, col);
+    /* Don't worry about external libs */
+    static const std::string Xlibs("/usr/");
+    if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
+      continue;
+    std::size_t found = filename.find_last_of("/\\");
+    if (found != std::string::npos)
+      filename = filename.substr(found + 1);
+    Filename = filename;
+    Line = line;
+    Col = col;
+    break;
+  }
+}
+
+uint32_t Taint::getBasicblockId(BasicBlock *BB) {
+  static uint32_t unamed = 0;
+  std::string bb_name_with_col("");
+  std::string filename;
+  unsigned line = 0;
+  unsigned col = 0;
+  getBBDebugLoc(BB, filename, line, col);
+  if (!filename.empty() && line != 0 ){
+    bb_name_with_col = filename + ":" + std::to_string(line) + ":" + std::to_string(col);
+  }else{
+    filename = Mod->getSourceFileName();
+    std::size_t found = filename.find_last_of("/\\");
+    if (found != std::string::npos)
+      filename = filename.substr(found + 1);
+    bb_name_with_col = filename + ":unamed:" + std::to_string(unamed++);
+  }
+  return djbHash(bb_name_with_col);
+}
+
 void Taint::addContextRecording(Function &F) {
   // Most code from Angora
   BasicBlock *BB = &F.getEntryBlock();
@@ -692,6 +758,15 @@ void Taint::addContextRecording(Function &F) {
   StoreInst *SCS = IRB.CreateStore(NCS, CallStack);
   SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
 
+  // instrument (ctx << kContextSensitiveGranularity) ^ return_addr at the beginning of a function
+  ConstantInt *ReturnAddress = ConstantInt::get(Int32Ty, hash);
+  LoadInst *LCSA = IRB.CreateLoad(CallStackAddr);
+  LCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+  Value *ShiftedLCS = IRB.CreateShl(LCSA, kContextSensitiveGranularity);
+  Value *NCSA = IRB.CreateXor(ShiftedLCS, ReturnAddress);
+  StoreInst *SCSA = IRB.CreateStore(NCSA, CallStackAddr);
+  SCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+
   // Recover ctx at the end of a function
   for (auto FI = F.begin(), FE = F.end(); FI != FE; FI++) {
     BasicBlock *BB = &*FI;
@@ -700,6 +775,8 @@ void Taint::addContextRecording(Function &F) {
       IRB.SetInsertPoint(Inst);
       SCS = IRB.CreateStore(LCS, CallStack);
       SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+      SCSA = IRB.CreateStore(LCSA, CallStackAddr);
+      SCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
     }
   }
 }
@@ -1089,6 +1166,11 @@ bool Taint::runOnModule(Module &M) {
     Changed |= G->getThreadLocalMode() != GlobalVariable::InitialExecTLSModel;
     G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
   }
+  CallStackAddr = Mod->getOrInsertGlobal("__taint_trace_callstack_addr", Int32Ty);
+  if (GlobalVariable *G = dyn_cast<GlobalVariable>(CallStackAddr)) {
+    Changed |= G->getThreadLocalMode() != GlobalVariable::InitialExecTLSModel;
+    G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
+  }
 
   initializeCallbackFunctions(M);
   initializeRuntimeFunctions(M);
@@ -1197,6 +1279,12 @@ bool Taint::runOnModule(Module &M) {
         addGlobalNamePrefix(&F);
       }
     } else if (!IsZeroArgsVoidRet || getWrapperKind(&F) == WK_Custom) {
+      if (FT->isVarArg() && F.isDeclaration() && F.hasAddressTaken() && 
+      !isInstrumented(&F)) {
+        // FIXME: vararg functions do used as indirect call targets
+        *i = nullptr;
+        continue;
+      }
       // Build a wrapper function for F.  The wrapper simply calls F, and is
       // added to FnsToInstrument so that any instrumentation according to its
       // WrapperKind is done in the second pass below.
@@ -1724,7 +1812,7 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   unsigned size = DL.getTypeSizeInBits(Cond->getType());
   ConstantInt *Size = ConstantInt::get(TT.ShadowTy, size);
   ConstantInt *Predicate = ConstantInt::get(TT.ShadowTy, 32); // EQ, ==
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getBasicblockId(I->getParent()));
 
   for (auto C : I->cases()) {
     Value *CV = C.getCaseValue();
@@ -2312,7 +2400,7 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   if (Shadow == TT.ZeroShadow && (flag & 0x3) == 0)
     return;
   ConstantInt *LF = ConstantInt::get(TT.Int8Ty, flag);
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getBasicblockId(I->getParent()));
   IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, LF, CID});
 }
 
