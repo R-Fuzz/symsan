@@ -335,14 +335,13 @@ bool AFLCoverage::runOnModule(Module &M) {
           bb_name = filename + ":unamed:" + std::to_string(unamed++);
           bb_name_with_col = bb_name;
         }
+        /* handle direct calls */
         for (auto &I : BB) {
           getInsDebugLoc(&I, filename, line, col);
           /* Don't worry about external libs */
           static const std::string Xlibs("/usr/");
           if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
             continue;
-
-          /* handle direct calls */
           if (auto *c = dyn_cast<CallInst>(&I)) {
             if (auto *CalledF = c->getCalledFunction()) {
               if (!isBlacklisted(CalledF) && !bb_name.empty()) {
@@ -352,24 +351,34 @@ bool AFLCoverage::runOnModule(Module &M) {
               }
             }
           }
-          if (!is_target) {
-              for (auto &target : targets) {
-                std::size_t found = target.find_last_of("/\\");
-                if (found != std::string::npos)
-                  target = target.substr(found + 1);
-                std::size_t pos = target.find_last_of(":");
-                std::string target_file = target.substr(0, pos);
-                unsigned int target_line = atoi(target.substr(pos + 1).c_str());
-                if (!target_file.compare(filename) && target_line == line){
-                  is_target = true;
-                  break;
-                }
-              }
+        }
+        /* find target BB */
+        for (auto &target : targets) {
+          for (auto &I : BB) {
+            getInsDebugLoc(&I, filename, line, col);
+            /* Don't worry about external libs */
+            static const std::string Xlibs("/usr/");
+            if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
+              continue;
+
+            std::size_t found = target.find_last_of("/\\");
+            if (found != std::string::npos)
+              target = target.substr(found + 1);
+            std::size_t pos = target.find_last_of(":");
+            std::string target_file = target.substr(0, pos);
+            unsigned int target_line = atoi(target.substr(pos + 1).c_str());
+            if (!target_file.compare(filename) && target_line == line){
+              is_target = true;
+              if (!bb_name.empty()) bbtargets << "\n" << bb_name;
+              break;
+            }
           }
         }
 
-        if (is_target) is_fun_target = true;
-        if (is_target && !bb_name.empty()) bbtargets << bb_name << "\n";
+        if (is_target) {
+          is_fun_target = true;
+          bbtargets << "\n";
+        }
         if (!bb_name.empty()) {
           BB.setName(bb_name_with_col);
           if (!BB.hasName()) {

@@ -314,20 +314,7 @@ class CFGraph:
             return False
         if main_node in self.reachable_nodes:
             return True
-        print("none of targets can be reached from main entry")
-        if self.indirect_calls_enabled:
-            return False
-        else:
-            self.indirect_calls_enabled = True
-            print(f"adding indirect call graph")
-            self.reset()
-            try:
-                self._load_cfg()
-                self._load_cg()
-            except:
-                print("failed to load indirect call graph")
-                return False
-            return self._compute_reachable_nodes(main_node)
+        return False
 
     def _compute_unreachable_nodes(self):
         # (1) nodes directly connect to the exit node
@@ -419,8 +406,7 @@ class CFGraph:
             self.dist[target] = 0.
         main_entry = get_program_entry()
         if not self._compute_reachable_nodes(main_entry):
-            return
-        print("sorting reachable nodes based on shortest path length")
+            print("none of targets can be reached from main entry")
         max_len = 200
         # in case CFG is too deep
         sys.setrecursionlimit(100000)
@@ -575,9 +561,13 @@ if __name__ == '__main__':
         if not os.path.isfile(fp):
             print(f"{fp} does not exist")
             return
+        lines = set()
         with open(fp, 'r') as f:
-            lines = f.readlines()
-        lines = list(set(lines))
+            for l in f.readlines():
+                if not l: continue
+                if l == '\n': continue
+                lines.add(l)
+        lines = list(lines)
         with open(fp, 'w') as f:
             f.writelines(lines)
     
