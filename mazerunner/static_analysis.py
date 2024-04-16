@@ -83,7 +83,7 @@ def get_exit_locs():
                     locs.add(s[0])
     return locs
 
-def build_function_cfgs(cfg_folder: Path):
+def build_function_cfgs():
     """
     Build and return a dictionary mapping each function name to its CFG.
     """
@@ -208,28 +208,9 @@ class CFGraph:
                 targets_loc.add(l.strip())
         assert (len(targets_loc) > 0), "no target in the BBtargets.txt"
         t = {node for node in self.cfg.nodes if self.extract_location(node) in targets_loc}
-        # if the target location not found in the CFG, 
-        # this could be due to optimization or inlining, 
-        # we may still find the target by matching the basic block name in the CFG
-        if not t:
-            all_locs = collections.defaultdict(set)
-            for node in self.cfg.nodes:
-                n_loc = self.extract_location(node)
-                if ':' in n_loc:
-                    all_locs[n_loc].add(node)
-            for t_loc in targets_loc:
-                fn_t, l_t = t_loc.split(':')
-                l_t = int(l_t)
-                for line in range(l_t, l_t - 10, -1):
-                    protential_loc = f"{fn_t}:{line}"
-                    if protential_loc in all_locs:
-                        print(f'adding {protential_loc} into targets')
-                        t.update(all_locs[protential_loc])
-                        break
+        # if the target location not found in the CFG, this could be due to optimization or inlining.
         for node in t:
-            # delete return nodes
-            if self.cfg.out_degree(node) > 0:
-                self.targets.add(node)
+            self.targets.add(node)
         assert (len(self.targets) > 0), "no target in the CFG"
 
     def _cal_dist_helper(self, b, jmp_dist, dcall_dist, incall_dist):
@@ -544,7 +525,8 @@ def correlate_data(cfg_data, distance_data):
     return result
 
 if __name__ == '__main__':
-    global cfg_folder, direct_calls_path, target_BB_file, has_indirect_calls
+    global cfg_folder, direct_calls_path, target_BB_file, has_indirect_calls, function_loc, \
+        function_mangle_mappping, direct_callsite, indirect_callsite, exit_locs
     # setup paths
     tmp_folder = Path(sys.argv[1])
     if not tmp_folder.is_dir():
@@ -570,32 +552,15 @@ if __name__ == '__main__':
         lines = list(lines)
         with open(fp, 'w') as f:
             f.writelines(lines)
-    
-    def remove_invalid_lines(fp):
-        if not os.path.isfile(fp):
-            print(f"{fp} does not exist")
-            return
-        lines = []
-        with open(fp, 'r') as f:
-            for l in f.readlines():
-                if not l or '.c' not in l: continue
-                s = l.strip().split(",")
-                if len(s) == 2 and s[0] and s[1]:
-                    lines.append((s[0].strip(), s[1].strip()))
-        with open(fp, 'w') as f:
-            for l in lines:
-                f.write(f"{l[0]},{l[1]}\n")
 
     remove_repeated_lines(target_fun_file)
     remove_repeated_lines(target_BB_file)
     remove_repeated_lines(direct_calls_path)
-    remove_invalid_lines(direct_calls_path)
     if has_indirect_calls:
         remove_repeated_lines(indirect_calls_path)
-        remove_invalid_lines(indirect_calls_path)
     
     # merge CFGs
-    function_cfgs, function_loc, function_mangle_mappping = build_function_cfgs(cfg_folder)
+    function_cfgs, function_loc, function_mangle_mappping = build_function_cfgs()
     exit_locs = get_exit_locs()
     direct_callsite = collections.defaultdict(list)
     indirect_callsite = collections.defaultdict(list)
@@ -604,15 +569,15 @@ if __name__ == '__main__':
             for l in fd.readlines():
                 s = l.strip().split(',')
                 indirect_callsite[s[0]].append(s[1])
-        G, cg = merge_cfgs(function_cfgs)
-        print(f"saving the merged indirect {G} ...")
-        nx.drawing.nx_pydot.write_dot(G, tmp_folder / "merged_cfg_indirect_calls.dot")
-        print(f"saving the indirect ret {cg}...")
-        nx.drawing.nx_pydot.write_dot(G, tmp_folder / "indirect_call_sites.dot")
     with open(direct_calls_path, 'r') as f:
         for l in f.readlines():
             s = l.strip().split(",")
             direct_callsite[s[0]].append(s[1])
+    G, cg = merge_cfgs(function_cfgs)
+    print(f"saving the merged indirect {G} ...")
+    nx.drawing.nx_pydot.write_dot(G, tmp_folder / "merged_cfg_indirect_calls.dot")
+    print(f"saving the indirect ret {cg}...")
+    nx.drawing.nx_pydot.write_dot(G, tmp_folder / "indirect_call_sites.dot")
     indirect_callsite.clear()
     G, cg = merge_cfgs(function_cfgs)
     print(f"saving the merged direct {G} ...")

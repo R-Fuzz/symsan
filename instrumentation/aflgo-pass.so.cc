@@ -92,18 +92,23 @@ std::string getMangledName(const Function *F) {
 
 void getInsDebugLoc(const Instruction *I, std::string &Filename,
                         unsigned &Line, unsigned &Col) {
+  std::string filename;
   if (DILocation *Loc = I->getDebugLoc()) {
     Line = Loc->getLine();
-    Filename = Loc->getFilename().str();
+    filename = Loc->getFilename().str();
     Col = Loc->getColumn();
-    if (Filename.empty()) {
+    if (filename.empty()) {
       DILocation *oDILoc = Loc->getInlinedAt();
       if (oDILoc) {
         Line = oDILoc->getLine();
         Col = oDILoc->getColumn();
-        Filename = oDILoc->getFilename().str();
+        filename = oDILoc->getFilename().str();
       }
     }
+    std::size_t found = filename.find_last_of("/\\");
+    if (found != std::string::npos)
+      filename = filename.substr(found + 1);
+    Filename = filename;
   }
 }
 
@@ -118,9 +123,6 @@ void getBBDebugLoc(const BasicBlock *BB, std::string &Filename, unsigned &Line, 
     static const std::string Xlibs("/usr/");
     if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
       continue;
-    std::size_t found = filename.find_last_of("/\\");
-    if (found != std::string::npos)
-      filename = filename.substr(found + 1);
     Filename = filename;
     Line = line;
     Col = col;
@@ -239,8 +241,10 @@ bool AFLCoverage::runOnModule(Module &M) {
 
     std::ifstream targetsfile(TargetsFile);
     std::string line;
-    while (std::getline(targetsfile, line))
+    while (std::getline(targetsfile, line)){
+      if (line.empty()) continue;
       targets.push_back(line);
+    }
     targetsfile.close();
 
     is_aflgo_preprocessing = true;
@@ -337,11 +341,6 @@ bool AFLCoverage::runOnModule(Module &M) {
         }
         /* handle direct calls */
         for (auto &I : BB) {
-          getInsDebugLoc(&I, filename, line, col);
-          /* Don't worry about external libs */
-          static const std::string Xlibs("/usr/");
-          if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
-            continue;
           if (auto *c = dyn_cast<CallInst>(&I)) {
             if (auto *CalledF = c->getCalledFunction()) {
               if (!isBlacklisted(CalledF) && !bb_name.empty()) {
@@ -447,22 +446,11 @@ bool AFLCoverage::runOnModule(Module &M) {
         if (is_aflgo) {
 
           std::string bb_name;
-          for (auto &I : BB) {
-            std::string filename;
-            unsigned line = 0;
-            unsigned col = 0;
-            getInsDebugLoc(&I, filename, line, col);
-
-            if (filename.empty() || line == 0)
-              continue;
-            std::size_t found = filename.find_last_of("/\\");
-            if (found != std::string::npos)
-              filename = filename.substr(found + 1);
-
-            bb_name = filename + ":" + std::to_string(line);
-            break;
-          }
-
+          std::string filename;
+          unsigned int line = 0;
+          unsigned int col = 0;
+          getBBDebugLoc(&BB, filename, line, col);
+          bb_name = filename + ":" + std::to_string(line);
           if (!bb_name.empty() && bb_to_dis.find(bb_name) != bb_to_dis.end()) {
             /* Find distance for BB */
             distance = bb_to_dis[bb_name];
