@@ -666,6 +666,7 @@ class ReplayExecutor(Mazerunner):
 class HybridExecutor():
     def __init__(self, config, agent_type):
         self.config = config
+        self.logger = logging.getLogger(self.__class__.__qualname__)
         # check_resource_limit returns a flag that controlled by another monitor thread
         self.my_dir = config.mazerunner_dir
         self.check_resource_limit = lambda: False
@@ -705,7 +706,7 @@ class HybridExecutor():
             self.concolic_executor.run(run_once=True)
             if self.config.offline_learning_enabled:
                 self.replayer.offline_learning()
-        logging.getLogger(self.__class__.__qualname__).error("Reached resource limit, exiting...")
+        self.logger.getLogger(self.__class__.__qualname__).error("Reached resource limit, exiting...")
 
     def cleanup(self):
         self._export_state()

@@ -75,7 +75,7 @@ static inline void __handle_new_state(u32 cid, void *addr, u8 result, u8 loop_fl
     *(unsigned long*)(__afl_area_ptr+MAP_SIZE+8) = INT_MAX;
     *(unsigned long*)(__afl_area_ptr+MAP_SIZE+16) = 0;
   }
-  AOUT("pc: 0x%x, BB distance: %llu, avg distance: %llu \n", (uptr)addr, global_min_dist, local_min_dist);
+  AOUT("pc: 0x%x, global distance: %llu, avg distance: %llu \n", (uptr)addr, global_min_dist, local_min_dist);
 
   mazerunner_msg mmsg = {
     .flags = flags,

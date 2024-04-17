@@ -310,9 +310,9 @@ class Agent:
         if has_dist:
             d = msg.local_min_dist
         else:
-            # msg.local_min_dist is zero, assign the last distance available
             d = self.curr_state.d
         self.min_distance = min([msg.global_min_dist, d, self.min_distance])
+        assert 0 <= self.min_distance <= self.config.max_distance
         self.curr_state.update(msg.addr, msg.context, msg.id, action, d, self.pc_counter)
 
     def _make_dirs(self):
