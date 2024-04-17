@@ -1,5 +1,6 @@
-import os
+import select
 import sys
+import os
 import fcntl
 import subprocess
 import ctypes
@@ -148,7 +149,7 @@ class SymSanExecutor:
             if stdin:
                 # the symsan proc reads the input from stdin
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                              env=current_env,
                                              pass_fds=(self.shm._fd, self.pipefds[1]))
                 self.proc.stdin.write(stdin)
@@ -173,6 +174,10 @@ class SymSanExecutor:
         should_handle = True
         self.msg_num = 0
         while should_handle:
+            readable, _, _ = select.select([self.pipefds[0]], [], [], 5)
+            if not readable:
+                self.logger.info("process_request: pipe is broken, stop processing.")
+                break
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
             if len(msg_data) < ctypes.sizeof(pipe_msg):
                 break
