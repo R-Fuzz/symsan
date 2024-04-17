@@ -411,3 +411,5 @@ fun:__taint_*=discard
 fun:LLVMFuzzerTestOneInput=uninstrumented
 fun:__afl_manual_init=uninstrumented
 fun:__afl_manual_init=discard
+
+fun:getchar=custom

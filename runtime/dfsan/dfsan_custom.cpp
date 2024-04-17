@@ -2093,7 +2093,7 @@ __dfsw_getchar(dfsan_label *ret_label) {
   off_t offset = ftell(stdin);
   int ret = getchar();
   if (ret != EOF && taint_get_file(0)) {
-    *ret_label = dfsan_union(dfsan_create_label(offset), CONST_LABEL, ZExt, 32, 0, 0);
+    *ret_label = dfsan_union(get_label_for(0, offset), CONST_LABEL, ZExt, 32, 0, 0);
     AOUT("%d label is readed by getchar\n", *ret_label);
   } else *ret_label = 0;
   return ret;
