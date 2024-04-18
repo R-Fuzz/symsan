@@ -67,17 +67,20 @@ class DistanceRewardCalculator(RewardCalculator):
         # Did not reach the target
         if i >= len(self.trace) and self.min_distance > 0:
                 return -float('inf')
+        if i >= len(self.trace) and self.min_distance == 0:
+            return self.config.max_distance
+        if i >= len(self.trace):
+            return 0
         d = self.trace[i].d
-        # Reached the target
-        if d == 0 or (i >= len(self.trace) and self.min_distance == 0):
+        if d == 0:
             return self.config.max_distance
         # found local optimum
-        if i in self.local_min_indices:
-            return (1000 / d) * (1000 / d) * self.config.max_distance
-        sa = self.trace[i].sa
-        if sa in self.nested_cond_unsat_sas:
-            return -d
-        return 0
+        else:
+            if i in self.local_min_indices:
+                return (1000 / d) * (1000 / d) * self.config.max_distance
+            sa = self.trace[i].sa
+            if sa in self.nested_cond_unsat_sas:
+                return -d
 
 
 class ReachabilityRewardCalculator(RewardCalculator):
@@ -85,9 +88,10 @@ class ReachabilityRewardCalculator(RewardCalculator):
         # Did not reach the target at the end
         if i >= len(self.trace) and self.min_distance > 0:
             return Decimal(0)
-        d = self.trace[i].d
         # Reached the target
-        if d == 0 or (i >= len(self.trace) and self.min_distance == 0):
+        if i >= len(self.trace) and self.min_distance == 0:
+            return Decimal(1)
+        if i < len(self.trace) and self.trace[i].d == 0:
             return Decimal(1)
         # Default reward
         return Decimal(0)
