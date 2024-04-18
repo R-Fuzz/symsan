@@ -5,6 +5,7 @@ import fcntl
 import subprocess
 import ctypes
 import logging
+import resource
 import time
 from enum import Enum
 from multiprocessing import shared_memory
@@ -76,12 +77,9 @@ class SymSanExecutor:
         self.record_mode_enabled = True if type(agent) is RecordAgent else False
         self.onetime_solving_enabled = True if (type(agent) is ExploitAgent) else False
         self.gep_solver_enabled = config.gep_solver_enabled
-        try:
-            self._setup_pipe()
-        except PermissionError:
-            self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. \n"
-                                f"Please try to set it manually with: "
-                                f"'echo {PIPE_CAPACITY} | sudo tee /proc/sys/fs/pipe-max-size' ")
+        self.should_increase_pipe_capacity = True
+        self._setup_pipe()
+        self._disable_core_dump()
 
     @property
     def has_terminated(self):
@@ -122,10 +120,7 @@ class SymSanExecutor:
         except:
             self.logger.critical(f"setup: Failed to map shm({self.shm._fd}), size(shm.size)")
             sys.exit(1)
-        try:
-            self._setup_pipe()
-        except PermissionError:
-            pass
+        self._setup_pipe()
         self.solver = Z3Solver(self.config, self.shm, self.input_file, 
                                self.testcase_dir, 0, session_id)
         self.agent.reset()
@@ -173,8 +168,8 @@ class SymSanExecutor:
         self.timer.solving_time = 0
         should_handle = True
         self.msg_num = 0
-        while should_handle:
-            readable, _, _ = select.select([self.pipefds[0]], [], [], 5)
+        while should_handle and not self.has_terminated:
+            readable, _, _ = select.select([self.pipefds[0]], [], [], 3)
             if not readable:
                 self.logger.info("process_request: pipe is broken, stop processing.")
                 break
@@ -274,10 +269,26 @@ class SymSanExecutor:
             self._close_pipe()
         # pipefds[0] for read, pipefds[1] for write
         self.pipefds = list(os.pipe())
+        if not self.should_increase_pipe_capacity:
+            return
         if not hasattr(fcntl, 'F_GETPIPE_SZ'):
             return
         pipe_capacity = fcntl.fcntl(self.pipefds[0], fcntl.F_GETPIPE_SZ)
         if pipe_capacity >= PIPE_CAPACITY:
             return
-        fcntl.fcntl(self.pipefds[0], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
-        fcntl.fcntl(self.pipefds[1], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
+        try:
+            fcntl.fcntl(self.pipefds[0], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
+            fcntl.fcntl(self.pipefds[1], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
+        except PermissionError:
+            self.should_increase_pipe_capacity = False
+            self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. \n"
+                                f"Please try to set it manually by running: "
+                                f"'echo {PIPE_CAPACITY} | sudo tee /proc/sys/fs/pipe-max-size' ")
+
+    def _disable_core_dump(self):
+        try:
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        except ValueError:
+            self.logger.warning(f"Failed to disable core dump. \n"
+                                f"Please try to set it manually by running: "
+                                f"'ulimit -c 0'")
