@@ -65,6 +65,8 @@ class TestcaseMinimizer:
             return False
 
     def has_new_cov(self, testcase):
+        if self.showmap is None:
+            return False
         cmd = [self.showmap,
                "-t",
                str(TIMEOUT),

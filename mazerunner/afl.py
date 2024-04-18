@@ -494,15 +494,20 @@ class ExploreExecutor(Mazerunner):
                 os.unlink(testcase)
                 continue
             index = self.state.tick()
-            filename = f"id:{index:06},src:{get_id_from_fn(fn)},ts:{ts},execs:{self.state.execs}"
-            shutil.move(testcase, os.path.join(self.my_generations, filename))
-            self.logger.debug(f"save testcase: {filename}")
+            t_fn = f"id:{index:06},src:{get_id_from_fn(fn)},ts:{ts},execs:{self.state.execs}"
+            t_fp = os.path.join(self.my_generations, t_fn)
+            shutil.move(testcase, t_fp)
             t_d = int(t.split(',')[-1].strip())
-            self.seed_scheduler.put(filename, t_d)
+            self.seed_scheduler.put(t_fn, t_d)
+            has_cov = self.minimizer.has_new_cov(t_fp)
+            if has_cov and 'sync' not in t_fn:
+                self.logger.info(f"Explore agent found new coverage, ts: {ts}, fn: {t_fn}")
+                q_fp = os.path.join(self.my_queue, t_fn)
+                shutil.copy2(t_fp, q_fp)
         # syn back to AFL queue if it's interesting
-        is_interesting = self.minimizer.has_closer_distance(res.distance, fn)
-        if is_interesting and 'sync' not in fn:
-            self.logger.info(f"Explore agent found closer distance={res.distance}, ts: {ts}")
+        has_dis = self.minimizer.has_closer_distance(res.distance, fn)
+        if has_dis and 'sync' not in fn:
+            self.logger.info(f"Explore agent found closer distance:{res.distance}, ts: {ts}, fn: {fn}")
             dst_fp = os.path.join(self.my_queue, fn)
             shutil.copy2(fp, dst_fp)
 
