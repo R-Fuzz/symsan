@@ -11,15 +11,15 @@ OLD = 1
 CRASH = 2
 
 TIMEOUT = 5 * utils.MILLION_SECONDS_SCALE
-MAP_SIZE = 65536
+DEFAULT_MAP_SIZE = 8388608
 
 def read_bitmap_file(bitmap_file):
     with open(bitmap_file, "rb") as f:
-        return list(map(ord, list(f.read())))
+        return list(f.read())
 
 def write_bitmap_file(bitmap_file, bitmap):
     with open(bitmap_file, "wb") as f:
-        f.write(bytes(map(chr, bitmap)))
+        f.write(bytes(bitmap))
 
 def compute_md5(file_path):
     hash_md5 = hashlib.md5()
@@ -29,15 +29,14 @@ def compute_md5(file_path):
     return hash_md5.hexdigest()
 
 class TestcaseMinimizer:
-    def __init__(self, cmd, afl_path, out_dir, qemu_mode, state, map_size=MAP_SIZE):
+    def __init__(self, cmd, afl_path, out_dir, qemu_mode, state):
         self.cmd = cmd
         self.qemu_mode = qemu_mode
         self.showmap = None if not afl_path else os.path.join(afl_path, "afl-showmap")
-        self.bitmap_file = os.path.join(out_dir, "afl-bitmap")
-        self.crash_bitmap_file = os.path.join(out_dir, "afl-crash-bitmap")
+        self.bitmap_file = os.path.join(out_dir, "fuzz_bitmap")
+        self.map_size = self._get_map_size(self.bitmap_file)
         _, self.temp_file = tempfile.mkstemp(dir=out_dir)
-        self.bitmap = self.initialize_bitmap(self.bitmap_file, map_size)
-        self.crash_bitmap = self.initialize_bitmap(self.crash_bitmap_file, map_size)
+        self.bitmap = self.initialize_bitmap(self.bitmap_file, self.map_size )
         self.mazerunner_state = state
 
     def initialize_bitmap(self, filename, map_size):
@@ -83,17 +82,13 @@ class TestcaseMinimizer:
         ] + self.cmd
 
         cmd, stdin = utils.fix_at_file(cmd, testcase)
-        result = subprocess.run(cmd, input=stdin.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         this_bitmap = read_bitmap_file(self.temp_file)
         return self.is_interesting_testcase(this_bitmap, result.returncode)
 
     def is_interesting_testcase(self, bitmap, returncode):
-        if returncode == 0:
-            my_bitmap = self.bitmap
-            my_bitmap_file = self.bitmap_file
-        else:
-            my_bitmap = self.crash_bitmap
-            my_bitmap_file = self.crash_bitmap_file
+        my_bitmap = self.bitmap
+        my_bitmap_file = self.bitmap_file
 
         # Maybe need to port in C to speed up
         interesting = False
@@ -111,3 +106,9 @@ class TestcaseMinimizer:
     def cleanup(self):
         if os.path.exists(self.temp_file):
             os.unlink(self.temp_file)
+
+    def _get_map_size(self, bitmap_file):
+        if os.path.exists(bitmap_file):
+            return os.path.getsize(bitmap_file)
+        else:
+            return DEFAULT_MAP_SIZE

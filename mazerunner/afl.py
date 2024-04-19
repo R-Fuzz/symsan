@@ -200,10 +200,10 @@ class Mazerunner:
         if self.afl:
             self.afl_cmd, afl_path, qemu_mode = self._parse_fuzzer_stats()
             self.minimizer = minimizer.TestcaseMinimizer(
-                self.afl_cmd, afl_path, self.output, qemu_mode, self.state)
+                self.afl_cmd, afl_path, self.afl_dir, qemu_mode, self.state)
         else:
             self.minimizer = minimizer.TestcaseMinimizer(
-                None, None, self.output, None, self.state)
+                None, None, self.afl_dir, None, self.state)
 
     @property
     def reached_resource_limit(self):
@@ -501,6 +501,7 @@ class ExploreExecutor(Mazerunner):
             self.seed_scheduler.put(t_fn, t_d)
             has_cov = self.minimizer.has_new_cov(t_fp)
             if has_cov and 'sync' not in t_fn:
+                t_fn += ",+cov"
                 self.logger.info(f"Explore agent found new coverage, ts: {ts}, fn: {t_fn}")
                 q_fp = os.path.join(self.my_queue, t_fn)
                 shutil.copy2(t_fp, q_fp)
