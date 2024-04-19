@@ -121,7 +121,7 @@ def get_afl_cmd(fuzzer_stats):
         for l in f:
             if l.startswith("command_line"):
                 # format is "command_line: [cmd]"
-                return l.lstrip('command_line:').strip().split()
+                return l.partition(':')[-1].strip().split()
 
 class MazerunnerState:
     def __init__(self, timeout):
