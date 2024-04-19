@@ -168,7 +168,9 @@ class SymSanExecutor:
         self.timer.solving_time = 0
         should_handle = True
         self.msg_num = 0
-        while should_handle and not self.has_terminated:
+        # we don't need to check self.has_terminated here
+        # because the pipe might still be readable even if the child process has terminated
+        while should_handle:
             readable, _, _ = select.select([self.pipefds[0]], [], [], 3)
             if not readable:
                 self.logger.info("process_request: pipe is broken, stop processing.")
