@@ -273,7 +273,7 @@ class Mazerunner:
     def run_file(self, fn):
         self.state.execs += 1
         # copy the test case
-        fp = os.path.join(self.my_generations, fn)
+        fp = os.path.join(self.my_queue, fn)
         shutil.copy2(fp, self.cur_input)
         self.logger.info("Run input: %s" % fn)
         symsan_res = self.run_target()
@@ -326,7 +326,7 @@ class Mazerunner:
             path = os.path.join(self.afl_queue, name)
             new_name = "id:" + get_id_from_fn(name) + f',sync:{self.afl}'
             if os.path.isfile(path) and not new_name in self.state.synced:
-                shutil.copy2(path, os.path.join(self.my_generations, new_name))
+                shutil.copy2(path, os.path.join(self.my_queue, new_name))
                 files.append(new_name)
                 self.state.synced.add(new_name)
         if need_sort:
@@ -343,7 +343,7 @@ class Mazerunner:
         for name in os.listdir(self.config.initial_seed_dir):
             path = os.path.join(self.config.initial_seed_dir, name)
             if os.path.isfile(path) and not name in self.state.synced:
-                shutil.copy2(path, os.path.join(self.my_generations, name))
+                shutil.copy2(path, os.path.join(self.my_queue, name))
                 files.append(name)
                 self.state.synced.add(name)
         return files
@@ -502,22 +502,10 @@ class ExploreExecutor(Mazerunner):
                 continue
             index = self.state.tick()
             t_fn = f"id:{index:06},src:{get_id_from_fn(fn)},ts:{ts},execs:{self.state.execs}"
-            t_fp = os.path.join(self.my_generations, t_fn)
-            shutil.move(testcase, t_fp)
+            q_fp = os.path.join(self.my_queue, t_fn)
+            shutil.move(testcase, q_fp)
             t_d = int(t.split(',')[-1].strip())
             self.seed_scheduler.put(t_fn, t_d)
-            has_cov = self.minimizer.has_new_cov(t_fp)
-            if has_cov and 'sync' not in t_fn:
-                t_fn += ",+cov"
-                self.logger.info(f"Explore agent found new coverage, ts: {ts}, fn: {t_fn}")
-                q_fp = os.path.join(self.my_queue, t_fn)
-                shutil.copy2(t_fp, q_fp)
-        # syn back to AFL queue if it's interesting
-        has_dis = self.minimizer.has_closer_distance(res.distance, fn)
-        if has_dis and 'sync' not in fn:
-            self.logger.info(f"Explore agent found closer distance:{res.distance}, ts: {ts}, fn: {fn}")
-            dst_fp = os.path.join(self.my_queue, fn)
-            shutil.copy2(fp, dst_fp)
 
     def _run(self):
         next_seed = self.seed_scheduler.pop()
@@ -591,16 +579,16 @@ class ExploitExecutor(Mazerunner):
         target = get_id_from_fn(fn)
         ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
         dst_fn = f"id:{index:06},src:{target},ts:{ts},dis:{res.distance:06},execs:{self.state.execs}"
-        dst_fp = os.path.join(self.my_generations, dst_fn)
+        dst_fp = os.path.join(self.my_queue, dst_fn)
         self.logger.debug(f"save testcase: {dst_fn}")
         shutil.copy2(self.cur_input, dst_fp)
         self.agent.save_trace(dst_fn)
+        dst_fp = os.path.join(self.my_queue, dst_fn)
+        shutil.copy2(self.cur_input, dst_fp)
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
             self.seed_scheduler.put(dst_fn, res.distance)
             self.logger.info(f"Exploit agent found closer distance={res.distance}, ts: {ts}")
-            dst_fp = os.path.join(self.my_queue, dst_fn)
-            shutil.copy2(self.cur_input, dst_fp)
 
     def _run(self):
         next_seed = self.seed_scheduler.pick()
