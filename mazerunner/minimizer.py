@@ -30,22 +30,25 @@ def compute_md5(file_path):
 
 class TestcaseMinimizer:
     def __init__(self, cmd, afl_path, out_dir, qemu_mode, state):
+        self.mazerunner_state = state
         self.cmd = cmd
         self.qemu_mode = qemu_mode
         self.showmap = None if not afl_path else os.path.join(afl_path, "afl-showmap")
-        self.bitmap_file = os.path.join(out_dir, "fuzz_bitmap")
-        self.map_size = self._get_map_size(self.bitmap_file)
+        self.fuzzer_bitmap_file = os.path.join(out_dir, "fuzz_bitmap")
         _, self.temp_file = tempfile.mkstemp(dir=out_dir)
-        self.bitmap = self.initialize_bitmap(self.bitmap_file, self.map_size )
-        self.mazerunner_state = state
+        self.my_bitmap = self.load_or_initialize_bitmap()
 
-    def initialize_bitmap(self, filename, map_size):
-        if os.path.exists(filename):
-            bitmap = read_bitmap_file(filename)
-            assert len(bitmap) == map_size
-        else:
-            bitmap = [0] * map_size
-        return bitmap
+    def load_or_initialize_bitmap(self):
+        map_size = self._get_map_size(self.fuzzer_bitmap_file)
+        if not self.mazerunner_state.bitmap:
+            if os.path.exists(self.fuzzer_bitmap_file):
+                fuzzer_bitmap = read_bitmap_file(self.fuzzer_bitmap_file)
+                self.mazerunner_state.read_bitmap(fuzzer_bitmap)
+            else:
+                self.mazerunner_state.create_bitmap(map_size)
+        assert len(self.mazerunner_state.bitmap) == map_size, \
+            "Bitmap size does not match fuzzer map size."
+        return self.mazerunner_state.bitmap
 
     def is_new_file(self, testcase):
         md5 = compute_md5(testcase)
@@ -83,24 +86,22 @@ class TestcaseMinimizer:
 
         cmd, stdin = utils.fix_at_file(cmd, testcase)
         result = subprocess.run(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        this_bitmap = read_bitmap_file(self.temp_file)
-        return self.is_interesting_testcase(this_bitmap, result.returncode)
+        ts_bitmap = read_bitmap_file(self.temp_file)
+        return self.is_interesting_testcase(ts_bitmap, result.returncode)
 
-    def is_interesting_testcase(self, bitmap, returncode):
-        my_bitmap = self.bitmap
-        my_bitmap_file = self.bitmap_file
-
+    def is_interesting_testcase(self, ts_bitmap, returncode):
         # Maybe need to port in C to speed up
         interesting = False
-        for i in range(len(bitmap)):
-            old = my_bitmap[i]
-            new = my_bitmap[i] | bitmap[i]
+        for i in range(len(ts_bitmap)):
+            old = self.my_bitmap[i]
+            new = self.my_bitmap[i] | ts_bitmap[i]
             if old != new:
                 interesting = True
-                my_bitmap[i] = new
-
+                self.my_bitmap[i] = new
         if interesting:
-            write_bitmap_file(my_bitmap_file, my_bitmap)
+            fuzzer_bitmap = read_bitmap_file(self.fuzzer_bitmap_file)
+            for i in range(len(fuzzer_bitmap)):
+                self.my_bitmap[i] = fuzzer_bitmap[i] | self.my_bitmap[i]
         return interesting
 
     def cleanup(self):

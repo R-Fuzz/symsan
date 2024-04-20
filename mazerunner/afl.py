@@ -139,6 +139,7 @@ class MazerunnerState:
         self.num_crash_reports = 0
         self.seed_queue = []
         self._best_seed_info = [None, float("inf"), False] # filename, distance, is_new
+        self.bitmap = []
 
     def __setstate__(self, dict):
         self.__dict__ = dict
@@ -161,6 +162,12 @@ class MazerunnerState:
     def update_best_seed(self, filename, distance):
         self._best_seed_info[0] = filename
         self._best_seed_info[1] = int(distance)
+    
+    def read_bitmap(self, bitmap):
+        self.bitmap = bitmap
+    
+    def create_bitmap(self, size):
+        self.bitmap = [0] * size
 
     def increase_timeout(self, logger, max_timeout):
         old_timeout = self.timeout
