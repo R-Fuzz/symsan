@@ -413,3 +413,14 @@ fun:__afl_manual_init=uninstrumented
 fun:__afl_manual_init=discard
 
 fun:getchar=custom
+
+# Ignores functions from freetype lib
+fun:FT_Init_FreeType=uninstrumented
+fun:FT_New_Face=uninstrumented
+fun:FT_Load_Glyph=uninstrumented
+fun:FT_Get_Next_Char=uninstrumented
+fun:FT_Outline_Decompose=uninstrumented
+fun:FT_Get_Next_Char=uninstrumented
+fun:FT_Done_FreeType=uninstrumented
+fun:FT_Done_Face=uninstrumented
+fun:FT_Get_First_Char=uninstrumented
