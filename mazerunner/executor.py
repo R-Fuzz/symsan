@@ -47,7 +47,7 @@ class ExecutorResult:
         self.total_time = total_time
         self.solving_time = solving_time
 
-class SymSanExecutor:
+class ConcolicExecutor:
     class InvalidGEPMessage(Exception):
         pass
     
@@ -66,7 +66,7 @@ class SymSanExecutor:
         self.config = config
         self.cmd = config.cmd
         self.agent = agent
-        self.timer = SymSanExecutor.Timer()
+        self.timer = ConcolicExecutor.Timer()
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logging_level = config.logging_level
         # resources
@@ -247,7 +247,7 @@ class SymSanExecutor:
         if msg.label != gmsg.index_label: # Double check
             self.logger.error(f"__process_gep_request: Incorrect gep msg: {msg.label} "
                               f"vs {gmsg.index_label}")
-            raise SymSanExecutor.InvalidGEPMessage()
+            raise ConcolicExecutor.InvalidGEPMessage()
         if self.gep_solver_enabled:
             return self.solver.handle_gep(gmsg, msg.addr)
 

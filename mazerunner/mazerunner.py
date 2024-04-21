@@ -71,15 +71,15 @@ def main():
     logging.getLogger('Launcher').info("[*] spinning up mazerunner: " + " ".join(sys.argv))
 
     if config.agent_type == "explore":
-        e = afl.HybridExecutor(config, "explore")
+        e = afl.RLExecutor(config, "explore")
     elif config.agent_type == "exploit":
-        e = afl.HybridExecutor(config, "exploit")
+        e = afl.RLExecutor(config, "exploit")
     elif config.agent_type == "record":
         e = afl.RecordExecutor(config)
     elif config.agent_type == "replay":
         e = afl.ReplayExecutor(config)
-    elif config.agent_type == "qsym":
-        e = afl.QSYMExecutor(config)
+    elif config.agent_type == "symsan":
+        e = afl.SymSanExecutor(config)
     else:
         raise ValueError(f"unknown agent type {config.agent_type}")
     

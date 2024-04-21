@@ -68,7 +68,7 @@ class TestcaseMinimizer:
 
     def has_new_cov(self, testcase):
         if self.showmap is None:
-            return False
+            return True
         cmd = [self.showmap,
                "-t",
                str(TIMEOUT),
@@ -85,7 +85,10 @@ class TestcaseMinimizer:
         ] + self.cmd
 
         cmd, stdin = utils.fix_at_file(cmd, testcase)
-        result = subprocess.run(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if stdin:
+            result = subprocess.run(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            result = subprocess.run(cmd, input=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         ts_bitmap = read_bitmap_file(self.temp_file)
         return self.is_interesting_testcase(ts_bitmap, result.returncode)
 

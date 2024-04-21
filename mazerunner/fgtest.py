@@ -5,7 +5,7 @@ import logging
 
 from agent import Agent
 from config import Config
-from executor import SymSanExecutor
+from executor import ConcolicExecutor
 from utils import AT_FILE
 
 def print_usage_exit():
@@ -47,7 +47,7 @@ if __name__ == "__main__":
         print_usage_exit()
     input_file = options.split("taint_file=")[1].split(":")[0].split(" ")[0]
     fastgen_agent = Agent(config)
-    symsan = SymSanExecutor(config, fastgen_agent, output_seed_dir)
+    symsan = ConcolicExecutor(config, fastgen_agent, output_seed_dir)
     symsan.setup(input_file)
     symsan.run()
     try:

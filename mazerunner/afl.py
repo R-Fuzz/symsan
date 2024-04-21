@@ -11,7 +11,7 @@ import heapq
 import numpy as np
 
 from agent import Agent, ExploreAgent, ExploitAgent, RecordAgent
-from executor import SymSanExecutor
+from executor import ConcolicExecutor
 from model import RLModel
 import minimizer
 import utils
@@ -131,7 +131,6 @@ class MazerunnerState:
         self.synced = set()
         self.hang = set()
         self.processed = set()
-        self.crashes = set()
         self.testscases_md5 = set()
         self.index = 0
         self.execs = 0
@@ -334,11 +333,9 @@ class Mazerunner:
                         key=functools.cmp_to_key(
                             (lambda a, b: testcase_compare(a, b, self.afl_queue))),
                         reverse=reversed_order)
-        if not files:
-            self.logger.info("No new testcases from AFL")
         return files
 
-    def sync_from_initial_seeds(self):
+    def sync_from_seeds_dir(self):
         files = []
         for name in os.listdir(self.config.initial_seed_dir):
             path = os.path.join(self.config.initial_seed_dir, name)
@@ -348,11 +345,11 @@ class Mazerunner:
                 self.state.synced.add(name)
         return files
 
-    def sync_from_either(self):
+    def sync_from_either(self, need_sort=False):
         if self.afl_queue and os.path.exists(self.afl_queue):
-            return self.sync_from_afl()
+            return self.sync_from_afl(need_sort)
         else:
-            return self.sync_from_initial_seeds()
+            return self.sync_from_seeds_dir()
 
     def handle_return_status(self, result, fp):
         msg_count = result.symsan_msg_num
@@ -381,23 +378,6 @@ class Mazerunner:
                     d = self.config.max_distance if d is None else d
                     self.seed_scheduler.put(fn, d)
                 self.state.hang.clear()
-
-    def check_crashes(self):
-        for fuzzer in os.listdir(self.output):
-            crash_dir = os.path.join(self.output, fuzzer, "crashes")
-            if not os.path.exists(crash_dir):
-                continue
-            # initialize if it's first time to see the fuzzer
-            if not fuzzer in self.state.crashes:
-                self.state.crashes[fuzzer] = -1
-            for name in sorted(os.listdir(crash_dir)):
-                # skip readme
-                if "id:" not in name:
-                    continue
-                # read id from the format "id:000000..."
-                num = int(name[3:9])
-                if num > self.state.crashes[fuzzer]:
-                    self.state.crashes[fuzzer] = num
 
     def cleanup(self):
         self.minimizer.cleanup()
@@ -438,49 +418,48 @@ class Mazerunner:
     def _report_error(self, fp, log):
         self.logger.warn("Symsan process error: %s\nLog:%s" % (fp, log))
 
-class QSYMExecutor(Mazerunner):
+class SymSanExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
-        self.agent = ExploreAgent(self.config)
-        self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
+        config.gep_solver_enabled = True
+        self.agent = Agent(config)
+        self.symsan = ConcolicExecutor(self.config, self.agent, self.my_generations)
 
     def sync_back_if_interesting(self, fp, res):
         old_idx = self.state.index
         fn = os.path.basename(fp)
         num_testcase = 0
-        for testcase in res.generated_testcases():
+        ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
+        for t in res.generated_testcases:
             num_testcase += 1
-            if not self.minimizer.has_new_cov(testcase):
+            testcase = os.path.join(self.my_generations, t)
+            if not self.minimizer.is_new_file(testcase):
                 # Remove if it's not interesting testcases
                 os.unlink(testcase)
                 continue
             index = self.state.tick()
-            filename = os.path.join(
-                    self.my_queue,
-                    "id:%06d,src:%s" % (index, get_id_from_fn(fn)))
-            shutil.copy2(testcase, filename)
-            self.logger.info("Sync back: %s" % filename)
+            q_fn = "id:%06d,src:%s,ts:%d" % (index, get_id_from_fn(fn), ts)
+            q_fp = os.path.join(self.my_queue, q_fn)
+            shutil.move(testcase, q_fp)
         self.logger.info("Generated %d testcases" % num_testcase)
         self.logger.info("%d testcases are new" % (self.state.index - old_idx))
 
     def _run(self):
-        files = self.sync_from_afl(need_sort=True)
+        files = self.sync_from_either(need_sort=True)
         if not files:
-            self.handle_hang_files()
+            self.logger.info("Sleeping for getting seeds from AFL")
             time.sleep(WAITING_INTERVAL)
             return
         for fn in files:
             fp = self.run_file(fn)
             fn = os.path.basename(fp)
             self.state.processed.add(fn)
-            self.check_crashes()
-            break
 
 class ExploreExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = ExploreAgent(self.config)
-        self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
+        self.symsan = ConcolicExecutor(self.config, self.agent, self.my_generations)
 
 
     def update_timmer(self, res):
@@ -524,7 +503,7 @@ class ExploitExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = ExploitAgent(self.config)
-        self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
+        self.symsan = ConcolicExecutor(self.config, self.agent, self.my_generations)
 
     def run_target(self):
         total_time = emulation_time = solving_time = 0
@@ -606,7 +585,7 @@ class RecordExecutor(Mazerunner):
         self.record_enabled = record_enabled
         if self.record_enabled:
             self.agent = RecordAgent(config)
-            self.symsan = SymSanExecutor(self.config, self.agent, self.my_generations)
+            self.symsan = ConcolicExecutor(self.config, self.agent, self.my_generations)
 
     def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
@@ -664,7 +643,7 @@ class ReplayExecutor(Mazerunner):
                 self.export_state()
         self.state.execs = 0
 
-class HybridExecutor():
+class RLExecutor():
     def __init__(self, config, agent_type):
         self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
