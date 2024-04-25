@@ -157,6 +157,10 @@ class MazerunnerState:
     @property
     def min_distance(self):
         return self._best_seed_info[1]
+    
+    @property
+    def target_reached(self):
+        return self._best_seed_info[0] is not None and self._best_seed_info[1] == 0
 
     def update_best_seed(self, filename, distance):
         self._best_seed_info[0] = filename
@@ -470,6 +474,8 @@ class ExploreExecutor(Mazerunner):
     
     def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
+        if self.minimizer.has_closer_distance(res.distance, fn):
+            self.logger.info(f"Explore agent found closer distance={res.distance}")
         ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
         self.agent.save_trace(fn)
         # rename or delete generated testcases from fp
@@ -589,8 +595,7 @@ class RecordExecutor(Mazerunner):
 
     def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
-        d = utils.get_distance_from_fn(fn)
-        if self.minimizer.has_closer_distance(d, fn):
+        if self.minimizer.has_closer_distance(res.distance, fn):
             self.logger.info(f"Fuzzer found closer distance={res.distance}")
         self.agent.save_trace(fn)
 
@@ -678,7 +683,13 @@ class RLExecutor():
         return self.check_resource_limit()
 
     def run(self):
-        while not self.reached_resource_limit:
+        while True:
+            if self.reached_resource_limit:    
+                self.logger.error("Reached resource limit, exiting...")
+                break
+            if self.state.target_reached:
+                self.logger.info("Target reached, exiting...")
+                break
             if self.state.execs % self.config.save_frequency == 0:
                 self._export_state()
             if not self.seed_scheduler.queue or self.state.execs % self.config.sync_frequency == 0:
@@ -686,7 +697,6 @@ class RLExecutor():
             self.concolic_executor.run(run_once=True)
             if self.config.offline_learning_enabled:
                 self.replayer.offline_learning()
-        self.logger.getLogger(self.__class__.__qualname__).error("Reached resource limit, exiting...")
 
     def cleanup(self):
         self._export_state()
