@@ -234,7 +234,7 @@ class ConcolicExecutor:
         if solving_status == SolvingStatus.UNSOLVED_OPT_UNSAT:
             self.agent.handle_unsat_condition(solving_status)
         if solving_status == SolvingStatus.SOLVED_OPT_NESTED_UNSAT and self.onetime_solving_enabled:
-            # self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
+            self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
             pass
         return solving_status
 

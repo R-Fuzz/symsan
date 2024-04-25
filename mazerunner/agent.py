@@ -97,10 +97,11 @@ class ReachabilityRewardCalculator(RewardCalculator):
         return Decimal(0)
 
 class MaxQLearner:
-    def __init__(self, m: model.RLModel, df, lr):
+    def __init__(self, m: model.RLModel, df, lr, md):
         self.model = m
         self.discount_factor = df
         self.learning_rate = lr
+        self.max_distance = md
 
     def learn(self, last_s, next_s, last_reward):
         last_Q = self.model.Q_lookup(last_s, last_s.action)
@@ -128,14 +129,15 @@ class MaxQLearner:
         self.model.Q_update(last_s.sa, last_Q)
 
     def punish_state(self, reversed_state):
-        terminal_state = ProgramState(distance=self.config.max_distance)
-        self.learner.learn(reversed_state, terminal_state, -self.config.max_distance)
+        terminal_state = ProgramState(distance=self.max_distance)
+        self.learn(reversed_state, terminal_state, -self.max_distance)
 
 class AvgQLearner:
-    def __init__(self, m: model.RLModel, df, lr):
+    def __init__(self, m: model.RLModel, df, lr, md):
         self.model = m
         self.discount_factor = df
         self.learning_rate = lr
+        self.max_distance = md
 
     def learn(self, last_s, next_s, last_reward):
         last_Q = self.model.Q_lookup(last_s, last_s.action)
@@ -159,8 +161,8 @@ class AvgQLearner:
         self.model.Q_update(last_s.sa, last_Q)
 
     def punish_state(self, reversed_state):
-        terminal_state = ProgramState(distance=self.config.max_distance)
-        self.learner.learn(reversed_state, terminal_state, Decimal(0))
+        terminal_state = ProgramState(distance=self.max_distance)
+        self.learn(reversed_state, terminal_state, Decimal(0))
 
 class Agent:
     def __init__(self, config):
@@ -214,9 +216,9 @@ class Agent:
         lr = self.config.learning_rate
         df = self.config.discount_factor
         if self.config.model_type == model.RLModelType.distance:
-            return MaxQLearner(self.model, df, lr)
+            return MaxQLearner(self.model, df, lr, self.config.max_distance)
         elif self.config.model_type == model.RLModelType.reachability:
-            return AvgQLearner(self.model, Decimal(df), Decimal(lr))
+            return AvgQLearner(self.model, Decimal(df), Decimal(lr), self.config.max_distance)
         else:
             raise NotImplementedError()
     
@@ -256,15 +258,7 @@ class Agent:
         pass
 
     def handle_nested_unsat_condition(self, state_deps):
-        for s in state_deps:
-            if s.sa == self.curr_state.sa or s.sa in self.nested_cond_unsat_sas:
-                continue
-            self.logger.debug(f"handle_nested_unsat_condition: {s.sa}")
-            self.nested_cond_unsat_sas.add(s.sa)
-        reversed_action = 1 if self.curr_state.action == 0 else 0
-        reversed_state = copy.copy(self.curr_state)
-        reversed_state.action = reversed_action
-        self.learner.punish_state(reversed_state)
+        pass
 
     def is_interesting_branch(self):
         return True
@@ -431,6 +425,17 @@ class ExploitAgent(Agent):
         if solving_status == solving_status.UNSOLVED_UNINTERESTING_SAT:
             return
         self.model.add_unreachable_sa(self.target[0])
+
+    def handle_nested_unsat_condition(self, state_deps):
+        # for s in state_deps:
+        #     if s.sa == self.curr_state.sa or s.sa in self.nested_cond_unsat_sas:
+        #         continue
+        #     self.logger.debug(f"handle_nested_unsat_condition: {s.sa}")
+        #     self.nested_cond_unsat_sas.add(s.sa)
+        reversed_action = 1 if self.curr_state.action == 0 else 0
+        reversed_state = copy.copy(self.curr_state)
+        reversed_state.action = reversed_action
+        self.learner.punish_state(reversed_state)
 
     def _greedy_policy(self):
         d_taken = self.model.get_distance(self.curr_state, 1)
