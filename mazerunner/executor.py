@@ -233,9 +233,12 @@ class ConcolicExecutor:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
         if solving_status == SolvingStatus.UNSOLVED_OPT_UNSAT:
             self.agent.handle_unsat_condition(solving_status)
-        if solving_status == SolvingStatus.SOLVED_OPT_NESTED_UNSAT and self.onetime_solving_enabled:
+        if solving_status == SolvingStatus.UNSOLVED_TIMEOUT:
+            self.agent.handle_unsat_condition(solving_status)
+        if solving_status == SolvingStatus.SOLVED_OPT_NESTED_UNSAT:
             self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
-            pass
+        if solving_status == SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT:
+            self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
         return solving_status
 
     def _process_gep_request(self, msg):

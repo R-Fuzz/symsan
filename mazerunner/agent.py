@@ -258,7 +258,15 @@ class Agent:
         pass
 
     def handle_nested_unsat_condition(self, state_deps):
-        pass
+        # for s in state_deps:
+        #     if s.sa == self.curr_state.sa or s.sa in self.nested_cond_unsat_sas:
+        #         continue
+        #     self.logger.debug(f"handle_nested_unsat_condition: {s.sa}")
+        #     self.nested_cond_unsat_sas.add(s.sa)
+        reversed_action = 1 if self.curr_state.action == 0 else 0
+        reversed_state = copy.copy(self.curr_state)
+        reversed_state.action = reversed_action
+        self.learner.punish_state(reversed_state)
 
     def is_interesting_branch(self):
         return True
@@ -426,17 +434,6 @@ class ExploitAgent(Agent):
             return
         self.model.add_unreachable_sa(self.target[0])
 
-    def handle_nested_unsat_condition(self, state_deps):
-        # for s in state_deps:
-        #     if s.sa == self.curr_state.sa or s.sa in self.nested_cond_unsat_sas:
-        #         continue
-        #     self.logger.debug(f"handle_nested_unsat_condition: {s.sa}")
-        #     self.nested_cond_unsat_sas.add(s.sa)
-        reversed_action = 1 if self.curr_state.action == 0 else 0
-        reversed_state = copy.copy(self.curr_state)
-        reversed_state.action = reversed_action
-        self.learner.punish_state(reversed_state)
-
     def _greedy_policy(self):
         d_taken = self.model.get_distance(self.curr_state, 1)
         d_not_taken = self.model.get_distance(self.curr_state, 0)
@@ -474,4 +471,3 @@ class ExploitAgent(Agent):
             return 0
         else:
             return self.curr_state.action
-
