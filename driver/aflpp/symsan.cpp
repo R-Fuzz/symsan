@@ -270,6 +270,7 @@ static uint32_t map_arg(const u8 *buf, size_t offset, uint32_t length,
 }
 
 // this combines both AST construction and arg mapping
+[[nodiscard]] [[gnu::hot]]
 static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
                        const u8 *buf, size_t buf_size,
                        std::shared_ptr<rgd::Constraint> constraint,
@@ -509,7 +510,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     // to get the size of the constant, we need to subtract the size
     // of the other operand
     if (info->op == __dfsan::Concat) {
-      assert(info->l2 >= CONST_OFFSET);
+      if (unlikely(info->l2 == 0)) {
+        WARNF("invalid concat node %u\n", info->l2);
+        return false;
+      }
       size -= get_label_info(info->l2)->size;
     }
     left->set_bits(size);
@@ -548,7 +552,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     visited.insert(info->l2);
   } else {
     if (unlikely(needs_concretization)) {
-      assert(rgd::isRelationalKind(ret->kind()) && "invalid kind for concretization");
+      if (unlikely(!rgd::isRelationalKind(ret->kind()))) {
+        WARNF("invalid kind for concretization %u\n", ret->kind());
+        return false;
+      }
     }
     // constant
     right->set_kind(rgd::Constant);
@@ -558,7 +565,10 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     // to get the size of the constant, we need to subtract the size
     // of the other operand
     if (info->op == __dfsan::Concat) {
-      assert(info->l1 >= CONST_OFFSET);
+      if (unlikely(info->l1 == 0)) {
+        WARNF("invalid concat node %u\n", info->l1);
+        return false;
+      }
       size -= get_label_info(info->l1)->size;
     }
     right->set_bits(size);
@@ -590,6 +600,7 @@ static bool do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   return true;
 }
 
+[[nodiscard]] [[gnu::hot]]
 static constraint_t
 parse_constraint(dfsan_label label, const u8 *buf, size_t buf_size) {
   DEBUGF("constructing constraint for label %u\n", label);
@@ -627,6 +638,7 @@ parse_constraint(dfsan_label label, const u8 *buf, size_t buf_size) {
   }
 }
 
+[[nodiscard]] [[gnu::hot]]
 static task_t construct_task(std::vector<const rgd::AstNode*> clause,
                              const u8 *buf, size_t buf_size) {
   task_t task = std::make_shared<rgd::SearchTask>();
@@ -672,6 +684,7 @@ static dfsan_label strip_zext(dfsan_label label) {
   return label;
 }
 
+[[nodiscard]] [[gnu::hot]]
 static int find_roots(dfsan_label label, rgd::AstNode *ret,
                       std::unordered_set<dfsan_label> &subroots) {
   if (label < CONST_OFFSET || label == kInitializingLabel) {
@@ -738,8 +751,14 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
 
         if (info->op == __dfsan::Not) {
           DEBUGF("simplify not: %d, %d\n", info->l2, info->size);
-          assert(node->children_size() == 1);
-          assert(info->size == 1);
+          if (unlikely(node->children_size() != 1)) {
+            WARNF("child node size != 1\n");
+            return INVALID_NODE;
+          }
+          if (unlikely(info->size != 1)) {
+            WARNF("info size != 1\n");
+            return INVALID_NODE;
+          }
           rgd::AstNode *child = node->mutable_children(0);
           node->set_bits(1);
           if (child->kind() == rgd::Bool) {
@@ -752,8 +771,14 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
         } else if (info->op == __dfsan::And) {
           // if And apprears, it must be LAnd, try to simplify
           DEBUGF("simplify land: %d LAnd %d, %d\n", info->l1, info->l2, info->size);
-          assert(node->children_size() != 0);
-          assert(info->size == 1);
+          if (unlikely(node->children_size() == 0)) {
+            WARNF("child node size == 0\n");
+            return INVALID_NODE;
+          }
+          if (unlikely(info->size != 1)) {
+            WARNF("info size != 1\n");
+            return INVALID_NODE;
+          }
           uint32_t child = 0;
           rgd::AstNode *left = nullptr;
           rgd::AstNode *right = nullptr;
@@ -772,14 +797,25 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
               node->set_kind(rgd::Bool);
               node->set_boolvalue(0);
               node->clear_children();
-            } else {
-              assert(info->op1.i == 1); // 1 LAnd x = x
-              assert(right != nullptr);
+            } else if (info->op1.i == 1) { // 1 LAnd x = x
+              if (unlikely(right == nullptr)) {
+                WARNF("right child is null\n");
+                return INVALID_NODE;
+              }
               node->CopyFrom(*right);
+            } else {
+              WARNF("invalid constant %ld\n", info->op1.i);
+              return INVALID_NODE;
             }
           } else {
-            assert(left != nullptr);
-            assert(right != nullptr);
+            if (unlikely(left == nullptr)) {
+              WARNF("left child is null\n");
+              return INVALID_NODE;
+            }
+            if (unlikely(right == nullptr)) {
+              WARNF("right child is null\n");
+              return INVALID_NODE;
+            }
             // check for constant
             if (left->kind() == rgd::Bool) {
               if (left->boolvalue() == 0) { // 0 LAnd x = 0
@@ -812,8 +848,14 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
           }
         } else if (info->op == __dfsan::Or) {
           DEBUGF("simplify lor: %d LOr %d, %d\n", info->l1, info->l2, info->size);
-          assert(node->children_size() != 0);
-          assert(info->size == 1);
+          if (unlikely(node->children_size() == 0)) {
+            WARNF("child node size == 0\n");
+            return INVALID_NODE;
+          }
+          if (unlikely(info->size != 1)) {
+            WARNF("info size != 1\n");
+            return INVALID_NODE;
+          }
           uint32_t child = 0;
           rgd::AstNode *left = nullptr;
           rgd::AstNode *right = nullptr;
@@ -832,14 +874,25 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
               node->set_kind(rgd::Bool);
               node->set_boolvalue(1);
               node->clear_children();
-            } else { // 0 LOr x = x
-              assert(info->op1.i == 0);
-              assert(right != nullptr);
+            } else if (info->op1.i == 0) { // 0 LOr x = x
+              if (unlikely(right == nullptr)) {
+                WARNF("right child is null\n");
+                return INVALID_NODE;
+              }
               node->CopyFrom(*right);
+            } else {
+              WARNF("invalid constant %ld\n", info->op1.i);
+              return INVALID_NODE;
             }
           } else {
-            assert(left != nullptr);
-            assert(right != nullptr);
+            if (unlikely(left == nullptr)) {
+              WARNF("left child is null\n");
+              return INVALID_NODE;
+            }
+            if (unlikely(right == nullptr)) {
+              WARNF("right child is null\n");
+              return INVALID_NODE;
+            }
             // check for constant
             if (left->kind() == rgd::Bool) {
               if (left->boolvalue() == 1) { // 1 LOr x = 1
@@ -871,8 +924,14 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
           }
         } else if (info->op == __dfsan::Xor) {
           DEBUGF("simplify lxor: %d LXOr %d, %d\n", info->l1, info->l2, info->size);
-          assert(node->children_size() != 0);
-          assert(info->size == 1);
+          if (unlikely(node->children_size() == 0)) {
+            WARNF("child node size == 0\n");
+            return INVALID_NODE;
+          }
+          if (unlikely(info->size != 1)) {
+            WARNF("info size != 1\n");
+            return INVALID_NODE;
+          }
           uint32_t child = 0;
           rgd::AstNode *left = nullptr;
           rgd::AstNode *right = nullptr;
@@ -887,7 +946,10 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
 
           if (likely(info->l1 == 0)) {
             // lhs is a constant
-            assert(right != nullptr);
+            if (unlikely(right == nullptr)) {
+              WARNF("right child is null\n");
+              return INVALID_NODE;
+            }
             if (unlikely(right->kind() == rgd::Bool)) {
               // rhs is a constant
               node->set_kind(rgd::Bool);
@@ -902,9 +964,14 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
               }
             }
           } else {
-            assert(left != nullptr);
-            assert(right != nullptr);
-
+            if (unlikely(left == nullptr)) {
+              WARNF("left child is null\n");
+              return INVALID_NODE;
+            }
+            if (unlikely(right == nullptr)) {
+              WARNF("right child is null\n");
+              return INVALID_NODE;
+            }
             // check for constant
             if (unlikely(left->kind() == rgd::Bool)) {
               if (unlikely(right->kind() == rgd::Bool)) {
@@ -971,7 +1038,10 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
               node->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
             } else {
               auto itr = OP_MAP.find(info->op);
-              assert(itr != OP_MAP.end());
+              if (unlikely(itr == OP_MAP.end())) {
+                WARNF("invalid icmp op: %d\n", info->op);
+                return INVALID_NODE;
+              }
               node->set_kind(itr->second.first);
               node->set_label(curr);
 #ifdef DEBUG
@@ -980,7 +1050,6 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
             }
           } else if (node->children_size() == 1) {
             // one side has another icmp, must be simplifiable
-            // assert(is_rel_cmp(info->op, __dfsan::bveq) || is_rel_cmp(info->op, __dfsan::bvneq));
             if (!is_rel_cmp(info->op, __dfsan::bveq) && !is_rel_cmp(info->op, __dfsan::bvneq)) {
               WARNF("unexpected icmp: %d\n", info->op);
               // unexpected icmp, set as a constant boolean
@@ -990,7 +1059,10 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
               if (nested_cmp_cache[info->l1]) {
                 // nested icmp in the lhs
                 rgd::AstNode *left = node->mutable_children(0);
-                assert(left->bits() == 1);
+                if (unlikely(left->bits() != 1)) {
+                  WARNF("nested icmp lhs bits != 1\n");
+                  return INVALID_NODE;
+                }
                 if (likely(info->l2 == 0)) {
                   if (is_rel_cmp(info->op, __dfsan::bveq)) {
                     if (info->op2.i == 1) { // checking bool == true
@@ -1012,11 +1084,13 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
                   node->set_boolvalue(0);
                   node->clear_children();
                 }
-              } else {
+              } else if (nested_cmp_cache[info->l2] > 0) {
                 // nested icmp in the rhs
-                assert(nested_cmp_cache[info->l2] > 0);
                 rgd::AstNode *right = node->mutable_children(0);
-                assert(right->bits() == 1);
+                if (unlikely(right->bits() != 1)) {
+                  WARNF("nested icmp rhs bits != 1\n");
+                  return INVALID_NODE;
+                }
                 if (likely(info->l1 == 0)) {
                   if (is_rel_cmp(info->op, __dfsan::bveq)) {
                     if (info->op1.i == 1) { // checking true == bool
@@ -1038,6 +1112,9 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
                   node->set_boolvalue(0);
                   node->clear_children();
                 }
+              } else {
+                WARNF("icmp with child yet no nested icmp?!\n");
+                return INVALID_NODE;
               }
             }
           } else {
@@ -1048,7 +1125,10 @@ static int find_roots(dfsan_label label, rgd::AstNode *ret,
           }
         } else if (info->op == __dfsan::fmemcmp) {
           // memcmp is also considered as a root node (relational comparison)
-          assert(node->children_size() == 0 && "memcmp should not have additional icmp");
+          if (unlikely(node->children_size() != 0)) {
+            WARNF("memcmp should not have additional icmp");
+            return INVALID_NODE;
+          }
           node->set_bits(1); // XXX: treat memcmp as a boolean
           node->set_kind(rgd::Memcmp); // fix later
           node->set_label(curr);
@@ -1089,28 +1169,44 @@ static void printAst(const rgd::AstNode *node, int indent) {
   fprintf(stderr, ")");
 }
 
-static void to_nnf(bool expected_r, rgd::AstNode *node) {
+[[nodiscard]]
+static int to_nnf(bool expected_r, rgd::AstNode *node) {
+  int ret = 0;
   if (!expected_r) {
     // we're looking for a negated formula
     if (node->kind() == rgd::LNot) {
       // double negation
-      assert(node->children_size() == 1);
+      if (unlikely(node->children_size() != 1)) {
+        WARNF("LNot expect a singple child\n");
+        return INVALID_NODE;
+      }
       rgd::AstNode *child = node->mutable_children(0);
       // transform the child, now looking for a true formula
-      to_nnf(true, child);
+      ret = to_nnf(true, child);
+      if (unlikely(ret != 0)) { return ret; }
       node->CopyFrom(*child);
     } else if (node->kind() == rgd::LAnd) {
       // De Morgan's law
-      assert(node->children_size() == 2);
+      if (unlikely(node->children_size() != 2)) {
+        WARNF("LAnd expect two children\n");
+        return INVALID_NODE;
+      }
       node->set_kind(rgd::LOr);
-      to_nnf(false, node->mutable_children(0));
-      to_nnf(false, node->mutable_children(1));
+      ret = to_nnf(false, node->mutable_children(0));
+      if (unlikely(ret != 0)) { return ret; }
+      ret = to_nnf(false, node->mutable_children(1));
+      if (unlikely(ret != 0)) { return ret; }
     } else if (node->kind() == rgd::LOr) {
       // De Morgan's law
-      assert(node->children_size() == 2);
+      if (unlikely(node->children_size() != 2)) {
+        WARNF("LOr expect two children\n");
+        return INVALID_NODE;
+      }
       node->set_kind(rgd::LAnd);
-      to_nnf(false, node->mutable_children(0));
-      to_nnf(false, node->mutable_children(1));
+      ret = to_nnf(false, node->mutable_children(0));
+      if (unlikely(ret != 0)) { return ret; }
+      ret = to_nnf(false, node->mutable_children(1));
+      if (unlikely(ret != 0)) { return ret; }
     } else {
       // leaf node
       if (rgd::isRelationalKind(node->kind())) {
@@ -1120,16 +1216,21 @@ static void to_nnf(bool expected_r, rgd::AstNode *node) {
         // memcmp == 0 actually means s1 == s2
         // so we don't need to negate it
       } else {
-        assert(false && "unexpected node kind");
+        WARNF("Unexpected node kind %d\n", node->kind());
+        return INVALID_NODE;
       }
     }
   } else {
     // we're looking for a true formula
     if (node->kind() == rgd::LNot) {
-      assert(node->children_size() == 1);
+      if (unlikely(node->children_size() != 1)) {
+        WARNF("LNot expect a singple child\n");
+        return INVALID_NODE;
+      }
       rgd::AstNode *child = node->mutable_children(0);
       // negate the child, now looking for a false formula
-      to_nnf(false, child);
+      ret = to_nnf(false, child);
+      if (unlikely(ret != 0)) { return ret; }
       node->CopyFrom(*child);
     } else if (node->kind() == rgd::Memcmp) {
       // memcmp is also considered as a leaf node (relational comparison)
@@ -1138,10 +1239,13 @@ static void to_nnf(bool expected_r, rgd::AstNode *node) {
       node->set_kind(rgd::MemcmpN);
     } else {
       for (int i = 0; i < node->children_size(); i++) {
-        to_nnf(expected_r, node->mutable_children(i));
+        ret = to_nnf(expected_r, node->mutable_children(i));
+        if (unlikely(ret != 0)) { return ret; }
       }
     }
   }
+
+  return 0;
 }
 
 using formula_t = std::vector<std::vector<const rgd::AstNode*> > ;
@@ -1173,6 +1277,7 @@ static void to_dnf(const rgd::AstNode *node, formula_t &formula) {
   }
 }
 
+[[nodiscard]]
 static bool scan_labels(dfsan_label label, size_t buf_size) {
   // assuming label has been checked by caller
   // assuming the last label scanned is the size of the cache
@@ -1256,6 +1361,7 @@ static bool scan_labels(dfsan_label label, size_t buf_size) {
   return true;
 }
 
+[[nodiscard]]
 static inline expr_t get_root_expr(dfsan_label label, size_t buf_size) {
   if (label < CONST_OFFSET || label == kInitializingLabel || label >= MAX_LABEL) {
     WARNF("invalid label: %d\n", label);
@@ -1311,7 +1417,9 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
 
   // next, convert the formula to NNF form, possibly negate the root
   // if we are looking for a false formula
-  to_nnf(target_direction, root.get());
+  if (to_nnf(target_direction, root.get()) != 0) {
+    return false;
+  }
 #if DEBUG
   printAst(root.get(), 0);
   fprintf(stderr, "\n");
@@ -1404,7 +1512,9 @@ static bool add_data_flow_constraints(bool direction, dfsan_label label,
 
   // next, convert the formula to NNF form, possibly negate the root
   // if we are looking for a false formula
-  to_nnf(direction, root.get());
+  if (to_nnf(direction, root.get()) != 0) {
+    return false;
+  }
 #if DEBUG
   printAst(root.get(), 0);
   fprintf(stderr, "\n");
@@ -1889,7 +1999,10 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
   (void)(add_buf);
   (void)(add_buf_size);
   (void)(max_size);
-  assert(buf_size <= MAX_FILE);
+  if (buf_size > MAX_FILE) {
+    *out_buf = buf;
+    return 0;
+  }
 
   // try to get a task if we don't already have one
   // or if we've find a valid solution from the previous mutation
