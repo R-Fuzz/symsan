@@ -77,7 +77,7 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
       if (rhs) return v + 1;
       else return v - 1;
     default:
-      assert(false && "Non-relational op!");
+      WARNF("Non-relational i2s op %u!\n", comp);
   }
   return v;
 }
@@ -97,7 +97,7 @@ static inline uint64_t _get_binop_value(uint64_t v1, uint64_t v2, uint16_t kind)
     case rgd::Shl: return v1 << v2;
     case rgd::LShr: return v1 >> v2;
     case rgd::AShr: return (int64_t)v1 >> v2;
-    default: assert(false && "Non-binary op!");
+    default: WARNF("Non-binary i2s op %u!\n", kind);
   }
   return 0;
 }
@@ -114,7 +114,10 @@ static inline uint64_t _get_binop_value_r(uint64_t r, uint64_t const_op, uint16_
     case rgd::SDiv: return rhs ? (int64_t)const_op / (int64_t)r : (int64_t)r * (int64_t)const_op;
     case rgd::URem:
       if (rhs) {
-        assert(const_op >= r && "URem rhs");
+        if (const_op < r) {
+          WARNF("URem rhs const_op < r\n");
+          return r;
+        }
         // const_op % v = r
         // if const_op > r, const_op % (const_op - r) = r
         // if const_op == r, const_op % (const_op + 1) = const_op = r
@@ -126,7 +129,10 @@ static inline uint64_t _get_binop_value_r(uint64_t r, uint64_t const_op, uint16_
       }
     case rgd::SRem:
       if (rhs) {
-        assert((int64_t)const_op >= (int64_t)r && "SRem rhs");
+        if ((int64_t)const_op < (int64_t)r) {
+          WARNF("SRem rhs const_op < r\n");
+          return r;
+        }
         return (int64_t)const_op > (int64_t)r ? (int64_t)const_op - (int64_t)r : (int64_t)const_op + 1;
       } else {
         return r;
@@ -147,12 +153,18 @@ static inline uint64_t _get_binop_value_r(uint64_t r, uint64_t const_op, uint16_
         return r >> const_op; // v = r >> const_op
       }
     case rgd::LShr:
-      assert(!rhs && "LShr rhs not supported");
+      if (rhs) {
+        WARNF("LShr rhs not supported\n");
+        return r; // FIXME: r probably is not correct
+      }
       return r << const_op; // v = r << diff
     case rgd::AShr:
-      assert(!rhs && "AShr rhs not supported");
+      if (rhs) {
+        WARNF("AShr rhs not supported");
+        return r; // FIXME: r probably is not correct
+      }
       return (int64_t)r << const_op;
-    default: assert(false && "Non-binary op!");
+    default: WARNF("Non-binary binop_value op %u!\n", kind);
   }
   return 0;
 }
@@ -372,10 +384,16 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
       mismatches++;
       return SOLVER_TIMEOUT;
     }
-    assert(cm->i2s_candidates.size() == 1 && "only support single candidate");
+    if (cm->i2s_candidates.size() != 1) {
+      WARNF("only support single i2s candidate\n");
+      return SOLVER_TIMEOUT;
+    }
     size_t offset = cm->i2s_candidates[0].first;
     uint32_t size = cm->i2s_candidates[0].second;
-    assert(size == c->local_map.size() && "input size mismatch");
+    if (size != c->local_map.size()) {
+      WARNF("input size mismatch\n");
+      return SOLVER_TIMEOUT;
+    }
     uint64_t value = 0;
     int i = 0;
     auto &right = c->get_root()->children(1);
