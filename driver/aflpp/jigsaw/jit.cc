@@ -321,19 +321,20 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
     }
     // this should never happen!
     case rgd::LOr: {
-      assert(false && "LOr expression");
+      throw std::invalid_argument("LOr expression");
       break;
     }
     case rgd::LAnd: {
-      assert(false && "LAnd expression");
+      throw std::invalid_argument("LAnd expression");
       break;
     }
     case rgd::LNot: {
-      assert(false && "LNot expression");
+      throw std::invalid_argument("LNot expression");
       break;
     }
     case rgd::Ite: {
       // don't handle ITE for now, doesn't work with GD
+      throw std::invalid_argument("Ite expression");
 #if DEUBG
       std::cerr << "ITE expr codegen" << std::endl;
 #endif
@@ -349,7 +350,7 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       break;
     }
     default:
-      assert(false && "WARNING: unhandled expression");
+      throw std::invalid_argument("unhandled expression");
       //printExpression(node);
       break;
   }
@@ -366,7 +367,12 @@ int rgd::addFunction(const AstNode* node,
     std::map<size_t,uint32_t> const& local_map,
     uint64_t id) {
 
-  assert((isRelationalKind(node->kind()) || node->kind() == rgd::Memcmp || node->kind() == rgd::MemcmpN) && "non-relational expr");
+  if ((!isRelationalKind(node->kind()) &&
+      node->kind() != rgd::Memcmp &&
+      node->kind() != rgd::MemcmpN)) {
+    std::cerr << "non-relational expr\n";
+    return -1;
+  }
 
   // Open a new module.
   std::string moduleName = "rgdjit_m" + std::to_string(id);
@@ -390,8 +396,17 @@ int rgd::addFunction(const AstNode* node,
   auto args = fooFunc->arg_begin();
   llvm::Value* var = &(*args);
   std::unordered_map<uint32_t, llvm::Value*> value_cache;
-  auto *body = codegen(Builder, node, local_map, var, value_cache);
-  assert(body == nullptr && "non-comparison expr");
+  llvm::Value* body = nullptr;
+  try {
+    body = codegen(Builder, node, local_map, var, value_cache);
+  } catch (std::invalid_argument &e) {
+    std::cerr << "Invalid node: " << e.what() << std::endl;
+    return -1;
+  }
+  if (body != nullptr) {
+    std::cerr << "non-comparison expr\n";
+    return -1;
+  }
   Builder.CreateRet(body);
 
   llvm::raw_ostream *stream = &llvm::outs();
