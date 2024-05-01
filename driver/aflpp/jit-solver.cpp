@@ -97,7 +97,10 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
         DEBUGF("jit constraint %d\n", c->ast->label());
         uint64_t id = ++uuid;
         start = getTimeStamp();
-        addFunction(c->get_root(), c->local_map, id);
+        if (unlikely(addFunction(c->get_root(), c->local_map, id) != 0)) {
+          WARNF("failed to add function\n");
+          return SOLVER_ERROR;
+        }
         process_time += (getTimeStamp() - start);
         start = getTimeStamp();
         auto fn = performJit(id);

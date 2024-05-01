@@ -110,7 +110,7 @@ static uint32_t negate(uint32_t op) {
     case rgd::Ugt:  return rgd::Ule;
     case rgd::Ule:  return rgd::Ugt;
     case rgd::Ult:  return rgd::Uge;
-    default: assert(false && "Non-relational op!");
+    default: fprintf(stderr, "Non-relational op!\n");
   };
   return 0;
 }
@@ -166,7 +166,7 @@ static uint64_t get_distance(uint32_t comp, uint64_t a, uint64_t b) {
       dis = a;
       break;
     default:
-      assert(false && "Non-relational op!");
+      fprintf(stderr, "Non-relational op!\n");
   }
   return dis;
 }
@@ -503,7 +503,7 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
       if (rhs) return v + 1;
       else return v - 1;
     default:
-      assert(false && "Non-relational op!");
+      fprintf(stderr, "Non-relational op!\n");
   }
   return v;
 }
@@ -618,10 +618,16 @@ try_reverse:
         // memcmp(s1, s2) is i2s_feasible iff s1 is constant
         // try copy s1 to s2
         if (const_index == c->input_args.size()) continue;
-        assert(cm->i2s_candidates.size() == 1 && "memcmp should have only one candidate");
+        if (cm->i2s_candidates.size() != 1) {
+          fprintf(stderr, "memcmp should have only one candidate\n");
+          continue;
+        }
         size_t offset = cm->i2s_candidates[0].first;
         uint32_t size = cm->i2s_candidates[0].second;
-        assert(size == c->local_map.size() && "input size mismatch");
+        if (size != c->local_map.size()) {
+          fprintf(stderr, "input size mismatch\n");
+          continue;
+        }
         int i = 0;
         uint64_t value = 0;
         for (size_t off = offset; off < offset + size; off++) {
