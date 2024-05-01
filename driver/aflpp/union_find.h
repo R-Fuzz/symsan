@@ -9,6 +9,8 @@ namespace rgd {
 // disjoint set data structure
 class UnionFind {
 public:
+  static const size_t INVALID = (size_t)-1;
+
   UnionFind() : size_(0) {};
   UnionFind(size_t size) {
     reset(size);
@@ -28,7 +30,7 @@ public:
 
   // find the root of the set containing x
   size_t find(size_t x) {
-    assert(x < size_);
+    if (x >= size_) return INVALID;
 
     size_t p = parent[x];
     while (x != p) {
@@ -42,8 +44,8 @@ public:
 
   // merge the sets containing x and y, return new root
   size_t merge(size_t x, size_t y) {
-    assert(x < size_);
-    assert(y < size_);
+    if (x >= size_) return INVALID;
+    if (y >= size_) return INVALID;
 
     size_t x_root = find(x);
     size_t y_root = find(y);
@@ -69,7 +71,7 @@ public:
 
   // get the set containing x
   size_t get_set(size_t x, std::unordered_set<size_t> &set) {
-    assert(x < size_);
+    if (x >= size_) return INVALID;
     size_t temp = x;
     set.clear();
     set.insert(temp);

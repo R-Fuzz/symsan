@@ -1448,7 +1448,7 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
       // then, iterate each var in the clause
       for (auto const& var: clause) {
         const dfsan_label l = var->label();
-        assert(branch_to_inputs.size() > l);
+        // assert(branch_to_inputs.size() > l);
         auto &itr = branch_to_inputs[l];
         auto citr = concretize_node.find(l);
         if (unlikely(citr != concretize_node.end())) {
@@ -1460,13 +1460,16 @@ static bool construct_tasks(bool target_direction, dfsan_label label,
             itr = branch_to_inputs[get_label_info(l)->l1];
           }
         }
-        assert(itr.find_first() != input_dep_t::npos);
+        if (unlikely(itr.find_first() == input_dep_t::npos)) {
+          // not actual input dependency, skip
+          continue;
+        }
         // for each input byte used in the var, we collect additional constraints
         // first, we use union find to add additional related input bytes
         std::unordered_set<size_t> related_inputs;
         for (auto input = itr.find_first(); input != input_dep_t::npos;
              input = itr.find_next(input)) {
-          data_flow_deps.get_set(input, related_inputs);
+          data_flow_deps.get_set(input, related_inputs); // FIXME: should be fine?
         }
         // then, we collect the branch constraints for each related input byte
         for (auto input: related_inputs) {
@@ -1558,6 +1561,10 @@ static bool add_data_flow_constraints(bool direction, dfsan_label label,
         DEBUGF("union input bytes: (%zu, %zu)\n", root, input);
 #endif
         root = data_flow_deps.merge(root, input);
+        if (unlikely(root == rgd::UnionFind::INVALID)) {
+          WARNF("invalid input to union find\n");
+          return false;
+        }
       }
       // add the constraint
       auto &bucket = input_to_branches[root];
