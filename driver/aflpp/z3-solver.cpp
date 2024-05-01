@@ -199,7 +199,9 @@ z3::expr Z3Solver::serialize_rel(uint32_t comparison,
     const std::vector<std::pair<bool, uint64_t>> &input_args,
     std::unordered_map<uint32_t,z3::expr> &expr_cache) {
 
-  assert(node->children_size() == 2);
+  if (node->children_size() != 2) {
+    throw z3::exception("invalid children size");
+  }
   z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
   z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
 
@@ -243,10 +245,13 @@ static inline void extract_model(z3::model &m, uint8_t *buf, size_t buf_size,
     if (name.kind() == Z3_INT_SYMBOL) {
       uint8_t value = (uint8_t)e.get_numeral_int();
       size_t offset = name.to_int();
-      assert(offset < buf_size);
-      buf[offset] = value;
-      solution[offset] = value;
-      DEBUGF("generate_input offset:%zu => %u\n", offset, value);
+      if (offset < buf_size) {
+        buf[offset] = value;
+        solution[offset] = value;
+        DEBUGF("generate_input offset:%zu => %u\n", offset, value);
+      } else {
+        WARNF("offset %zu out of range %zu\n", offset, buf_size);
+      }
     }
   }
 }
