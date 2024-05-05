@@ -276,17 +276,28 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
     // error or EOF
     waitpid(g_config.symsan_pid, NULL, 0);
     g_config.symsan_pid = -1;
+    close(g_config.pipefds[0]); // close the read fd
   }
 
   return n;
 }
 
 __attribute__((visibility("default")))
-void symsan_destroy() {
+int symsan_terminate() {
   if (g_config.symsan_pid > 0) {
     kill(g_config.symsan_pid, SIGKILL);
     waitpid(g_config.symsan_pid, NULL, 0);
+    g_config.symsan_pid = -1;
+    close(g_config.pipefds[0]);
+    return 0;
+  } else {
+    return -1;
   }
+}
+
+__attribute__((visibility("default")))
+void symsan_destroy() {
+  symsan_terminate();
 
   if (g_config.dev_null_fd != -1) {
     close(g_config.dev_null_fd);
