@@ -4,6 +4,10 @@
 
 #include "dfsan/dfsan.h"
 
+extern "C" {
+#include "launch.h"
+}
+
 #include <z3++.h>
 
 #include <unordered_map>
@@ -16,12 +20,9 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <sys/ipc.h>
 #include <sys/mman.h>
-#include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <fcntl.h>
 
 using namespace __dfsan;
@@ -37,8 +38,6 @@ using namespace __dfsan;
 static dfsan_label_info *__dfsan_label_info;
 static char *input_buf;
 static size_t input_size;
-
-static const char *shm_prefix = "/symsan_union_table";
 
 dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
   return &__dfsan_label_info[label];
@@ -645,81 +644,53 @@ int main(int argc, char* const argv[]) {
 
   // load input file
   struct stat st;
-  int fd = open(input, O_RDONLY);
-  if (fd == -1) {
+  int input_fd = open(input, O_RDONLY);
+  if (input_fd == -1) {
     fprintf(stderr, "Failed to open input file: %s\n", strerror(errno));
     exit(1);
   }
-  fstat(fd, &st);
+  fstat(input_fd, &st);
   input_size = st.st_size;
-  input_buf = (char *)mmap(NULL, input_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  input_buf = (char *)mmap(NULL, input_size, PROT_READ, MAP_PRIVATE, input_fd, 0);
   if (input_buf == (void *)-1) {
     fprintf(stderr, "Failed to map input file: %s\n", strerror(errno));
     exit(1);
   }
-  close(fd);
 
-  // setup shmem and pipe
-  int length = snprintf(NULL, 0, "%s-%d", shm_prefix, getpid());
-  char shm_name[length + 1];
-  snprintf(shm_name, length + 1, "%s-%d", shm_prefix, getpid());
-  int shmfd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-  if (shmfd == -1) {
-    fprintf(stderr, "Failed to open shmem: %s\n", strerror(errno));
-    exit(1);
-  }
-
-  if (ftruncate(shmfd, uniontable_size) == -1) {
-    fprintf(stderr, "Failed to truncate shmem: %s\n", strerror(errno));
-    exit(1);
-  }
-
-  __dfsan_label_info = (dfsan_label_info *)mmap(NULL, uniontable_size,
-      PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0);
+  // setup launcher
+  __dfsan_label_info = (dfsan_label_info *)symsan_init(program, uniontable_size);
   if (__dfsan_label_info == (void *)-1) {
     fprintf(stderr, "Failed to map shm: %s\n", strerror(errno));
     exit(1);
   }
-  // clear O_CLOEXEC flag
-  fcntl(shmfd, F_SETFD, fcntl(shmfd, F_GETFD) & ~FD_CLOEXEC);
 
-  int pipefds[2];
-  if (pipe(pipefds) != 0) {
-    fprintf(stderr, "Failed to create pipe fds: %s\n", strerror(errno));
+  if (symsan_set_input(is_stdin ? "stdin" : input) != 0) {
+    fprintf(stderr, "Failed to set input\n");
     exit(1);
   }
 
-  // prepare the env and fork
-  const char *input_file = is_stdin ? "stdin" : input;
-  length = snprintf(NULL, 0, "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=1",
-                    input_file, shmfd, pipefds[1]);
-  options = (char *)malloc(length + 1);
-  snprintf(options, length + 1, "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=1",
-           input_file, shmfd, pipefds[1]);
-  
-  int pid = fork();
-  if (pid < 0) {
-    fprintf(stderr, "Failed to fork: %s\n", strerror(errno));
+  char* args[3];
+  args[0] = program;
+  args[1] = input;
+  args[2] = NULL;
+  if (symsan_set_args(2, args) != 0) {
+    fprintf(stderr, "Failed to set args\n");
     exit(1);
   }
 
-  if (pid == 0) {
-    close(pipefds[0]); // close the read fd
-    setenv("TAINT_OPTIONS", options, 1);
-    char* args[3];
-    args[0] = program;
-    args[1] = input;
-    args[2] = NULL;
-    if (is_stdin) {
-      fd = open(input, O_RDONLY);
-      dup2(fd, 0);
-      close(fd);
-    }
-    execv(program, args);
-    exit(0);
-  }
+  symsan_set_debug(1);
+  symsan_set_bounds_check(0);
 
-  close(pipefds[1]);
+  // launch the target
+  int ret = symsan_run(input_fd);
+  if (ret < 0) {
+    fprintf(stderr, "Failed to launch target: %s\n", strerror(errno));
+    exit(1);
+  } else if (ret > 0) {
+    fprintf(stderr, "SymSan launch error %d\n", ret);
+    exit(1);
+  }
+  close(input_fd);
 
   pipe_msg msg;
   gep_msg gmsg;
@@ -727,14 +698,14 @@ int main(int argc, char* const argv[]) {
   size_t msg_size;
   memcmp_msg *mmsg = nullptr;
 
-  while (read(pipefds[0], &msg, sizeof(msg)) > 0) {
+  while (symsan_read_event(&msg, sizeof(msg), 0) > 0) {
     // solve constraints
     switch (msg.msg_type) {
       case cond_type:
         __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr);
         break;
       case gep_type:
-        if (read(pipefds[0], &gmsg, sizeof(gmsg)) != sizeof(gmsg)) {
+        if (symsan_read_event(&gmsg, sizeof(gmsg), 0) != sizeof(gmsg)) {
           fprintf(stderr, "Failed to receive gep msg: %s\n", strerror(errno));
           break;
         }
@@ -753,7 +724,7 @@ int main(int argc, char* const argv[]) {
           break;
         msg_size = sizeof(memcmp_msg) + msg.result;
         mmsg = (memcmp_msg*)malloc(msg_size); // not freed until terminate
-        if (read(pipefds[0], mmsg, msg_size) != msg_size) {
+        if (symsan_read_event(mmsg, msg_size, 0) != msg_size) {
           fprintf(stderr, "Failed to receive memcmp msg: %s\n", strerror(errno));
           break;
         }
@@ -772,9 +743,6 @@ int main(int argc, char* const argv[]) {
     }
   }
 
-  wait(NULL);
-  close(pipefds[0]);
-  close(shmfd);
-  shm_unlink(shm_name);
+  symsan_destroy();
   exit(0);
 }
