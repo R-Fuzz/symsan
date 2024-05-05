@@ -14,6 +14,7 @@
 
 extern "C" {
 #include "afl-fuzz.h"
+#include "launch.h"
 }
 
 #include "boost/dynamic_bitset.hpp"
@@ -97,23 +98,20 @@ struct my_mutator_t {
   my_mutator_t() = delete;
   my_mutator_t(const afl_state_t *afl, rgd::TaskManager* tmgr, rgd::CovManager* cmgr) :
     afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
-    argv(NULL), out_fd(-1), shm_fd(-1), cur_queue_entry(NULL),
+    argv(NULL), out_fd(-1), cur_queue_entry(NULL),
     cur_mutation_state(MUTATION_INVALID), output_buf(NULL),
     cur_task(nullptr), cur_solver_index(-1),
     task_mgr(tmgr), cov_mgr(cmgr) {}
 
   ~my_mutator_t() {
     if (out_fd >= 0) close(out_fd);
-    if (shm_fd >= 0) close(shm_fd);
-    // unlink(data->out_file);
-    shm_unlink(shm_name);
-    ck_free(shm_name);
     ck_free(out_dir);
     ck_free(out_file);
     ck_free(output_buf);
     ck_free(argv);
     delete task_mgr;
     delete cov_mgr;
+    symsan_destroy();
   }
 
   const afl_state_t *afl;
@@ -122,8 +120,6 @@ struct my_mutator_t {
   char *symsan_bin;
   char **argv;
   int out_fd;
-  char *shm_name;
-  int shm_fd;
   u8* cur_queue_entry;
   int cur_mutation_state;
   u8* output_buf;
@@ -1703,25 +1699,11 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     FATAL("Failed to create output file %s: %s\n", data->out_file, strerror(errno));
   }
 
-  // setup shmem for label info
-  data->shm_name = alloc_printf("/symsan-union-table-%d", afl->_id);
-  data->shm_fd = shm_open(data->shm_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);;
-  if (data->shm_fd == -1) {
-    FATAL("Failed to open shm(%s): %s\n", data->shm_name, strerror(errno));
-  }
-
-  if (ftruncate(data->shm_fd, uniontable_size) == -1) {
-    FATAL("Failed to truncate shmem: %s\n", strerror(errno));
-  }
-
-  __dfsan_label_info = (dfsan_label_info *)mmap(NULL, uniontable_size,
-      PROT_READ | PROT_WRITE, MAP_SHARED, data->shm_fd, 0);
+  // setup symsan launcher
+  __dfsan_label_info = (dfsan_label_info *)symsan_init(data->symsan_bin, uniontable_size);
   if (__dfsan_label_info == (void *)-1) {
-    FATAL("Failed to map shm(%d): %s\n", data->shm_fd, strerror(errno));
+    FATAL("Failed to init symsan launcher: %s\n", strerror(errno));
   }
-
-  // clear O_CLOEXEC flag
-  fcntl(data->shm_fd, F_SETFD, fcntl(data->shm_fd, F_GETFD) & ~FD_CLOEXEC);
 
   // allocate output buffer
   data->output_buf = (u8 *)malloc(MAX_FILE+1);
@@ -1749,100 +1731,6 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   delete data;
 }
 
-static int spawn_symsan_child(my_mutator_t *data, const u8 *buf, size_t buf_size,
-                              int pipefds[2]) {
-  // setup argv in case of initialized
-  if (unlikely(!data->argv)) {
-    int argc = 0;
-    while (data->afl->argv[argc]) { argc++; }
-    data->argv = (char **)calloc(argc + 1, sizeof(char *));
-    if (!data->argv) {
-      FATAL("Failed to alloc argv\n");
-    }
-    for (int i = 0; i < argc; i++) {
-      if (strstr(data->afl->argv[i], (char*)data->afl->tmp_dir)) {
-        DEBUGF("Replacing %s with %s\n", data->afl->argv[i], data->out_file);
-        data->argv[i] = data->out_file;
-      } else {
-        data->argv[i] = data->afl->argv[i];
-      }
-    }
-    data->argv[argc] = NULL;
-  }
-
-  // FIXME: should we use the afl->queue_cur->fname instead?
-  // write the buf to the file
-  lseek(data->out_fd, 0, SEEK_SET);
-  ck_write(data->out_fd, buf, buf_size, data->out_file);
-  fsync(data->out_fd);
-  if (ftruncate(data->out_fd, buf_size)) {
-    WARNF("Failed to truncate output file: %s\n", strerror(errno));
-    return 0;
-  }
-
-  // setup the env vars for SYMSAN
-  const char *taint_file = data->afl->fsrv.use_stdin ? "stdin" : data->out_file;
-  char *options = alloc_printf("taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=%d:trace_bound=%d",
-                                taint_file, data->shm_fd, pipefds[1], DEBUG, TraceBounds);
-#if DEBUG
-  DEBUGF("TAINT_OPTIONS=%s\n", options);
-#endif
-  
-  int pid = fork();
-  if (pid == 0) {
-    close(pipefds[0]); // close the read fd
-    setenv("TAINT_OPTIONS", (char*)options, 1);
-    unsetenv("LD_PRELOAD"); // don't preload anything
-    if (data->afl->fsrv.use_stdin) {
-      close(0);
-      lseek(data->out_fd, 0, SEEK_SET);
-      dup2(data->out_fd, 0);
-    }
-#if !DEBUG
-    close(1);
-    close(2);
-    dup2(data->afl->fsrv.dev_null_fd, 1);
-    dup2(data->afl->fsrv.dev_null_fd, 2);
-#endif
-    execv(data->symsan_bin, data->argv);
-    DEBUGF("Failed to execv: %s: %s", data->symsan_bin, strerror(errno));
-    exit(-1);
-  } if (pid < 0) {
-    WARNF("Failed to fork: %s\n", strerror(errno));
-  }
-
-  // free options
-  ck_free(options);
-
-  return pid;
-
-}
-
-static ssize_t timed_read(int fd, void *buf, size_t count, uint32_t timeout, bool &timedout) {
-  fd_set rfds;
-  struct timeval tv;
-  ssize_t ret;
-
-  FD_ZERO(&rfds);
-  FD_SET(fd, &rfds);
-
-  tv.tv_sec = (timeout / 1000);
-  tv.tv_usec = (timeout % 1000) * 1000;
-  timedout = false;
-
-  ret = select(fd + 1, &rfds, NULL, NULL, &tv);
-  if (ret == -1) {
-    WARNF("Failed to select: %s\n", strerror(errno));
-    return -1;
-  } else if (ret == 0) {
-    WARNF("Timeout\n");
-    timedout = true;
-    return -1;
-  }
-
-  return read(fd, buf, count);
-}
-
 /// @brief the trace stage for symsan
 /// @param data the custom mutator state
 /// @param buf input buffer
@@ -1865,22 +1753,50 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   data->cur_queue_entry = data->afl->queue_cur->fname;
   DEBUGF("Fuzzing %s\n", data->cur_queue_entry);
 
-  // create pipe for communication
-  int pipefds[2];
-  if (pipe(pipefds) != 0) {
-    WARNF("Failed to create pipe fds: %s\n", strerror(errno));
+  // FIXME: should we use the afl->queue_cur->fname instead?
+  // write the buf to the file
+  lseek(data->out_fd, 0, SEEK_SET);
+  ck_write(data->out_fd, buf, buf_size, data->out_file);
+  fsync(data->out_fd);
+  if (ftruncate(data->out_fd, buf_size)) {
+    WARNF("Failed to truncate output file: %s\n", strerror(errno));
     return 0;
   }
 
-  // spawn the symsan child
-  int pid = spawn_symsan_child(data, buf, buf_size, pipefds);
-  close(pipefds[1]); // close the write fd
+  // setup argv in case of initialized
+  if (unlikely(!data->argv)) {
+    int argc = 0;
+    while (data->afl->argv[argc]) { argc++; }
+    data->argv = (char **)calloc(argc + 1, sizeof(char *));
+    if (!data->argv) {
+      FATAL("Failed to alloc argv\n");
+    }
+    for (int i = 0; i < argc; i++) {
+      if (strstr(data->afl->argv[i], (char*)data->afl->tmp_dir)) {
+        DEBUGF("Replacing %s with %s\n", data->afl->argv[i], data->out_file);
+        data->argv[i] = data->out_file;
+      } else {
+        data->argv[i] = data->afl->argv[i];
+      }
+    }
+    data->argv[argc] = NULL;
+    // setup symsan launcher
+    symsan_set_input(data->afl->fsrv.use_stdin ? "stdin" : data->out_file);
+    symsan_set_args(argc, data->argv);
+    symsan_set_debug(DEBUG);
+    symsan_set_bounds_check(TraceBounds);
+  }
 
-  if (pid < 0) {
-    close(pipefds[0]);
+  // launch the symsan child process
+  int ret = symsan_run(data->out_fd);
+  if (ret < 0) {
+    WARNF("Failed to start symsan bin: %s\n", strerror(errno));
+    return 0;
+  } else if (ret > 0) {
+    WARNF("symsan_run failed %d\n", ret);
     return 0;
   }
- 
+
   pipe_msg msg;
   gep_msg gmsg;
   memcmp_msg *mmsg;
@@ -1896,7 +1812,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   // clear all caches
   reset_global_caches(buf_size);
 
-  while (timed_read(pipefds[0], &msg, sizeof(msg), timeout, timedout) > 0) {
+  while (symsan_read_event(&msg, sizeof(msg), timeout) == sizeof(msg)) {
     // create solving tasks
     switch (msg.msg_type) {
       // conditional branch
@@ -1904,7 +1820,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
         handle_cond(msg, buf, buf_size, data);
         break;
       case gep_type:
-        if (read(pipefds[0], &gmsg, sizeof(gmsg)) != sizeof(gmsg)) {
+        if (symsan_read_event(&gmsg, sizeof(gmsg), 0) != sizeof(gmsg)) {
           WARNF("Failed to receive gep msg: %s\n", strerror(errno));
           break;
         }
@@ -1926,7 +1842,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
           break;
         msg_size = sizeof(memcmp_msg) + msg.result;
         mmsg = (memcmp_msg*)malloc(msg_size);
-        if (read(pipefds[0], mmsg, msg_size) != msg_size) {
+        if (symsan_read_event(mmsg, msg_size, 0) != msg_size) {
           WARNF("Failed to receive memcmp msg: %s\n", strerror(errno));
           free(mmsg);
           break;
@@ -1965,14 +1881,9 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   }
 
   if (timedout) {
-    // kill the child process
-    kill(pid, SIGKILL);
+    // kill the symsan process
+    symsan_terminate();
   }
-
-  pid = waitpid(pid, NULL, 0);
-
-  // clean up
-  close(pipefds[0]);
 
   // reinit solving state
   data->cur_task = nullptr;
