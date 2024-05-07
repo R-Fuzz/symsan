@@ -31,6 +31,7 @@ MAX_BRANCH_NUM = 33
 MIN_HANG_FILES = 30
 # Model configurations
 DECIMAL_PRECISION = 200
+USE_ORDERED_DICT = False
 
 class Config:
     __slots__ = ['__dict__',
@@ -64,6 +65,7 @@ class Config:
                  'initial_policy',
                  'static_result_folder',
                  'offline_learning_enabled',
+                 'use_ordered_dict',
     ]
 
     def __init__(self):
@@ -141,6 +143,7 @@ class Config:
         self.decimal_precision = DECIMAL_PRECISION
         self.max_branch_num = MAX_BRANCH_NUM
         self.offline_learning_enabled = OFFLINE_LEARNING_ENABLED
+        self.use_ordered_dict = USE_ORDERED_DICT
         # The other configurations need to be set explicitly by config file or cmd arguments
         self.model_type = RLModelType.unknown
         self.afl_dir = ''

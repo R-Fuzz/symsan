@@ -1,3 +1,5 @@
+import abc
+import ast
 import logging
 import functools
 import os
@@ -18,7 +20,43 @@ import utils
 
 WAITING_INTERVAL = 5
 
-class SeedScheduler:
+class SeedScheduler(abc.ABC):
+    @abc.abstractmethod
+    def put(self, fn, info, from_fuzzer=False):
+        pass
+
+    @abc.abstractmethod
+    def pop(self):
+        pass
+    
+    @abc.abstractmethod
+    def is_empty(self):
+        pass
+
+class FILOScheduler(SeedScheduler):
+    def __init__(self, q):
+        self.queue = q
+        self.fuzzer_seeds = []
+
+    def put(self, fn, info, from_fuzzer=False):
+        p, _ = info[0], info[1]
+        if from_fuzzer:
+            self.fuzzer_seeds.append(fn)
+        priority = int(p/1000)
+        heapq.heappush(self.queue, (priority, fn))
+
+    def pop(self):
+        if self.fuzzer_seeds:
+            return self.fuzzer_seeds.pop()
+        if not self.queue:
+            return None
+        _, removed_seed = heapq.heappop(self.queue)
+        return removed_seed
+    
+    def is_empty(self):
+        return not self.queue and not self.fuzzer_seeds
+
+class PrioritySamplingScheduler(SeedScheduler):
     def __init__(self, q):
         self.queue = q
         self._max = float('-inf')
@@ -38,9 +76,10 @@ class SeedScheduler:
     def _logistic_function(self, x, k, mid):
         return 1 / (1 + np.exp(k * (x - mid)))
 
-    def put(self, fn, p):
-        if not fn:
-            raise ValueError("Invalid seed")
+    def put(self, fn, info, from_fuzzer=False):
+        p, _ = info[0], info[1]
+        if from_fuzzer and p is None:
+            p = 0
         priority = int(p/1000)
         heapq.heappush(self.queue, (priority, fn))
         self._max = max(self._max, priority)
@@ -49,40 +88,61 @@ class SeedScheduler:
     def pop(self):
         if not self.queue:
             return None
-        p_to_remove, removed_seed = heapq.heappop(self.queue)
-        if p_to_remove == self._max and self.queue:
-            self._max = max(self.queue, key=lambda x: x[0])[0]
-        self._weights_need_update = True
-        return removed_seed
-
-    def remove(self, fn):
-        if not self.queue:
-            return
-        index_to_remove = None
-        p_to_remove = float('-inf')
-        for i, (p, seed_fn) in enumerate(self.queue):
-            if seed_fn == fn:
-                index_to_remove = i
-                p_to_remove = p
-                break
-        if index_to_remove is not None:
-            self.queue.pop(index_to_remove)
-            heapq.heapify(self.queue)
-            if self.queue and self._max == p_to_remove:
-                self._max = max(self.queue, key=lambda x: x[0])[0]
-            if not self.queue:
-                self._max = float('-inf')
-            self._weights_need_update = True
-
-    def pick(self):
-        if not self.queue:
-            return None
         if len(self.queue) == 1:
             return self.queue[0][1]
         if self._weights_need_update:
             self._update_weights()
         chosen_index = np.random.choice(range(len(self.queue)), p=self._weights)
-        return self.queue[chosen_index][1]
+        chosen_seed = self.queue[chosen_index][1]
+        if self.queue[chosen_index][0] == 0:
+            self.remove(chosen_index)
+        return chosen_seed
+
+    def is_empty(self) -> bool:
+        return not self.queue
+
+    def remove(self, index_to_remove):
+        if not self.queue:
+            return
+        p_to_remove = self.queue[index_to_remove][0]
+        self.queue.pop(index_to_remove)
+        heapq.heapify(self.queue)
+        if self.queue and self._max == p_to_remove:
+            self._max = max(self.queue, key=lambda x: x[0])[0]
+        if not self.queue:
+            self._max = float('-inf')
+        self._weights_need_update = True
+
+class RealTimePriorityScheduler(SeedScheduler):
+    def __init__(self, m, t):
+        self.state_seed_mapping = m
+        self.D_table = t
+        self.fuzzer_seeds = []
+    
+    def put(self, fn, info, from_fuzzer=False):
+        _, sa_str = info[0], info[1]
+        if from_fuzzer or not sa_str:
+            self.fuzzer_seeds.append(fn)
+            return
+        sa = ast.literal_eval(sa_str)
+        assert not sa is None
+        self.state_seed_mapping[sa] = fn
+
+    def pop(self):
+        if self.fuzzer_seeds:
+            return self.fuzzer_seeds.pop()
+        selected_state = self.D_table.pop()
+        if selected_state is None:
+            return None
+        while selected_state not in self.state_seed_mapping:
+            selected_state = self.D_table.pop()
+            if selected_state is None:
+                return None
+        # import ipdb; ipdb.set_trace()
+        return self.state_seed_mapping[selected_state]
+    
+    def is_empty(self) -> bool:
+        return not self.fuzzer_seeds and self.D_table.is_heap_empty
 
 # 'id:xxxx,src:yyyyy' -> 'id:xxxx'
 # 'id-xxx-xxxxxx-xx,src:yy-yyyyyy-yy' -> 'id-xxx-xxxxxx-xx'
@@ -137,6 +197,7 @@ class MazerunnerState:
         self.num_error_reports = 0
         self.num_crash_reports = 0
         self.seed_queue = []
+        self.state_seed_mapping = {}
         self._best_seed_info = [None, float("inf"), False] # filename, distance, is_new
         self.bitmap = []
 
@@ -204,7 +265,7 @@ class Mazerunner:
             self.state = shared_state
         else:
             self._import_state()
-            self.seed_scheduler = SeedScheduler(self.state.seed_queue)
+            self.seed_scheduler = FILOScheduler(self.state.seed_queue)
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.afl = config.afl_dir
         if self.afl:
@@ -380,7 +441,7 @@ class Mazerunner:
                 for fn in self.state.hang:
                     d = utils.get_distance_from_fn(fn)
                     d = self.config.max_distance if d is None else d
-                    self.seed_scheduler.put(fn, d)
+                    self.seed_scheduler.put(fn, (d, ''))
                 self.state.hang.clear()
 
     def cleanup(self):
@@ -489,8 +550,10 @@ class ExploreExecutor(Mazerunner):
             t_fn = f"id:{index:06},src:{get_id_from_fn(fn)},ts:{ts},execs:{self.state.execs}"
             q_fp = os.path.join(self.my_queue, t_fn)
             shutil.move(testcase, q_fp)
-            t_d = int(t.split(',')[-1].strip())
-            self.seed_scheduler.put(t_fn, t_d)
+            info = t.partition(',')[-1].strip().split(':')
+            t_d = int(info[0]) if info else self.config.max_distance
+            t_sa = info[1] if info else ''
+            self.seed_scheduler.put(t_fn, (t_d, t_sa))
 
     def _run(self):
         next_seed = self.seed_scheduler.pop()
@@ -572,11 +635,11 @@ class ExploitExecutor(Mazerunner):
         shutil.copy2(self.cur_input, dst_fp)
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
-            self.seed_scheduler.put(dst_fn, res.distance)
+            self.seed_scheduler.put(dst_fn, (res.distance, ''))
             self.logger.info(f"Exploit agent found closer distance={res.distance}, ts: {ts}")
 
     def _run(self):
-        next_seed = self.seed_scheduler.pick()
+        next_seed = self.seed_scheduler.pop()
         if next_seed:
             self.run_file(next_seed)
             self.agent.train()
@@ -608,7 +671,7 @@ class RecordExecutor(Mazerunner):
     def update_seed_queue(self, fn):
         d = utils.get_distance_from_fn(fn)
         d = -self.config.max_distance if d is None else d
-        self.seed_scheduler.put(fn, d)
+        self.seed_scheduler.put(fn, [d, ''], from_fuzzer=True)
 
     def _run(self):
         files = self.sync_from_either()
@@ -658,21 +721,23 @@ class RLExecutor():
         # All executors share the same state and All agents share the same model
         self._import_state()
         self.replayer = ReplayExecutor(config, self.state)
+        if agent_type == "explore":
+            self.config.use_ordered_dict = True
         self.model = Agent.create_model(self.config)
-        self.seed_scheduler = SeedScheduler(self.state.seed_queue)
         if agent_type == "exploit":
             self.concolic_executor = ExploitExecutor(config, self.state)
             self.synchronizer = RecordExecutor(config, shared_state=self.state, record_enabled=True)
+            self.seed_scheduler = PrioritySamplingScheduler(self.state.seed_queue)
         elif agent_type == "explore":
             self.concolic_executor = ExploreExecutor(config, self.state)
             self.synchronizer = RecordExecutor(config, shared_state=self.state, record_enabled=False)
+            self.seed_scheduler = RealTimePriorityScheduler(self.state.state_seed_mapping, self.model.distance_table)
         else:
             raise NotImplementedError()
         self.replayer.agent.model = self.model
         self.concolic_executor.agent.model = self.model
         self.concolic_executor.seed_scheduler = self.seed_scheduler
         self.synchronizer.seed_scheduler = self.seed_scheduler
-        self.replayer.seed_scheduler = self.seed_scheduler
 
     @property
     def metadata(self):
@@ -692,7 +757,7 @@ class RLExecutor():
                 break
             if self.state.execs % self.config.save_frequency == 0:
                 self._export_state()
-            if not self.seed_scheduler.queue or self.state.execs % self.config.sync_frequency == 0:
+            if self.seed_scheduler.is_empty() or self.state.execs % self.config.sync_frequency == 0:
                 self.synchronizer.run(run_once=True)
             self.concolic_executor.run(run_once=True)
             if self.config.offline_learning_enabled:

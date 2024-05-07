@@ -419,8 +419,8 @@ class Z3Solver:
                 c.expr_deps.add(index_bv == r_bv)
         return status
 
-    def handle_cond(self, msg: pipe_msg, should_solve: bool, s: agent.ProgramState, score: str):
-        return self.__solve_cond(msg.label, msg.result, s, should_solve, score)
+    def handle_cond(self, msg: pipe_msg, should_solve: bool, s: agent.ProgramState, seed_info: str):
+        return self.__solve_cond(msg.label, msg.result, s, should_solve, seed_info)
 
     def handle_memcmp(self, msg: pipe_msg, pipe):
         info = get_label_info(msg.label, self.shm)
@@ -455,7 +455,7 @@ class Z3Solver:
             self.__branch_deps.extend([None] * (n + 1 - len(self.__branch_deps)))
         self.__branch_deps[n] = dep
 
-    def __solve_expr(self, e: z3.ExprRef, score=''):
+    def __solve_expr(self, e: z3.ExprRef, seed_info=''):
         # set up local optmistic solver
         opt_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         opt_solver.set("timeout", 1000)
@@ -472,7 +472,7 @@ class Z3Solver:
         r_nested = self.__z3_solver.check()
         if r_nested == z3.sat:
             m = self.__z3_solver.model()
-            has_generated = self.__generate_input(m, False, score)
+            has_generated = self.__generate_input(m, False, seed_info)
             if not has_generated:
                 status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
             else:
@@ -482,7 +482,7 @@ class Z3Solver:
                 self.__z3_solver.pop()
                 return SolvingStatus.UNSOLVED_PRE_UNSAT
             m = opt_solver.model()
-            has_generated = self.__generate_input(m, True, score)
+            has_generated = self.__generate_input(m, True, seed_info)
             if not has_generated:
                 status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
             elif r_nested == z3.unknown:
@@ -497,12 +497,12 @@ class Z3Solver:
         self.__z3_solver.pop()
         return status
 
-    def __generate_input(self, m: z3.Model, is_optimistic: bool, score=''):
+    def __generate_input(self, m: z3.Model, is_optimistic: bool, seed_info=''):
         fname = f"id-{self.__instance_id}-{self.__session_id}-{self.__current_index}"
         if is_optimistic:
             fname += "-opt"
-        if score:
-            fname += "," + score
+        if seed_info:
+            fname += "," + seed_info
         path = os.path.join(self.output_dir, fname)
         self.__current_index += 1
         with open(path, "wb") as f:
@@ -565,7 +565,7 @@ class Z3Solver:
                         self.__z3_solver.add(expr)
 
     def __solve_cond(self, label: ctypes.c_uint32, r: ctypes.c_uint64,
-                     s: agent.ProgramState, should_solve: bool, score=''):
+                     s: agent.ProgramState, should_solve: bool, seed_info=''):
         addr = s.state[0]
         self.logger.debug(f"__solve_cond: label={label}, result={r}, addr={hex(addr)}")
         result = z3.BoolVal(r != 0, ctx=self.__z3_context)
@@ -587,7 +587,7 @@ class Z3Solver:
         solving_status = None
         if should_solve:
             e = (cond != result)
-            solving_status = self.__solve_expr(e, score)
+            solving_status = self.__solve_expr(e, seed_info)
         # 3. nested branch
         if self.config.nested_branch_enabled:
             for off in self._dep_input_offsets:

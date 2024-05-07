@@ -13,7 +13,7 @@ from multiprocessing import shared_memory
 from backend_solver import Z3Solver
 from defs import *
 import utils
-from agent import ExploitAgent, RecordAgent
+from agent import ExploitAgent, RecordAgent, ExploreAgent
 
 UNION_TABLE_SIZE = 0xc00000000
 PIPE_CAPACITY = 4 * 1024 * 1024
@@ -76,6 +76,7 @@ class ConcolicExecutor:
         self.testcase_dir = output_dir
         self.record_mode_enabled = True if type(agent) is RecordAgent else False
         self.onetime_solving_enabled = True if (type(agent) is ExploitAgent) else False
+        self.save_seed_info = True if (type(agent) is ExploreAgent or type(agent) is ExploitAgent) else False
         self.gep_solver_enabled = config.gep_solver_enabled
         self.should_increase_pipe_capacity = True
         self._setup_pipe()
@@ -227,8 +228,12 @@ class ConcolicExecutor:
         if self.record_mode_enabled:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
         is_interesting = self.agent.is_interesting_branch()
-        score = self.agent.compute_branch_score() if is_interesting else ''
-        solving_status = self.solver.handle_cond(msg, is_interesting, self.agent.curr_state, score)
+        seed_info = ''
+        if self.save_seed_info:
+            reversed_sa = str(self.agent.curr_state.reversed_sa) if is_interesting else ''
+            score = self.agent.compute_branch_score() if is_interesting else ''
+            seed_info = f"{score}:{reversed_sa}"
+        solving_status = self.solver.handle_cond(msg, is_interesting, self.agent.curr_state, seed_info)
         if not is_interesting:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
         if solving_status == SolvingStatus.UNSOLVED_OPT_UNSAT:

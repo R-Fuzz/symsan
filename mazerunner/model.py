@@ -2,10 +2,83 @@ import collections
 import logging
 import os
 import pickle
+import heapq
 
 from decimal import Decimal, getcontext
 from enum import Enum
 from utils import mkdir
+
+class SortedDict:
+    def __init__(self, need_sort=False):
+        self.need_sort = need_sort
+        self.data = collections.OrderedDict()
+        self.heap = []
+
+    def __len__(self):
+        return len(self.data)
+    
+    def __setitem__(self, key, value):
+        if self.need_sort:
+            if key in self.data:
+                self.remove(key, mark_only=True)
+            heapq.heappush(self.heap, (value, key))
+        self.data[key] = value
+
+    def __getitem__(self, key):
+        return self.data.get(key, None)
+
+    def __delitem__(self, key):
+        self.remove(key)
+
+    def __contains__(self, key):
+        return key in self.data
+    
+    def __iter__(self):
+        return iter(self.data)
+
+    def keys(self):
+        return self.data.keys()
+
+    def values(self):
+        return self.data.values()
+
+    def items(self):
+        return self.data.items()
+
+    @property
+    def is_heap_empty(self):
+        if not self.heap:
+            return True
+
+    def remove(self, key, mark_only=False):
+        if key in self.data:
+            del self.data[key]
+            if self.need_sort and not mark_only:
+                self.rebuild_heap()
+
+    def pop(self):
+        while self.heap:
+            value, key = heapq.heappop(self.heap)
+            if key in self.data and self.data[key] == value:
+                # don't remove item in Q-table
+                # self.remove(key)
+                return key
+        return None
+
+    def peak(self):
+        while self.heap:
+            value, key = self.heap[0]
+            if key in self.data and self.data[key] == value:
+                return key
+            heapq.heappop(self.heap)
+        return None
+
+    def rebuild_heap(self):
+        if not self.need_sort:
+            return
+        self.heap = [(-v, k) for k, v in self.data.items() if k in self.data]
+        heapq.heapify(self.heap)
+
 
 class RLModelType(Enum):
     unknown = 0
@@ -22,7 +95,10 @@ class RLModel:
         self.visited_sa = collections.Counter()
         self.all_target_sa = set()
         self.unreachable_sa = set()
-        self.Q_table = {}
+        if self.config.use_ordered_dict:
+            self.distance_table = SortedDict(need_sort=True)
+        else:
+            self.distance_table = SortedDict(need_sort=False)
         if config.mazerunner_dir:
             mkdir(self.my_dir)
             self.load()
@@ -35,7 +111,9 @@ class RLModel:
         with open(os.path.join(self.my_dir, "visited_sa"), 'wb') as fp:
             pickle.dump(self.visited_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
         with open(os.path.join(self.my_dir, "Q_table"), 'wb') as fp:
-            pickle.dump(self.Q_table, fp, protocol=pickle.HIGHEST_PROTOCOL)  
+            if self.distance_table.need_sort:
+                self.distance_table.rebuild_heap()
+            pickle.dump(self.distance_table, fp, protocol=pickle.HIGHEST_PROTOCOL)  
         with open(os.path.join(self.my_dir, "unreachable_branches"), 'wb') as fp:
             pickle.dump(self.unreachable_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
         with open(os.path.join(self.my_dir, "target_sa"), 'wb') as fp:
@@ -49,7 +127,7 @@ class RLModel:
         Q_table_path = os.path.join(self.my_dir, "Q_table")
         if os.path.isfile(Q_table_path):
             with open(Q_table_path, 'rb') as fp:
-                self.Q_table = pickle.load(fp)
+                self.distance_table = pickle.load(fp)
         unreachable_branches_path = os.path.join(self.my_dir, "unreachable_sa")
         if os.path.isfile(unreachable_branches_path):
             with open(unreachable_branches_path, 'rb') as fp:
@@ -95,21 +173,19 @@ class DistanceModel(RLModel):
         return -p
 
     def get_distance(self, s, a):
-        key = s.state + (a,)
-        if key not in self.Q_table:
-            return self.get_default_distance(s.bid, a)
-        else:
-            return DistanceModel.q_to_distance(self.Q_table[key])
+        q = self.Q_lookup(s, a)
+        return DistanceModel.q_to_distance(q)
 
     def Q_lookup(self, s, a):
         key = s.state + (a,)
-        if key not in self.Q_table:
+        if key not in self.distance_table:
             d = self.get_default_distance(s.bid, a)
-            return DistanceModel.distance_to_q(d)
-        return self.Q_table[key]
+            self.distance_table[key] = d
+        return DistanceModel.distance_to_q(self.distance_table[key])
 
     def Q_update(self, key, value):
-        self.Q_table[key] = value
+        d = DistanceModel.q_to_distance(value)
+        self.distance_table[key] = d
         self.logger.debug(f"Q_update: key={key}, value={value}")
 
     def update_unreachable_Q(self, sa):
@@ -148,10 +224,10 @@ class ReachabilityModel(RLModel):
 
     def get_distance(self, s, a):
         key = s.state + (a,)
-        if key not in self.Q_table:
-            return self.get_default_distance(s.bid, a)
-        else:
-            return self.Q_table[key]
+        if key not in self.distance_table:
+            d = self.get_default_distance(s.bid, a)
+            self.distance_table[key] = d
+        return self.distance_table[key]
 
     def Q_lookup(self, s, a):
         d = self.get_distance(s, a)
@@ -161,8 +237,8 @@ class ReachabilityModel(RLModel):
         d = ReachabilityModel.prob_to_distance(value)
         if d > self.config.max_distance * 2:
             d = float('inf')
-        self.Q_table[key] = d
-        self.logger.debug(f"Q_update: key={key}, value={d}")
+        self.distance_table[key] = d
+        self.logger.debug(f"Q_update: key={key}, value={value}")
 
     def update_unreachable_Q(self, sa):
         self.Q_update(sa, ReachabilityModel.ZERO)
