@@ -128,17 +128,17 @@ private:
   using offset_dep_t = std::vector<std::unique_ptr<branch_dep_t>>;
   std::vector<offset_dep_t> branch_deps_;
 
-  inline branch_dep_t* get_branch_dep(uint32_t id, uint32_t off) {
-    auto &offset_deps = branch_deps_.at(id);
-    return offset_deps.at(off).get();
+  inline branch_dep_t* get_branch_dep(offset_t off) {
+    auto &offset_deps = branch_deps_.at(off.first);
+    return offset_deps.at(off.second).get();
   }
 
-  inline void set_branch_dep(uint32_t id, uint32_t off, std::unique_ptr<branch_dep_t> dep) {
-    auto &offset_deps = branch_deps_.at(id);
-    if (off >= offset_deps.size()) {
-      offset_deps.resize(off + 1);
+  inline void set_branch_dep(offset_t off, std::unique_ptr<branch_dep_t> dep) {
+    auto &offset_deps = branch_deps_.at(off.first);
+    if (off.second >= offset_deps.size()) {
+      offset_deps.resize(off.second + 1);
     }
-    offset_deps[off] = std::move(dep);
+    offset_deps[off.second] = std::move(dep);
   }
 
   inline z3::expr cache_expr(dfsan_label label, z3::expr const &e, input_dep_set_t &deps) {
@@ -149,6 +149,8 @@ private:
 
   z3::expr read_concrete(dfsan_label label, uint16_t size);
   z3::expr serialize(dfsan_label label, input_dep_set_t &deps);
+  inline void collect_more_deps(input_dep_set_t &deps);
+  inline size_t add_nested_constraints(input_dep_set_t &deps, std::shared_ptr<z3_task_t> task);
 };
 
 

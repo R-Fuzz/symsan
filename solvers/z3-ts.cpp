@@ -256,35 +256,10 @@ int Z3AstParser::parse_bool(dfsan_label label, bool result, std::vector<uint64_t
     task->push_back((cond == r));
 
     // collect additional input deps
-    std::vector<offset_t> worklist;
-    worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
-    while (!worklist.empty()) {
-      auto off = worklist.back();
-      worklist.pop_back();
-
-      auto deps = get_branch_dep(off.first, off.second);
-      if (deps != nullptr) {
-        for (auto &i : deps->input_deps) {
-          if (inputs.insert(i).second)
-            worklist.push_back(i);
-        }
-      }
-    }
+    collect_more_deps(inputs);
   
     // add nested constraints
-    expr_set_t added;
-    for (auto &i : inputs) {
-      //logf("adding offset %d\n", i.second);
-      auto deps = get_branch_dep(i.first, i.second);
-      if (deps != nullptr) {
-        for (auto &expr : deps->expr_deps) {
-          if (added.insert(expr).second) {
-            //logf("adding expr: %s\n", expr.to_string().c_str());
-            task->push_back(expr);
-          }
-        }
-      }
-    }
+    add_nested_constraints(inputs, task);
 
     // save the task
     uint64_t tid = prev_task_id_++;
@@ -326,11 +301,11 @@ int Z3AstParser::add_constraints(dfsan_label label, bool result) {
     input_dep_set_t inputs;
     z3::expr cond = serialize(label, inputs);
     for (auto off : inputs) {
-      auto c = get_branch_dep(off.first, off.second);
+      auto c = get_branch_dep(off);
       if (c == nullptr) {
         auto nc = std::make_unique<branch_dep_t>();
         c = nc.get();
-        set_branch_dep(off.first, off.second, std::move(nc));
+        set_branch_dep(off, std::move(nc));
       }
       if (c == nullptr) {
         return -1;
@@ -347,4 +322,39 @@ int Z3AstParser::add_constraints(dfsan_label label, bool result) {
   }
 
   return 0;
+}
+
+void Z3AstParser::collect_more_deps(input_dep_set_t &inputs) {
+  // collect additional input deps
+  std::vector<offset_t> worklist;
+  worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
+  while (!worklist.empty()) {
+    auto off = worklist.back();
+    worklist.pop_back();
+
+    auto deps = get_branch_dep(off);
+    if (deps != nullptr) {
+      for (auto &i : deps->input_deps) {
+        if (inputs.insert(i).second)
+          worklist.push_back(i);
+      }
+    }
+  }
+}
+
+size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, std::shared_ptr<z3_task_t> task) {
+  expr_set_t added;
+  for (auto &off : inputs) {
+    //logf("adding offset %d\n", i.second);
+    auto deps = get_branch_dep(off);
+    if (deps != nullptr) {
+      for (auto &expr : deps->expr_deps) {
+        if (added.insert(expr).second) {
+          //logf("adding expr: %s\n", expr.to_string().c_str());
+          task->push_back(expr);
+        }
+      }
+    }
+  }
+  return added.size();
 }
