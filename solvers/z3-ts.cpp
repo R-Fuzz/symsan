@@ -300,6 +300,7 @@ int Z3AstParser::add_constraints(dfsan_label label, bool result) {
   try {
     input_dep_set_t inputs;
     z3::expr cond = serialize(label, inputs);
+    collect_more_deps(inputs);
     for (auto off : inputs) {
       auto c = get_branch_dep(off);
       if (c == nullptr) {

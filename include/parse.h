@@ -86,6 +86,8 @@ public:
 
   std::shared_ptr<z3_task_t> get_task(uint64_t id) override;
 
+  // separate adding constraints from parsing, not ideal for peref
+  // but may not be a big deal for z3
   int add_constraints(dfsan_label label, bool result = true);
 
 private:
