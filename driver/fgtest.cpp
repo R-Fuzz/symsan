@@ -117,108 +117,62 @@ static void generate_input(z3::model &m) {
   close(fd);
 }
 
-// assumes under try-catch and the global solver __z3_solver already has nested context
-static bool __solve_expr(z3::expr &e) {
+static bool __solve_expr(std::unique_ptr<symsan::z3_task_t> task) {
   bool ret = false;
-  // set up local optmistic solver
-  z3::solver opt_solver = z3::solver(__z3_context, "QF_BV");
-  opt_solver.set("timeout", 1000U);
-  opt_solver.add(e);
-  z3::check_result res = opt_solver.check();
-  if (res == z3::sat) {
-    // optimistic sat, check nested
-    __z3_solver.push();
+  try {
+    // setup global solver
+    __z3_solver.reset();
+    __z3_solver.set("timeout", 1000U);
+    // solve the first constraint (optimistic)
+    z3::expr e = task->at(0);
     __z3_solver.add(e);
-    res = __z3_solver.check();
+    z3::check_result res = __z3_solver.check();
     if (res == z3::sat) {
+      // optimistic sat, save a model
       z3::model m = __z3_solver.get_model();
+      // check nested, if any
+      if (task->size() > 1) {
+        __z3_solver.push();
+        // add nested constraints
+        for (size_t i = 1; i < task->size(); i++) {
+          __z3_solver.add(task->at(i));
+        }
+        res = __z3_solver.check();
+        if (res == z3::sat) {
+          m = __z3_solver.get_model();
+        }
+      }
       generate_input(m);
       ret = true;
     } else {
-    #if OPTIMISTIC
-      z3::model m = opt_solver.get_model();
-      generate_input(m);
-    #endif
+      //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
+      //AOUT("  tree_size = %d", __dfsan_label_info[label].tree_size);
     }
-    // reset
-    __z3_solver.pop();
+  } catch (z3::exception ze) {
+    AOUT("WARNING: solving error: %s\n", ze.msg());
   }
+
   return ret;
 }
 
 static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *addr) {
 
   std::vector<uint64_t> tasks;
-  // r == 0 will negate r
-  if (__z3_parser->parse_bool(label, r == 0, tasks) != 1) {
+  if (__z3_parser->parse_cond(label, r, add_nested, tasks)) {
     AOUT("WARNING: failed to parse condition %d @%p\n", label, addr);
     return;
   }
 
-  try {
-    for (auto id : tasks) {
-      std::shared_ptr<symsan::z3_task_t> task = __z3_parser->get_task(id);
-
-      // setup global solver
-      __z3_solver.reset();
-      __z3_solver.set("timeout", 5000U);
-      // 2. add constraints
-      for (size_t i = 1; i < task->size(); i++) {
-        __z3_solver.add(task->at(i));
-      }
-    
-      // solve
-      z3::expr e = task->at(0);
-      std::cout << e << std::endl;
-      if (__solve_expr(e)) {
-        AOUT("branch solved\n");
-      } else {
-        AOUT("branch not solvable @%p\n", addr);
-        //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
-        //AOUT("  tree_size = %d", __dfsan_label_info[label].tree_size);
-      }
+  for (auto id : tasks) {
+    auto task = __z3_parser->retrieve_task(id);
+    // solve
+    if (__solve_expr(std::move(task))) {
+      AOUT("branch solved\n");
+    } else {
+      AOUT("branch not solvable @%p\n", addr);
     }
-  } catch (z3::exception e) {
-    AOUT("WARNING: solving error: %s @%p\n", e.msg(), addr);
   }
 
-  // add nested constraints
-  if (add_nested)
-    __z3_parser->add_constraints(label, r);
-
-}
-
-// assumes under try-catch and the global solver already has context
-static void __solve_gep(z3::expr &index, uint64_t lb, uint64_t ub, uint64_t step, void *addr) {
-
-  // enumerate indices
-  for (uint64_t i = lb; i < ub; i += step) {
-    z3::expr idx = __z3_context.bv_val(i, 64);
-    z3::expr e = (index == idx);
-    if (__solve_expr(e))
-      AOUT("\tindex == %ld feasible\n", i);
-  }
-
-  // check feasibility for OOB
-  // upper bound
-  z3::expr u = __z3_context.bv_val(ub, 64);
-  z3::expr e = z3::uge(index, u);
-  if (__solve_expr(e))
-    AOUT("\tindex >= %ld solved @%p\n", ub, addr);
-  else
-    AOUT("\tindex >= %ld not possible\n", ub);
-
-  // lower bound
-  if (lb == 0) {
-    e = (index < 0);
-  } else {
-    z3::expr l = __z3_context.bv_val(lb, 64);
-    e = z3::ult(index, l);
-  }
-  if (__solve_expr(e))
-    AOUT("\tindex < %ld solved @%p\n", lb, addr);
-  else
-    AOUT("\tindex < %ld not possible\n", lb);
 }
 
 static void __handle_gep(dfsan_label ptr_label, uptr ptr,
@@ -229,96 +183,22 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
   AOUT("tainted GEP index: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
       index, index_label, num_elems, elem_size, current_offset);
 
-  // uint8_t size = get_label_info(index_label)->size;
-  // try {
-  //   std::unordered_set<dfsan_label> inputs;
-  //   z3::expr i = serialize(index_label, inputs);
-  //   z3::expr r = __z3_context.bv_val(index, size);
+  std::vector<uint64_t> tasks;
+  if (__z3_parser->parse_gep(ptr_label, ptr, index_label, index, num_elems,
+                             elem_size, current_offset, tasks)) {
+    AOUT("WARNING: failed to parse gep %d @%p\n", index_label, addr);
+    return;
+  }
 
-  //   // collect additional input deps
-  //   std::vector<dfsan_label> worklist;
-  //   worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
-  //   while (!worklist.empty()) {
-  //     auto off = worklist.back();
-  //     worklist.pop_back();
-
-  //     auto deps = get_branch_dep(off);
-  //     if (deps != nullptr) {
-  //       for (auto i : deps->input_deps) {
-  //         if (inputs.insert(i).second)
-  //           worklist.push_back(i);
-  //       }
-  //     }
-  //   }
-
-  //   // set up the global solver with nested constraints
-  //   __z3_solver.reset();
-  //   __z3_solver.set("timeout", 5000U);
-  //   expr_set_t added;
-  //   for (auto off : inputs) {
-  //     auto deps = get_branch_dep(off);
-  //     if (deps != nullptr) {
-  //       for (auto &expr : deps->expr_deps) {
-  //         if (added.insert(expr).second) {
-  //           __z3_solver.add(expr);
-  //         }
-  //       }
-  //     }
-  //   }
-  //   assert(__z3_solver.check() == z3::sat);
-
-  //   // first, check against fixed array bounds if available
-  //   z3::expr idx = z3::zext(i, 64 - size);
-  //   if (num_elems > 0) {
-  //     __solve_gep(idx, 0, num_elems, 1, addr);
-  //   } else {
-  //     dfsan_label_info *bounds = get_label_info(ptr_label);
-  //     // if the array is not with fixed size, check bound info
-  //     if (bounds->op == Alloca) {
-  //       z3::expr es = __z3_context.bv_val(elem_size, 64);
-  //       z3::expr co = __z3_context.bv_val(current_offset, 64);
-  //       if (bounds->l2 == 0) {
-  //         // only perform index enumeration and bound check
-  //         // when the size of the buffer is fixed
-  //         z3::expr p = __z3_context.bv_val(ptr, 64);
-  //         z3::expr np = idx * es + co + p;
-  //         __solve_gep(np, (uint64_t)bounds->op1.i, (uint64_t)bounds->op2.i, elem_size, addr);
-  //       } else {
-  //         // if the buffer size is input-dependent (not fixed)
-  //         // check if over flow is possible
-  //         std::unordered_set<dfsan_label> dummy;
-  //         z3::expr bs = serialize(bounds->l2, dummy); // size label
-  //         if (bounds->l1) {
-  //           dummy.clear();
-  //           z3::expr be = serialize(bounds->l1, dummy); // elements label
-  //           bs = bs * be;
-  //         }
-  //         z3::expr e = z3::ugt(idx * es * co, bs);
-  //         if (__solve_expr(e))
-  //           AOUT("index >= buffer size feasible @%p\n", addr);
-  //       }
-  //     }
-  //   }
-
-  //   // always preserve
-  //   for (auto off : inputs) {
-  //     auto c = get_branch_dep(off);
-  //     if (c == nullptr) {
-  //       c = new branch_dep_t();
-  //       set_branch_dep(off, c);
-  //     }
-  //     if (c == nullptr) {
-  //       AOUT("WARNING: out of memory\n");
-  //     } else {
-  //       c->input_deps.insert(inputs.begin(), inputs.end());
-  //       c->expr_deps.insert(i == r);
-  //     }
-  //   }
-
-  // } catch (z3::exception e) {
-  //   AOUT("WARNING: index solving error: %s @%p\n", e.msg(), __builtin_return_address(0));
-  // }
-
+  for (auto id : tasks) {
+    auto task = __z3_parser->retrieve_task(id);
+    // solve
+    if (__solve_expr(std::move(task))) {
+      AOUT("gep solved\n");
+    } else {
+      AOUT("gep not solvable @%p\n", addr);
+    }
+  }
 }
 
 int main(int argc, char* const argv[]) {
