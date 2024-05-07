@@ -30,14 +30,14 @@ public:
   virtual ~ASTParser() {}
 
   virtual int restart(std::vector<input_t> &inputs) = 0;
-  virtual int parse_bool(dfsan_label label, bool result,
+  // for branch conditions
+  virtual int parse_cond(dfsan_label label, bool result, bool add_nested,
                          std::vector<uint64_t> &tasks) = 0;
-  virtual int parse_bveq(dfsan_label label, uint64_t result,
-                         std::vector<uint64_t> &tasks) = 0;
-  virtual int parse_bvgt(dfsan_label label, uint64_t result,
-                         std::vector<uint64_t> &tasks) = 0;
-  virtual int parse_bvlt(dfsan_label label, uint64_t result,
-                         std::vector<uint64_t> &tasks) = 0;
+  virtual int parse_gep(dfsan_label ptr_label, uptr ptr,
+                        dfsan_label index_label, int64_t index,
+                        uint64_t num_elems, uint64_t elem_size,
+                        int64_t current_offset,
+                        std::vector<uint64_t> &tasks) = 0;
 
   virtual int record_memcmp(dfsan_label label, uint8_t* buf, size_t size) {
     auto content = std::make_unique<uint8_t[]>(size);
@@ -46,9 +46,15 @@ public:
     return 0;
   };
 
-  virtual std::shared_ptr<T> get_task(uint64_t id) = 0;
-  virtual void remove_task(uint64_t id) {
-    tasks_.erase(id);
+  // use unique_ptr to auto-free task
+  virtual std::unique_ptr<T> retrieve_task(uint64_t id) {
+    auto it = tasks_.find(id);
+    if (it == tasks_.end()) {
+      return nullptr;
+    }
+    auto tmp = std::move(it->second);
+    tasks_.erase(it);
+    return tmp;
   }
 
 protected:
@@ -62,7 +68,7 @@ protected:
   dfsan_label_info *base_;
   size_t size_;
   uint64_t prev_task_id_;
-  std::unordered_map<uint64_t, std::shared_ptr<T>> tasks_;
+  std::unordered_map<uint64_t, std::unique_ptr<T>> tasks_;
   std::unordered_map<dfsan_label, std::unique_ptr<uint8_t[]>> memcmp_cache_;
 };
 
@@ -75,20 +81,15 @@ public:
   ~Z3AstParser() {}
 
   int restart(std::vector<input_t> &inputs) override;
-  int parse_bool(dfsan_label label, bool result,
+  int parse_cond(dfsan_label label, bool result, bool add_nested,
                  std::vector<uint64_t> &tasks) override;
-  int parse_bveq(dfsan_label label, uint64_t result,
-                 std::vector<uint64_t> &tasks) override;
-  int parse_bvgt(dfsan_label label, uint64_t result,
-                 std::vector<uint64_t> &tasks) override;
-  int parse_bvlt(dfsan_label label, uint64_t result,
-                 std::vector<uint64_t> &tasks) override;
+  int parse_gep(dfsan_label ptr_label, uptr ptr,
+                dfsan_label index_label, int64_t index,
+                uint64_t num_elems, uint64_t elem_size,
+                int64_t current_offset,
+                std::vector<uint64_t> &tasks) override;
 
-  std::shared_ptr<z3_task_t> get_task(uint64_t id) override;
-
-  // separate adding constraints from parsing, not ideal for peref
-  // but may not be a big deal for z3
-  int add_constraints(dfsan_label label, bool result = true);
+  int add_constraints(dfsan_label label, uint64_t result);
 
 private:
   z3::context &context_;
@@ -152,7 +153,16 @@ private:
   z3::expr read_concrete(dfsan_label label, uint16_t size);
   z3::expr serialize(dfsan_label label, input_dep_set_t &deps);
   inline void collect_more_deps(input_dep_set_t &deps);
-  inline size_t add_nested_constraints(input_dep_set_t &deps, std::shared_ptr<z3_task_t> task);
+  inline size_t add_nested_constraints(input_dep_set_t &deps, z3_task_t *task);
+  inline void save_constraint(z3::expr expr, input_dep_set_t &inputs);
+  inline uint64_t save_task(std::unique_ptr<z3_task_t> task) {
+    uint64_t tid = prev_task_id_++;
+    tasks_.insert({tid, std::move(task)});
+    return tid;
+  }
+  void construct_index_tasks(z3::expr &index, uint64_t curr,
+                             uint64_t lb, uint64_t ub, uint64_t step,
+                             z3_task_t &nested, std::vector<uint64_t> &tasks);
 };
 
 

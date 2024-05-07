@@ -22,12 +22,9 @@ int Z3AstParser::restart(std::vector<input_t> &inputs) {
   branch_deps_.clear();
   branch_deps_.resize(inputs.size());
 
-  // copy the inputs
   for (size_t i = 0; i < inputs.size(); i++) {
     auto &input = inputs[i];
-    uint8_t *buf = new uint8_t[input.second];
-    memcpy(buf, input.first, input.second);
-    inputs_.push_back({buf, input.second});
+    // z3parser doesn't use inputs, so we don't need to make a copy of it
     // resize branch_deps_
     branch_deps_[i].resize(input.second);
   }
@@ -243,86 +240,180 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
   // std::unreachable();
 }
 
-int Z3AstParser::parse_bool(dfsan_label label, bool result, std::vector<uint64_t> &tasks) {
+int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std::vector<uint64_t> &tasks) {
 
   // allocate a new task
-  auto task = std::make_shared<z3_task_t>();
+  auto task = std::make_unique<z3_task_t>();
   try {
     // add last branch condition
     z3::expr r = context_.bool_val(result);
 
     input_dep_set_t inputs;
     z3::expr cond = serialize(label, inputs);
-    task->push_back((cond == r));
+    task->push_back((cond != r));
 
     // collect additional input deps
     collect_more_deps(inputs);
   
     // add nested constraints
-    add_nested_constraints(inputs, task);
+    add_nested_constraints(inputs, task.get());
 
     // save the task
-    uint64_t tid = prev_task_id_++;
-    tasks_.insert({tid, task});
+    tasks.push_back(save_task(std::move(task)));
 
-    // add to return value
-    tasks.push_back(tid);
-    return 1;
+    // save nested
+    if (add_nested) {
+      save_constraint(cond == r, inputs);
+    }
+
+    return 0; // success
   } catch (z3::exception e) {
     // logf("WARNING: solving error: %s\n", e.msg());
   }
 
   // exception happened, nothing added
-  return 0;
+  return -1;
 }
 
-int Z3AstParser::parse_bveq(dfsan_label label, uint64_t result, std::vector<uint64_t> &tasks) {
+void Z3AstParser::construct_index_tasks(z3::expr &index, uint64_t curr,
+                                        uint64_t lb, uint64_t ub, uint64_t step,
+                                        z3_task_t &nested, std::vector<uint64_t> &tasks) {
 
-}
+  std::unique_ptr<z3_task_t> task = nullptr;
 
-int Z3AstParser::parse_bvgt(dfsan_label label, uint64_t result, std::vector<uint64_t> &tasks) {
-
-}
-
-int Z3AstParser::parse_bvlt(dfsan_label label, uint64_t result, std::vector<uint64_t> &tasks) {
-
-}
-
-std::shared_ptr<z3_task_t> Z3AstParser::get_task(uint64_t id) {
-  auto itr = tasks_.find(id);
-  if (itr == tasks_.end()) {
-    return nullptr;
+  // enumerate indices
+  for (uint64_t i = lb; i < ub; i += step) {
+    if (i == curr) continue;
+    z3::expr idx = context_.bv_val(i, 64);
+    z3::expr e = (index == idx);
+    // allocate a new task
+    task = std::make_unique<z3_task_t>();
+    task->push_back(e);
+    // add nested constraints
+    task->insert(task->end(), nested.begin(), nested.end());
+    // save the task
+    tasks.push_back(save_task(std::move(task)));
   }
-  return itr->second;
+
+  // check feasibility for OOB
+  // upper bound
+  z3::expr u = context_.bv_val(ub, 64);
+  z3::expr e = z3::uge(index, u);
+  task = std::make_unique<z3_task_t>();
+  task->push_back(e);
+  task->insert(task->end(), nested.begin(), nested.end());
+  tasks.push_back(save_task(std::move(task)));
+
+  // lower bound
+  if (lb == 0) {
+    e = (index < 0);
+  } else {
+    z3::expr l = context_.bv_val(lb, 64);
+    e = z3::ult(index, l);
+  }
+  task = std::make_unique<z3_task_t>();
+  task->push_back(e);
+  task->insert(task->end(), nested.begin(), nested.end());
+  tasks.push_back(save_task(std::move(task)));
 }
 
-int Z3AstParser::add_constraints(dfsan_label label, bool result) {
+int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_label, int64_t index,
+                           uint64_t num_elems, uint64_t elem_size, int64_t current_offset,
+                           std::vector<uint64_t> &tasks) {
+
   try {
+    // prepare current index
+    uint8_t size = get_label_info(index_label)->size;
+    z3::expr r = context_.bv_val(index, size);
+
     input_dep_set_t inputs;
-    z3::expr cond = serialize(label, inputs);
+    z3::expr i = serialize(index_label, inputs);
+
+    // collect nested constraints
     collect_more_deps(inputs);
-    for (auto off : inputs) {
-      auto c = get_branch_dep(off);
-      if (c == nullptr) {
-        auto nc = std::make_unique<branch_dep_t>();
-        c = nc.get();
-        set_branch_dep(off, std::move(nc));
-      }
-      if (c == nullptr) {
-        return -1;
-      } else {
-        c->input_deps.insert(inputs.begin(), inputs.end());
-        if (result)
-          c->expr_deps.insert(cond);
-        else
-          c->expr_deps.insert(!cond);
+    z3_task_t nested_tasks;
+    add_nested_constraints(inputs, &nested_tasks);
+
+    // first, check against fixed array bounds if available
+    z3::expr idx = z3::zext(i, 64 - size);
+    if (num_elems > 0) {
+      construct_index_tasks(idx, index, 0, num_elems, 1, nested_tasks, tasks);
+    } else {
+      dfsan_label_info *bounds = get_label_info(ptr_label);
+      // if the array is not with fixed size, check bound info
+      if (bounds->op == __dfsan::Alloca) {
+        z3::expr es = context_.bv_val(elem_size, 64);
+        z3::expr co = context_.bv_val(current_offset, 64);
+        if (bounds->l2 == 0) {
+          // only perform index enumeration and bound check
+          // when the size of the buffer is fixed
+          z3::expr p = context_.bv_val(ptr, 64);
+          z3::expr np = idx * es + co + p;
+          construct_index_tasks(np, index, (uint64_t)bounds->op1.i, (uint64_t)bounds->op2.i, elem_size, nested_tasks, tasks);
+        } else {
+          // if the buffer size is input-dependent (not fixed)
+          // check if over flow is possible
+          input_dep_set_t dummy;
+          z3::expr bs = serialize(bounds->l2, dummy); // size label
+          if (bounds->l1) {
+            dummy.clear();
+            z3::expr be = serialize(bounds->l1, dummy); // elements label
+            bs = bs * be;
+          }
+          z3::expr e = z3::ugt(idx * es * co, bs);
+          auto task = std::make_unique<z3_task_t>();
+          task->push_back(e);
+          task->insert(task->end(), nested_tasks.begin(), nested_tasks.end());
+          tasks.push_back(save_task(std::move(task)));
+        }
       }
     }
+
+    // always preserve
+    save_constraint(i == r, inputs);
+
+    return 0; // success
+  } catch (z3::exception e) {
+    // logf("WARNING: solving error: %s\n", e.msg());
+  }
+
+  // exception happened, nothing added
+  return -1;
+}
+
+int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
+  try {
+    input_dep_set_t inputs;
+    z3::expr expr = serialize(label, inputs);
+    collect_more_deps(inputs);
+    // prepare result
+    uint8_t size = get_label_info(label)->size;
+    z3::expr r = context_.bv_val(result, size);
+    // add constraint
+    if (expr.is_bool()) r = context_.bool_val(result);
+    save_constraint(expr == r, inputs);
   } catch (z3::exception e) {
     return -1;
   }
 
   return 0;
+}
+
+void Z3AstParser::save_constraint(z3::expr expr, input_dep_set_t &inputs) {
+  for (auto off : inputs) {
+    auto c = get_branch_dep(off);
+    if (c == nullptr) {
+      auto nc = std::make_unique<branch_dep_t>();
+      c = nc.get();
+      set_branch_dep(off, std::move(nc));
+    }
+    if (c == nullptr) {
+      throw z3::exception("out of memory");
+    } else {
+      c->input_deps.insert(inputs.begin(), inputs.end());
+      c->expr_deps.insert(expr);
+    }
+  }
 }
 
 void Z3AstParser::collect_more_deps(input_dep_set_t &inputs) {
@@ -343,7 +434,7 @@ void Z3AstParser::collect_more_deps(input_dep_set_t &inputs) {
   }
 }
 
-size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, std::shared_ptr<z3_task_t> task) {
+size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, z3_task_t *task) {
   expr_set_t added;
   for (auto &off : inputs) {
     //logf("adding offset %d\n", i.second);
