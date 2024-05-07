@@ -178,9 +178,14 @@ __taint_trace_memcmp(dfsan_label label) {
   if (__pipe_fd < 0)
     return;
 
+  uint16_t has_content = 1;
+  // if both operands are symbolic, skip sending the content
+  if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
+    has_content = 0;
+
   pipe_msg msg = {
     .msg_type = memcmp_type,
-    .flags = 0,
+    .flags = has_content,
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
@@ -192,8 +197,7 @@ __taint_trace_memcmp(dfsan_label label) {
     Die();
   }
 
-  // if both operands are symbolic, skip sending the content
-  if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
+  if (!has_content)
     return;
 
   size_t msg_size = sizeof(memcmp_msg) + info->size;
