@@ -12,6 +12,7 @@ target_include_directories(FGTest PUBLIC
 )
 target_link_libraries(FGTest PRIVATE
   launcher_static
+  z3parser
   z3
   rt
 )
