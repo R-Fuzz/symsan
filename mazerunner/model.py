@@ -21,7 +21,7 @@ class SortedDict:
         if self.need_sort:
             if key in self.data:
                 self.remove(key, mark_only=True)
-            heapq.heappush(self.heap, (value, key))
+            heapq.heappush(self.heap, (value, key[2], key))
         self.data[key] = value
 
     def __getitem__(self, key):
@@ -58,7 +58,7 @@ class SortedDict:
 
     def pop(self):
         while self.heap:
-            value, key = heapq.heappop(self.heap)
+            value, _, key = heapq.heappop(self.heap)
             if key in self.data and self.data[key] == value:
                 # don't remove item in Q-table
                 # self.remove(key)
@@ -67,7 +67,7 @@ class SortedDict:
 
     def peak(self):
         while self.heap:
-            value, key = self.heap[0]
+            value, _, key = self.heap[0]
             if key in self.data and self.data[key] == value:
                 return key
             heapq.heappop(self.heap)
@@ -76,7 +76,7 @@ class SortedDict:
     def rebuild_heap(self):
         if not self.need_sort:
             return
-        self.heap = [(-v, k) for k, v in self.data.items() if k in self.data]
+        self.heap = [(-v, k[2], k) for k, v in self.data.items() if k in self.data]
         heapq.heapify(self.heap)
 
 
