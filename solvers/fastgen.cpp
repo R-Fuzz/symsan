@@ -30,23 +30,6 @@ static int __pipe_fd;
 // filter?
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 
-static uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predicate) {
-  switch (predicate) {
-    case __dfsan::bveq:  return c1 == c2;
-    case __dfsan::bvneq: return c1 != c2;
-    case __dfsan::bvugt: return c1 > c2;
-    case __dfsan::bvuge: return c1 >= c2;
-    case __dfsan::bvult: return c1 < c2;
-    case __dfsan::bvule: return c1 <= c2;
-    case __dfsan::bvsgt: return (s64)c1 > (s64)c2;
-    case __dfsan::bvsge: return (s64)c1 >= (s64)c2;
-    case __dfsan::bvslt: return (s64)c1 < (s64)c2;
-    case __dfsan::bvsle: return (s64)c1 <= (s64)c2;
-    default: break;
-  }
-  return 0;
-}
-
 static inline void __solve_cond(dfsan_label label, uint8_t result, uint8_t add_nested, uint32_t cid, void *addr) {
 
   if (__pipe_fd < 0)

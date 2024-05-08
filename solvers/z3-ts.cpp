@@ -121,7 +121,13 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     z3::expr base = serialize(info->l1, deps);
     tsize_cache_[label] = tsize_cache_[info->l1]; // lazy init
     return cache_expr(label, base.extract(info->size - 1, 0), deps);
-  } else if (info->op == __dfsan::Extract) {
+  } else if (info->op == __dfsan::IntToPtr) {
+    z3::expr e = serialize(info->l1, deps);
+    tsize_cache_[label] = tsize_cache_[info->l1]; // lazy init
+    return cache_expr(label, e, deps);
+  } //FIXME: other casting ops (PtrToInt, BitCast)?
+  // symsan-defined
+  else if (info->op == __dfsan::Extract) {
     z3::expr base = serialize(info->l1, deps);
     tsize_cache_[label] = tsize_cache_[info->l1]; // lazy init
     return cache_expr(label, base.extract((info->op2.i + info->size) - 1, info->op2.i), deps);

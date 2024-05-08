@@ -30,9 +30,24 @@ public:
   virtual ~ASTParser() {}
 
   virtual int restart(std::vector<input_t> &inputs) = 0;
-  // for branch conditions
+  /// @brief Parse a conditional branch
+  /// @param label the label of the condition
+  /// @param result the result of the condition
+  /// @param add_nested whether to add nested constraints
+  /// @param tasks the tasks to be added
+  /// @return 0 on success, -1 on failure
   virtual int parse_cond(dfsan_label label, bool result, bool add_nested,
                          std::vector<uint64_t> &tasks) = 0;
+  /// @brief Parse a GEP instruction with symbolic index
+  /// @param ptr_label symbol label of the pointer (e.g., bounds info)
+  /// @param ptr actual pointer value
+  /// @param index_label symbolic label of the index
+  /// @param index actual index value
+  /// @param num_elems number of elements if ptr is an array
+  /// @param elem_size size of each element
+  /// @param current_offset current offset from previous GEP
+  /// @param tasks tasks to be added
+  /// @return 0 on success, -1 on failure
   virtual int parse_gep(dfsan_label ptr_label, uptr ptr,
                         dfsan_label index_label, int64_t index,
                         uint64_t num_elems, uint64_t elem_size,
@@ -89,11 +104,11 @@ public:
                 int64_t current_offset,
                 std::vector<uint64_t> &tasks) override;
 
+  /// @return 0 on success, -1 on failure
   int add_constraints(dfsan_label label, uint64_t result);
 
 private:
   z3::context &context_;
-  std::vector<input_t> inputs_;
 
   // input deps
   using offset_t = std::pair<uint32_t, uint32_t>;
