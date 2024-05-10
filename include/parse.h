@@ -114,8 +114,13 @@ public:
 
 protected:
   z3::context &context_;
+  const char* input_name_format;
+  const char* atoi_name_format;
 
 private:
+  // fsize flag
+  bool has_fsize;
+
   // input deps
   using offset_t = std::pair<uint32_t, uint32_t>;
   struct offset_hash {
