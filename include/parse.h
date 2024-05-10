@@ -10,6 +10,7 @@
 #include <z3++.h>
 
 #include <memory>
+#include <tuple>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,7 +30,11 @@ public:
       prev_task_id_(0) {}
   virtual ~ASTParser() {}
 
-  virtual int restart(std::vector<input_t> &inputs) = 0;
+  virtual int restart(std::vector<input_t> &inputs) {
+    (void)inputs;
+    memcmp_cache_.clear();
+    return 0;
+  }
   /// @brief Parse a conditional branch
   /// @param label the label of the condition
   /// @param result the result of the condition
@@ -107,9 +112,10 @@ public:
   /// @return 0 on success, -1 on failure
   int add_constraints(dfsan_label label, uint64_t result);
 
-private:
+protected:
   z3::context &context_;
 
+private:
   // input deps
   using offset_t = std::pair<uint32_t, uint32_t>;
   struct offset_hash {
@@ -180,6 +186,37 @@ private:
                              z3_task_t &nested, std::vector<uint64_t> &tasks);
 };
 
+class Z3ParserSolver : public Z3AstParser {
+public:
+  Z3ParserSolver() = delete;
+  Z3ParserSolver(void *base, size_t size, z3::context &context)
+      : Z3AstParser(base, size, context) {}
+  ~Z3ParserSolver() {}
+
+  struct solution_val {
+    uint32_t id;
+    uint32_t offset;
+    uint8_t val;
+  };
+
+  enum solving_status {
+    invalid_task = 1,
+    opt_sat = 2,
+    opt_unsat = 3,
+    opt_timeout = 4,
+    nested_sat = 5,
+    opt_sat_nested_unsat = 6,
+    opt_sat_nested_timeout = 7,
+    unknown_error,
+  };
+
+  using solution_t = std::vector<struct solution_val>;
+  solving_status solve_task(uint64_t task_id, unsigned timeout, solution_t &solutions);
+
+private:
+  void generate_solution(z3::model &m, solution_t &solutions);
+
+};
 
 // class RGDAstParser : public ASTParser<rgd::SearchTask>;
 

@@ -268,6 +268,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     tasks.push_back(save_task(std::move(task)));
 
     // save nested
+    // FIXME: don't remember size constraints
     if (add_nested) {
       save_constraint(cond == r, inputs);
     }
@@ -455,4 +456,110 @@ size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, z3_task_t *t
     }
   }
   return added.size();
+}
+
+Z3ParserSolver::solving_status
+Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solutions) {
+  solving_status ret = unknown_error;
+  auto task = retrieve_task(task_id);
+  if (task == nullptr) {
+    return invalid_task;
+  }
+
+  try {
+    // setup global solver
+    z3::solver solver(context_, "QF_BV");
+    solver.set("timeout", timeout);
+    // solve the first constraint (optimistic)
+    z3::expr e = task->at(0);
+    solver.add(e);
+    z3::check_result res = solver.check();
+    if (res == z3::sat) {
+      ret = opt_sat;
+      // optimistic sat, save a model
+      z3::model m = solver.get_model();
+      // check nested, if any
+      if (task->size() > 1) {
+        solver.push();
+        // add nested constraints
+        for (size_t i = 1; i < task->size(); i++) {
+          solver.add(task->at(i));
+        }
+        res = solver.check();
+        if (res == z3::sat) {
+          ret = nested_sat;
+          m = solver.get_model();
+        } else if (res == z3::unsat) {
+          ret = opt_sat_nested_unsat;
+        } else {
+          ret = opt_sat_nested_timeout;
+        }
+      } else {
+        ret = nested_sat; // XXX: upgrade to nested_sat?
+      }
+      generate_solution(m, solutions);
+    } else if (res == z3::unsat) {
+      ret = opt_unsat;
+      //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
+      //AOUT("  tree_size = %d", __dfsan_label_info[label].tree_size);
+    } else {
+      ret = opt_timeout;
+    }
+  } catch (z3::exception ze) {
+    ret = unknown_error;
+  }
+
+  return ret;
+}
+
+void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
+  // from qsym
+  unsigned num_constants = m.num_consts();
+  for (unsigned i = 0; i < num_constants; i++) {
+    z3::func_decl decl = m.get_const_decl(i);
+    z3::expr e = m.get_const_interp(decl);
+    z3::symbol name = decl.name();
+
+    if (name.kind() == Z3_INT_SYMBOL) {
+      uint32_t offset = (uint32_t)name.to_int();
+      uint8_t value = (uint8_t)e.get_numeral_int();
+      solutions.push_back({0, offset, value});
+    } else { // string symbol
+      if (!name.str().compare("fsize")) {
+        // FIXME:
+        // off_t size = (off_t)e.get_numeral_int64();
+        // if (size > input_size) { // grow
+        //   lseek(fd, size, SEEK_SET);
+        //   uint8_t dummy = 0;
+        //   write(fd, &dummy, sizeof(dummy));
+        // } else {
+        //   AOUT("truncate file to %ld\n", size);
+        //   ftruncate(fd, size);
+        // }
+        throw z3::exception("skip fsize constraints");
+      } else if (name.str().find("atoi") == 0) {
+        uint32_t offset;
+        int base;
+        char buf[64];
+        sscanf(name.str().c_str(), "atoi-%d-%d", &offset, &base);
+        const char *format = NULL;
+        switch (base) {
+          case 2: format = "%lb"; break;
+          case 8: format = "%lo"; break;
+          case 10: format = "%ld"; break;
+          case 16: format = "%lx"; break;
+          default: throw z3::exception("unsupported base");
+        }
+        // XXX: assumed signed
+        int len = snprintf(buf, 64, format, (int)e.get_numeral_int());
+        // len excludes \0
+        for (int i = 0; i < len; ++i) {
+          solutions.push_back({0, offset + i, (uint8_t)buf[i]});
+        }
+        solutions.push_back({0, offset + len, 0});
+      } else {
+        throw z3::exception("unknown symbol");
+      }
+    }
+  }
 }
