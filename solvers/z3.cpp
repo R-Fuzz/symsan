@@ -23,7 +23,7 @@ static uint32_t __session_id;
 static uint32_t __current_index = 0;
 static z3::context __z3_context;
 static z3::solver __z3_solver(__z3_context, "QF_BV");
-static symsan::Z3AstParser *__z3_parser = nullptr;
+static symsan::Z3ParserSolver *__z3_parser = nullptr;
 
 // filter?
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
@@ -41,93 +41,51 @@ static const uint64_t MAX_GEP_INDEX = 0x10000;
 static std::unordered_set<uptr> __buffers;
 
 
-static void generate_input(z3::model &m) {
+static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
+
+  if (tainted.is_stdin) {
+    // FIXME: input is stdin
+    AOUT("WARNING: original input is stdin");
+    return;
+  }
+
   char path[PATH_MAX];
   internal_snprintf(path, PATH_MAX, "%s/id-%d-%d-%d", __output_dir,
                     __instance_id, __session_id, __current_index++);
   fd_t fd = OpenFile(path, WrOnly);
   if (fd == kInvalidFd) {
-    throw z3::exception("failed to open new input file for write");
+    AOUT("WARNING: failed to open new input file for write");
+    return;
   }
 
-  if (!tainted.is_stdin) {
-    if (!WriteToFile(fd, tainted.buf, tainted.size)) {
-      throw z3::exception("failed to copy original input\n");
-    }
-  } else {
-    // FIXME: input is stdin
-    throw z3::exception("original input is stdin");
+  if (!WriteToFile(fd, tainted.buf, tainted.size)) {
+    AOUT("WARNING: failed to copy original input\n");
+    CloseFile(fd);
+    return;
   }
   AOUT("generate #%d output\n", __current_index - 1);
 
-  // from qsym
-  unsigned num_constants = m.num_consts();
-  for (unsigned i = 0; i < num_constants; i++) {
-    z3::func_decl decl = m.get_const_decl(i);
-    z3::expr e = m.get_const_interp(decl);
-    z3::symbol name = decl.name();
-
-    if (name.kind() == Z3_INT_SYMBOL) {
-      int offset = name.to_int();
-      uint8_t value = (uint8_t)e.get_numeral_int();
-      AOUT("offset %lld = %x\n", offset, value);
-      internal_lseek(fd, offset, SEEK_SET);
-      WriteToFile(fd, &value, sizeof(value));
-    } else { // string symbol
-      if (!name.str().compare("fsize")) {
-        off_t size = (off_t)e.get_numeral_int64();
-        if (size > tainted.size) { // grow
-          internal_lseek(fd, size, SEEK_SET);
-          uint8_t dummy = 0;
-          WriteToFile(fd, &dummy, sizeof(dummy));
-        } else {
-          AOUT("truncate file to %lld\n", size);
-          internal_ftruncate(fd, size);
-        }
-        // don't remember size constraints
-        throw z3::exception("skip fsize constraints");
-      }
-    }
+  for (auto const& sol : solutions) {
+    uint8_t value = sol.val;
+    AOUT("offset %d = %x\n", sol.offset, value);
+    internal_lseek(fd, sol.offset, SEEK_SET);
+    WriteToFile(fd, &value, sizeof(value));
   }
+
+  // FIXME: fsize
 
   CloseFile(fd);
 }
 
-static bool __solve_expr(std::unique_ptr<symsan::z3_task_t> task) {
-  bool ret = false;
-  try {
-    // setup global solver
-    __z3_solver.reset();
-    __z3_solver.set("timeout", 5000U);
-    // solve the first constraint (optimistic)
-    z3::expr e = task->at(0);
-    __z3_solver.add(e);
-    z3::check_result res = __z3_solver.check();
-    if (res == z3::sat) {
-      // optimistic sat, save a model
-      z3::model m = __z3_solver.get_model();
-      // check nested, if any
-      if (task->size() > 1) {
-        __z3_solver.push();
-        // add nested constraints
-        for (size_t i = 1; i < task->size(); i++) {
-          __z3_solver.add(task->at(i));
-        }
-        res = __z3_solver.check();
-        if (res == z3::sat) {
-          m = __z3_solver.get_model();
-        }
-      }
-      generate_input(m);
-      ret = true;
-    } else {
-      //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
-      //AOUT("  tree_size = %d", __dfsan_label_info[label].tree_size);
-    }
-  } catch (z3::exception ze) {
-    AOUT("WARNING: solving error: %s\n", ze.msg());
+static inline bool __solve_task(uint64_t task_id) {
+  symsan::Z3ParserSolver::solution_t solutions;
+  auto status = __z3_parser->solve_task(task_id, 5000U, solutions);
+  if (solutions.size() != 0) {
+    generate_input(solutions);
+    return true;
+  } else {
+    return false;
   }
-  return ret;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -162,9 +120,8 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
   }
 
   for (auto id : tasks) {
-    auto task = __z3_parser->retrieve_task(id);
     // solve
-    if (__solve_expr(std::move(task))) {
+    if (__solve_task(id)) {
       AOUT("cmp solved\n");
     } else {
       AOUT("cmp not solvable @%p\n", addr);
@@ -203,9 +160,8 @@ __taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
   }
 
   for (auto id : tasks) {
-    auto task = __z3_parser->retrieve_task(id);
     // solve
-    if (__solve_expr(std::move(task))) {
+    if (__solve_task(id)) {
       AOUT("branch solved\n");
     } else {
       AOUT("branch not solvable @%p\n", addr);
@@ -248,9 +204,8 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
   }
 
   for (auto id : tasks) {
-    auto task = __z3_parser->retrieve_task(id);
     // solve
-    if (__solve_expr(std::move(task))) {
+    if (__solve_task(id)) {
       AOUT("gep solved\n");
     } else {
       AOUT("gep not solvable @%p\n", addr);
@@ -282,9 +237,8 @@ extern "C" void InitializeSolver() {
   __output_dir = flags().output_dir;
   __instance_id = flags().instance_id;
   __session_id = flags().session_id;
-  __z3_parser = new symsan::Z3AstParser((void*)UnionTableAddr(), uniontable_size, __z3_context);
+  __z3_parser = new symsan::Z3ParserSolver((void*)UnionTableAddr(), uniontable_size, __z3_context);
   std::vector<symsan::input_t> inputs;
   inputs.push_back({(u8*)tainted.buf, tainted.size});
   __z3_parser->restart(inputs);
 }
-

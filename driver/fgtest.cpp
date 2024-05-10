@@ -48,111 +48,35 @@ static uint32_t __instance_id = 0;
 static uint32_t __session_id = 0;
 static uint32_t __current_index = 0;
 static z3::context __z3_context;
-static z3::solver __z3_solver(__z3_context, "QF_BV");
 
 // z3parser
-symsan::Z3AstParser *__z3_parser = nullptr;
+symsan::Z3ParserSolver *__z3_parser = nullptr;
 
-static void generate_input(z3::model &m) {
+static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
   char path[PATH_MAX];
   snprintf(path, PATH_MAX, "%s/id-%d-%d-%d", __output_dir,
            __instance_id, __session_id, __current_index++);
   int fd = open(path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
   if (fd == -1) {
-    throw z3::exception("failed to open new input file for write");
+    AOUT("failed to open new input file for write");
+    return;
   }
 
   if (write(fd, input_buf, input_size) == -1) {
-    throw z3::exception("failed to copy original input\n");
+    AOUT("failed to copy original input\n");
+    close(fd);
+    return;
   }
   AOUT("generate #%d output\n", __current_index - 1);
 
-  // from qsym
-  unsigned num_constants = m.num_consts();
-  for (unsigned i = 0; i < num_constants; i++) {
-    z3::func_decl decl = m.get_const_decl(i);
-    z3::expr e = m.get_const_interp(decl);
-    z3::symbol name = decl.name();
-
-    if (name.kind() == Z3_INT_SYMBOL) {
-      int offset = name.to_int();
-      uint8_t value = (uint8_t)e.get_numeral_int();
-      AOUT("offset %d = %x\n", offset, value);
-      lseek(fd, offset, SEEK_SET);
-      write(fd, &value, sizeof(value));
-    } else { // string symbol
-      if (!name.str().compare("fsize")) {
-        off_t size = (off_t)e.get_numeral_int64();
-        if (size > input_size) { // grow
-          lseek(fd, size, SEEK_SET);
-          uint8_t dummy = 0;
-          write(fd, &dummy, sizeof(dummy));
-        } else {
-          AOUT("truncate file to %ld\n", size);
-          ftruncate(fd, size);
-        }
-        // don't remember size constraints
-        throw z3::exception("skip fsize constraints");
-      } else if (name.str().find("atoi") == 0) {
-        off_t offset;
-        int base;
-        sscanf(name.str().c_str(), "atoi-%ld-%d", &offset, &base);
-        AOUT("atoi: %s, offset = %ld, base = %d\n", name.str().c_str(), offset, base);
-        lseek(fd, offset, SEEK_SET);
-        const char *format = NULL;
-        switch (base) {
-          case 2: format = "%lb"; break;
-          case 8: format = "%lo"; break;
-          case 10: format = "%ld"; break;
-          case 16: format = "%lx"; break;
-          default: throw z3::exception("unsupported base");
-        }
-        dprintf(fd, format, (int)e.get_numeral_int());
-      } else {
-        AOUT("WARNING: unknown symbol: %s\n", name.str().c_str());
-      }
-    }
+  for (auto const& sol : solutions) {
+    uint8_t value = sol.val;
+    AOUT("offset %d = %x\n", sol.offset, value);
+    lseek(fd, sol.offset, SEEK_SET);
+    write(fd, &value, sizeof(value));
   }
 
   close(fd);
-}
-
-static bool __solve_expr(std::unique_ptr<symsan::z3_task_t> task) {
-  bool ret = false;
-  try {
-    // setup global solver
-    __z3_solver.reset();
-    __z3_solver.set("timeout", 1000U);
-    // solve the first constraint (optimistic)
-    z3::expr e = task->at(0);
-    __z3_solver.add(e);
-    z3::check_result res = __z3_solver.check();
-    if (res == z3::sat) {
-      // optimistic sat, save a model
-      z3::model m = __z3_solver.get_model();
-      // check nested, if any
-      if (task->size() > 1) {
-        __z3_solver.push();
-        // add nested constraints
-        for (size_t i = 1; i < task->size(); i++) {
-          __z3_solver.add(task->at(i));
-        }
-        res = __z3_solver.check();
-        if (res == z3::sat) {
-          m = __z3_solver.get_model();
-        }
-      }
-      generate_input(m);
-      ret = true;
-    } else {
-      //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
-      //AOUT("  tree_size = %d", __dfsan_label_info[label].tree_size);
-    }
-  } catch (z3::exception ze) {
-    AOUT("WARNING: solving error: %s\n", ze.msg());
-  }
-
-  return ret;
 }
 
 static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *addr) {
@@ -164,13 +88,16 @@ static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *ad
   }
 
   for (auto id : tasks) {
-    auto task = __z3_parser->retrieve_task(id);
     // solve
-    if (__solve_expr(std::move(task))) {
+    symsan::Z3ParserSolver::solution_t solutions;
+    auto status = __z3_parser->solve_task(id, 5000U, solutions);
+    if (solutions.size() != 0) {
       AOUT("branch solved\n");
+      generate_input(solutions);
     } else {
       AOUT("branch not solvable @%p\n", addr);
     }
+    solutions.clear();
   }
 
 }
@@ -191,13 +118,15 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
   }
 
   for (auto id : tasks) {
-    auto task = __z3_parser->retrieve_task(id);
-    // solve
-    if (__solve_expr(std::move(task))) {
+    symsan::Z3ParserSolver::solution_t solutions;
+    auto status = __z3_parser->solve_task(id, 5000U, solutions);
+    if (solutions.size() != 0) {
       AOUT("gep solved\n");
+      generate_input(solutions);
     } else {
       AOUT("gep not solvable @%p\n", addr);
     }
+    solutions.clear();
   }
 }
 
@@ -287,7 +216,7 @@ int main(int argc, char* const argv[]) {
   close(input_fd);
 
   // setup z3 parser
-  __z3_parser = new symsan::Z3AstParser(shm_base, uniontable_size, __z3_context);
+  __z3_parser = new symsan::Z3ParserSolver(shm_base, uniontable_size, __z3_context);
   std::vector<symsan::input_t> inputs;
   inputs.push_back({(uint8_t*)input_buf, input_size});
   if (__z3_parser->restart(inputs) != 0) {
