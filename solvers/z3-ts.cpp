@@ -10,7 +10,10 @@
 using namespace symsan;
 
 Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
-  : ASTParser(base, size), context_(context) {}
+  : ASTParser(base, size), context_(context) {
+    input_name_format = "input-%u-%u";
+    atoi_name_format = "atoi-%u-%u-%d";
+  }
 
 int Z3AstParser::restart(std::vector<input_t> &inputs) {
 
@@ -82,23 +85,29 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
   }
 
   // special ops
+  char name[256];
   if (info->op == 0) {
     // input
-    z3::symbol symbol = context_.int_symbol(info->op1.i); // FIXME: single input name
+    uint32_t offset = info->op1.i; // legacy: offset in op1
+    uint32_t input = info->op2.i;
+    snprintf(name, sizeof(name), input_name_format, input, offset);
+    z3::symbol symbol = context_.str_symbol(name);
     z3::sort sort = context_.bv_sort(8);
     tsize_cache_[label] = 1; // lazy init
-    deps.insert(std::make_pair(info->op2.i, info->op1.i)); // legacy: offset in op1
+    deps.insert(std::make_pair(input, offset));
     // caching is not super helpful
     return context_.constant(symbol, sort);
   } else if (info->op == __dfsan::Load) {
     uint32_t offset = get_label_info(info->l1)->op1.i; // legacy: offset in op1
     uint32_t input = get_label_info(info->l1)->op2.i;
-    z3::symbol symbol = context_.int_symbol(offset); // FIXME: single input name
+    snprintf(name, sizeof(name), input_name_format, input, offset);
+    z3::symbol symbol = context_.str_symbol(name);
     z3::sort sort = context_.bv_sort(8);
     z3::expr out = context_.constant(symbol, sort);
     deps.insert(std::make_pair(input, offset));
     for (uint32_t i = 1; i < info->l2; i++) {
-      symbol = context_.int_symbol(offset + i); // FIXME: single input name
+      snprintf(name, sizeof(name), input_name_format, input, offset + i);
+      symbol = context_.str_symbol(name);
       out = z3::concat(context_.constant(symbol, sort), out);
       deps.insert(std::make_pair(input, offset + i));
     }
@@ -167,6 +176,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     z3::sort sort = context_.bv_sort(info->size);
     z3::expr base = context_.constant(symbol, sort);
     tsize_cache_[label] = 1; // lazy init
+    has_fsize = true; // XXX: set a flag
     // don't cache because of deps
     if (info->op1.i) {
       // minus the offset stored in op1
@@ -180,12 +190,13 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     assert(info->l1 == 0 && info->l2 >= CONST_OFFSET);
     dfsan_label_info *src = get_label_info(info->l2);
     assert(src->op == __dfsan::Load);
-    uint64_t offset = get_label_info(src->l1)->op1.i;
+    uint32_t offset = get_label_info(src->l1)->op1.i; // legacy: offset in op1
+    uint32_t input = get_label_info(src->l1)->op2.i;
+    int base = info->op1.i;
     // FIXME: dependencies?
     tsize_cache_[label] = 1; // lazy init
     // XXX: hacky, avoid string theory
-    char name[36];
-    snprintf(name, 36, "atoi-%lu-%ld", offset, info->op1.i);
+    snprintf(name, sizeof(name), atoi_name_format, input, offset, base);
     z3::symbol symbol = context_.str_symbol(name);
     z3::sort sort = context_.bv_sort(info->size);
     return context_.constant(symbol, sort);
@@ -251,11 +262,15 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
   // allocate a new task
   auto task = std::make_unique<z3_task_t>();
   try {
-    // add last branch condition
-    z3::expr r = context_.bool_val(result);
+    // reset has_fsize flag
+    has_fsize = false;
 
+    // parse last branch cond
     input_dep_set_t inputs;
     z3::expr cond = serialize(label, inputs);
+
+    // add negated last branch condition
+    z3::expr r = context_.bool_val(result);
     task->push_back((cond != r));
 
     // collect additional input deps
@@ -267,9 +282,8 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     // save the task
     tasks.push_back(save_task(std::move(task)));
 
-    // save nested
-    // FIXME: don't remember size constraints
-    if (add_nested) {
+    // save nested unless it's a fsize constraints
+    if (add_nested && !has_fsize) {
       save_constraint(cond == r, inputs);
     }
 
@@ -520,12 +534,15 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
     z3::expr e = m.get_const_interp(decl);
     z3::symbol name = decl.name();
 
-    if (name.kind() == Z3_INT_SYMBOL) {
-      uint32_t offset = (uint32_t)name.to_int();
-      uint8_t value = (uint8_t)e.get_numeral_int();
-      solutions.push_back({0, offset, value});
-    } else { // string symbol
-      if (!name.str().compare("fsize")) {
+    // all values should be string symbols
+    if (name.kind() == Z3_STRING_SYMBOL) {
+      if (name.str().find("input") == 0) {
+        uint32_t input;
+        uint32_t offset;
+        sscanf(name.str().c_str(), input_name_format, &input, &offset);
+        uint8_t value = (uint8_t)e.get_numeral_int();
+        solutions.push_back({input, offset, value});
+      } else if (!name.str().compare("fsize")) {
         // FIXME:
         // off_t size = (off_t)e.get_numeral_int64();
         // if (size > input_size) { // grow
@@ -538,10 +555,11 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         // }
         throw z3::exception("skip fsize constraints");
       } else if (name.str().find("atoi") == 0) {
+        uint32_t input;
         uint32_t offset;
         int base;
         char buf[64];
-        sscanf(name.str().c_str(), "atoi-%d-%d", &offset, &base);
+        sscanf(name.str().c_str(), atoi_name_format, &input, &offset, &base);
         const char *format = NULL;
         switch (base) {
           case 2: format = "%lb"; break;
@@ -554,9 +572,9 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         int len = snprintf(buf, 64, format, (int)e.get_numeral_int());
         // len excludes \0
         for (int i = 0; i < len; ++i) {
-          solutions.push_back({0, offset + i, (uint8_t)buf[i]});
+          solutions.push_back({input, offset + i, (uint8_t)buf[i]});
         }
-        solutions.push_back({0, offset + len, 0});
+        solutions.push_back({input, offset + len, 0});
       } else {
         throw z3::exception("unknown symbol");
       }
