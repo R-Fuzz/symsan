@@ -11,7 +11,7 @@ target_include_directories(FGTest PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
 )
 target_link_libraries(FGTest PRIVATE
-  launcher_static
+  launcher
   z3parser
   z3
   rt
