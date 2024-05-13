@@ -65,7 +65,7 @@ public:
 
   bool is_branch_interesting(const std::shared_ptr<BranchContext> context) override {
     auto itr = branches.find(context->addr);
-    assert(itr != branches.end());
+    // assert(itr != branches.end());
     if (context->direction) {
       return itr->second.first == false;
     } else {

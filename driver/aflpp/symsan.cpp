@@ -11,6 +11,7 @@
 #include "solver.h"
 #include "cov.h"
 #include "union_find.h"
+#include "task_mgr.h"
 
 extern "C" {
 #include "afl-fuzz.h"
@@ -111,7 +112,6 @@ struct my_mutator_t {
     ck_free(argv);
     delete task_mgr;
     delete cov_mgr;
-    symsan_destroy();
   }
 
   const afl_state_t *afl;
@@ -1608,7 +1608,7 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
 
     // add the tasks to the task manager
     for (auto const& task : tasks) {
-      my_mutator->task_mgr->add_task(neg_ctx, task);
+      my_mutator->task_mgr->add_task(neg_ctx, std::move(task));
 #if PRINT_STATS
       task_size_dist[task->constraints.size()] += 1;
 #endif
@@ -1696,7 +1696,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   // create the output file
   data->out_fd = open(data->out_file, O_RDWR | O_CREAT | O_TRUNC, 0644);
   if (data->out_fd < 0) {
-    FATAL("Failed to create output file %s: %s\n", data->out_file, strerror(errno));
+    PFATAL("Failed to create output file %s: %s\n", data->out_file, strerror(errno));
   }
 
   // setup symsan launcher
@@ -1716,7 +1716,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   if (log_f) {
     data->log_fd = open(log_f, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (data->log_fd < 0) {
-      FATAL("Failed to create log file: %s\n", strerror(errno));
+      PFATAL("Failed to create log file: %s\n", strerror(errno));
     }
   } else {
     data->log_fd = 2; // stderr by default
@@ -1727,7 +1727,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
 }
 
 extern "C" void afl_custom_deinit(my_mutator_t *data) {
-  shmdt(__dfsan_label_info);
+  symsan_destroy();
   delete data;
 }
 
