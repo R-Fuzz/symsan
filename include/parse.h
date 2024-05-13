@@ -59,6 +59,12 @@ public:
                         int64_t current_offset,
                         std::vector<uint64_t> &tasks) = 0;
 
+  /// @brief Add a constraint, typically from symbolic offset
+  /// @param label symbolic label of the constraint
+  /// @param result concrete value of the constraint
+  /// @return 0 on success, -1 on failure
+  virtual int add_constraints(dfsan_label label, uint64_t result) = 0;
+
   virtual int record_memcmp(dfsan_label label, uint8_t* buf, size_t size) {
     auto content = std::make_unique<uint8_t[]>(size);
     memcpy(content.get(), buf, size);
@@ -66,8 +72,8 @@ public:
     return 0;
   };
 
-  // use unique_ptr to auto-free task
-  virtual std::unique_ptr<T> retrieve_task(uint64_t id) {
+  // use shared_ptr to auto-free task
+  virtual std::shared_ptr<T> retrieve_task(uint64_t id) {
     auto it = tasks_.find(id);
     if (it == tasks_.end()) {
       return nullptr;
@@ -88,7 +94,7 @@ protected:
   dfsan_label_info *base_;
   size_t size_;
   uint64_t prev_task_id_;
-  std::unordered_map<uint64_t, std::unique_ptr<T>> tasks_;
+  std::unordered_map<uint64_t, std::shared_ptr<T>> tasks_;
   std::unordered_map<dfsan_label, std::unique_ptr<uint8_t[]>> memcmp_cache_;
 };
 
@@ -109,8 +115,7 @@ public:
                 int64_t current_offset,
                 std::vector<uint64_t> &tasks) override;
 
-  /// @return 0 on success, -1 on failure
-  int add_constraints(dfsan_label label, uint64_t result);
+  int add_constraints(dfsan_label label, uint64_t result) override;
 
 protected:
   z3::context &context_;
@@ -150,19 +155,20 @@ private:
     }
   };
   using expr_set_t = std::unordered_set<z3::expr, expr_hash, expr_equal>;
-  using branch_dep_t = struct {
+  struct branch_dependency {
     expr_set_t expr_deps;
     input_dep_set_t input_deps;
   };
-  using offset_dep_t = std::vector<std::unique_ptr<branch_dep_t>>;
+  using branch_dep_t = std::unique_ptr<struct branch_dependency>;
+  using offset_dep_t = std::vector<branch_dep_t>;
   std::vector<offset_dep_t> branch_deps_;
 
-  inline branch_dep_t* get_branch_dep(offset_t off) {
+  inline struct branch_dependency* get_branch_dep(offset_t off) {
     auto &offset_deps = branch_deps_.at(off.first);
     return offset_deps.at(off.second).get();
   }
 
-  inline void set_branch_dep(offset_t off, std::unique_ptr<branch_dep_t> dep) {
+  inline void set_branch_dep(offset_t off, branch_dep_t dep) {
     auto &offset_deps = branch_deps_.at(off.first);
     if (off.second >= offset_deps.size()) {
       offset_deps.resize(off.second + 1);
@@ -181,7 +187,7 @@ private:
   inline void collect_more_deps(input_dep_set_t &deps);
   inline size_t add_nested_constraints(input_dep_set_t &deps, z3_task_t *task);
   inline void save_constraint(z3::expr expr, input_dep_set_t &inputs);
-  inline uint64_t save_task(std::unique_ptr<z3_task_t> task) {
+  inline uint64_t save_task(std::shared_ptr<z3_task_t> task) {
     uint64_t tid = prev_task_id_++;
     tasks_.insert({tid, std::move(task)});
     return tid;
@@ -222,7 +228,5 @@ private:
   void generate_solution(z3::model &m, solution_t &solutions);
 
 };
-
-// class RGDAstParser : public ASTParser<rgd::SearchTask>;
 
 }; // namespace symsan

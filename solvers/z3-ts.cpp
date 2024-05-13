@@ -260,7 +260,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std::vector<uint64_t> &tasks) {
 
   // allocate a new task
-  auto task = std::make_unique<z3_task_t>();
+  auto task = std::make_shared<z3_task_t>();
   try {
     // reset has_fsize flag
     has_fsize = false;
@@ -280,7 +280,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     add_nested_constraints(inputs, task.get());
 
     // save the task
-    tasks.push_back(save_task(std::move(task)));
+    tasks.push_back(save_task(task));
 
     // save nested unless it's a fsize constraints
     if (add_nested && !has_fsize) {
@@ -300,7 +300,7 @@ void Z3AstParser::construct_index_tasks(z3::expr &index, uint64_t curr,
                                         uint64_t lb, uint64_t ub, uint64_t step,
                                         z3_task_t &nested, std::vector<uint64_t> &tasks) {
 
-  std::unique_ptr<z3_task_t> task = nullptr;
+  std::shared_ptr<z3_task_t> task = nullptr;
 
   // enumerate indices
   for (uint64_t i = lb; i < ub; i += step) {
@@ -308,22 +308,22 @@ void Z3AstParser::construct_index_tasks(z3::expr &index, uint64_t curr,
     z3::expr idx = context_.bv_val(i, 64);
     z3::expr e = (index == idx);
     // allocate a new task
-    task = std::make_unique<z3_task_t>();
+    task = std::make_shared<z3_task_t>();
     task->push_back(e);
     // add nested constraints
     task->insert(task->end(), nested.begin(), nested.end());
     // save the task
-    tasks.push_back(save_task(std::move(task)));
+    tasks.push_back(save_task(task));
   }
 
   // check feasibility for OOB
   // upper bound
   z3::expr u = context_.bv_val(ub, 64);
   z3::expr e = z3::uge(index, u);
-  task = std::make_unique<z3_task_t>();
+  task = std::make_shared<z3_task_t>();
   task->push_back(e);
   task->insert(task->end(), nested.begin(), nested.end());
-  tasks.push_back(save_task(std::move(task)));
+  tasks.push_back(save_task(task));
 
   // lower bound
   if (lb == 0) {
@@ -332,10 +332,10 @@ void Z3AstParser::construct_index_tasks(z3::expr &index, uint64_t curr,
     z3::expr l = context_.bv_val(lb, 64);
     e = z3::ult(index, l);
   }
-  task = std::make_unique<z3_task_t>();
+  task = std::make_shared<z3_task_t>();
   task->push_back(e);
   task->insert(task->end(), nested.begin(), nested.end());
-  tasks.push_back(save_task(std::move(task)));
+  tasks.push_back(save_task(task));
 }
 
 int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_label, int64_t index,
@@ -382,10 +382,10 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
             bs = bs * be;
           }
           z3::expr e = z3::ugt(idx * es * co, bs);
-          auto task = std::make_unique<z3_task_t>();
+          auto task = std::make_shared<z3_task_t>();
           task->push_back(e);
           task->insert(task->end(), nested_tasks.begin(), nested_tasks.end());
-          tasks.push_back(save_task(std::move(task)));
+          tasks.push_back(save_task(task));
         }
       }
     }
@@ -424,7 +424,7 @@ void Z3AstParser::save_constraint(z3::expr expr, input_dep_set_t &inputs) {
   for (auto off : inputs) {
     auto c = get_branch_dep(off);
     if (c == nullptr) {
-      auto nc = std::make_unique<branch_dep_t>();
+      auto nc = std::make_unique<struct branch_dependency>();
       c = nc.get();
       set_branch_dep(off, std::move(nc));
     }
