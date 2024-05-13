@@ -190,6 +190,166 @@ static PyObject* SymSanDestroy(PyObject *self) {
   Py_RETURN_NONE;
 }
 
+static PyObject* InitParser(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  std::vector<symsan::input_t> inputs;
+  PyObject *iargs = NULL;
+
+  if (!PyArg_ParseTuple(args, "O!", &PyList_Type, &iargs)) {
+    return NULL;
+  }
+
+  Py_ssize_t argc = PyList_Size(iargs);
+  for (Py_ssize_t i = 0; i < argc; i++) {
+    PyObject *item = PyList_GetItem(iargs, i);
+    if (item == NULL) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to retrieve args list");
+      return NULL;
+    }
+    if (!PyBytes_Check(item)) {
+      PyErr_SetString(PyExc_TypeError, "args must be a list of bytes");
+      return NULL;
+    }
+    Py_ssize_t size;
+    char *data;
+    if (PyBytes_AsStringAndSize(item, &data, &size) != 0) {
+      // exception should have been set?
+      return NULL;
+    }
+    inputs.push_back({(uint8_t*)data, size});
+  }
+
+  if (__z3_parser->restart(inputs) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to restart parser");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
+static PyObject* ParseCond(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  PyObject *ret;
+  dfsan_label label = 0;
+  uint64_t result = 0;
+  uint16_t flags = 0;
+
+  if (!PyArg_ParseTuple(args, "IKH", &label, &result, &flags)) {
+    return NULL;
+  }
+
+  std::vector<uint64_t> tasks;
+  if (__z3_parser->parse_cond(label, result, flags & F_ADD_CONS, tasks) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to parse condition");
+    return NULL;
+  }
+
+  ret = PyList_New(tasks.size());
+  for (size_t i = 0; i < tasks.size(); i++) {
+    PyObject *task = PyLong_FromUnsignedLongLong(tasks[i]);
+    PyList_SetItem(ret, i, task);
+  }
+
+  return ret;
+}
+
+static PyObject* ParseGEP(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  PyObject *ret;
+  dfsan_label ptr_label = 0;
+  uptr ptr = 0;
+  dfsan_label index_label = 0;
+  int64_t index = 0;
+  uint64_t num_elems = 0;
+  uint64_t elem_size = 0;
+  int64_t current_offset = 0;
+
+  if (!PyArg_ParseTuple(args, "IKILKKL", &ptr_label, &ptr, &index_label, &index,
+      &num_elems, &elem_size, &current_offset)) {
+    return NULL;
+  }
+
+  std::vector<uint64_t> tasks;
+  if (__z3_parser->parse_gep(ptr_label, ptr, index_label, index,
+                             num_elems, elem_size, current_offset, tasks) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to parse GEP");
+    return NULL;
+  }
+
+  ret = PyList_New(tasks.size());
+  for (size_t i = 0; i < tasks.size(); i++) {
+    PyObject *task = PyLong_FromUnsignedLongLong(tasks[i]);
+    PyList_SetItem(ret, i, task);
+  }
+
+  return ret;
+}
+
+static PyObject* AddConstraint(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  dfsan_label label = 0;
+  uint64_t val = 0;
+
+  if (!PyArg_ParseTuple(args, "IL", &label, &val)) {
+    return NULL;
+  }
+
+  if (__z3_parser->add_constraints(label, val) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to add constraint");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
+static PyObject* SolveTask(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  uint64_t id = 0;
+  unsigned timeout = 5000;
+  if (!PyArg_ParseTuple(args, "K|I", &id, &timeout)) {
+    return NULL;
+  }
+
+  symsan::Z3ParserSolver::solution_t solutions;
+  int status = __z3_parser->solve_task(id, timeout, solutions);
+
+  PyObject *sols = PyList_New(solutions.size());
+  for (size_t i = 0; i < solutions.size(); i++) {
+    PyObject *sol = PyTuple_New(3);
+    auto val = solutions[i];
+    PyTuple_SetItem(sol, 0, PyLong_FromUnsignedLong(val.id));
+    PyTuple_SetItem(sol, 1, PyLong_FromUnsignedLong(val.offset));
+    PyTuple_SetItem(sol, 2, PyLong_FromUnsignedLong(val.val));
+    PyList_SetItem(sols, i, sol);
+  }
+
+  PyObject *ret = PyTuple_New(2);
+  PyTuple_SetItem(ret, 0, PyLong_FromLong(status));
+  PyTuple_SetItem(ret, 1, sols);
+
+  return ret;
+}
+
 static PyMethodDef SymSanMethods[] = {
   {"init", SymSanInit, METH_VARARGS, "initialize symsan target"},
   {"config", (PyCFunction)SymSanConfig, METH_VARARGS | METH_KEYWORDS, "config symsan"},
@@ -197,11 +357,11 @@ static PyMethodDef SymSanMethods[] = {
   {"read_event", SymSanReadEvent, METH_VARARGS, "read a symsan event"},
   {"terminate", (PyCFunction)SymSanTerminate, METH_NOARGS, "terminate current symsan instance"},
   {"destroy", (PyCFunction)SymSanDestroy, METH_NOARGS, "destroy symsan target"},
-  // {"init_parser", InitParser, METH_VARARGS, "initialize symbolic expression parser"},
-  // {"parse_cond", ParseCond, METH_VARARGS, "parse trace_cond event into solving tasks"},
-  // {"parse_gep", ParseGEP, METH_VARARGS, "parse trace_gep event into solving tasks"},
-  // {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},
-  // {"solve_task", SolveTask, METH_VARARGS, "solve a task"},
+  {"init_parser", InitParser, METH_VARARGS, "initialize symbolic expression parser"},
+  {"parse_cond", ParseCond, METH_VARARGS, "parse trace_cond event into solving tasks"},
+  {"parse_gep", ParseGEP, METH_VARARGS, "parse trace_gep event into solving tasks"},
+  {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},
+  {"solve_task", SolveTask, METH_VARARGS, "solve a task"},
   {NULL, NULL, 0, NULL}  /* Sentinel */
 };
 
