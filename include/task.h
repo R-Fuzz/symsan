@@ -3,9 +3,9 @@
 #include <stdint.h>
 
 #include <bitset>
+#include <cassert>
 #include <map>
 #include <memory>
-#include <queue>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -210,37 +210,6 @@ struct SearchTask {
     }
   }
 
-};
-
-class TaskManager {
-public:
-  virtual ~TaskManager() {}
-  virtual bool add_task(std::shared_ptr<BranchContext> ctx, std::shared_ptr<SearchTask> task) = 0;
-  virtual std::shared_ptr<SearchTask> get_next_task() = 0;
-  virtual size_t get_num_tasks() = 0;
-};
-
-class FIFOTaskManager : public TaskManager {
-public:
-  bool add_task(std::shared_ptr<BranchContext> ctx, std::shared_ptr<SearchTask> task) override {
-    (void)ctx;
-    tasks.push_back(task);
-    return true;
-  }
-
-  std::shared_ptr<SearchTask> get_next_task() override {
-    if (tasks.empty()) return nullptr;
-    auto task = tasks.front();
-    tasks.pop_front();
-    return task;
-  }
-
-  size_t get_num_tasks() override {
-    return tasks.size();
-  }
-
-private:
-  std::deque<std::shared_ptr<SearchTask>> tasks;
 };
 
 }; // namespace rgd
