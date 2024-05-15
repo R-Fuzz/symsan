@@ -7,15 +7,19 @@
 #include "jigsaw/jit.h"
 #include "wheels/lockfreehash/lprobe/hash_table.h"
 
-extern "C" {
-#include "afl-fuzz.h"
-}
-
 using namespace rgd;
 
 #if !DEBUG
 #undef DEBUGF
 #define DEBUGF(_str...) do { } while (0)
+#endif
+
+#ifndef WARNF
+#define WARNF(_str...) do { fprintf(stderr, _str); } while (0)
+// #define WARNF(x...) do { \
+//     SAYF(cYEL "[!] " cBRI "WARNING: " cRST x); \
+//     SAYF(cRST "\n"); \
+//   } while (0)
 #endif
 
 static const uint64_t kUsToS = 1000000;
@@ -97,7 +101,7 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
         DEBUGF("jit constraint %d\n", c->ast->label());
         uint64_t id = ++uuid;
         start = getTimeStamp();
-        if (unlikely(addFunction(c->get_root(), c->local_map, id) != 0)) {
+        if (addFunction(c->get_root(), c->local_map, id) != 0) {
           WARNF("failed to add function\n");
           return SOLVER_ERROR;
         }
@@ -129,7 +133,7 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
       out_buf[offset] = value;
     }
     // handle atoi bytes
-    if (unlikely(!task->atoi_info.empty())) {
+    if (!task->atoi_info.empty()) {
       // if there are atoi bytes, handle them
       for (auto const &[offset, info] : task->atoi_info) {
         uint64_t val = 0;
