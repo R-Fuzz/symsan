@@ -8,7 +8,7 @@ extern "C" {
 #include "launch.h"
 }
 
-#include "parse.h"
+#include "parse-z3.h"
 
 #include <z3++.h>
 
