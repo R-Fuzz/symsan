@@ -39,7 +39,7 @@ add_library(rgd-solver STATIC
 )
 
 target_compile_options(rgd-solver PRIVATE
-    -mcx16 -march=native -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free
+    -O3 -g -mcx16 -march=native -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free
 )
 if (ASAN_BUILD)
   target_compile_options(rgd-solver PRIVATE -fsanitize=address)
