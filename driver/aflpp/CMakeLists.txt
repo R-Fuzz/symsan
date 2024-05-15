@@ -21,28 +21,16 @@ if (NOT IS_DIRECTORY "${AFLPP_PATH}/include")
   message(FATAL_ERROR "Invalid AFL++ directory path!")
 endif()
 
-add_subdirectory(jigsaw)
-
-add_library(SymSanMutator SHARED
-  symsan.cpp
-  z3-solver.cpp
-  jit-solver.cpp
-  i2s-solver.cpp
-)
-
+add_library(SymSanMutator SHARED symsan.cpp )
 target_include_directories(SymSanMutator PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime
   ${AFLPP_PATH}/include
 )
-
 target_link_libraries(SymSanMutator
-  tcmalloc
-  z3
-  jigsaw
-  profiler
   launcher
   rgd-parser
+  rgd-solver
 )
 if (ASAN_BUILD)
   target_link_libraries(SymSanMutator
