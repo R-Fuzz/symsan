@@ -58,7 +58,7 @@ static const std::unordered_map<unsigned, std::pair<unsigned, const char*> > OP_
   {__dfsan::Or,      {rgd::Or, "or"}},
   {__dfsan::Xor,     {rgd::Xor, "xor"}},
   // relational comparisons
-#define RELATIONAL_ICMP(cmp) (__dfsan::ICmp | (cmp << 8)) 
+#define RELATIONAL_ICMP(cmp) (__dfsan::ICmp | (cmp << 8))
   {RELATIONAL_ICMP(__dfsan::bveq),  {rgd::Equal, "equal"}},
   {RELATIONAL_ICMP(__dfsan::bvneq), {rgd::Distinct, "distinct"}},
   {RELATIONAL_ICMP(__dfsan::bvugt), {rgd::Ugt, "ugt"}},
@@ -426,7 +426,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     left->set_name("constant");
 #endif
   }
-  
+
   // unary ops
   if (info->op == __dfsan::ZExt || info->op == __dfsan::SExt ||
       info->op == __dfsan::Extract || info->op == __dfsan::Trunc) {
