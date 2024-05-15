@@ -1,7 +1,5 @@
 #pragma once
 
-//#include "task.h"
-
 #include "dfsan/dfsan.h"
 
 #include <stdint.h>
@@ -18,7 +16,16 @@
 
 namespace symsan {
 
-using input_t = std::pair<uint8_t*, size_t>;
+using input_t = std::pair<const uint8_t*, size_t>;
+using offset_t = std::pair<uint32_t, uint32_t>;
+struct offset_hash {
+  std::size_t operator()(const offset_t &off) const {
+    uint64_t key = off.first;
+    key <<= 32;
+    key |= off.second;
+    return std::hash<uint64_t>{}(key);
+  }
+};
 
 template <class T>
 class ASTParser {
@@ -91,6 +98,12 @@ protected:
     return &base_[label];
   }
 
+  inline uint64_t save_task(std::shared_ptr<T> task) {
+    uint64_t tid = prev_task_id_++;
+    tasks_.insert({tid, task});
+    return tid;
+  }
+
   dfsan_label_info *base_;
   size_t size_;
   uint64_t prev_task_id_;
@@ -127,15 +140,6 @@ private:
   bool has_fsize;
 
   // input deps
-  using offset_t = std::pair<uint32_t, uint32_t>;
-  struct offset_hash {
-    std::size_t operator()(const offset_t &off) const {
-      uint64_t key = off.first;
-      key <<= 32;
-      key |= off.second;
-      return std::hash<uint64_t>{}(key);
-    }
-  };
   using input_dep_set_t = std::unordered_set<offset_t, offset_hash>;
 
   // caches
@@ -187,11 +191,6 @@ private:
   inline void collect_more_deps(input_dep_set_t &deps);
   inline size_t add_nested_constraints(input_dep_set_t &deps, z3_task_t *task);
   inline void save_constraint(z3::expr expr, input_dep_set_t &inputs);
-  inline uint64_t save_task(std::shared_ptr<z3_task_t> task) {
-    uint64_t tid = prev_task_id_++;
-    tasks_.insert({tid, std::move(task)});
-    return tid;
-  }
   void construct_index_tasks(z3::expr &index, uint64_t curr,
                              uint64_t lb, uint64_t ub, uint64_t step,
                              z3_task_t &nested, std::vector<uint64_t> &tasks);
