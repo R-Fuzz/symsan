@@ -24,6 +24,10 @@ target_include_directories(z3parser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
 )
 
+if (NOT LLVM_FOUND)
+  message(FATAL_ERROR "You haven't install LLVM !")
+endif()
+
 ## rgd-solver
 
 add_subdirectory(jigsaw)
@@ -37,6 +41,9 @@ add_library(rgd-solver STATIC
 target_compile_options(rgd-solver PRIVATE
     -mcx16 -march=native -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free
 )
+if (ASAN_BUILD)
+  target_compile_options(rgd-solver PRIVATE -fsanitize=address)
+endif()
 
 target_include_directories(rgd-solver PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
