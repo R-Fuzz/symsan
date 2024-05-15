@@ -3,7 +3,7 @@
 #include "sanitizer_common/sanitizer_posix.h"
 #include "dfsan/dfsan.h"
 
-#include "parse.h"
+#include "parse-z3.h"
 
 #include <z3++.h>
 
@@ -110,7 +110,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
   uint8_t r = get_const_result(c1, c2, predicate);
 
-  if (__solved_labels.count(temp) != 0) 
+  if (__solved_labels.count(temp) != 0)
     return;
 
   std::vector<uint64_t> tasks;
@@ -150,7 +150,7 @@ __taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
   AOUT("solving cond: %u %u 0x%x 0x%x %p %u\n",
        label, r, __taint_trace_callstack, cid, addr, itr->second);
 
-  if (__solved_labels.count(label) != 0) 
+  if (__solved_labels.count(label) != 0)
     return;
 
   std::vector<uint64_t> tasks;
@@ -186,7 +186,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
   if (index_label == 0)
     return;
 
-  if (__solved_labels.count(index_label) != 0) 
+  if (__solved_labels.count(index_label) != 0)
     return;
 
   if (__buffers.count(ptr) != 0)

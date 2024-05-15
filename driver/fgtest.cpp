@@ -8,9 +8,7 @@ extern "C" {
 #include "launch.h"
 }
 
-#include "parse.h"
-
-#include <z3++.h>
+#include "parse-z3.h"
 
 #include <memory>
 #include <unordered_map>
@@ -131,10 +129,10 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
 }
 
 int main(int argc, char* const argv[]) {
-  
+
   if (argc != 3) {
     fprintf(stderr, "Usage: %s target input\n", argv[0]);
-    exit(1);    
+    exit(1);
   }
 
   char *program = argv[1];
@@ -267,6 +265,7 @@ int main(int argc, char* const argv[]) {
         }
         // save the content
         __z3_parser->record_memcmp(msg.label, mmsg->content, msg.result);
+        free(mmsg);
         break;
       case fsize_type:
         break;
@@ -278,3 +277,4 @@ int main(int argc, char* const argv[]) {
   symsan_destroy();
   exit(0);
 }
+

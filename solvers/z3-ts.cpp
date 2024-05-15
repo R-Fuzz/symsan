@@ -1,6 +1,6 @@
-#include "parse.h"
-
 #include "dfsan/dfsan.h"
+
+#include "parse-z3.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -275,7 +275,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
     // collect additional input deps
     collect_more_deps(inputs);
-  
+
     // add nested constraints
     add_nested_constraints(inputs, task.get());
 

@@ -140,7 +140,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
     Die();
   }
 
-  return; 
+  return;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
