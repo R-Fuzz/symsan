@@ -35,7 +35,7 @@ public:
   }
 
 private:
-  std::deque<std::shared_ptr<SearchTask>> tasks;
+  std::deque<task_t> tasks;
 };
 
 };  // namespace rgd

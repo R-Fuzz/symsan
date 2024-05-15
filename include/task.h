@@ -212,4 +212,6 @@ struct SearchTask {
 
 };
 
+using task_t = std::shared_ptr<rgd::SearchTask>;
+
 }; // namespace rgd

@@ -313,7 +313,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
 /// @brief the trace stage for symsan
 /// @param data the custom mutator state
 /// @param buf input buffer
-/// @param buf_size 
+/// @param buf_size
 /// @return the number of solving tasks
 extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
                                      size_t buf_size) {
