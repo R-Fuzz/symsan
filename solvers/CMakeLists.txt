@@ -34,7 +34,12 @@ add_library(rgd-solver STATIC
     i2s-solver.cpp
 )
 
-target_include_directories(z3parser PRIVATE
+target_compile_options(rgd-solver PRIVATE
+    -mcx16 -march=native -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free
+)
+
+target_include_directories(rgd-solver PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
 )
 

@@ -2,11 +2,8 @@
 
 #include "dfsan/dfsan.h"
 
-extern "C" {
-#include "afl-fuzz.h"
-}
-
-#include <cmath>
+#include <math.h>
+#include <string.h>
 
 using namespace rgd;
 
@@ -15,6 +12,18 @@ using namespace rgd;
 #if !DEBUG
 #undef DEBUGF
 #define DEBUGF(_str...) do { } while (0)
+#endif
+
+#ifndef WARNF
+#define WARNF(_str...) do { fprintf(stderr, _str); } while (0)
+#endif
+
+#if defined(__GNUC__)
+static inline bool (likely)(bool x) { return __builtin_expect((x), true); }
+static inline bool (unlikely)(bool x) { return __builtin_expect((x), false); }
+#else
+static inline bool (likely)(bool x) { return x; }
+static inline bool (unlikely)(bool x) { return x; }
 #endif
 
 #undef SWAP64

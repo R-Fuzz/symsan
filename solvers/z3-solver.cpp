@@ -1,14 +1,18 @@
 #include "solver.h"
 
-extern "C" {
-#include "afl-fuzz.h"
-}
+#include <z3++.h>
+
+#include <string.h>
 
 using namespace rgd;
 
 #if !DEBUG
 #undef DEBUGF
 #define DEBUGF(_str...) do { } while (0)
+#endif
+
+#ifndef WARNF
+#define WARNF(_str...) do { fprintf(stderr, _str); } while (0)
 #endif
 
 z3::context g_z3_context;
@@ -304,7 +308,7 @@ Z3Solver::solve(std::shared_ptr<SearchTask> task,
       out_size = in_size;
       z3::model m = solver_.get_model();
       extract_model(m, out_buf, out_size, task->solution);
-      if (unlikely(!task->atoi_info.empty())) {
+      if (!task->atoi_info.empty()) {
         // if there are atoi bytes, handle them
         for (auto const &[offset, info] : task->atoi_info) {
           uint64_t val = 0;
