@@ -23,3 +23,24 @@ add_library(z3parser STATIC z3-ts.cpp)
 target_include_directories(z3parser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
 )
+
+## rgd-solver
+
+add_subdirectory(jigsaw)
+
+add_library(rgd-solver STATIC
+    z3-solver.cpp
+    jit-solver.cpp
+    i2s-solver.cpp
+)
+
+target_include_directories(z3parser PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+)
+
+target_link_libraries(rgd-solver PRIVATE
+    tcmalloc
+    z3
+    jigsaw
+    profiler
+)
