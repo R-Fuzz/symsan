@@ -8,15 +8,16 @@ from model import RLModelType
 LOGGING_LEVEL = logging.INFO
 MEMORY_LIMIT_PERCENTAGE = 85
 DISK_LIMIT_SIZE = 32 * (1 << 30) # 32GB
-SEED_SYNC_FREQUENCY = 100
+# set FREQUENCY to 0 if you want to disable the feature
+SYNC_FREQUENCY = 10 # sync mazerunner status with AFL every SYNC_FREQUENCY executions.
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
+REPLAY_FREQUENCY = 0 # off-learning from replay buffer every REPLAY_FREQUENCY executions.
 # Solver configurations
 MAX_DISTANCE = float(0x7FFFFFFFFFFFFFFF)
 NESTED_BRANCH_ENABLED = True
 GEP_SOLVER_ENABLED = False
 OPTIMISTIC_SOLVING_ENABLED = True
 # Learner configurations
-OFFLINE_LEARNING_ENABLED = False
 DISCOUNT_FACTOR = 1
 LEARNING_RATE = 1
 EXPLORE_RATE = 0.5
@@ -59,12 +60,12 @@ class Config:
                  "memory_limit",
                  "disk_limit",
                  "save_frequency",
+                 "replay_frequency",
                  "model_type",
                  "decimal_precision",
                  'max_distance',
                  'initial_policy',
                  'static_result_folder',
-                 'offline_learning_enabled',
                  'use_ordered_dict',
     ]
 
@@ -129,7 +130,8 @@ class Config:
         self.optimistic_solving_enabled = OPTIMISTIC_SOLVING_ENABLED
         self.discount_factor = DISCOUNT_FACTOR
         self.learning_rate = LEARNING_RATE
-        self.sync_frequency = SEED_SYNC_FREQUENCY
+        self.sync_frequency = SYNC_FREQUENCY
+        self.replay_frequency = REPLAY_FREQUENCY
         self.explore_rate = EXPLORE_RATE
         self.timeout = DEFAULT_TIMEOUT
         self.max_timeout = MAX_TIMEOUT
@@ -142,7 +144,6 @@ class Config:
         self.save_frequency = SAVE_FREQUENCY
         self.decimal_precision = DECIMAL_PRECISION
         self.max_branch_num = MAX_BRANCH_NUM
-        self.offline_learning_enabled = OFFLINE_LEARNING_ENABLED
         self.use_ordered_dict = USE_ORDERED_DICT
         # The other configurations need to be set explicitly by config file or cmd arguments
         self.model_type = RLModelType.unknown

@@ -1,5 +1,6 @@
 import logging
 import functools
+import math
 import os
 import pickle
 import random
@@ -628,13 +629,23 @@ class RLExecutor():
             if self.state.target_reached:
                 self.logger.info("Target reached, exiting...")
                 break
-            if self.state.execs % self.config.save_frequency == 0:
-                self._export_state()
-            if self.seed_scheduler.is_empty() or self.state.execs % self.config.sync_frequency == 0:
-                self.synchronizer.run(run_once=True)
+            
+            if self.config.save_frequency > 0:
+                if self.state.execs % math.ceil(self.config.save_frequency) == 0:
+                    self._export_state()
+
+            if self.config.sync_frequency > 0:
+                if (self.seed_scheduler.is_empty() or 
+                    self.state.execs % math.ceil(self.config.sync_frequency) == 0):
+                    self.synchronizer.run(run_once=True)
+
+            if self.config.replay_frequency > 0: 
+                if (self.state.execs > 0 and 
+                    self.state.execs % math.ceil(self.config.replay_frequency)) == 0:
+                    repetition = math.ceil(1 / self.config.replay_frequency)
+                    for _ in range(repetition):
+                        self.replayer.offline_learning()
             self.concolic_executor.run(run_once=True)
-            if self.config.offline_learning_enabled:
-                self.replayer.offline_learning()
 
     def cleanup(self):
         self._export_state()
