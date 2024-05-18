@@ -300,7 +300,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n) {
   if (is_constant_label(label0) || is_kind_of_label(label0, Alloca)) {
     bool same = true;
     for (uptr i = 1; i < n; i++) {
-      if (ls[i] != label0) {
+      if (ls[i] == kInitializingLabel) return kInitializingLabel;
+      else if (ls[i] != label0) {
         same = false;
         break;
       }
