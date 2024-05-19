@@ -1672,7 +1672,7 @@ void TaintFunction::loadShadowRecursive(
       uint64_t Offset = ElemSize * Idx;
       assert(Offset <= Size);
       // get the address of the array element
-      Value *SubAddr = IRB.CreateConstGEP1_32(ElemTy, Addr, Idx);
+      Value *SubAddr = IRB.CreateConstGEP2_32(AT, Addr, 0, Idx);
       loadShadowRecursive(Shadow, Indices, ElemTy,
                           SubAddr, Size - Offset, Align, IRB);
       Indices.pop_back();
@@ -1689,7 +1689,7 @@ void TaintFunction::loadShadowRecursive(
       assert(Offset <= Size);
       Type *ElemTy = ST->getElementType(Idx);
       // get the address of the struct field
-      Value *SubAddr = IRB.CreateConstGEP2_32(ElemTy, Addr, 0, Idx);
+      Value *SubAddr = IRB.CreateConstGEP2_32(ST, Addr, 0, Idx);
       loadShadowRecursive(Shadow, Indices, ElemTy,
                           SubAddr, Size - Offset, Align, IRB);
       Indices.pop_back();
@@ -1792,7 +1792,7 @@ void TaintFunction::storeShadowRecursive(
       uint64_t Offset = ElemSize * Idx;
       assert(Offset <= Size);
       // get the address of the array element
-      Value *SubAddr = IRB.CreateConstGEP1_32(ElemTy, Addr, Idx);
+      Value *SubAddr = IRB.CreateConstGEP2_32(AT, Addr, 0, Idx);
       storeShadowRecursive(Shadow, Indices, ElemTy,
                            SubAddr, Size - Offset, Align, IRB);
       Indices.pop_back();
@@ -1809,7 +1809,7 @@ void TaintFunction::storeShadowRecursive(
       assert(Offset <= Size);
       Type *ElemTy = ST->getElementType(Idx);
       // get the address of the struct field
-      Value *SubAddr = IRB.CreateConstGEP2_32(ElemTy, Addr, 0, Idx);
+      Value *SubAddr = IRB.CreateConstGEP2_32(ST, Addr, 0, Idx);
       storeShadowRecursive(Shadow, Indices, ElemTy,
                            SubAddr, Size - Offset, Align, IRB);
       Indices.pop_back();
