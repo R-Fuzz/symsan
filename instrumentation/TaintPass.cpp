@@ -641,7 +641,7 @@ FunctionType *Taint::getTrampolineFunctionType(FunctionType *T) {
   // ArgTypes.append(T->getNumParams(), PrimitiveShadowTy);
   Type *RetType = T->getReturnType();
   if (!RetType->isVoidTy())
-    ArgTypes.push_back(getShadowTy(RetType));
+    ArgTypes.push_back(PointerType::getUnqual(getShadowTy(RetType)));
   return FunctionType::get(T->getReturnType(), ArgTypes, false);
 }
 
