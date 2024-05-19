@@ -28,20 +28,73 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 static char *obj_path;       /* Path to runtime libraries         */
 static char **cc_params;     /* Parameters passed to the real CC  */
 static u32 cc_par_cnt = 1;   /* Param count, including argv0      */
 static u8 is_cxx = 0;
 static u8 use_native_cxx = 0;
 
+/* Try to find the executable from PATH */
+static char *find_executable_in_path(const char *filename) {
+  char *path = getenv("PATH");
+  if (path == NULL) {
+    FATAL("Cannot get PATH env");
+    return NULL;
+  }
+
+  char *prev = path;
+  char full_path[PATH_MAX];
+  size_t filename_len = strlen(filename);
+  while (1) {
+    char *colon = strstr(prev, ":");
+    size_t len = colon ? colon - prev : strlen(prev);
+    if (len + 1 + filename_len + 1 >= PATH_MAX) {
+      WARNF("Path too long: %s", prev);
+      continue;
+    }
+
+    // Construct the full path
+    memcpy(full_path, prev, len);
+    full_path[len] = '/';
+    memcpy(full_path + len + 1, filename, filename_len + 1);
+
+    // Check if the file exists and is executable
+    if (access(full_path, X_OK) == 0) {
+      return ck_strdup(full_path);
+    }
+
+    if (colon == NULL || *(colon + 1) == '\0') {
+      break;
+    }
+    prev = colon + 1;
+  }
+
+  return NULL;
+}
+
 /* Try to find the runtime libraries. If that fails, abort. */
 static void find_obj(const char *argv0) {
 
   char *slash, *tmp;
-  char path[4096];
+  char path[PATH_MAX];
 
-  if (!realpath(argv0, path)) {
-    FATAL("Cannot get real path of the compiler (%s): %s", argv0, strerror(errno));
+  if (strchr(argv0, '/') == NULL) {
+    char *exec_path = find_executable_in_path(argv0);
+    if (exec_path == NULL) {
+      FATAL("Cannot find the compiler (%s) in PATH", argv0);
+    }
+    if (!realpath(exec_path, path)) {
+      FATAL("Cannot get real path of the compiler (%s): %s", exec_path, strerror(errno));
+    }
+    ck_free(exec_path);
+  } else {
+    if (!realpath(argv0, path)) {
+      FATAL("Cannot get real path of the compiler (%s): %s", argv0, strerror(errno));
+    }
   }
 
   slash = strrchr(path, '/');
