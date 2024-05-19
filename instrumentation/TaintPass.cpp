@@ -953,7 +953,8 @@ Taint::buildWrapperFunction(Function *F, StringRef NewFName,
       AttributeFuncs::typeIncompatible(NewFT->getReturnType()));
 
   BasicBlock *BB = BasicBlock::Create(*Ctx, "entry", NewF);
-  if (F->isVarArg()) {
+  if (F->isVarArg() && getWrapperKind(F) != WK_Custom) {
+    // keep the invocation if custom (e.g., open)
     NewF->removeAttributes(AttributeList::FunctionIndex,
                            AttrBuilder().addAttribute("split-stack"));
     CallInst::Create(TaintVarargWrapperFn,
