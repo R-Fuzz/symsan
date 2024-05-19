@@ -153,6 +153,11 @@ static void add_taint_pass() {
     cc_params[cc_par_cnt++] = "-taint-trace-float-pointer";
   }
 
+  if (getenv("KO_NO_TRACE_BOUND")) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = "-taint-trace-bound=false";
+  }
+
   if (is_cxx && getenv("KO_USE_NATIVE_LIBCXX")) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] =
