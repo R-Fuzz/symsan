@@ -30,8 +30,9 @@
 
 static char *obj_path;       /* Path to runtime libraries         */
 static char **cc_params;     /* Parameters passed to the real CC  */
-static u32 cc_par_cnt = 1; /* Param count, including argv0      */
+static u32 cc_par_cnt = 1;   /* Param count, including argv0      */
 static u8 is_cxx = 0;
+static u8 use_native_cxx = 0;
 
 /* Try to find the runtime libraries. If that fails, abort. */
 static void find_obj(const char *argv0) {
@@ -95,13 +96,12 @@ static void add_runtime() {
 
   cc_params[cc_par_cnt++] = alloc_printf("-Wl,-T%s/../lib/symsan/taint.ld", obj_path);
 
-  if (is_cxx && !getenv("KO_USE_NATIVE_LIBCXX")) {
-    cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
+  if (is_cxx && !use_native_cxx) {
+    // cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libc++.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libc++abi.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libunwind.a", obj_path);
-    cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
-    // cc_params[cc_par_cnt++] = alloc_printf("-L%s/../lib/symsan/", obj_path);
+    // cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
   } else {
     cc_params[cc_par_cnt++] = "-lc++";
     cc_params[cc_par_cnt++] = "-lc++abi";
@@ -158,7 +158,7 @@ static void add_taint_pass() {
     cc_params[cc_par_cnt++] = "-taint-trace-bound=false";
   }
 
-  if (is_cxx && getenv("KO_USE_NATIVE_LIBCXX")) {
+  if (is_cxx && use_native_cxx) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] =
         alloc_printf("-taint-abilist=%s/../lib/symsan/libc++_abilist.txt", obj_path);
@@ -189,6 +189,8 @@ static void edit_params(u32 argc, char **argv) {
   }
 
   maybe_assembler = check_if_assembler(argc, argv);
+
+  use_native_cxx = getenv("KO_USE_NATIVE_LIBCXX") ? 1 : 0;
 
   /* Detect stray -v calls from ./configure scripts. */
   if (argc == 1 && !strcmp(argv[1], "-v"))
@@ -222,6 +224,19 @@ static void edit_params(u32 argc, char **argv) {
 
     if (!strcmp(cur, "-Wl,-z,defs") || !strcmp(cur, "-Wl,--no-undefined"))
       continue;
+
+    if (strstr(cur, "-stdlib=") == cur) {
+      // XXX: use native if the target prefers stdlibc++?
+      continue;
+    }
+
+    if (!strcmp(cur, "-lc++") || !strcmp(cur, "-lc++abi") || !strcmp(cur, "-lunwind") ||
+        strstr(cur, "-l:libc++.so") == cur ||
+        strstr(cur, "-l:libc++abi.so") == cur ||
+        strstr(cur, "-l:libunwind.so") == cur) {
+      // skip libc++, libc++abi, and libunwind
+      continue;
+    }
 
     cc_params[cc_par_cnt++] = cur;
   }
@@ -269,7 +284,7 @@ static void edit_params(u32 argc, char **argv) {
     cc_params[cc_par_cnt++] = "-funroll-loops";
   }
 
-  if (is_cxx && !getenv("KO_USE_NATIVE_LIBCXX")) {
+  if (is_cxx && !use_native_cxx) {
     // FIXME: or use the same header
     // cc_params[cc_par_cnt++] = alloc_printf("-I%s/../include/c++/v1", obj_path);
     cc_params[cc_par_cnt++] = "-stdlib=libc++";
