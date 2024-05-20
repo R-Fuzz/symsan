@@ -1,3 +1,4 @@
+import abc
 import copy
 import logging
 import math
@@ -47,15 +48,16 @@ class ProgramState:
         return (self.state, self.action, self.d, self.bid)
 
 
-class RewardCalculator:
+class RewardCalculator(abc.ABC):
     def __init__(self, config, min_distance, trace, nested_cond_unsat_sas):
         self.config = config
         self.min_distance = min_distance
         self.trace = trace
         self.nested_cond_unsat_sas = nested_cond_unsat_sas
 
+    @abc.abstractmethod
     def compute_reward(self, i):
-        raise NotImplementedError("This method should be overridden by subclass")
+        pass
 
 
 class DistanceRewardCalculator(RewardCalculator):
@@ -64,23 +66,24 @@ class DistanceRewardCalculator(RewardCalculator):
         self.local_min_indices = find_local_min([s.d for s in trace])
 
     def compute_reward(self, i):
-        # Did not reach the target
-        if i >= len(self.trace) and self.min_distance > 0:
-                return -float('inf')
-        if i >= len(self.trace) and self.min_distance == 0:
-            return self.config.max_distance
+        # Reward at the terminal state
         if i >= len(self.trace):
-            return 0
+            # Did not reach the target
+            if self.min_distance > 0:
+                    return -self.config.max_distance
+            # Reached the target
+            elif self.min_distance == 0:
+                return self.config.max_distance
+            else:
+                return 0
         d = self.trace[i].d
+        # Reached the target
         if d == 0:
             return self.config.max_distance
         # found local optimum
-        else:
-            if i in self.local_min_indices:
-                return (1000 / d) * (1000 / d) * self.config.max_distance
-            sa = self.trace[i].sa
-            if sa in self.nested_cond_unsat_sas:
-                return -d
+        if i in self.local_min_indices:
+            return (1000 / d) * (1000 / d) * self.config.max_distance
+        return 0
 
 
 class ReachabilityRewardCalculator(RewardCalculator):
@@ -96,7 +99,16 @@ class ReachabilityRewardCalculator(RewardCalculator):
         # Default reward
         return Decimal(0)
 
-class MaxQLearner:
+class Learner(abc.ABC):
+    @abc.abstractmethod
+    def learn(self, last_s, next_s, last_reward):
+        pass
+    
+    @abc.abstractmethod
+    def punish_state(self, reversed_state):
+        pass
+
+class MaxQLearner(Learner):
     def __init__(self, m: model.RLModel, df, lr, md):
         self.model = m
         self.discount_factor = df
@@ -132,7 +144,7 @@ class MaxQLearner:
         terminal_state = ProgramState(distance=self.max_distance)
         self.learn(reversed_state, terminal_state, -self.max_distance)
 
-class AvgQLearner:
+class AvgQLearner(Learner):
     def __init__(self, m: model.RLModel, df, lr, md):
         self.model = m
         self.discount_factor = df

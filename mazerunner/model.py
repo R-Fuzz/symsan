@@ -185,8 +185,10 @@ class DistanceModel(RLModel):
 
     def Q_update(self, key, value):
         d = DistanceModel.q_to_distance(value)
+        if d >= self.config.max_distance:
+            d = float('inf')
         self.distance_table[key] = d
-        self.logger.debug(f"Q_update: key={key}, value={value}")
+        self.logger.debug(f"Q_update: key={key}, value={d}")
 
     def update_unreachable_Q(self, sa):
         self.Q_update(sa, -float('inf'))
@@ -238,7 +240,7 @@ class ReachabilityModel(RLModel):
         if d > self.config.max_distance * 2:
             d = float('inf')
         self.distance_table[key] = d
-        self.logger.debug(f"Q_update: key={key}, value={value}")
+        self.logger.debug(f"Q_update: key={key}, value={d}")
 
     def update_unreachable_Q(self, sa):
         self.Q_update(sa, ReachabilityModel.ZERO)
