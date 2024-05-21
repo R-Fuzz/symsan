@@ -431,13 +431,15 @@ class ExploreExecutor(Mazerunner):
 
     def _run(self):
         next_seed = self.seed_scheduler.pop()
-        if not next_seed is None and next_seed not in self.state.processed:
-            self.run_file(next_seed)
-            self.agent.train()
-            self.state.processed.add(next_seed)
-        else:
+        if next_seed is None:
             self.logger.info("Sleeping for getting seeds from AFL")
             time.sleep(WAITING_INTERVAL)
+            return
+        if next_seed in self.state.processed:
+            return
+        self.run_file(next_seed)
+        self.agent.train()
+        self.state.processed.add(next_seed)
 
 
 class ExploitExecutor(Mazerunner):
@@ -513,7 +515,7 @@ class ExploitExecutor(Mazerunner):
 
     def _run(self):
         next_seed = self.seed_scheduler.pop()
-        if next_seed:
+        if next_seed is not None:
             new_fp = self.run_file(next_seed)
             self.agent.train()
             self.state.processed.add(os.path.basename(new_fp))
