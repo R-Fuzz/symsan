@@ -2,6 +2,7 @@ import os
 import copy
 import subprocess
 import re
+import resource
 
 AT_FILE = "@@"
 MILLION_SECONDS_SCALE = 1000
@@ -30,14 +31,16 @@ def mkdir(dirp):
 
 def fix_at_file(cmd, testcase):
     cmd = copy.copy(cmd)
+    with open(testcase, "rb") as f:
+        file_content = f.read()
     if AT_FILE in cmd:
         idx = cmd.index(AT_FILE)
         cmd[idx] = testcase
         stdin = None
     else:
         with open(testcase, "rb") as f:
-            stdin = f.read()
-    return cmd, stdin
+            stdin = file_content
+    return cmd, stdin, file_content
 
 def get_distance_from_fn(filename):
     match = re.search(r'dis:(\d+)', filename)
@@ -88,3 +91,11 @@ def find_local_min(nums):
             min_vals.remove(num)
     
     return min_indices
+
+def disable_core_dump():
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except ValueError:
+        print(f"Failed to disable core dump. \n"
+                    f"Please try to set it manually by running: "
+                    f"'ulimit -c 0'")

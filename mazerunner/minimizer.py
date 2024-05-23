@@ -84,7 +84,7 @@ class TestcaseMinimizer:
                "--"
         ] + self.cmd
 
-        cmd, stdin = utils.fix_at_file(cmd, testcase)
+        cmd, stdin, _ = utils.fix_at_file(cmd, testcase)
         if stdin:
             result = subprocess.run(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
