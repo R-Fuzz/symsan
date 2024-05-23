@@ -318,6 +318,34 @@ static PyObject* AddConstraint(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject* RecordMemcmp(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  dfsan_label label = 0;
+  PyObject *buf = NULL;
+
+  if (!PyArg_ParseTuple(args, "IS", &label, &buf)) {
+    return NULL;
+  }
+
+  Py_ssize_t size;
+  char *data;
+  if (PyBytes_AsStringAndSize(buf, &data, &size) != 0) {
+    // exception should have been set?
+    return NULL;
+  }
+
+  if (__z3_parser->record_memcmp(label, (uint8_t*)data, size) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to record memcmp");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyObject* SolveTask(PyObject *self, PyObject *args) {
   if (__z3_parser == nullptr) {
     PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
@@ -353,14 +381,15 @@ static PyObject* SolveTask(PyObject *self, PyObject *args) {
 static PyMethodDef SymSanMethods[] = {
   {"init", SymSanInit, METH_VARARGS, "initialize symsan target"},
   {"config", (PyCFunction)SymSanConfig, METH_VARARGS | METH_KEYWORDS, "config symsan"},
-  {"run", (PyCFunction)SymSanRun, METH_VARARGS, "run symsan target, optional stdin=file"},
+  {"run", (PyCFunction)SymSanRun, METH_VARARGS | METH_KEYWORDS, "run symsan target, optional stdin=file"},
   {"read_event", SymSanReadEvent, METH_VARARGS, "read a symsan event"},
   {"terminate", (PyCFunction)SymSanTerminate, METH_NOARGS, "terminate current symsan instance"},
   {"destroy", (PyCFunction)SymSanDestroy, METH_NOARGS, "destroy symsan target"},
-  {"init_parser", InitParser, METH_VARARGS, "initialize symbolic expression parser"},
+  {"reset_input", InitParser, METH_VARARGS, "reset the symbolic expression parser with a new input"},
   {"parse_cond", ParseCond, METH_VARARGS, "parse trace_cond event into solving tasks"},
   {"parse_gep", ParseGEP, METH_VARARGS, "parse trace_gep event into solving tasks"},
   {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},
+  {"record_memcmp", RecordMemcmp, METH_VARARGS, "record a memcmp event"},
   {"solve_task", SolveTask, METH_VARARGS, "solve a task"},
   {NULL, NULL, 0, NULL}  /* Sentinel */
 };
