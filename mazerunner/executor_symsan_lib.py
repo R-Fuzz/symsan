@@ -45,11 +45,10 @@ class ConcolicExecutor:
         symsan.destroy()
 
     def get_result(self):
-        # TODO: implement stream reader thread in case the subprocess closes
-            return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
-                                  self.timer.solving_time, self.agent.min_distance, 
-                                  self.proc.returncode, self.msg_num, 
-                                  self.generated_files, self.proc.stdout, self.proc.stderr)
+        return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
+                                self.timer.solving_time, self.agent.min_distance, 
+                                self.proc.returncode, self.msg_num, 
+                                self.generated_files, self.proc.stdout, self.proc.stderr)
 
     def setup(self, input_file, session_id=0):
         self._session_id = session_id
@@ -106,7 +105,8 @@ class ConcolicExecutor:
             elif msg.msg_type == MsgType.gep_type.value:
                 self._process_gep_request(msg)
             elif msg.msg_type == MsgType.memcmp_type.value:
-                self.solver.handle_memcmp(msg, self.pipefds[0])
+                # TODO: self.solver.handle_memcmp(msg, self.pipefds[0])
+                pass
             elif msg.msg_type == MsgType.fsize_type.value:
                 pass
             elif msg.msg_type == MsgType.fini_type.value:

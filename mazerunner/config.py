@@ -13,6 +13,7 @@ SYNC_FREQUENCY = 10 # sync mazerunner status with AFL every SYNC_FREQUENCY execu
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 REPLAY_FREQUENCY = 0 # off-learning from replay buffer every REPLAY_FREQUENCY executions.
 # Solver configurations
+USE_BUILTIN_SOLVER = True
 MAX_DISTANCE = float(0x7FFFFFFFFFFFFFFF)
 NESTED_BRANCH_ENABLED = True
 GEP_SOLVER_ENABLED = False
@@ -67,6 +68,7 @@ class Config:
                  'initial_policy',
                  'static_result_folder',
                  'use_ordered_dict',
+                 'use_builtin_solver',
     ]
 
     def __init__(self):
@@ -145,6 +147,7 @@ class Config:
         self.decimal_precision = DECIMAL_PRECISION
         self.max_branch_num = MAX_BRANCH_NUM
         self.use_ordered_dict = USE_ORDERED_DICT
+        self.use_builtin_solver = USE_BUILTIN_SOLVER
         # The other configurations need to be set explicitly by config file or cmd arguments
         self.model_type = RLModelType.unknown
         self.afl_dir = ''

@@ -9,8 +9,9 @@ import shutil
 import sys
 import time
 
+import executor
+import executor_symsan_lib
 from agent import Agent, ExploreAgent, ExploitAgent, RecordAgent
-from executor import ConcolicExecutor
 from seed_scheduler import FILOScheduler, PrioritySamplingScheduler, RealTimePriorityScheduler
 
 import minimizer
@@ -362,7 +363,10 @@ class SymSanExecutor(Mazerunner):
         super().__init__(config, shared_state)
         config.gep_solver_enabled = True
         self.agent = Agent(config)
-        self.symsan = ConcolicExecutor(self.config, self.agent, self.my_generations)
+        if config.use_builtin_solver:
+            self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+        else:
+            self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
 
     def sync_back_if_interesting(self, fp, res):
         old_idx = self.state.index
@@ -398,8 +402,10 @@ class ExploreExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = ExploreAgent(self.config)
-        self.symsan = ConcolicExecutor(self.config, self.agent, self.my_generations)
-
+        if config.use_builtin_solver:
+            self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+        else:
+            self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
 
     def update_timmer(self, res):
         try:
@@ -446,7 +452,10 @@ class ExploitExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = ExploitAgent(self.config)
-        self.symsan = ConcolicExecutor(self.config, self.agent, self.my_generations)
+        if config.use_builtin_solver:
+            self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+        else:
+            self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
 
     def run_target(self):
         total_time = emulation_time = solving_time = 0
@@ -530,7 +539,10 @@ class RecordExecutor(Mazerunner):
         self.record_enabled = record_enabled
         if self.record_enabled:
             self.agent = RecordAgent(config)
-            self.symsan = ConcolicExecutor(self.config, self.agent, self.my_generations)
+            if config.use_builtin_solver:
+                self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+            else:
+                self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
 
     def sync_back_if_interesting(self, fp, res):
         fn = os.path.basename(fp)
