@@ -13,12 +13,12 @@ class ConcolicExecutor:
     
     class Timer:
         def reset(self):
-            self.proc_start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            self.proc_start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             self.proc_end_time = self.proc_start_time
             self.solving_time = 0
 
         def execution_timeout(self, timeout):
-            curr_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            curr_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             total_time = curr_time - self.proc_start_time
             return total_time >= timeout * utils.MILLION_SECONDS_SCALE
 
@@ -43,12 +43,14 @@ class ConcolicExecutor:
 
     def tear_down(self):
         symsan.destroy()
+        self.timer.proc_end_time = (time.time() * utils.MILLION_SECONDS_SCALE)
 
     def get_result(self):
+        # TODO: invoke symsan.get_proc_status()
         return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
                                 self.timer.solving_time, self.agent.min_distance, 
-                                self.proc.returncode, self.msg_num, 
-                                self.generated_files, self.proc.stdout, self.proc.stderr)
+                                0, self.msg_num, 
+                                self.generated_files, None, None)
 
     def setup(self, input_file, session_id=0):
         self._session_id = session_id
@@ -83,7 +85,7 @@ class ConcolicExecutor:
             e = symsan.read_event(ctypes.sizeof(pipe_msg))
             if len(e) < ctypes.sizeof(pipe_msg):
                 break
-            start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             msg = pipe_msg.from_buffer_copy(e)
             self.logger.debug(
                 "process_request: received msg. "
@@ -113,7 +115,7 @@ class ConcolicExecutor:
                 self.agent.min_distance = min(msg.result, self.agent.min_distance)
             else:
                 self.logger.error(f"process_request: Unknown message type: {msg.msg_type}")
-            end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            end_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             self.timer.solving_time += end_time - start_time
             self.msg_num += 1
 
