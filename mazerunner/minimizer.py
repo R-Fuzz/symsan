@@ -33,10 +33,29 @@ class TestcaseMinimizer:
         self.mazerunner_state = state
         self.cmd = cmd
         self.qemu_mode = qemu_mode
+        self.out_dir = out_dir
         self.showmap = None if not afl_path else os.path.join(afl_path, "afl-showmap")
-        self.fuzzer_bitmap_file = os.path.join(out_dir, "fuzz_bitmap")
-        _, self.temp_file = tempfile.mkstemp(dir=out_dir)
-        self.my_bitmap = self.load_or_initialize_bitmap()
+        self._fuzzer_bitmap_file = None
+        self._temp_file = None
+        self._my_bitmap = None
+    
+    @property
+    def my_bitmap(self):
+        if self._my_bitmap is None:
+            self._my_bitmap = self.load_or_initialize_bitmap()
+        return self._my_bitmap
+    
+    @property
+    def temp_file(self):
+        if self._temp_file is None:
+            _, self._temp_file = tempfile.mkstemp(dir=self.out_dir)
+        return self._temp_file
+    
+    @property
+    def fuzzer_bitmap_file(self):
+        if self._fuzzer_bitmap_file is None:
+            self._fuzzer_bitmap_file = os.path.join(self.out_dir, "fuzzer_bitmap")
+        return self._fuzzer_bitmap_file
 
     def load_or_initialize_bitmap(self):
         map_size = self._get_map_size(self.fuzzer_bitmap_file)
@@ -108,8 +127,10 @@ class TestcaseMinimizer:
         return interesting
 
     def cleanup(self):
-        if os.path.exists(self.temp_file):
-            os.unlink(self.temp_file)
+        if self._temp_file is None:
+            return
+        if os.path.exists(self._temp_file):
+            os.unlink(self._temp_file)
 
     def _get_map_size(self, bitmap_file):
         if os.path.exists(bitmap_file):
