@@ -20,6 +20,8 @@ class SortedDict:
     def __setitem__(self, key, value):
         if self.need_sort:
             if key in self.data:
+                if self.data[key] == value:
+                    return
                 self.remove(key, mark_only=True)
             heapq.heappush(self.heap, (value, key[2], key))
         self.data[key] = value
@@ -76,7 +78,14 @@ class SortedDict:
     def rebuild_heap(self):
         if not self.need_sort:
             return
-        self.heap = [(-v, k[2], k) for k, v in self.data.items() if k in self.data]
+        new_heap = []
+        for (v, c, k) in self.heap:
+            if k not in self.data:
+                continue
+            if self.data[k] != v:
+                continue
+            new_heap.append((v, c, k))
+        self.heap = new_heap
         heapq.heapify(self.heap)
 
 
