@@ -6,6 +6,7 @@ import subprocess
 import ctypes
 import logging
 import resource
+import threading
 import time
 from enum import Enum
 from multiprocessing import shared_memory
@@ -36,8 +37,8 @@ class ExecutorResult:
         self.symsan_msg_num = msg_num
         self.generated_testcases = testcases
         self.flipped_times = 0
-        self.stdout = out if out else "Output not available"
-        self.stderr = err if err else "Unknown error"
+        self.stdout = out if out else "stdout not available"
+        self.stderr = err if err else "stderr not available"
 
     @property
     def emulation_time(self):
@@ -61,6 +62,42 @@ class ConcolicExecutor:
             curr_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
             total_time = curr_time - self.proc_start_time
             return total_time >= timeout * utils.MILLION_SECONDS_SCALE
+        
+    class SubprocessIOReader:
+        def __init__(self, io):
+            self.stream = io
+            self.data = ''
+            self.should_stop = False
+            if self.is_io_valid:
+                self._set_non_blocking()
+        
+        @property
+        def is_io_valid(self):
+            if not self.stream:
+                return False
+            if self.stream.closed:
+                return False
+            return True
+
+        def _set_non_blocking(self):
+            fd = self.stream.fileno()
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+        def read(self):
+            while not self.should_stop:
+                try:
+                    if not self.is_io_valid:
+                        break
+                    line = self.stream.readline()
+                    if not line:
+                        continue
+                    self.data += line.decode('utf-8')
+                except BlockingIOError:
+                    time.sleep(0.1)
+                except Exception:
+                    logging.error(f"SubprocessIOReader: Failed to read output")
+                    break
 
     def __init__(self, config, agent, output_dir):
         self.config = config
@@ -84,7 +121,7 @@ class ConcolicExecutor:
 
     @property
     def has_terminated(self):
-        if not self.proc:
+        if self.proc is None:
             return True
         if self.proc.poll() is not None:
             return True
@@ -100,17 +137,20 @@ class ConcolicExecutor:
             self.shm = None
 
     def kill_proc(self):
+        self.stdout_reader.should_stop = True
+        self.stderr_reader.should_stop = True
         if not self.has_terminated:
+            if self.proc.stdout: self.proc.stdout.close()
+            if self.proc.stderr: self.proc.stderr.close()
             self.proc.kill()
             self.proc.wait()
         self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
 
     def get_result(self):
-        # TODO: implement stream reader thread in case the subprocess closes
             return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
                                   self.timer.solving_time, self.agent.min_distance, 
                                   self.proc.returncode, self.msg_num, 
-                                  self.solver.generated_files, self.proc.stdout, self.proc.stderr)
+                                  self.solver.generated_files, self.stdout_reader.data, self.stderr_reader.data)
 
     def setup(self, input_file, session_id=0):
         self.input_file = input_file
@@ -130,6 +170,7 @@ class ConcolicExecutor:
     def run(self, timeout=None):
         # create and execute the child symsan process
         logging_level = 1 if self.logging_level == logging.DEBUG else 0
+        subprocess_io = subprocess.PIPE if self.logging_level == 1 else subprocess.DEVNULL
         cmd, stdin = utils.fix_at_file(self.cmd, self.input_file)
         taint_file = "stdin" if stdin else self.input_file
         options = (f"taint_file=\"{taint_file}\""
@@ -145,7 +186,7 @@ class ConcolicExecutor:
             if stdin:
                 # the symsan proc reads the input from stdin
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             stdout=subprocess_io, stderr=subprocess_io,
                                              env=current_env,
                                              pass_fds=(self.shm._fd, self.pipefds[1]))
                 self.proc.stdin.write(stdin)
@@ -153,7 +194,7 @@ class ConcolicExecutor:
             else:
                 # the symsan proc reads the input from file stream
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             stdout=subprocess_io, stderr=subprocess_io,
                                              env=current_env,
                                              pass_fds=(self.shm._fd, self.pipefds[1]))
         except Exception as e:
@@ -162,6 +203,12 @@ class ConcolicExecutor:
                                  f"CMD: {' '.join(cmd)}")
             self.tear_down()
             sys.exit(1)
+        self.stdout_reader = ConcolicExecutor.SubprocessIOReader(self.proc.stdout)
+        self.stderr_reader = ConcolicExecutor.SubprocessIOReader(self.proc.stderr)
+        self.stdout_thread = threading.Thread(target=self.stdout_reader.read)
+        self.stderr_thread = threading.Thread(target=self.stderr_reader.read)
+        self.stdout_thread.start()
+        self.stderr_thread.start()
         os.close(self.pipefds[1])
         self.pipefds[1] = None
 
@@ -241,9 +288,9 @@ class ConcolicExecutor:
         if solving_status == SolvingStatus.UNSOLVED_TIMEOUT:
             self.agent.handle_unsat_condition(solving_status)
         if solving_status == SolvingStatus.SOLVED_OPT_NESTED_UNSAT:
-            self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
+            self.agent.handle_nested_unsat_condition()
         if solving_status == SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT:
-            self.agent.handle_nested_unsat_condition(self.solver.get_sa_dep())
+            self.agent.handle_nested_unsat_condition()
         return solving_status
 
     def _process_gep_request(self, msg):
@@ -263,15 +310,17 @@ class ConcolicExecutor:
         if self.pipefds[0] is not None:
             try:
                 os.close(self.pipefds[0])
-                self.pipefds[0] = None
             except OSError:
                 self.logger.warning("Failed to close pipefds[0] for read")
+            finally:
+                self.pipefds[0] = None
         if self.pipefds[1] is not None:
             try:
                 os.close(self.pipefds[1])
-                self.pipefds[1] = None
             except OSError:
                 self.logger.warning("Failed to close pipefds[1] for write")
+            finally:
+                self.pipefds[1] = None
         self.pipefds = None
 
     def _setup_pipe(self):

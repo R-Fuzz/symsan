@@ -38,6 +38,7 @@ if __name__ == "__main__":
     options = os.environ['TAINT_OPTIONS']
     if "debug=1" in options:
         logging.basicConfig(level=logging.DEBUG)
+        config.logging_level = logging.DEBUG
     else:
         logging.basicConfig(level=logging.INFO)
     output_seed_dir = "."
@@ -61,7 +62,7 @@ if __name__ == "__main__":
                 f"Solver={symsan_res.solving_time}ms, "
                 f"Return={symsan_res.returncode}, "
                 f"Distance={symsan_res.distance}, "
-                f"Msg_count={symsan_res.symsan_msg_num}. "
+                f"Msg_count={symsan_res.symsan_msg_num}. \n"
                 f"stdout:\n{symsan_res.stdout}\n"
                 f"stderr:\n{symsan_res.stderr}\n"
             )

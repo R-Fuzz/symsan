@@ -464,7 +464,7 @@ class Z3Solver:
         if r_opt == z3.unsat:
             return SolvingStatus.UNSOLVED_OPT_UNSAT
         elif r_opt == z3.unknown:
-            self.logger.warning(f"__solve_expr: opt solving timeout for {e}")
+            self.logger.warning(f"__solve_expr: opt solving timeout")
             return SolvingStatus.UNSOLVED_TIMEOUT
         # optimistic sat, check nested
         self.__z3_solver.push()
@@ -486,10 +486,10 @@ class Z3Solver:
             if not has_generated:
                 status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
             elif r_nested == z3.unknown:
-                self.logger.warning(f"__solve_expr: nested solving timeout for {e}")
+                self.logger.warning(f"__solve_expr: nested solving timeout")
                 status = SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT
             elif r_nested == z3.unsat:
-                self.logger.debug(f"__solve_expr: nested solving unsat for {e}")
+                self.logger.debug(f"__solve_expr: nested solving unsat")
                 status = SolvingStatus.SOLVED_OPT_NESTED_UNSAT
             else:
                 status = SolvingStatus.UNSOLVED_UNKNOWN
