@@ -48,6 +48,9 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout);
 /// @brief terminate target binary
 int symsan_terminate();
 
+/// @brief retrieve exit status
+int symsan_get_exit_status(int *status);
+
 /// @brief teardown shared men
 void symsan_destroy();
 

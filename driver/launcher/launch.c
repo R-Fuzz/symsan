@@ -46,6 +46,9 @@ struct symsan_config {
   int enable_bounds_check;
 
   int dev_null_fd;
+
+  int exit_status;
+  int is_killed;
 };
 
 static struct symsan_config g_config;
@@ -72,6 +75,9 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   g_config.is_input_network = 0;
   g_config.enable_debug = 0;
   g_config.enable_bounds_check = 0;
+  g_config.dev_null_fd = -1;
+  g_config.exit_status = 0;
+  g_config.is_killed = 0;
 
   // open /dev/null
   g_config.dev_null_fd = open("/dev/null", O_RDWR);
@@ -239,6 +245,7 @@ int symsan_run(int fd) {
   }
 
   close(g_config.pipefds[1]); // close the write fd
+  g_config.is_killed = 0; // reset kill flag
 
   return 0;
 }
@@ -270,11 +277,12 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
   } else {
     // time out or error on select
     kill(g_config.symsan_pid, SIGKILL);
+    g_config.is_killed = 1;
   }
 
   if (n != size) {
     // error or EOF
-    waitpid(g_config.symsan_pid, NULL, 0);
+    waitpid(g_config.symsan_pid, &g_config.exit_status, 0);
     g_config.symsan_pid = -1;
     close(g_config.pipefds[0]); // close the read fd
   }
@@ -284,15 +292,29 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
 
 __attribute__((visibility("default")))
 int symsan_terminate() {
-  if (g_config.symsan_pid > 0) {
+  if (g_config.symsan_pid == -1) {
+    // already terminated
+    return 0;
+  } else if (g_config.symsan_pid > 0) {
     kill(g_config.symsan_pid, SIGKILL);
-    waitpid(g_config.symsan_pid, NULL, 0);
+    g_config.is_killed = 1;
+    waitpid(g_config.symsan_pid, &g_config.exit_status, 0);
     g_config.symsan_pid = -1;
     close(g_config.pipefds[0]);
     return 0;
   } else {
     return -1;
   }
+}
+
+__attribute__((visibility("default")))
+int symsan_get_exit_status(int *status) {
+  if (!status) {
+    return -1;
+  }
+
+  *status = g_config.exit_status;
+  return g_config.is_killed;
 }
 
 __attribute__((visibility("default")))

@@ -178,7 +178,15 @@ static PyObject* SymSanTerminate(PyObject *self) {
     PyErr_SetString(PyExc_RuntimeError, "failed to terminate target");
     return NULL;
   }
-  Py_RETURN_NONE;
+
+  int status, is_killed;
+  is_killed = symsan_get_exit_status(&status);
+
+  PyObject *ret = PyTuple_New(2);
+  PyTuple_SetItem(ret, 0, PyLong_FromLong(status));
+  PyTuple_SetItem(ret, 1, PyLong_FromLong(is_killed));
+
+  return ret;
 }
 
 static PyObject* SymSanDestroy(PyObject *self) {

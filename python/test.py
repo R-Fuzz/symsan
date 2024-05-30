@@ -61,5 +61,8 @@ while True:
         r, sol = symsan.solve_task(task)
         print(sol)
 
+status, is_killed = symsan.terminate()
+print(f"exit status {status}, killed? {is_killed}")
+
 symsan.destroy()
 
