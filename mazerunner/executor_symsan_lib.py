@@ -43,14 +43,15 @@ class ConcolicExecutor:
         utils.disable_core_dump()
 
     def tear_down(self):
-        symsan.destroy()
+        self.proc_returncode, is_killed = symsan.terminate()
+        if not is_killed:
+            symsan.destroy()
         self.timer.proc_end_time = (time.time() * utils.MILLION_SECONDS_SCALE)
 
     def get_result(self):
-        # TODO: invoke symsan.get_proc_status()
         return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
                                 self.timer.solving_time, self.agent.min_distance, 
-                                0, self.msg_num, 
+                                self.proc_returncode, self.msg_num, 
                                 self.generated_files, None, None)
 
     def setup(self, input_file, session_id=0):
@@ -61,6 +62,8 @@ class ConcolicExecutor:
         self.generated_files.clear()
         self.agent.reset()
         self.timer.reset()
+        # subprocess status
+        self.proc_returncode = None
 
     def run(self, timeout=None):
         # create and execute the child symsan process
@@ -142,8 +145,8 @@ class ConcolicExecutor:
         status = [] 
         for task in tasks:
             r, sol = symsan.solve_task(task)
-            solution += sol
             s = self._parse_solving_status(r)
+            solution += sol
             status.append(s)
         
         seed_info = ''
@@ -151,8 +154,9 @@ class ConcolicExecutor:
             reversed_sa = str(self.agent.curr_state.reversed_sa) if is_interesting else ''
             score = self.agent.compute_branch_score() if is_interesting else ''
             seed_info = f"{score}:{reversed_sa}"
-        self._generate_testcases(solution, seed_info)
         solving_status = self._handle_solving_status(status)
+        if solving_status in solved_statuses:
+            self._generate_testcases(solution, seed_info)
         return solving_status
 
     def _process_gep_request(self, msg):

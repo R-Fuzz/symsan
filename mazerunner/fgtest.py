@@ -57,6 +57,7 @@ if __name__ == "__main__":
     try:
         ce.process_request()
     finally:
+        ce.tear_down()
         if "debug=1" in options:
             symsan_res = ce.get_result()
             print(
@@ -69,4 +70,3 @@ if __name__ == "__main__":
                 f"stdout:\n{symsan_res.stdout}\n"
                 f"stderr:\n{symsan_res.stderr}\n"
             )
-        ce.tear_down()

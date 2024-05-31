@@ -71,6 +71,10 @@ class SolvingStatus(Enum):
     UNSOLVED_UNINTERESTING_COND = auto()
     UNSOLVED_UNKNOWN = auto()
 
+solved_statuses = {SolvingStatus.SOLVED_NESTED, 
+                   SolvingStatus.SOLVED_OPT_NESTED_UNSAT, 
+                   SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT}
+
 class MsgType(Enum):
     cond_type = 0
     gep_type = 1

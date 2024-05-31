@@ -13,7 +13,7 @@ SYNC_FREQUENCY = 10 # sync mazerunner status with AFL every SYNC_FREQUENCY execu
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 REPLAY_FREQUENCY = 0 # off-learning from replay buffer every REPLAY_FREQUENCY executions.
 # Solver configurations
-USE_BUILTIN_SOLVER = True
+USE_BUILTIN_SOLVER = False
 MAX_DISTANCE = float(0x7FFFFFFFFFFFFFFF)
 NESTED_BRANCH_ENABLED = True
 GEP_SOLVER_ENABLED = False
