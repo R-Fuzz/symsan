@@ -1,4 +1,5 @@
 import copy
+import re
 import symsan
 import os
 import ctypes
@@ -73,7 +74,7 @@ class ConcolicExecutor:
         else:
             symsan.config(self.input_file, args=cmd, debug=logging_level, bounds=0)
             symsan.run()
-        symsan.init_parser([self.input_content])
+        symsan.reset_input([self.input_content])
 
     def process_request(self):
         self.timer.solving_time = 0
@@ -106,9 +107,10 @@ class ConcolicExecutor:
                     should_handle = False
             elif msg.msg_type == MsgType.gep_type.value:
                 self._process_gep_request(msg)
-            elif msg.msg_type == MsgType.memcmp_type.value:
-                # TODO: self.solver.handle_memcmp(msg, self.pipefds[0])
-                pass
+            # msg.flags == 1 means there is additional data need to be processed
+            elif msg.msg_type == MsgType.memcmp_type.value and msg.flags == 1:
+                has_error = self._process_memcmp_request(msg)
+                if has_error: should_handle = False
             elif msg.msg_type == MsgType.fsize_type.value:
                 pass
             elif msg.msg_type == MsgType.fini_type.value:
@@ -156,6 +158,22 @@ class ConcolicExecutor:
     def _process_gep_request(self, msg):
         #TODO: implemnet gep solver
         pass
+    
+    def _process_memcmp_request(self, msg):
+        label = msg.label
+        size = msg.result
+        m = symsan.read_event(ctypes.sizeof(memcmp_msg) + size)
+        if len(m) < ctypes.sizeof(memcmp_msg) + size:
+            self.logger.error("error reading memcmp msg")
+            return True
+        buf = memcmp_msg.from_buffer_copy(m)
+        if buf.label != label:
+            self.logger.error("error reading memcmp msg")
+            return True
+        buf.content = m[ctypes.sizeof(memcmp_msg):]
+        self.logger.debug(f"memcmp content: {buf.content.hex()}")
+        symsan.record_memcmp(label, buf.content)     
+        return False
 
     def _generate_testcases(self, solution, seed_info):
         input_buf = copy.copy(bytearray(self.input_content))
