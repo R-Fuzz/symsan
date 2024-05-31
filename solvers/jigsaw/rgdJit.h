@@ -102,6 +102,7 @@ namespace rgd {
         FPM->add(llvm::createInstructionCombiningPass());
         FPM->add(llvm::createReassociatePass());
         FPM->add(llvm::createGVNPass());
+        FPM->add(llvm::createInstSimplifyLegacyPass());
         FPM->add(llvm::createCFGSimplificationPass());
         FPM->doInitialization();
 
