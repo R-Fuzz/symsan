@@ -219,10 +219,10 @@ class ConcolicExecutor:
             if s == SolvingStatus.UNSOLVED_UNKNOWN:
                 return SolvingStatus.UNSOLVED_UNKNOWN
             if s == SolvingStatus.SOLVED_OPT_NESTED_UNSAT:
-                self.agent.handle_nested_unsat_condition([])
+                self.agent.handle_nested_unsat_condition()
                 return SolvingStatus.SOLVED_OPT_NESTED_UNSAT
             if s == SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT:
-                self.agent.handle_nested_unsat_condition([])
+                self.agent.handle_nested_unsat_condition()
                 return SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT
             if s != SolvingStatus.SOLVED_NESTED:
                 nested_solved = False
