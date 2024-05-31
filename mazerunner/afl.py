@@ -321,8 +321,8 @@ class Mazerunner:
 
     def cleanup(self):
         self.minimizer.cleanup()
-        if self.symsan:
-            self.symsan.tear_down()
+        if not self.symsan is None:
+            self.symsan.tear_down(need_cleanup=True)
 
     def signal_handler(self, signum, frame):
         self.logger.info(f"Received signal {signum}, cleaning up...")

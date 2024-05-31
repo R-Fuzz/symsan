@@ -42,9 +42,11 @@ class ConcolicExecutor:
         self.gep_solver_enabled = config.gep_solver_enabled
         utils.disable_core_dump()
 
-    def tear_down(self):
+    def tear_down(self, need_cleanup=False):
         self.proc_returncode, is_killed = symsan.terminate()
-        if not is_killed:
+        if is_killed:
+            self.proc_returncode = -9
+        if need_cleanup:
             symsan.destroy()
         self.timer.proc_end_time = (time.time() * utils.MILLION_SECONDS_SCALE)
 
