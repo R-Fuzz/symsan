@@ -3,9 +3,10 @@ import sys
 import os
 import logging
 
+import executor_symsan_lib
+import executor
 from agent import Agent
 from config import Config
-from executor import ConcolicExecutor
 from utils import AT_FILE
 
 def print_usage_exit():
@@ -48,14 +49,18 @@ if __name__ == "__main__":
         print_usage_exit()
     input_file = options.split("taint_file=")[1].split(":")[0].split(" ")[0]
     fastgen_agent = Agent(config)
-    symsan = ConcolicExecutor(config, fastgen_agent, output_seed_dir)
-    symsan.setup(input_file)
-    symsan.run()
+    if config.use_builtin_solver:
+        ce = executor.ConcolicExecutor(config, fastgen_agent, output_seed_dir)
+    else:
+        ce = executor_symsan_lib.ConcolicExecutor(config, fastgen_agent, output_seed_dir)
+    ce.setup(input_file)
+    ce.run()
     try:
-        symsan.process_request()
+        ce.process_request()
     finally:
+        ce.tear_down()
         if "debug=1" in options:
-            symsan_res = symsan.get_result()
+            symsan_res = ce.get_result()
             print(
                 f"Total={symsan_res.total_time}ms, "
                 f"Emulation={symsan_res.emulation_time}ms, "
@@ -66,4 +71,3 @@ if __name__ == "__main__":
                 f"stdout:\n{symsan_res.stdout}\n"
                 f"stderr:\n{symsan_res.stderr}\n"
             )
-        symsan.tear_down()

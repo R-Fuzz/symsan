@@ -2,10 +2,11 @@ import ctypes
 from enum import Enum, auto
 
 class TaintFlag:
-    F_ADD_CONS = 0b0001
-    F_LOOP_EXIT = 0b0010
-    F_LOOP_LATCH = 0b0100
-    F_HAS_DISTANCE = 0b1000
+    F_MEMERR_UAF = 0b0001
+    F_MEMERR_OLB = 0b0010
+    F_MEMERR_OUB = 0b0100
+    F_ADD_CONS = 0b10000
+    F_HAS_DISTANCE = 0b100000
 
 class pipe_msg(ctypes.Structure):
     _pack_ = 1
@@ -69,3 +70,36 @@ class SolvingStatus(Enum):
     UNSOLVED_INVALID_MSG = auto()
     UNSOLVED_UNINTERESTING_COND = auto()
     UNSOLVED_UNKNOWN = auto()
+
+solved_statuses = {SolvingStatus.SOLVED_NESTED, 
+                   SolvingStatus.SOLVED_OPT_NESTED_UNSAT, 
+                   SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT}
+
+class MsgType(Enum):
+    cond_type = 0
+    gep_type = 1
+    memcmp_type = 2
+    fsize_type = 3
+    memerr_type = 4
+    fini_type = 5
+
+class ExecutorResult:
+    def __init__(self, total_time, solving_time, dist,
+                 returncode, msg_num, testcases, out, err):
+        self.total_time = total_time
+        self.solving_time = solving_time
+        self.distance = int(dist)
+        self.returncode = returncode
+        self.symsan_msg_num = msg_num
+        self.generated_testcases = testcases
+        self.flipped_times = 0
+        self.stdout = out if out else "Output not available"
+        self.stderr = err if err else "Unknown error"
+
+    @property
+    def emulation_time(self):
+        return self.total_time - self.solving_time
+    
+    def update_time(self, total_time, solving_time):
+        self.total_time = total_time
+        self.solving_time = solving_time

@@ -110,7 +110,7 @@ static void add_runtime() {
   } else {
     cc_params[cc_par_cnt++] = "-lc++";
     cc_params[cc_par_cnt++] = "-lc++abi";
-    cc_params[cc_par_cnt++] = "-lunwind";
+    cc_params[cc_par_cnt++] = "-l:libunwind.so.1";
   }
   cc_params[cc_par_cnt++] = "-lrt";
 

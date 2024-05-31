@@ -11,42 +11,13 @@ import time
 from enum import Enum
 from multiprocessing import shared_memory
 
-from backend_solver import Z3Solver
+from builtin_solver import Z3Solver
 from defs import *
 import utils
 from agent import ExploitAgent, RecordAgent, ExploreAgent
 
 UNION_TABLE_SIZE = 0xc00000000
 PIPE_CAPACITY = 4 * 1024 * 1024
-
-class MsgType(Enum):
-    cond_type = 0
-    gep_type = 1
-    memcmp_type = 2
-    fsize_type = 3
-    loop_type = 4
-    fini_type = 5
-
-class ExecutorResult:
-    def __init__(self, total_time, solving_time, dist,
-                 returncode, msg_num, testcases, out, err):
-        self.total_time = total_time
-        self.solving_time = solving_time
-        self.distance = int(dist)
-        self.returncode = returncode
-        self.symsan_msg_num = msg_num
-        self.generated_testcases = testcases
-        self.flipped_times = 0
-        self.stdout = out if out else "stdout not available"
-        self.stderr = err if err else "stderr not available"
-
-    @property
-    def emulation_time(self):
-        return self.total_time - self.solving_time
-    
-    def update_time(self, total_time, solving_time):
-        self.total_time = total_time
-        self.solving_time = solving_time
 
 class ConcolicExecutor:
     class InvalidGEPMessage(Exception):
@@ -117,7 +88,7 @@ class ConcolicExecutor:
         self.gep_solver_enabled = config.gep_solver_enabled
         self.should_increase_pipe_capacity = True
         self._setup_pipe()
-        self._disable_core_dump()
+        utils.disable_core_dump()
 
     @property
     def has_terminated(self):
@@ -171,7 +142,7 @@ class ConcolicExecutor:
         # create and execute the child symsan process
         logging_level = 1 if self.logging_level == logging.DEBUG else 0
         subprocess_io = subprocess.PIPE if self.logging_level == 1 else subprocess.DEVNULL
-        cmd, stdin = utils.fix_at_file(self.cmd, self.input_file)
+        cmd, stdin, _ = utils.fix_at_file(self.cmd, self.input_file)
         taint_file = "stdin" if stdin else self.input_file
         options = (f"taint_file=\"{taint_file}\""
         f":shm_fd={self.shm._fd}"
@@ -245,14 +216,10 @@ class ConcolicExecutor:
                     self.logger.error(f"process_request: slover panic, stop processing. "
                                       f"solving_status={solving_status}")
                     should_handle = False
-                if (msg.flags & TaintFlag.F_LOOP_EXIT) and (msg.flags & TaintFlag.F_LOOP_LATCH):
-                    self.logger.debug(f"Loop handle_loop_exit: id={msg.id}, target={hex(msg.addr)}")
             elif msg.msg_type == MsgType.gep_type.value:
                 self._process_gep_request(msg)
             elif msg.msg_type == MsgType.memcmp_type.value:
                 self.solver.handle_memcmp(msg, self.pipefds[0])
-            elif msg.msg_type == MsgType.loop_type.value:
-                self.logger.debug(f"handle_loop_enter: id={msg.id}, loop_header={hex(msg.addr)}")
             elif msg.msg_type == MsgType.fsize_type.value:
                 pass
             elif msg.msg_type == MsgType.fini_type.value:
@@ -343,11 +310,3 @@ class ConcolicExecutor:
             self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. \n"
                                 f"Please try to set it manually by running: "
                                 f"'echo {PIPE_CAPACITY} | sudo tee /proc/sys/fs/pipe-max-size' ")
-
-    def _disable_core_dump(self):
-        try:
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        except ValueError:
-            self.logger.warning(f"Failed to disable core dump. \n"
-                                f"Please try to set it manually by running: "
-                                f"'ulimit -c 0'")
