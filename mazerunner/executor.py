@@ -5,10 +5,8 @@ import fcntl
 import subprocess
 import ctypes
 import logging
-import resource
 import threading
 import time
-from enum import Enum
 from multiprocessing import shared_memory
 
 from builtin_solver import Z3Solver
@@ -80,6 +78,12 @@ class ConcolicExecutor:
         # resources
         self.pipefds = self.shm = self.proc = None
         self.solver = None
+        # Create and map shared memory
+        try:
+            self.shm = shared_memory.SharedMemory(create=True, size=UNION_TABLE_SIZE)
+        except:
+            self.logger.critical(f"setup: Failed to map shm({self.shm._fd}), size(shm.size)")
+            sys.exit(1)
         # options
         self.testcase_dir = output_dir
         self.record_mode_enabled = True if type(agent) is RecordAgent else False
@@ -98,14 +102,13 @@ class ConcolicExecutor:
             return True
         return False
 
-    def tear_down(self):
+    def tear_down(self, need_cleanup=False):
         if self.pipefds:
             self._close_pipe()
         self.kill_proc()
-        if self.shm:
+        if need_cleanup:
             self.shm.close()
             self.shm.unlink()
-            self.shm = None
 
     def kill_proc(self):
         self.stdout_reader.should_stop = True
@@ -126,12 +129,6 @@ class ConcolicExecutor:
     def setup(self, input_file, session_id=0):
         self.input_file = input_file
         self.msg_num = 0
-        # Create and map shared memory
-        try:
-            self.shm = shared_memory.SharedMemory(create=True, size=UNION_TABLE_SIZE)
-        except:
-            self.logger.critical(f"setup: Failed to map shm({self.shm._fd}), size(shm.size)")
-            sys.exit(1)
         self._setup_pipe()
         self.solver = Z3Solver(self.config, self.shm, self.input_file, 
                                self.testcase_dir, 0, session_id)
