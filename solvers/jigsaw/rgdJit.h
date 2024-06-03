@@ -103,7 +103,7 @@ namespace rgd {
         FPM->add(llvm::createReassociatePass());
         FPM->add(llvm::createGVNPass());
         FPM->add(llvm::createInstSimplifyLegacyPass());
-        FPM->add(llvm::createCFGSimplificationPass());
+        // FPM->add(llvm::createCFGSimplificationPass());
         FPM->doInitialization();
 
         // Run the optimizations over all functions in the module being added to
