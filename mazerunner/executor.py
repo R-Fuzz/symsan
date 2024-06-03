@@ -159,6 +159,7 @@ class ConcolicExecutor:
                                              pass_fds=(self.shm._fd, self.pipefds[1]))
                 self.proc.stdin.write(stdin)
                 self.proc.stdin.flush()
+                self.proc.stdin.close()
             else:
                 # the symsan proc reads the input from file stream
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
