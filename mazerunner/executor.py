@@ -121,10 +121,11 @@ class ConcolicExecutor:
         self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
 
     def get_result(self):
-            return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
-                                  self.timer.solving_time, self.agent.min_distance, 
-                                  self.proc.returncode, self.msg_num, 
-                                  self.solver.generated_files, self.stdout_reader.data, self.stderr_reader.data)
+        ret_code = self.proc.returncode if self.proc.returncode >= 0 else -self.proc.returncode
+        return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
+                            self.timer.solving_time, self.agent.min_distance, 
+                            ret_code, self.msg_num, 
+                            self.solver.generated_files, self.stdout_reader.data, self.stderr_reader.data)
 
     def setup(self, input_file, session_id=0):
         self.input_file = input_file

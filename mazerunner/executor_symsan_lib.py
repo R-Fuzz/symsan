@@ -45,7 +45,7 @@ class ConcolicExecutor:
     def tear_down(self, need_cleanup=False):
         self.proc_returncode, is_killed = symsan.terminate()
         if is_killed:
-            self.proc_returncode = -9
+            self.proc_returncode = 9
         if need_cleanup:
             symsan.destroy()
         self.timer.proc_end_time = (time.time() * utils.MILLION_SECONDS_SCALE)

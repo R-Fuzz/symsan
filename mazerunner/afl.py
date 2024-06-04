@@ -301,12 +301,16 @@ class Mazerunner:
         
         retcode = result.returncode
         fn = os.path.basename(fp)
-        if retcode in [124, -9]: # killed
+        if retcode in [124, 9]: # killed
             shutil.copy2(fp, os.path.join(self.my_hangs, fn))
             self.state.hang.add(fn)
-
-        # segfault or abort
-        if (retcode in [128 + 11, -11, 128 + 6, -6]):
+            
+        # Did we crash? The following comments are coming from AFL++'s comments.
+        # In a normal case, (abort or segfault) WIFSIGNALED(retcode) will be set.
+        # However, MSAN and LSAN use a special exit code.
+        # On top, a user may specify a custom AFL_CRASH_EXITCODE.
+        # TODO: handle MSAN, LSAN and custom exit codes
+        if os.WIFSIGNALED(retcode) or (retcode in {128 + 11, 11, 128 + 6, 6}):
             shutil.copy2(fp, os.path.join(self.my_errors, fn))
             self._report_error(fp, result.stderr)
 

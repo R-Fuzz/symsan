@@ -2022,7 +2022,7 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   unsigned size = DL.getTypeSizeInBits(Cond->getType());
   ConstantInt *Size = ConstantInt::get(TT.PrimitiveShadowTy, size);
   ConstantInt *Predicate = ConstantInt::get(TT.PrimitiveShadowTy, 32); // EQ, ==
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getBasicblockId(I->getParent()));
 
   for (auto C : I->cases()) {
     Value *CV = C.getCaseValue();
@@ -2644,7 +2644,7 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   Value *Shadow = getShadow(Condition);
   if (TT.isZeroShadow(Shadow))
     return;
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getBasicblockId(I->getParent()));
   IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, CID});
 }
 
