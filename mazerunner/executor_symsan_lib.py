@@ -52,7 +52,7 @@ class ConcolicExecutor:
 
     def get_result(self):
         return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
-                                self.timer.solving_time, self.agent.min_distance, 
+                                self.timer.solving_time, int(self.agent.min_distance),
                                 self.proc_returncode, self.msg_num, 
                                 self.generated_files, None, None)
 
@@ -137,9 +137,8 @@ class ConcolicExecutor:
             return SolvingStatus.UNSOLVED_INVALID_MSG
         if self.record_mode_enabled:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
-        is_interesting = self.agent.is_interesting_branch()
         tasks = symsan.parse_cond(msg.label, msg.result, msg.flags)
-        
+        is_interesting = self.agent.is_interesting_branch()
         if not is_interesting:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
         
@@ -153,8 +152,8 @@ class ConcolicExecutor:
         
         seed_info = ''
         if self.save_seed_info:
-            reversed_sa = str(self.agent.curr_state.reversed_sa) if is_interesting else ''
-            score = self.agent.compute_branch_score() if is_interesting else ''
+            reversed_sa = str(self.agent.curr_state.reversed_sa)
+            score = self.agent.compute_branch_score()
             seed_info = f"{score}:{reversed_sa}"
         solving_status = self._handle_solving_status(status)
         if solving_status in solved_statuses:

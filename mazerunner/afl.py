@@ -19,19 +19,6 @@ import utils
 
 WAITING_INTERVAL = 5
 
-# 'id:xxxx,src:yyyyy' -> 'id:xxxx'
-# 'id-xxx-xxxxxx-xx,src:yy-yyyyyy-yy' -> 'id-xxx-xxxxxx-xx'
-# 'idxxxxxxxx' -> 'idxxxxxxxx'
-def get_id_from_fn(s):
-    s_with_removed_sync = re.sub(r'(,?sync:[^,]*)', '', s)
-    s_with_removed_dis = re.sub(r'(,?dis:[^,]*)', '', s_with_removed_sync)
-    match = re.compile(r'id[^,]*').findall(s_with_removed_dis)
-    if not match:
-        return s_with_removed_dis
-    if 'id:' in match[0] and len(match[0]) >= len("id:......"):
-        return match[0][len("id:"):len("id:......")]
-    return match[0]
-
 def get_score(testcase):
     # New coverage is the best
     score1 = testcase.endswith("+cov")
@@ -65,7 +52,7 @@ class MazerunnerState:
         self.end_ts = None
         self.synced = set()
         self.hang = set()
-        self.processed = set()
+        self.processed = {}
         self.testscases_md5 = set()
         self.index = 0
         self.execs = 0
@@ -83,9 +70,9 @@ class MazerunnerState:
         return self.__dict__
 
     @property
-    def processed_num(self):
-        return len(self.processed)
-
+    def curr_ts(self):
+        return int(time.time() * utils.MILLION_SECONDS_SCALE - self.start_ts * utils.MILLION_SECONDS_SCALE)
+    
     @property
     def best_seed(self):
         return self._best_seed_info[0]
@@ -114,7 +101,6 @@ class MazerunnerState:
             t = self.timeout * 2
             self.timeout = t if t < max_timeout else max_timeout
             logger.info("Increase timeout %d -> %d" % (old_timeout, self.timeout))
-            self.processed = self.processed - self.hang
             return True
         else:
             logger.warn("Hit the maximum timeout")
@@ -223,7 +209,7 @@ class Mazerunner:
         return fp
 
     def run_target(self):
-        self.symsan.setup(self.cur_input, self.state.processed_num)
+        self.symsan.setup(self.cur_input, len(self.state.processed))
         timeout = self.state.timeout
         if self.symsan.record_mode_enabled:
             timeout = int(self.config.timeout / 10)
@@ -249,7 +235,7 @@ class Mazerunner:
         new_fp = fp
         fn = os.path.basename(fp)
         if 'dis:' not in fn:
-            new_fp = fp + f",dis:{res.distance:06}"
+            new_fp = fp + f",dis:{res.distance}"
         if 'time:' in fn and 'ts:' not in fn:
             new_fp = new_fp.replace('time:', 'ts:')
         if new_fp != fp:
@@ -263,11 +249,13 @@ class Mazerunner:
         files = []
         for name in os.listdir(self.afl_queue):
             path = os.path.join(self.afl_queue, name)
-            new_name = "id:" + get_id_from_fn(name) + f',sync:{self.afl}'
-            if os.path.isfile(path) and not new_name in self.state.synced:
+            if os.path.isfile(path) and not name in self.state.synced:
+                index = self.state.tick()
+                src_id = utils.get_id_from_fn(name)
+                new_name = f"id:{index:06},src:{src_id:06},sync:{self.afl},ts:{self.state.curr_ts}"
                 shutil.copy2(path, os.path.join(self.my_queue, new_name))
                 files.append(new_name)
-                self.state.synced.add(new_name)
+                self.state.synced.add(name)
         if need_sort:
             return sorted(files,
                         key=functools.cmp_to_key(
@@ -280,8 +268,10 @@ class Mazerunner:
         for name in os.listdir(self.config.initial_seed_dir):
             path = os.path.join(self.config.initial_seed_dir, name)
             if os.path.isfile(path) and not name in self.state.synced:
-                shutil.copy2(path, os.path.join(self.my_queue, name))
-                files.append(name)
+                index = self.state.tick()
+                new_name = f"id:{index:06},src:{name},sync:seed_dir,ts:{self.state.curr_ts}"
+                shutil.copy2(path, os.path.join(self.my_queue, new_name))
+                files.append(new_name)
                 self.state.synced.add(name)
         return files
 
@@ -376,7 +366,6 @@ class SymSanExecutor(Mazerunner):
         old_idx = self.state.index
         fn = os.path.basename(fp)
         num_testcase = 0
-        ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
         for t in res.generated_testcases:
             num_testcase += 1
             testcase = os.path.join(self.my_generations, t)
@@ -385,7 +374,8 @@ class SymSanExecutor(Mazerunner):
                 os.unlink(testcase)
                 continue
             index = self.state.tick()
-            q_fn = "id:%06d,src:%s,ts:%d" % (index, get_id_from_fn(fn), ts)
+            src_id = utils.get_id_from_fn(fn)
+            q_fn = f"id:{index:06},src:{src_id:06},ts:{self.state.curr_ts}"
             q_fp = os.path.join(self.my_queue, q_fn)
             shutil.move(testcase, q_fp)
         self.logger.info("Generated %d testcases" % num_testcase)
@@ -398,9 +388,7 @@ class SymSanExecutor(Mazerunner):
             time.sleep(WAITING_INTERVAL)
             return
         for fn in files:
-            fp = self.run_file(fn)
-            fn = os.path.basename(fp)
-            self.state.processed.add(fn)
+            self.run_file(fn)
 
 class ExploreExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
@@ -421,7 +409,6 @@ class ExploreExecutor(Mazerunner):
         fn = os.path.basename(fp)
         if self.minimizer.has_closer_distance(res.distance, fn):
             self.logger.info(f"Explore agent found closer distance={res.distance}")
-        ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
         self.agent.save_trace(fn)
         # rename or delete generated testcases from fp
         self.logger.info("Generated %d testcases" % len(res.generated_testcases))
@@ -431,7 +418,8 @@ class ExploreExecutor(Mazerunner):
                 os.unlink(testcase)
                 continue
             index = self.state.tick()
-            t_fn = f"id:{index:06},src:{get_id_from_fn(fn)},ts:{ts},execs:{self.state.execs}"
+            src_id = utils.get_id_from_fn(fn)
+            t_fn = f"id:{index:06},src:{src_id:06},ts:{self.state.curr_ts},execs:{self.state.execs}"
             q_fp = os.path.join(self.my_queue, t_fn)
             shutil.move(testcase, q_fp)
             info = t.partition(',')[-1].strip().split(':')
@@ -445,11 +433,12 @@ class ExploreExecutor(Mazerunner):
             self.logger.info("Sleeping for getting seeds from AFL")
             time.sleep(WAITING_INTERVAL)
             return
-        if next_seed in self.state.processed:
+        seed_id = int(utils.get_id_from_fn(next_seed))
+        if seed_id in self.state.processed:
             return
-        self.run_file(next_seed)
+        fp = self.run_file(next_seed)
         self.agent.train()
-        self.state.processed.add(next_seed)
+        self.state.processed[seed_id] = os.path.basename(fp)
 
 
 class ExploitExecutor(Mazerunner):
@@ -466,7 +455,7 @@ class ExploitExecutor(Mazerunner):
         has_reached_max_flip_num = lambda: len(self.agent.all_targets) >= self.config.max_flip_num
         while not has_reached_max_flip_num():
             try:
-                self.symsan.setup(self.cur_input, self.state.processed_num)
+                self.symsan.setup(self.cur_input, len(self.state.processed))
                 self.symsan.run(self.state.timeout)
                 self.symsan.process_request()
                 # (1) symsan proc has nomarlly terminated and self.cur_input is on policy
@@ -507,31 +496,30 @@ class ExploitExecutor(Mazerunner):
             self.state.exploit_time = res.total_time / utils.MILLION_SECONDS_SCALE
 
     def sync_back_if_interesting(self, fp, res):
-        fn = os.path.basename(fp)
+        if res.flipped_times == 0:
+            return
         if not self.minimizer.is_new_file(self.cur_input):
             return
         index = self.state.tick()
-        target = get_id_from_fn(fn)
-        ts = int(time.time() * utils.MILLION_SECONDS_SCALE - self.state.start_ts * utils.MILLION_SECONDS_SCALE)
-        dst_fn = f"id:{index:06},src:{target},ts:{ts},dis:{res.distance:06},execs:{self.state.execs}"
+        target = utils.get_id_from_fn(os.path.basename(fp))
+        dst_fn = f"id:{index:06},src:{target:06},execs:{self.state.execs},ts:{self.state.curr_ts},dis:{res.distance}"
         dst_fp = os.path.join(self.my_queue, dst_fn)
         self.logger.debug(f"save testcase: {dst_fn}")
         shutil.copy2(self.cur_input, dst_fp)
         self.agent.save_trace(dst_fn)
         dst_fp = os.path.join(self.my_queue, dst_fn)
         shutil.copy2(self.cur_input, dst_fp)
-        self.state.processed.add(dst_fn)
+        self.state.processed[index] = dst_fn
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
             self.seed_scheduler.put(dst_fn, (res.distance, ''))
-            self.logger.info(f"Exploit agent found closer distance={res.distance}, ts: {ts}")
+            self.logger.info(f"Exploit agent found closer distance={res.distance}, ts={self.state.curr_ts}")
 
     def _run(self):
         next_seed = self.seed_scheduler.pop()
         if next_seed is not None:
             new_fp = self.run_file(next_seed)
             self.agent.train()
-            self.state.processed.add(os.path.basename(new_fp))
         else:
             self.logger.info("Sleeping for getting seeds from AFL")
             time.sleep(WAITING_INTERVAL)
@@ -573,7 +561,6 @@ class RecordExecutor(Mazerunner):
             if self.record_enabled:
                 fp = self.run_file(fn)
                 fn = os.path.basename(fp)
-                self.state.processed.add(fn)
             if self.is_hybrid_mode:
                 self.update_seed_queue(fn)
 

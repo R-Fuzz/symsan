@@ -46,6 +46,10 @@ def get_distance_from_fn(filename):
     match = re.search(r'dis:(\d+)', filename)
     return None if not match else float(match.group(1))
 
+def get_id_from_fn(s):
+    assert 'id:' in s and len(s) > len("id:......")
+    return int(s[len("id:"):len("id:......")])
+
 def run_command(cmd, testcase):
     cmd, stdin = fix_at_file(cmd, testcase)
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE,

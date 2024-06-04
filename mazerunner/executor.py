@@ -123,7 +123,7 @@ class ConcolicExecutor:
     def get_result(self):
         ret_code = self.proc.returncode if self.proc.returncode >= 0 else -self.proc.returncode
         return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
-                            self.timer.solving_time, self.agent.min_distance, 
+                            self.timer.solving_time, int(self.agent.min_distance), 
                             ret_code, self.msg_num, 
                             self.solver.generated_files, self.stdout_reader.data, self.stderr_reader.data)
 
