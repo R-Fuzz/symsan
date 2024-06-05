@@ -148,7 +148,7 @@ class RLModel:
 
     def get_default_distance(self, bid, a):
         assert a == 0 or a == 1
-        initial_distances = self.config.initial_policy.get(str(bid), None)
+        initial_distances = self.config.initial_policy.get(bid, None)
         value = initial_distances[a] if initial_distances else None
         value = self.config.max_distance if value is None else value
         self.logger.debug(f"get_default_distance: bid={bid}, action={a}, value={value}")

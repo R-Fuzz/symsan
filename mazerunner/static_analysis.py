@@ -502,7 +502,7 @@ def parse_cfg(dot_file_path):
             true_line = ':'.join(true_line.split(':')[:2]) if '%' not in true_line and 'unamed' not in true_line else ''
             false_line = G.nodes[false_target]['label'].split(',')[0].strip('{}:')
             false_line = ':'.join(false_line.split(':')[:2]) if '%' not in false_line and 'unamed' not in false_line else ''
-            cfg_data[node_id] = {'T': true_line, 'F': false_line}
+            cfg_data[int(node_id)] = {'T': true_line, 'F': false_line}
     return cfg_data
 
 def parse_distances(file_path):

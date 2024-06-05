@@ -38,8 +38,7 @@ def fix_at_file(cmd, testcase):
         cmd[idx] = testcase
         stdin = None
     else:
-        with open(testcase, "rb") as f:
-            stdin = file_content
+        stdin = file_content
     return cmd, stdin, file_content
 
 def get_distance_from_fn(filename):
