@@ -119,7 +119,6 @@ class Mazerunner:
         self.cmd = config.cmd
         self.output = config.output_dir
         self.my_dir = config.mazerunner_dir
-        self.filename = ".cur_input"
         self.symsan = None
         self._make_dirs()
         if shared_state:
@@ -140,10 +139,6 @@ class Mazerunner:
     @property
     def reached_resource_limit(self):
         return self.check_resource_limit()
-
-    @property
-    def cur_input(self):
-        return os.path.realpath(os.path.join(self.my_dir, self.filename))
 
     @property
     def afl_dir(self):
@@ -199,17 +194,16 @@ class Mazerunner:
         self.state.execs += 1
         # copy the test case
         fp = os.path.join(self.my_queue, fn)
-        shutil.copy2(fp, self.cur_input)
         self.logger.info("Run input: %s" % fn)
-        symsan_res = self.run_target()
+        symsan_res = self.run_target(fp)
         fp = self.update_seed_info(fp, symsan_res)
         self.handle_return_status(symsan_res, fp)
         self.update_timmer(symsan_res)
         self.sync_back_if_interesting(fp, symsan_res)
         return fp
 
-    def run_target(self):
-        self.symsan.setup(self.cur_input, len(self.state.processed))
+    def run_target(self, testcase):
+        self.symsan.setup(testcase, len(self.state.processed))
         timeout = self.state.timeout
         if self.symsan.record_mode_enabled:
             timeout = int(self.config.timeout / 10)
@@ -445,26 +439,28 @@ class ExploitExecutor(Mazerunner):
     def __init__(self, config, shared_state=None):
         super().__init__(config, shared_state)
         self.agent = ExploitAgent(self.config)
+        self._cur_input = os.path.join(self.my_generations, ".cur_input")
         if config.use_builtin_solver:
             self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
         else:
             self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
 
-    def run_target(self):
+    def run_target(self, testcase) -> executor.ExecutorResult:
+        shutil.copy2(testcase, self._cur_input)
         total_time = emulation_time = solving_time = 0
         has_reached_max_flip_num = lambda: len(self.agent.all_targets) >= self.config.max_flip_num
         while not has_reached_max_flip_num():
             try:
-                self.symsan.setup(self.cur_input, len(self.state.processed))
+                self.symsan.setup(self._cur_input, len(self.state.processed))
                 self.symsan.run(self.state.timeout)
                 self.symsan.process_request()
-                # (1) symsan proc has nomarlly terminated and self.cur_input is on policy
+                # (1) symsan proc has nomarlly terminated and cur_input is on policy
                 # (2) the solver is not able to solve the branch condition
                 if len(self.symsan.solver.generated_files) == 0:
                     break
                 assert len(self.symsan.solver.generated_files) == 1
                 fp = os.path.join(self.my_generations, self.symsan.solver.generated_files[0])
-                shutil.move(fp, self.cur_input)
+                shutil.move(fp, self._cur_input)
             finally:
                 self.symsan.tear_down()
                 symsan_res = self.symsan.get_result()
@@ -498,17 +494,15 @@ class ExploitExecutor(Mazerunner):
     def sync_back_if_interesting(self, fp, res):
         if res.flipped_times == 0:
             return
-        if not self.minimizer.is_new_file(self.cur_input):
+        if not self.minimizer.is_new_file(self._cur_input):
             return
         index = self.state.tick()
         target = utils.get_id_from_fn(os.path.basename(fp))
         dst_fn = f"id:{index:06},src:{target:06},execs:{self.state.execs},ts:{self.state.curr_ts},dis:{res.distance}"
-        dst_fp = os.path.join(self.my_queue, dst_fn)
         self.logger.debug(f"save testcase: {dst_fn}")
-        shutil.copy2(self.cur_input, dst_fp)
-        self.agent.save_trace(dst_fn)
         dst_fp = os.path.join(self.my_queue, dst_fn)
-        shutil.copy2(self.cur_input, dst_fp)
+        shutil.copy2(self._cur_input, dst_fp)
+        self.agent.save_trace(dst_fn)
         self.state.processed[index] = dst_fn
         is_closer = self.minimizer.has_closer_distance(res.distance, dst_fn)
         if is_closer:
