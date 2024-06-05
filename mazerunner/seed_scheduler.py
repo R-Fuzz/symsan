@@ -1,6 +1,6 @@
 import abc
-import ast
 import heapq
+import logging
 import numpy as np
 
 class SeedScheduler(abc.ABC):
@@ -98,31 +98,29 @@ class PrioritySamplingScheduler(SeedScheduler):
 
 class RealTimePriorityScheduler(SeedScheduler):
     def __init__(self, m, t):
+        self.logger = logging.getLogger(self.__class__.__qualname__)
         self.state_seed_mapping = m
         self.D_table = t
         self.fuzzer_seeds = []
     
     def put(self, fn, info, from_fuzzer=False):
-        _, sa_str = info[0], info[1]
-        if from_fuzzer or not sa_str:
+        _, sa = info[0], info[1]
+        if from_fuzzer:
             self.fuzzer_seeds.append(fn)
             return
-        sa = ast.literal_eval(sa_str)
         assert not sa is None
         self.state_seed_mapping[sa] = fn
 
     def pop(self):
         if self.fuzzer_seeds:
-            return self.fuzzer_seeds.pop()
+            return self.fuzzer_seeds.pop(), None
         selected_state = self.D_table.pop()
         if selected_state is None:
-            return None
-        while selected_state not in self.state_seed_mapping:
-            selected_state = self.D_table.pop()
-            if selected_state is None:
-                return None
-        # print(f"seed: {self.state_seed_mapping[selected_state]}, state: {selected_state}, distacne: {self.D_table[selected_state]}")
-        return self.state_seed_mapping[selected_state]
+            return None, None
+        self.logger.debug(f"selected state: {selected_state}, distacne: {self.D_table[selected_state]}")
+        if selected_state in self.state_seed_mapping:
+            return self.state_seed_mapping[selected_state], selected_state
+        return None, selected_state
     
     def is_empty(self) -> bool:
         return not self.fuzzer_seeds and self.D_table.is_heap_empty

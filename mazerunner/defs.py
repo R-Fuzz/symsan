@@ -69,6 +69,7 @@ class SolvingStatus(Enum):
     UNSOLVED_INVALID_EXPR = auto()
     UNSOLVED_INVALID_MSG = auto()
     UNSOLVED_UNINTERESTING_COND = auto()
+    UNSOLVED_DEFERRED = auto()
     UNSOLVED_UNKNOWN = auto()
 
 solved_statuses = {SolvingStatus.SOLVED_NESTED, 
@@ -93,8 +94,8 @@ class ExecutorResult:
         self.symsan_msg_num = msg_num
         self.generated_testcases = testcases
         self.flipped_times = 0
-        self.stdout = out if out else "Output not available"
-        self.stderr = err if err else "Unknown error"
+        self.stdout = out if out else "stdout not available"
+        self.stderr = err if err else "stderr not available"
 
     @property
     def emulation_time(self):

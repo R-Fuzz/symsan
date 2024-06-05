@@ -177,7 +177,7 @@ class AvgQLearner(Learner):
         self.learn(reversed_state, terminal_state, Decimal(0))
 
 class Agent:
-    def __init__(self, config):
+    def __init__(self, config, model=None):
         self.config = config
         # for fgtest compatibility
         if config.mazerunner_dir:
@@ -190,7 +190,7 @@ class Agent:
         self.pc_counter = collections.Counter()
         self.min_distance = self.config.max_distance
         self._learner = None
-        self._model = None
+        self._model = None if model is None else model
 
     @property
     def my_traces(self):
@@ -201,9 +201,7 @@ class Agent:
         if not self._model:
             self._model = self.create_model(self.config)
         return self._model
-    @model.setter
-    def model(self, m):
-        self._model = m
+
     def save_model(self):
         if self.config.mazerunner_dir and self._model:
             self._model.save()
@@ -366,7 +364,10 @@ class ExploreAgent(Agent):
             return False
         if self.curr_state.reversed_sa in self.model.all_target_sa:
             return False
-        interesting = self._greedy_policy()
+        if self.config.defferred_solving_enabled:
+            interesting = self._curious_policy()
+        else:
+            interesting = self._greedy_policy()
         if interesting:
             self.model.add_target_sa(self.curr_state.reversed_sa)
             self.logger.debug(f"Target SA: {self.curr_state.reversed_sa}")
@@ -388,6 +389,8 @@ class ExploreAgent(Agent):
     def compute_branch_score(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
         d = self.model.get_distance(self.curr_state, reversed_action)
+        if d == float('inf'):
+            return ''
         return str(int(d))
 
     def _greedy_policy(self):
@@ -403,6 +406,10 @@ class ExploreAgent(Agent):
         return self._curious_policy()
 
     def _curious_policy(self):
+        reversed_action = 1 if self.curr_state.action == 0 else 0
+        d_reverse = self.model.get_distance(self.curr_state, reversed_action)
+        if d_reverse >= self.config.max_distance:
+            return False
         return self.curr_state.reversed_sa not in self.model.visited_sa
 
 class ExploitAgent(Agent):

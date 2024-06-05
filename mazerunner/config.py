@@ -69,6 +69,7 @@ class Config:
                  'static_result_folder',
                  'use_ordered_dict',
                  'use_builtin_solver',
+                 'defferred_solving_enabled',
     ]
 
     def __init__(self):
@@ -117,8 +118,7 @@ class Config:
             self.static_result_folder = args.static_result_folder
             distance_file = os.path.join(self.static_result_folder, "distance.cfg.txt")
             self.max_distance = self._load_distance_file(distance_file)
-            policy_file = os.path.join(self.static_result_folder, "policy.pkl")
-            self.initial_policy = self._load_initial_policy(policy_file)
+            self.initial_policy = self._load_initial_policy()
         
     def validate_config(self):
         # TODO: validate the configurations after loading
@@ -148,6 +148,7 @@ class Config:
         self.max_branch_num = MAX_BRANCH_NUM
         self.use_ordered_dict = USE_ORDERED_DICT
         self.use_builtin_solver = USE_BUILTIN_SOLVER
+        self.defferred_solving_enabled = False
         # The other configurations need to be set explicitly by config file or cmd arguments
         self.model_type = RLModelType.unknown
         self.afl_dir = ''
@@ -164,13 +165,29 @@ class Config:
             raise ValueError(f"distance file {fp} does not exist.")
         with open(fp, 'r') as file:
             for l in file.readlines():
-                max_distance = max(float(l.strip().split(',')[-1]), max_distance)
+                d = float(l.strip().split(',')[-1]) * 2
+                max_distance = max(d, max_distance)
         return max_distance
 
-    def _load_initial_policy(self, fp):
-        if not os.path.isfile(fp):
-            self.logger.warning(f"policy file {fp} does not exist, using random policy.")
-            return {}
-        with open(fp, 'rb') as file:
-            policy = pickle.load(file)
+    def _load_initial_policy(self):
+        policy_pkl = os.path.join(self.static_result_folder, "policy.pkl")
+        policy_txt = os.path.join(self.static_result_folder, "policy.txt")
+        policy = {}
+        if os.path.isfile(policy_pkl):
+            with open(policy_pkl, 'rb') as file:
+                policy = pickle.load(file)
+                return policy
+        if os.path.isfile(policy_txt):
+            with open(policy_txt, 'r') as file:
+                for l in file.readlines():
+                    if not l.strip():
+                        continue
+                    items = l.strip().split(',')
+                    assert len(items) == 3
+                    bid = int(items[0])
+                    df = float(items[1]) if items[1] != 'inf' else None
+                    dt = float(items[2]) if items[2] != 'inf' else None
+                    policy[bid] = (df, dt)
+                return policy
+        self.logger.warning(f"policy file does not exist, using random policy.")
         return policy

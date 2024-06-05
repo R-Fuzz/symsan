@@ -1,3 +1,4 @@
+import ast
 import logging
 import functools
 import math
@@ -112,7 +113,7 @@ class MazerunnerState:
         return old_index
 
 class Mazerunner:
-    def __init__(self, config, shared_state=None):
+    def __init__(self, config, shared_state=None, seed_scheduler=None):
         self.config = config
         # check_resource_limit returns a flag that controlled by another monitor thread
         self.check_resource_limit = lambda: False
@@ -125,6 +126,9 @@ class Mazerunner:
             self.state = shared_state
         else:
             self._import_state()
+        if seed_scheduler:
+            self.seed_scheduler = seed_scheduler
+        else:
             self.seed_scheduler = FILOScheduler(self.state.seed_queue)
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.afl = config.afl_dir
@@ -199,14 +203,12 @@ class Mazerunner:
         fp = self.update_seed_info(fp, symsan_res)
         self.handle_return_status(symsan_res, fp)
         self.update_timmer(symsan_res)
-        self.sync_back_if_interesting(fp, symsan_res)
+        self.sync_seed_queue(fp, symsan_res)
         return fp
 
     def run_target(self, testcase):
         self.symsan.setup(testcase, len(self.state.processed))
         timeout = self.state.timeout
-        if self.symsan.record_mode_enabled:
-            timeout = int(self.config.timeout / 10)
         self.symsan.run(timeout)
         try:
             self.symsan.process_request()
@@ -214,9 +216,9 @@ class Mazerunner:
             self.symsan.tear_down()
         symsan_res = self.symsan.get_result()
         self.logger.info(
-            f"Total={symsan_res.total_time}ms, "
-            f"Emulation={symsan_res.emulation_time}ms, "
-            f"Solver={symsan_res.solving_time}ms, "
+            f"Total={symsan_res.total_time:.3f}ms, "
+            f"Emulation={symsan_res.emulation_time:.3f}ms, "
+            f"Solver={symsan_res.solving_time:.3f}ms, "
             f"Timeout={timeout}s, "
             f"Return={symsan_res.returncode}, "
             f"Distance={symsan_res.distance}, "
@@ -344,19 +346,18 @@ class Mazerunner:
             self.state = MazerunnerState(self.config.timeout)
 
     def _report_error(self, fp, log):
-        self.logger.warn("Symsan process error: %s\nLog:%s" % (fp, log))
+        self.logger.info("Detected crashed: %s\nSubprocess stderr:%s" % (fp, log))
 
 class SymSanExecutor(Mazerunner):
-    def __init__(self, config, shared_state=None):
-        super().__init__(config, shared_state)
-        config.gep_solver_enabled = True
-        self.agent = Agent(config)
+    def __init__(self, config, shared_state=None, seed_scheduler=None, model=None):
+        super().__init__(config, shared_state, seed_scheduler)
+        self.agent = Agent(config, model)
         if config.use_builtin_solver:
             self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
         else:
             self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
 
-    def sync_back_if_interesting(self, fp, res):
+    def sync_seed_queue(self, fp, res):
         old_idx = self.state.index
         fn = os.path.basename(fp)
         num_testcase = 0
@@ -385,9 +386,9 @@ class SymSanExecutor(Mazerunner):
             self.run_file(fn)
 
 class ExploreExecutor(Mazerunner):
-    def __init__(self, config, shared_state=None):
-        super().__init__(config, shared_state)
-        self.agent = ExploreAgent(self.config)
+    def __init__(self, config, shared_state=None, seed_scheduler=None, model=None):
+        super().__init__(config, shared_state, seed_scheduler)
+        self.agent = ExploreAgent(config, model)
         if config.use_builtin_solver:
             self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
         else:
@@ -399,36 +400,57 @@ class ExploreExecutor(Mazerunner):
         except AttributeError:
             self.state.explore_time = res.total_time / utils.MILLION_SECONDS_SCALE
     
-    def sync_back_if_interesting(self, fp, res):
+    def sync_seed_queue(self, fp, res):
         fn = os.path.basename(fp)
         if self.minimizer.has_closer_distance(res.distance, fn):
             self.logger.info(f"Explore agent found closer distance={res.distance}")
         self.agent.save_trace(fn)
-        # rename or delete generated testcases from fp
+        
+        if self.config.defferred_solving_enabled:
+            for s in self.agent.episode:
+                self.seed_scheduler.put(fn, (res.distance, s.sa))
+            return
+        
         self.logger.info("Generated %d testcases" % len(res.generated_testcases))
         for t in res.generated_testcases:
-            testcase = os.path.join(self.my_generations, t)
-            if not self.minimizer.is_new_file(testcase):
-                os.unlink(testcase)
-                continue
-            index = self.state.tick()
-            src_id = utils.get_id_from_fn(fn)
-            t_fn = f"id:{index:06},src:{src_id:06},ts:{self.state.curr_ts},execs:{self.state.execs}"
-            q_fp = os.path.join(self.my_queue, t_fn)
-            shutil.move(testcase, q_fp)
-            info = t.partition(',')[-1].strip().split(':')
-            t_d = int(info[0]) if info else self.config.max_distance
-            t_sa = info[1] if info else ''
+            self._triage_testcase(t, fn, save_queue=True)
+    
+    def _triage_testcase(self, t, src_fn, save_queue):
+        if t is None or src_fn is None:
+            return None
+        testcase = os.path.join(self.my_generations, t)
+        if not self.minimizer.is_new_file(testcase):
+            os.unlink(testcase)
+            return None
+        index = self.state.tick()
+        src_id = utils.get_id_from_fn(src_fn)
+        t_fn = f"id:{index:06},src:{src_id:06},ts:{self.state.curr_ts},execs:{self.state.execs}"
+        q_fp = os.path.join(self.my_queue, t_fn)
+        shutil.move(testcase, q_fp)
+        info = t.partition(',')[-1].strip().split(':')
+        t_d = int(info[0]) if info and info[0] else self.config.max_distance
+        t_sa = info[1] if info and info[1] else ''
+        t_sa = ast.literal_eval(t_sa)
+        if save_queue:
             self.seed_scheduler.put(t_fn, (t_d, t_sa))
+        return t_fn
 
     def _run(self):
-        next_seed = self.seed_scheduler.pop()
-        if next_seed is None:
+        next_seed, target_sa = self.seed_scheduler.pop()
+        if next_seed is None and target_sa is None:
+            # Nothing in the queue
             self.logger.info("Sleeping for getting seeds from AFL")
             time.sleep(WAITING_INTERVAL)
             return
+        if next_seed is None and not target_sa is None:
+            t, src = self.symsan.generate_testcase(target_sa, self.state.processed)
+            next_seed = self._triage_testcase(t, src, save_queue=False)
+        if next_seed is None:
+            self.logger.debug(f"Skip. Cannot solve target_sa={target_sa}")
+            return
         seed_id = int(utils.get_id_from_fn(next_seed))
         if seed_id in self.state.processed:
+            self.logger.debug(f"Skip. {self.state.processed[seed_id]} already processed")
             return
         fp = self.run_file(next_seed)
         self.agent.train()
@@ -436,9 +458,9 @@ class ExploreExecutor(Mazerunner):
 
 
 class ExploitExecutor(Mazerunner):
-    def __init__(self, config, shared_state=None):
-        super().__init__(config, shared_state)
-        self.agent = ExploitAgent(self.config)
+    def __init__(self, config, shared_state=None, seed_scheduler=None, model=None):
+        super().__init__(config, shared_state, seed_scheduler)
+        self.agent = ExploitAgent(config, model)
         self._cur_input = os.path.join(self.my_generations, ".cur_input")
         if config.use_builtin_solver:
             self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
@@ -470,9 +492,9 @@ class ExploitExecutor(Mazerunner):
         symsan_res.update_time(total_time, solving_time)
         symsan_res.flipped_times = len(self.agent.all_targets)
         self.logger.info(
-            f"Total={total_time}ms, "
-            f"Emulation={emulation_time}ms, "
-            f"Solver={solving_time}ms, "
+            f"Total={total_time:.3f}ms, "
+            f"Emulation={emulation_time:.3f}ms, "
+            f"Solver={solving_time:.3f}ms, "
             f"Return={symsan_res.returncode}, "
             f"Distance={symsan_res.distance}, "
             f"Episode_length={len(self.agent.episode)}, "
@@ -491,7 +513,7 @@ class ExploitExecutor(Mazerunner):
         except AttributeError:
             self.state.exploit_time = res.total_time / utils.MILLION_SECONDS_SCALE
 
-    def sync_back_if_interesting(self, fp, res):
+    def sync_seed_queue(self, fp, res):
         if res.flipped_times == 0:
             return
         if not self.minimizer.is_new_file(self._cur_input):
@@ -512,25 +534,25 @@ class ExploitExecutor(Mazerunner):
     def _run(self):
         next_seed = self.seed_scheduler.pop()
         if next_seed is not None:
-            new_fp = self.run_file(next_seed)
+            self.run_file(next_seed)
             self.agent.train()
         else:
             self.logger.info("Sleeping for getting seeds from AFL")
             time.sleep(WAITING_INTERVAL)
 
 class RecordExecutor(Mazerunner):
-    def __init__(self, config, shared_state=None, record_enabled=True):
-        super().__init__(config, shared_state)
+    def __init__(self, config, shared_state=None, record_enabled=True, seed_scheduler=None, model=None):
+        super().__init__(config, shared_state, seed_scheduler)
         self.is_hybrid_mode = shared_state is not None
         self.record_enabled = record_enabled
         if self.record_enabled:
-            self.agent = RecordAgent(config)
+            self.agent = RecordAgent(config, model)
             if config.use_builtin_solver:
                 self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
             else:
                 self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
 
-    def sync_back_if_interesting(self, fp, res):
+    def sync_seed_queue(self, fp, res):
         fn = os.path.basename(fp)
         if self.minimizer.has_closer_distance(res.distance, fn):
             self.logger.info(f"Fuzzer found closer distance={res.distance}")
@@ -544,7 +566,7 @@ class RecordExecutor(Mazerunner):
 
     def update_seed_queue(self, fn):
         d = utils.get_distance_from_fn(fn)
-        d = -self.config.max_distance if d is None else d
+        d = 0 if d is None else d
         self.seed_scheduler.put(fn, [d, ''], from_fuzzer=True)
 
     def _run(self):
@@ -559,9 +581,9 @@ class RecordExecutor(Mazerunner):
                 self.update_seed_queue(fn)
 
 class ReplayExecutor(Mazerunner):
-    def __init__(self, config, shared_state=None):
-        super().__init__(config, shared_state)
-        self.agent = Agent(config)
+    def __init__(self, config, shared_state=None, seed_scheduler=None, model=None):
+        super().__init__(config, shared_state) # replay does not need seed_scheduler
+        self.agent = Agent(config, model)
 
     def offline_learning(self):
         iteration_num = 1
@@ -598,19 +620,40 @@ class RLExecutor():
             self.config.use_ordered_dict = True
         self.model = Agent.create_model(self.config)
         if agent_type == "exploit":
-            self.concolic_executor = ExploitExecutor(config, self.state)
-            self.synchronizer = RecordExecutor(config, shared_state=self.state, record_enabled=True)
             self.seed_scheduler = PrioritySamplingScheduler(self.state.seed_queue)
+            self.concolic_executor = ExploitExecutor(
+                config,
+                shared_state=self.state,
+                seed_scheduler=self.seed_scheduler,
+                model=self.model
+            )
+            self.synchronizer = RecordExecutor(
+                config,
+                shared_state=self.state,
+                record_enabled=True,
+                seed_scheduler=self.seed_scheduler,
+                model=self.model
+            )
         elif agent_type == "explore":
-            self.concolic_executor = ExploreExecutor(config, self.state)
-            self.synchronizer = RecordExecutor(config, shared_state=self.state, record_enabled=False)
-            self.seed_scheduler = RealTimePriorityScheduler(self.state.state_seed_mapping, self.model.distance_table)
+            self.seed_scheduler = RealTimePriorityScheduler(
+                self.state.state_seed_mapping,
+                self.model.distance_table
+            )
+            self.concolic_executor = ExploreExecutor(
+                config,
+                shared_state=self.state,
+                seed_scheduler=self.seed_scheduler,
+                model=self.model
+            )
+            self.synchronizer = RecordExecutor(
+                config,
+                shared_state=self.state,
+                record_enabled=False,
+                seed_scheduler=self.seed_scheduler,
+                model=self.model
+            )
         else:
             raise NotImplementedError()
-        self.replayer.agent.model = self.model
-        self.concolic_executor.agent.model = self.model
-        self.concolic_executor.seed_scheduler = self.seed_scheduler
-        self.synchronizer.seed_scheduler = self.seed_scheduler
 
     @property
     def metadata(self):
