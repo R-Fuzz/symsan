@@ -408,7 +408,7 @@ class ExploreAgent(Agent):
     def _curious_policy(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
         d_reverse = self.model.get_distance(self.curr_state, reversed_action)
-        if d_reverse >= self.config.max_distance:
+        if d_reverse == float('inf'):
             return False
         return self.curr_state.reversed_sa not in self.model.visited_sa
 

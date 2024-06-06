@@ -165,7 +165,7 @@ class Config:
             raise ValueError(f"distance file {fp} does not exist.")
         with open(fp, 'r') as file:
             for l in file.readlines():
-                d = float(l.strip().split(',')[-1]) * 2
+                d = float(l.strip().split(',')[-1])
                 max_distance = max(d, max_distance)
         return max_distance
 

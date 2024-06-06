@@ -416,7 +416,7 @@ class ExploreExecutor(Mazerunner):
             self._triage_testcase(t, fn, save_queue=True)
     
     def _triage_testcase(self, t, src_fn, save_queue):
-        if t is None or src_fn is None:
+        if t is None:
             return None
         testcase = os.path.join(self.my_generations, t)
         if not self.minimizer.is_new_file(testcase):
@@ -443,7 +443,10 @@ class ExploreExecutor(Mazerunner):
             time.sleep(WAITING_INTERVAL)
             return
         if next_seed is None and not target_sa is None:
+            assert self.config.defferred_solving_enabled
             t, src = self.symsan.generate_testcase(target_sa, self.state.processed)
+            if t is None and src is None:
+                self.state.processed.clear()
             next_seed = self._triage_testcase(t, src, save_queue=False)
         if next_seed is None:
             self.logger.debug(f"Skip. Cannot solve target_sa={target_sa}")
