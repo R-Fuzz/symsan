@@ -10,13 +10,13 @@ import shutil
 import sys
 import time
 
+import utils
+import minimizer
 import executor
 import executor_symsan_lib
 from agent import Agent, ExploreAgent, ExploitAgent, RecordAgent
 from seed_scheduler import FILOScheduler, PrioritySamplingScheduler, RealTimePriorityScheduler
-
-import minimizer
-import utils
+from defs import SolvingStatus
 
 WAITING_INTERVAL = 5
 
@@ -379,7 +379,7 @@ class SymSanExecutor(Mazerunner):
     def _run(self):
         files = self.sync_from_either(need_sort=True)
         if not files:
-            self.logger.info("Sleeping for getting seeds from AFL")
+            self.logger.info("Sleeping for getting seeds from Fuzzer")
             time.sleep(WAITING_INTERVAL)
             return
         for fn in files:
@@ -435,24 +435,7 @@ class ExploreExecutor(Mazerunner):
             self.seed_scheduler.put(t_fn, (t_d, t_sa))
         return t_fn
 
-    def _run(self):
-        next_seed, target_sa = self.seed_scheduler.pop()
-        if next_seed is None and target_sa is None:
-            # Nothing in the queue
-            self.logger.info("Sleeping for getting seeds from AFL")
-            time.sleep(WAITING_INTERVAL)
-            return
-        if next_seed is None and not target_sa is None:
-            assert self.config.defferred_solving_enabled
-            t, src = self.symsan.generate_testcase(target_sa, self.state.processed)
-            # recipe is lost, need to start from scrah to collect constraints
-            if t is None and src is None:
-                self.state.processed.clear()
-                self.seed_scheduler.reset()
-            next_seed = self._triage_testcase(t, src, save_queue=False)
-        if next_seed is None:
-            self.logger.debug(f"Skip. Cannot solve target_sa={target_sa}")
-            return
+    def _process_seed(self, next_seed):
         seed_id = int(utils.get_id_from_fn(next_seed))
         if seed_id in self.state.processed:
             self.logger.debug(f"Skip. {self.state.processed[seed_id]} already processed")
@@ -461,6 +444,32 @@ class ExploreExecutor(Mazerunner):
         self.agent.train()
         self.state.processed[seed_id] = os.path.basename(fp)
 
+    def _generate_testcase(self, target_sa):
+        t, src, status = self.symsan.generate_testcase(target_sa, self.state.processed)
+        if t is None and src is None:
+            return None, status
+        if t is not None:
+            return self._triage_testcase(t, src, save_queue=False), status
+        return None, status
+
+    def _run(self):
+        next_seed, target_sa = self.seed_scheduler.pop()
+        if next_seed is None and target_sa is None:
+            # Nothing in the queue
+            self.logger.info("Sleeping for getting seeds from Fuzzer")
+            time.sleep(WAITING_INTERVAL)
+            return
+        if self.config.defferred_solving_enabled and target_sa is not None:
+            new_seed, status = self._generate_testcase(target_sa)
+            if status == SolvingStatus.UNSOLVED_RECIPE_LOST and next_seed is None:
+                self.logger.warning("Recipe lost. Reset seed scheduler and processed queue")
+                self.state.processed.clear()
+                self.seed_scheduler.reset()
+            next_seed = new_seed if new_seed is not None else next_seed
+        if next_seed is None:
+            self.logger.debug(f"Skip. Cannot solve target_sa={target_sa}")
+            return
+        self._process_seed(next_seed)
 
 class ExploitExecutor(Mazerunner):
     def __init__(self, config, shared_state=None, seed_scheduler=None, model=None):
@@ -542,7 +551,7 @@ class ExploitExecutor(Mazerunner):
             self.run_file(next_seed)
             self.agent.train()
         else:
-            self.logger.info("Sleeping for getting seeds from AFL")
+            self.logger.info("Sleeping for getting seeds from Fuzzer")
             time.sleep(WAITING_INTERVAL)
 
 class RecordExecutor(Mazerunner):

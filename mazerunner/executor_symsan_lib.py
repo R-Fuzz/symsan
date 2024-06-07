@@ -132,16 +132,16 @@ class ConcolicExecutor:
 
     def generate_testcase(self, target_sa, seed_map):
         if target_sa not in self._recipe:
-            self.logger.warning(f"generate_testcase: target_sa not in recipe: {target_sa}")
-            return None, None
+            self.logger.debug(f"generate_testcase: target_sa not in recipe: {target_sa}")
+            return None, None, SolvingStatus.UNSOLVED_RECIPE_LOST
         tasks, seed_id = self._recipe[target_sa]
         assert seed_id in seed_map
         solution, status = self._solve_tasks(tasks)
         solving_status = self._finalize_solving(status, solution, seed_map, seed_id)
         if solving_status not in solved_statuses:
             self.logger.debug(f"generate_testcase: failed to solve target_sa: {target_sa}")
-            return None, seed_map[seed_id]
-        return self.generated_files[-1], seed_map[seed_id]
+            return None, seed_map[seed_id], solving_status
+        return self.generated_files[-1], seed_map[seed_id], solving_status
 
     def _solve_tasks(self, tasks):
         solution = []
