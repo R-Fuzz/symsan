@@ -8,6 +8,8 @@ from decimal import Decimal, getcontext
 from enum import Enum
 from utils import mkdir
 
+DISTANCE_SCALE = 1000
+
 class SortedDict:
     def __init__(self, need_sort=False):
         self.need_sort = need_sort
@@ -152,12 +154,14 @@ class RLModel:
             with open(target_sa_path, 'rb') as fp:
                 self.all_target_sa = pickle.load(fp)
 
-    def get_default_distance(self, bid, a):
+    def get_default_distance(self, s, a):
         assert a == 0 or a == 1
+        bid = s.bid
         initial_distances = self.config.initial_policy.get(bid, None)
         value = initial_distances[a] if initial_distances else None
         value = self.config.max_distance if value is None else value
         self.logger.debug(f"get_default_distance: bid={bid}, action={a}, value={value}")
+        value += (s.state[2] - 1) * DISTANCE_SCALE
         return value
 
     def add_unreachable_sa(self, sa):
@@ -194,7 +198,7 @@ class DistanceModel(RLModel):
     def Q_lookup(self, s, a):
         key = s.state + (a,)
         if key not in self.distance_table:
-            d = self.get_default_distance(s.bid, a)
+            d = self.get_default_distance(s, a)
             self.distance_table[key] = d
         return DistanceModel.distance_to_q(self.distance_table[key])
 
@@ -216,31 +220,31 @@ class ReachabilityModel(RLModel):
     def distance_to_prob(d):
         """
         Converts a distance to a probability.
-        Returns: 1 / 2 ** (d / 1000)
+        Returns: 1 / 2 ** (d / DISTANCE_SCALE)
         """
         if d == float('inf'):
             return ReachabilityModel.ZERO
         if d == 0.:
             return ReachabilityModel.ONE
-        return ReachabilityModel.ONE / (ReachabilityModel.TWO ** Decimal(float(d) / 1000))
+        return ReachabilityModel.ONE / (ReachabilityModel.TWO ** Decimal(float(d) / DISTANCE_SCALE))
 
     @staticmethod
     def prob_to_distance(p):
         """
         Converts a probability to a distance.
-        Returns: -log_2(p) * 1000
+        Returns: -log_2(p) * DISTANCE_SCALE
         """
         if p == ReachabilityModel.ZERO:
             return float('inf')
         if p == ReachabilityModel.ONE:
             return 0.
         res = - (p.ln() / ReachabilityModel.TWO.ln())
-        return float(res) * 1000
+        return float(res) * DISTANCE_SCALE
 
     def get_distance(self, s, a):
         key = s.state + (a,)
         if key not in self.distance_table:
-            d = self.get_default_distance(s.bid, a)
+            d = self.get_default_distance(s, a)
             self.distance_table[key] = d
         return self.distance_table[key]
 
