@@ -7,7 +7,7 @@ import time
 
 from defs import *
 import utils
-from agent import ExploitAgent, RecordAgent, ExploreAgent
+from agent import ExploitAgent, ExploreAgent
 
 class ConcolicExecutor:
     

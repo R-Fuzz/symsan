@@ -12,7 +12,7 @@ from multiprocessing import shared_memory
 from builtin_solver import Z3Solver
 from defs import *
 import utils
-from agent import ExploitAgent, RecordAgent, ExploreAgent
+from agent import ExploitAgent, ExploreAgent
 
 UNION_TABLE_SIZE = 0xc00000000
 PIPE_CAPACITY = 4 * 1024 * 1024
@@ -23,12 +23,12 @@ class ConcolicExecutor:
     
     class Timer:
         def reset(self):
-            self.proc_start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            self.proc_start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             self.proc_end_time = self.proc_start_time
             self.solving_time = 0
 
         def execution_timeout(self, timeout):
-            curr_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            curr_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             total_time = curr_time - self.proc_start_time
             return total_time >= timeout * utils.MILLION_SECONDS_SCALE
         
@@ -86,11 +86,9 @@ class ConcolicExecutor:
             sys.exit(1)
         # options
         self.testcase_dir = output_dir
-        self.record_mode_enabled = True if type(agent) is RecordAgent else False
-        self.onetime_solving_enabled = True if (type(agent) is ExploitAgent) else False
-        self.save_seed_info = True if (type(agent) is ExploreAgent or type(agent) is ExploitAgent) else False
-        self.gep_solver_enabled = config.gep_solver_enabled
-        self.should_increase_pipe_capacity = True
+        self._onetime_solving_enabled = True if (type(agent) is ExploitAgent) else False
+        self._save_seed_info = True if (type(agent) is ExploreAgent or type(agent) is ExploitAgent) else False
+        self._should_increase_pipe_capacity = True
         self._setup_pipe()
         utils.disable_core_dump()
 
@@ -107,8 +105,11 @@ class ConcolicExecutor:
             self._close_pipe()
         self.kill_proc()
         if need_cleanup:
-            self.shm.close()
-            self.shm.unlink()
+            try:
+                self.shm.close()
+                self.shm.unlink()
+            except:
+                pass
 
     def kill_proc(self):
         self.stdout_reader.should_stop = True
@@ -208,7 +209,7 @@ class ConcolicExecutor:
             if msg.msg_type == MsgType.cond_type.value:
                 solving_status = self._process_cond_request(msg)
                 if ((solving_status == SolvingStatus.SOLVED_NESTED or solving_status == SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT) 
-                    and self.onetime_solving_enabled):
+                    and self._onetime_solving_enabled):
                     should_handle = False
                 if (solving_status == SolvingStatus.UNSOLVED_UNKNOWN
                     or solving_status == SolvingStatus.UNSOLVED_INVALID_EXPR):
@@ -238,11 +239,9 @@ class ConcolicExecutor:
         self.agent.handle_new_state(state_msg, msg.result, msg.label)
         if not msg.label:
             return SolvingStatus.UNSOLVED_INVALID_MSG
-        if self.record_mode_enabled:
-            return SolvingStatus.UNSOLVED_UNINTERESTING_COND
         is_interesting = self.agent.is_interesting_branch()
         seed_info = ''
-        if self.save_seed_info:
+        if self._save_seed_info:
             reversed_sa = str(self.agent.curr_state.reversed_sa) if is_interesting else ''
             score = self.agent.compute_branch_score() if is_interesting else ''
             seed_info = f"{score}:{reversed_sa}"
@@ -269,7 +268,7 @@ class ConcolicExecutor:
             self.logger.error(f"__process_gep_request: Incorrect gep msg: {msg.label} "
                               f"vs {gmsg.index_label}")
             raise ConcolicExecutor.InvalidGEPMessage()
-        if self.gep_solver_enabled:
+        if self.config.gep_solver_enabled:
             return self.solver.handle_gep(gmsg, msg.addr)
 
     def _close_pipe(self):
@@ -294,7 +293,7 @@ class ConcolicExecutor:
             self._close_pipe()
         # pipefds[0] for read, pipefds[1] for write
         self.pipefds = list(os.pipe())
-        if not self.should_increase_pipe_capacity:
+        if not self._should_increase_pipe_capacity:
             return
         if not hasattr(fcntl, 'F_GETPIPE_SZ'):
             return
@@ -305,7 +304,7 @@ class ConcolicExecutor:
             fcntl.fcntl(self.pipefds[0], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
             fcntl.fcntl(self.pipefds[1], fcntl.F_SETPIPE_SZ, PIPE_CAPACITY)
         except PermissionError:
-            self.should_increase_pipe_capacity = False
+            self._should_increase_pipe_capacity = False
             self.logger.warning(f"Failed to increase pipe capacity. Need higher privilege. \n"
                                 f"Please try to set it manually by running: "
                                 f"'echo {PIPE_CAPACITY} | sudo tee /proc/sys/fs/pipe-max-size' ")
