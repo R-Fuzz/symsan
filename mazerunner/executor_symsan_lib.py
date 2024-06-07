@@ -1,3 +1,4 @@
+import collections
 import copy
 import symsan
 import os
@@ -33,7 +34,7 @@ class ConcolicExecutor:
         # symsan lib instance
         symsan.init(self.cmd[0])
         self.symsan_tasks = []
-        self._recipe = {}
+        self._recipe = collections.defaultdict(list)
         # options
         self.config.defferred_solving_enabled = True if (type(agent) is ExploreAgent) else False
         self._testcase_dir = output_dir
@@ -131,10 +132,10 @@ class ConcolicExecutor:
             self.msg_num += 1
 
     def generate_testcase(self, target_sa, seed_map):
-        if target_sa not in self._recipe:
+        if not self._recipe[target_sa]:
             self.logger.debug(f"generate_testcase: target_sa not in recipe: {target_sa}")
             return None, None, SolvingStatus.UNSOLVED_RECIPE_LOST
-        tasks, seed_id = self._recipe[target_sa]
+        tasks, seed_id = self._recipe[target_sa].pop()
         assert seed_id in seed_map
         solution, status = self._solve_tasks(tasks)
         solving_status = self._finalize_solving(status, solution, seed_map, seed_id)
@@ -191,7 +192,7 @@ class ConcolicExecutor:
         if self.config.defferred_solving_enabled:
             reversed_sa = self.agent.curr_state.reversed_sa
             input_id = utils.get_id_from_fn(self._input_fn)
-            self._recipe[reversed_sa] = (tasks, input_id)
+            self._recipe[reversed_sa].append((tasks, input_id))
             return SolvingStatus.UNSOLVED_DEFERRED
 
         solution, status = self._solve_tasks(tasks)

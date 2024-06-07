@@ -40,6 +40,11 @@ class SortedDict:
     def __iter__(self):
         return iter(self.data)
 
+    @property
+    def is_heap_empty(self):
+        if not self.heap:
+            return True
+
     def keys(self):
         return self.data.keys()
 
@@ -49,10 +54,12 @@ class SortedDict:
     def items(self):
         return self.data.items()
 
-    @property
-    def is_heap_empty(self):
-        if not self.heap:
-            return True
+    def reload(self, key):
+        if not self.need_sort:
+            return
+        if not key in self.data:
+            return
+        heapq.heappush(self.heap, (self.data[key], key[2], key))
 
     def remove(self, key, mark_only=False):
         if key in self.data:
@@ -174,9 +181,14 @@ class RLModel:
             self.unreachable_sa.remove(sa)
     
     def add_target_sa(self, sa):
-        self.all_target_sa.add(sa)
+        if self.config.defferred_solving_enabled:
+            self.distance_table.reload(sa)
+        else:
+            self.all_target_sa.add(sa)
     
     def remove_target_sa(self, sa):
+        if self.config.defferred_solving_enabled:
+            return
         if sa in self.all_target_sa:
             self.all_target_sa.remove(sa)
 
