@@ -593,6 +593,8 @@ class ReplayExecutor(Mazerunner):
     def offline_learning(self):
         iteration_num = 1
         files = os.listdir(self.agent.my_traces)
+        if not files:
+            return
         if len(files) > 10:
             iteration_num = int(len(files) / 10)
         for _ in range(iteration_num):
@@ -609,7 +611,6 @@ class ReplayExecutor(Mazerunner):
             self.state.execs += 1
             if self.state.execs % self.config.save_frequency == 0:
                 self.export_state()
-        self.state.execs = 0
 
 class RLExecutor():
     def __init__(self, config, agent_type):
@@ -686,9 +687,9 @@ class RLExecutor():
                     self.state.execs % math.ceil(self.config.sync_frequency) == 0):
                     self.synchronizer.run(run_once=True)
 
-            if self.config.replay_frequency > 0: 
+            if self.config.replay_frequency > 0:
                 if (self.state.execs > 0 and 
-                    self.state.execs % math.ceil(self.config.replay_frequency)) == 0:
+                    self.state.execs % math.ceil(self.config.replay_frequency) == 0):
                     repetition = math.ceil(1 / self.config.replay_frequency)
                     for _ in range(repetition):
                         self.replayer.offline_learning()
