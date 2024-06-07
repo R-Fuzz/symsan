@@ -445,8 +445,10 @@ class ExploreExecutor(Mazerunner):
         if next_seed is None and not target_sa is None:
             assert self.config.defferred_solving_enabled
             t, src = self.symsan.generate_testcase(target_sa, self.state.processed)
+            # recipe is lost, need to start from scrah to collect constraints
             if t is None and src is None:
                 self.state.processed.clear()
+                self.seed_scheduler.reset()
             next_seed = self._triage_testcase(t, src, save_queue=False)
         if next_seed is None:
             self.logger.debug(f"Skip. Cannot solve target_sa={target_sa}")

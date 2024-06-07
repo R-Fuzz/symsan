@@ -33,7 +33,6 @@ MAX_BRANCH_NUM = 33
 MIN_HANG_FILES = 30
 # Model configurations
 DECIMAL_PRECISION = 200
-USE_ORDERED_DICT = False
 
 class Config:
     __slots__ = ['__dict__',
@@ -146,8 +145,8 @@ class Config:
         self.save_frequency = SAVE_FREQUENCY
         self.decimal_precision = DECIMAL_PRECISION
         self.max_branch_num = MAX_BRANCH_NUM
-        self.use_ordered_dict = USE_ORDERED_DICT
         self.use_builtin_solver = USE_BUILTIN_SOLVER
+        self.use_ordered_dict = False
         self.defferred_solving_enabled = False
         # The other configurations need to be set explicitly by config file or cmd arguments
         self.model_type = RLModelType.unknown

@@ -56,7 +56,7 @@ class SortedDict:
         if key in self.data:
             del self.data[key]
             if self.need_sort and not mark_only:
-                self.rebuild_heap()
+                self.clean_heap()
 
     def pop(self):
         while self.heap:
@@ -75,7 +75,7 @@ class SortedDict:
             heapq.heappop(self.heap)
         return None
 
-    def rebuild_heap(self):
+    def clean_heap(self):
         if not self.need_sort:
             return
         new_heap = []
@@ -86,6 +86,12 @@ class SortedDict:
                 continue
             new_heap.append((v, c, k))
         self.heap = new_heap
+        heapq.heapify(self.heap)
+    
+    def rebuild_heap(self):
+        if not self.need_sort:
+            return
+        self.heap = [(v, k[2], k) for k, v in self.data.items()]
         heapq.heapify(self.heap)
 
 
@@ -121,7 +127,7 @@ class RLModel:
             pickle.dump(self.visited_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
         with open(os.path.join(self.my_dir, "Q_table"), 'wb') as fp:
             if self.distance_table.need_sort:
-                self.distance_table.rebuild_heap()
+                self.distance_table.clean_heap()
             pickle.dump(self.distance_table, fp, protocol=pickle.HIGHEST_PROTOCOL)  
         with open(os.path.join(self.my_dir, "unreachable_branches"), 'wb') as fp:
             pickle.dump(self.unreachable_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)

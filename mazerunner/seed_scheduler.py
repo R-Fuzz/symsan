@@ -122,5 +122,8 @@ class RealTimePriorityScheduler(SeedScheduler):
             return self.state_seed_mapping[selected_state], selected_state
         return None, selected_state
     
+    def reset(self):
+        self.D_table.rebuild_heap()
+    
     def is_empty(self) -> bool:
         return not self.fuzzer_seeds and self.D_table.is_heap_empty
