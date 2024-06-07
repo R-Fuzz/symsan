@@ -364,10 +364,7 @@ class ExploreAgent(Agent):
             return False
         if self.curr_state.reversed_sa in self.model.all_target_sa:
             return False
-        if self.config.defferred_solving_enabled:
-            interesting = self._curious_policy()
-        else:
-            interesting = self._greedy_policy()
+        interesting = self._greedy_policy()
         if interesting:
             self.model.add_target_sa(self.curr_state.reversed_sa)
             self.logger.debug(f"Target SA: {self.curr_state.reversed_sa}")
@@ -394,6 +391,9 @@ class ExploreAgent(Agent):
         return str(int(d))
 
     def _greedy_policy(self):
+        not_visited = self._curious_policy()
+        if not_visited:
+            return True
         d_curr = self.model.get_distance(self.curr_state, self.curr_state.action)
         reversed_action = 1 if self.curr_state.action == 0 else 0
         d_reverse = self.model.get_distance(self.curr_state, reversed_action)
@@ -403,7 +403,7 @@ class ExploreAgent(Agent):
             return False
         if d_reverse == float('inf'):
             return False
-        return self._curious_policy()
+        return not_visited
 
     def _curious_policy(self):
         reversed_action = 1 if self.curr_state.action == 0 else 0
