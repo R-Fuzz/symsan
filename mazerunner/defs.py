@@ -70,6 +70,7 @@ class SolvingStatus(Enum):
     UNSOLVED_INVALID_MSG = auto()
     UNSOLVED_UNINTERESTING_COND = auto()
     UNSOLVED_DEFERRED = auto()
+    UNSOLVED_RECIPE_MISS = auto()
     UNSOLVED_RECIPE_LOST = auto()
     UNSOLVED_UNKNOWN = auto()
 

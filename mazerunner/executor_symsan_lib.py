@@ -35,6 +35,7 @@ class ConcolicExecutor:
         symsan.init(self.cmd[0])
         self.symsan_tasks = []
         self._recipe = collections.defaultdict(list)
+        self._processed = set()
         # options
         self.config.defferred_solving_enabled = True if (type(agent) is ExploreAgent) else False
         self._testcase_dir = output_dir
@@ -132,17 +133,29 @@ class ConcolicExecutor:
             self.msg_num += 1
 
     def generate_testcase(self, target_sa, seed_map):
+        if not self._recipe:
+            return None, None, SolvingStatus.UNSOLVED_RECIPE_LOST
+        self._remove_stall_recipe(target_sa)
         if not self._recipe[target_sa]:
             self.logger.debug(f"generate_testcase: target_sa not in recipe: {target_sa}")
-            return None, None, SolvingStatus.UNSOLVED_RECIPE_LOST
+            return None, None, SolvingStatus.UNSOLVED_RECIPE_MISS
         tasks, seed_id = self._recipe[target_sa].pop()
         assert seed_id in seed_map
         solution, status = self._solve_tasks(tasks)
         solving_status = self._finalize_solving(status, solution, seed_map, seed_id)
+        self._processed.add(tasks)
         if solving_status not in solved_statuses:
             self.logger.debug(f"generate_testcase: failed to solve target_sa: {target_sa}")
             return None, seed_map[seed_id], solving_status
         return self.generated_files[-1], seed_map[seed_id], solving_status
+
+    # remove processed recipes
+    def _remove_stall_recipe(self, target_sa):
+        while self._recipe[target_sa]:
+            tasks, _ = self._recipe[target_sa][-1]
+            if tasks not in self._processed:
+                break
+            self._recipe[target_sa].pop()
 
     def _solve_tasks(self, tasks):
         solution = []
@@ -185,18 +198,30 @@ class ConcolicExecutor:
         if not msg.label:
             return SolvingStatus.UNSOLVED_INVALID_MSG
         
-        tasks = symsan.parse_cond(msg.label, msg.result, msg.flags)
         if not self.agent.is_interesting_branch():
+            symsan.add_constraint(msg.label, msg.result)
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
 
+        reversed_sa = self.agent.curr_state.reversed_sa
         if self.config.defferred_solving_enabled:
-            reversed_sa = self.agent.curr_state.reversed_sa
+            self._remove_stall_recipe(reversed_sa)
+            # found one recipe that not been processed,
+            # return without constructing a new recipe
+            if self._recipe[reversed_sa]:
+                symsan.add_constraint(msg.label, msg.result)
+                return SolvingStatus.UNSOLVED_DEFERRED
+        
+        tasks = tuple(symsan.parse_cond(msg.label, msg.result, msg.flags))
+        if self.config.defferred_solving_enabled:
             input_id = utils.get_id_from_fn(self._input_fn)
             self._recipe[reversed_sa].append((tasks, input_id))
+            for state in self.agent.episode:
+                self._recipe[state.sa].append((tasks, input_id))
             return SolvingStatus.UNSOLVED_DEFERRED
 
         solution, status = self._solve_tasks(tasks)
         solving_status = self._finalize_solving(status, solution)
+        self._processed.add(tasks)
         return solving_status
 
     def _process_gep_request(self, msg):
