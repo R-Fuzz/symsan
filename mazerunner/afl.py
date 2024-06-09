@@ -219,7 +219,6 @@ class Mazerunner:
             f"Total={symsan_res.total_time:.3f}ms, "
             f"Emulation={symsan_res.emulation_time:.3f}ms, "
             f"Solver={symsan_res.solving_time:.3f}ms, "
-            f"Timeout={timeout}s, "
             f"Return={symsan_res.returncode}, "
             f"Distance={symsan_res.distance}, "
             f"Episode_length={len(self.agent.episode)}, "
@@ -442,7 +441,36 @@ class ExploreExecutor(Mazerunner):
             return None, status
         return self._triage_testcase(t, src, save_queue=False), status
 
-    def _run(self):
+    def _process_seed(self, next_seed, target_sa=None):
+        if target_sa is not None:
+            new_seed, status = self._generate_testcase(target_sa)
+            if status == SolvingStatus.UNSOLVED_RECIPE_MISS and next_seed is None:
+                self.logger.info(f"No valid recipe for {target_sa}. Skip")
+                return None
+            if status == SolvingStatus.UNSOLVED_RECIPE_LOST:
+                self.logger.warning(f"Recipe lost when trying to solve {target_sa}. Reset scheduler and processed seeds")
+                self.state.processed.clear()
+                self.agent.model.rebuild_targets(target_sa)
+            next_seed = new_seed if new_seed is not None else next_seed
+
+        if next_seed is None:
+            self.logger.info(f"Skip. Cannot solve target_sa={target_sa}, status={status}")
+            return None
+
+        seed_id = int(utils.get_id_from_fn(next_seed))
+        if seed_id in self.state.processed:
+            self.logger.debug(f"Skip. {self.state.processed[seed_id]} already processed")
+            return None
+        
+        return next_seed
+
+    def _run_seed(self, next_seed):
+        fp = self.run_file(next_seed)
+        self.agent.train()
+        seed_id = int(utils.get_id_from_fn(next_seed))
+        self.state.processed[seed_id] = os.path.basename(fp)
+
+    def _run_defferred_gen(self):
         while True:
             next_seed, target_sa = self.seed_scheduler.pop()
             # Nothing in the queue
@@ -451,26 +479,32 @@ class ExploreExecutor(Mazerunner):
                 time.sleep(WAITING_INTERVAL)
                 return
 
-            if self.config.defferred_solving_enabled and target_sa is not None:
-                new_seed, status = self._generate_testcase(target_sa)
-                if status == SolvingStatus.UNSOLVED_RECIPE_LOST and next_seed is None:
-                    self.logger.warning("Recipe lost. Reset seed scheduler and processed queue")
-                    self.state.processed.clear()
-                    self.seed_scheduler.reset()
-                next_seed = new_seed if new_seed is not None else next_seed
-            
-            if next_seed is None:
-                self.logger.debug(f"Skip. Cannot solve target_sa={target_sa}")
-                continue
-            
-            seed_id = int(utils.get_id_from_fn(next_seed))
-            if seed_id not in self.state.processed:
+            next_seed = self._process_seed(next_seed, target_sa)
+            if next_seed is not None:
                 break
-            self.logger.debug(f"Skip. {self.state.processed[seed_id]} already processed")
-        
-        fp = self.run_file(next_seed)
-        self.agent.train()
-        self.state.processed[seed_id] = os.path.basename(fp)
+
+        self._run_seed(next_seed)
+
+    def _run_realtime_gen(self):
+        while True:
+            next_seed, _ = self.seed_scheduler.pop()
+            # Nothing in the queue
+            if next_seed is None:
+                self.logger.info("Sleeping for getting seeds from Fuzzer")
+                time.sleep(WAITING_INTERVAL)
+                return
+
+            next_seed = self._process_seed(next_seed)
+            if next_seed is not None:
+                break
+
+        self._run_seed(next_seed)
+
+    def _run(self):
+        if self.config.defferred_solving_enabled:
+            self._run_defferred_gen()
+        else:
+            self._run_realtime_gen()
 
 class ExploitExecutor(Mazerunner):
     def __init__(self, config, shared_state=None, seed_scheduler=None, model=None):
