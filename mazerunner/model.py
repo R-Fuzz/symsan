@@ -15,18 +15,15 @@ class SortedDict:
         self.need_sort = need_sort
         self.data = collections.OrderedDict()
         self.heap = []
+        self._heap_items = set()
 
     def __len__(self):
         return len(self.data)
     
     def __setitem__(self, key, value):
-        if self.need_sort:
-            if key in self.data:
-                if self.data[key] == value:
-                    return
-                self.remove(key, mark_only=True)
-            heapq.heappush(self.heap, (value, key[2], key))
         self.data[key] = value
+        if self.need_sort:
+            self.reload(key)
 
     def __getitem__(self, key):
         return self.data.get(key, None)
@@ -42,8 +39,13 @@ class SortedDict:
 
     @property
     def is_heap_empty(self):
+        assert len(self.heap) == len(self._heap_items)
         if not self.heap:
             return True
+    @property
+    def heap_size(self):
+        assert len(self.heap) == len(self._heap_items)
+        return len(self._heap_items)
 
     def keys(self):
         return self.data.keys()
@@ -57,9 +59,11 @@ class SortedDict:
     def reload(self, key):
         if not self.need_sort:
             return
-        if not key in self.data:
+        t = (self.data[key], key[2], key)
+        if t in self._heap_items:
             return
-        heapq.heappush(self.heap, (self.data[key], key[2], key))
+        self._heap_items.add(t)
+        heapq.heappush(self.heap, t)
 
     def remove(self, key, mark_only=False):
         if key in self.data:
@@ -69,7 +73,9 @@ class SortedDict:
 
     def pop(self):
         while self.heap:
-            value, _, key = heapq.heappop(self.heap)
+            t = heapq.heappop(self.heap)
+            self._heap_items.remove(t)
+            value, _, key = t
             if key in self.data and self.data[key] == value:
                 # don't remove item in Q-table
                 # self.remove(key)
@@ -81,7 +87,8 @@ class SortedDict:
             value, _, key = self.heap[0]
             if key in self.data and self.data[key] == value:
                 return key
-            heapq.heappop(self.heap)
+            t = heapq.heappop(self.heap)
+            self._heap_items.remove(t)
         return None
 
     def clean_heap(self):
@@ -95,12 +102,17 @@ class SortedDict:
                 continue
             new_heap.append((v, c, k))
         self.heap = new_heap
+        self._heap_items = set(self.heap)
         heapq.heapify(self.heap)
     
-    def rebuild_heap(self):
+    def rebuild_heap(self, targets={}):
         if not self.need_sort:
             return
-        self.heap = [(v, k[2], k) for k, v in self.data.items()]
+        if targets:
+            self.heap = [(self.data[k], k[2], k) for k in targets if k in self.data]
+        else:
+            self.heap = [(v, k[2], k) for k, v in self.data.items()]
+        self._heap_items = set(self.heap)
         heapq.heapify(self.heap)
 
 
@@ -192,6 +204,14 @@ class RLModel:
         if sa in self.all_target_sa:
             self.all_target_sa.remove(sa)
 
+    def rebuild_targets(self, last_sa):
+        if not self.config.defferred_solving_enabled:
+            return
+        targets = set(self.visited_sa.keys()) - self.unreachable_sa
+        self.distance_table.rebuild_heap(targets)
+        if self.distance_table.peak() == last_sa:
+            self.add_unreachable_sa(last_sa)
+            self.distance_table.pop()
 
 class DistanceModel(RLModel):
 

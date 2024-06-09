@@ -117,13 +117,10 @@ class RealTimePriorityScheduler(SeedScheduler):
         selected_state = self.D_table.pop()
         if selected_state is None:
             return None, None
-        self.logger.debug(f"selected state: {selected_state}, distacne: {self.D_table[selected_state]}")
+        self.logger.debug(f"selected_state: {selected_state}, real_dis: {self.D_table[selected_state]}")
         if selected_state in self.state_seed_mapping:
             return self.state_seed_mapping[selected_state], selected_state
         return None, selected_state
-    
-    def reset(self):
-        self.D_table.rebuild_heap()
     
     def is_empty(self) -> bool:
         return not self.fuzzer_seeds and self.D_table.is_heap_empty
