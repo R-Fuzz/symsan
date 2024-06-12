@@ -451,6 +451,7 @@ class ExploreExecutor(Mazerunner):
                 self.logger.warning(f"Recipe lost when trying to solve {target_sa}. Reset scheduler and processed seeds")
                 self.state.processed.clear()
                 self.agent.model.rebuild_targets(target_sa)
+            self.logger.info(f"Generated testcase for {target_sa}, status={status}")
             next_seed = new_seed if new_seed is not None else next_seed
 
         if next_seed is None:
@@ -687,7 +688,7 @@ class RLExecutor():
         elif agent_type == "explore":
             self.seed_scheduler = RealTimePriorityScheduler(
                 self.state.state_seed_mapping,
-                self.model.distance_table
+                self.model.q_table
             )
             self.concolic_executor = ExploreExecutor(
                 config,

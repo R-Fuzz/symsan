@@ -1,8 +1,10 @@
+import abc
 import collections
 import logging
 import os
 import pickle
 import heapq
+import math
 
 from decimal import Decimal, getcontext
 from enum import Enum
@@ -26,7 +28,7 @@ class SortedDict:
             self.reload(key)
 
     def __getitem__(self, key):
-        return self.data.get(key, None)
+        return self.data[key]
 
     def __delitem__(self, key):
         self.remove(key)
@@ -42,6 +44,8 @@ class SortedDict:
         assert len(self.heap) == len(self._heap_items)
         if not self.heap:
             return True
+        return False
+
     @property
     def heap_size(self):
         assert len(self.heap) == len(self._heap_items)
@@ -122,19 +126,18 @@ class RLModelType(Enum):
     reachability = 2
 
 
-class RLModel:
+class RLModel(abc.ABC):
 
     def __init__(self, config):
         self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        getcontext().prec = config.decimal_precision
         self.visited_sa = collections.Counter()
         self.all_target_sa = set()
         self.unreachable_sa = set()
         if self.config.use_ordered_dict:
-            self.distance_table = SortedDict(need_sort=True)
+            self.q_table = SortedDict(need_sort=True)
         else:
-            self.distance_table = SortedDict(need_sort=False)
+            self.q_table = SortedDict(need_sort=False)
         if config.mazerunner_dir:
             mkdir(self.my_dir)
             self.load()
@@ -142,14 +145,34 @@ class RLModel:
     @property
     def my_dir(self):
         return os.path.join(self.config.mazerunner_dir, "model")
+    
+    @abc.abstractmethod
+    def Q_lookup(self, s, a):
+        pass
+    
+    @abc.abstractmethod
+    def Q_update(self, key, value):
+        pass
+
+    @abc.abstractmethod
+    def get_distance(self, s, a, compare_only):
+        pass
+
+    @abc.abstractmethod
+    def update_unreachable_Q(self, sa):
+        pass
+
+    @abc.abstractmethod
+    def is_unreachable(self, state, action):
+        pass
 
     def save(self):
         with open(os.path.join(self.my_dir, "visited_sa"), 'wb') as fp:
             pickle.dump(self.visited_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
         with open(os.path.join(self.my_dir, "Q_table"), 'wb') as fp:
-            if self.distance_table.need_sort:
-                self.distance_table.clean_heap()
-            pickle.dump(self.distance_table, fp, protocol=pickle.HIGHEST_PROTOCOL)  
+            if self.q_table.need_sort:
+                self.q_table.clean_heap()
+            pickle.dump(self.q_table, fp, protocol=pickle.HIGHEST_PROTOCOL)  
         with open(os.path.join(self.my_dir, "unreachable_branches"), 'wb') as fp:
             pickle.dump(self.unreachable_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
         with open(os.path.join(self.my_dir, "target_sa"), 'wb') as fp:
@@ -163,10 +186,10 @@ class RLModel:
         Q_table_path = os.path.join(self.my_dir, "Q_table")
         if os.path.isfile(Q_table_path):
             with open(Q_table_path, 'rb') as fp:
-                self.distance_table = pickle.load(fp)
-        unreachable_branches_path = os.path.join(self.my_dir, "unreachable_sa")
-        if os.path.isfile(unreachable_branches_path):
-            with open(unreachable_branches_path, 'rb') as fp:
+                self.q_table = pickle.load(fp)
+        unreachable_sa_fp = os.path.join(self.my_dir, "unreachable_sa")
+        if os.path.isfile(unreachable_sa_fp):
+            with open(unreachable_sa_fp, 'rb') as fp:
                 self.unreachable_sa = pickle.load(fp)
         target_sa_path = os.path.join(self.my_dir, "target_sa")
         if os.path.isfile(target_sa_path):
@@ -194,7 +217,7 @@ class RLModel:
     
     def add_target_sa(self, sa):
         if self.config.defferred_solving_enabled:
-            self.distance_table.reload(sa)
+            self.q_table.reload(sa)
         else:
             self.all_target_sa.add(sa)
     
@@ -208,10 +231,10 @@ class RLModel:
         if not self.config.defferred_solving_enabled:
             return
         targets = set(self.visited_sa.keys()) - self.unreachable_sa
-        self.distance_table.rebuild_heap(targets)
-        if self.distance_table.peak() == last_sa:
+        self.q_table.rebuild_heap(targets)
+        if self.q_table.peak() == last_sa:
             self.add_unreachable_sa(last_sa)
-            self.distance_table.pop()
+            self.q_table.pop()
 
 class DistanceModel(RLModel):
 
@@ -223,30 +246,39 @@ class DistanceModel(RLModel):
     def q_to_distance(p):
         return -p
 
-    def get_distance(self, s, a):
+    def get_distance(self, s, a, compare_only=False):
         q = self.Q_lookup(s, a)
         return DistanceModel.q_to_distance(q)
 
     def Q_lookup(self, s, a):
         key = s.state + (a,)
-        if key not in self.distance_table:
+        if key not in self.q_table:
             d = self.get_default_distance(s, a)
-            self.distance_table[key] = d
-        return DistanceModel.distance_to_q(self.distance_table[key])
+            self.q_table[key] = d
+        return DistanceModel.distance_to_q(self.q_table[key])
 
     def Q_update(self, key, value):
         d = DistanceModel.q_to_distance(value)
-        self.distance_table[key] = d
-        self.logger.debug(f"Q_update: key={key}, value={d}")
+        self.q_table[key] = d
 
     def update_unreachable_Q(self, sa):
         self.Q_update(sa, -float('inf'))
 
-class ReachabilityModel(RLModel):
+    def is_unreachable(self, state, action):
+        d = DistanceModel.q_to_distance(self.Q_lookup(state, action))
+        if d == float('inf'):
+            return True
+        return False
+
+class ReachabilityModelDecimal(RLModel):
     # Constants
     ZERO = Decimal(0)
     ONE = Decimal(1)
     TWO = Decimal(2)
+    
+    def __init__(self, config):
+        super().__init__(config)
+        getcontext().prec = config.decimal_precision
 
     @staticmethod
     def distance_to_prob(d):
@@ -255,10 +287,10 @@ class ReachabilityModel(RLModel):
         Returns: 1 / 2 ** (d / DISTANCE_SCALE)
         """
         if d == float('inf'):
-            return ReachabilityModel.ZERO
+            return ReachabilityModelDecimal.ZERO
         if d == 0.:
-            return ReachabilityModel.ONE
-        return ReachabilityModel.ONE / (ReachabilityModel.TWO ** Decimal(float(d) / DISTANCE_SCALE))
+            return ReachabilityModelDecimal.ONE
+        return ReachabilityModelDecimal.ONE / (ReachabilityModelDecimal.TWO ** Decimal(float(d) / DISTANCE_SCALE))
 
     @staticmethod
     def prob_to_distance(p):
@@ -266,28 +298,94 @@ class ReachabilityModel(RLModel):
         Converts a probability to a distance.
         Returns: -log_2(p) * DISTANCE_SCALE
         """
-        if p == ReachabilityModel.ZERO:
+        if p == ReachabilityModelDecimal.ZERO:
             return float('inf')
-        if p == ReachabilityModel.ONE:
+        if p == ReachabilityModelDecimal.ONE:
             return 0.
-        res = - (p.ln() / ReachabilityModel.TWO.ln())
+        res = - (p.ln() / ReachabilityModelDecimal.TWO.ln())
         return float(res) * DISTANCE_SCALE
 
-    def get_distance(self, s, a):
+    def get_distance(self, s, a, compare_only=False):
         key = s.state + (a,)
-        if key not in self.distance_table:
+        if key not in self.q_table:
             d = self.get_default_distance(s, a)
-            self.distance_table[key] = d
-        return self.distance_table[key]
+            self.q_table[key] = d
+        return self.q_table[key]
 
     def Q_lookup(self, s, a):
         d = self.get_distance(s, a)
-        return ReachabilityModel.distance_to_prob(d)
+        return ReachabilityModelDecimal.distance_to_prob(d)
 
     def Q_update(self, key, value):
-        d = ReachabilityModel.prob_to_distance(value)
-        self.distance_table[key] = d
-        self.logger.debug(f"Q_update: key={key}, value={d}")
+        d = ReachabilityModelDecimal.prob_to_distance(value)
+        self.q_table[key] = d
 
     def update_unreachable_Q(self, sa):
-        self.Q_update(sa, ReachabilityModel.ZERO)
+        self.Q_update(sa, ReachabilityModelDecimal.ZERO)
+
+    def is_unreachable(self, state, action):
+        d = self.get_distance(state, action)
+        if d == float('inf'):
+            return True
+        return False
+
+class ReachabilityModelFloat(RLModel):
+
+    @staticmethod
+    def q_to_prob(q):
+        return -q
+
+    @staticmethod
+    def prob_to_q(p):
+        return -p
+    
+    @staticmethod
+    def distance_to_prob(d):
+        if d == float('inf'):
+            return 0.
+        if d == 0:
+            return 1.
+        return 1. / (2 ** (d / DISTANCE_SCALE))
+
+    @staticmethod
+    def prob_to_distance(p):
+        if p == 0:
+            return float('inf')
+        if p == 1:
+            return 0.
+        return -math.log2(p) * DISTANCE_SCALE
+
+    def get_distance(self, s, a, compare_only=False):
+        key = s.state + (a,)
+        if key not in self.q_table:
+            d = self.get_default_distance(s, a)
+            p = ReachabilityModelFloat.distance_to_prob(d)
+            self.Q_update(key, p)
+            if compare_only: return self.q_table[key]
+            return d
+        if compare_only: return self.q_table[key]
+        p = ReachabilityModelFloat.q_to_prob(self.q_table[key])
+        d = ReachabilityModelFloat.prob_to_distance(p)
+        return d
+
+    def Q_lookup(self, s, a):
+        key = s.state + (a,)
+        if key not in self.q_table:
+            d = self.get_default_distance(s, a)
+            p = ReachabilityModelFloat.distance_to_prob(d)
+            self.Q_update(key, p)
+        return ReachabilityModelFloat.q_to_prob(self.q_table[key])
+
+    def Q_update(self, key, p):
+        assert 0 <= p <= 1
+        q = ReachabilityModelFloat.prob_to_q(p)
+        self.q_table[key] = q
+
+    def update_unreachable_Q(self, sa):
+        self.Q_update(sa, 0.)
+
+    def is_unreachable(self, state, action):
+        p = ReachabilityModelFloat.q_to_prob(self.Q_lookup(state, action))
+        if p == 0:
+            return True
+        return False
