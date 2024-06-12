@@ -270,6 +270,9 @@ class DistanceModel(RLModel):
             return True
         return False
 
+'''
+Slow but accurate, use it when precision is needed.
+'''
 class ReachabilityModelDecimal(RLModel):
     # Constants
     ZERO = Decimal(0)
@@ -329,6 +332,12 @@ class ReachabilityModelDecimal(RLModel):
             return True
         return False
 
+'''
+Be carefull about precision lost when doing computations between numbers 
+that the diff = |num_1 - number_2| > (1.0 / 2**52), 
+and one number is smaller than (1.0 / 2**52).
+Fall back to ReachabilityModelDecimal if needed.
+'''
 class ReachabilityModelFloat(RLModel):
 
     @staticmethod
