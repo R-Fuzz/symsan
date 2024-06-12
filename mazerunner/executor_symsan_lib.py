@@ -142,7 +142,7 @@ class ConcolicExecutor:
         tasks, seed_id = self._recipe[target_sa].pop()
         assert seed_id in seed_map
         solution, status = self._solve_tasks(tasks)
-        solving_status = self._finalize_solving(status, solution, seed_map, seed_id)
+        solving_status = self._finalize_solving(status, solution, target_sa, seed_map, seed_id)
         self._processed.add(tasks)
         if solving_status not in solved_statuses:
             self.logger.debug(f"generate_testcase: failed to solve target_sa: {target_sa}")
@@ -167,13 +167,13 @@ class ConcolicExecutor:
             status.append(s)
         return solution, status
 
-    def _finalize_solving(self, status, solution, seed_map=None, seed_id=None):
+    def _finalize_solving(self, status, solution, target_sa, seed_map=None, seed_id=None):
         seed_info = ''
         if self._save_seed_info:
             reversed_sa = str(self.agent.curr_state.reversed_sa)
             score = self.agent.compute_branch_score()
             seed_info = f"{score}:{reversed_sa}"
-        solving_status = self._handle_solving_status(status)
+        solving_status = self._handle_solving_status(status, target_sa)
         if solving_status in solved_statuses:
             input_buf = self._prepare_input_buffer(seed_map, seed_id)
             self._generate_testcase(solution, seed_info, input_buf)
@@ -220,7 +220,7 @@ class ConcolicExecutor:
             return SolvingStatus.UNSOLVED_DEFERRED
 
         solution, status = self._solve_tasks(tasks)
-        solving_status = self._finalize_solving(status, solution)
+        solving_status = self._finalize_solving(status, solution, reversed_sa)
         self._processed.add(tasks)
         return solving_status
 
@@ -259,8 +259,10 @@ class ConcolicExecutor:
             f.write(input_buf)
         self.generated_files.append(fname)
     
-    def _handle_solving_status(self, status):
+    def _handle_solving_status(self, status, target_sa):
         nested_solved = True
+        reversed_action = 1 if target_sa[3] == 0 else 0
+        self.agent.create_curr_state(sa=(target_sa[0], target_sa[1], target_sa[2], reversed_action))
         for s in status:
             if s == SolvingStatus.UNSOLVED_UNINTERESTING_SAT:
                 return SolvingStatus.UNSOLVED_UNINTERESTING_SAT
