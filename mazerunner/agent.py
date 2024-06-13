@@ -361,14 +361,16 @@ class Agent:
         distance_taken = self.model.get_distance(state, 1)
         distance_not_taken = self.model.get_distance(state, 0)
         s = state.serialize()
-        self.logger.info(f"sad={(s[0],s[1],s[2])}, "
-                        f"hit_tn={self.model.visited_sa.get(state.sa, 0)}, "
-                        f"d_t={distance_taken}, "
-                        f"d_nt={distance_not_taken}, "
-                        f"unreachale={state.reversed_sa in self.model.unreachable_sa}, "
-                        f"trace_len={len(self.episode)}, "
-                        f"min_d={self.min_distance}"
-                        )
+        loc = find_source_code(s[0][0], self.config.cmd[0])
+        self.logger.info(f"loc={loc}, "
+            f"sad={(s[0],s[1],s[2])}, "
+            f"hit_tn={self.model.visited_sa.get(state.sa, 0)}, "
+            f"d_t={distance_taken}, "
+            f"d_nt={distance_not_taken}, "
+            f"unreachale={state.reversed_sa in self.model.unreachable_sa}, "
+            f"trace_len={len(self.episode)}, "
+            f"min_d={self.min_distance}"
+            )
 
 
 class RecordAgent(Agent):

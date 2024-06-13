@@ -102,3 +102,14 @@ def disable_core_dump():
         print(f"Failed to disable core dump. \n"
                     f"Please try to set it manually by running: "
                     f"'ulimit -c 0'")
+
+pc_loc = {}
+def find_source_code(addr, bin_path):
+    if addr in pc_loc:
+        return pc_loc[addr]
+    addr_str = hex(addr)
+    cmd = ['/usr/bin/addr2line', '-e', bin_path, '-p', '-s', addr_str]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    loc = result.stdout.strip()
+    pc_loc[addr] = loc
+    return loc
