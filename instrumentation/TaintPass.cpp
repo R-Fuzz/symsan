@@ -563,6 +563,7 @@ public:
   void visitCmpInst(CmpInst &CI);
   void visitSwitchInst(SwitchInst &SWI);
   void visitGetElementPtrInst(GetElementPtrInst &GEPI);
+  void visitAtomicRMWInst(AtomicRMWInst &I);
   void visitLoadInst(LoadInst &LI);
   void visitStoreInst(StoreInst &SI);
   void visitReturnInst(ReturnInst &RI);
@@ -1736,6 +1737,45 @@ Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size, uint64_t A
   Value *Shadow = UndefValue::get(ShadowTy);
   loadShadowRecursive(Shadow, Indices, T, Addr, Size, Align, IRB);
   return Shadow;
+}
+
+void TaintVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
+  auto &DL = I.getModule()->getDataLayout();
+
+  BinaryOperator::BinaryOps Op;
+  UnaryOperator::UnaryOps Extra = UnaryOperator::UnaryOpsEnd; // TODO: extra operations
+  switch (I.getOperation()) {
+    case AtomicRMWInst::Add: Op = BinaryOperator::Add; break;
+    case AtomicRMWInst::Sub: Op = BinaryOperator::Sub; break;
+    case AtomicRMWInst::And: Op = BinaryOperator::And; break;
+    case AtomicRMWInst::Or: Op = BinaryOperator::Or; break;
+    case AtomicRMWInst::Xor: Op = BinaryOperator::Xor; break;
+    // case AtomicRMWInst::Nand: Op = BinaryOperator::And; Extra = UnaryOperator::Not; break;
+    // case AtomicRMWInst::Max: Op = BinaryOperator::ICmp; Extra = UnaryOperator::Max; break;
+    // case AtomicRMWInst::Min: Op = BinaryOperator::ICmp; Extra = UnaryOperator::Min; break;
+    // case AtomicRMWInst::UMax: Op = BinaryOperator::ICmp; Extra = UnaryOperator::UMax; break;
+    // case AtomicRMWInst::UMin: Op = BinaryOperator::ICmp; Extra = UnaryOperator::UMin; break;
+
+
+    default:
+    assert(false && "unimplemented atomicrmw operation");
+      break;
+  }
+
+  Value *Shadow1 = TF.loadShadow(
+    I.getPointerOperand()->getType(),
+    I.getPointerOperand(), 
+    DL.getTypeAllocSize(I.getPointerOperand()->getType()->getPointerElementType()), 
+    I.getAlign().value(), 
+    &I);
+  Value *Shadow2 = TF.getShadow(I.getValOperand());
+  Value *Shadow = TF.combineShadows(Shadow1, Shadow2, Op, &I);
+  // TODO: support extra operations
+  TF.storeShadow(I.getPointerOperand(), 
+    DL.getTypeAllocSize(I.getPointerOperand()->getType()->getPointerElementType()), 
+    I.getAlign(), 
+    Shadow, &I);
+  TF.setShadow(&I, Shadow1);
 }
 
 void TaintVisitor::visitLoadInst(LoadInst &LI) {
