@@ -1741,40 +1741,67 @@ Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size, uint64_t A
 
 void TaintVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
   auto &DL = I.getModule()->getDataLayout();
+  Value *Ptr = I.getPointerOperand();
+  Value *Val = I.getValOperand();
+  Type *Ty = I.getType();
+  uint64_t Size = DL.getTypeStoreSize(Ty);
 
-  BinaryOperator::BinaryOps Op;
-  UnaryOperator::UnaryOps Extra = UnaryOperator::UnaryOpsEnd; // TODO: extra operations
+  Value *Shadow1 = TF.loadShadow(Ty, Ptr, Size, I.getAlign().value(), &I);
+  Value *Shadow2 = TF.getShadow(Val);
+  Value *Shadow  = nullptr;
+  Value *Op1 = nullptr, *Cond = nullptr;
+  IRBuilder<> IRB(&I);
+
   switch (I.getOperation()) {
-    case AtomicRMWInst::Add: Op = BinaryOperator::Add; break;
-    case AtomicRMWInst::Sub: Op = BinaryOperator::Sub; break;
-    case AtomicRMWInst::And: Op = BinaryOperator::And; break;
-    case AtomicRMWInst::Or: Op = BinaryOperator::Or; break;
-    case AtomicRMWInst::Xor: Op = BinaryOperator::Xor; break;
-    // case AtomicRMWInst::Nand: Op = BinaryOperator::And; Extra = UnaryOperator::Not; break;
-    // case AtomicRMWInst::Max: Op = BinaryOperator::ICmp; Extra = UnaryOperator::Max; break;
-    // case AtomicRMWInst::Min: Op = BinaryOperator::ICmp; Extra = UnaryOperator::Min; break;
-    // case AtomicRMWInst::UMax: Op = BinaryOperator::ICmp; Extra = UnaryOperator::UMax; break;
-    // case AtomicRMWInst::UMin: Op = BinaryOperator::ICmp; Extra = UnaryOperator::UMin; break;
-
-
+    case AtomicRMWInst::Xchg:
+      Shadow = Shadow2;
+      break;
+    case AtomicRMWInst::Add:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Add, &I);
+      break;
+    case AtomicRMWInst::Sub:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Sub, &I);
+      break;
+    case AtomicRMWInst::And:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
+      break;
+    case AtomicRMWInst::Nand:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
+      Shadow = TF.combineShadows(TF.TT.getZeroShadow(Ty), Shadow, 2, &I); // __dfsan::Neg
+      break;
+    case AtomicRMWInst::Or:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Or, &I);
+      break;
+    case AtomicRMWInst::Xor:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Xor, &I);
+      break;
+    case AtomicRMWInst::Max:
+      Op1 = IRB.CreateLoad(Ptr, true);
+      Cond = IRB.CreateICmpSGT(Op1, Val);
+      Shadow = IRB.CreateSelect(Cond, Shadow1, Shadow2);
+      break;
+    case AtomicRMWInst::Min:
+      Op1 = IRB.CreateLoad(Ptr, true);
+      Cond = IRB.CreateICmpSLT(Op1, Val);
+      Shadow = IRB.CreateSelect(Cond, Shadow1, Shadow2);
+      break;
+    case AtomicRMWInst::UMax:
+      Op1 = IRB.CreateLoad(Ptr, true);
+      Cond = IRB.CreateICmpUGT(Op1, Val);
+      Shadow = IRB.CreateSelect(Cond, Shadow1, Shadow2);
+      break;
+    case AtomicRMWInst::UMin:
+      Op1 = IRB.CreateLoad(Ptr, true);
+      Cond = IRB.CreateICmpULT(Op1, Val);
+      Shadow = IRB.CreateSelect(Cond, Shadow1, Shadow2);
+      break;
+    // TODO: support extra operations
     default:
-    assert(false && "unimplemented atomicrmw operation");
+      assert(false && "unimplemented atomicrmw operation");
       break;
   }
 
-  Value *Shadow1 = TF.loadShadow(
-    I.getPointerOperand()->getType(),
-    I.getPointerOperand(), 
-    DL.getTypeAllocSize(I.getPointerOperand()->getType()->getPointerElementType()), 
-    I.getAlign().value(), 
-    &I);
-  Value *Shadow2 = TF.getShadow(I.getValOperand());
-  Value *Shadow = TF.combineShadows(Shadow1, Shadow2, Op, &I);
-  // TODO: support extra operations
-  TF.storeShadow(I.getPointerOperand(), 
-    DL.getTypeAllocSize(I.getPointerOperand()->getType()->getPointerElementType()), 
-    I.getAlign(), 
-    Shadow, &I);
+  TF.storeShadow(Ptr, Size, I.getAlign(), Shadow, &I);
   TF.setShadow(&I, Shadow1);
 }
 
