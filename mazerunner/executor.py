@@ -18,6 +18,7 @@ UNION_TABLE_SIZE = 0xc00000000
 PIPE_CAPACITY = 4 * 1024 * 1024
 
 class ConcolicExecutor:
+    
     class InvalidGEPMessage(Exception):
         pass
     

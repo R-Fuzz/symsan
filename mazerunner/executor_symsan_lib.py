@@ -12,6 +12,9 @@ from agent import ExploitAgent, ExploreAgent
 
 class ConcolicExecutor:
     
+    class InvalidGEPMessage(Exception):
+        pass
+    
     class Timer:
         def reset(self):
             self.proc_start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
@@ -225,8 +228,30 @@ class ConcolicExecutor:
         return solving_status
 
     def _process_gep_request(self, msg):
-        #TODO: implemnet gep solver
-        pass
+        gep_data = symsan.read_event(ctypes.sizeof(gep_msg))
+        if len(gep_data) < ctypes.sizeof(gep_msg):
+            self.logger.error(f"__process_gep_request: GEP message too small: {len(gep_data)}")
+            return SolvingStatus.UNSOLVED_INVALID_MSG
+        gmsg = gep_msg.from_buffer_copy(gep_data)
+        if msg.label != gmsg.index_label: # Double check
+            self.logger.error(f"__process_gep_request: Incorrect gep msg: {msg.label} "
+                              f"vs {gmsg.index_label}")
+            raise ConcolicExecutor.InvalidGEPMessage()
+        if self.config.gep_solver_enabled:
+            tasks = tuple(symsan.parse_gep(gmsg.ptr_label, 
+                             gmsg.ptr, 
+                             gmsg.index_label, 
+                             gmsg.index, 
+                             gmsg.num_elems, 
+                             gmsg.elem_size, 
+                             gmsg.current_offset))
+            solution, status = self._solve_tasks(tasks)
+            # we don't have a target_sa for GEP requests, use (0,0,0,0)
+            # TODO: nothing generated, need more testing and debugging
+            solving_status = self._finalize_solving(status, solution, (0,0,0,0))
+            self._processed.add(tasks)
+            return solving_status
+            
     
     def _process_memcmp_request(self, msg):
         label = msg.label
