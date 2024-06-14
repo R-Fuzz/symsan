@@ -213,7 +213,7 @@ class Mazerunner:
         try:
             self.symsan.process_request()
         finally:
-            self.symsan.tear_down()
+            self.symsan.tear_down(deep_clean=False)
         symsan_res = self.symsan.get_result()
         self.logger.info(
             f"Total={symsan_res.total_time:.3f}ms, "
@@ -311,7 +311,7 @@ class Mazerunner:
     def cleanup(self):
         self.minimizer.cleanup()
         if not self.symsan is None:
-            self.symsan.tear_down(need_cleanup=True)
+            self.symsan.tear_down()
 
     def signal_handler(self, signum, frame):
         self.logger.info(f"Received signal {signum}, cleaning up...")
@@ -534,7 +534,7 @@ class ExploitExecutor(Mazerunner):
                 fp = os.path.join(self.my_generations, self.symsan.solver.generated_files[0])
                 shutil.move(fp, self._cur_input)
             finally:
-                self.symsan.tear_down()
+                self.symsan.tear_down(deep_clean=False)
                 symsan_res = self.symsan.get_result()
                 total_time += symsan_res.total_time
                 emulation_time += symsan_res.emulation_time
