@@ -37,7 +37,7 @@ int main (int argc, char** argv) {
 
   int orig = __atomic_fetch_add(&x, y, __ATOMIC_RELAXED);
   if(orig == 2 && y == 1) {
-        // CHECK-GEN: Good
+    // CHECK-GEN: Good
     printf("Good\n");
   }
   else {
