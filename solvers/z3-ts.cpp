@@ -342,6 +342,10 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
                            uint64_t num_elems, uint64_t elem_size, int64_t current_offset,
                            std::vector<uint64_t> &tasks) {
 
+  if (index_label < CONST_OFFSET || index_label == __dfsan::kInitializingLabel) {
+    return 0;
+  }
+
   try {
     // prepare current index
     uint8_t size = get_label_info(index_label)->size;
