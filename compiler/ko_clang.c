@@ -141,6 +141,10 @@ static u8 check_if_assembler(u32 argc, char **argv) {
 }
 
 static void add_runtime() {
+  if (getenv("KO_LIBRARY_PATH")) {
+    cc_params[cc_par_cnt++] = alloc_printf("-L%s", getenv("KO_LIBRARY_PATH"));
+  }
+
   cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
   cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libdfsan_rt-x86_64.a", obj_path);
   cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
@@ -266,7 +270,7 @@ static void edit_params(u32 argc, char **argv) {
     if (!strcmp(cur, "-c") || !strcmp(cur, "-S") || !strcmp(cur, "-E"))
       maybe_linking = 0;
 
-    if (!strcmp(cur, "-fsanitize=address") || !strcmp(cur, "-fsanitize=memory"))
+    if (!strncmp(cur, "-fsanitize=", 11))
       continue; // doesn't work together
 
     if (strstr(cur, "FORTIFY_SOURCE"))
