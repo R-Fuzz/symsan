@@ -162,7 +162,7 @@ static void add_runtime() {
   } else {
     cc_params[cc_par_cnt++] = "-lc++";
     cc_params[cc_par_cnt++] = "-lc++abi";
-    cc_params[cc_par_cnt++] = "-l:libunwind.so.1";
+    cc_params[cc_par_cnt++] = "-l:libunwind.so";
   }
   cc_params[cc_par_cnt++] = "-lrt";
 
@@ -272,6 +272,10 @@ static void edit_params(u32 argc, char **argv) {
 
     if (!strncmp(cur, "-fsanitize=", 11))
       continue; // doesn't work together
+  
+    if (!strncmp(cur, "-fsanitize=", strlen("-fsanitize="))) {
+      continue;
+    }
 
     if (strstr(cur, "FORTIFY_SOURCE"))
       fortify_set = 1;
@@ -293,6 +297,20 @@ static void edit_params(u32 argc, char **argv) {
         strstr(cur, "-l:libunwind.so") == cur) {
       // skip libc++, libc++abi, and libunwind
       continue;
+    }
+
+    if (strstr(cur, "libSymsanProxy.o")) {
+      char* last = *(argv - 1);
+      if (last) {
+        if (!strcmp(last, "-I")) { // remove the -I
+          cc_params[cc_par_cnt - 1] = cur;
+          continue;
+        }
+        if (!strcmp(last, "-L")) { // remove the -L
+          cc_params[cc_par_cnt - 1] = cur;
+          continue;
+        }
+      }
     }
 
     cc_params[cc_par_cnt++] = cur;
