@@ -21,3 +21,11 @@ install (TARGETS FGTest DESTINATION ${SYMSAN_BIN_DIR})
 if (DEFINED AFLPP_PATH)
     add_subdirectory(aflpp)
 endif()
+
+add_library(libSymsanProxy OBJECT harness-proxy)
+set_target_properties(libSymsanProxy PROPERTIES
+  OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/obj
+)
+
+install (FILES $<TARGET_OBJECTS:libSymsanProxy> DESTINATION ${SYMSAN_LIB_DIR} RENAME libSymsanProxy.o)
+
