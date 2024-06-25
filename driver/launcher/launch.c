@@ -45,6 +45,7 @@ struct symsan_config {
   int is_input_network;
   int enable_debug;
   int enable_bounds_check;
+  int exit_on_memerror;
 
   int dev_null_fd;
 
@@ -76,6 +77,7 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   g_config.is_input_network = 0;
   g_config.enable_debug = 0;
   g_config.enable_bounds_check = 0;
+  g_config.exit_on_memerror = 1;
   g_config.dev_null_fd = -1;
   g_config.exit_status = 0;
   g_config.is_killed = 0;
@@ -185,6 +187,12 @@ int symsan_set_bounds_check(int enable) {
 }
 
 __attribute__((visibility("default")))
+int symsan_set_exit_on_memerror(int enable) {
+  g_config.exit_on_memerror = !!enable;
+  return 0;
+}
+
+__attribute__((visibility("default")))
 int symsan_run(int fd) {
   if (fd < 0) {
     return SYMSAN_INVALID_ARGS;
@@ -212,9 +220,11 @@ int symsan_run(int fd) {
   }
 
   if (!g_config.symsan_env) {
-    g_config.symsan_env = alloc_printf("taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=%d:trace_bound=%d",
+    g_config.symsan_env = alloc_printf(
+        "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=%d:trace_bounds=%d:exit_on_memerror=%d",
         g_config.input_file, g_config.shm_fd, g_config.pipefds[1],
-        g_config.enable_debug, g_config.enable_bounds_check);
+        g_config.enable_debug, g_config.enable_bounds_check,
+        g_config.exit_on_memerror);
     if (!g_config.symsan_env) {
       return SYMSAN_NO_MEMORY;
     }
@@ -226,8 +236,8 @@ int symsan_run(int fd) {
     sigset_t set;
     sigemptyset(&set);
     sigprocmask(SIG_SETMASK, &set, NULL);
-    
-    // disable core dump
+
+    // disable core dump as shadow mem is toooooo large
     struct rlimit limit;
     limit.rlim_cur = limit.rlim_max = 0;
     setrlimit(RLIMIT_CORE, &limit);
