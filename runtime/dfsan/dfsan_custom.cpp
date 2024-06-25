@@ -479,6 +479,7 @@ __dfsw_pread(int fd, void *buf, size_t count, off_t offset,
              dfsan_label fd_label, dfsan_label buf_label,
              dfsan_label count_label, dfsan_label offset_label,
              dfsan_label *ret_label) {
+  __taint_check_bounds(buf_label, (uptr)buf, count_label, count);
   ssize_t ret = pread(fd, buf, count, offset);
   *ret_label = 0;
   if (ret >= 0) {
@@ -500,6 +501,7 @@ __dfsw_read(int fd, void *buf, size_t count,
              dfsan_label count_label,
              dfsan_label *ret_label) {
   off_t offset = lseek(fd, 0, SEEK_CUR);
+  __taint_check_bounds(buf_label, (uptr)buf, count_label, count);
   ssize_t ret = read(fd, buf, count);
   *ret_label = 0;
   if (ret >= 0) {
@@ -1584,6 +1586,7 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
     }
   }
 #endif
+  __taint_check_bounds(ptr_label, (uptr)ptr, nmemb_label, size * nmemb);
   size_t ret = fread(ptr, size, nmemb, stream);
   AOUT("fread(%u,%u) = %lld, off = %lld\n", size, nmemb, ret, offset);
   if (ret) {
@@ -1630,7 +1633,8 @@ __dfsw_fread_unlocked(
     }
   }
 #endif
-  size_t ret = fread(ptr, size, nmemb, stream);
+  __taint_check_bounds(ptr_label, (uptr)ptr, nmemb_label, size * nmemb);
+  size_t ret = fread_unlocked(ptr, size, nmemb, stream);
   AOUT("fread(%u,%u) = %lld, off = %lld\n", size, nmemb, ret, offset);
   if (ret) {
     if (tfsize) {
@@ -1665,6 +1669,7 @@ __dfsw_getline(char **lineptr, size_t *n, FILE *stream,
       }
       dfsan_set_label(0, (*lineptr) + ret, 1);
       // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
+      // FIXME: set the label for the ptr to track the buffer size
     } else {
       dfsan_set_label(0, *lineptr, ret + 1);
     }
@@ -1688,6 +1693,7 @@ __dfsw_getdelim(char **lineptr, size_t *n, int delim, FILE *stream,
       for(ssize_t i = 0; i < ret; i++) {
         void *addr = (*lineptr) + i;
         dfsan_set_label(get_label_for(fd, offset + i), addr, 1);
+        // FIXME: set the label for the ptr to track the buffer size
       }
       dfsan_set_label(0, (*lineptr) + ret, 1);
       // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
@@ -1715,6 +1721,7 @@ __dfsw___getdelim(char **lineptr, size_t *n, int delim, FILE *stream,
       }
       dfsan_set_label(0, (*lineptr) + ret, 1);
       // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
+      // FIXME: set the label for the ptr to track the buffer size
     } else {
       dfsan_set_label(0, *lineptr, ret + 1);
     }
@@ -1774,6 +1781,7 @@ char *__dfsw_fgets(char *s, int size, FILE *stream, dfsan_label s_label,
                    dfsan_label *ret_label) {
   int fd = fileno(stream);
   off_t offset = ftell(stream);
+  __taint_check_bounds(s_label, (uptr)s, size_label, size);
   char *ret = fgets(s, size, stream);
   if (ret) {
     if (taint_get_file(fd)) {
@@ -1801,6 +1809,7 @@ char *__dfsw_fgets_unlocked(char *s, int size, FILE *stream, dfsan_label s_label
                    dfsan_label *ret_label) {
   int fd = fileno(stream);
   off_t offset = ftell(stream);
+  __taint_check_bounds(s_label, (uptr)s, size_label, size);
   char *ret = fgets_unlocked(s, size, stream);
   if (ret) {
     if (taint_get_file(fd)) {
