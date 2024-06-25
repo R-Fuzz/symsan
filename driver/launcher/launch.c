@@ -16,6 +16,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 
 #undef alloc_printf
@@ -221,6 +222,16 @@ int symsan_run(int fd) {
 
   g_config.symsan_pid = fork();
   if (g_config.symsan_pid == 0) {
+    // clear signal handlers and masks
+    sigset_t set;
+    sigemptyset(&set);
+    sigprocmask(SIG_SETMASK, &set, NULL);
+    
+    // disable core dump
+    struct rlimit limit;
+    limit.rlim_cur = limit.rlim_max = 0;
+    setrlimit(RLIMIT_CORE, &limit);
+
     close(g_config.pipefds[0]); // close the read fd
     setenv("TAINT_OPTIONS", (char*)g_config.symsan_env, 1);
     unsetenv("LD_PRELOAD"); // don't preload anything
