@@ -355,6 +355,7 @@ class Taint : public ModulePass {
   FunctionType *TaintPopStackFrameFnTy;
   FunctionType *TaintTraceAllocaFnTy;
   FunctionType *TaintCheckBoundsFnTy;
+  FunctionType *TaintTraceGlobalFnTy;
   FunctionType *TaintMemcmpFnTy;
   FunctionType *TaintStrcmpFnTy;
   FunctionType *TaintStrncmpFnTy;
@@ -375,6 +376,7 @@ class Taint : public ModulePass {
   FunctionCallee TaintPopStackFrameFn;
   FunctionCallee TaintTraceAllocaFn;
   FunctionCallee TaintCheckBoundsFn;
+  FunctionCallee TaintTraceGlobalFn;
   FunctionCallee TaintMemcmpFn;
   FunctionCallee TaintStrcmpFn;
   FunctionCallee TaintStrncmpFn;
@@ -876,6 +878,8 @@ bool Taint::doInitialization(Module &M) {
       PrimitiveShadowTy, TaintTraceAllocaArgs, false);
   TaintCheckBoundsFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy, Int64Ty }, false);
+  TaintTraceGlobalFnTy = FunctionType::get(
+      PrimitiveShadowTy, { Int64Ty, Int64Ty }, false);
 
   TaintMemcmpFnTy = FunctionType::get(
       PrimitiveShadowTy, { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx), Int64Ty }, false);
@@ -1139,6 +1143,16 @@ void Taint::initializeCallbackFunctions(Module &M) {
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     TaintCheckBoundsFn =
         Mod->getOrInsertFunction("__taint_check_bounds", TaintCheckBoundsFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
+                         Attribute::NoUnwind);
+    AL = AL.addAttribute(M.getContext(), AttributeList::ReturnIndex,
+                         Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
+    TaintTraceGlobalFn =
+        Mod->getOrInsertFunction("__taint_trace_global", TaintTraceGlobalFnTy, AL);
   }
   {
     AttributeList AL;
@@ -2035,7 +2049,7 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   int64_t CurrentOffset = 0;
 
   IRBuilder<> IRB(I);
-  Type *ETy = I->getPointerOperandType();
+  Type *ETy = I->getSourceElementType();
   for (auto &Idx: I->indices()) {
     // reference: DataLayout::getIndexedOffsetInType
     Value *Index = &*Idx;
@@ -2078,7 +2092,21 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
       }
     }
   }
+
   if (ClTraceBound) {
+    // set shadow for global variable
+    if (GlobalVariable *GV = dyn_cast<GlobalVariable>(I->getPointerOperand()->stripPointerCasts())) {
+      // nice thing about GEP is it still has type information
+      Type *T = I->getSourceElementType();
+      if (T->isArrayTy() || T->isStructTy()) {
+        uint64_t size = DL.getTypeAllocSize(T);
+        Value *Size = ConstantInt::get(TT.Int64Ty, size);
+        Value *Addr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
+        Value *Shadow = IRB.CreateCall(TT.TaintTraceGlobalFn, {Addr, Size});
+        setShadow(I, Shadow);
+      }
+    }
+  } else {
     // propagate bounds info
     Value *Bounds = getShadow(I->getPointerOperand());
     setShadow(I, Bounds);
