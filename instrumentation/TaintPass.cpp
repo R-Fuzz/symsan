@@ -505,7 +505,7 @@ struct TaintFunction {
   void visitSwitchInst(SwitchInst *I);
   void visitCondition(Value *Cond, Instruction *I);
   void visitGEPInst(GetElementPtrInst *I);
-  Value *visitAllocaInst(AllocaInst *I);
+  Value *visitAllocaInst(AllocaInst *I, Value *ArraySize, Type *ElTy);
   void checkBounds(Value *Ptr, Value *Size, Instruction *Pos);
 
   /// XXX: because we never collapse taint labels for aggregate types,
@@ -2049,7 +2049,7 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   int64_t CurrentOffset = 0;
 
   IRBuilder<> IRB(I);
-  Type *ETy = I->getSourceElementType();
+  Type *ETy = I->getPointerOperandType();
   for (auto &Idx: I->indices()) {
     // reference: DataLayout::getIndexedOffsetInType
     Value *Index = &*Idx;
@@ -2151,18 +2151,17 @@ void TaintVisitor::visitInsertValueInst(InsertValueInst &I) {
   TF.setShadow(&I, Res);
 }
 
-Value *TaintFunction::visitAllocaInst(AllocaInst *I) {
+Value *TaintFunction::visitAllocaInst(AllocaInst *I, Value *ArraySize, Type *ElTy) {
   // insert after the instruction to get the address
   BasicBlock::iterator ip(I);
   IRBuilder<> IRB(I->getParent(), ++ip);
-  // get size
-  Value *Size = I->getArraySize();
-  Value *SizeShadow = getShadow(Size);
-  Size = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
+  // prepare array size
+  Value *Size = IRB.CreateZExtOrTrunc(ArraySize, TT.Int64Ty);
+  Value *SizeShadow = getShadow(ArraySize);
   // get element size
   Module *M = F->getParent();
   auto &DL = M->getDataLayout();
-  uint64_t es = DL.getTypeAllocSize(I->getAllocatedType());
+  uint64_t es = DL.getTypeAllocSize(ElTy);
   ConstantInt *ElemSize = ConstantInt::get(TT.Int64Ty, es);
   // get address
   Value *Address = IRB.CreatePtrToInt(I, TT.Int64Ty);
@@ -2198,25 +2197,27 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
     TF.setShadow(&I, TF.TT.ZeroPrimitiveShadow);
   } else {
     Type *T = I.getAllocatedType();
-    bool isArray = I.isArrayAllocation() | T->isArrayTy();
-    if (isArray) {
+    Value *ArraySize = I.getArraySize();
+    bool TrackBounds = I.isArrayAllocation() | T->isArrayTy() | T->isStructTy();
+    if (TrackBounds) {
       // array could be VLA, rely on runtime
-      Value *Bounds = TF.visitAllocaInst(&I);
+      Value *Bounds = TF.visitAllocaInst(&I, ArraySize, T);
       TF.setShadow(&I, Bounds);
     } else {
       TF.setShadow(&I, TF.TT.ZeroPrimitiveShadow); // no bounds
-      if (!AllLoadsStores) {
-        // handle not all loads and stores cases here
-        IRBuilder<> IRB(I.getNextNode());
-        auto DL = I.getModule()->getDataLayout();
-        auto size = I.getAllocationSizeInBits(DL);
-        assert(size != None);
-        Value *Size = ConstantInt::get(TF.TT.IntptrTy, (size->getValue() + 7) >> 3);
-        IRB.CreateCall(TF.TT.TaintSetLabelFn,
-                       {TF.TT.UninitializedPrimitiveShadow,
-                        IRB.CreateBitCast(&I, Type::getInt8PtrTy(*TF.TT.Ctx)),
-                        Size});
-      }
+    }
+    // set uninit shadow for allocation with constant size
+    if (!AllLoadsStores && isa<ConstantInt>(ArraySize)) {
+      // handle not all loads and stores cases here
+      IRBuilder<> IRB(I.getNextNode());
+      auto DL = I.getModule()->getDataLayout();
+      auto size = I.getAllocationSizeInBits(DL);
+      assert(size != None);
+      Value *Size = ConstantInt::get(TF.TT.IntptrTy, (size->getValue() + 7) >> 3);
+      IRB.CreateCall(TF.TT.TaintSetLabelFn,
+                      {TF.TT.UninitializedPrimitiveShadow,
+                      IRB.CreateBitCast(&I, Type::getInt8PtrTy(*TF.TT.Ctx)),
+                      Size});
     }
   }
 }
