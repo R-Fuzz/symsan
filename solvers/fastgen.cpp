@@ -280,6 +280,7 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
     .result = r
   };
 
+  __taint_trace_fini();
   if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
     Die();
   }

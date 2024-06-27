@@ -47,7 +47,8 @@ class ConcolicExecutor:
         utils.disable_core_dump()
 
     def tear_down(self, deep_clean=True):
-        self.proc_returncode, is_killed = symsan.terminate()
+        status_code, is_killed = symsan.terminate()
+        self.proc_returncode = status_code if self.proc_returncode is None else self.proc_returncode
         if is_killed:
             self.proc_returncode = 9
         if deep_clean:
@@ -129,6 +130,9 @@ class ConcolicExecutor:
                 pass
             elif msg.msg_type == MsgType.fini_type.value:
                 self.agent.min_distance = min(msg.result, self.agent.min_distance)
+            elif msg.msg_type == MsgType.memerr_type:
+                # indicate seg fault
+                self.proc_returncode = 128 + 11
             else:
                 self.logger.error(f"process_request: Unknown message type: {msg.msg_type}")
             end_time = (time.time() * utils.MILLION_SECONDS_SCALE)
