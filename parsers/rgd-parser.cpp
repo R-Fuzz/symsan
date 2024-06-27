@@ -1485,8 +1485,13 @@ bool RGDAstParser::save_constraint(expr_t expr, bool result) {
 int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
                             dfsan_label index_label, int64_t index,
                             uint64_t num_elems, uint64_t elem_size,
-                            int64_t current_offset,
+                            int64_t current_offset, bool enum_index,
                             std::vector<uint64_t> &tasks) {
+  // check validity of the labels
+  if (index_label < CONST_OFFSET || index_label == __dfsan::kInitializingLabel || index_label >= size_) {
+    return -1;
+  }
+
   return 0;
 }
 

@@ -298,22 +298,25 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
 void Z3AstParser::construct_index_tasks(z3::expr &index, uint64_t curr,
                                         uint64_t lb, uint64_t ub, uint64_t step,
-                                        z3_task_t &nested, std::vector<uint64_t> &tasks) {
+                                        z3_task_t &nested, bool enum_index,
+                                        std::vector<uint64_t> &tasks) {
 
   std::shared_ptr<z3_task_t> task = nullptr;
 
   // enumerate indices
-  for (uint64_t i = lb; i < ub; i += step) {
-    if (i == curr) continue;
-    z3::expr idx = context_.bv_val(i, 64);
-    z3::expr e = (index == idx);
-    // allocate a new task
-    task = std::make_shared<z3_task_t>();
-    task->push_back(e);
-    // add nested constraints
-    task->insert(task->end(), nested.begin(), nested.end());
-    // save the task
-    tasks.push_back(save_task(task));
+  if (enum_index) {
+    for (uint64_t i = lb; i < ub; i += step) {
+      if (i == curr) continue;
+      z3::expr idx = context_.bv_val(i, 64);
+      z3::expr e = (index == idx);
+      // allocate a new task
+      task = std::make_shared<z3_task_t>();
+      task->push_back(e);
+      // add nested constraints
+      task->insert(task->end(), nested.begin(), nested.end());
+      // save the task
+      tasks.push_back(save_task(task));
+    }
   }
 
   // check feasibility for OOB
@@ -340,7 +343,7 @@ void Z3AstParser::construct_index_tasks(z3::expr &index, uint64_t curr,
 
 int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_label, int64_t index,
                            uint64_t num_elems, uint64_t elem_size, int64_t current_offset,
-                           std::vector<uint64_t> &tasks) {
+                           bool enum_index, std::vector<uint64_t> &tasks) {
 
   if (index_label < CONST_OFFSET || index_label == __dfsan::kInitializingLabel) {
     return 0;
@@ -362,7 +365,7 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
     // first, check against fixed array bounds if available
     z3::expr idx = z3::zext(i, 64 - size);
     if (num_elems > 0) {
-      construct_index_tasks(idx, index, 0, num_elems, 1, nested_tasks, tasks);
+      construct_index_tasks(idx, index, 0, num_elems, 1, nested_tasks, enum_index, tasks);
     } else {
       dfsan_label_info *bounds = get_label_info(ptr_label);
       // if the array is not with fixed size, check bound info
@@ -374,7 +377,8 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
           // when the size of the buffer is fixed
           z3::expr p = context_.bv_val(ptr, 64);
           z3::expr np = idx * es + co + p;
-          construct_index_tasks(np, index, (uint64_t)bounds->op1.i, (uint64_t)bounds->op2.i, elem_size, nested_tasks, tasks);
+          construct_index_tasks(np, index, (uint64_t)bounds->op1.i,
+              (uint64_t)bounds->op2.i, elem_size, nested_tasks, enum_index, tasks);
         } else {
           // if the buffer size is input-dependent (not fixed)
           // check if over flow is possible

@@ -23,7 +23,7 @@ public:
   int parse_gep(dfsan_label ptr_label, uptr ptr,
                 dfsan_label index_label, int64_t index,
                 uint64_t num_elems, uint64_t elem_size,
-                int64_t current_offset,
+                int64_t current_offset, bool enum_index,
                 std::vector<uint64_t> &tasks) override;
 
   int add_constraints(dfsan_label label, uint64_t result) override;

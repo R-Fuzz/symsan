@@ -19,7 +19,7 @@ public:
   int parse_gep(dfsan_label ptr_label, uptr ptr,
                 dfsan_label index_label, int64_t index,
                 uint64_t num_elems, uint64_t elem_size,
-                int64_t current_offset,
+                int64_t current_offset, bool enum_index,
                 std::vector<uint64_t> &tasks) override;
 
   int add_constraints(dfsan_label label, uint64_t result) override;
@@ -87,7 +87,8 @@ private:
   inline void save_constraint(z3::expr expr, input_dep_set_t &inputs);
   void construct_index_tasks(z3::expr &index, uint64_t curr,
                              uint64_t lb, uint64_t ub, uint64_t step,
-                             z3_task_t &nested, std::vector<uint64_t> &tasks);
+                             z3_task_t &nested, bool enum_index,
+                             std::vector<uint64_t> &tasks);
 };
 
 class Z3ParserSolver : public Z3AstParser {

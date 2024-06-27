@@ -283,15 +283,16 @@ static PyObject* ParseGEP(PyObject *self, PyObject *args) {
   uint64_t num_elems = 0;
   uint64_t elem_size = 0;
   int64_t current_offset = 0;
+  bool enum_index = false; // XXX: default to false?
 
-  if (!PyArg_ParseTuple(args, "IKILKKL", &ptr_label, &ptr, &index_label, &index,
-      &num_elems, &elem_size, &current_offset)) {
+  if (!PyArg_ParseTuple(args, "IKILKKLp", &ptr_label, &ptr, &index_label, &index,
+      &num_elems, &elem_size, &current_offset, &enum_index)) {
     return NULL;
   }
 
   std::vector<uint64_t> tasks;
-  if (__z3_parser->parse_gep(ptr_label, ptr, index_label, index,
-                             num_elems, elem_size, current_offset, tasks) != 0) {
+  if (__z3_parser->parse_gep(ptr_label, ptr, index_label, index, num_elems,
+                             elem_size, current_offset, enum_index, tasks) != 0) {
     PyErr_SetString(PyExc_RuntimeError, "failed to parse GEP");
     return NULL;
   }
