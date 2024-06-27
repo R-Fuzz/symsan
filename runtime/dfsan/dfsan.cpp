@@ -318,7 +318,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n) {
   if (is_constant_label(label0) || is_kind_of_label(label0, Alloca)) {
     bool same = true;
     for (uptr i = 1; i < n; i++) {
-      if (ls[i] != label0) {
+      if (ls[i] == kInitializingLabel) return kInitializingLabel;
+      else if (ls[i] != label0) {
         same = false;
         break;
       }
@@ -481,6 +482,39 @@ dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size, uint64_t elem_siz
   }
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_trace_global(uint64_t addr, uint64_t size) {
+  if (flags().trace_bounds) {
+    // setup a hash tree for dedup
+    uint32_t h1 = (uint32_t)addr; // lower 32 bits
+    uint32_t h2 = (uint32_t)(addr >> 32); // upper 32 bits
+    uint32_t hash = xxhash(h1, h2, Alloca);
+
+    struct dfsan_label_info label_info = {
+      .l1 = 0, .l2 = 0, .op1 = addr, .op2 = addr + size, .op = Alloca, .size = sizeof(void*) * 8,
+      .hash = hash};
+
+    __taint::option res = __union_table.lookup(label_info);
+    if (res != __taint::none()) {
+      dfsan_label label = *res;
+      AOUT("global %u found\n", label);
+      return label;
+    }
+
+    dfsan_label label =
+      atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
+    dfsan_check_label(label);
+    internal_memcpy(&__dfsan_label_info[label], &label_info, sizeof(dfsan_label_info));
+    __union_table.insert(&__dfsan_label_info[label], label);
+
+    AOUT("adding global bounds %d=(%llx, %lld)\n", label, addr, size);
+
+    return label;
+  }
+
+  return 0;
+}
+
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memerr, dfsan_label, uptr, dfsan_label,
                              uint64_t, uint16_t, void*) {}
 
@@ -508,12 +542,12 @@ void __taint_check_bounds(dfsan_label addr_label, uptr addr,
     } else if (info->op == Alloca) {
       AOUT("addr = %p, lower = %p, upper = %p\n", addr, info->op1.i, info->op2.i);
       if (addr < info->op1.i) {
-        AOUT("ERROR: OOB detected %p = %d, %llu = %d @%p\n",
+        AOUT("ERROR: OOB underflow detected %p = %d, %llu = %d @%p\n",
              addr, addr_label, size, size_label, retaddr);
         __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_OLB, retaddr);
         if (flags().exit_on_memerror) Die();
       } else if ((addr + size) > info->op2.i || (addr + size) < info->op1.i) {
-        AOUT("ERROR: OOB detected %p = %d, %llu = %d @%p\n",
+        AOUT("ERROR: OOB overflow detected %p = %d, %llu = %d @%p\n",
              addr, addr_label, size, size_label, __builtin_return_address(0));
         __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_OUB, retaddr);
         if (flags().exit_on_memerror) Die();

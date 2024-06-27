@@ -88,6 +88,10 @@ static u8 check_if_assembler(u32 argc, char **argv) {
 }
 
 static void add_runtime() {
+  if (getenv("KO_LIBRARY_PATH")) {
+    cc_params[cc_par_cnt++] = alloc_printf("-L%s", getenv("KO_LIBRARY_PATH"));
+  }
+
   cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
   if (getenv("KO_ADD_AFLGO")) {
   cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libAFLGORT.a", obj_path);
@@ -233,7 +237,7 @@ static void edit_params(u32 argc, char **argv) {
     if (!strcmp(cur, "-c") || !strcmp(cur, "-S") || !strcmp(cur, "-E"))
       maybe_linking = 0;
 
-    if (!strcmp(cur, "-fsanitize=address") || !strcmp(cur, "-fsanitize=memory"))
+    if (!strncmp(cur, "-fsanitize=", strlen("-fsanitize=")))
       continue; // doesn't work together
 
     if (strstr(cur, "FORTIFY_SOURCE"))
@@ -244,6 +248,20 @@ static void edit_params(u32 argc, char **argv) {
 
     if (!strcmp(cur, "-Wl,-z,defs") || !strcmp(cur, "-Wl,--no-undefined"))
       continue;
+
+    if (strstr(cur, "libSymsanProxy.o")) {
+      char* last = *(argv - 1);
+      if (last) {
+        if (!strcmp(last, "-I")) { // remove the -I
+          cc_params[cc_par_cnt - 1] = cur;
+          continue;
+        }
+        if (!strcmp(last, "-L")) { // remove the -L
+          cc_params[cc_par_cnt - 1] = cur;
+          continue;
+        }
+      }
+    }
 
     cc_params[cc_par_cnt++] = cur;
   }
