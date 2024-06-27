@@ -58,12 +58,13 @@ public:
   /// @param num_elems number of elements if ptr is an array
   /// @param elem_size size of each element
   /// @param current_offset current offset from previous GEP
+  /// @param enum_index whether to enumerate all possible indices
   /// @param tasks tasks to be added
   /// @return 0 on success, -1 on failure
   virtual int parse_gep(dfsan_label ptr_label, uptr ptr,
                         dfsan_label index_label, int64_t index,
                         uint64_t num_elems, uint64_t elem_size,
-                        int64_t current_offset,
+                        int64_t current_offset, bool enum_index,
                         std::vector<uint64_t> &tasks) = 0;
 
   /// @brief Add a constraint, typically from symbolic offset

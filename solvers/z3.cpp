@@ -198,7 +198,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
   void *addr = __builtin_return_address(0);
   std::vector<uint64_t> tasks;
   if (__z3_parser->parse_gep(ptr_label, ptr, index_label, index, num_elems,
-                             elem_size, current_offset, tasks)) {
+                             elem_size, current_offset, true, tasks)) {
     AOUT("WARNING: failed to parse gep %d @%p\n", index_label, addr);
     return;
   }
