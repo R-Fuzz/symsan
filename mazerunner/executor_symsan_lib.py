@@ -144,7 +144,7 @@ class ConcolicExecutor:
             return None, None, SolvingStatus.UNSOLVED_RECIPE_MISS
         tasks, seed_id = self._recipe[target_sa].pop()
         assert seed_id in seed_map
-        solution, status = self._solve_tasks(tasks)
+        solution, status = self._solve_cond_tasks(tasks)
         solving_status = self._finalize_solving(status, solution, target_sa, seed_map, seed_id)
         self._processed.add(tasks)
         if solving_status not in solved_statuses:
@@ -160,15 +160,23 @@ class ConcolicExecutor:
                 break
             self._recipe[target_sa].pop()
 
-    def _solve_tasks(self, tasks):
-        solution = []
-        status = []
+    def _solve_cond_tasks(self, tasks):
         for task in tasks:
             r, sol = symsan.solve_task(task)
             s = self._parse_solving_status(r)
-            solution += sol
-            status.append(s)
-        return solution, status
+            if s in solved_statuses:
+                # only need one solution
+                break
+        return sol, s
+    
+    def _solve_gep_tasks(self, tasks):
+        res = []
+        for task in tasks:
+            r, sol = symsan.solve_task(task)
+            s = self._parse_solving_status(r)
+            if s in solved_statuses:
+                res.append((sol, s))
+        return res
 
     def _finalize_solving(self, status, solution, target_sa, seed_map=None, seed_id=None):
         seed_info = ''
@@ -176,11 +184,10 @@ class ConcolicExecutor:
             reversed_sa = str(self.agent.curr_state.reversed_sa)
             score = self.agent.compute_branch_score()
             seed_info = f"{score}:{reversed_sa}"
-        solving_status = self._handle_solving_status(status, target_sa)
-        if solving_status in solved_statuses:
+        self._handle_solving_status(status, target_sa)
+        if status in solved_statuses:
             input_buf = self._prepare_input_buffer(seed_map, seed_id)
             self._generate_testcase(solution, seed_info, input_buf)
-        return solving_status
 
     def _prepare_input_buffer(self, seed_map, seed_id):
         if seed_map and seed_id:
@@ -222,10 +229,10 @@ class ConcolicExecutor:
                 self._recipe[state.sa].append((tasks, input_id))
             return SolvingStatus.UNSOLVED_DEFERRED
 
-        solution, status = self._solve_tasks(tasks)
-        solving_status = self._finalize_solving(status, solution, reversed_sa)
+        solution, status = self._solve_cond_tasks(tasks)
+        self._finalize_solving(status, solution, reversed_sa)
         self._processed.add(tasks)
-        return solving_status
+        return status
 
     def _process_gep_request(self, msg):
         gep_data = symsan.read_event(ctypes.sizeof(gep_msg))
@@ -244,14 +251,13 @@ class ConcolicExecutor:
                              gmsg.index, 
                              gmsg.num_elems, 
                              gmsg.elem_size, 
-                             gmsg.current_offset))
-            solution, status = self._solve_tasks(tasks)
+                             gmsg.current_offset,
+                             False))
+            gep_res = self._solve_gep_tasks(tasks)
             # we don't have a target_sa for GEP requests, use (0,0,0,0)
-            # TODO: nothing generated, need more testing and debugging
-            solving_status = self._finalize_solving(status, solution, (0,0,0,0))
+            for (solution, status) in gep_res:
+                self._finalize_solving(status, solution, (0,0,0,0))
             self._processed.add(tasks)
-            return solving_status
-            
     
     def _process_memcmp_request(self, msg):
         label = msg.label
@@ -285,40 +291,16 @@ class ConcolicExecutor:
         self.generated_files.append(fname)
     
     def _handle_solving_status(self, status, target_sa):
-        nested_solved = True
         reversed_action = 1 if target_sa[3] == 0 else 0
         self.agent.create_curr_state(sa=(target_sa[0], target_sa[1], target_sa[2], reversed_action))
-        for s in status:
-            if s == SolvingStatus.UNSOLVED_UNINTERESTING_SAT:
-                return SolvingStatus.UNSOLVED_UNINTERESTING_SAT
-            if s == SolvingStatus.UNSOLVED_PRE_UNSAT:
-                return SolvingStatus.UNSOLVED_PRE_UNSAT
-            if s == SolvingStatus.UNSOLVED_OPT_UNSAT:
-                self.agent.handle_unsat_condition(SolvingStatus.UNSOLVED_OPT_UNSAT)
-                return SolvingStatus.UNSOLVED_OPT_UNSAT
-            if s == SolvingStatus.UNSOLVED_TIMEOUT:
-                self.agent.handle_unsat_condition(SolvingStatus.UNSOLVED_TIMEOUT)
-                return SolvingStatus.UNSOLVED_TIMEOUT
-            if s == SolvingStatus.UNSOLVED_INVALID_EXPR:
-                return SolvingStatus.UNSOLVED_INVALID_EXPR
-            if s == SolvingStatus.UNSOLVED_INVALID_MSG:
-                return SolvingStatus.UNSOLVED_INVALID_MSG
-            if s == SolvingStatus.UNSOLVED_UNINTERESTING_COND:
-                return SolvingStatus.UNSOLVED_UNINTERESTING_COND
-            if s == SolvingStatus.UNSOLVED_UNKNOWN:
-                return SolvingStatus.UNSOLVED_UNKNOWN
-            if s == SolvingStatus.SOLVED_OPT_NESTED_UNSAT:
-                self.agent.handle_nested_unsat_condition()
-                return SolvingStatus.SOLVED_OPT_NESTED_UNSAT
-            if s == SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT:
-                self.agent.handle_nested_unsat_condition()
-                return SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT
-            if s != SolvingStatus.SOLVED_NESTED:
-                nested_solved = False
-        
-        if nested_solved:
-            return SolvingStatus.SOLVED_NESTED
-        assert False, "Unkown solving status"
+        if status == SolvingStatus.UNSOLVED_OPT_UNSAT:
+            self.agent.handle_unsat_condition(SolvingStatus.UNSOLVED_OPT_UNSAT)
+        if status == SolvingStatus.UNSOLVED_TIMEOUT:
+            self.agent.handle_unsat_condition(SolvingStatus.UNSOLVED_TIMEOUT)
+        if status == SolvingStatus.SOLVED_OPT_NESTED_UNSAT:
+            self.agent.handle_nested_unsat_condition()
+        if status == SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT:
+            self.agent.handle_nested_unsat_condition()
     
     def _parse_solving_status(self, r):
         status_map = {
