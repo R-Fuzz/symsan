@@ -1237,6 +1237,7 @@ bool Taint::runOnModule(Module &M) {
         &i != TaintPushStackFrameFn.getCallee()->stripPointerCasts() &&
         &i != TaintPopStackFrameFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceAllocaFn.getCallee()->stripPointerCasts() &&
+        &i != TaintTraceGlobalFn.getCallee()->stripPointerCasts() &&
         &i != TaintCheckBoundsFn.getCallee()->stripPointerCasts() &&
         &i != TaintMemcmpFn.getCallee()->stripPointerCasts() &&
         &i != TaintStrcmpFn.getCallee()->stripPointerCasts() &&
