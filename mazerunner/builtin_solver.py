@@ -349,7 +349,7 @@ class Z3Solver:
         self.__branch_deps = []
         self.serializer = Serializer(config, self.shm, self.__z3_context)
 
-    def handle_gep(self, gmsg: gep_msg, addr: ctypes.c_ulong):
+    def handle_gep(self, gmsg: gep_msg, addr: ctypes.c_ulong, should_enumerate=True):
         self.logger.debug(f"handle_gep: ptr_label={gmsg.ptr_label}, ptr={gmsg.ptr}, "
               f"index_label={gmsg.index_label}, index={gmsg.index}, num_elems={gmsg.num_elems}, "
               f"elem_size={gmsg.elem_size}, current_offset={gmsg.current_offset}, addr={addr}")
@@ -369,7 +369,7 @@ class Z3Solver:
         # first, check against fixed array bounds if available
         idx = z3.ZeroExt(64 - size, index_bv)
         if gmsg.num_elems > 0:
-            status = self.__solve_gep(idx, 0, gmsg.num_elems, 1, addr)
+            status = self.__solve_gep(idx, 0, gmsg.num_elems, 1, addr, should_enumerate)
         else:
             bounds = get_label_info(gmsg.ptr_label, self.shm)
             # if the array is not with fixed size, check bound info
@@ -381,7 +381,7 @@ class Z3Solver:
                     # when the size of the buffer is fixed
                     p = z3.BitVecVal(gmsg.ptr, 64, self.__z3_context)
                     np = idx * es + co + p
-                    status = self.__solve_gep(np, bounds.op1.i, bounds.op2.i, gmsg.elem_size, addr)
+                    status = self.__solve_gep(np, bounds.op1.i, bounds.op2.i, gmsg.elem_size, addr, should_enumerate)
                 else:
                     # if the buffer size is input-dependent (not fixed)
                     # check if over flow is possible
@@ -603,13 +603,14 @@ class Z3Solver:
                     c.state_deps.add(copy.copy(s))
         return solving_status
 
-    def __solve_gep(self, index: z3.ExprRef, lb: int, ub: int, step: int, addr: int):
+    def __solve_gep(self, index: z3.ExprRef, lb: int, ub: int, step: int, addr: int, should_enumerate: bool):
         # enumerate indices
-        for i in range(lb, ub, step):
-            idx = z3.BitVecVal(i, 64, self.__z3_context)
-            e = (index == idx)
-            if self.__solve_expr(e):
-                self.logger.debug(f"__solve_gep: index == {i} feasible")
+        if should_enumerate:
+            for i in range(lb, ub, step):
+                idx = z3.BitVecVal(i, 64, self.__z3_context)
+                e = (index == idx)
+                if self.__solve_expr(e):
+                    self.logger.debug(f"__solve_gep: index == {i} feasible")
         # check feasibility for OOB, upper bound
         u = z3.BitVecVal(ub, 64, self.__z3_context)
         e = z3.UGE(index, u)

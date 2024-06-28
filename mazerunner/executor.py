@@ -147,6 +147,7 @@ class ConcolicExecutor:
         options = (f"taint_file=\"{taint_file}\""
         f":shm_fd={self.shm._fd}"
         f":pipe_fd={self.pipefds[1]}"
+        f":trace_bounds=1"
         f":debug={logging_level}")
         current_env = os.environ.copy()
         current_env["TAINT_OPTIONS"] = options
@@ -225,6 +226,9 @@ class ConcolicExecutor:
                 pass
             elif msg.msg_type == MsgType.fini_type.value:
                 self.agent.min_distance = min(msg.result, self.agent.min_distance)
+            elif msg.msg_type == MsgType.memerr_type:
+                # indicate seg fault
+                self.proc.returncode = 128 + 11
             else:
                 self.logger.error(f"process_request: Unknown message type: {msg.msg_type}")
             end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
@@ -270,7 +274,7 @@ class ConcolicExecutor:
                               f"vs {gmsg.index_label}")
             raise ConcolicExecutor.InvalidGEPMessage()
         if self.config.gep_solver_enabled:
-            return self.solver.handle_gep(gmsg, msg.addr)
+            return self.solver.handle_gep(gmsg, msg.addr, should_enumerate=False)
 
     def _close_pipe(self):
         if self.pipefds[0] is not None:
