@@ -296,6 +296,7 @@ fun:fread=custom
 fun:fread_unlocked=custom
 fun:freopen=custom
 fun:getc=custom
+fun:getchar=custom
 fun:getc_unlocked=custom
 fun:getdelim=custom
 fun:getline=custom
