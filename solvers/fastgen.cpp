@@ -137,8 +137,8 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
 
   void *addr = __builtin_return_address(0);
 
-  AOUT("tainted GEP index: %lld = %d, ne: %lld, es: %lld, offset: %lld\n",
-      index, index_label, num_elems, elem_size, current_offset);
+  AOUT("tainted GEP index: %lld = %d, ne: %lld, es: %lld, offset: %lld, ptr: %lld = %d\n",
+      index, index_label, num_elems, elem_size, current_offset, ptr, ptr_label);
 
   if (__pipe_fd < 0)
     return;

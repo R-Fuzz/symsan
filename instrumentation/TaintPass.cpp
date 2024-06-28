@@ -1316,6 +1316,7 @@ bool Taint::runOnModule(Module &M) {
         &i != TaintPushStackFrameFn.getCallee()->stripPointerCasts() &&
         &i != TaintPopStackFrameFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceAllocaFn.getCallee()->stripPointerCasts() &&
+	&i != TaintTraceGlobalFn.getCallee()->stripPointerCasts() &&
         &i != TaintCheckBoundsFn.getCallee()->stripPointerCasts() &&
         &i != TaintMemcmpFn.getCallee()->stripPointerCasts() &&
         &i != TaintStrcmpFn.getCallee()->stripPointerCasts() &&
@@ -2128,6 +2129,27 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   int64_t CurrentOffset = 0;
 
   IRBuilder<> IRB(I);
+  Value *Base = I->getPointerOperand();
+  Value *Bounds = TT.getZeroShadow(Base);
+  if (ClTraceBound) {
+    // set shadow for global variable
+    if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Base->stripPointerCasts())) {
+      // nice thing about GEP is it still has type information
+      Type *T = I->getSourceElementType();
+      if (T->isArrayTy() || T->isStructTy()) {
+        uint64_t size = DL.getTypeAllocSize(T);
+        Value *Size = ConstantInt::get(TT.Int64Ty, size);
+        Value *Addr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
+        Bounds = IRB.CreateCall(TT.TaintTraceGlobalFn, {Addr, Size});
+      }
+    } else {
+      Bounds = getShadow(Base);
+      if (TT.isZeroShadow(Bounds)) {
+        Bounds = getShadow(Base->stripPointerCasts());
+      }
+    }
+  }
+
   Type *ETy = I->getPointerOperandType();
   for (auto &Idx: I->indices()) {
     // reference: DataLayout::getIndexedOffsetInType
@@ -2162,8 +2184,7 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
           ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, CurrentOffset);
           ConstantInt *ES = ConstantInt::get(TT.Int64Ty, DL.getTypeAllocSize(ETy));
           ConstantInt *NE = ConstantInt::get(TT.Int64Ty, NumElements);
-          Value *Ptr = IRB.CreatePtrToInt(I->getPointerOperand(), TT.Int64Ty);
-          Value *Bounds = getShadow(I->getPointerOperand());
+          Value *Ptr = IRB.CreatePtrToInt(Base, TT.Int64Ty);
           IRB.CreateCall(TT.TaintTraceGEPFn, {Bounds, Ptr, Shadow, Index, NE, ES, Offset});
         } else {
           break;
@@ -2171,22 +2192,8 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
       }
     }
   }
+
   if (ClTraceBound) {
-    // set shadow for global variable
-    if (GlobalVariable *GV = dyn_cast<GlobalVariable>(I->getPointerOperand()->stripPointerCasts())) {
-      // nice thing about GEP is it still has type information
-      Type *T = I->getSourceElementType();
-      if (T->isArrayTy() || T->isStructTy()) {
-        uint64_t size = DL.getTypeAllocSize(T);
-        Value *Size = ConstantInt::get(TT.Int64Ty, size);
-        Value *Addr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
-        Value *Shadow = IRB.CreateCall(TT.TaintTraceGlobalFn, {Addr, Size});
-        setShadow(I, Shadow);
-      }
-    }
-  } else {
-    // propagate bounds info
-    Value *Bounds = getShadow(I->getPointerOperand());
     setShadow(I, Bounds);
   }
 }
