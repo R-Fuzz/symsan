@@ -368,6 +368,7 @@ class Z3Solver:
             return SolvingStatus.UNSOLVED_PRE_UNSAT
         # first, check against fixed array bounds if available
         idx = z3.ZeroExt(64 - size, index_bv)
+        status = SolvingStatus.UNSOLVED_UNSUPPORTED_EXPR
         if gmsg.num_elems > 0:
             status = self.__solve_gep(idx, 0, gmsg.num_elems, 1, addr, should_enumerate)
         else:

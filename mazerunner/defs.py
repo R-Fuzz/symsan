@@ -66,6 +66,7 @@ class SolvingStatus(Enum):
     UNSOLVED_PRE_UNSAT = auto()
     UNSOLVED_OPT_UNSAT = auto()
     UNSOLVED_TIMEOUT = auto()
+    UNSOLVED_UNSUPPORTED_EXPR = auto()
     UNSOLVED_INVALID_EXPR = auto()
     UNSOLVED_INVALID_MSG = auto()
     UNSOLVED_UNINTERESTING_COND = auto()
