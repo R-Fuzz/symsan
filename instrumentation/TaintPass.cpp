@@ -495,6 +495,10 @@ struct TaintFunction {
 
   Value *getShadow(Value *V);
   void setShadow(Instruction *I, Value *Shadow);
+
+  /// Returns the shadow value of a global variable GV.
+  Value *getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB);
+
   // Op Shadow
   Value *combineShadows(Value *V1, Value *V2,
                         uint16_t op, Instruction *Pos);
@@ -1480,6 +1484,24 @@ Value *TaintFunction::getShadowForTLSArgument(Argument *A) {
   return TT.getZeroShadow(A);
 }
 
+Value *TaintFunction::getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB) {
+  Type *T = nullptr;
+  if (GV->hasInitializer()) {
+    T = GV->getInitializer()->getType();
+  } else {
+    T = GV->getValueType();
+  }
+  if (T && (T->isArrayTy() || T->isStructTy())) {
+    Module *M = F->getParent();
+    auto &DL = M->getDataLayout();
+    uint64_t size = DL.getTypeAllocSize(T);
+    Value *Size = ConstantInt::get(TT.Int64Ty, size);
+    Value *Addr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
+    return IRB.CreateCall(TT.TaintTraceGlobalFn, {Addr, Size});
+  }
+  return TT.ZeroPrimitiveShadow; // GV is always a ptr
+}
+
 Value *TaintFunction::getShadow(Value *V) {
   if (!isa<Argument>(V) && !isa<Instruction>(V))
     return TT.getZeroShadow(V);
@@ -1639,7 +1661,13 @@ Value *TaintFunction::combineCmpInstShadows(CmpInst *CI,
 
 void TaintFunction::checkBounds(Value *Ptr, Value* Size, Instruction *Pos) {
   IRBuilder<> IRB(Pos);
-  Value *PtrShadow = getShadow(Ptr);
+  // another place to check for global variable as the ptr
+  Value *PtrShadow = nullptr;
+  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts())) {
+    PtrShadow = getShadowForGlobal(GV, IRB);
+  } else {
+    PtrShadow = getShadow(Ptr);
+  }
   Value *SizeShadow = getShadow(Size);
   // ptr shadow only exists for array and heap object
   if (!TT.isZeroShadow(PtrShadow)) {
@@ -2478,8 +2506,12 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
 
         i = CB.arg_begin();
         const unsigned ShadowArgStart = Args.size();
-        for (unsigned n = FT->getNumParams(); n != 0; ++i, --n)
-          Args.push_back(TF.getShadow(*i)); // we don't collapse shadow
+        for (unsigned n = FT->getNumParams(); n != 0; ++i, --n) {
+          Value *Shadow = isa<GlobalVariable>(*i)
+                        ? TF.getShadowForGlobal(cast<GlobalVariable>(*i), IRB)
+                        : TF.getShadow(*i);
+          Args.push_back(Shadow); // we don't collapse shadow
+        }
 
         if (FT->isVarArg()) {
           auto *LabelVATy = ArrayType::get(TF.TT.PrimitiveShadowTy,
@@ -2490,7 +2522,10 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
 
           for (unsigned n = 0; i != CB.arg_end(); ++i, ++n) {
             auto LabelVAPtr = IRB.CreateStructGEP(LabelVATy, LabelVAAlloca, n);
-            IRB.CreateStore(TF.getShadow(*i), LabelVAPtr);
+            Value *Shadow = isa<GlobalVariable>(*i)
+                          ? TF.getShadowForGlobal(cast<GlobalVariable>(*i), IRB)
+                          : TF.getShadow(*i);
+            IRB.CreateStore(Shadow, LabelVAPtr);
           }
 
           Args.push_back(IRB.CreateStructGEP(LabelVATy, LabelVAAlloca, 0));
@@ -2552,8 +2587,12 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       // after overflow have zero shadow values.
       if (ArgOffset + Size > kArgTLSSize)
         break;
+      Value *Arg = CB.getArgOperand(I);
+      Value *Shadow = isa<GlobalVariable>(Arg)
+                    ? TF.getShadowForGlobal(cast<GlobalVariable>(Arg), IRB)
+                    : TF.getShadow(Arg);
       IRB.CreateAlignedStore(
-          TF.getShadow(CB.getArgOperand(I)),
+          Shadow,
           TF.getArgTLS(FT->getParamType(I), ArgOffset, IRB),
           kShadowTLSAlignment);
       ArgOffset += alignTo(Size, kShadowTLSAlignment);
@@ -2606,8 +2645,12 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       Args.push_back(*i);
 
     i = CB.arg_begin();
-    for (unsigned n = FT->getNumParams(); n != 0; ++i, --n)
-      Args.push_back(TF.getShadow(*i));
+    for (unsigned n = FT->getNumParams(); n != 0; ++i, --n) {
+      Value *Shadow = isa<GlobalVariable>(*i)
+                    ? TF.getShadowForGlobal(cast<GlobalVariable>(*i), IRB)
+                    : TF.getShadow(*i);
+      Args.push_back(Shadow);
+    }
 
     if (FT->isVarArg()) {
       unsigned VarArgSize = CB.arg_size() - FT->getNumParams();
@@ -2617,8 +2660,11 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
                        "", &TF.F->getEntryBlock().front());
       Args.push_back(IRB.CreateConstGEP2_32(VarArgArrayTy, VarArgShadow, 0, 0));
       for (unsigned n = 0; i != E; ++i, ++n) {
+        Value *Shadow = isa<GlobalVariable>(*i)
+                      ? TF.getShadowForGlobal(cast<GlobalVariable>(*i), IRB)
+                      : TF.getShadow(*i);
         IRB.CreateStore(
-            TF.getShadow(*i),
+            Shadow,
             IRB.CreateConstGEP2_32(VarArgArrayTy, VarArgShadow, 0, n));
         Args.push_back(*i);
       }
