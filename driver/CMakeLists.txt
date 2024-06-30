@@ -22,10 +22,5 @@ if (DEFINED AFLPP_PATH)
     add_subdirectory(aflpp)
 endif()
 
-add_library(libSymsanProxy OBJECT harness-proxy)
-set_target_properties(libSymsanProxy PROPERTIES
-  OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/obj
-)
-
-install (FILES $<TARGET_OBJECTS:libSymsanProxy> DESTINATION ${SYMSAN_LIB_DIR} RENAME libSymsanProxy.o)
-
+install (CODE "MESSAGE(STATUS \"Build & Install: libSymsanProxy.o\")")
+install (CODE "execute_process(COMMAND ${CMAKE_INSTALL_PREFIX}/${SYMSAN_BIN_DIR}/ko-clang -c ${CMAKE_CURRENT_SOURCE_DIR}/harness-proxy.c -o ${CMAKE_INSTALL_PREFIX}/${SYMSAN_LIB_DIR}/libSymsanProxy.o)")

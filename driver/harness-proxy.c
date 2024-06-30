@@ -30,7 +30,10 @@ int main(int argc, char* argv[]) {
     }
     // get file size
     struct stat st;
-    stat(fd, &st);
+    if (stat(argv[1], &st) < 0) {
+        perror("stat");
+        return 1;
+    }
     size_t fsize = st.st_size;
 
     // read file contents
