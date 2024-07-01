@@ -1312,9 +1312,13 @@ int RGDAstParser::parse_cond(dfsan_label label, bool result, bool add_nested,
   // relational sub-expressions, where each sub-expression only contains
   // one relational operator at the root
   expr_t orig_root = get_root_expr(label);
-  if (orig_root == nullptr || orig_root->kind() == rgd::Bool) {
-    // if the simplified formula is a boolean constant, nothing to do
+  if (orig_root == nullptr) {
+    WARNF("failed to get root expr for label %u\n", label);
     return -1;
+  } else if (orig_root->kind() == rgd::Bool) {
+    // if the simplified formula is a boolean constant, nothing to do
+    DEBUGF("cond simplified to be a constant\n");
+    return 0;
   }
 
   // duplication the original root for transformation
@@ -1325,7 +1329,8 @@ int RGDAstParser::parse_cond(dfsan_label label, bool result, bool add_nested,
   // if we are looking for a false formula
   bool target_direction = !result;
   if (to_nnf(target_direction, root.get()) != 0) {
-    return false;
+    WARNF("failed to convert to NNF\n");
+    return -1;
   }
 #if DEBUG
   printAst(stderr, root.get(), 0);
@@ -1340,6 +1345,7 @@ int RGDAstParser::parse_cond(dfsan_label label, bool result, bool add_nested,
     if (task != nullptr) {
       tasks.push_back(save_task(task));
     } else {
+      WARNF("failed to construct task for clause\n");
       continue; // skip the nested task if the current task is invalid
     }
 
