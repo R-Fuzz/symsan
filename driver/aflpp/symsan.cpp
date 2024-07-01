@@ -177,7 +177,7 @@ static void handle_cond(pipe_msg &msg, my_mutator_t *my_mutator) {
     // parse the uniont table AST to solving tasks
     std::vector<uint64_t> tasks;
     if (my_mutator->parser->parse_cond(msg.label, ctx->direction, msg.flags & F_ADD_CONS, tasks) != 0) {
-      WARNF("Failed to parse the condition\n");
+      WARNF("Failed to parse the condition %u, from input %s\n", msg.label, my_mutator->cur_queue_entry);
       // symsan_terminate();
       return;
     }
@@ -209,7 +209,7 @@ static void handle_gep(gep_msg &gmsg, pipe_msg &msg, my_mutator_t *my_mutator) {
   std::vector<uint64_t> tasks;
   if (my_mutator->parser->parse_gep(gmsg.ptr_label, gmsg.ptr, gmsg.index_label, gmsg.index,
         gmsg.num_elems, gmsg.elem_size, gmsg.current_offset, false, tasks) != 0) {
-    WARNF("Failed to parse symbolic index\n");
+    WARNF("Failed to parse symbolic index %u, from input %s\n", gmsg.index_label, my_mutator->cur_queue_entry);
     // symsan_terminate();
     return;
   }
