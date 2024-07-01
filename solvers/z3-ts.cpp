@@ -389,7 +389,7 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
             z3::expr be = serialize(bounds->l1, dummy); // elements label
             bs = bs * be;
           }
-          z3::expr e = z3::ugt(idx * es * co, bs);
+          z3::expr e = z3::ugt(idx * es + co, bs);
           auto task = std::make_shared<z3_task_t>();
           task->push_back(e);
           task->insert(task->end(), nested_tasks.begin(), nested_tasks.end());
