@@ -350,9 +350,9 @@ class Z3Solver:
         self.serializer = Serializer(config, self.shm, self.__z3_context)
 
     def handle_gep(self, gmsg: gep_msg, addr: ctypes.c_ulong, should_enumerate=True):
-        self.logger.debug(f"handle_gep: ptr_label={gmsg.ptr_label}, ptr={gmsg.ptr}, "
+        self.logger.debug(f"handle_gep: ptr_label={gmsg.ptr_label}, ptr={hex(gmsg.ptr)}, "
               f"index_label={gmsg.index_label}, index={gmsg.index}, num_elems={gmsg.num_elems}, "
-              f"elem_size={gmsg.elem_size}, current_offset={gmsg.current_offset}, addr={addr}")
+              f"elem_size={gmsg.elem_size}, current_offset={gmsg.current_offset}, addr={hex(addr)}")
         size = get_label_info(gmsg.index_label, self.shm).size
         self._dep_input_offsets = set()
         try:
@@ -374,7 +374,8 @@ class Z3Solver:
         else:
             bounds = get_label_info(gmsg.ptr_label, self.shm)
             # if the array is not with fixed size, check bound info
-            if bounds.op == LLVM_INS.Alloca:
+            if bounds.op == LLVM_INS.Alloca.value:
+                self.logger.debug(f"handle_gep: lower_bound={hex(bounds.op1.i)}, upper_bound={hex(bounds.op2.i)}")
                 es = z3.BitVecVal(gmsg.elem_size, 64, self.__z3_context)
                 co = z3.BitVecVal(gmsg.current_offset, 64, self.__z3_context)
                 if bounds.l2 == 0:
@@ -604,7 +605,7 @@ class Z3Solver:
                     c.state_deps.add(copy.copy(s))
         return solving_status
 
-    def __solve_gep(self, index: z3.ExprRef, lb: int, ub: int, step: int, addr: int, should_enumerate: bool):
+    def __solve_gep(self, index: z3.ExprRef, lb, ub, step, addr, should_enumerate: bool):
         # enumerate indices
         if should_enumerate:
             for i in range(lb, ub, step):
@@ -616,9 +617,9 @@ class Z3Solver:
         u = z3.BitVecVal(ub, 64, self.__z3_context)
         e = z3.UGE(index, u)
         if self.__solve_expr(e):
-            self.logger.debug(f"__solve_gep: index >= {ub} solved @{addr}")
+            self.logger.debug(f"__solve_gep: index >= {hex(ub)} solved @{hex(addr)}")
         else:
-            self.logger.debug(f"__solve_gep: index >= {ub} not possible")
+            self.logger.debug(f"__solve_gep: index >= {hex(ub)} not possible")
         # check feasibility for OOB, lower bound
         if lb == 0:
             e = (index < 0)
@@ -626,6 +627,6 @@ class Z3Solver:
             l = z3.BitVecVal(lb, 64, self.__z3_context)
             e = z3.ULT(index, l)
         if self.__solve_expr(e):
-            self.logger.debug(f"__solve_gep: index < {lb} solved @{addr}")
+            self.logger.debug(f"__solve_gep: index < {hex(lb)} solved @{hex(addr)}")
         else:
-            self.logger.debug(f"__solve_gep: index < {lb} not possible")
+            self.logger.debug(f"__solve_gep: index < {hex(lb)} not possible")

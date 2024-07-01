@@ -465,7 +465,7 @@ void writeBB(const char* bbname) {
 }
 
 void llvm_profiling_call(const char* bbname)
-	__attribute__((visibility("default")));
+  __attribute__((visibility("default")));
 
 void llvm_profiling_call(const char* bbname) {
     if (filefd != NULL) {

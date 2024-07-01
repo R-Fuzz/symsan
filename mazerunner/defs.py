@@ -23,7 +23,7 @@ class gep_msg(ctypes.Structure):
     _pack_ = 1
     _fields_ = [("ptr_label", ctypes.c_uint32),
                 ("index_label", ctypes.c_uint32),
-                ("ptr", ctypes.c_ulong),
+                ("ptr", ctypes.c_void_p),
                 ("index", ctypes.c_int64),
                 ("num_elems", ctypes.c_uint64),
                 ("elem_size", ctypes.c_uint64),

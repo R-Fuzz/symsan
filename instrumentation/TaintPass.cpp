@@ -1320,7 +1320,7 @@ bool Taint::runOnModule(Module &M) {
         &i != TaintPushStackFrameFn.getCallee()->stripPointerCasts() &&
         &i != TaintPopStackFrameFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceAllocaFn.getCallee()->stripPointerCasts() &&
-	      &i != TaintTraceGlobalFn.getCallee()->stripPointerCasts() &&
+        &i != TaintTraceGlobalFn.getCallee()->stripPointerCasts() &&
         &i != TaintCheckBoundsFn.getCallee()->stripPointerCasts() &&
         &i != TaintMemcmpFn.getCallee()->stripPointerCasts() &&
         &i != TaintStrcmpFn.getCallee()->stripPointerCasts() &&
@@ -1573,7 +1573,7 @@ Value *TaintFunction::getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB) {
   if (T && (T->isArrayTy() || T->isStructTy())) {
     Module *M = F->getParent();
     auto &DL = M->getDataLayout();
-    uint64_t size = DL.getTypeAllocSize(T);
+    uint64_t size = T->isSized() ? DL.getTypeAllocSize(T) : 1;
     Value *Size = ConstantInt::get(TT.Int64Ty, size);
     Value *Addr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
     return IRB.CreateCall(TT.TaintTraceGlobalFn, {Addr, Size});
@@ -2582,8 +2582,8 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
         i = CB.arg_begin();
         const unsigned ShadowArgStart = Args.size();
         for (unsigned n = FT->getNumParams(); n != 0; ++i, --n) {
-          Value *Shadow = isa<GlobalVariable>(*i)
-                        ? TF.getShadowForGlobal(cast<GlobalVariable>(*i), IRB)
+          auto *GV = dyn_cast<GlobalVariable>((*i)->stripPointerCasts());
+          Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
                         : TF.getShadow(*i);
           Args.push_back(Shadow); // we don't collapse shadow
         }
@@ -2597,8 +2597,8 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
 
           for (unsigned n = 0; i != CB.arg_end(); ++i, ++n) {
             auto LabelVAPtr = IRB.CreateStructGEP(LabelVATy, LabelVAAlloca, n);
-            Value *Shadow = isa<GlobalVariable>(*i)
-                          ? TF.getShadowForGlobal(cast<GlobalVariable>(*i), IRB)
+            auto *GV = dyn_cast<GlobalVariable>((*i)->stripPointerCasts());
+            Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
                           : TF.getShadow(*i);
             IRB.CreateStore(Shadow, LabelVAPtr);
           }
@@ -2663,8 +2663,8 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       if (ArgOffset + Size > kArgTLSSize)
         break;
       Value *Arg = CB.getArgOperand(I);
-      Value *Shadow = isa<GlobalVariable>(Arg)
-                    ? TF.getShadowForGlobal(cast<GlobalVariable>(Arg), IRB)
+      auto *GV = dyn_cast<GlobalVariable>(Arg->stripPointerCasts());
+      Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
                     : TF.getShadow(Arg);
       IRB.CreateAlignedStore(
           Shadow,
@@ -2721,8 +2721,8 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
 
     i = CB.arg_begin();
     for (unsigned n = FT->getNumParams(); n != 0; ++i, --n) {
-      Value *Shadow = isa<GlobalVariable>(*i)
-                    ? TF.getShadowForGlobal(cast<GlobalVariable>(*i), IRB)
+      auto *GV = dyn_cast<GlobalVariable>((*i)->stripPointerCasts());
+      Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
                     : TF.getShadow(*i);
       Args.push_back(Shadow);
     }
@@ -2735,8 +2735,8 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
                        "", &TF.F->getEntryBlock().front());
       Args.push_back(IRB.CreateConstGEP2_32(VarArgArrayTy, VarArgShadow, 0, 0));
       for (unsigned n = 0; i != E; ++i, ++n) {
-        Value *Shadow = isa<GlobalVariable>(*i)
-                      ? TF.getShadowForGlobal(cast<GlobalVariable>(*i), IRB)
+        auto *GV = dyn_cast<GlobalVariable>((*i)->stripPointerCasts());
+        Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
                       : TF.getShadow(*i);
         IRB.CreateStore(
             Shadow,
