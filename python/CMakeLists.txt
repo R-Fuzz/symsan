@@ -22,5 +22,6 @@ target_link_libraries(pysymsan PRIVATE
   z3parser
   z3
   ${Python3_LIBRARIES}
+  rt
 )
 install (TARGETS Fastgen DESTINATION ${SYMSAN_LIB_DIR})
