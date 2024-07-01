@@ -136,6 +136,7 @@ dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
 
 // FIXME: local filter?
 static std::unordered_map<uint32_t, uint8_t> local_counter;
+static std::unordered_set<uint32_t> local_index_filter;
 // staticstics
 static uint64_t total_branches = 0;
 static uint64_t branches_to_solve = 0;
@@ -146,6 +147,7 @@ static uint64_t solved_branches = 0;
 
 static void reset_global_caches(size_t buf_size) {
   local_counter.clear();
+  local_index_filter.clear();
 }
 
 static void handle_cond(pipe_msg &msg, my_mutator_t *my_mutator) {
@@ -202,6 +204,11 @@ static void handle_gep(gep_msg &gmsg, pipe_msg &msg, my_mutator_t *my_mutator) {
     return;
   } else if (unlikely(msg.label == kInitializingLabel)) {
     WARNF("UBI array index @%p\n", (void*)msg.addr);
+    return;
+  }
+
+  // apply a local (per input) index filter
+  if (!local_index_filter.insert(msg.label).second) {
     return;
   }
 
