@@ -356,6 +356,10 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_name("atoi");
 #endif
     return true;
+  } else if (info->op == __dfsan::fsize) {
+    // do nothing now
+    WARNF("fsize not supported yet\n");
+    return false;
   }
 
   // common ops, make sure no special ops
@@ -1139,8 +1143,8 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
       if (info->l2 != 0) itr |= branch_to_inputs[info->l2];
       // nested cmp?
       uint8_t nested = 0;
-      nested += info->l1 == 0? 0 : nested_cmp_cache[info->l1];
-      nested += info->l2 == 0? 0 : nested_cmp_cache[info->l2];
+      nested += info->l1 == 0 ? 0 : nested_cmp_cache[info->l1];
+      nested += info->l2 == 0 ? 0 : nested_cmp_cache[info->l2];
       if (info->op == __dfsan::fmemcmp || (info->op & 0xff) == __dfsan::ICmp)
         nested += 1;
       nested_cmp_cache.push_back(nested);
@@ -1482,6 +1486,25 @@ bool RGDAstParser::save_constraint(expr_t expr, bool result) {
   return true;
 }
 
+void RGDAstParser::add_nested_constraint(task_t task, const clause_t &nested_caluse) {
+  for (auto const& node: nested_caluse) {
+    // check cache, should happen most of the time
+    auto itr = constraint_cache.find(node->label());
+    if (likely(itr != constraint_cache.end())) {
+      task->constraints.push_back(itr->second);
+      task->comparisons.push_back(node->kind());
+      continue;
+    }
+    // otherwise, parse the AST into a constraint
+    constraint_t constraint = parse_constraint(node->label());
+    if (likely(constraint != nullptr)) {
+      task->constraints.push_back(constraint);
+      task->comparisons.push_back(node->kind());
+      constraint_cache.insert({node->label(), constraint});
+    }
+  }
+}
+
 int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
                             dfsan_label index_label, int64_t index,
                             uint64_t num_elems, uint64_t elem_size,
@@ -1492,12 +1515,240 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     return -1;
   }
 
+  // update ast_size and branch_to_inputs caches
+  // if the index_label has been scanned before, it won't be scanned again
+  if (!scan_labels(index_label)) {
+    return -1;
+  }
+
+  // sanity checks
+  if (unlikely(ast_size_cache.size() <= index_label)) {
+    WARNF("invalid label %u, larger than ast_size_cache: %lu\n", index_label, ast_size_cache.size());
+    return -1;
+  }
+  if (unlikely(nested_cmp_cache.at(index_label) > 0)) {
+    WARNF("unexpected nested cmp in parse_gep for %u, skip\n", index_label);
+    return -1;
+  }
+
+  auto ast_size = ast_size_cache.at(index_label);
+  if (unlikely(ast_size == 0)) {
+    WARNF("invalid label %u, ast_size_cache is 0\n", index_label);
+    return 0;
+  } else if (unlikely(ast_size > max_ast_size_)) {
+    DEBUGF("skip large AST (%lu) in parse_gep for %u\n", ast_size, index_label);
+    return 0; // not an error, just skip
+  }
+
+  // early return if nothing to check
+  if (!enum_index) {
+    if (num_elems == 0 &&
+        (ptr_label == 0 || get_label_info(ptr_label)->op != __dfsan::Alloca)) {
+      return 0;
+    }
+  }
+
+  // hmm, since the gep constraints we want to solve are not in the union table,
+  // which means parse_constraint will not work,
+  // so we have to construct the tasks directly here
+  //
+
+  // first, parse the index_label into a partial constraint
+  // again, the index_label is not a cmp node
+  constraint_t partial_constraint = nullptr;
+  // check cache first
+  auto itr = constraint_cache.find(index_label);
+  if (itr != constraint_cache.end()) {
+    partial_constraint = itr->second;
+  } else {
+    // otherwise, parse the AST into a constraint
+    std::unordered_set<dfsan_label> visited;
+    partial_constraint = std::make_shared<rgd::Constraint>(ast_size + 3); // leave extra one buffer?
+
+    // add the constant node first
+    auto const_node = partial_constraint->ast->add_children();
+    const_node->set_kind(rgd::Constant);
+    const_node->set_label(0);
+    uint32_t size = get_label_info(index_label)->size;
+    const_node->set_bits(size); // size of the index
+    // map args
+    uint32_t arg_index = 0; // first arg
+    const_node->set_index(arg_index);
+    partial_constraint->input_args.push_back(std::make_pair(false, 0)); // use 0 as a temporary placeholder
+    partial_constraint->const_num += 1;
+    uint32_t hash = rgd::xxhash(size, rgd::Constant, arg_index);
+    const_node->set_hash(hash);
+
+    // now, parse the index_label
+    auto index_node = partial_constraint->ast->add_children();
+    try {
+      if (!do_uta_rel(index_label, index_node, partial_constraint, visited)) {
+        WARNF("failed to parse index_label %u\n", index_label);
+        return -1;
+      }
+    } catch (std::bad_alloc &e) {
+      WARNF("failed to allocate memory for gep constraint\n");
+      return -1;
+    } catch (std::out_of_range &e) {
+      WARNF("AST %u goes out of range at %s\n", index_label, e.what());
+      return -1;
+    }
+
+    // setup root cmp node
+    auto cmp_node = partial_constraint->ast.get();
+    cmp_node->set_kind(rgd::Equal); // a placeholder, not really useful
+    cmp_node->set_label(0); // so jigsaw will not cache it as visited
+    cmp_node->set_bits(1);
+    // again, in jigsaw, we don't care about actual cmp kind
+    hash = rgd::xxhash(const_node->hash(), (rgd::Bool << 16) | 1, index_node->hash());
+    cmp_node->set_hash(hash);
+
+    // done parsing, add to cache
+    constraint_cache.insert({index_label, partial_constraint});
+  }
+
+  if (unlikely(partial_constraint == nullptr)) {
+    WARNF("failed to parse index_label %u\n", index_label);
+    return -1;
+  }
+
+  // next, retrive nested constraints if needed
+  clause_t nested_caluse;
+  if (solve_nested_) {
+    auto &itr = branch_to_inputs[index_label];
+    if (unlikely(itr.find_first() != input_dep_t::npos)) {
+      // use union find to add additional related input bytes
+      std::unordered_set<size_t> related_inputs;
+      for (auto input = itr.find_first(); input != input_dep_t::npos;
+           input = itr.find_next(input)) {
+        data_flow_deps.get_set(input, related_inputs); // FIXME: should be fine?
+      }
+      // collect the branch constraints for each related input byte
+      std::unordered_set<dfsan_label> inserted;
+      for (auto input: related_inputs) {
+        auto const& bucket = input_to_branches[input];
+        for (auto const& nc : bucket) {
+          if (inserted.insert(nc->label()).second) {
+#if DEBUG
+            fprintf(stderr, "add nested constraint for gep: (%d, %d)\n", nc->label(), nc->kind());
+#endif
+            nested_caluse.push_back(nc.get()); // XXX: borrow the raw ptr, should be fine?
+          }
+        }
+      }
+    }
+  }
+
+  // finally, we are ready to construct GEP tasks
+  //
+
+  if (enum_index) {
+    // TODO:
+  }
+
+  // bounds check
+  if (num_elems > 0) {
+    // array with known size
+    //
+    // check underflow, 0 > index
+    constraint_t underflow = std::make_shared<rgd::Constraint>(*partial_constraint);
+    underflow->op1 = 0;
+    underflow->op2 = index;
+    task_t uf_task = std::make_shared<rgd::SearchTask>();
+    uf_task->constraints.push_back(underflow);
+    uf_task->comparisons.push_back(rgd::Sgt); // signed GT
+    uf_task->finalize();
+    tasks.push_back(save_task(uf_task));
+    if (solve_nested_) {
+      task_t nested_task = std::make_shared<rgd::SearchTask>();
+      uf_task->constraints.push_back(underflow);
+      uf_task->comparisons.push_back(rgd::Sgt);
+      add_nested_constraint(nested_task, nested_caluse);
+      nested_task->finalize();
+      tasks.push_back(save_task(nested_task));
+    }
+    // check overflow, num_elems <= index
+    constraint_t overflow = std::make_shared<rgd::Constraint>(*partial_constraint);
+    overflow->input_args[0].second = num_elems; // IMPORTANT: fix the constant arg
+    overflow->op1 = num_elems;
+    overflow->op2 = index;
+    task_t of_task = std::make_shared<rgd::SearchTask>();
+    of_task->constraints.push_back(overflow);
+    of_task->comparisons.push_back(rgd::Ule); // unsigned LE
+    of_task->finalize();
+    tasks.push_back(save_task(of_task));
+    if (solve_nested_) {
+      task_t nested_task = std::make_shared<rgd::SearchTask>();
+      of_task->constraints.push_back(overflow);
+      of_task->comparisons.push_back(rgd::Ule);
+      add_nested_constraint(nested_task, nested_caluse);
+      nested_task->finalize();
+      tasks.push_back(save_task(nested_task));
+    }
+  } else {
+    // struct or array with unknown compile time size
+    auto bounds_info = get_label_info(ptr_label);
+    if (bounds_info->op == __dfsan::Alloca) {
+      // bounds information is available, check if allocation size is symbolic
+      if (bounds_info->l2 ==0) {
+        // concrete allocation size, check bounds
+        // check underflow, lower_bound > index * elem_size + current_offset + ptr
+        // => (lower_bound - current_offset - ptr) / elem_size > index
+        constraint_t underflow = std::make_shared<rgd::Constraint>(*partial_constraint);
+        uint64_t lower_bound = (bounds_info->op1.i - current_offset - ptr) / elem_size;
+        underflow->input_args[0].second = lower_bound; // IMPORTANT: fix the constant arg
+        underflow->op1 = lower_bound;
+        underflow->op2 = index;
+        task_t uf_task = std::make_shared<rgd::SearchTask>();
+        uf_task->constraints.push_back(underflow);
+        uf_task->comparisons.push_back(rgd::Ugt); // unsigned GT, automatically detects integer overflow
+        uf_task->finalize();
+        tasks.push_back(save_task(uf_task));
+        if (solve_nested_) {
+          task_t nested_task = std::make_shared<rgd::SearchTask>();
+          uf_task->constraints.push_back(underflow);
+          uf_task->comparisons.push_back(rgd::Ugt);
+          add_nested_constraint(nested_task, nested_caluse);
+          nested_task->finalize();
+          tasks.push_back(save_task(nested_task));
+        }
+        // check overflow, upper_bound <= index * elem_size + current_offset + ptr
+        // => (upper_bound - current_offset - ptr) / elem_size <= index
+        constraint_t overflow = std::make_shared<rgd::Constraint>(*partial_constraint);
+        uint64_t upper_bound = (bounds_info->op2.i - current_offset - ptr) / elem_size;
+        overflow->input_args[0].second = upper_bound; // IMPORTANT: fix the constant arg
+        overflow->op1 = upper_bound;
+        overflow->op2 = index;
+        task_t of_task = std::make_shared<rgd::SearchTask>();
+        of_task->constraints.push_back(overflow);
+        of_task->comparisons.push_back(rgd::Ule); // unsigned LE
+        of_task->finalize();
+        tasks.push_back(save_task(of_task));
+        if (solve_nested_) {
+          task_t nested_task = std::make_shared<rgd::SearchTask>();
+          of_task->constraints.push_back(overflow);
+          of_task->comparisons.push_back(rgd::Ule);
+          add_nested_constraint(nested_task, nested_caluse);
+          nested_task->finalize();
+          tasks.push_back(save_task(nested_task));
+        }
+      } else {
+        // TODO: check size overflow
+        // index * elem_size + current_offset + ptr > array_size * alloc_elem_size
+      }
+    }
+  }
+
   return 0;
 }
 
 int RGDAstParser::add_constraints(dfsan_label label, uint64_t result) {
   // offset constraint should be in the form of r = (offset == label) = true
-  //
+  if (!solve_nested_) {
+    // only matters in nested mode
+    return 0;
+  }
+
   // check validity of the label
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
     return -1;
@@ -1505,6 +1756,7 @@ int RGDAstParser::add_constraints(dfsan_label label, uint64_t result) {
   // check validity of the result
   if (result != 1) {
     WARNF("unexpected result in add_constraints: %lu\n", result);
+    return -1;
   }
 
   expr_t root = nullptr;
