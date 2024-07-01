@@ -340,6 +340,7 @@ fun:fopen64=custom
 fun:fread=custom
 fun:fread_unlocked=custom
 fun:freopen=custom
+fun:getchar=custom
 fun:getc=custom
 fun:getc_unlocked=custom
 fun:getdelim=custom
