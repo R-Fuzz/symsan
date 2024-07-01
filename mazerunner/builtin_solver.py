@@ -457,7 +457,7 @@ class Z3Solver:
             self.__branch_deps.extend([None] * (n + 1 - len(self.__branch_deps)))
         self.__branch_deps[n] = dep
 
-    def __solve_expr(self, e: z3.ExprRef, seed_info=''):
+    def __solve_expr(self, e: z3.ExprRef, seed_info='', is_gep=False):
         # set up local optmistic solver
         opt_solver = z3.SolverFor("QF_BV", ctx=self.__z3_context)
         opt_solver.set("timeout", 1000)
@@ -474,7 +474,7 @@ class Z3Solver:
         r_nested = self.__z3_solver.check()
         if r_nested == z3.sat:
             m = self.__z3_solver.model()
-            has_generated = self.__generate_input(m, False, seed_info)
+            has_generated = self.__generate_input(m, False, is_gep, seed_info)
             if not has_generated:
                 status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
             else:
@@ -484,7 +484,7 @@ class Z3Solver:
                 self.__z3_solver.pop()
                 return SolvingStatus.UNSOLVED_PRE_UNSAT
             m = opt_solver.model()
-            has_generated = self.__generate_input(m, True, seed_info)
+            has_generated = self.__generate_input(m, True, is_gep, seed_info)
             if not has_generated:
                 status = SolvingStatus.UNSOLVED_UNINTERESTING_SAT
             elif r_nested == z3.unknown:
@@ -499,8 +499,10 @@ class Z3Solver:
         self.__z3_solver.pop()
         return status
 
-    def __generate_input(self, m: z3.Model, is_optimistic: bool, seed_info=''):
+    def __generate_input(self, m: z3.Model, is_optimistic: bool, is_gep: bool, seed_info=''):
         fname = f"id-{self.__instance_id}-{self.__session_id}-{self.__current_index}"
+        if is_gep:
+            fname += "-gep"
         if is_optimistic:
             fname += "-opt"
         if seed_info:
@@ -611,12 +613,12 @@ class Z3Solver:
             for i in range(lb, ub, step):
                 idx = z3.BitVecVal(i, 64, self.__z3_context)
                 e = (index == idx)
-                if self.__solve_expr(e):
+                if self.__solve_expr(e, is_gep=True):
                     self.logger.debug(f"__solve_gep: index == {i} feasible")
         # check feasibility for OOB, upper bound
         u = z3.BitVecVal(ub, 64, self.__z3_context)
         e = z3.UGE(index, u)
-        if self.__solve_expr(e):
+        if self.__solve_expr(e, is_gep=True):
             self.logger.debug(f"__solve_gep: index >= {hex(ub)} solved @{hex(addr)}")
         else:
             self.logger.debug(f"__solve_gep: index >= {hex(ub)} not possible")
@@ -626,7 +628,7 @@ class Z3Solver:
         else:
             l = z3.BitVecVal(lb, 64, self.__z3_context)
             e = z3.ULT(index, l)
-        if self.__solve_expr(e):
+        if self.__solve_expr(e, is_gep=True):
             self.logger.debug(f"__solve_gep: index < {hex(lb)} solved @{hex(addr)}")
         else:
             self.logger.debug(f"__solve_gep: index < {hex(lb)} not possible")

@@ -34,6 +34,7 @@ class ConcolicExecutor:
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.logging_level = config.logging_level
         self.generated_files = []
+        self.proc_returncode = None
         # symsan lib instance
         symsan.init(self.cmd[0])
         self.symsan_tasks = []
@@ -56,7 +57,6 @@ class ConcolicExecutor:
         self.timer.proc_end_time = (time.time() * utils.MILLION_SECONDS_SCALE)
 
     def get_result(self):
-        assert self.proc_returncode is not None
         if self.config.defferred_solving_enabled:
             assert not self.generated_files
         return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
