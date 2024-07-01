@@ -30,15 +30,20 @@ int main(int argc, char* argv[]) {
     }
     // get file size
     struct stat st;
-    if (stat(argv[1], &st) < 0) {
-        perror("stat");
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
         return 1;
     }
     size_t fsize = st.st_size;
 
     // read file contents
-    char *string = (char*)malloc(fsize + 1);
-    read(fd, string, fsize);
+    char *string = (char*)malloc(fsize);
+    if (read(fd, string, fsize) != fsize) {
+        perror("read");
+        close(fd);
+        return 1;
+    }
     close(fd);
 
     // Now call into the harness
