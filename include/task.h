@@ -26,6 +26,7 @@ struct Constraint {
   Constraint(int ast_size): fn(nullptr), const_num(0) {
     ast = std::make_shared<AstNode>(ast_size);
   }
+  Constraint(const Constraint&) = default; // XXX: okay to use default?
   const AstNode *get_root() const { return const_cast<const AstNode*>(ast.get()); }
 
   // JIT'ed function for a comparison expression
@@ -72,7 +73,9 @@ struct SearchTask {
   SearchTask(): scratch_args(nullptr), max_const_num(0),
       stopped(false), attempts(0), solved(false), skip_next(false),
       base_task(nullptr) {}
+  SearchTask(const SearchTask&) = delete;
   ~SearchTask() { if (scratch_args) free(scratch_args); }
+  bool has_finalized() const { return scratch_args != nullptr; }
 
   uint32_t num_exprs;
   // constraints, could be shared, strictly read-only

@@ -84,6 +84,7 @@ private:
                    constraint_t constraint);
 
   bool save_constraint(expr_t expr, bool result);
+  inline void add_nested_constraint(task_t task, const clause_t &nested_caluse);
 };
 
 }; // namespace rgd

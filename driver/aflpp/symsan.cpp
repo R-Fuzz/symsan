@@ -148,8 +148,7 @@ static void reset_global_caches(size_t buf_size) {
   local_counter.clear();
 }
 
-static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
-                        my_mutator_t *my_mutator) {
+static void handle_cond(pipe_msg &msg, my_mutator_t *my_mutator) {
   if (unlikely(msg.label == 0)) {
     return;
   } else if (unlikely(msg.label == kInitializingLabel)) {
@@ -179,9 +178,9 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
     std::vector<uint64_t> tasks;
     if (my_mutator->parser->parse_cond(msg.label, ctx->direction, msg.flags & F_ADD_CONS, tasks) != 0) {
       WARNF("Failed to parse the condition\n");
-      symsan_terminate();
+      // symsan_terminate();
+      return;
     }
-    // construct_tasks(neg_ctx->direction, msg.label, buf, buf_size, tasks);
 
     // add the tasks to the task manager
     for (auto const& task_id : tasks) {
@@ -197,7 +196,37 @@ static void handle_cond(pipe_msg &msg, const u8 *buf, size_t buf_size,
   }
 }
 
-static void handle_gep(gep_msg &gmsg, pipe_msg &msg) {
+static void handle_gep(gep_msg &gmsg, pipe_msg &msg, my_mutator_t *my_mutator) {
+  // msg.label === gmsg.index_label
+  if (unlikely(msg.label == 0)) {
+    return;
+  } else if (unlikely(msg.label == kInitializingLabel)) {
+    WARNF("UBI array index @%p\n", (void*)msg.addr);
+    return;
+  }
+
+  // parse the uniont table AST to solving tasks
+  std::vector<uint64_t> tasks;
+  if (my_mutator->parser->parse_gep(gmsg.ptr_label, gmsg.ptr, gmsg.index_label, gmsg.index,
+        gmsg.num_elems, gmsg.elem_size, gmsg.current_offset, false, tasks) != 0) {
+    WARNF("Failed to parse symbolic index\n");
+    // symsan_terminate();
+    return;
+  }
+
+  // add the tasks to the task manager, with a dummy context
+  branch_ctx_t ctx = std::make_shared<rgd::BranchContext>();
+  ctx->addr = (void*)msg.addr;
+  ctx->direction = true;
+  for (auto const& task_id : tasks) {
+    auto task = my_mutator->parser->retrieve_task(task_id);
+    my_mutator->task_mgr->add_task(ctx, task);
+#if PRINT_STATS
+    task_size_dist[task->constraints.size()] += 1;
+#endif
+  }
+
+  total_tasks += tasks.size();
 }
 
 /// no splice input
@@ -398,7 +427,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
     switch (msg.msg_type) {
       // conditional branch
       case cond_type:
-        handle_cond(msg, buf, buf_size, data);
+        handle_cond(msg, data);
         break;
       case gep_type:
         if (symsan_read_event(&gmsg, sizeof(gmsg), 0) != sizeof(gmsg)) {
@@ -410,7 +439,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
           WARNF("Incorrect gep msg: %d vs %d\n", msg.label, gmsg.index_label);
           break;
         }
-        handle_gep(gmsg, msg);
+        handle_gep(gmsg, msg, data);
         break;
       case memcmp_type:
         if (msg.label == 0 || msg.label >= MAX_LABEL) {
