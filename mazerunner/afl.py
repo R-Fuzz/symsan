@@ -1,4 +1,5 @@
 import ast
+import copy
 import logging
 import functools
 import math
@@ -14,7 +15,7 @@ import utils
 import minimizer
 import executor
 import executor_symsan_lib
-from agent import Agent, ExploreAgent, ExploitAgent, RecordAgent
+from agent import Agent, ExploreAgent, ExploitAgent, LazyAgent
 from seed_scheduler import FILOScheduler, PrioritySamplingScheduler, RealTimePriorityScheduler
 from defs import SolvingStatus
 
@@ -51,13 +52,14 @@ class MazerunnerState:
         self.timeout = timeout
         self.start_ts = time.time()
         self.end_ts = None
+        self.ce_time = 0
         self.synced = set()
         self.hang = set()
         self.processed = {}
+        self.target_triggered = False
         self.testscases_md5 = set()
         self.index = 0
         self.execs = 0
-        self.num_error_reports = 0
         self.num_crash_reports = 0
         self.seed_queue = []
         self.state_seed_mapping = {}
@@ -115,13 +117,14 @@ class MazerunnerState:
 class Mazerunner:
     def __init__(self, config, shared_state=None, seed_scheduler=None):
         self.config = config
-        # check_resource_limit returns a flag that controlled by another monitor thread
-        self.check_resource_limit = lambda: False
         self.cmd = config.cmd
         self.output = config.output_dir
         self.my_dir = config.mazerunner_dir
-        self.symsan = None
         self._make_dirs()
+        # Concolic Executors
+        self.directed_ce = None
+        self.exploit_ce = None
+
         if shared_state:
             self.state = shared_state
         else:
@@ -139,10 +142,6 @@ class Mazerunner:
         else:
             self.minimizer = minimizer.TestcaseMinimizer(
                 None, None, self.afl_dir, None, self.state)
-
-    @property
-    def reached_resource_limit(self):
-        return self.check_resource_limit()
 
     @property
     def afl_dir(self):
@@ -184,15 +183,8 @@ class Mazerunner:
     def dictionary(self):
         return os.path.join(self.my_dir, "dictionary")
 
-    def run(self, run_once=False):
-        while not self.reached_resource_limit:
-            self._run()
-            if run_once:
-                break
-            if self.state.execs % self.config.save_frequency == 0:
-                self.export_state()
-        if not run_once:
-            self.logger.error("Reached resource limit, exiting...")
+    def run(self):
+        self._run()
 
     def run_file(self, fn):
         self.state.execs += 1
@@ -204,17 +196,19 @@ class Mazerunner:
         self.handle_return_status(symsan_res, fp)
         self.update_timmer(symsan_res)
         self.sync_seed_queue(fp, symsan_res)
+        # CVE might be reproduced before reaching the target
+        if symsan_res.distance <= self.config.bug_trigger_distance:
+            self.trigger_crash(fp)
         return fp
 
     def run_target(self, testcase):
-        self.symsan.setup(testcase, len(self.state.processed))
-        timeout = self.state.timeout
-        self.symsan.run(timeout)
+        self.directed_ce.setup(testcase, len(self.state.processed))
+        self.directed_ce.run(self.state.timeout)
         try:
-            self.symsan.process_request()
+            self.directed_ce.process_request()
         finally:
-            self.symsan.tear_down(deep_clean=False)
-        symsan_res = self.symsan.get_result()
+            self.directed_ce.tear_down(deep_clean=False)
+        symsan_res = self.directed_ce.get_result()
         self.logger.info(
             f"Total={symsan_res.total_time:.3f}ms, "
             f"Emulation={symsan_res.emulation_time:.3f}ms, "
@@ -225,6 +219,44 @@ class Mazerunner:
             f"Msg_count={symsan_res.symsan_msg_num}. "
         )
         return symsan_res
+    
+    def trigger_crash(self, protential_seed):
+        if self.exploit_ce is None:
+            return
+        self.logger.debug(f"Triggering crash from {protential_seed}")
+        # rerun the testcase with GEP solver
+        self.exploit_ce.setup(protential_seed)
+        self.exploit_ce.run(self.state.timeout)
+        try:
+            self.exploit_ce.process_request()
+        finally:
+            self.exploit_ce.tear_down(deep_clean=False)
+        # find crashing input in the generation directory
+        res = self.exploit_ce.get_result()
+        for t in res.generated_testcases:
+            testcase = os.path.join(self.my_generations, t)
+            if not self.minimizer.is_new_file(testcase):
+                os.unlink(testcase)
+                continue
+            self.logger.debug(f"Testing generated testcase: {testcase}")
+            self.exploit_ce.setup(testcase)
+            self.exploit_ce.run(self.state.timeout)
+            try:
+                self.exploit_ce.process_request()
+            finally:
+                self.exploit_ce.tear_down(deep_clean=False)
+            r = self.exploit_ce.get_result()
+            # move testcase to the queue directory
+            index = self.state.tick()
+            src_id = utils.get_id_from_fn(os.path.basename(protential_seed))
+            t_fn = f"id:{index:06},src:{src_id:06},ts:{self.state.curr_ts},execs:{self.state.execs}"
+            q_fp = os.path.join(self.my_queue, t_fn)
+            shutil.move(testcase, q_fp)
+            fp = self.update_seed_info(q_fp, r)
+            self.determine_crash(r, fp)
+    
+    def sync_seed_queue(self, fp, res):
+        self._sync_seed_queue(fp, res)
 
     def update_seed_info(self, fp, res):
         new_fp = fp
@@ -238,7 +270,10 @@ class Mazerunner:
         return new_fp
 
     def update_timmer(self, res):
-        pass
+        try:
+            self.state.ce_time += res.total_time / utils.MILLION_SECONDS_SCALE
+        except AttributeError:
+            self.state.ce_time = res.total_time / utils.MILLION_SECONDS_SCALE
 
     def sync_from_afl(self, reversed_order=True, need_sort=False):
         files = []
@@ -283,21 +318,13 @@ class Mazerunner:
         trace_len = len(self.agent.episode)
         if trace_len == 0:
             self.logger.warning("No episode infomation during the execution")
-        
-        retcode = result.returncode
+        # check hangs
         fn = os.path.basename(fp)
-        if retcode in [124, 9]: # killed
+        if result.returncode in [124, 9]: # killed
             shutil.copy2(fp, os.path.join(self.my_hangs, fn))
             self.state.hang.add(fn)
-            
-        # Did we crash? The following comments are coming from AFL++'s comments.
-        # In a normal case, (abort or segfault) WIFSIGNALED(retcode) will be set.
-        # However, MSAN and LSAN use a special exit code.
-        # On top, a user may specify a custom AFL_CRASH_EXITCODE.
-        # TODO: handle MSAN, LSAN and custom exit codes
-        if os.WIFSIGNALED(retcode) or (retcode in {128 + 11, 11, 128 + 6, 6}):
-            shutil.copy2(fp, os.path.join(self.my_errors, fn))
-            self._report_error(fp, result.stderr)
+
+        self.determine_crash(result, fp)
 
     def handle_hang_files(self):
         if len(self.state.hang) > self.config.min_hang_files:
@@ -308,10 +335,30 @@ class Mazerunner:
                     self.seed_scheduler.put(fn, (d, ''))
                 self.state.hang.clear()
 
+    '''    
+    Did we crash? The following are coming from AFL++'s doc.
+    In a normal case, (abort or segfault) WIFSIGNALED(retcode) will be set.
+    However, MSAN and LSAN use a special exit code.
+    On top, a user may specify a custom AFL_CRASH_EXITCODE.
+    '''
+    # TODO: handle MSAN, LSAN and custom exit codes
+    def determine_crash(self, result, testcase):
+        code = result.returncode
+        if os.WIFSIGNALED(code) or (code in {128 + 11, 11, 128 + 6, 6}):
+            fn = os.path.basename(testcase)
+            self.logger.info(f"crash triggered at {fn}.")
+            shutil.copy2(testcase, os.path.join(self.my_errors, fn))
+            self.state.num_crash_reports += 1
+            if result.distance == 0:
+                io = result.stderr
+                self._report_crash(testcase, io)
+
     def cleanup(self):
         self.minimizer.cleanup()
-        if not self.symsan is None:
-            self.symsan.tear_down()
+        if not self.directed_ce is None:
+            self.directed_ce.tear_down(deep_clean=True)
+        if not self.exploit_ce is None:
+            self.exploit_ce.tear_down(deep_clean=True)
 
     def signal_handler(self, signum, frame):
         self.logger.info(f"Received signal {signum}, cleaning up...")
@@ -344,19 +391,20 @@ class Mazerunner:
         else:
             self.state = MazerunnerState(self.config.timeout)
 
-    def _report_error(self, fp, log):
-        self.logger.info("Detected crashed: %s\nSubprocess stderr:%s" % (fp, log))
+    def _report_crash(self, fp, log):
+        self.state.target_triggered = True
+        # TODO: email the crash report
 
 class SymSanExecutor(Mazerunner):
     def __init__(self, config, shared_state=None, seed_scheduler=None, model=None):
         super().__init__(config, shared_state, seed_scheduler)
         self.agent = Agent(config, model)
         if config.use_builtin_solver:
-            self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+            self.directed_ce = executor.ConcolicExecutor(config, self.agent, self.my_generations)
         else:
-            self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
+            self.directed_ce = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
 
-    def sync_seed_queue(self, fp, res):
+    def _sync_seed_queue(self, fp, res):
         old_idx = self.state.index
         fn = os.path.basename(fp)
         num_testcase = 0
@@ -364,7 +412,6 @@ class SymSanExecutor(Mazerunner):
             num_testcase += 1
             testcase = os.path.join(self.my_generations, t)
             if not self.minimizer.is_new_file(testcase):
-                # Remove if it's not interesting testcases
                 os.unlink(testcase)
                 continue
             index = self.state.tick()
@@ -388,18 +435,17 @@ class ExploreExecutor(Mazerunner):
     def __init__(self, config, shared_state=None, seed_scheduler=None, model=None):
         super().__init__(config, shared_state, seed_scheduler)
         self.agent = ExploreAgent(config, model)
+        crash_config = copy.copy(config)
+        crash_config.gep_solver_enabled = True
+        lazy_agent = LazyAgent(crash_config)
         if config.use_builtin_solver:
-            self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+            self.directed_ce = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+            self.exploit_ce = executor.ConcolicExecutor(crash_config, lazy_agent, self.my_generations)
         else:
-            self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
+            self.directed_ce = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
+            self.exploit_ce = executor_symsan_lib.ConcolicExecutor(crash_config, lazy_agent, self.my_generations)
 
-    def update_timmer(self, res):
-        try:
-            self.state.explore_time += res.total_time / utils.MILLION_SECONDS_SCALE
-        except AttributeError:
-            self.state.explore_time = res.total_time / utils.MILLION_SECONDS_SCALE
-    
-    def sync_seed_queue(self, fp, res):
+    def _sync_seed_queue(self, fp, res):
         fn = os.path.basename(fp)
         if self.minimizer.has_closer_distance(res.distance, fn):
             self.logger.info(f"Explore agent found closer distance={res.distance}")
@@ -439,7 +485,7 @@ class ExploreExecutor(Mazerunner):
         if target_sa is None:
             return None
         
-        t, src, status = self.symsan.generate_testcase(target_sa, self.state.processed)
+        t, src, status = self.directed_ce.generate_testcase(target_sa, self.state.processed)
         if status == SolvingStatus.UNSOLVED_RECIPE_MISS:
             self.logger.info(f"No valid recipe for {target_sa}. Skip")
             return None
@@ -513,30 +559,35 @@ class ExploitExecutor(Mazerunner):
         super().__init__(config, shared_state, seed_scheduler)
         self.agent = ExploitAgent(config, model)
         self._cur_input = os.path.join(self.my_generations, ".cur_input")
+        crash_config = copy.copy(config)
+        crash_config.gep_solver_enabled = True
+        lazy_agent = LazyAgent(crash_config)
         if config.use_builtin_solver:
-            self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+            self.directed_ce = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+            self.exploit_ce = executor.ConcolicExecutor(crash_config, lazy_agent, self.my_generations)
         else:
-            self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
-
+            self.directed_ce = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
+            self.exploit_ce = executor_symsan_lib.ConcolicExecutor(crash_config, lazy_agent, self.my_generations)
+        
     def run_target(self, testcase) -> executor.ExecutorResult:
         shutil.copy2(testcase, self._cur_input)
         total_time = emulation_time = solving_time = 0
         has_reached_max_flip_num = lambda: len(self.agent.all_targets) >= self.config.max_flip_num
         while not has_reached_max_flip_num():
             try:
-                self.symsan.setup(self._cur_input, len(self.state.processed))
-                self.symsan.run(self.state.timeout)
-                self.symsan.process_request()
+                self.directed_ce.setup(self._cur_input, len(self.state.processed))
+                self.directed_ce.run(self.state.timeout)
+                self.directed_ce.process_request()
                 # (1) symsan proc has nomarlly terminated and cur_input is on policy
                 # (2) the solver is not able to solve the branch condition
-                if len(self.symsan.solver.generated_files) == 0:
+                if len(self.directed_ce.solver.generated_files) == 0:
                     break
-                assert len(self.symsan.solver.generated_files) == 1
-                fp = os.path.join(self.my_generations, self.symsan.solver.generated_files[0])
+                assert len(self.directed_ce.solver.generated_files) == 1
+                fp = os.path.join(self.my_generations, self.directed_ce.solver.generated_files[0])
                 shutil.move(fp, self._cur_input)
             finally:
-                self.symsan.tear_down(deep_clean=False)
-                symsan_res = self.symsan.get_result()
+                self.directed_ce.tear_down(deep_clean=False)
+                symsan_res = self.directed_ce.get_result()
                 total_time += symsan_res.total_time
                 emulation_time += symsan_res.emulation_time
                 solving_time += symsan_res.solving_time
@@ -558,13 +609,7 @@ class ExploitExecutor(Mazerunner):
         self.agent.clear_targets()
         return symsan_res
 
-    def update_timmer(self, res):
-        try:
-            self.state.exploit_time += res.total_time / utils.MILLION_SECONDS_SCALE
-        except AttributeError:
-            self.state.exploit_time = res.total_time / utils.MILLION_SECONDS_SCALE
-
-    def sync_seed_queue(self, fp, res):
+    def _sync_seed_queue(self, fp, res):
         if res.flipped_times == 0:
             return
         if not self.minimizer.is_new_file(self._cur_input):
@@ -597,23 +642,17 @@ class RecordExecutor(Mazerunner):
         self.is_hybrid_mode = shared_state is not None
         self.record_enabled = record_enabled
         if self.record_enabled:
-            self.agent = RecordAgent(config, model)
+            self.agent = LazyAgent(config)
             if config.use_builtin_solver:
-                self.symsan = executor.ConcolicExecutor(config, self.agent, self.my_generations)
+                self.directed_ce = executor.ConcolicExecutor(config, self.agent, self.my_generations)
             else:
-                self.symsan = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
+                self.directed_ce = executor_symsan_lib.ConcolicExecutor(config, self.agent, self.my_generations)
 
-    def sync_seed_queue(self, fp, res):
+    def _sync_seed_queue(self, fp, res):
         fn = os.path.basename(fp)
         if self.minimizer.has_closer_distance(res.distance, fn):
             self.logger.info(f"Fuzzer found closer distance={res.distance}")
         self.agent.save_trace(fn)
-
-    def update_timmer(self, res):
-        try:
-            self.state.record_time += res.total_time / utils.MILLION_SECONDS_SCALE
-        except AttributeError:
-            self.state.record_time = res.total_time / utils.MILLION_SECONDS_SCALE
 
     def update_seed_queue(self, fn):
         d = utils.get_distance_from_fn(fn)
@@ -635,6 +674,9 @@ class ReplayExecutor(Mazerunner):
     def __init__(self, config, shared_state=None, seed_scheduler=None, model=None):
         super().__init__(config, shared_state) # replay does not need seed_scheduler
         self.agent = Agent(config, model)
+
+    def _sync_seed_queue(self, fn, res):
+        pass
 
     def offline_learning(self):
         iteration_num = 1
@@ -720,8 +762,8 @@ class RLExecutor():
             if self.reached_resource_limit:    
                 self.logger.error("Reached resource limit, exiting...")
                 break
-            if self.state.target_reached:
-                self.logger.info("Target reached, exiting...")
+            if self.state.target_triggered and self.config.target_triggered_exit:
+                self.logger.info("Target triggered, exiting...")
                 break
             
             if self.config.save_frequency > 0:
@@ -731,7 +773,7 @@ class RLExecutor():
             if self.config.sync_frequency > 0:
                 if (self.seed_scheduler.is_empty() or 
                     self.state.execs % math.ceil(self.config.sync_frequency) == 0):
-                    self.synchronizer.run(run_once=True)
+                    self.synchronizer.run()
 
             if self.config.replay_frequency > 0:
                 if (self.state.execs > 0 and 
@@ -739,7 +781,7 @@ class RLExecutor():
                     repetition = math.ceil(1 / self.config.replay_frequency)
                     for _ in range(repetition):
                         self.replayer.offline_learning()
-            self.concolic_executor.run(run_once=True)
+            self.concolic_executor.run()
 
     def cleanup(self):
         self._export_state()

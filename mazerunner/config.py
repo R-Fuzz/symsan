@@ -12,11 +12,12 @@ DISK_LIMIT_SIZE = 32 * (1 << 30) # 32GB
 SYNC_FREQUENCY = 10 # sync mazerunner status with AFL every SYNC_FREQUENCY executions.
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 REPLAY_FREQUENCY = 0 # off-learning from replay buffer every REPLAY_FREQUENCY executions.
+TARGET_TRIGGERED_EXIT = False
+BUG_TRIGGER_DISTANCE = 5 * 1000 # start bug triggering after reaching this distance value
 # Solver configurations
 USE_BUILTIN_SOLVER = False
 MAX_DISTANCE = float(0x7FFFFFFFFFFFFFFF)
 NESTED_BRANCH_ENABLED = True
-GEP_SOLVER_ENABLED = False
 OPTIMISTIC_SOLVING_ENABLED = True
 # Learner configurations
 DISCOUNT_FACTOR = 1
@@ -69,6 +70,8 @@ class Config:
                  'use_ordered_dict',
                  'use_builtin_solver',
                  'defferred_solving_enabled',
+                 'target_triggered_exit',
+                 'bug_trigger_distance',
     ]
 
     def __init__(self):
@@ -127,7 +130,6 @@ class Config:
         self.logging_level = LOGGING_LEVEL
         self.max_distance = MAX_DISTANCE
         self.nested_branch_enabled = NESTED_BRANCH_ENABLED
-        self.gep_solver_enabled = GEP_SOLVER_ENABLED
         self.optimistic_solving_enabled = OPTIMISTIC_SOLVING_ENABLED
         self.discount_factor = DISCOUNT_FACTOR
         self.learning_rate = LEARNING_RATE
@@ -146,6 +148,9 @@ class Config:
         self.decimal_precision = DECIMAL_PRECISION
         self.max_branch_num = MAX_BRANCH_NUM
         self.use_builtin_solver = USE_BUILTIN_SOLVER
+        self.target_triggered_exit = TARGET_TRIGGERED_EXIT
+        self.bug_trigger_distance = BUG_TRIGGER_DISTANCE
+        self.gep_solver_enabled = False
         self.use_ordered_dict = False
         self.defferred_solving_enabled = False
         # The other configurations need to be set explicitly by config file or cmd arguments

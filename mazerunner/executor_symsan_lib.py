@@ -47,7 +47,7 @@ class ConcolicExecutor:
         self._save_seed_info = True if (type(agent) is ExploreAgent or type(agent) is ExploitAgent) else False
         utils.disable_core_dump()
 
-    def tear_down(self, deep_clean=True):
+    def tear_down(self, deep_clean=False):
         status_code, is_killed = symsan.terminate()
         self.proc_returncode = status_code if self.proc_returncode is None else self.proc_returncode
         if is_killed:

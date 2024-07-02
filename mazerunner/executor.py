@@ -100,7 +100,7 @@ class ConcolicExecutor:
             return True
         return False
 
-    def tear_down(self, deep_clean=True):
+    def tear_down(self, deep_clean=False):
         if self.pipefds:
             self._close_pipe()
         self.kill_proc()
@@ -173,7 +173,7 @@ class ConcolicExecutor:
             self.logger.critical(f"Failed to execute subprocess, error: \n{e}\n"
                                  f"Input: {self.input_file}\n"
                                  f"CMD: {' '.join(cmd)}")
-            self.tear_down(deep_clean=False)
+            self.tear_down(deep_clean=True)
             sys.exit(1)
         self.stdout_reader = ConcolicExecutor.SubprocessIOReader(self.proc.stdout)
         self.stderr_reader = ConcolicExecutor.SubprocessIOReader(self.proc.stderr)

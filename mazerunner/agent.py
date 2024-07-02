@@ -373,7 +373,7 @@ class Agent:
             )
 
 
-class RecordAgent(Agent):
+class LazyAgent(Agent):
 
     def handle_new_state(self, msg, action, is_symbranch):
         if is_symbranch:
