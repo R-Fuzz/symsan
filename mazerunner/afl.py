@@ -451,12 +451,13 @@ class ExploreExecutor(Mazerunner):
                 self.logger.warning(f"Recipe lost when trying to solve {target_sa}. Reset scheduler and processed seeds")
                 self.state.processed.clear()
                 self.agent.model.rebuild_targets(target_sa)
-            self.logger.info(f"Generated testcase for {target_sa}, status={status}")
             next_seed = new_seed if new_seed is not None else next_seed
 
         if next_seed is None:
             self.logger.info(f"Skip. Cannot solve target_sa={target_sa}, status={status}")
             return None
+        else:
+            self.logger.info(f"Generated testcase for {target_sa}, status={status}")
 
         seed_id = int(utils.get_id_from_fn(next_seed))
         if seed_id in self.state.processed:

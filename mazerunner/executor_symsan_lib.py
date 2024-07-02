@@ -148,8 +148,8 @@ class ConcolicExecutor:
             return None, None, SolvingStatus.UNSOLVED_RECIPE_MISS
         tasks, seed_id = self._recipe[target_sa].pop()
         assert seed_id in seed_map
-        solution, status = self._solve_cond_tasks(tasks)
-        solving_status = self._finalize_solving(status, solution, target_sa, seed_map, seed_id)
+        solution, solving_status = self._solve_cond_tasks(tasks)
+        self._finalize_solving(solving_status, solution, target_sa, seed_map, seed_id)
         self._processed.add(tasks)
         if solving_status not in solved_statuses:
             self.logger.debug(f"generate_testcase: failed to solve target_sa: {target_sa}")
