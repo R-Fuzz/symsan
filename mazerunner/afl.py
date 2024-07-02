@@ -435,35 +435,30 @@ class ExploreExecutor(Mazerunner):
             self.seed_scheduler.put(t_fn, (t_d, t_sa))
         return t_fn
 
-    def _generate_testcase(self, target_sa):
-        t, src, status = self.symsan.generate_testcase(target_sa, self.state.processed)
-        if t is None:
-            return None, status
-        return self._triage_testcase(t, src, save_queue=False), status
-
-    def _process_seed(self, next_seed, target_sa=None):
-        if target_sa is not None:
-            new_seed, status = self._generate_testcase(target_sa)
-            if status == SolvingStatus.UNSOLVED_RECIPE_MISS and next_seed is None:
-                self.logger.info(f"No valid recipe for {target_sa}. Skip")
-                return None
-            if status == SolvingStatus.UNSOLVED_RECIPE_LOST:
-                self.logger.warning(f"Recipe lost when trying to solve {target_sa}. Reset scheduler and processed seeds")
-                self.state.processed.clear()
-                self.agent.model.rebuild_targets(target_sa)
-            next_seed = new_seed if new_seed is not None else next_seed
-
-        if next_seed is None:
-            self.logger.info(f"Skip. Cannot solve target_sa={target_sa}, status={status}")
-            return None
-        else:
-            self.logger.info(f"Generated testcase for {target_sa}, status={status}")
-
-        seed_id = int(utils.get_id_from_fn(next_seed))
-        if seed_id in self.state.processed:
-            self.logger.debug(f"Skip. {self.state.processed[seed_id]} already processed")
+    def _get_ts_from_sa(self, target_sa):
+        if target_sa is None:
             return None
         
+        t, src, status = self.symsan.generate_testcase(target_sa, self.state.processed)
+        if status == SolvingStatus.UNSOLVED_RECIPE_MISS:
+            self.logger.info(f"No valid recipe for {target_sa}. Skip")
+            return None
+        if status == SolvingStatus.UNSOLVED_RECIPE_LOST:
+            self.logger.warning(f"Recipe lost when trying to solve {target_sa}. "
+                                f"Reset scheduler and processed seeds.")
+            self.state.processed.clear()
+            self.agent.model.rebuild_targets(target_sa)
+            return None
+        
+        if t is None:
+            self.logger.info(f"Skip. Cannot solve target_sa={target_sa}, status={status}")
+            return None
+        
+        next_seed = self._triage_testcase(t, src, save_queue=False)
+        seed_id = int(utils.get_id_from_fn(next_seed))
+        assert seed_id not in self.state.processed
+        self.logger.debug(f"Generated {next_seed} for {target_sa}, "
+                            f"status={status}. ")
         return next_seed
 
     def _run_seed(self, next_seed):
@@ -474,15 +469,19 @@ class ExploreExecutor(Mazerunner):
 
     def _run_defferred_gen(self):
         while True:
-            next_seed, target_sa = self.seed_scheduler.pop()
-            # Nothing in the queue
-            if next_seed is None and target_sa is None:
+            fuzzer_sync_seed, target_sa = self.seed_scheduler.pop()
+            if fuzzer_sync_seed is not None and target_sa is None:
+                next_seed = fuzzer_sync_seed
+                break
+            
+            if target_sa is None:
                 self.logger.info("Sleeping for getting seeds from Fuzzer")
                 time.sleep(WAITING_INTERVAL)
                 return
-
-            next_seed = self._process_seed(next_seed, target_sa)
-            if next_seed is not None:
+            
+            new_seed = self._get_ts_from_sa(target_sa)
+            if new_seed is not None:
+                next_seed = new_seed
                 break
 
         self._run_seed(next_seed)
@@ -495,11 +494,12 @@ class ExploreExecutor(Mazerunner):
                 self.logger.info("Sleeping for getting seeds from Fuzzer")
                 time.sleep(WAITING_INTERVAL)
                 return
-
-            next_seed = self._process_seed(next_seed)
-            if next_seed is not None:
-                break
-
+            seed_id = int(utils.get_id_from_fn(next_seed))
+            if seed_id in self.state.processed:
+                self.logger.debug(f"Skip. {self.state.processed[seed_id]} already processed")
+                continue
+            break
+        
         self._run_seed(next_seed)
 
     def _run(self):

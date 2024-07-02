@@ -154,6 +154,7 @@ class ConcolicExecutor:
         if solving_status not in solved_statuses:
             self.logger.debug(f"generate_testcase: failed to solve target_sa: {target_sa}")
             return None, seed_map[seed_id], solving_status
+        assert len(self.generated_files) == 1
         return self.generated_files[-1], seed_map[seed_id], solving_status
 
     # remove processed recipes

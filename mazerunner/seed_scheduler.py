@@ -100,7 +100,7 @@ class RealTimePriorityScheduler(SeedScheduler):
     def __init__(self, m, t):
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.state_seed_mapping = m
-        self.D_table = t
+        self.heap = t
         self.fuzzer_seeds = []
     
     def put(self, fn, info, from_fuzzer=False):
@@ -114,13 +114,21 @@ class RealTimePriorityScheduler(SeedScheduler):
     def pop(self):
         if self.fuzzer_seeds:
             return self.fuzzer_seeds.pop(), None
-        selected_state = self.D_table.pop()
+        
+        selected_state = self.heap.pop()
         if selected_state is None:
             return None, None
-        self.logger.debug(f"selected_state: {selected_state}, real_dis: {self.D_table[selected_state]}")
+        
+        # for realtime sovler
         if selected_state in self.state_seed_mapping:
             return self.state_seed_mapping[selected_state], selected_state
+        
+        # state = (selected_state[0], selected_state[1], selected_state[2])
+        # action = selected_state[-1]
+        # self.logger.info(f"selected_sa: {selected_state}, "
+        #   f"real_dis: {self.agent.model.get_distance(state, action)}")
+    
         return None, selected_state
     
     def is_empty(self) -> bool:
-        return not self.fuzzer_seeds and self.D_table.is_heap_empty
+        return not self.fuzzer_seeds and self.heap.is_heap_empty
