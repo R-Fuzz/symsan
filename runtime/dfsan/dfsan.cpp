@@ -727,7 +727,13 @@ SANITIZER_INTERFACE_ATTRIBUTE off_t
 taint_get_file(int fd) {
   AOUT("fd: %d\n", fd);
   AOUT("tainted.fd: %d\n", tainted.fd);
-  return tainted.fd == fd ? tainted.size : 0;
+  if (tainted.fd == fd) {
+    return tainted.size;
+  } else if (flags().force_stdin && fd == 0) {
+    return tainted.size;
+  } else {
+    return 0;
+  }
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE void
