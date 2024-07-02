@@ -407,18 +407,6 @@ class Z3Solver:
                         bs = bs * be
                     e = z3.UGT(idx * es * co, bs)  # unsigned greater than
                     status = self.__solve_expr(e)
-        # always preserve
-        r_bv = z3.BitVecVal(gmsg.index, size, self.__z3_context)
-        for off in self._dep_input_offsets:
-            c = self.__get_branch_dep(off)
-            if not c:
-                c = branch_dep_t()
-                self.__set_branch_dep(off, c)
-            if not c:
-                self.logger.warning("handle_gep: out of memory")
-            else:
-                c.input_deps.update(self._dep_input_offsets)
-                c.expr_deps.add(index_bv == r_bv)
         return status
 
     def handle_cond(self, msg: pipe_msg, should_solve: bool, s: agent.ProgramState, seed_info: str):
