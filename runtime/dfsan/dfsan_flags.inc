@@ -31,10 +31,13 @@ DFSAN_FLAG(const char *, dump_labels_at_exit, "", "The path of the file where "
                                                   "program terminates.")
 DFSAN_FLAG(const char *, taint_file, "", "The path of the file which "
                                          "will be tainted.")
+DFSAN_FLAG(const char *, taint_socket, "", "The network source which "
+                                          "will be tainted.")
 DFSAN_FLAG(const char *, union_table, "union.txt", "union table.")
 DFSAN_FLAG(int, shm_fd, -1, "shared union table.")
 DFSAN_FLAG(int, pipe_fd, -1, "communication fd.")
 DFSAN_FLAG(bool, trace_bounds, false, "trace bounds info.")
+DFSAN_FLAG(bool, exit_on_memerror, true, "terminate on memory error.")
 DFSAN_FLAG(bool, debug, false, "Print debug output.")
 DFSAN_FLAG(const char *, output_dir, ".", "The path for output file.")
 DFSAN_FLAG(int, instance_id, 0, "instance id for multi-instance fuzzing.")
