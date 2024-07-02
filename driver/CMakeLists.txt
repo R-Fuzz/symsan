@@ -24,6 +24,6 @@ endif()
 
 install (CODE "MESSAGE(STATUS \"Build & Install: libSymsanProxy.o\")")
 install (CODE "execute_process(COMMAND \
-    KO_CC=${CMAKE_C_COMPILER} ${CMAKE_INSTALL_PREFIX}/${SYMSAN_BIN_DIR}/ko-clang \
+    ${CMAKE_INSTALL_PREFIX}/${SYMSAN_BIN_DIR}/ko-clang \
     -c ${CMAKE_CURRENT_SOURCE_DIR}/harness-proxy.c \
     -o ${CMAKE_INSTALL_PREFIX}/${SYMSAN_LIB_DIR}/libSymsanProxy.o)")
