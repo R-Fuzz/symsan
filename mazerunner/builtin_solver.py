@@ -558,8 +558,6 @@ class Z3Solver:
 
     def __solve_cond(self, label: ctypes.c_uint32, r: ctypes.c_uint64,
                      s: agent.ProgramState, should_solve: bool, seed_info=''):
-        addr = s.state[0]
-        self.logger.debug(f"__solve_cond: label={label}, result={r}, addr={hex(addr)}")
         result = z3.BoolVal(r != 0, ctx=self.__z3_context)
         self._dep_input_offsets = set()
         try:

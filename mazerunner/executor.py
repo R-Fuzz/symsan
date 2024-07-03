@@ -75,7 +75,6 @@ class ConcolicExecutor:
         self.agent = agent
         self.timer = ConcolicExecutor.Timer()
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.logging_level = config.logging_level
         # resources
         self.pipefds = self.shm = self.proc = None
         self.solver = None
@@ -140,8 +139,8 @@ class ConcolicExecutor:
 
     def run(self, timeout=None):
         # create and execute the child symsan process
-        logging_level = 1 if self.logging_level == logging.DEBUG else 0
-        subprocess_io = subprocess.PIPE if self.logging_level == 1 else subprocess.DEVNULL
+        logging_level = 1 if self.config.logging_level == logging.DEBUG else 0
+        subprocess_io = subprocess.PIPE if logging_level == 1 else subprocess.DEVNULL
         cmd, stdin, _ = utils.fix_at_file(self.cmd, self.input_file)
         taint_file = "stdin" if stdin else self.input_file
         options = (f"taint_file=\"{taint_file}\""
@@ -226,7 +225,7 @@ class ConcolicExecutor:
                 pass
             elif msg.msg_type == MsgType.fini_type.value:
                 self.agent.min_distance = min(msg.result, self.agent.min_distance)
-            elif msg.msg_type == MsgType.memerr_type:
+            elif msg.msg_type == MsgType.memerr_type.value:
                 # indicate seg fault
                 self.proc.returncode = 128 + 11
             else:
@@ -261,6 +260,7 @@ class ConcolicExecutor:
             self.agent.handle_nested_unsat_condition()
         if solving_status == SolvingStatus.SOLVED_OPT_NESTED_TIMEOUT:
             self.agent.handle_nested_unsat_condition()
+        self.logger.debug(f"_process_cond_request: label={msg.label}, result={msg.result}, addr={hex(msg.addr)}, solving_status={solving_status}")
         return solving_status
 
     def _process_gep_request(self, msg):

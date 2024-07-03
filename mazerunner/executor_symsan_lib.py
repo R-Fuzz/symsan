@@ -130,7 +130,7 @@ class ConcolicExecutor:
                 pass
             elif msg.msg_type == MsgType.fini_type.value:
                 self.agent.min_distance = min(msg.result, self.agent.min_distance)
-            elif msg.msg_type == MsgType.memerr_type:
+            elif msg.msg_type == MsgType.memerr_type.value:
                 # indicate seg fault
                 self.proc_returncode = 128 + 11
             else:
@@ -237,6 +237,7 @@ class ConcolicExecutor:
         solution, status = self._solve_cond_tasks(tasks)
         self._finalize_solving(status, solution, reversed_sa)
         self._processed.add(tasks)
+        self.logger.debug(f"_process_cond_request: label={msg.label}, result={msg.result}, addr={hex(msg.addr)}, solving_status={status}")
         return status
 
     def _process_gep_request(self, msg):
