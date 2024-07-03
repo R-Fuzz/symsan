@@ -188,7 +188,6 @@ class Mazerunner:
 
     def run_file(self, fn):
         self.state.execs += 1
-        # copy the test case
         fp = os.path.join(self.my_queue, fn)
         self.logger.info("Run input: %s" % fn)
         symsan_res = self.run_target(fp)
@@ -225,12 +224,14 @@ class Mazerunner:
             return
         self.logger.debug(f"Triggering crash from {protential_seed}")
         # rerun the testcase with GEP solver
+        self.exploit_ce.config.gep_solver_enabled = True
         self.exploit_ce.setup(protential_seed)
         self.exploit_ce.run(self.state.timeout)
         try:
             self.exploit_ce.process_request()
         finally:
             self.exploit_ce.tear_down(deep_clean=False)
+        self.exploit_ce.config.gep_solver_enabled = False
         # find crashing input in the generation directory
         res = self.exploit_ce.get_result()
         for t in res.generated_testcases:
@@ -238,7 +239,8 @@ class Mazerunner:
             if not self.minimizer.is_new_file(testcase):
                 os.unlink(testcase)
                 continue
-            self.logger.debug(f"Testing generated testcase: {testcase}")
+            # TODO: For performance reasons, instead of concolic execution, 
+            # run ASAN, UBSAN or other sanitizer instrumented binary to confirm the crash
             self.exploit_ce.setup(testcase)
             self.exploit_ce.run(self.state.timeout)
             try:
