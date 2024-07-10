@@ -196,7 +196,11 @@ class Mazerunner:
         self.update_timmer(symsan_res)
         self.sync_seed_queue(fp, symsan_res)
         # CVE might be reproduced before reaching the target
-        if symsan_res.distance <= self.config.bug_trigger_distance:
+        distance_threshold = symsan_res.distance <= self.config.bug_trigger_distance
+        execution_threshold = self.state.execs > 1000
+        is_distance_zero = symsan_res.distance == 0
+        shoud_trigger_crash = (distance_threshold and execution_threshold) or is_distance_zero
+        if shoud_trigger_crash:
             self.trigger_crash(fp)
         return fp
 
@@ -222,7 +226,7 @@ class Mazerunner:
     def trigger_crash(self, protential_seed):
         if self.exploit_ce is None:
             return
-        self.logger.debug(f"Triggering crash from {protential_seed}")
+        self.logger.info(f"Try to trigger crash from {os.path.basename(protential_seed)}")
         # rerun the testcase with GEP solver
         self.exploit_ce.config.gep_solver_enabled = True
         self.exploit_ce.setup(protential_seed)
