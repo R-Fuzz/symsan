@@ -2162,14 +2162,9 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   if (ClTraceBound) {
     // set shadow for global variable
     if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Base->stripPointerCasts())) {
-      // nice thing about GEP is it still has type information
-      Type *T = I->getSourceElementType();
-      if (T->isArrayTy() || T->isStructTy()) {
-        uint64_t size = DL.getTypeAllocSize(T);
-        Value *Size = ConstantInt::get(TT.Int64Ty, size);
-        Value *Addr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
-        Bounds = IRB.CreateCall(TT.TaintTraceGlobalFn, {Addr, Size});
-      }
+      // if the base pointer is a global variable
+      // we can't get its shadow from the shadow map
+      Bounds = getShadowForGlobal(GV, IRB);
     } else {
       Bounds = getShadow(Base);
       if (TT.isZeroShadow(Bounds)) {
