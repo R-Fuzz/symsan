@@ -63,7 +63,8 @@ static off_t current_stdin_offset = 0;
 
 static inline dfsan_label get_label_for(int fd, off_t offset) {
   // check if fd is stdin, if so, the label hasn't been pre-allocated
-  if (is_stdin_taint()) return dfsan_create_label(current_stdin_offset++);
+  if (is_stdin_taint() || (fd ==0 && flags().force_stdin))
+    return dfsan_create_label(current_stdin_offset++);
   // if fd is a tainted file, the label should have been pre-allocated
   else return (offset + CONST_OFFSET);
 }
@@ -85,8 +86,10 @@ __dfsw_stat(const char *path, struct stat *buf, dfsan_label path_label,
   int ret = stat(path, buf);
   if (ret == 0) {
     dfsan_set_label(0, buf, sizeof(struct stat));
-    dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
-    dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    if (flags().trace_fsize && is_taint_file(path)) {
+      dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
+      dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    }
   }
   *ret_label = 0;
   return ret;
@@ -100,8 +103,10 @@ __dfsw___xstat(int vers, const char *path, struct stat *buf,
   int ret = __xstat(vers, path, buf);
   if (ret == 0) {
     dfsan_set_label(0, buf, sizeof(struct stat));
-    dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
-    dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    if (flags().trace_fsize && is_taint_file(path)) {
+      dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
+      dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    }
   }
   *ret_label = 0;
   return ret;
@@ -114,8 +119,10 @@ __dfsw___fxstat(int vers, const int fd, struct stat *buf,
   int ret = __fxstat(vers, fd, buf);
   if (ret == 0) {
     dfsan_set_label(0, buf, sizeof(struct stat));
-    dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
-    dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    if (flags().trace_fsize && taint_get_file(fd)) {
+      dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
+      dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    }
   }
   *ret_label = 0;
   return ret;
@@ -128,8 +135,10 @@ __dfsw___lxstat(int vers, const char *path, struct stat *buf,
   int ret = __lxstat(vers, path, buf);
   if (ret == 0) {
     dfsan_set_label(0, buf, sizeof(struct stat));
-    dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
-    dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    if (flags().trace_fsize && is_taint_file(path)) {
+      dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
+      dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    }
   }
   *ret_label = 0;
   return ret;
@@ -143,8 +152,10 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_fstat(int fd, struct stat *buf,
   int ret = fstat(fd, buf);
   if (ret == 0) {
     dfsan_set_label(0, buf, sizeof(struct stat));
-    dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
-    dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    if (flags().trace_fsize && taint_get_file(fd)) {
+      dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
+      dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    }
   }
   *ret_label = 0;
   return ret;
@@ -156,8 +167,10 @@ __dfsw_lstat(const char *path, struct stat *buf, dfsan_label path_label,
   int ret = lstat(path, buf);
   if (ret == 0) {
     dfsan_set_label(0, buf, sizeof(struct stat));
-    dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
-    dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    if (flags().trace_fsize && is_taint_file(path)) {
+      dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
+      dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    }
   }
   *ret_label = 0;
   return ret;
