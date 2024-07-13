@@ -772,6 +772,9 @@ class RLExecutor():
             if self.state.target_triggered and self.config.target_triggered_exit:
                 self.logger.info("Target triggered, exiting...")
                 break
+            if self.state.target_reached and self.config.target_reached_exit:
+                self.logger.info("Target reached, exiting...")
+                break
             
             if self.config.save_frequency > 0:
                 if self.state.execs % math.ceil(self.config.save_frequency) == 0:

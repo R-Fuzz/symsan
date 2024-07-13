@@ -12,8 +12,9 @@ DISK_LIMIT_SIZE = 32 * (1 << 30) # 32GB
 SYNC_FREQUENCY = 10 # sync mazerunner status with AFL every SYNC_FREQUENCY executions.
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 REPLAY_FREQUENCY = 0 # off-learning from replay buffer every REPLAY_FREQUENCY executions.
+TARGET_REACHED_EXIT = False
 TARGET_TRIGGERED_EXIT = False
-BUG_TRIGGER_DISTANCE = 5 * 1000 # start bug triggering after reaching this distance value
+BUG_TRIGGER_DISTANCE = 3 * 1000 # start bug triggering after reaching this distance value
 # Solver configurations
 USE_BUILTIN_SOLVER = False
 MAX_DISTANCE = float(0x7FFFFFFFFFFFFFFF)
@@ -71,6 +72,7 @@ class Config:
                  'use_builtin_solver',
                  'defferred_solving_enabled',
                  'target_triggered_exit',
+                 'target_reached_exit',
                  'bug_trigger_distance',
     ]
 
@@ -149,6 +151,7 @@ class Config:
         self.max_branch_num = MAX_BRANCH_NUM
         self.use_builtin_solver = USE_BUILTIN_SOLVER
         self.target_triggered_exit = TARGET_TRIGGERED_EXIT
+        self.target_reached_exit = TARGET_REACHED_EXIT
         self.bug_trigger_distance = BUG_TRIGGER_DISTANCE
         self.gep_solver_enabled = False
         self.use_ordered_dict = False
