@@ -37,7 +37,6 @@ class ConcolicExecutor:
         self.proc_returncode = None
         # symsan lib instance
         symsan.init(self.cmd[0])
-        self.symsan_tasks = []
         self._recipe = collections.defaultdict(list)
         self._processed = set()
         # options
@@ -65,14 +64,12 @@ class ConcolicExecutor:
                                 self.generated_files, None, None)
 
     def setup(self, input_file, session_id=0):
-        # subprocess status
-        self.proc_returncode = None
-        self.msg_num = 0
-        self._session_id = session_id
         self._input_fp = input_file
         self._input_fn = os.path.basename(input_file)
         self._input_dir = os.path.dirname(input_file)
-        self.symsan_tasks.clear()
+        self.proc_returncode = None
+        self.msg_num = 0
+        self._session_id = session_id
         self.generated_files.clear()
         self.agent.reset()
         self.timer.reset()
@@ -139,20 +136,21 @@ class ConcolicExecutor:
             self.timer.solving_time += end_time - start_time
             self.msg_num += 1
 
-    def generate_testcase(self, target_sa, seed_map):
+    def make_testcase(self, target_sa, seed_map):
+        self.generated_files.clear()
         if not self._recipe:
             return None, None, SolvingStatus.UNSOLVED_RECIPE_LOST
         self._remove_stall_recipe(target_sa)
         if not self._recipe[target_sa]:
-            self.logger.debug(f"generate_testcase: target_sa not in recipe: {target_sa}")
+            self.logger.debug(f"make_testcase: target_sa not in recipe: {target_sa}")
             return None, None, SolvingStatus.UNSOLVED_RECIPE_MISS
         tasks, seed_id = self._recipe[target_sa].pop()
         assert seed_id in seed_map
         solution, solving_status = self._solve_cond_tasks(tasks)
-        self._finalize_solving(solving_status, solution, target_sa, seed_map, seed_id)
+        self._finalize_solving(solving_status, solution, target_sa, seed_map[seed_id])
         self._processed.add(tasks)
         if solving_status not in solved_statuses:
-            self.logger.debug(f"generate_testcase: failed to solve target_sa: {target_sa}")
+            self.logger.debug(f"make_testcase: failed to solve target_sa: {target_sa}")
             return None, seed_map[seed_id], solving_status
         assert len(self.generated_files) == 1
         return self.generated_files[-1], seed_map[seed_id], solving_status
@@ -183,7 +181,7 @@ class ConcolicExecutor:
                 res.append((sol, s))
         return res
 
-    def _finalize_solving(self, status, solution, target_sa, seed_map=None, seed_id=None):
+    def _finalize_solving(self, status, solution, target_sa, src_seed):
         seed_info = ''
         if self._save_seed_info:
             reversed_sa = str(self.agent.curr_state.reversed_sa)
@@ -191,12 +189,12 @@ class ConcolicExecutor:
             seed_info = f"{score}:{reversed_sa}"
         self._handle_solving_status(status, target_sa)
         if status in solved_statuses:
-            input_buf = self._prepare_input_buffer(seed_map, seed_id)
+            input_buf = self._prepare_input_buffer(src_seed)
             self._generate_testcase(solution, seed_info, input_buf)
 
-    def _prepare_input_buffer(self, seed_map, seed_id):
-        if seed_map and seed_id:
-            src_testcase = os.path.join(self._input_dir, seed_map[seed_id])
+    def _prepare_input_buffer(self, src_seed):
+        if src_seed:
+            src_testcase = os.path.join(self._input_dir, src_seed)
             with open(src_testcase, "rb") as f:
                 return bytearray(f.read())
         return copy.copy(bytearray(self.input_content))

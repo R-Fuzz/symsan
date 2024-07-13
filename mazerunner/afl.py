@@ -487,11 +487,11 @@ class ExploreExecutor(Mazerunner):
             self.seed_scheduler.put(t_fn, (t_d, t_sa))
         return t_fn
 
-    def _get_ts_from_sa(self, target_sa):
+    def _get_tc_from_sa(self, target_sa):
         if target_sa is None:
             return None
         
-        t, src, status = self.directed_ce.generate_testcase(target_sa, self.state.processed)
+        t, src, status = self.directed_ce.make_testcase(target_sa, self.state.processed)
         if status == SolvingStatus.UNSOLVED_RECIPE_MISS:
             self.logger.info(f"No valid recipe for {target_sa}. Skip")
             return None
@@ -507,10 +507,11 @@ class ExploreExecutor(Mazerunner):
             return None
         
         next_seed = self._triage_testcase(t, src, save_queue=False)
-        seed_id = int(utils.get_id_from_fn(next_seed))
-        assert seed_id not in self.state.processed
-        self.logger.debug(f"Generated {next_seed} for {target_sa}, "
-                            f"status={status}. ")
+        if not next_seed is None:
+            seed_id = int(utils.get_id_from_fn(next_seed))
+            assert seed_id not in self.state.processed
+            self.logger.debug(f"Generated {next_seed} for {target_sa}, "
+                                f"status={status}. ")
         return next_seed
 
     def _run_seed(self, next_seed):
@@ -531,7 +532,7 @@ class ExploreExecutor(Mazerunner):
                 time.sleep(WAITING_INTERVAL)
                 return
             
-            new_seed = self._get_ts_from_sa(target_sa)
+            new_seed = self._get_tc_from_sa(target_sa)
             if new_seed is not None:
                 next_seed = new_seed
                 break
