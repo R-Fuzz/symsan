@@ -62,6 +62,7 @@ using namespace __dfsan;
 
 static bool NestedSolving = false;
 static int TraceBounds = 0;
+static int ForceStdin = 0;
 
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
@@ -271,6 +272,10 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   if (getenv("SYMSAN_TRACE_BOUNDS")) {
     TraceBounds = 1;
   }
+  // XXX: force stdin? ugly hack for aixcc
+  if (getenv("SYMSAN_FORCE_STDIN")) {
+    ForceStdin = 1;
+  }
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
     FATAL(
@@ -400,6 +405,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
     symsan_set_args(argc, data->argv);
     symsan_set_debug(DEBUG);
     symsan_set_bounds_check(TraceBounds);
+    symsan_set_force_stdin(ForceStdin);
   }
 
   // launch the symsan child process
