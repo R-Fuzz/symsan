@@ -812,6 +812,8 @@ SANITIZER_INTERFACE_ATTRIBUTE off_t
 taint_get_socket(int fd) {
   if (tainted_socket.fd == fd) {
     return tainted_socket.offset;
+  } else if (flags().force_stdin) {
+    return tainted_socket.offset;
   } else {
     return -1;
   }
