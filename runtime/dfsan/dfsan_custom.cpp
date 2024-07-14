@@ -59,6 +59,8 @@ using namespace __dfsan;
 #define DECLARE_WEAK_INTERCEPTOR_HOOK(f, ...) \
 SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE void f(__VA_ARGS__);
 
+#define AIXCC_HACK 1
+
 static off_t current_stdin_offset = 0;
 
 static inline dfsan_label get_label_for(int fd, off_t offset) {
@@ -952,7 +954,9 @@ int __dfsw_select(int nfds, fd_set *readfds, fd_set *writefds,
   if (exceptfds) {
     dfsan_set_label(0, exceptfds, sizeof(fd_set));
   }
-  dfsan_set_label(0, timeout, sizeof(struct timeval));
+  if (timeout) {
+    dfsan_set_label(0, timeout, sizeof(struct timeval));
+  }
   *ret_label = 0;
   return ret;
 }
@@ -1092,11 +1096,17 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_connect(
   return ret;
 }
 
+
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t __dfsw_recv(
     int sockfd, void *buf, size_t leng, int flags, dfsan_label sockfd_label,
     dfsan_label buf_label, dfsan_label leng_label, dfsan_label flags_label,
     dfsan_label *ret_label) {
+  internal_memset(buf, 0, leng);
   ssize_t ret = recv(sockfd, buf, leng, flags);
+#if AIXCC_HACK
+  ssize_t readed = strlen((char *)buf);
+  if (ret == 0 && readed > 0) ret = readed; // we actually readed something
+#endif
   if (ret > 0) {
     off_t offset = taint_get_socket(sockfd);
     if (offset >= 0) {
@@ -1120,7 +1130,14 @@ SANITIZER_INTERFACE_ATTRIBUTE ssize_t __dfsw_recvfrom(
     dfsan_label leng_label, dfsan_label flags_label, dfsan_label src_addr_label,
     dfsan_label addrlen_label, dfsan_label *ret_label) {
   socklen_t alen = 0;
+
+  internal_memset(buf, 0, leng);
+
   ssize_t ret = recvfrom(sockfd, buf, leng, flags, src_addr, &alen);
+#if AIXCC_HACK
+  ssize_t readed = strlen((char *)buf);
+  if (ret == 0 && readed > 0) ret = readed; // we actually readed something
+#endif
   if (ret > 0) {
     off_t offset = taint_get_socket(sockfd);
     if (offset >= 0) {
@@ -1219,7 +1236,14 @@ __dfsw_write(int fd, const void *buf, size_t count,
   }
 
   *ret_label = 0;
-  return write(fd, buf, count);
+  int ret = write(fd, buf, count);
+#if AIXCC_HACK
+  if (buf && tainted.buf && !internal_memcmp(buf, tainted.buf, count)) {
+    AOUT("Closing aixcc pipefd %d\n", fd);
+    close(fd);
+  }
+#endif
+  return ret;
 }
 
 } // extern "C"

@@ -601,6 +601,7 @@ dfsan_label dfsan_create_label(off_t offset) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __dfsan_set_label(dfsan_label label, void *addr, uptr size) {
+  if (addr == 0) return;
   for (dfsan_label *labelp = shadow_for(addr); size != 0; --size, ++labelp) {
     // Don't write the label if it is already the value we need it to be.
     // In a program where most addresses are not labeled, it is common that
