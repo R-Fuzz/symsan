@@ -181,7 +181,7 @@ class ConcolicExecutor:
                 res.append((sol, s))
         return res
 
-    def _finalize_solving(self, status, solution, target_sa, src_seed):
+    def _finalize_solving(self, status, solution, target_sa, src_seed=None):
         seed_info = ''
         if self._save_seed_info:
             reversed_sa = str(self.agent.curr_state.reversed_sa)
@@ -193,7 +193,7 @@ class ConcolicExecutor:
             self._generate_testcase(solution, seed_info, input_buf)
 
     def _prepare_input_buffer(self, src_seed):
-        if src_seed:
+        if src_seed is not None:
             src_testcase = os.path.join(self._input_dir, src_seed)
             with open(src_testcase, "rb") as f:
                 return bytearray(f.read())
