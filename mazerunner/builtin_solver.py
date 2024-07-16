@@ -599,22 +599,25 @@ class Z3Solver:
             for i in range(lb, ub, step):
                 idx = z3.BitVecVal(i, 64, self.__z3_context)
                 e = (index == idx)
-                if self.__solve_expr(e, is_gep=True):
-                    self.logger.debug(f"__solve_gep: index == {i} feasible")
+                status = self.__solve_expr(e, is_gep=True)
+                if status not in solved_statuses:
+                    self.logger.debug(f"__solve_gep: index == {i} not feasible, status={status}")
         # check feasibility for OOB, upper bound
         u = z3.BitVecVal(ub, 64, self.__z3_context)
         e = z3.UGE(index, u)
-        if self.__solve_expr(e, is_gep=True):
+        status = self.__solve_expr(e, is_gep=True)
+        if status in solved_statuses:
             self.logger.debug(f"__solve_gep: index >= {hex(ub)} solved @{hex(addr)}")
         else:
-            self.logger.debug(f"__solve_gep: index >= {hex(ub)} not possible")
+            self.logger.debug(f"__solve_gep: index >= {hex(ub)} not possible, status={status}")
         # check feasibility for OOB, lower bound
         if lb == 0:
             e = (index < 0)
         else:
             l = z3.BitVecVal(lb, 64, self.__z3_context)
             e = z3.ULT(index, l)
-        if self.__solve_expr(e, is_gep=True):
+        status = self.__solve_expr(e, is_gep=True)
+        if status in solved_statuses:
             self.logger.debug(f"__solve_gep: index < {hex(lb)} solved @{hex(addr)}")
         else:
-            self.logger.debug(f"__solve_gep: index < {hex(lb)} not possible")
+            self.logger.debug(f"__solve_gep: index < {hex(lb)} not possible, status={status}")
