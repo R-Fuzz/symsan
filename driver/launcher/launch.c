@@ -237,7 +237,7 @@ int symsan_run(int fd) {
 
   if (!g_config.symsan_env) {
     g_config.symsan_env = alloc_printf(
-        "taint_file=%s:shm_fd=%d:pipe_fd=%d:debug=%d:trace_bounds=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d",
+        "taint_file=\"%s\":shm_fd=%d:pipe_fd=%d:debug=%d:trace_bounds=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d",
         g_config.input_file, g_config.shm_fd, g_config.pipefds[1],
         g_config.enable_debug, g_config.enable_bounds_check,
         g_config.exit_on_memerror, g_config.trace_file_size,
