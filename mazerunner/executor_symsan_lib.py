@@ -10,6 +10,8 @@ from defs import *
 import utils
 from agent import ExploitAgent, ExploreAgent
 
+NEGATIVE_ONE = (1 << 32) - 1
+
 class ConcolicExecutor:
     
     class InvalidGEPMessage(Exception):
@@ -211,6 +213,9 @@ class ConcolicExecutor:
         if not msg.label:
             return SolvingStatus.UNSOLVED_INVALID_MSG
         
+        if msg.label == -1 or msg.label == NEGATIVE_ONE:
+            return SolvingStatus.UNSOLVED_INVALID_MSG
+        
         if not self.agent.is_interesting_branch():
             symsan.add_constraint(msg.label, msg.result)
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
@@ -243,11 +248,16 @@ class ConcolicExecutor:
         if len(gep_data) < ctypes.sizeof(gep_msg):
             self.logger.error(f"__process_gep_request: GEP message too small: {len(gep_data)}")
             return SolvingStatus.UNSOLVED_INVALID_MSG
+        
+        if msg.label == -1 or msg.label == NEGATIVE_ONE:
+            return SolvingStatus.UNSOLVED_INVALID_MSG
+        
         gmsg = gep_msg.from_buffer_copy(gep_data)
         if msg.label != gmsg.index_label: # Double check
             self.logger.error(f"__process_gep_request: Incorrect gep msg: {msg.label} "
                               f"vs {gmsg.index_label}")
             raise ConcolicExecutor.InvalidGEPMessage()
+        
         if self.config.gep_solver_enabled:
             tasks = tuple(symsan.parse_gep(gmsg.ptr_label, 
                              gmsg.ptr, 
