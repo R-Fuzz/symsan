@@ -89,11 +89,12 @@ class MsgType(Enum):
 
 class ExecutorResult:
     def __init__(self, total_time, solving_time, dist,
-                 returncode, msg_num, testcases, out, err):
+                 returncode, status, msg_num, testcases, out, err):
         self.total_time = total_time
         self.solving_time = solving_time
         self.distance = int(dist)
         self.returncode = returncode
+        self.exit_status = status
         self.symsan_msg_num = msg_num
         self.generated_testcases = testcases
         self.flipped_times = 0

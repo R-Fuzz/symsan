@@ -349,10 +349,12 @@ class Mazerunner:
     '''
     # TODO: handle MSAN, LSAN and custom exit codes
     def determine_crash(self, result, testcase):
-        code = result.returncode
-        if os.WIFSIGNALED(code) or (code in {128 + 11, 11, 128 + 6, 6}):
+        ret_code = result.returncode
+        exit_status = result.exit_status
+        sig_terminated = exit_status and os.WIFSIGNALED(exit_status)
+        if (sig_terminated and ret_code != 9) or (ret_code in {128 + 11, 11, 128 + 6, 6}):
             fn = os.path.basename(testcase)
-            self.logger.info(f"crash triggered at {fn}.")
+            self.logger.info(f"crash triggered at {fn}, ret_code={ret_code}")
             shutil.copy2(testcase, os.path.join(self.my_errors, fn))
             self.state.num_crash_reports += 1
             if result.distance == 0:

@@ -37,6 +37,7 @@ class ConcolicExecutor:
         self.logging_level = config.logging_level
         self.generated_files = []
         self.proc_returncode = None
+        self.proc_exit_status = None
         # symsan lib instance
         symsan.init(self.cmd[0])
         self._recipe = collections.defaultdict(list)
@@ -49,8 +50,9 @@ class ConcolicExecutor:
         utils.disable_core_dump()
 
     def tear_down(self, deep_clean=False):
-        status_code, is_killed = symsan.terminate()
-        self.proc_returncode = status_code if self.proc_returncode is None else self.proc_returncode
+        self.proc_exit_status, is_killed = symsan.terminate()
+        if os.WIFEXITED(self.proc_exit_status):
+            self.proc_returncode = os.WEXITSTATUS(self.proc_exit_status)
         if is_killed:
             self.proc_returncode = 9
         if deep_clean:
@@ -62,7 +64,7 @@ class ConcolicExecutor:
             assert not self.generated_files
         return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
                                 self.timer.solving_time, int(self.agent.min_distance),
-                                self.proc_returncode, self.msg_num, 
+                                self.proc_returncode, self.proc_exit_status,self.msg_num, 
                                 self.generated_files, None, None)
 
     def setup(self, input_file, session_id=0):
@@ -70,6 +72,7 @@ class ConcolicExecutor:
         self._input_fn = os.path.basename(input_file)
         self._input_dir = os.path.dirname(input_file)
         self.proc_returncode = None
+        self.proc_exit_status = None
         self.msg_num = 0
         self._session_id = session_id
         self.generated_files.clear()

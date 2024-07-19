@@ -1,4 +1,5 @@
 import select
+import signal
 import sys
 import os
 import fcntl
@@ -75,6 +76,7 @@ class ConcolicExecutor:
         self.agent = agent
         self.timer = ConcolicExecutor.Timer()
         self.logger = logging.getLogger(self.__class__.__qualname__)
+        self.proc_exit_status = None
         # resources
         self.pipefds = self.shm = self.proc = None
         self.solver = None
@@ -121,11 +123,16 @@ class ConcolicExecutor:
             self.proc.wait()
         self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
 
+    def handle_child_exit(self, signum, frame):
+        try:
+            _, self.proc_exit_status = os.waitpid(self.proc.pid, os.WNOHANG)
+        except Exception as e:
+            self.logger.error(f"handle_child_exit: {e}")
+        
     def get_result(self):
-        ret_code = self.proc.returncode if self.proc.returncode >= 0 else -self.proc.returncode
         return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
                             self.timer.solving_time, int(self.agent.min_distance), 
-                            ret_code, self.msg_num, 
+                            self.proc.returncode, self.proc_exit_status, self.msg_num, 
                             self.solver.generated_files, self.stdout_reader.data, self.stderr_reader.data)
 
     def setup(self, input_file, session_id=0):
@@ -134,6 +141,7 @@ class ConcolicExecutor:
         self._setup_pipe()
         self.solver = Z3Solver(self.config, self.shm, self.input_file, 
                                self.testcase_dir, 0, session_id)
+        self.proc_exit_status = None
         self.agent.reset()
         self.timer.reset()
 
@@ -175,6 +183,8 @@ class ConcolicExecutor:
                                  f"CMD: {' '.join(cmd)}")
             self.tear_down(deep_clean=True)
             sys.exit(1)
+        
+        signal.signal(signal.SIGCHLD, self.handle_child_exit)
         self.stdout_reader = ConcolicExecutor.SubprocessIOReader(self.proc.stdout)
         self.stderr_reader = ConcolicExecutor.SubprocessIOReader(self.proc.stderr)
         self.stdout_thread = threading.Thread(target=self.stdout_reader.read)
