@@ -77,6 +77,8 @@ class ConcolicExecutor:
         self.timer = ConcolicExecutor.Timer()
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.proc_exit_status = None
+        self.stdout_reader = None
+        self.stderr_reader = None
         # resources
         self.pipefds = self.shm = self.proc = None
         self.solver = None
@@ -114,8 +116,8 @@ class ConcolicExecutor:
                 pass
 
     def kill_proc(self):
-        self.stdout_reader.should_stop = True
-        self.stderr_reader.should_stop = True
+        if self.stdout_reader: self.stdout_reader.should_stop = True
+        if self.stderr_reader: self.stderr_reader.should_stop = True
         if not self.has_terminated:
             if self.proc.stdout: self.proc.stdout.close()
             if self.proc.stderr: self.proc.stderr.close()
@@ -187,10 +189,12 @@ class ConcolicExecutor:
         signal.signal(signal.SIGCHLD, self.handle_child_exit)
         self.stdout_reader = ConcolicExecutor.SubprocessIOReader(self.proc.stdout)
         self.stderr_reader = ConcolicExecutor.SubprocessIOReader(self.proc.stderr)
-        self.stdout_thread = threading.Thread(target=self.stdout_reader.read)
-        self.stderr_thread = threading.Thread(target=self.stderr_reader.read)
-        self.stdout_thread.start()
-        self.stderr_thread.start()
+        if self.config.logging_level == logging.DEBUG:
+            self.stdout_thread = threading.Thread(target=self.stdout_reader.read)
+            self.stderr_thread = threading.Thread(target=self.stderr_reader.read)
+            self.stdout_thread.start()
+            self.stderr_thread.start()
+        
         os.close(self.pipefds[1])
         self.pipefds[1] = None
 

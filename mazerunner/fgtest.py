@@ -58,7 +58,7 @@ if __name__ == "__main__":
     try:
         ce.process_request()
     finally:
-        ce.tear_down()
+        ce.tear_down(deep_clean=True)
         if "debug=1" in options:
             symsan_res = ce.get_result()
             print(
