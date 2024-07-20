@@ -444,7 +444,6 @@ class ExploreExecutor(Mazerunner):
         super().__init__(config, shared_state, seed_scheduler)
         self.agent = ExploreAgent(config, model)
         crash_config = copy.copy(config)
-        crash_config.gep_solver_enabled = True
         lazy_agent = LazyAgent(crash_config)
         if config.use_builtin_solver:
             self.directed_ce = executor.ConcolicExecutor(config, self.agent, self.my_generations)
@@ -569,7 +568,6 @@ class ExploitExecutor(Mazerunner):
         self.agent = ExploitAgent(config, model)
         self._cur_input = os.path.join(self.my_generations, ".cur_input")
         crash_config = copy.copy(config)
-        crash_config.gep_solver_enabled = True
         lazy_agent = LazyAgent(crash_config)
         if config.use_builtin_solver:
             self.directed_ce = executor.ConcolicExecutor(config, self.agent, self.my_generations)

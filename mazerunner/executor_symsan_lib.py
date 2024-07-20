@@ -82,14 +82,15 @@ class ConcolicExecutor:
     def run(self, timeout=None):
         # create and execute the child symsan process
         logging_level = 1 if self.logging_level == logging.DEBUG else 0
+        shoud_trace_bounds = 1 if self.config.gep_solver_enabled else 0
         cmd, stdin, self.input_content = utils.fix_at_file(self.cmd, self._input_fp)
         self.logger.debug("Executing %s" % ' '.join(cmd))
         
         if stdin:
-            symsan.config("stdin", args=cmd, debug=logging_level, bounds=0)
+            symsan.config("stdin", args=cmd, debug=logging_level, bounds=shoud_trace_bounds)
             symsan.run(stdin=self._input_fp)
         else:
-            symsan.config(self._input_fp, args=cmd, debug=logging_level, bounds=0)
+            symsan.config(self._input_fp, args=cmd, debug=logging_level, bounds=shoud_trace_bounds)
             symsan.run()
         symsan.reset_input([self.input_content])
 
