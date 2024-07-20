@@ -495,7 +495,7 @@ class ExploreExecutor(Mazerunner):
         
         t, src, status = self.directed_ce.make_testcase(target_sa, self.state.processed)
         if status == SolvingStatus.UNSOLVED_RECIPE_MISS:
-            self.logger.info(f"No valid recipe for {target_sa}. Skip")
+            self.logger.info(f"No valid recipe for {target_sa}. Skip...")
             return None
         if status == SolvingStatus.UNSOLVED_RECIPE_LOST:
             self.logger.warning(f"Recipe lost when trying to solve {target_sa}. "
@@ -505,7 +505,7 @@ class ExploreExecutor(Mazerunner):
             return None
         
         if t is None:
-            self.logger.info(f"Skip. Cannot solve target_sa={target_sa}, status={status}")
+            self.logger.info(f"Cannot solve target_sa={target_sa}, status={status}. Skip...")
             return None
         
         next_seed = self._triage_testcase(t, src, save_queue=False)

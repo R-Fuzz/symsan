@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from genericpath import isfile
+import re
 import sys
 import os
 import logging
@@ -30,6 +32,7 @@ if __name__ == "__main__":
     config = Config()
     config.gep_solver_enabled = True
     config.cmd = [sys.argv[1]]
+    
     if 'BIN_ARGS' in os.environ:
         xargs = os.environ['BIN_ARGS'].split(' ')
         config.cmd += xargs
@@ -42,12 +45,23 @@ if __name__ == "__main__":
         config.logging_level = logging.DEBUG
     else:
         logging.basicConfig(level=logging.INFO)
+    
     output_seed_dir = "."
     if "output_dir=" in options:
-        output_seed_dir = options.split("output_dir=")[1].split(":")[0].split(" ")[0]
+        pattern = r'output_dir=([^ \:]+)'
+        output_seed_dir = re.search(pattern, options).group(1)
+        if not os.path.isdir(output_seed_dir):
+            pattern = r'output_dir="([^"]+)"'
+            output_seed_dir = re.search(pattern, options).group(1)
+    
     if "taint_file=" not in options:
         print_usage_exit()
-    input_file = options.split("taint_file=")[1].split(":")[0].split(" ")[0]
+    pattern = r'taint_file=([^ \:]+)'
+    input_file = re.search(pattern, options).group(1)
+    if not os.path.isfile(input_file):
+        pattern = r'taint_file="([^"]+)"'
+        input_file = re.search(pattern, options).group(1)
+    
     fastgen_agent = Agent(config)
     if config.use_builtin_solver:
         ce = executor.ConcolicExecutor(config, fastgen_agent, output_seed_dir)
