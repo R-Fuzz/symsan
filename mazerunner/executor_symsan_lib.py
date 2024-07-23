@@ -1,5 +1,6 @@
 import collections
 import copy
+import shutil
 import symsan
 import os
 import ctypes
@@ -49,6 +50,10 @@ class ConcolicExecutor:
         self._save_seed_info = True if (type(agent) is ExploreAgent or type(agent) is ExploitAgent) else False
         utils.disable_core_dump()
 
+    @property
+    def cur_input(self):
+        return os.path.join(self._testcase_dir, ".cur")
+
     def tear_down(self, deep_clean=False):
         self.proc_exit_status, is_killed = symsan.terminate()
         if os.WIFEXITED(self.proc_exit_status):
@@ -71,6 +76,7 @@ class ConcolicExecutor:
         self._input_fp = input_file
         self._input_fn = os.path.basename(input_file)
         self._input_dir = os.path.dirname(input_file)
+        shutil.copy2(self._input_fp, self.cur_input)
         self.proc_returncode = None
         self.proc_exit_status = None
         self.msg_num = 0
@@ -83,14 +89,19 @@ class ConcolicExecutor:
         # create and execute the child symsan process
         logging_level = 1 if self.logging_level == logging.DEBUG else 0
         shoud_trace_bounds = 1 if self.config.gep_solver_enabled else 0
-        cmd, stdin, self.input_content = utils.fix_at_file(self.cmd, self._input_fp)
-        self.logger.debug("Executing %s" % ' '.join(cmd))
-        
+        cmd, stdin, self.input_content = utils.fix_at_file(self.cmd, self.cur_input)
+        self.logger.debug(f"Executing {' '.join(cmd)}, "
+                          f"stdin={stdin}, "
+                          f"input={self.cur_input}, "
+                          f"logging_level={logging_level}, "
+                          f"bounds={shoud_trace_bounds}")
         if stdin:
             symsan.config("stdin", args=cmd, debug=logging_level, bounds=shoud_trace_bounds)
-            symsan.run(stdin=self._input_fp)
+            symsan.reset_input([self.input_content])
+            symsan.run(stdin=self.cur_input)
         else:
-            symsan.config(self._input_fp, args=cmd, debug=logging_level, bounds=shoud_trace_bounds)
+            symsan.config(self.cur_input, args=cmd, debug=logging_level, bounds=shoud_trace_bounds)
+            symsan.reset_input([self.input_content])
             symsan.run()
         symsan.reset_input([self.input_content])
 
