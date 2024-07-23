@@ -37,6 +37,7 @@ static char **cc_params;     /* Parameters passed to the real CC  */
 static u32 cc_par_cnt = 1;   /* Param count, including argv0      */
 static u8 is_cxx = 0;
 static u8 use_native_cxx = 0;
+static u8 use_native_zlib = 1; /* Use system zlib by default */
 
 /* Try to find the executable from PATH */
 static char *find_executable_in_path(const char *filename) {
@@ -172,7 +173,7 @@ static void add_runtime() {
   cc_params[cc_par_cnt++] = "-lpthread";
   cc_params[cc_par_cnt++] = "-lm";
 
-  if (!getenv("KO_NO_NATIVE_ZLIB")) {
+  if (use_native_zlib) {
     cc_params[cc_par_cnt++] = "-lz";
   }
 
@@ -199,7 +200,7 @@ static void add_taint_pass() {
   cc_params[cc_par_cnt++] =
       alloc_printf("-taint-abilist=%s/../lib/symsan/dfsan_abilist.txt", obj_path);
 
-  if (!getenv("KO_NO_NATIVE_ZLIB")) {
+  if (use_native_zlib) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] =
         alloc_printf("-taint-abilist=%s/../lib/symsan/zlib_abilist.txt", obj_path);
@@ -249,6 +250,8 @@ static void edit_params(u32 argc, char **argv) {
 
   use_native_cxx = getenv("KO_USE_NATIVE_LIBCXX") ? 1 : 0;
 
+  use_native_zlib = getenv("KO_NO_NATIVE_ZLIB") ? 0 : 1;
+
   /* Detect stray -v calls from ./configure scripts. */
   if (argc == 1 && !strcmp(argv[1], "-v"))
     maybe_linking = 0;
@@ -270,12 +273,12 @@ static void edit_params(u32 argc, char **argv) {
     if (!strcmp(cur, "-c") || !strcmp(cur, "-S") || !strcmp(cur, "-E"))
       maybe_linking = 0;
 
-    if (!strncmp(cur, "-fsanitize=", 11))
-      continue; // doesn't work together
-  
     if (!strncmp(cur, "-fsanitize=", strlen("-fsanitize="))) {
-      continue;
+      continue; // doesn't work together
     }
+
+    if (!use_native_zlib && !strcmp(cur, "-lz"))
+      continue; // ignore -lz if we are using our own zlib
 
     if (strstr(cur, "FORTIFY_SOURCE"))
       fortify_set = 1;
