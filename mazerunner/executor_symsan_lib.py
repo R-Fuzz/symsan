@@ -103,7 +103,6 @@ class ConcolicExecutor:
             symsan.config(self.cur_input, args=cmd, debug=logging_level, bounds=shoud_trace_bounds)
             symsan.reset_input([self.input_content])
             symsan.run()
-        symsan.reset_input([self.input_content])
 
     def process_request(self):
         self.timer.solving_time = 0
