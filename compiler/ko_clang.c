@@ -240,6 +240,9 @@ static void edit_params(u32 argc, char **argv) {
     if (!strncmp(cur, "-fsanitize=", strlen("-fsanitize=")))
       continue; // doesn't work together
 
+    if (!strcmp(cur, "-lz"))
+      continue;
+
     if (strstr(cur, "FORTIFY_SOURCE"))
       fortify_set = 1;
 
