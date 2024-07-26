@@ -264,7 +264,11 @@ class ConcolicExecutor:
             reversed_sa = str(self.agent.curr_state.reversed_sa) if is_interesting else ''
             score = self.agent.compute_branch_score() if is_interesting else ''
             seed_info = f"{score}:{reversed_sa}"
-        solving_status = self.solver.handle_cond(msg, is_interesting, self.agent.curr_state, seed_info)
+        try:
+            solving_status = self.solver.handle_cond(msg, is_interesting, self.agent.curr_state, seed_info)
+        except RuntimeError as e:
+            self.logger.error(f"_process_cond_request: failed to parse cond for label {msg.label}. Error log:\n{e}")
+            return SolvingStatus.UNSOLVED_INVALID_MSG
         if not is_interesting:
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
         if solving_status == SolvingStatus.UNSOLVED_OPT_UNSAT:

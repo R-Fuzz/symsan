@@ -231,7 +231,11 @@ class ConcolicExecutor:
             return SolvingStatus.UNSOLVED_INVALID_MSG
         
         if not self.agent.is_interesting_branch():
-            symsan.add_constraint(msg.label, msg.result)
+            try:
+                symsan.add_constraint(msg.label, msg.result)
+            except RuntimeError as e:
+                self.logger.error(f"_process_cond_request: failed to add constraint for label {msg.label}. Error log:\n{e}")
+                return SolvingStatus.UNSOLVED_INVALID_MSG
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
 
         reversed_sa = self.agent.curr_state.reversed_sa
@@ -240,10 +244,17 @@ class ConcolicExecutor:
             # found one recipe that not been processed,
             # return without constructing a new recipe
             if self._recipe[reversed_sa]:
-                symsan.add_constraint(msg.label, msg.result)
+                try:
+                    symsan.add_constraint(msg.label, msg.result)
+                except RuntimeError as e:
+                    self.logger.error(f"_process_cond_request: failed to add constraint for label {msg.label}. Error log:\n{e}")
+                    return SolvingStatus.UNSOLVED_INVALID_MSG
                 return SolvingStatus.UNSOLVED_DEFERRED
-        
-        tasks = tuple(symsan.parse_cond(msg.label, msg.result, msg.flags))
+        try:
+            tasks = tuple(symsan.parse_cond(msg.label, msg.result, msg.flags))
+        except RuntimeError as e:
+            self.logger.error(f"_process_cond_request: failed to parse cond for label {msg.label}. Error log:\n{e}")
+            return SolvingStatus.UNSOLVED_INVALID_MSG
         if self.config.defferred_solving_enabled:
             input_id = utils.get_id_from_fn(self._input_fn)
             self._recipe[reversed_sa].append((tasks, input_id))
