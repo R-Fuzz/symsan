@@ -40,8 +40,9 @@ int main (int argc, char** argv) {
     return 0;
   }
 
-  char *val = new char[length];
+  char *val = new char[length + 1];
   in_file.read(val, length);
+  val[length] = '\0';
 
   if (val[0] == 'z' && val[1] == 'a' && val[2] == 'c') {
     // CHECK-GEN: Good
@@ -50,6 +51,6 @@ int main (int argc, char** argv) {
     // CHECK-ORIG: Bad
     std::cout << "Bad\n";
   }
-
+  delete[] val;
   return 0;
 }

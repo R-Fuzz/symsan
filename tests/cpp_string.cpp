@@ -28,7 +28,8 @@ int main(int argc, char **argv) {
   size_t ret;
 
   FILE* fp = chk_fopen(argv[1], "rb");
-  chk_fread(buf, 1, sizeof(buf), fp);
+  chk_fread(buf, 1, sizeof(buf) - 1, fp);
+  buf[sizeof(buf) - 1] = '\0'; 
   fclose(fp);
 
   // if (contents.substr(0, 7) == "iamback") {
