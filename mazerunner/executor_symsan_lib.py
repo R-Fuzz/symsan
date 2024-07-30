@@ -117,7 +117,7 @@ class ConcolicExecutor:
         # we don't need to check self.has_terminated here
         # because the pipe might still be readable even if the child process has terminated
         while should_handle and not self.timer.has_execution_timeout:
-            e = symsan.read_event(ctypes.sizeof(pipe_msg))
+            e = symsan.read_event(ctypes.sizeof(pipe_msg), 3 * utils.MILLION_SECONDS_SCALE)
             if len(e) < ctypes.sizeof(pipe_msg):
                 break
             start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
@@ -222,7 +222,7 @@ class ConcolicExecutor:
         return copy.copy(bytearray(self.input_content))
 
     def _process_cond_request(self, msg):
-        state_data = symsan.read_event(ctypes.sizeof(mazerunner_msg))
+        state_data = symsan.read_event(ctypes.sizeof(mazerunner_msg), 3 * utils.MILLION_SECONDS_SCALE)
         if len(state_data) < ctypes.sizeof(mazerunner_msg):
             self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
             return SolvingStatus.UNSOLVED_INVALID_MSG
@@ -275,7 +275,7 @@ class ConcolicExecutor:
         return status
 
     def _process_gep_request(self, msg):
-        gep_data = symsan.read_event(ctypes.sizeof(gep_msg))
+        gep_data = symsan.read_event(ctypes.sizeof(gep_msg), 3 * utils.MILLION_SECONDS_SCALE)
         if len(gep_data) < ctypes.sizeof(gep_msg):
             self.logger.error(f"__process_gep_request: GEP message too small: {len(gep_data)}")
             return SolvingStatus.UNSOLVED_INVALID_MSG
@@ -307,7 +307,7 @@ class ConcolicExecutor:
     def _process_memcmp_request(self, msg):
         label = msg.label
         size = msg.result
-        m = symsan.read_event(ctypes.sizeof(memcmp_msg) + size)
+        m = symsan.read_event(ctypes.sizeof(memcmp_msg) + size, 3 * utils.MILLION_SECONDS_SCALE)
         if len(m) < ctypes.sizeof(memcmp_msg) + size:
             self.logger.error("error reading memcmp msg")
             return True
