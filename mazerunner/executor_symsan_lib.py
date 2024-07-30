@@ -20,16 +20,16 @@ class ConcolicExecutor:
     
     class Timer:
         def reset(self, ts):
-            self.proc_start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
+            self.proc_start_time = (time.time() * utils.MILLI_SECONDS_SCALE)
             self.proc_end_time = self.proc_start_time
             self.solving_time = 0
             self.timeout = ts
 
         @property
         def has_execution_timeout(self):
-            curr_time = (time.time() * utils.MILLION_SECONDS_SCALE)
+            curr_time = (time.time() * utils.MILLI_SECONDS_SCALE)
             total_time = curr_time - self.proc_start_time
-            return total_time >= self.timeout * utils.MILLION_SECONDS_SCALE
+            return total_time >= self.timeout * utils.MILLI_SECONDS_SCALE
 
     def __init__(self, config, agent, output_dir):
         self.config = config
@@ -65,7 +65,7 @@ class ConcolicExecutor:
         #     self.proc_returncode = 9
         if deep_clean:
             symsan.destroy()
-        self.timer.proc_end_time = (time.time() * utils.MILLION_SECONDS_SCALE)
+        self.timer.proc_end_time = (time.time() * utils.MILLI_SECONDS_SCALE)
 
     def get_result(self):
         if self.config.defferred_solving_enabled:
@@ -117,10 +117,10 @@ class ConcolicExecutor:
         # we don't need to check self.has_terminated here
         # because the pipe might still be readable even if the child process has terminated
         while should_handle and not self.timer.has_execution_timeout:
-            e = symsan.read_event(ctypes.sizeof(pipe_msg), 3 * utils.MILLION_SECONDS_SCALE)
+            e = symsan.read_event(ctypes.sizeof(pipe_msg), 3 * utils.MILLI_SECONDS_SCALE)
             if len(e) < ctypes.sizeof(pipe_msg):
                 break
-            start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
+            start_time = (time.time() * utils.MILLI_SECONDS_SCALE)
             msg = pipe_msg.from_buffer_copy(e)
             self.logger.debug(
                 "process_request: received msg. "
@@ -154,7 +154,7 @@ class ConcolicExecutor:
                 self.proc_returncode = 128 + 11
             else:
                 self.logger.error(f"process_request: Unknown message type: {msg.msg_type}")
-            end_time = (time.time() * utils.MILLION_SECONDS_SCALE)
+            end_time = (time.time() * utils.MILLI_SECONDS_SCALE)
             self.timer.solving_time += end_time - start_time
             self.msg_num += 1
 
@@ -222,7 +222,7 @@ class ConcolicExecutor:
         return copy.copy(bytearray(self.input_content))
 
     def _process_cond_request(self, msg):
-        state_data = symsan.read_event(ctypes.sizeof(mazerunner_msg), 3 * utils.MILLION_SECONDS_SCALE)
+        state_data = symsan.read_event(ctypes.sizeof(mazerunner_msg), 3 * utils.MILLI_SECONDS_SCALE)
         if len(state_data) < ctypes.sizeof(mazerunner_msg):
             self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
             return SolvingStatus.UNSOLVED_INVALID_MSG
@@ -275,7 +275,7 @@ class ConcolicExecutor:
         return status
 
     def _process_gep_request(self, msg):
-        gep_data = symsan.read_event(ctypes.sizeof(gep_msg), 3 * utils.MILLION_SECONDS_SCALE)
+        gep_data = symsan.read_event(ctypes.sizeof(gep_msg), 3 * utils.MILLI_SECONDS_SCALE)
         if len(gep_data) < ctypes.sizeof(gep_msg):
             self.logger.error(f"__process_gep_request: GEP message too small: {len(gep_data)}")
             return SolvingStatus.UNSOLVED_INVALID_MSG
@@ -307,7 +307,7 @@ class ConcolicExecutor:
     def _process_memcmp_request(self, msg):
         label = msg.label
         size = msg.result
-        m = symsan.read_event(ctypes.sizeof(memcmp_msg) + size, 3 * utils.MILLION_SECONDS_SCALE)
+        m = symsan.read_event(ctypes.sizeof(memcmp_msg) + size, 3 * utils.MILLI_SECONDS_SCALE)
         if len(m) < ctypes.sizeof(memcmp_msg) + size:
             self.logger.error("error reading memcmp msg")
             return True

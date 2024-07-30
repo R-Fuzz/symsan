@@ -74,7 +74,7 @@ class MazerunnerState:
 
     @property
     def curr_ts(self):
-        return int(time.time() * utils.MILLION_SECONDS_SCALE - self.start_ts * utils.MILLION_SECONDS_SCALE)
+        return int(time.time() * utils.MILLI_SECONDS_SCALE - self.start_ts * utils.MILLI_SECONDS_SCALE)
     
     @property
     def best_seed(self):
@@ -277,9 +277,9 @@ class Mazerunner:
 
     def update_timmer(self, res):
         try:
-            self.state.ce_time += res.total_time / utils.MILLION_SECONDS_SCALE
+            self.state.ce_time += res.total_time / utils.MILLI_SECONDS_SCALE
         except AttributeError:
-            self.state.ce_time = res.total_time / utils.MILLION_SECONDS_SCALE
+            self.state.ce_time = res.total_time / utils.MILLI_SECONDS_SCALE
 
     def sync_from_afl(self, reversed_order=True, need_sort=False):
         files = []

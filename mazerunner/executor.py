@@ -25,16 +25,16 @@ class ConcolicExecutor:
     
     class Timer:
         def reset(self, ts):
-            self.proc_start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
+            self.proc_start_time = (time.time() * utils.MILLI_SECONDS_SCALE)
             self.proc_end_time = self.proc_start_time
             self.solving_time = 0
             self.timeout = ts
 
         @property
         def has_execution_timeout(self):
-            curr_time = (time.time() * utils.MILLION_SECONDS_SCALE)
+            curr_time = (time.time() * utils.MILLI_SECONDS_SCALE)
             total_time = curr_time - self.proc_start_time
-            return total_time >= self.timeout * utils.MILLION_SECONDS_SCALE
+            return total_time >= self.timeout * utils.MILLI_SECONDS_SCALE
         
     class SubprocessIOReader:
         def __init__(self, io):
@@ -125,7 +125,7 @@ class ConcolicExecutor:
             if self.proc.stderr: self.proc.stderr.close()
             self.proc.kill()
             self.proc.wait()
-        self.timer.proc_end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+        self.timer.proc_end_time = int(time.time() * utils.MILLI_SECONDS_SCALE)
 
     def handle_child_exit(self, signum, frame):
         try:
@@ -217,7 +217,7 @@ class ConcolicExecutor:
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
             if len(msg_data) < ctypes.sizeof(pipe_msg):
                 break
-            start_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            start_time = int(time.time() * utils.MILLI_SECONDS_SCALE)
             msg = pipe_msg.from_buffer_copy(msg_data)
             self.logger.debug(
                 "process_request: received msg. "
@@ -249,7 +249,7 @@ class ConcolicExecutor:
                 self.proc.returncode = 128 + 11
             else:
                 self.logger.error(f"process_request: Unknown message type: {msg.msg_type}")
-            end_time = int(time.time() * utils.MILLION_SECONDS_SCALE)
+            end_time = int(time.time() * utils.MILLI_SECONDS_SCALE)
             self.timer.solving_time += end_time - start_time
             self.msg_num += 1
 
