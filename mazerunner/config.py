@@ -6,8 +6,8 @@ import logging
 from model import RLModelType
 
 LOGGING_LEVEL = logging.INFO
-MEMORY_LIMIT_PERCENTAGE = 85
-DISK_LIMIT_SIZE = 32 * (1 << 30) # 32GB
+MEMORY_LIMIT_SIZE = 15 * (1 << 30) # 15GB
+DISK_LIMIT_SIZE = 1 * (1 << 30) # 1GB
 # set FREQUENCY to 0 if you want to disable the feature
 SYNC_FREQUENCY = 10 # sync mazerunner status with AFL every SYNC_FREQUENCY executions.
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
@@ -144,7 +144,7 @@ class Config:
         self.max_crash_reports = MAX_CRASH_REPORTS
         self.max_flip_num = MAX_FLIP_NUM
         self.min_hang_files = MIN_HANG_FILES
-        self.memory_limit = MEMORY_LIMIT_PERCENTAGE
+        self.memory_limit = MEMORY_LIMIT_SIZE
         self.disk_limit = DISK_LIMIT_SIZE
         self.save_frequency = SAVE_FREQUENCY
         self.decimal_precision = DECIMAL_PRECISION

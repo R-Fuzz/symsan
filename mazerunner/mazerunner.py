@@ -22,13 +22,12 @@ def monitor_disk(termination_event, interval, dir_path, disk_limit):
         time.sleep(interval)
 
 def monitor_memory(termination_event, interval, memory_limit):
-    total_memory = psutil.virtual_memory().total # in bytes
     process = psutil.Process(os.getpid())
     while not termination_event.is_set():
         process_memory = process.memory_info().rss  # in bytes
-        percent_memory_used = (process_memory / total_memory) * 100
-        if percent_memory_used > memory_limit:
-            print(f"Memory usage is {percent_memory_used}% - terminating")
+        print(f"Memory usage is {int(process_memory/1000)}KB")
+        if process_memory > memory_limit:
+            print(f"Out of memory - terminating")
             termination_event.set()
         time.sleep(interval)
 
@@ -84,15 +83,15 @@ def main():
         raise ValueError(f"unknown agent type {config.agent_type}")
     
     if args.resource_monitor_enabled:
-        # Start a background thread to check memory usage every 10 minutes
+        # Start a background thread to check memory usage every minute
         memory_termination_event = threading.Event()
         memory_monitor = threading.Thread(target=monitor_memory, 
-                                        args=(memory_termination_event, 10*60, config.memory_limit))
+                                        args=(memory_termination_event, 1*60, config.memory_limit))
         memory_monitor.start()
-        # Start a background thread to check disk usage every 10 minutes
+        # Start a background thread to check disk usage every minute
         disk_termination_event = threading.Event()
         disk_monitor = threading.Thread(target=monitor_disk, 
-                                        args=(disk_termination_event, 10*60, 
+                                        args=(disk_termination_event, 1*60, 
                                             config.mazerunner_dir, config.disk_limit))
         disk_monitor.start()
         e.check_resource_limit = lambda: (memory_termination_event.is_set() 
