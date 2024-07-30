@@ -19,15 +19,17 @@ class ConcolicExecutor:
         pass
     
     class Timer:
-        def reset(self):
+        def reset(self, ts):
             self.proc_start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             self.proc_end_time = self.proc_start_time
             self.solving_time = 0
+            self.timeout = ts
 
-        def execution_timeout(self, timeout):
+        @property
+        def has_execution_timeout(self):
             curr_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             total_time = curr_time - self.proc_start_time
-            return total_time >= timeout * utils.MILLION_SECONDS_SCALE
+            return total_time >= self.timeout * utils.MILLION_SECONDS_SCALE
 
     def __init__(self, config, agent, output_dir):
         self.config = config
@@ -83,9 +85,10 @@ class ConcolicExecutor:
         self._session_id = session_id
         self.generated_files.clear()
         self.agent.reset()
-        self.timer.reset()
+        self.timer.reset(self.config.timeout)
 
     def run(self, timeout=None):
+        self.timer.timeout = timeout if timeout else self.config.timeout
         # create and execute the child symsan process
         logging_level = 1 if self.logging_level == logging.DEBUG else 0
         shoud_trace_bounds = 1 if self.config.gep_solver_enabled else 0
@@ -110,7 +113,7 @@ class ConcolicExecutor:
         self.msg_num = 0
         # we don't need to check self.has_terminated here
         # because the pipe might still be readable even if the child process has terminated
-        while should_handle:
+        while should_handle and not self.timer.has_execution_timeout:
             e = symsan.read_event(ctypes.sizeof(pipe_msg))
             if len(e) < ctypes.sizeof(pipe_msg):
                 break

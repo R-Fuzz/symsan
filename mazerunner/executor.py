@@ -24,15 +24,17 @@ class ConcolicExecutor:
         pass
     
     class Timer:
-        def reset(self):
+        def reset(self, ts):
             self.proc_start_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             self.proc_end_time = self.proc_start_time
             self.solving_time = 0
+            self.timeout = ts
 
-        def execution_timeout(self, timeout):
+        @property
+        def has_execution_timeout(self):
             curr_time = (time.time() * utils.MILLION_SECONDS_SCALE)
             total_time = curr_time - self.proc_start_time
-            return total_time >= timeout * utils.MILLION_SECONDS_SCALE
+            return total_time >= self.timeout * utils.MILLION_SECONDS_SCALE
         
     class SubprocessIOReader:
         def __init__(self, io):
@@ -145,7 +147,7 @@ class ConcolicExecutor:
                                self.testcase_dir, 0, session_id)
         self.proc_exit_status = None
         self.agent.reset()
-        self.timer.reset()
+        self.timer.reset(self.config.timeout)
 
     def run(self, timeout=None):
         # create and execute the child symsan process
@@ -162,6 +164,7 @@ class ConcolicExecutor:
         current_env = os.environ.copy()
         current_env["TAINT_OPTIONS"] = options
         if timeout:
+            self.timer.timeout = timeout
             cmd = ["timeout", "-k", str(1), str(int(timeout))] + cmd
         try:
             self.logger.debug("Executing %s" % ' '.join(cmd))
@@ -205,7 +208,7 @@ class ConcolicExecutor:
         self.msg_num = 0
         # we don't need to check self.has_terminated here
         # because the pipe might still be readable even if the child process has terminated
-        while should_handle:
+        while should_handle and not self.timer.has_execution_timeout:
             readable, _, _ = select.select([self.pipefds[0]], [], [], 3)
             if not readable:
                 self.logger.info("process_request: pipe is broken, stop processing.")
