@@ -336,9 +336,12 @@ class Mazerunner:
         if len(self.state.hang) > self.config.min_hang_files:
             if self.state.increase_timeout(self.logger, self.config.max_timeout):
                 for fn in self.state.hang:
+                    self.logger.info(f"Adding hang file {fn} back to queue")
                     d = utils.get_distance_from_fn(fn)
                     d = self.config.max_distance if d is None else d
-                    self.seed_scheduler.put(fn, (d, ''))
+                    self.seed_scheduler.put(fn, (d, ''), from_fuzzer=True)
+                    seed_id = int(utils.get_id_from_fn(fn))
+                    if seed_id in self.state.processed: del self.state.processed[seed_id]
                 self.state.hang.clear()
 
     '''    
@@ -529,6 +532,9 @@ class ExploreExecutor(Mazerunner):
                 break
             
             if target_sa is None:
+                if self.state.hang:
+                    self.handle_hang_files()
+                    continue
                 self.logger.info("Sleeping for getting seeds from Fuzzer")
                 time.sleep(WAITING_INTERVAL)
                 return
@@ -545,6 +551,9 @@ class ExploreExecutor(Mazerunner):
             next_seed, _ = self.seed_scheduler.pop()
             # Nothing in the queue
             if next_seed is None:
+                if self.state.hang:
+                    self.handle_hang_files()
+                    continue
                 self.logger.info("Sleeping for getting seeds from Fuzzer")
                 time.sleep(WAITING_INTERVAL)
                 return
