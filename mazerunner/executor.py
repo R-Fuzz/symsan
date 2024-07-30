@@ -134,9 +134,10 @@ class ConcolicExecutor:
             self.logger.error(f"handle_child_exit: {e}")
         
     def get_result(self):
+        ret_code = 9 if self.timer.has_execution_timeout else self.proc.returncode
         return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
                             self.timer.solving_time, int(self.agent.min_distance), 
-                            self.proc.returncode, self.proc_exit_status, self.msg_num, 
+                            ret_code, self.proc_exit_status, self.msg_num, 
                             self.solver.generated_files, self.stdout_reader.data, self.stderr_reader.data)
 
     def setup(self, input_file, session_id=0):

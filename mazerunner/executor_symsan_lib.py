@@ -58,10 +58,11 @@ class ConcolicExecutor:
 
     def tear_down(self, deep_clean=False):
         self.proc_exit_status, is_killed = symsan.terminate()
-        if os.WIFEXITED(self.proc_exit_status):
-            self.proc_returncode = os.WEXITSTATUS(self.proc_exit_status)
-        if is_killed:
-            self.proc_returncode = 9
+        # TODO: enable this once symsan lib can detect process hang
+        # if os.WIFEXITED(self.proc_exit_status):
+        #     self.proc_returncode = os.WEXITSTATUS(self.proc_exit_status)
+        # if is_killed:
+        #     self.proc_returncode = 9
         if deep_clean:
             symsan.destroy()
         self.timer.proc_end_time = (time.time() * utils.MILLION_SECONDS_SCALE)
@@ -69,6 +70,8 @@ class ConcolicExecutor:
     def get_result(self):
         if self.config.defferred_solving_enabled:
             assert not self.generated_files
+        if self.timer.has_execution_timeout:
+            self.proc_returncode = 9
         return ExecutorResult(self.timer.proc_end_time - self.timer.proc_start_time, 
                                 self.timer.solving_time, int(self.agent.min_distance),
                                 self.proc_returncode, self.proc_exit_status,self.msg_num, 
