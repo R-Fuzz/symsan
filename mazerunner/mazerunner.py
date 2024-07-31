@@ -94,8 +94,8 @@ def main():
                                         args=(disk_termination_event, 1*60, 
                                             config.mazerunner_dir, config.disk_limit))
         disk_monitor.start()
-        e.check_resource_limit = lambda: (memory_termination_event.is_set() 
-                                                or disk_termination_event.is_set())
+        e.memory_termination_event = memory_termination_event
+        e.disk_termination_event = disk_termination_event
 
     for sig in (signal.SIGABRT, signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, e.signal_handler)

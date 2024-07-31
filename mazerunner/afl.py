@@ -720,9 +720,9 @@ class RLExecutor():
     def __init__(self, config, agent_type):
         self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        # check_resource_limit returns a flag that controlled by another monitor thread
         self.my_dir = config.mazerunner_dir
-        self.check_resource_limit = lambda: False
+        self.memory_termination_event = None
+        self.disk_termination_event = None
         # All executors share the same state and All agents share the same model
         self._import_state()
         self.replayer = ReplayExecutor(config, self.state)
@@ -771,7 +771,9 @@ class RLExecutor():
 
     @property
     def reached_resource_limit(self):
-        return self.check_resource_limit()
+        if self.memory_termination_event and self.disk_termination_event:
+            return self.memory_termination_event.is_set() or self.disk_termination_event.is_set()
+        return False
 
     def run(self):
         while True:
@@ -807,6 +809,9 @@ class RLExecutor():
         self.replayer.cleanup()
         self.concolic_executor.cleanup()
         self.synchronizer.cleanup()
+        if self.memory_termination_event and self.disk_termination_event:
+            self.memory_termination_event.set()
+            self.disk_termination_event.set()
 
     def signal_handler(self, signum, frame):
         self.logger.info(f"Received signal {signum}, cleaning up...")
