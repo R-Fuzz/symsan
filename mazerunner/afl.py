@@ -380,11 +380,6 @@ class Mazerunner:
         if not self.exploit_ce is None:
             self.exploit_ce.tear_down(deep_clean=True)
 
-    def signal_handler(self, signum, frame):
-        self.logger.info(f"Received signal {signum}, cleaning up...")
-        self.cleanup()
-        sys.exit(signum)
-
     def export_state(self):
         self.state.end_ts = time.time()
         with open(self.metadata, "wb") as fp:
@@ -819,14 +814,6 @@ class RLExecutor():
         self.replayer.cleanup()
         self.concolic_executor.cleanup()
         self.synchronizer.cleanup()
-        if self.memory_termination_event and self.disk_termination_event:
-            self.memory_termination_event.set()
-            self.disk_termination_event.set()
-
-    def signal_handler(self, signum, frame):
-        self.logger.info(f"Received signal {signum}, cleaning up...")
-        self.cleanup()
-        sys.exit(signum)
 
     def _import_state(self):
         if os.path.exists(self.metadata):

@@ -19,7 +19,7 @@ def monitor_disk(termination_event, interval, dir_path, disk_limit):
         if folder_size > disk_limit:
             print(f"Disk usage is {folder_size / 2**30}GB - terminating")
             termination_event.set()
-        time.sleep(interval)
+        termination_event.wait(interval)
 
 def monitor_memory(termination_event, interval, memory_limit):
     process = psutil.Process(os.getpid())
@@ -29,7 +29,7 @@ def monitor_memory(termination_event, interval, memory_limit):
         if process_memory > memory_limit:
             print(f"Out of memory - terminating")
             termination_event.set()
-        time.sleep(interval)
+        termination_event.wait(interval)
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -88,26 +88,34 @@ def main():
         memory_monitor = threading.Thread(target=monitor_memory, 
                                         args=(memory_termination_event, 1*60, config.memory_limit))
         memory_monitor.start()
-        # Start a background thread to check disk usage every minute
+        # Start a background thread to check disk usage every 10 minute
         disk_termination_event = threading.Event()
         disk_monitor = threading.Thread(target=monitor_disk, 
-                                        args=(disk_termination_event, 1*60, 
+                                        args=(disk_termination_event, 10*60, 
                                             config.mazerunner_dir, config.disk_limit))
         disk_monitor.start()
         e.memory_termination_event = memory_termination_event
         e.disk_termination_event = disk_termination_event
-
-    for sig in (signal.SIGABRT, signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, e.signal_handler)
-    try:
-        e.run()
-    finally:
-        e.cleanup()
+    
+    def close_monitors():
         if args.resource_monitor_enabled:
             memory_termination_event.set()
             disk_termination_event.set()
             memory_monitor.join()
             disk_monitor.join()
 
+    def signal_handler(signum, frame):
+        logging.info(f"Received signal {signum}, cleaning up...")
+        e.cleanup()
+        close_monitors()
+        sys.exit(signum)
+
+    for sig in (signal.SIGABRT, signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal_handler)
+    try:
+        e.run()
+    finally:
+        e.cleanup()
+        close_monitors()
 if __name__ == "__main__":
     main()
