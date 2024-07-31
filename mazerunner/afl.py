@@ -280,6 +280,11 @@ class Mazerunner:
         sync_fp = os.path.join(self.my_sync_queue, os.path.basename(new_fp))
         try:
             os.link(new_fp, sync_fp)
+        except FileExistsError:
+            os.unlink(sync_fp)
+            os.link(new_fp, sync_fp)
+        except FileNotFoundError:
+            pass
         except:
             shutil.copy2(new_fp, sync_fp)
         return new_fp
