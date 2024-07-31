@@ -56,14 +56,19 @@ def run_command(cmd, testcase):
     return p.communicate(stdin.encode())
 
 def get_folder_size(dir_path):
-    total = 0
-    with os.scandir(dir_path) as it:
-        for entry in it:
-            if entry.is_file():
-                total += entry.stat().st_size
-            elif entry.is_dir():
-                total += get_folder_size(entry.path)
-    return total
+    total_size = 0
+    seen_inodes = set()
+    for dirpath, dirnames, filenames in os.walk(dir_path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            try:
+                stat = os.stat(fp)
+                if stat.st_ino not in seen_inodes:
+                    seen_inodes.add(stat.st_ino)
+                    total_size += stat.st_size
+            except:
+                continue
+    return total_size
 
 def find_local_min(nums):
     assert nums
