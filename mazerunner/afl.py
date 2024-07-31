@@ -157,6 +157,10 @@ class Mazerunner:
 
     @property
     def my_queue(self):
+        return os.path.join(self.my_dir, "seeds")
+
+    @property
+    def my_sync_queue(self):
         return os.path.join(self.my_dir, "queue")
 
     @property
@@ -273,6 +277,11 @@ class Mazerunner:
             new_fp = new_fp.replace('time:', 'ts:')
         if new_fp != fp:
             shutil.move(fp, new_fp)
+        sync_fp = os.path.join(self.my_sync_queue, os.path.basename(new_fp))
+        try:
+            os.link(new_fp, sync_fp)
+        except:
+            shutil.copy2(new_fp, sync_fp)
         return new_fp
 
     def update_timmer(self, res):
@@ -384,6 +393,7 @@ class Mazerunner:
 
     def _make_dirs(self):
         utils.mkdir(self.my_queue)
+        utils.mkdir(self.my_sync_queue)
         utils.mkdir(self.my_hangs)
         utils.mkdir(self.my_errors)
         utils.mkdir(self.my_generations)
