@@ -12,6 +12,7 @@ import utils
 from agent import ExploitAgent, ExploreAgent
 
 NEGATIVE_ONE = (1 << 32) - 1
+PIPE_TIMEOUT = 50 # milliseconds
 
 class ConcolicExecutor:
     
@@ -117,8 +118,13 @@ class ConcolicExecutor:
         # we don't need to check self.has_terminated here
         # because the pipe might still be readable even if the child process has terminated
         while should_handle and not self.timer.has_execution_timeout:
-            e = symsan.read_event(ctypes.sizeof(pipe_msg), 3 * utils.MILLI_SECONDS_SCALE)
+            try:
+                e = symsan.read_event(ctypes.sizeof(pipe_msg), PIPE_TIMEOUT)
+            except OSError:
+                self.logger.info("process_request: pipe reading timeout, stop processing.")
+                break
             if len(e) < ctypes.sizeof(pipe_msg):
+                self.logger.info("process_request: pipe is broken, stop processing.")
                 break
             start_time = (time.time() * utils.MILLI_SECONDS_SCALE)
             msg = pipe_msg.from_buffer_copy(e)
@@ -143,8 +149,7 @@ class ConcolicExecutor:
                 self._process_gep_request(msg)
             # msg.flags == 1 means there is additional data need to be processed
             elif msg.msg_type == MsgType.memcmp_type.value and msg.flags == 1:
-                has_error = self._process_memcmp_request(msg)
-                if has_error: should_handle = False
+                self._process_memcmp_request(msg)
             elif msg.msg_type == MsgType.fsize_type.value:
                 pass
             elif msg.msg_type == MsgType.fini_type.value:
@@ -222,7 +227,11 @@ class ConcolicExecutor:
         return copy.copy(bytearray(self.input_content))
 
     def _process_cond_request(self, msg):
-        state_data = symsan.read_event(ctypes.sizeof(mazerunner_msg), 3 * utils.MILLI_SECONDS_SCALE)
+        try:
+            state_data = symsan.read_event(ctypes.sizeof(mazerunner_msg), PIPE_TIMEOUT)
+        except OSError:
+            self.logger.info("_process_cond_request: pipe reading timeout, skipping.")
+            return SolvingStatus.UNSOLVED_TIMEOUT
         if len(state_data) < ctypes.sizeof(mazerunner_msg):
             self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
             return SolvingStatus.UNSOLVED_INVALID_MSG
@@ -275,7 +284,11 @@ class ConcolicExecutor:
         return status
 
     def _process_gep_request(self, msg):
-        gep_data = symsan.read_event(ctypes.sizeof(gep_msg), 3 * utils.MILLI_SECONDS_SCALE)
+        try:
+            gep_data = symsan.read_event(ctypes.sizeof(gep_msg), PIPE_TIMEOUT)
+        except OSError:
+            self.logger.info("_process_gep_request: pipe reading timeout, skipping.")
+            return SolvingStatus.UNSOLVED_TIMEOUT
         if len(gep_data) < ctypes.sizeof(gep_msg):
             self.logger.error(f"__process_gep_request: GEP message too small: {len(gep_data)}")
             return SolvingStatus.UNSOLVED_INVALID_MSG
@@ -307,18 +320,21 @@ class ConcolicExecutor:
     def _process_memcmp_request(self, msg):
         label = msg.label
         size = msg.result
-        m = symsan.read_event(ctypes.sizeof(memcmp_msg) + size, 3 * utils.MILLI_SECONDS_SCALE)
+        try:
+            m = symsan.read_event(ctypes.sizeof(memcmp_msg) + size, PIPE_TIMEOUT)
+        except OSError:
+            self.logger.info("_process_memcmp_request: pipe reading timeout, skipping.")
+            return
         if len(m) < ctypes.sizeof(memcmp_msg) + size:
             self.logger.error("error reading memcmp msg")
-            return True
+            return
         buf = memcmp_msg.from_buffer_copy(m)
         if buf.label != label:
             self.logger.error("error reading memcmp msg")
-            return True
+            return
         buf.content = m[ctypes.sizeof(memcmp_msg):]
         self.logger.debug(f"memcmp content: {buf.content.hex()}")
         symsan.record_memcmp(label, buf.content)     
-        return False
 
     def _generate_testcase(self, solution, seed_info, input_buf):
         changed_index = set()

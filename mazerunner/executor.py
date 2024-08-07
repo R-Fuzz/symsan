@@ -17,6 +17,7 @@ from agent import ExploitAgent, ExploreAgent
 
 UNION_TABLE_SIZE = 0xc00000000
 PIPE_CAPACITY = 4 * 1024 * 1024
+PIPE_TIMEOUT = 0.1 # seconds
 
 class ConcolicExecutor:
     
@@ -210,9 +211,9 @@ class ConcolicExecutor:
         # we don't need to check self.has_terminated here
         # because the pipe might still be readable even if the child process has terminated
         while should_handle and not self.timer.has_execution_timeout:
-            readable, _, _ = select.select([self.pipefds[0]], [], [], 3)
+            readable, _, _ = select.select([self.pipefds[0]], [], [], PIPE_TIMEOUT)
             if not readable:
-                self.logger.info("process_request: pipe is broken, stop processing.")
+                self.logger.info("process_request: pipe reading timeout, stop processing.")
                 break
             msg_data = os.read(self.pipefds[0], ctypes.sizeof(pipe_msg))
             if len(msg_data) < ctypes.sizeof(pipe_msg):
@@ -254,6 +255,10 @@ class ConcolicExecutor:
             self.msg_num += 1
 
     def _process_cond_request(self, msg):
+        readable, _, _ = select.select([self.pipefds[0]], [], [], PIPE_TIMEOUT)
+        if not readable:
+            self.logger.info("_process_cond_request: pipe reading timeout, stop processing.")
+            return SolvingStatus.UNSOLVED_TIMEOUT
         state_data = os.read(self.pipefds[0], ctypes.sizeof(mazerunner_msg))
         if len(state_data) < ctypes.sizeof(mazerunner_msg):
             self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
@@ -287,6 +292,10 @@ class ConcolicExecutor:
         return solving_status
 
     def _process_gep_request(self, msg):
+        readable, _, _ = select.select([self.pipefds[0]], [], [], PIPE_TIMEOUT)
+        if not readable:
+            self.logger.info("_process_gep_request: pipe reading timeout, stop processing.")
+            return SolvingStatus.UNSOLVED_TIMEOUT
         gep_data = os.read(self.pipefds[0], ctypes.sizeof(gep_msg))
         if len(gep_data) < ctypes.sizeof(gep_msg):
             self.logger.error(f"__process_gep_request: GEP message too small: {len(gep_data)}")

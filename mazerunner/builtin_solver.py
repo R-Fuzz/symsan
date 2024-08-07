@@ -1,6 +1,7 @@
 import copy
 import os
 import ctypes
+import select
 import z3
 import logging
 from enum import Enum
@@ -416,6 +417,10 @@ class Z3Solver:
         info = get_label_info(msg.label, self.shm)
         # if both operands are symbolic, no content to be read
         if info.l1 != CONST_LABEL and info.l2 != CONST_LABEL:
+            return
+        readable, _, _ = select.select([pipe], [], [], 0.1)
+        if not readable:
+            self.logger.info("handle_memcmp: pipe is broken, nothing to read.")
             return
         memcmp_data = os.read(pipe, ctypes.sizeof(memcmp_msg) + msg.result)
         mmsg = memcmp_msg.from_buffer_copy(memcmp_data)
