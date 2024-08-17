@@ -203,7 +203,6 @@ class RLModel(abc.ABC):
         value = initial_distances[a] if initial_distances else None
         value = self.config.max_distance if value is None else value
         self.logger.debug(f"get_default_distance: bid={bid}, action={a}, value={value}")
-        value += (s.state[2] - 1) * DISTANCE_SCALE
         return value
 
     def add_unreachable_sa(self, sa):
