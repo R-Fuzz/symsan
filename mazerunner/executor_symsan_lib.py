@@ -165,11 +165,10 @@ class ConcolicExecutor:
 
     def make_testcase(self, target_sa, seed_map):
         self.generated_files.clear()
-        if not self._recipe:
+        if len(self._recipe) == 0:
             return None, None, SolvingStatus.UNSOLVED_RECIPE_LOST
         self._remove_stall_recipe(target_sa)
         if not self._recipe[target_sa]:
-            self.logger.debug(f"make_testcase: target_sa not in recipe: {target_sa}")
             return None, None, SolvingStatus.UNSOLVED_RECIPE_MISS
         tasks, seed_id = self._recipe[target_sa].pop()
         assert seed_id in seed_map
@@ -182,7 +181,6 @@ class ConcolicExecutor:
         assert len(self.generated_files) == 1
         return self.generated_files[-1], seed_map[seed_id], solving_status
 
-    # remove processed recipes
     def _remove_stall_recipe(self, target_sa):
         while self._recipe[target_sa]:
             tasks, _ = self._recipe[target_sa][-1]
@@ -211,9 +209,8 @@ class ConcolicExecutor:
     def _finalize_solving(self, status, solution, target_sa, src_seed=None):
         seed_info = ''
         if self._save_seed_info:
-            reversed_sa = str(self.agent.curr_state.reversed_sa)
             score = self.agent.compute_branch_score()
-            seed_info = f"{score}:{reversed_sa}"
+            seed_info = f"{score}:{target_sa}"
         self._handle_solving_status(status, target_sa)
         if status in solved_statuses:
             input_buf = self._prepare_input_buffer(src_seed)
@@ -232,19 +229,18 @@ class ConcolicExecutor:
         except OSError:
             self.logger.info("_process_cond_request: pipe reading timeout, skipping.")
             return SolvingStatus.UNSOLVED_TIMEOUT
+
         if len(state_data) < ctypes.sizeof(mazerunner_msg):
-            self.logger.error(f"__process_cond_request: mazerunner_msg too small: {len(state_data)}")
+            self.logger.error(f"_process_cond_request: mazerunner_msg too small: {len(state_data)}")
             return SolvingStatus.UNSOLVED_INVALID_MSG
 
         state_msg = mazerunner_msg.from_buffer_copy(state_data)
         self.agent.handle_new_state(state_msg, msg.result, msg.label)
-        
-        if not msg.label:
+        reversed_sa = self.agent.curr_state.reversed_sa
+
+        if not msg.label or msg.label in {-1, NEGATIVE_ONE}:
             return SolvingStatus.UNSOLVED_INVALID_MSG
-        
-        if msg.label == -1 or msg.label == NEGATIVE_ONE:
-            return SolvingStatus.UNSOLVED_INVALID_MSG
-        
+
         if not self.agent.is_interesting_branch():
             try:
                 symsan.add_constraint(msg.label, msg.result)
@@ -253,28 +249,31 @@ class ConcolicExecutor:
                 return SolvingStatus.UNSOLVED_INVALID_MSG
             return SolvingStatus.UNSOLVED_UNINTERESTING_COND
 
-        reversed_sa = self.agent.curr_state.reversed_sa
         if self.config.defferred_solving_enabled:
             self._remove_stall_recipe(reversed_sa)
             # found one recipe that not been processed,
             # return without constructing a new recipe
-            if self._recipe[reversed_sa]:
-                try:
-                    symsan.add_constraint(msg.label, msg.result)
-                except RuntimeError as e:
-                    self.logger.error(f"_process_cond_request: failed to add constraint for label {msg.label}. Error log:\n{e}")
-                    return SolvingStatus.UNSOLVED_INVALID_MSG
-                return SolvingStatus.UNSOLVED_DEFERRED
+            # TODO: bring it back if solver is reliable
+            # if self._recipe[reversed_sa]:
+            #     try:
+            #         symsan.add_constraint(msg.label, msg.result)
+            #     except RuntimeError as e:
+            #         self.logger.error(f"_process_cond_request: failed to add constraint for label {msg.label}. Error log:\n{e}")
+            #         return SolvingStatus.UNSOLVED_INVALID_MSG
+            #     return SolvingStatus.UNSOLVED_DEFERRED
+
         try:
             tasks = tuple(symsan.parse_cond(msg.label, msg.result, msg.flags))
         except RuntimeError as e:
             self.logger.error(f"_process_cond_request: failed to parse cond for label {msg.label}. Error log:\n{e}")
             return SolvingStatus.UNSOLVED_INVALID_MSG
+
         if self.config.defferred_solving_enabled:
             input_id = utils.get_id_from_fn(self._input_fn)
             self._recipe[reversed_sa].append((tasks, input_id))
             for state in self.agent.episode:
                 self._recipe[state.sa].append((tasks, input_id))
+            self.logger.debug(f"_process_cond_request: deferred solve protential sa={reversed_sa}")
             return SolvingStatus.UNSOLVED_DEFERRED
 
         solution, status = self._solve_cond_tasks(tasks)

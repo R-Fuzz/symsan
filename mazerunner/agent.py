@@ -364,7 +364,7 @@ class Agent:
         loc = find_source_code(s[0][0], self.config.cmd[0])
         self.logger.info(f"loc={loc}, "
             f"sad={(s[0],s[1],s[2])}, "
-            f"hit_tn={self.model.visited_sa.get(state.sa, 0)}, "
+            f"hit={self.model.visited_sa.get(state.sa, 0)}, "
             f"d_t={distance_taken}, "
             f"d_nt={distance_not_taken}, "
             f"unreachale={state.reversed_sa in self.model.unreachable_sa}, "

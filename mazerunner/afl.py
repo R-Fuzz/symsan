@@ -524,8 +524,7 @@ class ExploreExecutor(Mazerunner):
         if not next_seed is None:
             seed_id = int(utils.get_id_from_fn(next_seed))
             assert seed_id not in self.state.processed
-            self.logger.debug(f"Generated {next_seed} for {target_sa}, "
-                                f"status={status}. ")
+            self.logger.debug(f"Generated {next_seed} for {target_sa}, status={status}.")
         return next_seed
 
     def _run_seed(self, next_seed):
