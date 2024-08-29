@@ -15,9 +15,9 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
-    - name: install clang-12
+    - name: install dependencies
       run: sudo apt-get update && sudo apt-get install -y llvm-12 clang-12 libc++-12-dev libc++abi-12-dev python3-minimal libz3-dev libgoogle-perftools-dev libboost-container-dev python3-dev
     #   run: |
     #     wget https://apt.llvm.org/llvm.sh
@@ -25,13 +25,7 @@ jobs:
     #     sudo ./llvm.sh 12 all
 
     - name: get aflpp
-      uses: actions/checkout@v3
-      with:
-        repository: AFLplusplus/AFLplusplus
-        path: ${{ github.workspace }}/aflpp
-
-    - name: get aflpp
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         repository: AFLplusplus/AFLplusplus
         path: ${{ github.workspace }}/aflpp
