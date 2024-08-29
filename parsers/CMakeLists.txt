@@ -1,7 +1,11 @@
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 17)
 
-find_package(Boost REQUIRED COMPONENTS container)
+find_package(boost_container CONFIG)
+
+if (NOT boost_container_FOUND)
+    message(FATAL_ERROR "Failed to locate Boost")
+endif()
 
 ## parser
 add_library(rgd-parser STATIC rgd-parser.cpp)
