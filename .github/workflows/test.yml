@@ -37,7 +37,7 @@ jobs:
         path: ${{ github.workspace }}/aflpp
 
     - name: configure
-      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install -DAFLPP_ROOT=${{ github.workspace }}/aflpp
+      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install -DAFLPP_PATH=${{ github.workspace }}/aflpp
 
     - name: build
       run: CC=clang-12 CXX=clang++-12 cmake --build ${{ github.workspace }}/build
