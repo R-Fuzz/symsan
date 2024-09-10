@@ -68,7 +68,7 @@ if __name__ == "__main__":
     else:
         ce = executor_symsan_lib.ConcolicExecutor(config, fastgen_agent, output_seed_dir)
     ce.setup(input_file)
-    ce.run()
+    ce.run(timeout=60)
     try:
         ce.process_request()
     finally:
