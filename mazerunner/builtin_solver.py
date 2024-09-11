@@ -227,8 +227,9 @@ class Serializer:
                 return base
 
         # common ops
+        op = info.op & 0xff
         size = info.size
-        if info.op == LLVM_INS.Concat.value and info.l1 == 0:
+        if op == LLVM_INS.Concat.value and info.l1 == 0:
             if info.l2 < CONST_OFFSET:
                 self.logger.error(f"to_z3_expr: Invalid Concat operation {label}")
                 raise Serializer.InvalidData("Invalid Concat operation")
@@ -238,7 +239,8 @@ class Serializer:
             op1 = z3.simplify(self.to_z3_expr(info.l1, deps))
         elif info.size == 1:
             op1 = z3.BoolVal(info.op1.i == 1, self.__z3_context)
-        if info.op == LLVM_INS.Concat.value and info.l2 == 0:
+        
+        if op == LLVM_INS.Concat.value and info.l2 == 0:
             if info.l1 < CONST_OFFSET:
                 self.logger.error("to_z3_expr: Invalid Concat operation {label}")
                 raise Serializer.InvalidData("Invalid Concat operation")
@@ -250,8 +252,15 @@ class Serializer:
             deps.update(deps2)
         elif info.size == 1:
             op2 = z3.BoolVal(info.op2.i == 1, self.__z3_context)
+        
+        # Fix size mismatch
+        if (info.l1 >= CONST_OFFSET
+            and z3.is_bv(op1) and op != LLVM_INS.Concat.value):
+            op1 = self.__resize_bv(op1, size)
+        if (info.l2 >= CONST_OFFSET
+            and z3.is_bv(op2) and op != LLVM_INS.Concat.value):
+            op2 = self.__resize_bv(op2, size)
 
-        op = info.op & 0xff
         if op == LLVM_INS.And.value:
             return self.__cache_expr(label, op1 & op2 if info.size != 1 else z3.And(op1, op2), deps)
         elif op == LLVM_INS.Or.value:
@@ -286,6 +295,21 @@ class Serializer:
             # Should never reach here
             self.logger.error("to_z3_expr: Unsupported op: {}".format(info.op))
             raise NotImplementedError("Unsupported op: {}".format(info.op))
+
+    def __resize_bv(self, op, target_size):
+        """  
+        Args:
+            op: The bit-vector operand to resize.
+            target_size: The desired size for the bit-vector.
+        Returns:
+            A resized bit-vector.
+        """
+        current_size = op.size()
+        if current_size > target_size:
+            return z3.Extract(target_size - 1, 0, op)
+        elif current_size < target_size:
+            return z3.ZeroExt(target_size - current_size, op)
+        return op  # No resizing needed if sizes match
 
     def __get_cmd(self, lhs: z3.ExprRef, rhs: z3.ExprRef, predicate: int):
         if predicate == Predicate.bveq.value:
