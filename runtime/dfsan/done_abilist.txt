@@ -425,3 +425,7 @@ fun:FT_Get_Next_Char=uninstrumented
 fun:FT_Done_FreeType=uninstrumented
 fun:FT_Done_Face=uninstrumented
 fun:FT_Get_First_Char=uninstrumented
+
+# Ignore functions from CGC lib
+fun:cgc_*=uninstrumented
+fun:cgc_*=discard
