@@ -12,7 +12,6 @@ import utils
 from agent import ExploitAgent, ExploreAgent
 
 NEGATIVE_ONE = (1 << 32) - 1
-PIPE_TIMEOUT = 50 # milliseconds
 
 class ConcolicExecutor:
     
@@ -119,7 +118,7 @@ class ConcolicExecutor:
         # because the pipe might still be readable even if the child process has terminated
         while should_handle and not self.timer.has_execution_timeout:
             try:
-                e = symsan.read_event(ctypes.sizeof(pipe_msg), PIPE_TIMEOUT)
+                e = symsan.read_event(ctypes.sizeof(pipe_msg), self.config.pipe_timeout)
             except OSError:
                 self.logger.info("process_request: pipe reading timeout, stop processing.")
                 break
@@ -225,7 +224,7 @@ class ConcolicExecutor:
 
     def _process_cond_request(self, msg):
         try:
-            state_data = symsan.read_event(ctypes.sizeof(mazerunner_msg), PIPE_TIMEOUT)
+            state_data = symsan.read_event(ctypes.sizeof(mazerunner_msg), self.config.pipe_timeout)
         except OSError:
             self.logger.info("_process_cond_request: pipe reading timeout, skipping.")
             return SolvingStatus.UNSOLVED_TIMEOUT
@@ -284,7 +283,7 @@ class ConcolicExecutor:
 
     def _process_gep_request(self, msg):
         try:
-            gep_data = symsan.read_event(ctypes.sizeof(gep_msg), PIPE_TIMEOUT)
+            gep_data = symsan.read_event(ctypes.sizeof(gep_msg), self.config.pipe_timeout)
         except OSError:
             self.logger.info("_process_gep_request: pipe reading timeout, skipping.")
             return SolvingStatus.UNSOLVED_TIMEOUT
@@ -320,7 +319,7 @@ class ConcolicExecutor:
         label = msg.label
         size = msg.result
         try:
-            m = symsan.read_event(ctypes.sizeof(memcmp_msg) + size, PIPE_TIMEOUT)
+            m = symsan.read_event(ctypes.sizeof(memcmp_msg) + size, self.config.pipe_timeout)
         except OSError:
             self.logger.info("_process_memcmp_request: pipe reading timeout, skipping.")
             return

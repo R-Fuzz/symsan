@@ -17,7 +17,6 @@ from agent import ExploitAgent, ExploreAgent
 
 UNION_TABLE_SIZE = 0xc00000000
 PIPE_CAPACITY = 4 * 1024 * 1024
-PIPE_TIMEOUT = 0.1 # seconds
 
 class ConcolicExecutor:
     
@@ -75,6 +74,7 @@ class ConcolicExecutor:
 
     def __init__(self, config, agent, output_dir):
         self.config = config
+        self.pipe_timeout = self.config.pipe_timeout / 1000.0
         self.cmd = config.cmd
         self.agent = agent
         self.timer = ConcolicExecutor.Timer()
@@ -211,7 +211,7 @@ class ConcolicExecutor:
         # we don't need to check self.has_terminated here
         # because the pipe might still be readable even if the child process has terminated
         while should_handle and not self.timer.has_execution_timeout:
-            readable, _, _ = select.select([self.pipefds[0]], [], [], PIPE_TIMEOUT)
+            readable, _, _ = select.select([self.pipefds[0]], [], [], self.pipe_timeout)
             if not readable:
                 self.logger.info("process_request: pipe reading timeout, stop processing.")
                 break
@@ -255,7 +255,7 @@ class ConcolicExecutor:
             self.msg_num += 1
 
     def _process_cond_request(self, msg):
-        readable, _, _ = select.select([self.pipefds[0]], [], [], PIPE_TIMEOUT)
+        readable, _, _ = select.select([self.pipefds[0]], [], [], self.pipe_timeout)
         if not readable:
             self.logger.info("_process_cond_request: pipe reading timeout, stop processing.")
             return SolvingStatus.UNSOLVED_TIMEOUT
@@ -292,7 +292,7 @@ class ConcolicExecutor:
         return solving_status
 
     def _process_gep_request(self, msg):
-        readable, _, _ = select.select([self.pipefds[0]], [], [], PIPE_TIMEOUT)
+        readable, _, _ = select.select([self.pipefds[0]], [], [], self.pipe_timeout)
         if not readable:
             self.logger.info("_process_gep_request: pipe reading timeout, stop processing.")
             return SolvingStatus.UNSOLVED_TIMEOUT

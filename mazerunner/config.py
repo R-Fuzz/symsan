@@ -25,7 +25,8 @@ DISCOUNT_FACTOR = 1
 LEARNING_RATE = 1
 EXPLORE_RATE = 0.5
 # Executor configurations
-DEFAULT_TIMEOUT = 5
+SYMSAN_PIPE_TIMEOUT = 200 # milliseconds per symsan pipe message
+DEFAULT_TIMEOUT = 5 # seconds per execution
 MAX_TIMEOUT = 10 * 60
 MAX_ERROR_REPORTS = 30
 MAX_CRASH_REPORTS = 30
@@ -53,6 +54,7 @@ class Config:
                  "cmd",
                  "sync_frequency",
                  "explore_rate",
+                 'pipe_timeout',
                  "timeout",
                  "max_timeout",
                  "max_error_reports",
@@ -138,6 +140,7 @@ class Config:
         self.sync_frequency = SYNC_FREQUENCY
         self.replay_frequency = REPLAY_FREQUENCY
         self.explore_rate = EXPLORE_RATE
+        self.pipe_timeout = SYMSAN_PIPE_TIMEOUT
         self.timeout = DEFAULT_TIMEOUT
         self.max_timeout = MAX_TIMEOUT
         self.max_error_reports = MAX_ERROR_REPORTS
