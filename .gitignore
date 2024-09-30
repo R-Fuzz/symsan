@@ -1,4 +1,5 @@
 .vscode
+test.py
 *.taint
 *.o
 *.so
@@ -15,3 +16,14 @@ auto/
 /bin/
 .DS_Store
 /build/
+__pycache__/
+.python-version
+lib
+/libcxx/
+/libcxxabi/
+/libunwind/
+/llvm_src/
+/build_taint/
+!/build_taint/lib/libc++.a
+!/build_taint/lib/libc++abi.a
+!/build_taint/lib/libunwind.a

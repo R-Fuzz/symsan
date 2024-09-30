@@ -4,14 +4,14 @@
 // RUN: clang -o %t.uninstrumented %s
 // RUN: %t.uninstrumented %t.bin | FileCheck --check-prefix=CHECK-ORIG %s
 // RUN: env KO_USE_FASTGEN=1 %ko-clang -o %t.fg %s
-// RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg %t.bin
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg @@
 // RUN: %t.uninstrumented %t.out/id-0-0-0 | FileCheck --check-prefix=CHECK-GEN1 %s
 // RUN: %t.uninstrumented %t.out/id-0-0-1 | FileCheck --check-prefix=CHECK-GEN2 %s
 // RUN: cp %t.out/id-0-0-0 %t.bin1
 // RUN: cp %t.out/id-0-0-1 %t.bin2
-// RUN: env TAINT_OPTIONS="taint_file=%t.bin1 output_dir=%t.out" %fgtest %t.fg %t.bin1
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin1 output_dir=%t.out" %fgtest %t.fg @@
 // RUN: %t.uninstrumented %t.out/id-0-0-1 | FileCheck --check-prefix=CHECK-GEN12 %s
-// RUN: env TAINT_OPTIONS="taint_file=%t.bin2 output_dir=%t.out" %fgtest %t.fg %t.bin2
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin2 output_dir=%t.out" %fgtest %t.fg @@
 // RUN: %t.uninstrumented %t.out/id-0-0-2 | FileCheck --check-prefix=CHECK-GEN23 %s
 // RUN: env KO_USE_Z3=1 %ko-clang -o %t.z3 %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %t.z3 %t.bin

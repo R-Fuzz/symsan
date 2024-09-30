@@ -77,6 +77,10 @@
 
 using namespace llvm;
 
+// Number of bits to discard when computing the call stack hash.
+// This must be in the range of 1-32.
+static const unsigned kContextSensitiveGranularity = 4;
+
 // This must be consistent with ShadowWidthBits.
 static const Align kShadowTLSAlignment = Align(4);
 
@@ -155,11 +159,6 @@ static cl::opt<bool> ClTraceFP(
 static cl::opt<bool> ClTraceBound(
     "taint-trace-bound",
     cl::desc("Trace buffer bound info."),
-    cl::Hidden, cl::init(true));
-
-static cl::opt<bool> ClTraceLoop(
-    "taint-trace-loop",
-    cl::desc("Trace loop entering and exiting."),
     cl::Hidden, cl::init(true));
 
 static StringRef GetGlobalTypeString(const GlobalValue &G) {
@@ -320,7 +319,12 @@ class Taint : public ModulePass {
     /// pass the return value shadow in a register, while WK_Custom uses an
     /// extra pointer argument to return the shadow.  This allows the wrapped
     /// form of the function type to be expressed in C.
-    WK_Custom
+    WK_Custom,
+
+    /// Special cases for memcmp, strcmp, strncmp like functions
+    WK_Memcmp,
+    WK_Strcmp,
+    WK_Strncmp,
   };
 
   Module *Mod;
@@ -331,9 +335,10 @@ class Taint : public ModulePass {
   IntegerType *Int64Ty;
   IntegerType *IntptrTy;
   /// The shadow type for all primitive types and vector types.
-  IntegerType *ShadowTy;
-  PointerType *ShadowPtrTy;
-  ConstantInt *ZeroShadow;
+  IntegerType *PrimitiveShadowTy;
+  PointerType *PrimitiveShadowPtrTy;
+  ConstantInt *ZeroPrimitiveShadow;
+  ConstantInt *UninitializedPrimitiveShadow;
   ConstantInt *ShadowPtrMask;
   ConstantInt *ShadowPtrMul;
   Constant *ArgTLS;
@@ -348,13 +353,16 @@ class Taint : public ModulePass {
   FunctionType *TaintVarargWrapperFnTy;
   FunctionType *TaintTraceCmpFnTy;
   FunctionType *TaintTraceCondFnTy;
-  FunctionType *TaintTraceLoopFnTy;
   FunctionType *TaintTraceIndirectCallFnTy;
   FunctionType *TaintTraceGEPFnTy;
   FunctionType *TaintPushStackFrameFnTy;
   FunctionType *TaintPopStackFrameFnTy;
   FunctionType *TaintTraceAllocaFnTy;
   FunctionType *TaintCheckBoundsFnTy;
+  FunctionType *TaintTraceGlobalFnTy;
+  FunctionType *TaintMemcmpFnTy;
+  FunctionType *TaintStrcmpFnTy;
+  FunctionType *TaintStrncmpFnTy;
   FunctionType *TaintDebugFnTy;
   FunctionCallee TaintUnionFn;
   FunctionCallee TaintCheckedUnionFn;
@@ -366,22 +374,26 @@ class Taint : public ModulePass {
   FunctionCallee TaintVarargWrapperFn;
   FunctionCallee TaintTraceCmpFn;
   FunctionCallee TaintTraceCondFn;
-  FunctionCallee TaintTraceLoopFn;
   FunctionCallee TaintTraceIndirectCallFn;
   FunctionCallee TaintTraceGEPFn;
   FunctionCallee TaintPushStackFrameFn;
   FunctionCallee TaintPopStackFrameFn;
   FunctionCallee TaintTraceAllocaFn;
   FunctionCallee TaintCheckBoundsFn;
+  FunctionCallee TaintTraceGlobalFn;
+  FunctionCallee TaintMemcmpFn;
+  FunctionCallee TaintStrcmpFn;
+  FunctionCallee TaintStrncmpFn;
   FunctionCallee TaintDebugFn;
   Constant *CallStack;
+  Constant *CallStackAddr;
   MDNode *ColdCallWeights;
   TaintABIList ABIList;
   DenseMap<Value *, Function *> UnwrappedFnMap;
   AttrBuilder ReadOnlyNoneAttrs;
   bool TaintRuntimeShadowMask = false;
 
-  Value *getShadowAddress(Value *Addr, Instruction *Pos);
+  Value *getShadowAddress(Value *Addr, IRBuilder<> &IRB);
   bool isInstrumented(const Function *F);
   bool isInstrumented(const GlobalAlias *GA);
   FunctionType *getArgsFunctionType(FunctionType *T);
@@ -401,6 +413,7 @@ class Taint : public ModulePass {
   void initializeRuntimeFunctions(Module &M);
   void initializeCallbackFunctions(Module &M);
   uint32_t getInstructionId(Instruction *Inst);
+  uint32_t getBasicblockId(BasicBlock *BB);
 
   /// Returns a zero constant with the shadow type of OrigTy.
   ///
@@ -443,7 +456,6 @@ struct TaintFunction {
   Taint &TT;
   Function *F;
   DominatorTree DT;
-  LoopInfo *LI;
   Taint::InstrumentedABI IA;
   bool IsNativeABI;
   Value *ArgTLSPtr = nullptr;
@@ -473,14 +485,11 @@ struct TaintFunction {
   TaintFunction(Taint &TT, Function *F, bool IsNativeABI)
       : TT(TT), F(F), IA(TT.getInstrumentedABI()), IsNativeABI(IsNativeABI) {
     DT.recalculate(*F);
-    LI = new LoopInfo(DT);
     // FIXME: Need to track down the register allocator issue which causes poor
     // performance in pathological cases with large numbers of basic blocks.
     AvoidNewBlocks = F->size() > 1000;
     srandom(std::hash<std::string>{}(F->getName().str()));
   }
-
-  ~TaintFunction() { delete LI; }
 
   /// Computes the shadow address for a given function argument.
   ///
@@ -492,24 +501,59 @@ struct TaintFunction {
 
   Value *getShadow(Value *V);
   void setShadow(Instruction *I, Value *Shadow);
+
+  /// Returns the shadow value of a global variable GV.
+  Value *getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB);
+
   // Op Shadow
   Value *combineShadows(Value *V1, Value *V2,
                         uint16_t op, Instruction *Pos);
   Value *combineBinaryOperatorShadows(BinaryOperator *BO, uint8_t op);
   Value *combineCastInstShadows(CastInst *CI, uint8_t op);
   Value *combineCmpInstShadows(CmpInst *CI, uint8_t op);
-  Value *loadShadow(Value *ShadowAddr, uint64_t Size, uint64_t Align,
-                    Instruction *Pos);
-  void storeShadow(Value *Addr, uint64_t Size, Align Alignment, Value *Shadow,
-                   Instruction *Pos);
   void visitCmpInst(CmpInst *I);
   void visitSwitchInst(SwitchInst *I);
   void visitCondition(Value *Cond, Instruction *I);
   void visitGEPInst(GetElementPtrInst *I);
-  Value *visitAllocaInst(AllocaInst *I);
-  void checkBounds(Value *Ptr, Instruction *Pos);
+  Value *visitAllocaInst(AllocaInst *I, Value *ArraySize, Type *ElTy);
+  void checkBounds(Value *Ptr, Value *Size, Instruction *Pos);
+
+  /// XXX: because we never collapse taint labels for aggregate types,
+  ///      we also do not expand taint labels from an aggreated primitive
+  ///      shadow value. Instead, we always load the label for each
+  ///      primitive field.
+  ///
+  /// Load all primitive subtypes of T, returning the aggrate shadow value.
+  ///
+  /// LS({T1,T2, ...}, Addr) = {LS(T1, SubAdrr),LS(T2, SubAddr),...}
+  /// LS([n x T], Addr) = [n x LS(T, SubAddr)]
+  /// LS(other types, Addr) = LS(PS, Addr)
+  Value *loadShadow(Type *T, Value *Addr, uint64_t Size, uint64_t Align,
+                    Instruction *Pos);
+
+  /// XXX: we do not union taint labels for aggregate types before store;
+  ///      instead, we store each privimitive field individually.
+  ///
+  /// Store all primitive subtypes of T, using the aggrate shadow value.
+  ///
+  /// SS(Addr, {T1,T2, ...}) = SS(SubAddr, T1), SS(SubAddr, T2), ...
+  /// SS(Addr, [T1,T2,...]) = SS(SubAddr, T1), SS(SubAddr, T2), ...
+  /// SS(Addr, PS) = SS(Addr, PS)
+  void storeShadow(Value *Addr, uint64_t Size, Align Alignment,
+                   Value *Shadow, Instruction *Pos);
 
 private:
+  /// Loads a primitive shadow label
+  Value *loadPrimitiveShadow(Value *Addr, uint64_t Size, uint64_t Align,
+                             IRBuilder<> &IRB);
+  /// Loads shadow recursively for aggregate types
+  void loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
+                           Type *SubTy, Value *Addr, uint64_t Size,
+                           uint64_t Align, IRBuilder<> &IRB);
+  /// Stores an aggregate shadow label
+  void storeShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
+                            Type *SubShadowTy, Value *ShadowAddr, uint64_t Size,
+                            uint64_t Align, IRBuilder<> &IRB);
   /// Returns the shadow value of an argument A.
   Value *getShadowForTLSArgument(Argument *A);
 };
@@ -531,6 +575,7 @@ public:
   void visitCmpInst(CmpInst &CI);
   void visitSwitchInst(SwitchInst &SWI);
   void visitGetElementPtrInst(GetElementPtrInst &GEPI);
+  void visitAtomicRMWInst(AtomicRMWInst &I);
   void visitLoadInst(LoadInst &LI);
   void visitStoreInst(StoreInst &SI);
   void visitReturnInst(ReturnInst &RI);
@@ -580,12 +625,18 @@ Taint::Taint(
 
 FunctionType *Taint::getArgsFunctionType(FunctionType *T) {
   SmallVector<Type *, 4> ArgTypes(T->param_begin(), T->param_end());
-  ArgTypes.append(T->getNumParams(), ShadowTy);
-  if (T->isVarArg())
-    ArgTypes.push_back(ShadowPtrTy);
+  // we keep the shadow type consistent with the arg type so we don't
+  // need to collapse or expand the shadow
+  for (unsigned i = 0, ie = T->getNumParams(); i != ie; ++i) {
+    Type* param_type = T->getParamType(i);
+    ArgTypes.push_back(getShadowTy(param_type));
+  }
+  // ArgTypes.append(T->getNumParams(), PrimitiveShadowTy);
+  if (T->isVarArg()) // FIXME: vararg
+    ArgTypes.push_back(PrimitiveShadowPtrTy);
   Type *RetType = T->getReturnType();
   if (!RetType->isVoidTy())
-    RetType = StructType::get(RetType, ShadowTy);
+    RetType = StructType::get(RetType, getShadowTy(RetType));
   return FunctionType::get(RetType, ArgTypes, T->isVarArg());
 }
 
@@ -594,10 +645,16 @@ FunctionType *Taint::getTrampolineFunctionType(FunctionType *T) {
   SmallVector<Type *, 4> ArgTypes;
   ArgTypes.push_back(T->getPointerTo());
   ArgTypes.append(T->param_begin(), T->param_end());
-  ArgTypes.append(T->getNumParams(), ShadowTy);
+  // we keep the shadow type consistent with the arg type so we don't
+  // need to collapse or expand the shadow
+  for (unsigned i = 0, ie = T->getNumParams(); i != ie; ++i) {
+    Type* param_type = T->getParamType(i);
+    ArgTypes.push_back(getShadowTy(param_type));
+  }
+  // ArgTypes.append(T->getNumParams(), PrimitiveShadowTy);
   Type *RetType = T->getReturnType();
   if (!RetType->isVoidTy())
-    ArgTypes.push_back(ShadowPtrTy);
+    ArgTypes.push_back(PointerType::getUnqual(getShadowTy(RetType)));
   return FunctionType::get(T->getReturnType(), ArgTypes, false);
 }
 
@@ -623,27 +680,63 @@ TransformedFunction Taint::getCustomFunctionType(FunctionType *T) {
       ArgTypes.push_back(param_type);
     }
   }
-  for (unsigned i = 0, e = T->getNumParams(); i != e; ++i)
-    ArgTypes.push_back(ShadowTy);
-  if (T->isVarArg())
-    ArgTypes.push_back(ShadowPtrTy);
+  for (unsigned i = 0, e = T->getNumParams(); i != e; ++i) {
+    // we keep the shadow type consistent with the arg type so we don't
+    // need to collapse or expand the shadow
+    Type* param_type = T->getParamType(i);
+    ArgTypes.push_back(getShadowTy(param_type));
+    // ArgTypes.push_back(PrimitiveShadowTy);
+  }
+  if (T->isVarArg()) // FIXME: vararg
+    ArgTypes.push_back(PrimitiveShadowPtrTy);
   Type *RetType = T->getReturnType();
   if (!RetType->isVoidTy())
-    ArgTypes.push_back(ShadowPtrTy);
+    ArgTypes.push_back(getShadowTy(RetType));
   return TransformedFunction(
       T, FunctionType::get(T->getReturnType(), ArgTypes, T->isVarArg()),
       ArgumentIndexMapping);
 }
 
 bool Taint::isZeroShadow(Value *V) {
-  return ZeroShadow == V;
+  Type *T = V->getType();
+  if (!isa<ArrayType>(T) && !isa<StructType>(T)) {
+    if (const ConstantInt *CI = dyn_cast<ConstantInt>(V))
+      return CI->isZero();
+    return false;
+  }
+
+  return isa<ConstantAggregateZero>(V);
+}
+
+Constant *Taint::getZeroShadow(Type *OrigTy) {
+  if (!isa<ArrayType>(OrigTy) && !isa<StructType>(OrigTy))
+    return ZeroPrimitiveShadow;
+  Type *ShadowTy = getShadowTy(OrigTy);
+  return ConstantAggregateZero::get(ShadowTy);
 }
 
 Constant *Taint::getZeroShadow(Value *V) {
-  return ZeroShadow;
+  return getZeroShadow(V->getType());
 }
 
-Type *Taint::getShadowTy(Type *OrigTy) { return ShadowTy; }
+Type *Taint::getShadowTy(Type *OrigTy) {
+  if (!OrigTy->isSized())
+    return PrimitiveShadowTy;
+  if (isa<IntegerType>(OrigTy))
+    return PrimitiveShadowTy;
+  if (isa<VectorType>(OrigTy))
+    return PrimitiveShadowTy;
+  if (ArrayType *AT = dyn_cast<ArrayType>(OrigTy))
+    return ArrayType::get(getShadowTy(AT->getElementType()),
+                          AT->getNumElements());
+  if (StructType *ST = dyn_cast<StructType>(OrigTy)) {
+    SmallVector<Type *, 4> Elements;
+    for (unsigned I = 0, N = ST->getNumElements(); I < N; ++I)
+      Elements.push_back(getShadowTy(ST->getElementType(I)));
+    return StructType::get(*Ctx, Elements);
+  }
+  return PrimitiveShadowTy;
+}
 
 Type *Taint::getShadowTy(Value *V) {
   return getShadowTy(V->getType());
@@ -662,6 +755,63 @@ uint32_t Taint::getInstructionId(Instruction *Inst) {
   }
 
   return djbHash(SourceInfo);
+}
+
+static inline void getInsDebugLoc(const Instruction *I, std::string &Filename,
+                        unsigned &Line, unsigned &Col) {
+  if (DILocation *Loc = I->getDebugLoc()) {
+    Line = Loc->getLine();
+    Filename = Loc->getFilename().str();
+    Col = Loc->getColumn();
+    if (Filename.empty()) {
+      DILocation *oDILoc = Loc->getInlinedAt();
+      if (oDILoc) {
+        Line = oDILoc->getLine();
+        Col = oDILoc->getColumn();
+        Filename = oDILoc->getFilename().str();
+      }
+    }
+  }
+}
+
+static inline void getBBDebugLoc(const BasicBlock *BB, std::string &Filename, unsigned &Line, unsigned &Col) {
+  std::string bb_name("");
+  std::string filename;
+  unsigned line = 0;
+  unsigned col = 0;
+  for (auto &I : *BB) {
+    getInsDebugLoc(&I, filename, line, col);
+    /* Don't worry about external libs */
+    static const std::string Xlibs("/usr/");
+    if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
+      continue;
+    std::size_t found = filename.find_last_of("/\\");
+    if (found != std::string::npos)
+      filename = filename.substr(found + 1);
+    Filename = filename;
+    Line = line;
+    Col = col;
+    break;
+  }
+}
+
+uint32_t Taint::getBasicblockId(BasicBlock *BB) {
+  static uint32_t unamed = 0;
+  std::string bb_name_with_col("");
+  std::string filename;
+  unsigned line = 0;
+  unsigned col = 0;
+  getBBDebugLoc(BB, filename, line, col);
+  if (!filename.empty() && line != 0 ){
+    bb_name_with_col = filename + ":" + std::to_string(line) + ":" + std::to_string(col);
+  }else{
+    filename = Mod->getSourceFileName();
+    std::size_t found = filename.find_last_of("/\\");
+    if (found != std::string::npos)
+      filename = filename.substr(found + 1);
+    bb_name_with_col = filename + ":unamed:" + std::to_string(unamed++);
+  }
+  return djbHash(bb_name_with_col);
 }
 
 void Taint::addContextRecording(Function &F) {
@@ -692,6 +842,15 @@ void Taint::addContextRecording(Function &F) {
   StoreInst *SCS = IRB.CreateStore(NCS, CallStack);
   SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
 
+  // instrument (ctx << kContextSensitiveGranularity) ^ return_addr at the beginning of a function
+  ConstantInt *ReturnAddress = ConstantInt::get(Int32Ty, hash);
+  LoadInst *LCSA = IRB.CreateLoad(CallStackAddr);
+  LCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+  Value *ShiftedLCS = IRB.CreateShl(LCSA, kContextSensitiveGranularity);
+  Value *NCSA = IRB.CreateXor(ShiftedLCS, ReturnAddress);
+  StoreInst *SCSA = IRB.CreateStore(NCSA, CallStackAddr);
+  SCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+
   // Recover ctx at the end of a function
   for (auto FI = F.begin(), FE = F.end(); FI != FE; FI++) {
     BasicBlock *BB = &*FI;
@@ -700,6 +859,8 @@ void Taint::addContextRecording(Function &F) {
       IRB.SetInsertPoint(Inst);
       SCS = IRB.CreateStore(LCS, CallStack);
       SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+      SCSA = IRB.CreateStore(LCSA, CallStackAddr);
+      SCSA->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
     }
   }
 }
@@ -738,10 +899,11 @@ bool Taint::doInitialization(Module &M) {
   Int16Ty = IntegerType::get(*Ctx, 16);
   Int32Ty = IntegerType::get(*Ctx, 32);
   Int64Ty = IntegerType::get(*Ctx, 64);
-  ShadowTy = IntegerType::get(*Ctx, ShadowWidthBits);
-  ShadowPtrTy = PointerType::getUnqual(ShadowTy);
+  PrimitiveShadowTy = IntegerType::get(*Ctx, ShadowWidthBits);
+  PrimitiveShadowPtrTy = PointerType::getUnqual(PrimitiveShadowTy);
   IntptrTy = DL.getIntPtrType(*Ctx);
-  ZeroShadow = ConstantInt::getSigned(ShadowTy, 0);
+  ZeroPrimitiveShadow = ConstantInt::getSigned(PrimitiveShadowTy, 0);
+  UninitializedPrimitiveShadow = ConstantInt::getSigned(PrimitiveShadowTy, -1);
   ShadowPtrMul = ConstantInt::getSigned(IntptrTy, ShadowWidthBytes);
   if (IsX86_64)
     ShadowPtrMask = ConstantInt::getSigned(IntptrTy, ~0x700000000000LL);
@@ -753,51 +915,60 @@ bool Taint::doInitialization(Module &M) {
   else
     report_fatal_error("unsupported triple");
 
-  Type *TaintUnionArgs[6] = { ShadowTy, ShadowTy, Int16Ty, Int16Ty, Int64Ty, Int64Ty};
+  Type *TaintUnionArgs[6] = { PrimitiveShadowTy, PrimitiveShadowTy, Int16Ty, Int16Ty, Int64Ty, Int64Ty};
   TaintUnionFnTy = FunctionType::get(
-      ShadowTy, TaintUnionArgs, /*isVarArg=*/ false);
-  Type *TaintUnionLoadArgs[2] = { ShadowPtrTy, IntptrTy };
+      PrimitiveShadowTy, TaintUnionArgs, /*isVarArg=*/ false);
+  Type *TaintUnionLoadArgs[2] = { PrimitiveShadowPtrTy, IntptrTy };
   TaintUnionLoadFnTy = FunctionType::get(
-      ShadowTy, TaintUnionLoadArgs, /*isVarArg=*/ false);
-  Type *TaintUnionStoreArgs[3] = { ShadowTy, ShadowPtrTy, IntptrTy };
+      PrimitiveShadowTy, TaintUnionLoadArgs, /*isVarArg=*/ false);
+  Type *TaintUnionStoreArgs[3] = { PrimitiveShadowTy, PrimitiveShadowPtrTy, IntptrTy };
   TaintUnionStoreFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintUnionStoreArgs, /*isVarArg=*/ false);
   TaintUnimplementedFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), Type::getInt8PtrTy(*Ctx), /*isVarArg=*/false);
-  Type *TaintSetLabelArgs[3] = { ShadowTy, Type::getInt8PtrTy(*Ctx), IntptrTy };
+  Type *TaintSetLabelArgs[3] = { PrimitiveShadowTy, Type::getInt8PtrTy(*Ctx), IntptrTy };
   TaintSetLabelFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
                                         TaintSetLabelArgs, /*isVarArg=*/false);
   TaintNonzeroLabelFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), None, /*isVarArg=*/false);
   TaintVarargWrapperFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), Type::getInt8PtrTy(*Ctx), /*isVarArg=*/false);
-  Type *TaintTraceCmpArgs[7] = { ShadowTy, ShadowTy, ShadowTy, ShadowTy,
+  Type *TaintTraceCmpArgs[7] = { PrimitiveShadowTy, PrimitiveShadowTy,
+      PrimitiveShadowTy, PrimitiveShadowTy,
       Int64Ty, Int64Ty, Int32Ty };
   TaintTraceCmpFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCmpArgs, false);
-  Type *TaintTraceCondArgs[4] = { ShadowTy, Int8Ty, Int8Ty, Int32Ty };
+  Type *TaintTraceCondArgs[3] = { PrimitiveShadowTy, Int8Ty, Int32Ty };
   TaintTraceCondFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCondArgs, false);
-  TaintTraceLoopFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), { Int32Ty }, false);
   TaintTraceIndirectCallFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), { ShadowTy }, false);
-  Type *TaintTraceGEPArgs[7] = { ShadowTy, Int64Ty, ShadowTy, Int64Ty, Int64Ty,
-      Int64Ty, Int64Ty };
+      Type::getVoidTy(*Ctx), { PrimitiveShadowTy }, false);
+  Type *TaintTraceGEPArgs[7] = { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy,
+      Int64Ty, Int64Ty, Int64Ty, Int64Ty };
   TaintTraceGEPFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceGEPArgs, false);
   TaintPushStackFrameFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), {}, false);
   TaintPopStackFrameFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), {}, false);
-  Type *TaintTraceAllocaArgs[4] = { ShadowTy, Int64Ty, Int64Ty, Int64Ty };
+  Type *TaintTraceAllocaArgs[4] = { PrimitiveShadowTy, Int64Ty, Int64Ty, Int64Ty };
   TaintTraceAllocaFnTy = FunctionType::get(
-      ShadowTy, TaintTraceAllocaArgs, false);
+      PrimitiveShadowTy, TaintTraceAllocaArgs, false);
   TaintCheckBoundsFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), { ShadowTy, Int64Ty }, false);
+      Type::getVoidTy(*Ctx), { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy, Int64Ty }, false);
+  TaintTraceGlobalFnTy = FunctionType::get(
+      PrimitiveShadowTy, { Int64Ty, Int64Ty }, false);
+
+  TaintMemcmpFnTy = FunctionType::get(
+      PrimitiveShadowTy, { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx), Int64Ty }, false);
+  TaintStrcmpFnTy = FunctionType::get(
+      PrimitiveShadowTy, { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx) }, false);
+  TaintStrncmpFnTy = FunctionType::get(
+      PrimitiveShadowTy, { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx), Int64Ty }, false);
 
   TaintDebugFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
-      {ShadowTy, ShadowTy, ShadowTy, ShadowTy, ShadowTy}, false);
+      {PrimitiveShadowTy, PrimitiveShadowTy, PrimitiveShadowTy,
+       PrimitiveShadowTy, PrimitiveShadowTy}, false);
 
   ColdCallWeights = MDBuilder(*Ctx).createBranchWeights(1, 1000);
   return true;
@@ -819,6 +990,12 @@ Taint::WrapperKind Taint::getWrapperKind(Function *F) {
   // priority custom
   if (ABIList.isIn(*F, "custom"))
     return WK_Custom;
+  if (ABIList.isIn(*F, "memcmp"))
+    return WK_Memcmp;
+  if (ABIList.isIn(*F, "strcmp"))
+    return WK_Strcmp;
+  if (ABIList.isIn(*F, "strncmp"))
+    return WK_Strncmp;
   if (ABIList.isIn(*F, "functional"))
     return WK_Functional;
   if (ABIList.isIn(*F, "discard"))
@@ -859,7 +1036,8 @@ Taint::buildWrapperFunction(Function *F, StringRef NewFName,
       AttributeFuncs::typeIncompatible(NewFT->getReturnType()));
 
   BasicBlock *BB = BasicBlock::Create(*Ctx, "entry", NewF);
-  if (F->isVarArg()) {
+  if (F->isVarArg() && getWrapperKind(F) != WK_Custom) {
+    // keep the invocation if custom (e.g., open)
     NewF->removeAttributes(AttributeList::FunctionIndex,
                            AttrBuilder().addAttribute("split-stack"));
     CallInst::Create(TaintVarargWrapperFn,
@@ -999,14 +1177,6 @@ void Taint::initializeCallbackFunctions(Module &M) {
     AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
                          Attribute::NoUnwind);
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
-    TaintTraceLoopFn =
-        Mod->getOrInsertFunction("__taint_trace_loop", TaintTraceLoopFnTy, AL);
-  }
-  {
-    AttributeList AL;
-    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
-                         Attribute::NoUnwind);
-    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     TaintTraceIndirectCallFn =
         Mod->getOrInsertFunction("__taint_trace_indcall", TaintTraceIndirectCallFnTy, AL);
   }
@@ -1052,6 +1222,39 @@ void Taint::initializeCallbackFunctions(Module &M) {
     TaintCheckBoundsFn =
         Mod->getOrInsertFunction("__taint_check_bounds", TaintCheckBoundsFnTy, AL);
   }
+  {
+    AttributeList AL;
+    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
+                         Attribute::NoUnwind);
+    AL = AL.addAttribute(M.getContext(), AttributeList::ReturnIndex,
+                         Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
+    TaintTraceGlobalFn =
+        Mod->getOrInsertFunction("__taint_trace_global", TaintTraceGlobalFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
+                         Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
+    TaintMemcmpFn =
+        Mod->getOrInsertFunction("__taint_memcmp", TaintMemcmpFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
+                         Attribute::NoUnwind);
+    TaintStrcmpFn =
+        Mod->getOrInsertFunction("__taint_strcmp", TaintStrcmpFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addAttribute(M.getContext(), AttributeList::FunctionIndex,
+                         Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
+    TaintStrncmpFn =
+        Mod->getOrInsertFunction("__taint_strncmp", TaintStrncmpFnTy, AL);
+  }
 
 }
 
@@ -1089,6 +1292,11 @@ bool Taint::runOnModule(Module &M) {
     Changed |= G->getThreadLocalMode() != GlobalVariable::InitialExecTLSModel;
     G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
   }
+  CallStackAddr = Mod->getOrInsertGlobal("__taint_trace_callstack_addr", Int32Ty);
+  if (GlobalVariable *G = dyn_cast<GlobalVariable>(CallStackAddr)) {
+    Changed |= G->getThreadLocalMode() != GlobalVariable::InitialExecTLSModel;
+    G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
+  }
 
   initializeCallbackFunctions(M);
   initializeRuntimeFunctions(M);
@@ -1107,13 +1315,16 @@ bool Taint::runOnModule(Module &M) {
         &i != TaintVarargWrapperFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceCmpFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceCondFn.getCallee()->stripPointerCasts() &&
-        &i != TaintTraceLoopFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceIndirectCallFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceGEPFn.getCallee()->stripPointerCasts() &&
         &i != TaintPushStackFrameFn.getCallee()->stripPointerCasts() &&
         &i != TaintPopStackFrameFn.getCallee()->stripPointerCasts() &&
         &i != TaintTraceAllocaFn.getCallee()->stripPointerCasts() &&
+        &i != TaintTraceGlobalFn.getCallee()->stripPointerCasts() &&
         &i != TaintCheckBoundsFn.getCallee()->stripPointerCasts() &&
+        &i != TaintMemcmpFn.getCallee()->stripPointerCasts() &&
+        &i != TaintStrcmpFn.getCallee()->stripPointerCasts() &&
+        &i != TaintStrncmpFn.getCallee()->stripPointerCasts() &&
         &i != TaintDebugFn.getCallee()->stripPointerCasts()) {
       FnsToInstrument.push_back(&i);
     }
@@ -1197,6 +1408,12 @@ bool Taint::runOnModule(Module &M) {
         addGlobalNamePrefix(&F);
       }
     } else if (!IsZeroArgsVoidRet || getWrapperKind(&F) == WK_Custom) {
+      if (FT->isVarArg() && F.isDeclaration() && F.hasAddressTaken() && !isInstrumented(&F)) {
+        // FIXME: vararg functions do used as indirect call targets
+        *i = nullptr;
+        continue;
+      }
+
       // Build a wrapper function for F.  The wrapper simply calls F, and is
       // added to FnsToInstrument so that any instrumentation according to its
       // WrapperKind is done in the second pass below.
@@ -1264,16 +1481,6 @@ bool Taint::runOnModule(Module &M) {
     SmallVector<BasicBlock *, 4> BBList(depth_first(&i->getEntryBlock()));
 
     for (BasicBlock *i : BBList) {
-      // check for loop header
-      if (ClTraceLoop) {
-        if (TF.LI->isLoopHeader(i)) {
-          // This is a loop header
-          Instruction *FI = &*(i->getFirstInsertionPt());
-          ConstantInt *CID = ConstantInt::get(Int32Ty, getInstructionId(FI));
-          IRBuilder<> IRB(FI);
-          IRB.CreateCall(TaintTraceLoopFn, {CID});
-        }
-      }
       Instruction *Inst = &i->front();
       while (true) {
         // TaintVisitor may split the current basic block, changing the current
@@ -1306,27 +1513,6 @@ bool Taint::runOnModule(Module &M) {
       }
     }
 
-    // -dfsan-debug-nonzero-labels will split the CFG in all kinds of crazy
-    // places (i.e. instructions in basic blocks we haven't even begun visiting
-    // yet).  To make our life easier, do this work in a pass after the main
-    // instrumentation.
-    if (ClDebugNonzeroLabels) {
-      for (Value *V : TF.NonZeroChecks) {
-        Instruction *Pos;
-        if (Instruction *I = dyn_cast<Instruction>(V))
-          Pos = I->getNextNode();
-        else
-          Pos = &TF.F->getEntryBlock().front();
-        while (isa<PHINode>(Pos) || isa<AllocaInst>(Pos))
-          Pos = Pos->getNextNode();
-        IRBuilder<> IRB(Pos);
-        Value *Ne = IRB.CreateICmpNE(V, TF.TT.ZeroShadow);
-        BranchInst *BI = cast<BranchInst>(SplitBlockAndInsertIfThen(
-            Ne, Pos, /*Unreachable=*/false, ColdCallWeights));
-        IRBuilder<> ThenIRB(BI);
-        ThenIRB.CreateCall(TF.TT.TaintNonzeroLabelFn, {});
-      }
-    }
   }
 
   return Changed || !FnsToInstrument.empty() ||
@@ -1377,6 +1563,24 @@ Value *TaintFunction::getShadowForTLSArgument(Argument *A) {
   return TT.getZeroShadow(A);
 }
 
+Value *TaintFunction::getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB) {
+  Type *T = nullptr;
+  if (GV->hasInitializer()) {
+    T = GV->getInitializer()->getType();
+  } else {
+    T = GV->getValueType();
+  }
+  if (T && (T->isArrayTy() || T->isStructTy())) {
+    Module *M = F->getParent();
+    auto &DL = M->getDataLayout();
+    uint64_t size = T->isSized() ? DL.getTypeAllocSize(T) : 1;
+    Value *Size = ConstantInt::get(TT.Int64Ty, size);
+    Value *Addr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
+    return IRB.CreateCall(TT.TaintTraceGlobalFn, {Addr, Size});
+  }
+  return TT.ZeroPrimitiveShadow; // GV is always a ptr
+}
+
 Value *TaintFunction::getShadow(Value *V) {
   if (!isa<Argument>(V) && !isa<Instruction>(V))
     return TT.getZeroShadow(V);
@@ -1396,7 +1600,7 @@ Value *TaintFunction::getShadow(Value *V) {
         while (ArgIdx--)
           ++i;
         Shadow = &*i;
-        assert(Shadow->getType() == TT.ShadowTy);
+        // assert(Shadow->getType() == TT.ShadowTy);
         break;
       }
       }
@@ -1410,13 +1614,11 @@ Value *TaintFunction::getShadow(Value *V) {
 
 void TaintFunction::setShadow(Instruction *I, Value *Shadow) {
   assert(!ValShadowMap.count(I));
-  assert(Shadow->getType() == TT.ShadowTy);
   ValShadowMap[I] = Shadow;
 }
 
-Value *Taint::getShadowAddress(Value *Addr, Instruction *Pos) {
+Value *Taint::getShadowAddress(Value *Addr, IRBuilder<> &IRB) {
   assert(Addr != RetvalTLS && "Reinstrumenting?");
-  IRBuilder<> IRB(Pos);
   Value *ShadowPtrMaskValue;
   if (TaintRuntimeShadowMask)
     ShadowPtrMaskValue = IRB.CreateLoad(IntptrTy, ExternalShadowMask);
@@ -1427,7 +1629,7 @@ Value *Taint::getShadowAddress(Value *Addr, Instruction *Pos) {
           IRB.CreateAnd(IRB.CreatePtrToInt(Addr, IntptrTy),
                         IRB.CreatePtrToInt(ShadowPtrMaskValue, IntptrTy)),
           ShadowPtrMul),
-      ShadowPtrTy);
+      PrimitiveShadowPtrTy);
 }
 
 static inline bool isConstantOne(const Value *V) {
@@ -1442,7 +1644,7 @@ Value *TaintFunction::combineBinaryOperatorShadows(BinaryOperator *BO,
       BO->getOpcode() == Instruction::Xor &&
       (isConstantOne(BO->getOperand(1)) ||
        isConstantOne(BO->getOperand(0)))) {
-    op = 1;
+    op = 1; // __dfsan::Not
   }
   // else if (BinaryOperator::isNeg(BO))
   //   op = 2;
@@ -1523,7 +1725,7 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
 Value *TaintFunction::combineCastInstShadows(CastInst *CI,
                                              uint8_t op) {
   Value *Shadow1 = getShadow(CI->getOperand(0));
-  Value *Shadow2 = TT.ZeroShadow;
+  Value *Shadow2 = TT.getZeroShadow(CI);
   Value *Shadow = combineShadows(Shadow1, Shadow2, op, CI);
   return Shadow;
 }
@@ -1536,28 +1738,102 @@ Value *TaintFunction::combineCmpInstShadows(CmpInst *CI,
   return Shadow;
 }
 
-void TaintFunction::checkBounds(Value *Ptr, Instruction *Pos) {
+void TaintFunction::checkBounds(Value *Ptr, Value* Size, Instruction *Pos) {
   IRBuilder<> IRB(Pos);
-  Value *PtrShadow = getShadow(Ptr);
+  // another place to check for global variable as the ptr
+  Value *PtrShadow = nullptr;
+  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts())) {
+    PtrShadow = getShadowForGlobal(GV, IRB);
+  } else {
+    PtrShadow = getShadow(Ptr);
+  }
+  Value *SizeShadow = getShadow(Size);
   // ptr shadow only exists for array and heap object
   if (!TT.isZeroShadow(PtrShadow)) {
     Value *Addr = IRB.CreatePtrToInt(Ptr, TT.Int64Ty);
-    IRB.CreateCall(TT.TaintCheckBoundsFn, {PtrShadow, Addr});
+    Value *Size64 = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
+    IRB.CreateCall(TT.TaintCheckBoundsFn, {PtrShadow, Addr, SizeShadow, Size});
   }
 }
 
 // Generates IR to load shadow corresponding to bytes [Addr, Addr+Size), where
 // Addr has alignment Align, and take the union of each of those shadows.
-Value *TaintFunction::loadShadow(Value *Addr, uint64_t Size, uint64_t Align,
+Value *TaintFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size, uint64_t Align,
+                                          IRBuilder<> &IRB) {
+  if (Size == 0)
+    return TT.ZeroPrimitiveShadow;
+
+  Value *ShadowAddr = TT.getShadowAddress(Addr, IRB);
+  CallInst *FallbackCall = IRB.CreateCall(
+      TT.TaintUnionLoadFn, {ShadowAddr, ConstantInt::get(TT.IntptrTy, Size)});
+  FallbackCall->addAttribute(AttributeList::ReturnIndex, Attribute::ZExt);
+  return FallbackCall;
+}
+
+void TaintFunction::loadShadowRecursive(
+    Value *Shadow, SmallVector<unsigned, 4> &Indices, Type *SubTy,
+    Value *Addr, uint64_t Size, uint64_t Align, IRBuilder<> &IRB) {
+  auto &DL = F->getParent()->getDataLayout();
+
+  if (!isa<ArrayType>(SubTy) && !isa<StructType>(SubTy)) {
+    uint64_t SubSize = DL.getTypeStoreSize(SubTy);
+    assert(Size >= SubSize);
+    Align = std::min(Align, (uint64_t)DL.getABITypeAlignment(SubTy));
+    // load a primitive shadow from address
+    Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, Align, IRB);
+    // then insert the primitive shadow into the sub-field
+    IRB.CreateInsertValue(Shadow, PrimitiveShadow, Indices);
+    return;
+  }
+
+  if (ArrayType *AT = dyn_cast<ArrayType>(SubTy)) {
+    for (unsigned Idx = 0; Idx < AT->getNumElements(); Idx++) {
+      Indices.push_back(Idx);
+      // double check the remaining size
+      Type *ElemTy = AT->getElementType();
+      uint64_t ElemSize = DL.getTypeStoreSize(ElemTy);
+      uint64_t Offset = ElemSize * Idx;
+      assert(Offset <= Size);
+      // get the address of the array element
+      Value *SubAddr = IRB.CreateConstGEP2_32(AT, Addr, 0, Idx);
+      loadShadowRecursive(Shadow, Indices, ElemTy,
+                          SubAddr, Size - Offset, Align, IRB);
+      Indices.pop_back();
+    }
+    return;
+  }
+
+  if (StructType *ST = dyn_cast<StructType>(SubTy)) {
+    const StructLayout *SL = DL.getStructLayout(ST);
+    for (unsigned Idx = 0; Idx < ST->getNumElements(); Idx++) {
+      Indices.push_back(Idx);
+      // double check the remaining size
+      uint64_t Offset = SL->getElementOffset(Idx);
+      assert(Offset <= Size);
+      Type *ElemTy = ST->getElementType(Idx);
+      // get the address of the struct field
+      Value *SubAddr = IRB.CreateConstGEP2_32(ST, Addr, 0, Idx);
+      loadShadowRecursive(Shadow, Indices, ElemTy,
+                          SubAddr, Size - Offset, Align, IRB);
+      Indices.pop_back();
+    }
+    return;
+  }
+  llvm_unreachable("Unexpected shadow type");
+}
+
+Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size, uint64_t Align,
                                  Instruction *Pos) {
+  IRBuilder<> IRB(Pos);
+  // if loading from a local variable, load label from its shadow
   if (AllocaInst *AI = dyn_cast<AllocaInst>(Addr)) {
     const auto i = AllocaShadowMap.find(AI);
     if (i != AllocaShadowMap.end()) {
-      IRBuilder<> IRB(Pos);
-      return IRB.CreateLoad(TT.ShadowTy, i->second);
+      return IRB.CreateLoad(TT.PrimitiveShadowTy, i->second);
     }
   }
 
+  // check if the target object is a constant
   SmallVector<const Value *, 2> Objs;
   getUnderlyingObjects(Addr, Objs);
   bool AllConstants = true;
@@ -1571,17 +1847,84 @@ Value *TaintFunction::loadShadow(Value *Addr, uint64_t Size, uint64_t Align,
     break;
   }
   if (AllConstants)
-    return TT.ZeroShadow;
+    return TT.getZeroShadow(T);
 
-  Value *ShadowAddr = TT.getShadowAddress(Addr, Pos);
-  if (Size == 0)
-    return TT.ZeroShadow;
+  // now check if we're loading an aggragate object
+  if (!isa<ArrayType>(T) && !isa<StructType>(T))
+    return loadPrimitiveShadow(Addr, Size, Align, IRB);
 
-  IRBuilder<> IRB(Pos);
-  CallInst *FallbackCall = IRB.CreateCall(
-      TT.TaintUnionLoadFn, {ShadowAddr, ConstantInt::get(TT.IntptrTy, Size)});
-  FallbackCall->addAttribute(AttributeList::ReturnIndex, Attribute::ZExt);
-  return FallbackCall;
+  // if loading an aggregate object, load its shadow recursively
+  SmallVector<unsigned, 4> Indices;
+  Type *ShadowTy = TT.getShadowTy(T);
+  Value *Shadow = UndefValue::get(ShadowTy);
+  loadShadowRecursive(Shadow, Indices, T, Addr, Size, Align, IRB);
+  return Shadow;
+}
+
+void TaintVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
+  auto &DL = I.getModule()->getDataLayout();
+  Value *Ptr = I.getPointerOperand();
+  Value *Val = I.getValOperand();
+  Type *Ty = I.getType();
+  uint64_t Size = DL.getTypeStoreSize(Ty);
+
+  Value *Shadow1 = TF.loadShadow(Ty, Ptr, Size, I.getAlign().value(), &I);
+  Value *Shadow2 = TF.getShadow(Val);
+  Value *Shadow  = nullptr;
+  Value *Op1 = nullptr, *Cond = nullptr;
+  IRBuilder<> IRB(&I);
+
+  switch (I.getOperation()) {
+    case AtomicRMWInst::Xchg:
+      Shadow = Shadow2;
+      break;
+    case AtomicRMWInst::Add:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Add, &I);
+      break;
+    case AtomicRMWInst::Sub:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Sub, &I);
+      break;
+    case AtomicRMWInst::And:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
+      break;
+    case AtomicRMWInst::Nand:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
+      Shadow = TF.combineShadows(TF.TT.getZeroShadow(Ty), Shadow, 2, &I); // __dfsan::Neg
+      break;
+    case AtomicRMWInst::Or:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Or, &I);
+      break;
+    case AtomicRMWInst::Xor:
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Xor, &I);
+      break;
+    case AtomicRMWInst::Max:
+      Op1 = IRB.CreateLoad(Ptr, true);
+      Cond = IRB.CreateICmpSGT(Op1, Val);
+      Shadow = IRB.CreateSelect(Cond, Shadow1, Shadow2);
+      break;
+    case AtomicRMWInst::Min:
+      Op1 = IRB.CreateLoad(Ptr, true);
+      Cond = IRB.CreateICmpSLT(Op1, Val);
+      Shadow = IRB.CreateSelect(Cond, Shadow1, Shadow2);
+      break;
+    case AtomicRMWInst::UMax:
+      Op1 = IRB.CreateLoad(Ptr, true);
+      Cond = IRB.CreateICmpUGT(Op1, Val);
+      Shadow = IRB.CreateSelect(Cond, Shadow1, Shadow2);
+      break;
+    case AtomicRMWInst::UMin:
+      Op1 = IRB.CreateLoad(Ptr, true);
+      Cond = IRB.CreateICmpULT(Op1, Val);
+      Shadow = IRB.CreateSelect(Cond, Shadow1, Shadow2);
+      break;
+    // TODO: support extra operations
+    default:
+      assert(false && "unimplemented atomicrmw operation");
+      break;
+  }
+
+  TF.storeShadow(Ptr, Size, I.getAlign(), Shadow, &I);
+  TF.setShadow(&I, Shadow1);
 }
 
 void TaintVisitor::visitLoadInst(LoadInst &LI) {
@@ -1595,7 +1938,7 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
 
   Align Alignment = ClPreserveAlignment ? LI.getAlign() : Align(1);
   Value *Shadow =
-      TF.loadShadow(LI.getPointerOperand(), Size, Alignment.value(), &LI);
+      TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size, Alignment.value(), &LI);
 #if 0
   //FIXME: tainted pointer
   if (ClCombinePointerLabelsOnLoad) {
@@ -1606,27 +1949,82 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
   if (!TF.TT.isZeroShadow(Shadow))
     TF.NonZeroChecks.push_back(Shadow);
   if (ClTraceBound)
-    TF.checkBounds(LI.getPointerOperand(), &LI);
+    TF.checkBounds(LI.getPointerOperand(), ConstantInt::get(TF.TT.Int64Ty, Size), &LI);
 
   TF.setShadow(&LI, Shadow);
 }
 
+void TaintFunction::storeShadowRecursive(
+    Value *Shadow, SmallVector<unsigned, 4> &Indices, Type *SubShadowTy,
+    Value *Addr, uint64_t Size, uint64_t Align, IRBuilder<> &IRB) {
+  auto &DL = F->getParent()->getDataLayout();
+
+  if (!isa<ArrayType>(SubShadowTy) && !isa<StructType>(SubShadowTy)) {
+    uint64_t SubSize = DL.getTypeStoreSize(SubShadowTy);
+    assert(Size >= SubSize);
+    Align = std::min(Align, (uint64_t)DL.getABITypeAlignment(SubShadowTy));
+    // load a primitive shadow from the sub-field
+    Value *PrimitiveShadow = IRB.CreateExtractValue(Shadow, Indices);
+    // then store the primitive shadow into the shadow address
+    Value *ShadowAddr = TT.getShadowAddress(Addr, IRB);
+    IRB.CreateCall(TT.TaintUnionStoreFn,
+        {PrimitiveShadow, ShadowAddr, ConstantInt::get(TT.IntptrTy, SubSize)});
+    return;
+  }
+
+  if (ArrayType *AT = dyn_cast<ArrayType>(SubShadowTy)) {
+    for (unsigned Idx = 0; Idx < AT->getNumElements(); Idx++) {
+      Indices.push_back(Idx);
+      // double check the remaining size
+      Type *ElemTy = AT->getElementType();
+      uint64_t ElemSize = DL.getTypeStoreSize(ElemTy);
+      uint64_t Offset = ElemSize * Idx;
+      assert(Offset <= Size);
+      // get the address of the array element
+      Value *SubAddr = IRB.CreateConstGEP2_32(AT, Addr, 0, Idx);
+      storeShadowRecursive(Shadow, Indices, ElemTy,
+                           SubAddr, Size - Offset, Align, IRB);
+      Indices.pop_back();
+    }
+    return;
+  }
+
+  if (StructType *ST = dyn_cast<StructType>(SubShadowTy)) {
+    const StructLayout *SL = DL.getStructLayout(ST);
+    for (unsigned Idx = 0; Idx < ST->getNumElements(); Idx++) {
+      Indices.push_back(Idx);
+      // double check the remaining size
+      uint64_t Offset = SL->getElementOffset(Idx);
+      assert(Offset <= Size);
+      Type *ElemTy = ST->getElementType(Idx);
+      // get the address of the struct field
+      Value *SubAddr = IRB.CreateConstGEP2_32(ST, Addr, 0, Idx);
+      storeShadowRecursive(Shadow, Indices, ElemTy,
+                           SubAddr, Size - Offset, Align, IRB);
+      Indices.pop_back();
+    }
+    return;
+  }
+  llvm_unreachable("Unexpected shadow type");
+}
+
 void TaintFunction::storeShadow(Value *Addr, uint64_t Size, Align Alignment,
                                 Value *Shadow, Instruction *Pos) {
+  IRBuilder<> IRB(Pos);
   if (AllocaInst *AI = dyn_cast<AllocaInst>(Addr)) {
     const auto i = AllocaShadowMap.find(AI);
     if (i != AllocaShadowMap.end()) {
-      IRBuilder<> IRB(Pos);
       auto *SI = IRB.CreateStore(Shadow, i->second);
       SkipInsts.insert(SI);
       return;
     }
   }
 
-  const Align ShadowAlign(Alignment.value() * TT.ShadowWidthBytes);
-  IRBuilder<> IRB(Pos);
-  Value *ShadowAddr = TT.getShadowAddress(Addr, Pos);
+  Value *ShadowAddr = TT.getShadowAddress(Addr, IRB);
+  // check if the shadow is zero, if so, clear the shadow memory regardless
+  // of the shadow type
   if (TT.isZeroShadow(Shadow)) {
+    const Align ShadowAlign(Alignment.value() * TT.ShadowWidthBytes);
     IntegerType *ShadowTy = IntegerType::get(*TT.Ctx, Size * TT.ShadowWidthBits);
     Value *ExtZeroShadow = ConstantInt::get(ShadowTy, 0);
     Value *ExtShadowAddr =
@@ -1635,8 +2033,19 @@ void TaintFunction::storeShadow(Value *Addr, uint64_t Size, Align Alignment,
     return;
   }
 
-  IRB.CreateCall(TT.TaintUnionStoreFn,
+  // now check if we're storing an aggragate shadow object
+  Type *T = Shadow->getType();
+  if (!isa<ArrayType>(T) && !isa<StructType>(T)) {
+    IRB.CreateCall(TT.TaintUnionStoreFn,
                 {Shadow, ShadowAddr, ConstantInt::get(TT.IntptrTy, Size)});
+    return;
+  }
+
+  // if storing an aggregate shadow object, store its shadow recursively
+  // we want to do this so union_store may have a chance to simplify some
+  // constraints
+  SmallVector<unsigned, 4> Indices;
+  storeShadowRecursive(Shadow, Indices, T, Addr, Size, Alignment.value(), IRB);
 }
 
 void TaintVisitor::visitStoreInst(StoreInst &SI) {
@@ -1659,7 +2068,7 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
 #endif
   TF.storeShadow(SI.getPointerOperand(), Size, Alignment, Shadow, &SI);
   if (ClTraceBound)
-    TF.checkBounds(SI.getPointerOperand(), &SI);
+    TF.checkBounds(SI.getPointerOperand(), ConstantInt::get(TF.TT.Int64Ty, Size), &SI);
 }
 
 //void TaintVisitor::visitUnaryOperator(UnaryOperator &UO) {
@@ -1687,7 +2096,7 @@ void TaintFunction::visitCmpInst(CmpInst *I) {
   // get operand
   Value *Op1 = I->getOperand(0);
   unsigned size = DL.getTypeSizeInBits(Op1->getType());
-  ConstantInt *Size = ConstantInt::get(TT.ShadowTy, size);
+  ConstantInt *Size = ConstantInt::get(TT.PrimitiveShadowTy, size);
   Value *Op2 = I->getOperand(1);
   Value *Op1Shadow = getShadow(Op1);
   Value *Op2Shadow = getShadow(Op2);
@@ -1695,7 +2104,7 @@ void TaintFunction::visitCmpInst(CmpInst *I) {
   Op2 = IRB.CreateZExtOrTrunc(Op2, TT.Int64Ty);
   // get predicate
   int predicate = I->getPredicate();
-  ConstantInt *Predicate = ConstantInt::get(TT.ShadowTy, predicate);
+  ConstantInt *Predicate = ConstantInt::get(TT.PrimitiveShadowTy, predicate);
 
   IRB.CreateCall(TT.TaintTraceCmpFn, {Op1Shadow, Op2Shadow, Size, Predicate,
                  Op1, Op2});
@@ -1722,9 +2131,9 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   if (TT.isZeroShadow(CondShadow))
     return;
   unsigned size = DL.getTypeSizeInBits(Cond->getType());
-  ConstantInt *Size = ConstantInt::get(TT.ShadowTy, size);
-  ConstantInt *Predicate = ConstantInt::get(TT.ShadowTy, 32); // EQ, ==
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  ConstantInt *Size = ConstantInt::get(TT.PrimitiveShadowTy, size);
+  ConstantInt *Predicate = ConstantInt::get(TT.PrimitiveShadowTy, 32); // EQ, ==
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getBasicblockId(I->getParent()));
 
   for (auto C : I->cases()) {
     Value *CV = C.getCaseValue();
@@ -1732,8 +2141,8 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
     IRBuilder<> IRB(I);
     Cond = IRB.CreateZExtOrTrunc(Cond, TT.Int64Ty);
     CV = IRB.CreateZExtOrTrunc(CV, TT.Int64Ty);
-    IRB.CreateCall(TT.TaintTraceCmpFn, {CondShadow, TT.ZeroShadow, Size, Predicate,
-                   Cond, CV, CID});
+    IRB.CreateCall(TT.TaintTraceCmpFn, {CondShadow, TT.ZeroPrimitiveShadow,
+                    Size, Predicate, Cond, CV, CID});
   }
 }
 
@@ -1748,6 +2157,22 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   int64_t CurrentOffset = 0;
 
   IRBuilder<> IRB(I);
+  Value *Base = I->getPointerOperand();
+  Value *Bounds = TT.getZeroShadow(Base);
+  if (ClTraceBound) {
+    // set shadow for global variable
+    if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Base->stripPointerCasts())) {
+      // if the base pointer is a global variable
+      // we can't get its shadow from the shadow map
+      Bounds = getShadowForGlobal(GV, IRB);
+    } else {
+      Bounds = getShadow(Base);
+      if (TT.isZeroShadow(Bounds)) {
+        Bounds = getShadow(Base->stripPointerCasts());
+      }
+    }
+  }
+
   Type *ETy = I->getPointerOperandType();
   for (auto &Idx: I->indices()) {
     // reference: DataLayout::getIndexedOffsetInType
@@ -1782,8 +2207,7 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
           ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, CurrentOffset);
           ConstantInt *ES = ConstantInt::get(TT.Int64Ty, DL.getTypeAllocSize(ETy));
           ConstantInt *NE = ConstantInt::get(TT.Int64Ty, NumElements);
-          Value *Ptr = IRB.CreatePtrToInt(I->getPointerOperand(), TT.Int64Ty);
-          Value *Bounds = getShadow(I->getPointerOperand());
+          Value *Ptr = IRB.CreatePtrToInt(Base, TT.Int64Ty);
           IRB.CreateCall(TT.TaintTraceGEPFn, {Bounds, Ptr, Shadow, Index, NE, ES, Offset});
         } else {
           break;
@@ -1791,9 +2215,9 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
       }
     }
   }
+
   if (ClTraceBound) {
     // propagate bounds info
-    Value *Bounds = getShadow(I->getPointerOperand());
     setShadow(I, Bounds);
   }
 }
@@ -1817,25 +2241,36 @@ void TaintVisitor::visitShuffleVectorInst(ShuffleVectorInst &I) {
 }
 
 void TaintVisitor::visitExtractValueInst(ExtractValueInst &I) {
-  //FIXME:
+  if (I.getMetadata("nosanitize")) return;
+
+  IRBuilder<> IRB(&I);
+  Value *Agg = I.getAggregateOperand();
+  Value *AggShadow = TF.getShadow(Agg);
+  Value *ResShadow = IRB.CreateExtractValue(AggShadow, I.getIndices());
+  TF.setShadow(&I, ResShadow);
 }
 
 void TaintVisitor::visitInsertValueInst(InsertValueInst &I) {
-  //FIXME:
+  if (I.getMetadata("nosanitize")) return;
+
+  IRBuilder<> IRB(&I);
+  Value *AggShadow = TF.getShadow(I.getAggregateOperand());
+  Value *InsShadow = TF.getShadow(I.getInsertedValueOperand());
+  Value *Res = IRB.CreateInsertValue(AggShadow, InsShadow, I.getIndices());
+  TF.setShadow(&I, Res);
 }
 
-Value *TaintFunction::visitAllocaInst(AllocaInst *I) {
+Value *TaintFunction::visitAllocaInst(AllocaInst *I, Value *ArraySize, Type *ElTy) {
   // insert after the instruction to get the address
   BasicBlock::iterator ip(I);
   IRBuilder<> IRB(I->getParent(), ++ip);
-  // get size
-  Value *Size = I->getArraySize();
-  Value *SizeShadow = getShadow(Size);
-  Size = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
+  // prepare array size
+  Value *Size = IRB.CreateZExtOrTrunc(ArraySize, TT.Int64Ty);
+  Value *SizeShadow = getShadow(ArraySize);
   // get element size
   Module *M = F->getParent();
   auto &DL = M->getDataLayout();
-  uint64_t es = DL.getTypeAllocSize(I->getAllocatedType());
+  uint64_t es = DL.getTypeAllocSize(ElTy);
   ConstantInt *ElemSize = ConstantInt::get(TT.Int64Ty, es);
   // get address
   Value *Address = IRB.CreatePtrToInt(I, TT.Int64Ty);
@@ -1860,16 +2295,39 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
   }
   if (AllLoadsStores) {
     IRBuilder<> IRB(&I);
-    AllocaInst *AI = IRB.CreateAlloca(TF.TT.ShadowTy);
+    AllocaInst *AI = IRB.CreateAlloca(TF.TT.PrimitiveShadowTy);
     TF.AllocaShadowMap[&I] = AI;
+    if (ClTraceBound) {
+      // set shadow to uninit
+      IRB.CreateStore(TF.TT.UninitializedPrimitiveShadow, AI);
+    }
   }
-  Type *T = I.getAllocatedType();
-  bool isArray = I.isArrayAllocation() | T->isArrayTy();
-  if (!ClTraceBound || !isArray) {
-    TF.setShadow(&I, TF.TT.ZeroShadow);
+  if (!ClTraceBound) {
+    TF.setShadow(&I, TF.TT.ZeroPrimitiveShadow);
   } else {
-    Value *Bounds = TF.visitAllocaInst(&I);
-    TF.setShadow(&I, Bounds);
+    Type *T = I.getAllocatedType();
+    Value *ArraySize = I.getArraySize();
+    bool TrackBounds = I.isArrayAllocation() | T->isArrayTy() | T->isStructTy();
+    if (TrackBounds) {
+      // array could be VLA, rely on runtime
+      Value *Bounds = TF.visitAllocaInst(&I, ArraySize, T);
+      TF.setShadow(&I, Bounds);
+    } else {
+      TF.setShadow(&I, TF.TT.ZeroPrimitiveShadow); // no bounds
+    }
+    // set uninit shadow for allocation with constant size
+    if (!AllLoadsStores && isa<ConstantInt>(ArraySize)) {
+      // handle not all loads and stores cases here
+      IRBuilder<> IRB(I.getNextNode());
+      auto DL = I.getModule()->getDataLayout();
+      auto size = I.getAllocationSizeInBits(DL);
+      assert(size != None);
+      Value *Size = ConstantInt::get(TF.TT.IntptrTy, (size->getValue() + 7) >> 3);
+      IRB.CreateCall(TF.TT.TaintSetLabelFn,
+                      {TF.TT.UninitializedPrimitiveShadow,
+                      IRB.CreateBitCast(&I, Type::getInt8PtrTy(*TF.TT.Ctx)),
+                      Size});
+    }
   }
 }
 
@@ -1880,7 +2338,7 @@ void TaintVisitor::visitSelectInst(SelectInst &I) {
 
   if (isa<VectorType>(Condition->getType())) {
     //FIXME:
-    TF.setShadow(&I, TF.TT.ZeroShadow);
+    TF.setShadow(&I, TF.TT.ZeroPrimitiveShadow);
   } else {
     Value *ShadowSel;
     if (TrueShadow == FalseShadow) {
@@ -1895,6 +2353,10 @@ void TaintVisitor::visitSelectInst(SelectInst &I) {
 }
 
 void TaintVisitor::visitMemSetInst(MemSetInst &I) {
+  // check bounds before memset
+  if (ClTraceBound) {
+    TF.checkBounds(I.getDest(), I.getLength(), &I);
+  }
   IRBuilder<> IRB(&I);
   Value *ValShadow = TF.getShadow(I.getValue());
   IRB.CreateCall(TF.TT.TaintSetLabelFn,
@@ -1904,9 +2366,14 @@ void TaintVisitor::visitMemSetInst(MemSetInst &I) {
 }
 
 void TaintVisitor::visitMemTransferInst(MemTransferInst &I) {
+  // check bounds before memcpy
+  if (ClTraceBound) {
+    TF.checkBounds(I.getDest(), I.getLength(), &I);
+    TF.checkBounds(I.getSource(), I.getLength(), &I);
+  }
   IRBuilder<> IRB(&I);
-  Value *DestShadow = TF.TT.getShadowAddress(I.getDest(), &I);
-  Value *SrcShadow = TF.TT.getShadowAddress(I.getSource(), &I);
+  Value *DestShadow = TF.TT.getShadowAddress(I.getDest(), IRB);
+  Value *SrcShadow = TF.TT.getShadowAddress(I.getSource(), IRB);
   Value *LenShadow = IRB.CreateMul(
       I.getLength(),
       ConstantInt::get(I.getLength()->getType(), TF.TT.ShadowWidthBytes));
@@ -1940,7 +2407,6 @@ void TaintVisitor::visitMemTransferInst(MemTransferInst &I) {
     MTI->setSourceAlignment(Align(TF.TT.ShadowWidthBytes));
   }
 #endif
-  // FIXME trace memcpy
 }
 
 void TaintVisitor::visitReturnInst(ReturnInst &RI) {
@@ -1951,7 +2417,7 @@ void TaintVisitor::visitReturnInst(ReturnInst &RI) {
       IRBuilder<> IRB(&RI);
       Type *RT = TF.F->getFunctionType()->getReturnType();
       unsigned Size =
-          getDataLayout().getTypeAllocSize(TF.TT.ShadowTy);
+          getDataLayout().getTypeAllocSize(TF.TT.getShadowTy(RT));
       if (Size <= kRetvalTLSSize) {
         // If the size overflows, stores nothing. At callsite, oversized return
         // shadows are set to zero.
@@ -2012,7 +2478,7 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
   // trace indirect call
   if (CB.getCalledFunction() == nullptr) {
     Value *Shadow = TF.getShadow(CB.getCalledOperand());
-    if (Shadow != TF.TT.ZeroShadow)
+    if (!TF.TT.isZeroShadow(Shadow))
       IRB.CreateCall(TF.TT.TaintTraceIndirectCallFn, {Shadow});
   }
 
@@ -2023,21 +2489,47 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       TF.TT.UnwrappedFnMap.find(CB.getCalledOperand());
   if (i != TF.TT.UnwrappedFnMap.end()) {
     Function *F = i->second;
+    Value *Shadow = nullptr;
     switch (TF.TT.getWrapperKind(F)) {
     case Taint::WK_Warning:
       CB.setCalledFunction(F);
       IRB.CreateCall(TF.TT.TaintUnimplementedFn,
                      IRB.CreateGlobalStringPtr(F->getName()));
-      TF.setShadow(&CB, TF.TT.ZeroShadow);
+      TF.setShadow(&CB, TF.TT.getZeroShadow(&CB));
       return;
     case Taint::WK_Discard:
       CB.setCalledFunction(F);
-      TF.setShadow(&CB, TF.TT.ZeroShadow);
+      TF.setShadow(&CB, TF.TT.getZeroShadow(&CB));
       return;
     case Taint::WK_Functional:
       CB.setCalledFunction(F);
       //FIXME:
       // visitOperandShadowInst(CS);
+      return;
+    case Taint::WK_Memcmp:
+      CB.setCalledFunction(F);
+      assert(CB.arg_size() == 3);
+      Shadow = IRB.CreateCall(TF.TT.TaintMemcmpFn,
+                             {CB.getArgOperand(0),
+                              CB.getArgOperand(1),
+                              CB.getArgOperand(2)});
+      TF.setShadow(&CB, Shadow);
+      return;
+    case Taint::WK_Strcmp:
+      CB.setCalledFunction(F);
+      assert(CB.arg_size() == 2);
+      Shadow = IRB.CreateCall(TF.TT.TaintStrcmpFn,
+                             {CB.getArgOperand(0), CB.getArgOperand(1)});
+      TF.setShadow(&CB, Shadow);
+      return;
+    case Taint::WK_Strncmp:
+      CB.setCalledFunction(F);
+      assert(CB.arg_size() == 3);
+      Shadow = IRB.CreateCall(TF.TT.TaintStrncmpFn,
+                             {CB.getArgOperand(0),
+                              CB.getArgOperand(1),
+                              CB.getArgOperand(2)});
+      TF.setShadow(&CB, Shadow);
       return;
     case Taint::WK_Custom:
       // Don't try to handle invokes of custom functions, it's too complicated.
@@ -2084,11 +2576,15 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
 
         i = CB.arg_begin();
         const unsigned ShadowArgStart = Args.size();
-        for (unsigned n = FT->getNumParams(); n != 0; ++i, --n)
-          Args.push_back(TF.getShadow(*i));
+        for (unsigned n = FT->getNumParams(); n != 0; ++i, --n) {
+          auto *GV = dyn_cast<GlobalVariable>((*i)->stripPointerCasts());
+          Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
+                        : TF.getShadow(*i);
+          Args.push_back(Shadow); // we don't collapse shadow
+        }
 
         if (FT->isVarArg()) {
-          auto *LabelVATy = ArrayType::get(TF.TT.ShadowTy,
+          auto *LabelVATy = ArrayType::get(TF.TT.PrimitiveShadowTy,
                                            CB.arg_size() - FT->getNumParams());
           auto *LabelVAAlloca = new AllocaInst(
               LabelVATy, getDataLayout().getAllocaAddrSpace(),
@@ -2096,16 +2592,20 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
 
           for (unsigned n = 0; i != CB.arg_end(); ++i, ++n) {
             auto LabelVAPtr = IRB.CreateStructGEP(LabelVATy, LabelVAAlloca, n);
-            IRB.CreateStore(TF.getShadow(*i), LabelVAPtr);
+            auto *GV = dyn_cast<GlobalVariable>((*i)->stripPointerCasts());
+            Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
+                          : TF.getShadow(*i);
+            IRB.CreateStore(Shadow, LabelVAPtr);
           }
 
           Args.push_back(IRB.CreateStructGEP(LabelVATy, LabelVAAlloca, 0));
         }
 
-        if (!FT->getReturnType()->isVoidTy()) {
+        Type *RetTy = FT->getReturnType();
+        if (!RetTy->isVoidTy()) {
           if (!TF.LabelReturnAlloca) {
             TF.LabelReturnAlloca =
-              new AllocaInst(TF.TT.ShadowTy,
+              new AllocaInst(TF.TT.getShadowTy(RetTy),
                              getDataLayout().getAllocaAddrSpace(),
                              "labelreturn", &TF.F->getEntryBlock().front());
           }
@@ -2125,15 +2625,16 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
         // which consider ShadowTy an illegal type.
         for (unsigned n = 0; n < FT->getNumParams(); n++) {
           const unsigned ArgNo = ShadowArgStart + n;
-          if (CustomCI->getArgOperand(ArgNo)->getType() == TF.TT.ShadowTy) {
+          if (CustomCI->getArgOperand(ArgNo)->getType() ==
+              TF.TT.PrimitiveShadowTy) {
             CustomCI->addParamAttr(ArgNo, Attribute::ZExt);
             CustomCI->removeParamAttr(ArgNo, Attribute::NonNull);
           }
         }
 
-        if (!FT->getReturnType()->isVoidTy()) {
+        if (!RetTy->isVoidTy()) {
           LoadInst *LabelLoad =
-              IRB.CreateLoad(TF.TT.ShadowTy, TF.LabelReturnAlloca);
+              IRB.CreateLoad(TF.TT.getShadowTy(RetTy), TF.LabelReturnAlloca);
           TF.setShadow(CustomCI, LabelLoad);
         }
 
@@ -2156,8 +2657,12 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       // after overflow have zero shadow values.
       if (ArgOffset + Size > kArgTLSSize)
         break;
+      Value *Arg = CB.getArgOperand(I);
+      auto *GV = dyn_cast<GlobalVariable>(Arg->stripPointerCasts());
+      Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
+                    : TF.getShadow(Arg);
       IRB.CreateAlignedStore(
-          TF.getShadow(CB.getArgOperand(I)),
+          Shadow,
           TF.getArgTLS(FT->getParamType(I), ArgOffset, IRB),
           kShadowTLSAlignment);
       ArgOffset += alignTo(Size, kShadowTLSAlignment);
@@ -2210,19 +2715,26 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       Args.push_back(*i);
 
     i = CB.arg_begin();
-    for (unsigned n = FT->getNumParams(); n != 0; ++i, --n)
-      Args.push_back(TF.getShadow(*i));
+    for (unsigned n = FT->getNumParams(); n != 0; ++i, --n) {
+      auto *GV = dyn_cast<GlobalVariable>((*i)->stripPointerCasts());
+      Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
+                    : TF.getShadow(*i);
+      Args.push_back(Shadow);
+    }
 
     if (FT->isVarArg()) {
       unsigned VarArgSize = CB.arg_size() - FT->getNumParams();
-      ArrayType *VarArgArrayTy = ArrayType::get(TF.TT.ShadowTy, VarArgSize);
+      ArrayType *VarArgArrayTy = ArrayType::get(TF.TT.PrimitiveShadowTy, VarArgSize);
       AllocaInst *VarArgShadow =
         new AllocaInst(VarArgArrayTy, getDataLayout().getAllocaAddrSpace(),
                        "", &TF.F->getEntryBlock().front());
       Args.push_back(IRB.CreateConstGEP2_32(VarArgArrayTy, VarArgShadow, 0, 0));
       for (unsigned n = 0; i != E; ++i, ++n) {
+        auto *GV = dyn_cast<GlobalVariable>((*i)->stripPointerCasts());
+        Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
+                      : TF.getShadow(*i);
         IRB.CreateStore(
-            TF.getShadow(*i),
+            Shadow,
             IRB.CreateConstGEP2_32(VarArgArrayTy, VarArgShadow, 0, n));
         Args.push_back(*i);
       }
@@ -2256,11 +2768,12 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
 }
 
 void TaintVisitor::visitPHINode(PHINode &PN) {
+  Type *ShadowTy = TF.TT.getShadowTy(&PN);
   PHINode *ShadowPN =
-      PHINode::Create(TF.TT.ShadowTy, PN.getNumIncomingValues(), "", &PN);
+      PHINode::Create(ShadowTy, PN.getNumIncomingValues(), "", &PN);
 
   // Give the shadow phi node valid predecessors to fool SplitEdge into working.
-  Value *UndefShadow = UndefValue::get(TF.TT.ShadowTy);
+  Value *UndefShadow = UndefValue::get(ShadowTy);
   for (PHINode::block_iterator i = PN.block_begin(), e = PN.block_end(); i != e;
        ++i) {
     ShadowPN->addIncoming(UndefShadow, *i);
@@ -2270,50 +2783,14 @@ void TaintVisitor::visitPHINode(PHINode &PN) {
   TF.setShadow(&PN, ShadowPN);
 }
 
-static inline bool isLoopLatch(const BasicBlock *BB, const BasicBlock *Header) {
-  const BasicBlock *Succ = nullptr;
-  SmallVector<const BasicBlock*> Visited;
-  while (BB != Header) {
-    Visited.push_back(BB);
-    if ((Succ = BB->getSingleSuccessor()) == nullptr)
-      return false;
-    BB = Succ;
-    if (Visited.end() != std::find(Visited.begin(), Visited.end(), BB))
-      return false; // found a cycle
-  }
-  return true;
-}
-
 void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   IRBuilder<> IRB(I);
   // get operand
   Value *Shadow = getShadow(Condition);
-  uint8_t flag = 0;
-  if (ClTraceLoop && isa<BranchInst>(I)) {
-    // check loop exit and latch
-    BasicBlock *BB = I->getParent();
-    Loop *L = LI->getLoopFor(BB);
-    if (L) {
-      BranchInst *BI = cast<BranchInst>(I);
-      BasicBlock *TB = I->getSuccessor(0);
-      BasicBlock *FB = I->getSuccessor(1);
-      if (isLoopLatch(TB, L->getHeader())) // loop latch
-        flag |= 0x8;
-      if (isLoopLatch(FB, L->getHeader())) // loop latch
-        flag |= 0x4;
-      if (!L->contains(TB)) // loop exit
-        flag |= 0x2;
-      if (!L->contains(FB)) // loop exit
-        flag |= 0x1;
-    }
-  }
-  // we are not interested if the condition is not tainted,
-  // except for loop exit
-  if (Shadow == TT.ZeroShadow && (flag & 0x3) == 0)
+  if (TT.isZeroShadow(Shadow))
     return;
-  ConstantInt *LF = ConstantInt::get(TT.Int8Ty, flag);
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
-  IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, LF, CID});
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getBasicblockId(I->getParent()));
+  IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, CID});
 }
 
 void TaintVisitor::visitBranchInst(BranchInst &BR) {
