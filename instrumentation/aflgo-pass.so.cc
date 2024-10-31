@@ -39,6 +39,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <map>
 
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/IRBuilder.h"
@@ -141,6 +142,24 @@ void getFuncDebugLoc(const Function *F, std::string &Filename, unsigned &Line) {
     getInsDebugLoc(I, Filename, Line, col);
 }
 
+uint32_t getBasicblockId(BasicBlock &BB) {
+  static uint32_t unamed = 0;
+  std::string bb_name_with_col("");
+  std::string filename;
+  unsigned line = 0;
+  unsigned col = 0;
+  getBBDebugLoc(&BB, filename, line, col);
+  if (!filename.empty() && line != 0 ){
+    bb_name_with_col = filename + ":" + std::to_string(line) + ":" + std::to_string(col);
+  }else{
+    std::size_t found = filename.find_last_of("/\\");
+    if (found != std::string::npos)
+      filename = filename.substr(found + 1);
+    bb_name_with_col = filename + ":unamed:" + std::to_string(unamed++);
+  }
+  return djbHash(bb_name_with_col);
+}
+
 template<>
 struct DOTGraphTraits<Function*> : public DefaultDOTGraphTraits {
   DOTGraphTraits(bool isSimple=false) : DefaultDOTGraphTraits(isSimple) {}
@@ -230,7 +249,7 @@ bool AFLCoverage::runOnModule(Module &M) {
   }
 
   std::list<std::string> targets;
-  std::map<std::string, int> bb_to_dis;
+  std::map<uint64_t, int> bb_to_dis;
 
   if (!TargetsFile.empty()) {
 
@@ -256,13 +275,17 @@ bool AFLCoverage::runOnModule(Module &M) {
 
       std::string line;
       while (getline(cf, line)) {
-
-        std::size_t pos = line.find(",");
-        std::string bb_name = line.substr(0, pos);
-        int bb_dis = (int) atof(line.substr(pos + 1, line.length()).c_str());
-
-        bb_to_dis[bb_name] = bb_dis;
-
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string token;
+        getline(ss, token, ',');
+        uint64_t BB_id = std::stoull(token);
+        // Read filename:loc (not used here)
+        getline(ss, token, ',');
+        // Read distance
+        getline(ss, token, ',');
+        int bb_dis = (int) atof(token.c_str());
+        bb_to_dis[BB_id] = bb_dis;
       }
       cf.close();
 
@@ -437,23 +460,15 @@ bool AFLCoverage::runOnModule(Module &M) {
 
     for (auto &F : M) {
 
-      int distance = -1;
-
       for (auto &BB : F) {
 
-        distance = -2;
+        int distance = -2;
+        uint64_t bb_id = (uint64_t) getBasicblockId(BB);
 
         if (is_aflgo) {
-
-          std::string bb_name;
-          std::string filename;
-          unsigned int line = 0;
-          unsigned int col = 0;
-          getBBDebugLoc(&BB, filename, line, col);
-          bb_name = filename + ":" + std::to_string(line);
-          if (!bb_name.empty() && bb_to_dis.find(bb_name) != bb_to_dis.end()) {
+          if (bb_to_dis.find(bb_id) != bb_to_dis.end()) {
             /* Find distance for BB */
-            distance = bb_to_dis[bb_name];
+            distance = bb_to_dis[bb_id];
           }
         }
 
