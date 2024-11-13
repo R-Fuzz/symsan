@@ -12,8 +12,8 @@ DISK_LIMIT_SIZE = 1 * (1 << 30) # 1GB
 SYNC_FREQUENCY = 10 # sync mazerunner status with AFL every SYNC_FREQUENCY executions.
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 REPLAY_FREQUENCY = 0 # off-learning from replay buffer every REPLAY_FREQUENCY executions.
-TARGET_REACHED_EXIT = True
-TARGET_TRIGGERED_EXIT = False
+TARGET_REACHED_EXIT = False
+TARGET_TRIGGERED_EXIT = True
 BUG_TRIGGER_DISTANCE = 3 * 1000 # start bug triggering after reaching this distance value
 # Solver configurations
 USE_BUILTIN_SOLVER = False
