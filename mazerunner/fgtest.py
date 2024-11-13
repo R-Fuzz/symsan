@@ -30,7 +30,6 @@ if __name__ == "__main__":
         print_usage_exit()
     is_stdin = (AT_FILE != sys.argv[-1] and len(sys.argv) == 2)
     config = Config()
-    config.gep_solver_enabled = True
     config.cmd = [sys.argv[1]]
     
     if 'BIN_ARGS' in os.environ:
