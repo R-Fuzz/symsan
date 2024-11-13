@@ -289,7 +289,9 @@ class Agent:
         self.min_distance = self.config.max_distance
 
     def handle_new_state(self, msg, action, is_symbranch):
-        pass
+        if is_symbranch:
+            self.update_curr_state(msg, action)
+            self.append_episode()
     
     def handle_unsat_condition(self, solving_status):
         pass
@@ -374,11 +376,6 @@ class Agent:
 
 
 class LazyAgent(Agent):
-
-    def handle_new_state(self, msg, action, is_symbranch):
-        if is_symbranch:
-            self.update_curr_state(msg, action)
-            self.append_episode()
 
     def is_interesting_branch(self):
         return False
