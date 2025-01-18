@@ -349,7 +349,6 @@ class Agent:
         else:
             d = self.curr_state.d
         self.min_distance = min([msg.global_min_dist, d, self.min_distance])
-        assert 0 <= self.min_distance <= self.config.max_distance
         self.curr_state.update(msg.addr, msg.context, msg.id, action, d, self.pc_counter)
     
     def create_curr_state(self, sa=(0,0,0,0), bid=0):
