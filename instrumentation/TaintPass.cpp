@@ -2044,6 +2044,9 @@ void TaintFunction::storeShadow(Value *Addr, uint64_t Size, Align Alignment,
   // if storing an aggregate shadow object, store its shadow recursively
   // we want to do this so union_store may have a chance to simplify some
   // constraints
+  //
+  // get the actual value type, FIXME pass value type for newer llvm
+  T = cast<PointerType>(Addr->getType()->getScalarType())->getElementType();
   SmallVector<unsigned, 4> Indices;
   storeShadowRecursive(Shadow, Indices, T, Addr, Size, Alignment.value(), IRB);
 }
