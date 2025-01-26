@@ -29,6 +29,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <map>
 #include <algorithm>
 
@@ -55,6 +56,9 @@
 u8  __afl_area_initial[MAP_SIZE + 24]; // 8 + 8 + 8 bytes for additional data
 u8* __afl_area_ptr = __afl_area_initial;
 const char * distance_fp __attribute__((weak)) = nullptr;
+
+// critical branches that used to detect path divergence
+std::unordered_set<uint32_t> critical_branches;
 
 std::map<u64, int> bb_to_dis;
 
@@ -171,6 +175,40 @@ void __afl_manual_init(void) {
 
 } // extern "C"
 
+
+void __initialize_critical_branches() {
+  const char *filename = getenv("CRITICAL_BRANCH_FILEPATH");
+  if (filename == NULL) {
+    fprintf(stderr, "WARNING: ENV VAR CRITICAL_BRANCH_FILEPATH is not set\n");
+    return;
+  }
+  if (strcmp(filename, "") != 0) {
+    fprintf(stderr, "WARNING: critical branch file is not set\n");
+    return;
+  }
+  std::ifstream file_stream(filename);
+  if (!file_stream.is_open()) {
+    fprintf(stderr, "WARNING: failed to open critical branch file with ifstream\n");
+    return;
+  }
+  if (file_stream.tellg() == 0) {
+    file_stream.close();
+    return;
+  }
+  std::string line;
+  while (std::getline(file_stream, line)) {
+    std::istringstream iss(line);
+    uint32_t branch_id;
+    if (iss >> branch_id) {
+      critical_branches.insert(branch_id);
+    } else {
+      fprintf(stderr, "WARNING: failed to parse line in critical branch file\n");
+      break;
+    }
+  }
+  file_stream.close();
+}
+
 __attribute__((constructor(CONST_PRIO))) void __afl_auto_init(void) {
     // Initialize the shared memory area to zero
     std::memset(__afl_area_ptr, 0, MAP_SIZE + 24);
@@ -180,6 +218,7 @@ __attribute__((constructor(CONST_PRIO))) void __afl_auto_init(void) {
     std::memcpy(__afl_area_ptr + MAP_SIZE, &max, sizeof(u64));
     std::memcpy(__afl_area_ptr + MAP_SIZE + 8, &max, sizeof(u64));
 
+    __initialize_critical_branches();
     // Optionally handle persistent mode
     // is_persistent = !!std::getenv(PERSIST_ENV_VAR);
 

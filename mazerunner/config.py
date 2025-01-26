@@ -195,8 +195,12 @@ class Config:
                     df = float(items[1]) if items[1] != 'inf' else None
                     dt = float(items[2]) if items[2] != 'inf' else None
                     self.initial_policy[bid] = (df, dt)
+            self.logger.debug(f"initial policy loaded from {policy_txt}")
+            return
         policy_pkl = os.path.join(self.static_result_folder, "policy.pkl")
         if os.path.isfile(policy_pkl):
             with open(policy_pkl, 'rb') as file:
                 self.initial_policy = pickle.load(file)
+            self.logger.debug(f"initial policy loaded from {policy_pkl}")
+            return
         self.logger.warning(f"policy file does not exist, using random initial policy.")
