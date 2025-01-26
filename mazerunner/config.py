@@ -124,7 +124,7 @@ class Config:
             self.static_result_folder = args.static_result_folder
             distance_file = os.path.join(self.static_result_folder, "distance.cfg.txt")
             self.max_distance = self._load_distance_file(distance_file)
-            self.initial_policy = self._load_initial_policy()
+            self._load_initial_policy()
         
     def validate_config(self):
         # TODO: validate the configurations after loading
@@ -167,7 +167,8 @@ class Config:
         self.mazerunner_dir = ''
         self.initial_seed_dir = ''
         self.cmd = ''
-        self.static_result_folder = ''
+        self.static_result_folder = '/tmp'
+        self.initial_policy = {}
 
     def _load_distance_file(self, fp):
         max_distance = -float('inf')
@@ -180,7 +181,6 @@ class Config:
         return max_distance
 
     def _load_initial_policy(self):
-        policy = {}
         policy_txt = os.path.join(self.static_result_folder, "policy.txt")
         if os.path.isfile(policy_txt):
             with open(policy_txt, 'r') as file:
@@ -194,12 +194,9 @@ class Config:
                     bid = int(items[0])
                     df = float(items[1]) if items[1] != 'inf' else None
                     dt = float(items[2]) if items[2] != 'inf' else None
-                    policy[bid] = (df, dt)
-                return policy
+                    self.initial_policy[bid] = (df, dt)
         policy_pkl = os.path.join(self.static_result_folder, "policy.pkl")
         if os.path.isfile(policy_pkl):
             with open(policy_pkl, 'rb') as file:
-                policy = pickle.load(file)
-                return policy
+                self.initial_policy = pickle.load(file)
         self.logger.warning(f"policy file does not exist, using random initial policy.")
-        return policy

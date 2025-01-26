@@ -43,6 +43,9 @@ class ConcolicExecutor:
         self.proc_exit_status = None
         # symsan lib instance
         symsan.init(self.cmd[0])
+        self._critical_branches_fp = os.path.join(self.config.static_result_folder, "critical_branches.txt")
+        if config.initial_policy:
+            utils.make_critical_branches_file(config.initial_policy, self._critical_branches_fp)
         self._recipe = collections.defaultdict(list)
         self._processed = set()
         # options
@@ -65,6 +68,8 @@ class ConcolicExecutor:
         #     self.proc_returncode = 9
         if deep_clean:
             symsan.destroy()
+            if os.path.exists(self._critical_branches_fp):
+                os.unlink(self._critical_branches_fp)
         self.timer.proc_end_time = (time.time() * utils.MILLI_SECONDS_SCALE)
 
     def get_result(self):

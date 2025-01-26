@@ -118,3 +118,12 @@ def find_source_code(addr, bin_path):
     loc = result.stdout.strip()
     pc_loc[addr] = loc
     return loc
+
+def make_critical_branches_file(policy, file_path):
+    critical_branches = []
+    for bid in policy:
+        if policy[bid][0] is None or policy[bid][1] is None:
+            critical_branches.append(bid)
+    with open(file_path, "w") as f:
+        for bid in critical_branches:
+            f.write(f"{bid}\n")

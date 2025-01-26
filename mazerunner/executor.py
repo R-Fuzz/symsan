@@ -92,6 +92,8 @@ class ConcolicExecutor:
             self.logger.critical(f"setup: Failed to map shm({self.shm._fd}), size(shm.size)")
             sys.exit(1)
         # options
+        self._critical_branches_fp = os.path.join(self.config.static_result_folder, "critical_branches.txt")
+        utils.make_critical_branches_file(config.initial_policy, self._critical_branches_fp)
         self.testcase_dir = output_dir
         self._onetime_solving_enabled = True if (type(agent) is ExploitAgent) else False
         self._save_seed_info = True if (type(agent) is ExploreAgent or type(agent) is ExploitAgent) else False
@@ -112,6 +114,8 @@ class ConcolicExecutor:
             self._close_pipe()
         self.kill_proc()
         if deep_clean:
+            if os.path.exists(self._critical_branches_fp):
+                os.unlink(self._critical_branches_fp)
             try:
                 self.shm.close()
                 self.shm.unlink()
@@ -165,6 +169,7 @@ class ConcolicExecutor:
         f":debug={logging_level}")
         current_env = os.environ.copy()
         current_env["TAINT_OPTIONS"] = options
+        current_env["CRITICAL_BRANCH_FILEPATH"] = self._critical_branches_fp
         if timeout:
             self.timer.timeout = timeout
             cmd = ["timeout", "-k", str(1), str(int(timeout))] + cmd
