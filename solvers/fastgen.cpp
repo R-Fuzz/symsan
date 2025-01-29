@@ -22,6 +22,7 @@
 #include "sanitizer_common/sanitizer_file.h"
 #include "sanitizer_common/sanitizer_posix.h"
 #include "dfsan/dfsan.h"
+#include "hashset/hashset.h"
 
 using namespace __dfsan;
 
@@ -29,8 +30,8 @@ static uint32_t __instance_id;
 static uint32_t __session_id;
 static int __pipe_fd;
 
-SANITIZER_WEAK_ATTRIBUTE uint8_t* __afl_area_ptr=nullptr;
-SANITIZER_WEAK_ATTRIBUTE std::unordered_set<uint32_t> critical_branches;
+SANITIZER_WEAK_ATTRIBUTE uint8_t* __afl_area_ptr = nullptr;
+SANITIZER_WEAK_ATTRIBUTE HashSet* critical_branches_ptr = nullptr;
 
 // filter?
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
@@ -112,13 +113,16 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
-  bool is_critical_branch = critical_branches.find(cid) != critical_branches.end();
-  if (label == 0 && !is_critical_branch) {
+  bool critical_branch_found = false;
+  if (critical_branches_ptr != nullptr && critical_branches_ptr->contains(cid)) {
+      critical_branch_found = true;
+  }
+  if (label == 0 && !critical_branch_found) {
       return;
   }
 
-  if (is_critical_branch) {
-    AOUT("critical branch: %u %u 0x%x\n", label, r, cid);
+  if (label == 0 && critical_branch_found) {
+    AOUT("critical concret branch: %u %u %u\n", label, r, cid);
   }
 
   void *addr = __builtin_return_address(0);

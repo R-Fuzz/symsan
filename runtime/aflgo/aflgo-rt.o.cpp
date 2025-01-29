@@ -20,6 +20,7 @@
 */
 
 #include "defs.h"
+#include "hashset/hashset.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +30,6 @@
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <map>
 #include <algorithm>
 
@@ -58,7 +58,7 @@ u8* __afl_area_ptr = __afl_area_initial;
 const char * distance_fp __attribute__((weak)) = nullptr;
 
 // critical branches that used to detect path divergence
-std::unordered_set<uint32_t> critical_branches;
+HashSet* critical_branches_ptr = nullptr;
 
 std::map<u64, int> bb_to_dis;
 
@@ -175,14 +175,14 @@ void __afl_manual_init(void) {
 
 } // extern "C"
 
-
 void __initialize_critical_branches() {
+  critical_branches_ptr = new HashSet(1024);
   const char *filename = getenv("CRITICAL_BRANCH_FILEPATH");
-  if (filename == NULL) {
+  if (filename == nullptr) {
     fprintf(stderr, "WARNING: ENV VAR CRITICAL_BRANCH_FILEPATH is not set\n");
     return;
   }
-  if (strcmp(filename, "") != 0) {
+  if (strcmp(filename, "") == 0) {
     fprintf(stderr, "WARNING: critical branch file is not set\n");
     return;
   }
@@ -191,21 +191,18 @@ void __initialize_critical_branches() {
     fprintf(stderr, "WARNING: failed to open critical branch file with ifstream\n");
     return;
   }
-  if (file_stream.tellg() == 0) {
-    file_stream.close();
-    return;
-  }
   std::string line;
   while (std::getline(file_stream, line)) {
     std::istringstream iss(line);
-    uint32_t branch_id;
+    u32 branch_id;
     if (iss >> branch_id) {
-      critical_branches.insert(branch_id);
+      critical_branches_ptr->insert(branch_id);
     } else {
       fprintf(stderr, "WARNING: failed to parse line in critical branch file\n");
       break;
     }
   }
+  printf("INFO: read %d critical branches\n", critical_branches_ptr->getSize());
   file_stream.close();
 }
 
