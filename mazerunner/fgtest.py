@@ -59,7 +59,12 @@ if __name__ == "__main__":
     input_file = re.search(pattern, options).group(1)
     if not os.path.isfile(input_file):
         pattern = r'taint_file="([^"]+)"'
-        input_file = re.search(pattern, options).group(1)
+        matching_res = re.search(pattern, options)
+        if matching_res:
+            input_file = matching_res.group(1)
+    if not os.path.isfile(input_file):
+        print(f"Error: Taint file {input_file} does not exist", file=sys.stderr)
+        sys.exit(1)
     
     fastgen_agent = Agent(config)
     if config.use_builtin_solver:
