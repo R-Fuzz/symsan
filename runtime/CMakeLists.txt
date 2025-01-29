@@ -56,6 +56,7 @@ include(SanitizerUtils)
 
 set(CMAKE_CXX_STANDARD 14)
 
+add_subdirectory(hashset)
 add_subdirectory(sanitizer_common)
 add_subdirectory(interception)
 add_subdirectory(dfsan)

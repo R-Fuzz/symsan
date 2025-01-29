@@ -140,6 +140,7 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libFastgen.a", obj_path);
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
   }
+  cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libHashSetRT.a", obj_path);
 }
 
 static void add_aflgo_pass() {

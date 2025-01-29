@@ -1,0 +1,9 @@
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CXX_STANDARD 14)
+
+add_library(HashSetRT STATIC
+    hashset.cpp
+)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+target_include_directories(HashSetRT PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+install (TARGETS HashSetRT DESTINATION ${SYMSAN_LIB_DIR})
