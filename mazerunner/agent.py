@@ -289,6 +289,9 @@ class Agent:
         self.min_distance = self.config.max_distance
 
     def handle_new_state(self, msg, action, is_symbranch):
+        if not is_symbranch:
+            self.logger.debug(f"concret branch: addr={msg.addr}, bid={msg.id}, callstack={msg.context}, action={action}, d={msg.local_min_dist}")
+            return
         if is_symbranch:
             self.update_curr_state(msg, action)
             self.append_episode()
@@ -359,20 +362,25 @@ class Agent:
         mkdir(self.my_traces)
 
     def debug_policy(self, state):
-        distance_taken = self.model.get_distance(state, 1)
-        distance_not_taken = self.model.get_distance(state, 0)
         s = state.serialize()
         loc = find_source_code(s[0][0], self.config.cmd[0])
-        self.logger.info(f"loc={loc}, "
+        log_message = (
+            f"loc={loc}, "
             f"sad={(s[0],s[1],s[2])}, "
-            f"hit={self.model.visited_sa.get(state.sa, 0)}, "
-            f"d_t={distance_taken}, "
-            f"d_nt={distance_not_taken}, "
-            f"unreachale={state.reversed_sa in self.model.unreachable_sa}, "
             f"trace_len={len(self.episode)}, "
             f"min_d={self.min_distance}"
+        )
+        model_needed = (type(self) is ExploreAgent or type(self) is ExploitAgent)
+        if model_needed:
+            self.logger.info(
+                log_message + ", "
+                f"hit={self.model.visited_sa.get(state.sa, 0)}, "
+                f"unreachale={state.reversed_sa in self.model.unreachable_sa}, "
+                f"d_t={self.model.get_distance(state, 1)}, "
+                f"d_nt={self.model.get_distance(state, 0)}, "
             )
-
+        else:
+            self.logger.info(log_message)
 
 class LazyAgent(Agent):
 
@@ -383,10 +391,9 @@ class LazyAgent(Agent):
 class ExploreAgent(Agent):
 
     def handle_new_state(self, msg, action, is_symbranch):
+        super().handle_new_state(msg, action, is_symbranch)
         if is_symbranch:
-            self.update_curr_state(msg, action)
             self.model.remove_target_sa(self.curr_state.sa)
-            self.append_episode()
 
     def is_interesting_branch(self):
         if self.curr_state.reversed_sa in self.model.unreachable_sa:
@@ -448,12 +455,10 @@ class ExploitAgent(Agent):
         self.target = (None, 0) # sa, trace_length
 
     def handle_new_state(self, msg, action, is_symbranch):
-        if is_symbranch:
-            self.update_curr_state(msg, action)
-            self.append_episode()
-            if self.curr_state.sa == self.target[0]:
-                self.logger.debug(f"Target reached. sa={self.target[0]}, trace_length={self.target[1]}")
-                self.target = (None, 0) # sa, trace_length
+        super().handle_new_state(msg, action, is_symbranch)
+        if is_symbranch and self.curr_state.sa == self.target[0]:
+            self.logger.debug(f"Target reached. sa={self.target[0]}, trace_length={self.target[1]}")
+            self.target = (None, 0) # sa, trace_length
     
     def clear_targets(self):
         self.target = (None, 0)
