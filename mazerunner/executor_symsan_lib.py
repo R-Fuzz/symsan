@@ -106,11 +106,23 @@ class ConcolicExecutor:
                           f"logging_level={logging_level}, "
                           f"bounds={shoud_trace_bounds}")
         if stdin:
-            symsan.config("stdin", args=cmd, debug=logging_level, bounds=shoud_trace_bounds)
+            symsan.config(
+                "stdin",
+                args=cmd,
+                debug=logging_level,
+                bounds=shoud_trace_bounds,
+                critical_branches=self._critical_branches_fp
+            )
             symsan.reset_input([self.input_content])
             symsan.run(stdin=self.cur_input)
         else:
-            symsan.config(self.cur_input, args=cmd, debug=logging_level, bounds=shoud_trace_bounds)
+            symsan.config(
+                self.cur_input,
+                args=cmd,
+                debug=logging_level,
+                bounds=shoud_trace_bounds,
+                critical_branches=self._critical_branches_fp
+            )
             symsan.reset_input([self.input_content])
             symsan.run()
 

@@ -290,7 +290,18 @@ class Agent:
 
     def handle_new_state(self, msg, action, is_symbranch):
         if not is_symbranch:
-            self.logger.debug(f"concret branch: addr={msg.addr}, bid={msg.id}, callstack={msg.context}, action={action}, d={msg.local_min_dist}")
+            policy = self.config.initial_policy
+            reversed_action = 1 if action == 0 else 0
+            da = policy[msg.id][action] if policy[msg.id][action] else float('inf')
+            dna = policy[msg.id][reversed_action] if policy[msg.id][reversed_action] else float('inf')
+            if da > dna:
+                loc = find_source_code(msg.addr, self.config.cmd[0])
+                self.logger.debug(f"critical concret branch divergent: "
+                                  f"loc={loc}, "
+                                  f"bid={msg.id}, "
+                                  f"action={action}, "
+                                  f"dF={policy[msg.id][0]}, "
+                                  f"dT={policy[msg.id][1]}")
             return
         if is_symbranch:
             self.update_curr_state(msg, action)
