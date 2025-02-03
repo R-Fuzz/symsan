@@ -13,6 +13,8 @@ from utils import mkdir
 DISTANCE_SCALE = 1000
 
 class SortedDict:
+    HEAP_CLEAN_THRESHOLD = 2
+    
     def __init__(self, need_sort=False):
         self.need_sort = need_sort
         self.data = collections.OrderedDict()
@@ -41,14 +43,12 @@ class SortedDict:
 
     @property
     def is_heap_empty(self):
-        assert len(self.heap) == len(self._heap_items)
         if not self.heap:
             return True
         return False
 
     @property
     def heap_size(self):
-        assert len(self.heap) == len(self._heap_items)
         return len(self._heap_items)
 
     def keys(self):
@@ -86,7 +86,7 @@ class SortedDict:
                 return key
         return None
 
-    def peak(self):
+    def peek(self):
         while self.heap:
             value, _, key = self.heap[0]
             if key in self.data and self.data[key] == value:
@@ -109,10 +109,10 @@ class SortedDict:
         self._heap_items = set(self.heap)
         heapq.heapify(self.heap)
     
-    def rebuild_heap(self, targets={}):
+    def rebuild_heap(self, targets=None):
         if not self.need_sort:
             return
-        if targets:
+        if targets is not None:
             self.heap = [(self.data[k], k[2], k) for k in targets if k in self.data]
         else:
             self.heap = [(v, k[2], k) for k, v in self.data.items()]
@@ -170,7 +170,8 @@ class RLModel(abc.ABC):
         with open(os.path.join(self.my_dir, "visited_sa"), 'wb') as fp:
             pickle.dump(self.visited_sa, fp, protocol=pickle.HIGHEST_PROTOCOL)
         with open(os.path.join(self.my_dir, "Q_table"), 'wb') as fp:
-            if self.q_table.need_sort:
+            if (self.q_table.need_sort 
+                and self.q_table.heap_size > SortedDict.HEAP_CLEAN_THRESHOLD * len(self.q_table)):
                 self.q_table.clean_heap()
             pickle.dump(self.q_table, fp, protocol=pickle.HIGHEST_PROTOCOL)  
         with open(os.path.join(self.my_dir, "unreachable_branches"), 'wb') as fp:
@@ -226,13 +227,13 @@ class RLModel(abc.ABC):
         if sa in self.all_target_sa:
             self.all_target_sa.remove(sa)
 
-    def rebuild_targets(self, last_sa):
+    def rebuild_targets(self, problematic_sa):
         if not self.config.defferred_solving_enabled:
             return
         targets = set(self.visited_sa.keys()) - self.unreachable_sa
         self.q_table.rebuild_heap(targets)
-        if self.q_table.peak() == last_sa:
-            self.add_unreachable_sa(last_sa)
+        if self.q_table.peek() == problematic_sa:
+            self.add_unreachable_sa(problematic_sa)
             self.q_table.pop()
 
 class DistanceModel(RLModel):
