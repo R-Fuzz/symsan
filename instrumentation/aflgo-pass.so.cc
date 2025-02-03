@@ -142,12 +142,9 @@ void getFuncDebugLoc(const Function *F, std::string &Filename, unsigned &Line) {
     getInsDebugLoc(I, Filename, Line, col);
 }
 
-uint32_t getBasicblockId(BasicBlock &BB) {
+uint32_t getBasicblockId(BasicBlock &BB, std::string &filename, unsigned &line, unsigned &col) {
   static uint32_t unamed = 0;
   std::string bb_name_with_col("");
-  std::string filename;
-  unsigned line = 0;
-  unsigned col = 0;
   getBBDebugLoc(&BB, filename, line, col);
   if (!filename.empty() && line != 0 ){
     bb_name_with_col = filename + ":" + std::to_string(line) + ":" + std::to_string(col);
@@ -458,12 +455,29 @@ bool AFLCoverage::runOnModule(Module &M) {
         new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
                            GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
 
-    for (auto &F : M) {
+    std::ofstream bbLocs(OutDirectory + "/bid_loc_mapping.txt", std::ofstream::out | std::ofstream::app);
+    std::ofstream funcInfo(OutDirectory + "/function_info.txt", std::ofstream::out | std::ofstream::app);
 
+    for (auto &F : M) {
+      unsigned minLine = std::numeric_limits<unsigned>::max();
+      unsigned maxLine = 0;
+
+      std::string filename;
       for (auto &BB : F) {
 
         int distance = -2;
-        uint64_t bb_id = (uint64_t) getBasicblockId(BB);
+        unsigned line = 0;
+        unsigned col = 0;
+        uint64_t bb_id = (uint64_t) getBasicblockId(BB, filename, line, col);
+
+        if (line < minLine) {
+          minLine = line;
+        }
+        if (line > maxLine) {
+          maxLine = line;
+        }
+        if (!filename.empty() && line != 0)
+          bbLocs << bb_id << "," << F.getGUID() << "," << filename << ":" << line << "\n";
 
         if (is_aflgo) {
           if (bb_to_dis.find(bb_id) != bb_to_dis.end()) {
@@ -539,6 +553,8 @@ bool AFLCoverage::runOnModule(Module &M) {
         }
 
       }
+      if (!filename.empty() && minLine != std::numeric_limits<unsigned>::max() && maxLine != 0)
+        funcInfo << F.getGUID() << "," << F.getName().str() << "," << filename << "," << minLine << "," << maxLine << "\n";
     }
   }
 
