@@ -12,8 +12,8 @@ DISK_LIMIT_SIZE = 1 * (1 << 30) # 1GB
 SYNC_FREQUENCY = 10 # sync mazerunner status with AFL every SYNC_FREQUENCY executions.
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 REPLAY_FREQUENCY = 0 # off-learning from replay buffer every REPLAY_FREQUENCY executions.
-TARGET_REACHED_EXIT = False
-TARGET_TRIGGERED_EXIT = True
+TARGET_REACHED_EXIT = True
+TARGET_TRIGGERED_EXIT = False
 BUG_TRIGGER_DISTANCE = 3 * 1000 # start bug triggering after reaching this distance value
 # Solver configurations
 USE_BUILTIN_SOLVER = False
@@ -36,6 +36,9 @@ MAX_BRANCH_NUM = 33
 MIN_HANG_FILES = 1
 # Model configurations
 DECIMAL_PRECISION = 200
+# Path divergence handler configurations
+HANDLE_PATH_DIVERGENCE_ENABLED = True
+ADDRESS2LINE_PATH = '/usr/bin/addr2line'
 
 class Config:
     __slots__ = ['__dict__',
@@ -76,6 +79,9 @@ class Config:
                  'target_triggered_exit',
                  'target_reached_exit',
                  'bug_trigger_distance',
+                 'addr2line_path',
+                 'source_code_dir',
+                 'handle_path_divergence',
     ]
 
     def __init__(self):
@@ -123,12 +129,10 @@ class Config:
         if args.static_result_folder:
             self.static_result_folder = args.static_result_folder
             distance_file = os.path.join(self.static_result_folder, "distance.cfg.txt")
-            self.max_distance = self._load_distance_file(distance_file)
+            self._load_distance_file(distance_file)
             self._load_initial_policy()
-        
-    def validate_config(self):
-        # TODO: validate the configurations after loading
-        pass
+        if args.source_code_folder:
+            self.source_code_dir = args.source_code_folder
 
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL
@@ -156,6 +160,8 @@ class Config:
         self.target_triggered_exit = TARGET_TRIGGERED_EXIT
         self.target_reached_exit = TARGET_REACHED_EXIT
         self.bug_trigger_distance = BUG_TRIGGER_DISTANCE
+        self.addr2line_path = ADDRESS2LINE_PATH
+        self.handle_path_divergence = HANDLE_PATH_DIVERGENCE_ENABLED
         self.gep_solver_enabled = False
         self.use_ordered_dict = False
         self.defferred_solving_enabled = False
@@ -168,17 +174,17 @@ class Config:
         self.initial_seed_dir = ''
         self.cmd = ''
         self.static_result_folder = '/tmp'
+        self.source_code_dir = '/tmp'
         self.initial_policy = {}
 
     def _load_distance_file(self, fp):
-        max_distance = -float('inf')
         if not os.path.isfile(fp):
             raise ValueError(f"distance file {fp} does not exist.")
         with open(fp, 'r') as file:
             for l in file.readlines():
                 d = float(l.strip().split(',')[-1])
                 max_distance = max(d, max_distance)
-        return max_distance
+        self.max_distance = max_distance
 
     def _load_initial_policy(self):
         policy_txt = os.path.join(self.static_result_folder, "policy.txt")

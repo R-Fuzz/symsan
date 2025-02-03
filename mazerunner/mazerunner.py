@@ -37,6 +37,7 @@ def parse_args():
     p.add_argument("-m", dest="model_type", default="reachability", help="RL model type")
     p.add_argument("-o", dest="output_dir", default=None, help="hybrid fuzzing output path")
     p.add_argument("-s", dest="static_result_folder", default=None, help="static analysis results folder that saves the distance information and initial policy")
+    p.add_argument("-c", dest="source_code_folder", default=None, help="source code folder of the program under test")
     p.add_argument("-f", dest="fuzzer_dir", default=None, help="AFL fuzzer instance name")
     p.add_argument("-n", dest="mazerunner_dir", default="mazerunner", help="mazerunner instance name")
     p.add_argument("-i", dest="input_dir", default=None, help="initial seed directory")

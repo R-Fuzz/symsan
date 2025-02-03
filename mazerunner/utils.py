@@ -109,17 +109,6 @@ def disable_core_dump():
                     f"Please try to set it manually by running: "
                     f"'ulimit -c 0'")
 
-pc_loc = {}
-def find_source_code(addr, bin_path):
-    if addr in pc_loc:
-        return pc_loc[addr]
-    addr_str = hex(addr)
-    cmd = ['/usr/bin/addr2line', '-e', bin_path, '-p', '-s', addr_str]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    loc = result.stdout.strip()
-    pc_loc[addr] = loc
-    return loc
-
 def make_critical_branches_file(policy, file_path):
     critical_branches = []
     for bid in policy:
@@ -138,16 +127,12 @@ class SourceCodeFinder:
         """
         self.config = config
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.source_dir = ""
-        self.bin_path = ""
-        self.addr2line_path = ""
+        self.bin_path = self.config.cmd[0]
 
-        if not os.path.isdir(config.source_dir):
-            self.logger.error(f"source_dir {config.source_dir} does not exist.")
         if not os.path.isfile(self.bin_path):
             self.logger.error(f"binary file {self.bin_path} does not exist.")
-        if not os.path.isfile(self.addr2line_path):
-            self.logger.error(f"addr2line not found in {self.addr2line_path}")
+        if not os.path.isfile(self.config.addr2line_path):
+            self.logger.error(f"addr2line not found in {self.config.addr2line_path }")
 
         # A dictionary for caching function info: {fn_guid -> (function_name, filename, start_line_number, end_line_number)}
         self.function_infos = self._load_function_info(
@@ -173,12 +158,12 @@ class SourceCodeFinder:
         """
         if filename in self.fn_to_fp:
             return self.fn_to_fp[filename]
-        for root, _, files in os.walk(self.source_dir):
+        for root, _, files in os.walk(self.config.source_code_dir):
             if filename in files:
                 fp = os.path.join(root, filename)
                 self.fn_to_fp[filename] = fp
                 return fp
-        self.logger.error(f"file {filename} not found in {self.source_dir}")
+        self.logger.error(f"file {filename} not found in {self.config.source_code_dir}")
         self.fn_to_fp[filename] = ""
         return ""
 
@@ -201,10 +186,11 @@ class SourceCodeFinder:
 
         if addr in self.loc_addr_cache:
             return self.loc_addr_cache[addr]
-
+        
+        self.logger.debug(f"Loc info not found for bid {bid}, querying addr2line")
         # Convert the address to a hex string before calling addr2line
         cmd = [
-            self.addr2line_path,
+            self.config.addr2line_path ,
             "-e", self.bin_path,
             "-p",  # More friendly format
             "-f",  # Show function name
@@ -236,6 +222,8 @@ class SourceCodeFinder:
             return ("", "")
 
         func_name = parts[0].strip()
+        if func_name.startswith("dfs$"):
+            func_name = func_name[4:]
         loc = parts[1].strip()
         if not func_name or "??" in func_name:
             func_name = ""
@@ -371,6 +359,8 @@ class SourceCodeFinder:
                 assert len(items) == 5
                 fn_guid = int(items[0])
                 function_name = items[1]
+                if function_name.startswith("dfs$"):
+                    function_name = function_name[4:]
                 filename = items[2]
                 start_line_number = int(items[3])
                 end_line_number = int(items[4])

@@ -215,6 +215,13 @@ class Agent:
         self.min_distance = self.config.max_distance
         self._learner = None
         self._model = None if model is None else model
+        self._put_debugger = None
+
+    @property
+    def put_debugger(self):
+        if not self._put_debugger:
+            self._put_debugger = SourceCodeFinder(self.config)
+        return self._put_debugger
 
     @property
     def my_traces(self):
@@ -289,15 +296,16 @@ class Agent:
         self.min_distance = self.config.max_distance
 
     def handle_new_state(self, msg, action, is_symbranch):
-        if not is_symbranch:
+        if not is_symbranch and self.config.handle_path_divergence:
             policy = self.config.initial_policy
             reversed_action = 1 if action == 0 else 0
             da = policy[msg.id][action] if policy[msg.id][action] else float('inf')
             dna = policy[msg.id][reversed_action] if policy[msg.id][reversed_action] else float('inf')
             if da > dna:
-                loc = find_source_code(msg.addr, self.config.cmd[0])
+                func_name, loc = self.put_debugger.find_loc_info(msg.id, addr=msg.addr)
                 self.logger.debug(f"critical concret branch divergent: "
                                   f"loc={loc}, "
+                                  f"func={func_name}, "
                                   f"bid={msg.id}, "
                                   f"action={action}, "
                                   f"dF={policy[msg.id][0]}, "
@@ -373,11 +381,12 @@ class Agent:
         mkdir(self.my_traces)
 
     def debug_policy(self, state):
-        s = state.serialize()
-        loc = find_source_code(s[0][0], self.config.cmd[0])
+        s, a, d, bid = state.serialize()
+        fun_name, loc = self.put_debugger.find_loc_info(bid, addr=s[0])
         log_message = (
             f"loc={loc}, "
-            f"sad={(s[0],s[1],s[2])}, "
+            f"func={fun_name}, "
+            f"sad={(s, a, d)}, "
             f"trace_len={len(self.episode)}, "
             f"min_d={self.min_distance}"
         )
