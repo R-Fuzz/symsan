@@ -91,6 +91,85 @@ std::string getMangledName(const Function *F) {
     return mangledName;
 }
 
+
+/// \brief Retrieve the first available debug location in \p BB that is not
+/// inside /usr/ and store the **absolute, normalized path** in \p Filename.
+/// Sets \p Line and \p Col accordingly.
+///
+/// This version does:
+///  1) Loops over instructions in \p BB
+///  2) Checks the debug location (and possibly inlined-at location)
+///  3) Builds an absolute, normalized path (resolving "." and "..")
+///  4) Skips if the path is empty, line=0, or the path starts with "/usr/"
+///  5) Returns the first valid debug info found
+void getDebugLocationFullPath(const BasicBlock *BB,
+                              std::string &Filename,
+                              unsigned &Line,
+                              unsigned &Col) {
+  Filename.clear();
+  Line = 0;
+  Col = 0;
+
+  // We don't want paths that point to system libraries in /usr/
+  static const std::string Xlibs("/usr/");
+
+  // Iterate over instructions in the basic block
+  for (auto &Inst : *BB) {
+    if (DILocation *Loc = Inst.getDebugLoc()) {
+      // Extract directory & filename
+      std::string Dir  = Loc->getDirectory().str();
+      std::string File = Loc->getFilename().str();
+      unsigned    L    = Loc->getLine();
+      unsigned    C    = Loc->getColumn();
+
+      // If there's no filename, check the inlined location
+      if (File.empty()) {
+        if (DILocation *inlinedAt = Loc->getInlinedAt()) {
+          Dir  = inlinedAt->getDirectory().str();
+          File = inlinedAt->getFilename().str();
+          L    = inlinedAt->getLine();
+          C    = inlinedAt->getColumn();
+        }
+      }
+
+      // Skip if still no filename or line==0
+      if (File.empty() || L == 0)
+        continue;
+
+      // Build an absolute path in a SmallString
+      llvm::SmallString<256> FullPath;
+
+      // 1) If Dir is already absolute, just start with that.
+      //    Otherwise, use the current working directory as a base.
+      if (!Dir.empty() && llvm::sys::path::is_absolute(Dir)) {
+        FullPath = Dir;
+      } else {
+        llvm::sys::fs::current_path(FullPath); // get the current working dir
+        if (!Dir.empty()) {
+          llvm::sys::path::append(FullPath, Dir);
+        }
+      }
+
+      // 2) Append the filename
+      llvm::sys::path::append(FullPath, File);
+
+      // 3) Remove dot segments (both "." and "..")
+      llvm::sys::path::remove_dots(FullPath, /*remove_dot_dot=*/true);
+
+      // Now FullPath is absolute & normalized
+      // Check if it's in /usr/
+      if (StringRef(FullPath).startswith(Xlibs))
+        continue; // skip system-libs
+
+      // Found a valid location => set output vars
+      Filename = FullPath.str().str(); // convert to std::string
+      Line     = L;
+      Col      = C;
+      break; // stop after the first valid location
+    }
+  }
+}
+
 void getInsDebugLoc(const Instruction *I, std::string &Filename,
                         unsigned &Line, unsigned &Col) {
   std::string filename;
@@ -154,6 +233,7 @@ uint32_t getBasicblockId(BasicBlock &BB, std::string &filename, unsigned &line, 
       filename = filename.substr(found + 1);
     bb_name_with_col = filename + ":unamed:" + std::to_string(unamed++);
   }
+  getDebugLocationFullPath(&BB, filename, line, col);
   return djbHash(bb_name_with_col);
 }
 
