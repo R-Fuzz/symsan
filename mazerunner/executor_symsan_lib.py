@@ -195,6 +195,9 @@ class ConcolicExecutor:
             return None, seed_map[seed_id], solving_status
         assert len(self.generated_files) == 1
         return self.generated_files[-1], seed_map[seed_id], solving_status
+    
+    def handle_path_divergence(self):
+        self.agent.handle_path_divergence(self.input_content)
 
     def _remove_stall_recipe(self, target_sa):
         while self._recipe[target_sa]:

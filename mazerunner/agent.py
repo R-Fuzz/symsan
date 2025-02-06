@@ -1,5 +1,6 @@
 import abc
 import copy
+import heapq
 import logging
 import math
 import os
@@ -11,6 +12,7 @@ import model
 from decimal import Decimal
 from defs import TaintFlag
 from utils import *
+from prompt import *
 
 class ProgramState:
     def __init__(self, distance):
@@ -210,18 +212,26 @@ class Agent:
             mkdir(self.my_traces)
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.episode = []
+        self.path_divergences = []
         self.nested_cond_unsat_sas = set()
         self.pc_counter = collections.Counter()
         self.min_distance = self.config.max_distance
         self._learner = None
         self._model = None if model is None else model
-        self._put_debugger = None
+        self._code_finder = None
+        self._prompt_builder = None
 
     @property
-    def put_debugger(self):
-        if not self._put_debugger:
-            self._put_debugger = SourceCodeFinder(self.config)
-        return self._put_debugger
+    def prompt_builder(self):
+        if not self._prompt_builder:
+            self._prompt_builder = PromptBuilder(self.config, self.code_finder)
+        return self._prompt_builder
+
+    @property
+    def code_finder(self):
+        if not self._code_finder:
+            self._code_finder = SourceCodeFinder(self.config)
+        return self._code_finder
 
     @property
     def my_traces(self):
@@ -299,22 +309,32 @@ class Agent:
         if not is_symbranch and self.config.handle_path_divergence:
             policy = self.config.initial_policy
             reversed_action = 1 if action == 0 else 0
-            da = policy[msg.id][action] if policy[msg.id][action] else float('inf')
-            dna = policy[msg.id][reversed_action] if policy[msg.id][reversed_action] else float('inf')
+            bid = msg.id
+            da = policy[bid][action] if policy[bid][action] else float('inf')
+            dna = policy[bid][reversed_action] if policy[bid][reversed_action] else float('inf')
             if da > dna:
-                func_name, loc = self.put_debugger.find_loc_info(msg.id, addr=msg.addr)
+                func_name, loc = self.code_finder.find_loc_info(bid, addr=msg.addr)
                 self.logger.debug(f"critical concret branch divergent: "
                                   f"loc={loc}, "
                                   f"func={func_name}, "
-                                  f"bid={msg.id}, "
+                                  f"bid={bid}, "
                                   f"action={action}, "
-                                  f"dF={policy[msg.id][0]}, "
-                                  f"dT={policy[msg.id][1]}")
+                                  f"dF={policy[bid][0]}, "
+                                  f"dT={policy[bid][1]}")
+                d = min(msg.local_min_dist, self.config.initial_distance[bid])
+                self.path_divergences.append((d, len(self.episode), bid, action, loc, func_name))
             return
         if is_symbranch:
             self.update_curr_state(msg, action)
             self.append_episode()
     
+    def handle_path_divergence(self, input_content):
+        if not self.path_divergences:
+            return
+        heapq.heapify(self.path_divergences)
+        divergent_branch_info = heapq.heappop(self.path_divergences)
+        prompt = self.prompt_builder.build_concret_divergent_branch_prompt(self.episode, divergent_branch_info, input_content)
+
     def handle_unsat_condition(self, solving_status):
         pass
 
@@ -382,7 +402,7 @@ class Agent:
 
     def debug_policy(self, state):
         s, a, d, bid = state.serialize()
-        fun_name, loc = self.put_debugger.find_loc_info(bid, addr=s[0])
+        fun_name, loc = self.code_finder.find_loc_info(bid, addr=s[0])
         log_message = (
             f"loc={loc}, "
             f"func={fun_name}, "

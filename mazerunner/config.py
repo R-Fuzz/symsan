@@ -1,3 +1,4 @@
+import collections
 import json
 import pickle
 import os
@@ -72,6 +73,7 @@ class Config:
                  "decimal_precision",
                  'max_distance',
                  'initial_policy',
+                 'initial_distance',
                  'static_result_folder',
                  'use_ordered_dict',
                  'use_builtin_solver',
@@ -176,13 +178,18 @@ class Config:
         self.static_result_folder = '/tmp'
         self.source_code_dir = '/tmp'
         self.initial_policy = {}
+        self.initial_distance = collections.defaultdict(lambda: self.max_distance)
 
     def _load_distance_file(self, fp):
         if not os.path.isfile(fp):
             raise ValueError(f"distance file {fp} does not exist.")
         with open(fp, 'r') as file:
             for l in file.readlines():
-                d = float(l.strip().split(',')[-1])
+                items = l.strip().split(',')
+                assert len(items) == 3
+                bid = int(items[0])
+                d = float(items[2])
+                self.initial_distance[bid] = d
                 max_distance = max(d, max_distance)
         self.max_distance = max_distance
 

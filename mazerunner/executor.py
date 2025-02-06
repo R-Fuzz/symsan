@@ -258,6 +258,9 @@ class ConcolicExecutor:
             end_time = int(time.time() * utils.MILLI_SECONDS_SCALE)
             self.timer.solving_time += end_time - start_time
             self.msg_num += 1
+    
+    def handle_path_divergence(self):
+        self.agent.handle_path_divergence(self.input_content)
 
     def _process_cond_request(self, msg):
         readable, _, _ = select.select([self.pipefds[0]], [], [], self.pipe_timeout)
