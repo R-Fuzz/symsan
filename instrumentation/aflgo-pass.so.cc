@@ -470,10 +470,10 @@ bool AFLCoverage::runOnModule(Module &M) {
         unsigned col = 0;
         uint64_t bb_id = (uint64_t) getBasicblockId(BB, filename, line, col);
 
-        if (line < minLine) {
+        if (line < minLine && line > 0) {
           minLine = line;
         }
-        if (line > maxLine) {
+        if (line > maxLine && line > 0) {
           maxLine = line;
         }
         if (!filename.empty() && line != 0)
