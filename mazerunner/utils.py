@@ -112,11 +112,27 @@ def disable_core_dump():
 def make_critical_branches_file(policy, file_path):
     critical_branches = []
     for bid in policy:
-        if policy[bid][0] is None or policy[bid][1] is None:
+        if policy[bid][0] is None and policy[bid][1] is None:
+            continue
+        if policy[bid][0] is None:
+            critical_branches.append(bid)
+        if policy[bid][1] is None:
             critical_branches.append(bid)
     with open(file_path, "w") as f:
         for bid in critical_branches:
             f.write(f"{bid}\n")
+
+
+def get_critical_branches(policy):
+    critical_branches = []
+    for bid in policy:
+        if policy[bid][0] is None and policy[bid][1] is None:
+            continue
+        if policy[bid][0] is None:
+            critical_branches.append((bid, True))
+        if policy[bid][1] is None:
+            critical_branches.append((bid, False))
+    return critical_branches
 
 def hexdump(file_content, width=16):
     """
