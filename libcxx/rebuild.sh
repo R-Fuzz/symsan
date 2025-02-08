@@ -62,6 +62,7 @@ export KO_CC=clang-12
 export KO_CXX=clang++-12
 cmake -G Ninja -DLLVM_TARGETS_TO_BUILD=X86 -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX} \
+    -DCMAKE_C_FLAGS="-fpic" -DCMAKE_CXX_FLAGS="-fpic" \
     -DLLVM_ENABLE_PROJECTS="libcxx;libcxxabi;libunwind" \
     -DLIBCXXABI_ENABLE_SHARED=OFF -DLIBCXX_ENABLE_SHARED=OFF \
     -DLIBCXX_CXX_ABI="libcxxabi" \
