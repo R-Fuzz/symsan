@@ -105,6 +105,19 @@ class Config:
             return
         with open(path, 'w') as file:
             json.save(self.__dict__, file)
+    
+    def load_put_args(self, args):
+        if args.debug_enabled:
+            self.logging_level = logging.DEBUG
+        if args.cmd:
+            self.cmd = args.cmd
+        if args.static_result_folder:
+            self.static_result_folder = args.static_result_folder
+            distance_file = os.path.join(self.static_result_folder, "distance.cfg.txt")
+            self._load_distance_file(distance_file)
+            self._load_initial_policy()
+        if args.source_code_folder:
+            self.source_code_dir = args.source_code_folder
 
     def load_args(self, args):
         if args.agent_type:
@@ -124,17 +137,7 @@ class Config:
             self.mazerunner_dir = os.path.join(args.output_dir, args.mazerunner_dir)
         if args.input_dir:
             self.initial_seed_dir = args.input_dir
-        if args.cmd:
-            self.cmd = args.cmd
-        if args.debug_enabled:
-            self.logging_level = logging.DEBUG
-        if args.static_result_folder:
-            self.static_result_folder = args.static_result_folder
-            distance_file = os.path.join(self.static_result_folder, "distance.cfg.txt")
-            self._load_distance_file(distance_file)
-            self._load_initial_policy()
-        if args.source_code_folder:
-            self.source_code_dir = args.source_code_folder
+        self.load_put_args(args)
 
     def _load_default(self):
         self.logging_level = LOGGING_LEVEL
@@ -190,8 +193,7 @@ class Config:
                 bid = int(items[0])
                 d = float(items[2])
                 self.initial_distance[bid] = d
-                max_distance = max(d, max_distance)
-        self.max_distance = max_distance
+                self.max_distance = max(d, self.max_distance)
 
     def _load_initial_policy(self):
         policy_txt = os.path.join(self.static_result_folder, "policy.txt")
