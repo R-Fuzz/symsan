@@ -535,12 +535,7 @@ bool AFLCoverage::runOnModule(Module &M) {
         new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
                            GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
 
-    std::ofstream bbLocs(OutDirectory + "/bid_loc_mapping.txt", std::ofstream::out | std::ofstream::app);
-    std::ofstream funcInfo(OutDirectory + "/function_info.txt", std::ofstream::out | std::ofstream::app);
-
     for (auto &F : M) {
-      unsigned minLine = std::numeric_limits<unsigned>::max();
-      unsigned maxLine = 0;
 
       std::string filename;
       for (auto &BB : F) {
@@ -549,15 +544,6 @@ bool AFLCoverage::runOnModule(Module &M) {
         unsigned line = 0;
         unsigned col = 0;
         uint64_t bb_id = (uint64_t) getBasicblockId(BB, filename, line, col);
-
-        if (line < minLine && line > 0) {
-          minLine = line;
-        }
-        if (line > maxLine && line > 0) {
-          maxLine = line;
-        }
-        if (!filename.empty() && line != 0)
-          bbLocs << bb_id << "," << F.getGUID() << "," << filename << ":" << line << "\n";
 
         if (is_aflgo) {
           if (bb_to_dis.find(bb_id) != bb_to_dis.end()) {
@@ -633,8 +619,6 @@ bool AFLCoverage::runOnModule(Module &M) {
         }
 
       }
-      if (!filename.empty() && minLine != std::numeric_limits<unsigned>::max() && maxLine != 0)
-        funcInfo << F.getGUID() << "," << F.getName().str() << "," << filename << "," << minLine << "," << maxLine << "\n";
     }
   }
 
