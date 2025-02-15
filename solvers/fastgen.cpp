@@ -114,7 +114,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
   bool critical_branch_found = false;
-  if (critical_branches_ptr != nullptr && critical_branches_ptr->contains(cid)) {
+  if (critical_branches_ptr != nullptr && hashset_contains(critical_branches_ptr, cid)) {
       critical_branch_found = true;
   }
   if (label == 0 && !critical_branch_found) {

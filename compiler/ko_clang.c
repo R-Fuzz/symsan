@@ -92,10 +92,8 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = alloc_printf("-L%s", getenv("KO_LIBRARY_PATH"));
   }
 
-  cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
   if (getenv("KO_ADD_AFLGO")) {
-  cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libAFLGORT.a", obj_path);
-  cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libAFLGORT.a", obj_path);
   }
   cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libdfsan_rt-x86_64.a", obj_path);
   cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";

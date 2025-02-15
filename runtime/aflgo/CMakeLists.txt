@@ -1,11 +1,14 @@
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_CXX_STANDARD 14)
+cmake_minimum_required(VERSION 3.10)
+project(AFLGORT LANGUAGES C)
 
-add_library(AFLGORT STATIC aflgo-rt.o.cpp)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++ -fPIC")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+add_library(AFLGORT STATIC aflgo-rt.o.c)
 target_include_directories(AFLGORT PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
 )
-target_link_libraries(AFLGORT PRIVATE c++ c++abi)
-install (TARGETS AFLGORT DESTINATION ${SYMSAN_LIB_DIR})
+install(TARGETS AFLGORT DESTINATION ${SYMSAN_LIB_DIR})

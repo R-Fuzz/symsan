@@ -1,72 +1,80 @@
 #ifndef MY_HASHSET_H
 #define MY_HASHSET_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "defs.h"
+#include "hash.h"
+#include <stdint.h>
+#include <stdbool.h>
 
-class HashSet {
-private:
-    enum SlotState {
-        SLOTEMPTY,
-        SLOTUSED,
-        SLOTDELETED
-    };
-
+typedef struct {
     u32* keys;
     SlotState* states;
     int capacity;
     int size;
     float loadFactorThreshold;
+} HashSet;
 
-    u32 hash1(u32 key) const {
-        return key & (capacity - 1);
-    }
+// Creates a new hash set with a given initial capacity.
+// The capacity is rounded up to the nearest power of two.
+HashSet* hashset_create(int initialCapacity);
 
-    u32 hash2(uint32_t key) const {
-        u32 h = ((key * 31 + 1) & (capacity - 1));
-        if (h == 0) {
-            h = 1;
-        }
-        if ((h & 1) == 0) {
-            h ^= 1;
-        }
-        return h;
-    }
+// Frees all memory associated with the hash set.
+void hashset_free(HashSet* set);
 
-    void checkLoadFactorAndRehash();
-    void rehash(int newCapacity);
+// Inserts a key into the hash set.
+// Returns true if the key was inserted, or false if it was already present.
+bool hashset_insert(HashSet* set, u32 key);
 
-public:
-    HashSet(int initialCapacity = 8, float loadFactor = 0.75f);
-    ~HashSet();
+// Returns true if the key is in the hash set, false otherwise.
+bool hashset_contains(const HashSet* set, u32 key);
 
-    bool insert(u32 key);
-    int getSize() const;
-    bool contains(u32 key) const;
-    bool remove(u32 key);
-};
+// Removes a key from the hash set.
+// Returns true if the key was removed, or false if the key was not found.
+bool hashset_remove(HashSet* set, u32 key);
+
+// Returns the number of elements in the hash set.
+int hashset_get_size(const HashSet* set);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // MY_HASHSET_H
 
 // --------------------------------------------------------------------------
+/**
 // Example usage:
-// 
-// #include <cstdio>
 
-// int main() {
-//     HashSet set(8); // capacity=8, loadFactor=0.75
-//     set.insert(10);
-//     set.insert(20);
-//     set.insert(30);
-// 
-//     if (set.contains(20)) {
-//         printf("20 exists.\n");
-//     }
-// 
-//     set.remove(10);
-//     if (!set.contains(10)) {
-//         printf("10 removed.\n");
-//     }
-// 
-//     return 0;
-// }
-// --------------------------------------------------------------------------
+#include <stdio.h>
+#include "hashset.h"
+
+int main(void) {
+    HashSet* set = hashset_create(8);
+    if (!set) {
+        return 1; // Allocation failed
+    }
+    
+    hashset_insert(set, 10);
+    hashset_insert(set, 20);
+    hashset_insert(set, 30);
+
+    if (hashset_contains(set, 20)) {
+        printf("20 exists.\n");
+    }
+
+    hashset_remove(set, 10);
+    if (!hashset_contains(set, 10)) {
+        printf("10 removed.\n");
+    }
+
+    printf("Size: %d\n", hashset_get_size(set));
+
+    hashset_free(set);
+    return 0;
+}
+
+**/
