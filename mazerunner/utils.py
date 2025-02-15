@@ -134,6 +134,24 @@ def get_critical_branches(policy):
             critical_branches.append((bid, False))
     return critical_branches
 
+def get_policy_from_txt(file_path):
+    policy = {}
+    if not os.path.isfile(file_path):
+        return policy
+    with open(file_path, 'r') as file:
+        for l in file.readlines():
+            if not l.strip():
+                continue
+            if l.startswith('##########'):
+                break
+            items = l.strip().split(',')
+            assert len(items) == 3
+            bid = int(items[0])
+            df = float(items[1]) if items[1] != 'inf' else None
+            dt = float(items[2]) if items[2] != 'inf' else None
+            policy[bid] = (df, dt)
+    return policy
+
 def hexdump(file_content, width=16):
     """
     Mimics the behavior of `xxd` and generates a hexadecimal dump of the given binary content.

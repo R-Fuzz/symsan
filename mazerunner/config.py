@@ -4,6 +4,7 @@ import pickle
 import os
 import logging
 
+import utils
 from model import RLModelType
 
 LOGGING_LEVEL = logging.INFO
@@ -198,18 +199,7 @@ class Config:
     def _load_initial_policy(self):
         policy_txt = os.path.join(self.static_result_folder, "policy.txt")
         if os.path.isfile(policy_txt):
-            with open(policy_txt, 'r') as file:
-                for l in file.readlines():
-                    if not l.strip():
-                        continue
-                    if l.startswith('##########'):
-                        break
-                    items = l.strip().split(',')
-                    assert len(items) == 3
-                    bid = int(items[0])
-                    df = float(items[1]) if items[1] != 'inf' else None
-                    dt = float(items[2]) if items[2] != 'inf' else None
-                    self.initial_policy[bid] = (df, dt)
+            self.initial_policy = utils.get_policy_from_txt(policy_txt)
             self.logger.debug(f"initial policy loaded from {policy_txt}")
             return
         policy_pkl = os.path.join(self.static_result_folder, "policy.pkl")
