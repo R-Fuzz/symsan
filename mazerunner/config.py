@@ -39,7 +39,7 @@ MIN_HANG_FILES = 1
 # Model configurations
 DECIMAL_PRECISION = 200
 # Path divergence handler configurations
-HANDLE_PATH_DIVERGENCE_ENABLED = True
+HANDLE_PATH_DIVERGENCE_ENABLED = False
 ADDRESS2LINE_PATH = '/usr/bin/addr2line'
 
 class Config:

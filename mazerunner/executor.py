@@ -160,7 +160,7 @@ class ConcolicExecutor:
         logging_level = 1 if self.config.logging_level == logging.DEBUG else 0
         shoud_trace_bounds = 1 if self.config.gep_solver_enabled else 0
         subprocess_io = subprocess.PIPE if logging_level == 1 else subprocess.DEVNULL
-        cmd, stdin, _ = utils.fix_at_file(self.cmd, self.input_file)
+        cmd, stdin, self.input_content = utils.fix_at_file(self.cmd, self.input_file)
         taint_file = "stdin" if stdin else self.input_file
         options = (f"taint_file=\"{taint_file}\""
         f":shm_fd={self.shm._fd}"

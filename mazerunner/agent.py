@@ -222,7 +222,7 @@ class Agent:
         self._prompt_builder = None
 
     @property
-    def prompt_builder(self):
+    def prompt_engine(self):
         if not self._prompt_builder:
             self._prompt_builder = PromptBuilder(self.config, self.code_finder)
         return self._prompt_builder
@@ -314,7 +314,7 @@ class Agent:
             dna = policy[bid][reversed_action] if policy[bid][reversed_action] else float('inf')
             if da > dna:
                 func_name, loc = self.code_finder.find_loc_info(bid, addr=msg.addr)
-                self.logger.debug(f"critical concret branch divergent: "
+                self.logger.info(f"critical concret branch divergent: "
                                   f"loc={loc}, "
                                   f"func={func_name}, "
                                   f"bid={bid}, "
@@ -331,9 +331,9 @@ class Agent:
     def handle_path_divergence(self, input_content):
         if not self.path_divergences:
             return
-        heapq.heapify(self.path_divergences)
-        divergent_branch_info = heapq.heappop(self.path_divergences)
-        prompt = self.prompt_builder.build_concret_divergent_branch_prompt(self.episode, divergent_branch_info, input_content)
+        divergent_branch_info = min(self.path_divergences, key=lambda x: x[0])
+        prompt = self.prompt_engine.build_concret_divergent_branch_prompt(self.episode, divergent_branch_info, input_content)
+        print(prompt)
 
     def handle_unsat_condition(self, solving_status):
         pass

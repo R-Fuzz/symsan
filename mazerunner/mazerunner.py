@@ -65,7 +65,6 @@ def main():
     config = Config()
     config.load(args.config_path)
     config.load_args(args)
-    config.validate_config()
     
     logging.basicConfig(level=config.logging_level)
     logging.getLogger('Launcher').info("[*] spinning up mazerunner: " + " ".join(sys.argv))
