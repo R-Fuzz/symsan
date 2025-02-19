@@ -194,7 +194,8 @@ class Config:
                 bid = int(items[0])
                 d = float(items[2])
                 self.initial_distance[bid] = d
-                self.max_distance = max(d, self.max_distance)
+                if d > self.max_distance or (self.max_distance == MAX_DISTANCE and d > 0):
+                    self.max_distance = d
 
     def _load_initial_policy(self):
         policy_txt = os.path.join(self.static_result_folder, "policy.txt")
