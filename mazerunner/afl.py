@@ -473,7 +473,18 @@ class ExploreExecutor(Mazerunner):
         
         if self.config.defferred_solving_enabled:
             for s in self.agent.episode:
-                self.seed_scheduler.put(fn, (res.distance, s.sa))
+                old_fn = self.seed_scheduler.state_seed_mapping.get(s)
+                should_save = False
+                if old_fn is None:
+                    should_save = True
+                else:
+                    old_fp = os.path.join(self.my_queue, old_fn)
+                    if not os.path.isfile(old_fp):
+                        should_save = True
+                    if os.path.getsize(fp) <= os.path.getsize(old_fp):
+                        should_save = True
+                if should_save:
+                    self.seed_scheduler.put(fn, (res.distance, s.sa))
             return
         
         self.logger.info("Generated %d testcases" % len(res.generated_testcases))
