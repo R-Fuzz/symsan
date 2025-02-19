@@ -160,6 +160,9 @@ class ConcolicExecutor:
                     self.logger.error(f"process_request: slover panic, stop processing. "
                                       f"solving_status={solving_status}")
                     should_handle = False
+                if self.agent.min_distance == 0 and self.config.target_reached_exit:
+                    self.logger.info(f"process_request: target reached, stop processing new msg.")
+                    should_handle = False
             elif msg.msg_type == MsgType.gep_type.value:
                 self._process_gep_request(msg)
             # msg.flags == 1 means there is additional data need to be processed

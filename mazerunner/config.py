@@ -15,7 +15,7 @@ SYNC_FREQUENCY = 10 # sync mazerunner status with AFL every SYNC_FREQUENCY execu
 SAVE_FREQUENCY = 200 # save mazerunner status into disk every SAVE_FREQUENCY executions.
 REPLAY_FREQUENCY = 0 # off-learning from replay buffer every REPLAY_FREQUENCY executions.
 TARGET_REACHED_EXIT = True
-TARGET_TRIGGERED_EXIT = False
+TARGET_TRIGGERED_EXIT = True # TARGET_REACHED_EXIT implies TARGET_TRIGGERED_EXIT
 BUG_TRIGGER_DISTANCE = 3 * 1000 # start bug triggering after reaching this distance value
 # Solver configurations
 USE_BUILTIN_SOLVER = False
@@ -163,8 +163,8 @@ class Config:
         self.decimal_precision = DECIMAL_PRECISION
         self.max_branch_num = MAX_BRANCH_NUM
         self.use_builtin_solver = USE_BUILTIN_SOLVER
-        self.target_triggered_exit = TARGET_TRIGGERED_EXIT
         self.target_reached_exit = TARGET_REACHED_EXIT
+        self.target_triggered_exit = TARGET_TRIGGERED_EXIT or TARGET_REACHED_EXIT
         self.bug_trigger_distance = BUG_TRIGGER_DISTANCE
         self.addr2line_path = ADDRESS2LINE_PATH
         self.handle_path_divergence = HANDLE_PATH_DIVERGENCE_ENABLED
