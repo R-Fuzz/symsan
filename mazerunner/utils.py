@@ -1,4 +1,6 @@
+import collections
 import copy
+import json
 import os
 import subprocess
 import logging
@@ -170,3 +172,27 @@ def hexdump(file_content, width=16):
         # Format the line similar to xxd output
         hex_lines.append(f"{offset:08x}: {hex_part.ljust(width * 3)} {ascii_part}")
     return "\n".join(hex_lines)
+
+def load_knowledge():
+    knowledge = {}
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    json_file_path = os.path.join(cur_dir, "knowledge.json")
+    try:
+        with open(json_file_path, "r") as file:
+            data = json.load(file)
+    except:
+        print(f"Failed to load prior knowledge from {json_file_path}")
+        return knowledge
+    if not isinstance(data, dict):
+        print(f"Invalid prior knowledge format in {json_file_path}")
+        return knowledge
+    for key, value in data.items():
+        knowledge[key] = value
+    if not "projects" in knowledge:
+        print(f"LLM assistant requires prior knowledge of projects")
+        return knowledge
+    knowledge["bin_to_project"] = collections.defaultdict(str)
+    for project, bin_list in knowledge["projects"].items():
+        for bin in bin_list:
+            knowledge["bin_to_project"][bin] = project
+    return knowledge

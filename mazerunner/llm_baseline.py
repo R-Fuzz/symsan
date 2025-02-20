@@ -2,7 +2,7 @@ import argparse
 import os
 import config
 import prompt
-from utils import AT_FILE, get_critical_branches
+from utils import AT_FILE, get_critical_branches, load_knowledge
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -24,11 +24,12 @@ def validate_args(args):
 if __name__ == "__main__":
     args = parse_args()
     validate_args(args)
+    knowledge = load_knowledge()
     config = config.Config()
     config.load(args.config_path)
     config.load_put_args(args)
     code_finder = prompt.SourceCodeFinder(config)
-    prompt_engine = prompt.PromptBuilder(config, code_finder)
+    prompt_engine = prompt.PromptBuilder(config, code_finder, knowledge)
     critical_branches = get_critical_branches(config.initial_policy)
-    prompt_str = prompt_engine.build_critical_branches_LLM_solver_prompt(critical_branches)
+    prompt_str = prompt_engine.build_LLM_baseline_prompt(critical_branches)
     print(prompt_str)

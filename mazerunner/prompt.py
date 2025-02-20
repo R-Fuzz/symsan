@@ -32,32 +32,35 @@ class PromptBuilder:
     CRITICAL_BRANCHES_BASELINE_PROMPT = '''
 You are an advanced concolic execution engine with expert knowledge in software testing, \
 dynamic program analysis, and input generation techniques. \
-You are currently testing the binutils project and are very familiar with its source code. \
+You are currently testing the {project_name} project and are very familiar with its source code. \
 
 The command line arguments are:
-objdump -SD <input_file>
+{cmd}
 
 Your task is to analyze some critical branches in the program and generate inputs to cover them.
 You have the following sources of information:
     1. critical branches and their corresponding conditions that must be satisfied
-    2. Relevant Source Code: The corresponding binutils source code, with each line numbered at the beginning.
+    2. Relevant Source Code: The corresponding {project_name} source code, with each line numbered at the beginning.
 
-Using these materials, please write a python3 script to generate such input_file.
+Using these materials, please write a python3 script to generate such input_file called poc.
 '''
 
-    CONCRET_DIVERGENT_BRANCH_PROMPT = '''
+    SOLVE_DIVERGENT_BRANCH_PROMPT = '''
 You are an advanced concolic execution engine with expert knowledge in software testing, \
 dynamic program analysis, and input generation techniques. \
 Your expertise includes analyzing both symbolic and concrete branches in program execution. \
 In concolic execution, while symbolic branches can be directly solved, \
 concrete branches present unique challenges.
 
-You are currently testing the binutils project and are very familiar with its source code. \
+You are currently testing the {project_name} project and are very familiar with its source code. \
 Your task is to analyze a specific concrete branch divergence \
 by examining the following three sources of information:
 	1.	Input Hexdump: A hexdump representation of the input content.
 	2.	Symbolic Branch Trace: A chronologically ordered list of symbolic branch events during execution.
-	3.	Relevant Source Code: The corresponding binutils source code, with each line numbered at the beginning.
+	3.	Relevant Source Code: The corresponding {project_name} source code, with each line numbered at the beginning.
+
+The command line arguments are:
+{cmd}
 
 Using these materials, please answer the following questions:
 	1.	Identify Impactful Symbolic Branches:
@@ -70,10 +73,11 @@ that are not present in the provided trace but could affect the concrete branch.
 Consider data dependencies, control flow interactions, or other relevant factors from the source code.
     '''
     
-    def __init__(self, config, code_finder):
+    def __init__(self, config, code_finder, knowledge):
         self.config = config
-        self.code_finder = code_finder
         self.logger = logging.getLogger(self.__class__.__qualname__)
+        self.code_finder = code_finder
+        self.bin_to_project = knowledge["bin_to_project"]
         self._func_codes = {}
 
     def build_concret_divergent_branch_prompt(self, episode, divergent_branch_info, input_content):
@@ -144,10 +148,14 @@ Consider data dependencies, control flow interactions, or other relevant factors
         prompt_str += "<Concrete Divergent Branch Info Ends>\n"
         
         # prompt building with questions
-        prompt_str += PromptBuilder.CONCRET_DIVERGENT_BRANCH_PROMPT
+        cmd_str, _ = PromptBuilder._fix_at_file(self.config.cmd)
+        prompt_str += PromptBuilder.SOLVE_DIVERGENT_BRANCH_PROMPT.format(
+            project_name=self.bin_to_project[self.config.cmd[0]],
+            cmd=cmd_str
+        )
         return prompt_str
     
-    def build_critical_branches_LLM_solver_prompt(self, critical_branches):
+    def build_LLM_baseline_prompt(self, critical_branches):
         prompt_str = ""
         related_code_info = collections.defaultdict(set)
         for i in range(len(critical_branches)):
@@ -179,7 +187,11 @@ Consider data dependencies, control flow interactions, or other relevant factors
         prompt_str += "<Critical Branches Ends>\n"
         
         # prompt building with questions
-        prompt_str += PromptBuilder.CRITICAL_BRANCHES_BASELINE_PROMPT
+        cmd_str, _ = PromptBuilder._fix_at_file(self.config.cmd)
+        prompt_str += PromptBuilder.CRITICAL_BRANCHES_BASELINE_PROMPT.format(
+            project_name=self.bin_to_project[self.config.cmd[0]],
+            cmd=cmd_str
+        )
         return prompt_str
 
     def _compress_trace(self, trace):
@@ -198,6 +210,17 @@ Consider data dependencies, control flow interactions, or other relevant factors
             file_path = self.code_finder.get_fp_from_func_id(fn_guid)
             start_line_number, _ = self.code_finder.get_func_range_from_func_id(fn_guid)
             storage[file_path].add((start_line_number, fn_guid))
+
+    def _fix_at_file(cmd):
+        if utils.AT_FILE in cmd:
+            idx = cmd.index(utils.AT_FILE)
+            cmd[idx] = '[input_file]'
+            is_stdin = False
+        else:
+            is_stdin = True
+            cmd[idx] = ' < [input_file]'
+        cmd[0] = os.path.basename(cmd[0])
+        return " ".join(cmd), is_stdin
 
 class SourceCodeFinder:
     def __init__(self, config):

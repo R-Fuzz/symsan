@@ -1,0 +1,11 @@
+{
+    "projects": {
+        "binutils": [
+            "as", "ld", "objdump", "readelf", "strings", "nm", "size", "strip",
+            "ar", "ranlib", "c++filt", "addr2line", "objcopy"
+        ],
+        "libming": ["xmllint", "xmlcatalog"],
+        "libxml": ["xmllint", "xmlcatalog"],
+        "libpng": ["libpng_read_fuzzer", "pngfix", "pngcrush", "pngquant", "pngtopnm", "pnmtopng"]
+    }
+}

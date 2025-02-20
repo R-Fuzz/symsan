@@ -38,9 +38,10 @@ MAX_BRANCH_NUM = 33
 MIN_HANG_FILES = 1
 # Model configurations
 DECIMAL_PRECISION = 200
-# Path divergence handler configurations
-HANDLE_PATH_DIVERGENCE_ENABLED = False
 ADDRESS2LINE_PATH = '/usr/bin/addr2line'
+# LLM configurations
+LLM_ASSIST_ENABLED = True
+HANDLE_PATH_DIVERGENCE_ENABLED = False
 
 class Config:
     __slots__ = ['__dict__',
@@ -85,6 +86,7 @@ class Config:
                  'addr2line_path',
                  'source_code_dir',
                  'handle_path_divergence',
+                 'llm_assist_enabled',
     ]
 
     def __init__(self):
@@ -168,6 +170,7 @@ class Config:
         self.bug_trigger_distance = BUG_TRIGGER_DISTANCE
         self.addr2line_path = ADDRESS2LINE_PATH
         self.handle_path_divergence = HANDLE_PATH_DIVERGENCE_ENABLED
+        self.llm_assist_enabled = LLM_ASSIST_ENABLED
         self.gep_solver_enabled = False
         self.use_ordered_dict = False
         self.defferred_solving_enabled = False

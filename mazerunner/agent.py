@@ -1,6 +1,5 @@
 import abc
 import copy
-import heapq
 import logging
 import math
 import os
@@ -219,13 +218,9 @@ class Agent:
         self._learner = None
         self._model = None if model is None else model
         self._code_finder = None
-        self._prompt_builder = None
-
-    @property
-    def prompt_engine(self):
-        if not self._prompt_builder:
-            self._prompt_builder = PromptBuilder(self.config, self.code_finder)
-        return self._prompt_builder
+        if self.config.llm_assist_enabled:
+            self.knowledge = load_knowledge()
+            self.prompt_engine = PromptBuilder(self.config, self.code_finder, self.knowledge)
 
     @property
     def code_finder(self):
@@ -332,8 +327,15 @@ class Agent:
         if not self.path_divergences:
             return
         divergent_branch_info = min(self.path_divergences, key=lambda x: x[0])
-        prompt = self.prompt_engine.build_concret_divergent_branch_prompt(self.episode, divergent_branch_info, input_content)
-        print(prompt)
+        self.logger.debug(f"Interesting divergent branch_info: "
+                          f"loc={divergent_branch_info[4]}, "
+                          f"func={divergent_branch_info[5]}, "
+                          f"action={divergent_branch_info[3]}, "
+                          f"bid={divergent_branch_info[2]}, "
+                          f"d={divergent_branch_info[0]}")
+        if self.config.llm_assist_enabled:
+            prompt = self.prompt_engine.build_concret_divergent_branch_prompt(self.episode, divergent_branch_info, input_content)
+            self.logger.debug(f"Prompt sent to LLM: \n{prompt}")
 
     def handle_unsat_condition(self, solving_status):
         pass
@@ -397,9 +399,6 @@ class Agent:
         s = ((sa[0], sa[1], sa[2]), sa[3], self.config.max_distance, bid)
         self.curr_state = ProgramState.deserialize(s)
 
-    def _make_dirs(self):
-        mkdir(self.my_traces)
-
     def debug_policy(self, state):
         s, a, d, bid = state.serialize()
         fun_name, loc = self.code_finder.find_loc_info(bid, addr=s[0])
@@ -421,6 +420,9 @@ class Agent:
             )
         else:
             self.logger.info(log_message)
+
+    def _make_dirs(self):
+        mkdir(self.my_traces)
 
 class LazyAgent(Agent):
 
