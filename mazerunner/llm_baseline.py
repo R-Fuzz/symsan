@@ -1,7 +1,8 @@
 import argparse
 import os
 import config
-import prompt
+from prompt import PromptBuilder
+from source_code import SourceCodeFinder
 from utils import AT_FILE, get_critical_branches, load_knowledge
 
 def parse_args():
@@ -28,8 +29,8 @@ if __name__ == "__main__":
     config = config.Config()
     config.load(args.config_path)
     config.load_put_args(args)
-    code_finder = prompt.SourceCodeFinder(config)
-    prompt_engine = prompt.PromptBuilder(config, code_finder, knowledge)
+    code_finder = SourceCodeFinder(config)
+    prompt_engine = PromptBuilder(config, code_finder, knowledge)
     critical_branches = get_critical_branches(config.initial_policy)
     prompt_str = prompt_engine.build_LLM_baseline_prompt(critical_branches)
     print(prompt_str)

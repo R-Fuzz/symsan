@@ -10,8 +10,8 @@ import random
 import model
 from decimal import Decimal
 from defs import TaintFlag
+from source_code import SourceCodeFinder
 from utils import *
-from prompt import *
 
 class ProgramState:
     def __init__(self, distance):
@@ -218,9 +218,6 @@ class Agent:
         self._learner = None
         self._model = None if model is None else model
         self._code_finder = None
-        if self.config.llm_assist_enabled:
-            self.knowledge = load_knowledge()
-            self.prompt_engine = PromptBuilder(self.config, self.code_finder, self.knowledge)
 
     @property
     def code_finder(self):
@@ -309,7 +306,7 @@ class Agent:
             dna = policy[bid][reversed_action] if policy[bid][reversed_action] else float('inf')
             if da > dna:
                 func_name, loc = self.code_finder.find_loc_info(bid, addr=msg.addr)
-                self.logger.info(f"critical concret branch divergent: "
+                self.logger.debug(f"critical concret branch divergent: "
                                   f"loc={loc}, "
                                   f"func={func_name}, "
                                   f"bid={bid}, "
@@ -322,20 +319,6 @@ class Agent:
         if is_symbranch:
             self.update_curr_state(msg, action)
             self.append_episode()
-    
-    def handle_path_divergence(self, input_content):
-        if not self.path_divergences:
-            return
-        divergent_branch_info = min(self.path_divergences, key=lambda x: x[0])
-        self.logger.debug(f"Interesting divergent branch_info: "
-                          f"loc={divergent_branch_info[4]}, "
-                          f"func={divergent_branch_info[5]}, "
-                          f"action={divergent_branch_info[3]}, "
-                          f"bid={divergent_branch_info[2]}, "
-                          f"d={divergent_branch_info[0]}")
-        if self.config.llm_assist_enabled:
-            prompt = self.prompt_engine.build_concret_divergent_branch_prompt(self.episode, divergent_branch_info, input_content)
-            self.logger.debug(f"Prompt sent to LLM: \n{prompt}")
 
     def handle_unsat_condition(self, solving_status):
         pass

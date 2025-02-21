@@ -10,6 +10,7 @@ import time
 from defs import *
 import utils
 from agent import ExploitAgent, ExploreAgent
+from prompt import PromptBuilder
 
 NEGATIVE_ONE = (1 << 32) - 1
 
@@ -53,6 +54,9 @@ class ConcolicExecutor:
         self._onetime_solving_enabled = True if (type(agent) is ExploitAgent) else False
         self._save_seed_info = True if (type(agent) is ExploreAgent or type(agent) is ExploitAgent) else False
         utils.disable_core_dump()
+        if self.config.llm_assist_enabled:
+            self.knowledge = utils.load_knowledge()
+            self.prompt_engine = PromptBuilder(self.config, self.agent.code_finder, self.knowledge)
 
     @property
     def cur_input(self):
@@ -200,7 +204,18 @@ class ConcolicExecutor:
         return self.generated_files[-1], seed_map[seed_id], solving_status
     
     def handle_path_divergence(self):
-        self.agent.handle_path_divergence(self.input_content)
+        if not self.agent.path_divergences:
+            return
+        divergent_branch_info = min(self.agent.path_divergences, key=lambda x: x[0])
+        self.logger.debug(f"Interesting divergent branch_info: "
+                          f"loc={divergent_branch_info[4]}, "
+                          f"func={divergent_branch_info[5]}, "
+                          f"action={divergent_branch_info[3]}, "
+                          f"bid={divergent_branch_info[2]}, "
+                          f"d={divergent_branch_info[0]}")
+        if self.config.llm_assist_enabled:
+            prompt = self.prompt_engine.build_concret_divergent_branch_prompt(self.agent.episode, divergent_branch_info, self.input_content)
+            self.logger.debug(f"Prompt sent to LLM: \n{prompt}")
 
     def _remove_stall_recipe(self, target_sa):
         while self._recipe[target_sa]:

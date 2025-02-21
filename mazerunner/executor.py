@@ -10,10 +10,11 @@ import threading
 import time
 from multiprocessing import shared_memory
 
-from builtin_solver import Z3Solver
-from defs import *
 import utils
+from builtin_solver import Z3Solver
 from agent import ExploitAgent, ExploreAgent
+from prompt import PromptBuilder
+from defs import *
 
 UNION_TABLE_SIZE = 0xc00000000
 PIPE_CAPACITY = 4 * 1024 * 1024
@@ -100,6 +101,9 @@ class ConcolicExecutor:
         self._should_increase_pipe_capacity = True
         self._setup_pipe()
         utils.disable_core_dump()
+        if self.config.llm_assist_enabled:
+            self.knowledge = utils.load_knowledge()
+            self.prompt_engine = PromptBuilder(self.config, self.agent.code_finder, self.knowledge)
 
     @property
     def has_terminated(self):
@@ -263,7 +267,18 @@ class ConcolicExecutor:
             self.msg_num += 1
     
     def handle_path_divergence(self):
-        self.agent.handle_path_divergence(self.input_content)
+        if not self.agent.path_divergences:
+            return
+        divergent_branch_info = min(self.agent.path_divergences, key=lambda x: x[0])
+        self.logger.debug(f"Interesting divergent branch_info: "
+                          f"loc={divergent_branch_info[4]}, "
+                          f"func={divergent_branch_info[5]}, "
+                          f"action={divergent_branch_info[3]}, "
+                          f"bid={divergent_branch_info[2]}, "
+                          f"d={divergent_branch_info[0]}")
+        if self.config.llm_assist_enabled:
+            prompt = self.prompt_engine.build_concret_divergent_branch_prompt(self.agent.episode, divergent_branch_info, self.input_content)
+            self.logger.debug(f"Prompt sent to LLM: \n{prompt}")
 
     def _process_cond_request(self, msg):
         readable, _, _ = select.select([self.pipefds[0]], [], [], self.pipe_timeout)
