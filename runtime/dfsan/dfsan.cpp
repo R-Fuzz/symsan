@@ -178,8 +178,8 @@ static inline bool is_valid_op(uint16_t op) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
-                          uint64_t op1, uint64_t op2) {
+dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
+                          uint16_t size, uint64_t op1, uint64_t op2) {
   if (!is_valid_op(op)) {
     AOUT("WARNING: invalid op %d\n", op);
     return 0;
@@ -189,8 +189,11 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t 
     Swap(l1, l2);
     Swap(op1, op2);
   }
-  if (l1 == 0 && l2 < CONST_OFFSET && op != fsize && op != __dfsan::Alloca) return 0;
-  if (l1 == kInitializingLabel || l2 == kInitializingLabel) return kInitializingLabel;
+  if (l1 == 0 && l2 < CONST_OFFSET &&
+      op != fsize && op != __dfsan::Alloca)
+    return 0;
+  if (l1 == kInitializingLabel || l2 == kInitializingLabel)
+    return kInitializingLabel;
 
   // special handling for bounds
   if (get_label_info(l1)->op == __dfsan::Alloca ||
@@ -214,7 +217,9 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t 
     uint16_t len = size > 8 ? 8 : size; // for fmemcmp, size is in bytes, not bits
     if (l1 >= CONST_OFFSET) internal_memcpy(&op1, (void*)op1, len);
     if (l2 >= CONST_OFFSET) internal_memcpy(&op2, (void*)op2, len);
-  } else if (op != __dfsan::Alloca && (op & 0xff) != __dfsan::ICmp && op != __dfsan::fatoi) {
+  } else if (op != __dfsan::Alloca &&
+             (op & 0xff) != __dfsan::ICmp &&
+             op != __dfsan::fatoi) {
     if (l1 >= CONST_OFFSET) op1 = 0;
     if (l2 >= CONST_OFFSET) op2 = 0;
   }
@@ -261,7 +266,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t 
   uint32_t hash = xxhash(h1, h2, h3);
 
   struct dfsan_label_info label_info = {
-    .l1 = l1, .l2 = l2, .op1 = op1, .op2 = op2, .op = op, .size = size,
+    .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2}, .op = op, .size = size,
     .hash = hash};
 
   __taint::option res = __union_table.lookup(label_info);
@@ -287,7 +292,13 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t 
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_union_load(const dfsan_label *ls, uptr n) {
+dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
+  if ((uptr)ls < 4096) {
+    AOUT("WARNING: nullptr deref\n");
+    return 0;
+  } else if (((uptr)ls & (align - 1)) != 0) {
+    AOUT("WARNING: unaligned load %p\n", ls);
+  }
   dfsan_label label0 = ls[0];
   if (label0 == kInitializingLabel) return kInitializingLabel;
 
@@ -333,7 +344,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n) {
     return __taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0);
   }
 
-  // fast path 2: all labels are extracted from a n-size label, then return that label
+  // fast path 2: all labels are extracted from a n-size label,
+  // then return that label
   if (is_kind_of_label(label0, Extract)) {
     dfsan_label parent = get_label_info(label0)->l1;
     uptr offset = 0;
@@ -382,8 +394,14 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n) {
+void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align) {
   //AOUT("label = %d, n = %d, ls = %p\n", l, n, ls);
+  if ((uptr)ls < 4096) {
+    AOUT("WARNING: nullptr deref\n");
+    return;
+  } else if (((uptr)ls & (align - 1)) != 0) {
+    AOUT("WARNING: unaligned store %p\n", ls);
+  }
   if (l != kInitializingLabel) {
     // for debugging
     dfsan_label h = atomic_load(&__dfsan_last_label, memory_order_relaxed);
@@ -442,7 +460,8 @@ void __taint_pop_stack_frame() {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size, uint64_t elem_size, uint64_t base) {
+dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size,
+                                 uint64_t elem_size, uint64_t base) {
   if (flags().trace_bounds) {
     __alloca_stack_top -= 1;
     AOUT("label = %d, base = %p, size = %lld, elem_size = %lld\n",
@@ -473,8 +492,8 @@ dfsan_label __taint_trace_global(uint64_t addr, uint64_t size) {
     uint32_t hash = xxhash(h1, h2, Alloca);
 
     struct dfsan_label_info label_info = {
-      .l1 = 0, .l2 = 0, .op1 = addr, .op2 = addr + size, .op = Alloca, .size = sizeof(void*) * 8,
-      .hash = hash};
+      .l1 = 0, .l2 = 0, .op1 = addr, .op2 = addr + size, .op = Alloca,
+      .size = sizeof(void*) * 8, .hash = hash};
 
     __taint::option res = __union_table.lookup(label_info);
     if (res != __taint::none()) {
@@ -497,8 +516,8 @@ dfsan_label __taint_trace_global(uint64_t addr, uint64_t size) {
   return 0;
 }
 
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memerr, dfsan_label, uptr, dfsan_label,
-                             uint64_t, uint16_t, void*) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memerr, dfsan_label, uptr,
+                             dfsan_label, uint64_t, uint16_t, void*) {}
 
 // NOTES: for Alloca, or buffer buounds info
 // .l1 = num of elements label, for calloc style allocators
@@ -550,7 +569,7 @@ void __taint_check_bounds(dfsan_label addr_label, uptr addr,
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void dfsan_store_label(dfsan_label l, void *addr, uptr size) {
   if (l == 0) return;
-  __taint_union_store(l, shadow_for(addr), size);
+  __taint_union_store(l, shadow_for(addr), size, sizeof(dfsan_label));
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -581,7 +600,8 @@ __dfsan_vararg_wrapper(const char *fname) {
 // Like __dfsan_union, but for use from the client or custom functions.  Hence
 // the equality comparison is done here before calling __dfsan_union.
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
-dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size, uint64_t op1, uint64_t op2) {
+dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
+            uint64_t op1, uint64_t op2) {
   return __taint_union(l1, l2, op, size, op1, op2);
 }
 
@@ -614,7 +634,7 @@ void __dfsan_set_label(dfsan_label label, void *addr, uptr size) {
     if (label == *labelp)
       continue;
 
-    //AOUT("%p = %u\n", addr, label);
+    // AOUT("%p = %u\n", addr, label);
     *labelp = label;
   }
 }
@@ -644,7 +664,7 @@ SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
 dfsan_read_label(const void *addr, uptr size) {
   if (size == 0)
     return 0;
-  return __taint_union_load(shadow_for(addr), size);
+  return __taint_union_load(shadow_for(addr), size, sizeof(dfsan_label));
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
@@ -1068,7 +1088,8 @@ SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSolver, void) {}
 // Default empty implementations (weak) for hooks
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
                              uint32_t, uint32_t, uint64_t, uint64_t, uint32_t) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, uint8_t, uint32_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, uint8_t,
+                             uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
                              dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}

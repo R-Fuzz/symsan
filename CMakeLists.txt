@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.5)
 
 project(symsan VERSION 1.2.2 LANGUAGES C CXX ASM)
 
-find_package(LLVM 12 REQUIRED CONFIG)
+find_package(LLVM 14 REQUIRED CONFIG)
 
 if (LLVM_FOUND)
     message(STATUS "LLVM_VERSION_MAJOR: ${LLVM_VERSION_MAJOR}")

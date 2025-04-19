@@ -4,6 +4,7 @@
 *.so
 *.dwo
 *.bc
+*.ll
 GPATH
 GRTAGS
 GTAGS
