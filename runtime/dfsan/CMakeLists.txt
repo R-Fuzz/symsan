@@ -17,7 +17,6 @@ set(DFSAN_RTL_HEADERS
   union_util.h
   union_hashtable.h)
 
-list(APPEND ${SANITIZER_COMMON_CFLAGS} "-O3")
 set(DFSAN_COMMON_CFLAGS ${SANITIZER_COMMON_CFLAGS})
 
 if(OS_NAME MATCHES "Linux" AND
@@ -25,7 +24,7 @@ if(OS_NAME MATCHES "Linux" AND
    COMPILER_RT_LIBCXXABI_PATH)
   list(APPEND DFSAN_COMMON_CFLAGS -nostdinc++ -D_LIBCPP_ABI_VERSION=Taint)
   # Remove -stdlib= which is unused when passing -nostdinc++.
-  #string(REGEX REPLACE "-stdlib=[a-zA-Z+]*" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
+  string(REGEX REPLACE "-stdlib=[a-zA-Z+]*" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
 endif()
 
 append_rtti_flag(OFF DFSAN_COMMON_CFLAGS)
@@ -45,6 +44,8 @@ foreach(arch ${DFSAN_SUPPORTED_ARCH})
             $<TARGET_OBJECTS:RTInterception.${arch}>
             $<TARGET_OBJECTS:RTSanitizerCommon.${arch}>
             $<TARGET_OBJECTS:RTSanitizerCommonLibc.${arch}>
+            $<TARGET_OBJECTS:RTSanitizerCommonSymbolizer.${arch}>
+    ADDITIONAL_HEADERS ${DFSAN_RTL_HEADERS}
     CFLAGS ${DFSAN_CFLAGS}
     PARENT_TARGET dfsan)
   add_sanitizer_rt_symbols(dfsan_rt
@@ -52,7 +53,7 @@ foreach(arch ${DFSAN_SUPPORTED_ARCH})
     EXTRA dfsan.syms.extra)
   add_dependencies(dfsan
     dfsan_rt-${arch}-symbols)
- 
+
   if(OS_NAME MATCHES "Linux" AND
     COMPILER_RT_LIBCXX_PATH AND
     COMPILER_RT_LIBCXXABI_PATH)

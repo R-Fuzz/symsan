@@ -22,15 +22,15 @@ it has more strict dependency on the LLVM version. Right now only LLVM 12 is tes
 
 ### Build Requirements
 
-- Linux-amd64 (Tested on Ubuntu 20.04)
-- [LLVM 12.0.1](http://llvm.org/docs/index.html): clang, libc++, libc++abi
+- Linux-amd64 (Tested on Ubuntu 24.04)
+- [LLVM 14.0.6](http://llvm.org/docs/index.html): clang, libc++, libc++abi
 
 ### Compilation
 
 Create a `build` directory and execute the following commands in it:
 
 ```shell
-$ CC=clang-12 CXX=clang-12 cmake -DCMAKE_INSTALL_PREFIX=/path/to/install -DCMAKE_BUILD_TYPE=Release /path/to/symsan/source
+$ CC=clang-14 CXX=clang++-14 cmake -DCMAKE_INSTALL_PREFIX=/path/to/install -DCMAKE_BUILD_TYPE=Release /path/to/symsan/source
 $ make
 $ make install
 ```

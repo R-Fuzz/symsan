@@ -44,6 +44,7 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
     return itr->second;
   }
 
+  llvm::Type *ArgTy = Builder.getInt64Ty();
   switch (node->kind()) {
     case rgd::Bool: {
       // getTrue is actually 1 bit integer 1
@@ -59,27 +60,31 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       uint32_t length = node->bits() / 8;
 
       llvm::Value* idx[1];
+      // calculate the offset
       idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), start + RET_OFFSET);
-      llvm::PointerType *constPtr = llvm::PointerType::getUnqual(
-          llvm::Type::getIntNTy(Builder.getContext(), node->bits()));
-      ret = Builder.CreateGEP(arg, idx); // calculate the offset
-      ret = Builder.CreateBitCast(ret, constPtr);
-      ret = Builder.CreateLoad(ret); // load length bytes at once
+      ret = Builder.CreateGEP(ArgTy, arg, idx);
+      Type* CTy = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
+      llvm::PointerType* CPTy = llvm::PointerType::getUnqual(CTy);
+      ret = Builder.CreateBitCast(ret, CPTy);
+      ret = Builder.CreateLoad(CTy, ret); // load length bytes at once
       break;
     }
     case rgd::Read: {
       uint32_t start = local_map.at(node->index());
       size_t length = node->bits() / 8;
       //std::cout << "read index " << start << " length " << length << std::endl;
-      llvm::Type *retTy = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
+      llvm::Type *RTy = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
       llvm::Value* idx[1];
       idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), start + RET_OFFSET);
-      ret = Builder.CreateLoad(Builder.CreateGEP(arg, idx));
-      ret = Builder.CreateZExtOrTrunc(ret, retTy);
+      ret = Builder.CreateGEP(ArgTy, arg, idx);
+      ret = Builder.CreateLoad(ArgTy, ret);
+      ret = Builder.CreateZExtOrTrunc(ret, RTy);
       for (uint32_t k = 1; k < length; k++) {
-        idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), start + k + RET_OFFSET);
-        llvm::Value* tmp = Builder.CreateLoad(Builder.CreateGEP(arg, idx));
-        tmp = Builder.CreateZExtOrTrunc(tmp, retTy);
+        idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(),
+                                        start + k + RET_OFFSET);
+        llvm::Value* tmp = Builder.CreateGEP(ArgTy, arg, idx);
+        tmp = Builder.CreateLoad(ArgTy, tmp);
+        tmp = Builder.CreateZExtOrTrunc(tmp, RTy);
         tmp = Builder.CreateShl(tmp, 8 * k);
         ret = Builder.CreateAdd(ret, tmp);
       }
@@ -294,9 +299,11 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       // so it's easier to negate the condition
       llvm::Value* idx[1];
       idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(c1e, Builder.CreateGEP(arg, idx));
+      Builder.CreateStore(c1e,
+                          Builder.CreateGEP(Builder.getInt64Ty(), arg, idx));
       idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
-      Builder.CreateStore(c2e, Builder.CreateGEP(arg, idx));
+      Builder.CreateStore(c2e,
+                          Builder.CreateGEP(Builder.getInt64Ty(), arg, idx));
 
       ret = nullptr;
       break;
@@ -314,7 +321,8 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       // just save the results
       llvm::Value* idx[1];
       idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
-      Builder.CreateStore(ret, Builder.CreateGEP(arg, idx));
+      Builder.CreateStore(ret,
+                          Builder.CreateGEP(Builder.getInt64Ty(), arg, idx));
 
       ret = nullptr;
       break;

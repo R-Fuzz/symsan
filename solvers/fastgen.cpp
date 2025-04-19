@@ -30,7 +30,8 @@ static int __pipe_fd;
 // filter?
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 
-static inline void __solve_cond(dfsan_label label, uint8_t result, uint8_t add_nested, uint32_t cid, void *addr) {
+static inline void __solve_cond(dfsan_label label, uint8_t result,
+                                uint8_t add_nested, uint32_t cid, void *addr) {
 
   if (__pipe_fd < 0)
     return;
@@ -56,7 +57,8 @@ static inline void __solve_cond(dfsan_label label, uint8_t result, uint8_t add_n
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t predicate,
+__taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
+                  uint32_t predicate,
                   uint64_t c1, uint64_t c2, uint32_t cid) {
   if ((op1 == 0 && op2 == 0))
     return;
@@ -71,7 +73,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
 
   // add nested only for matching cases
-  __solve_cond(temp, r, r, cid, addr);
+  __solve_cond(temp, r, 0, cid, addr);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
