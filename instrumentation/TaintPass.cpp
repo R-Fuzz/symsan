@@ -368,6 +368,7 @@ class Taint {
   FunctionType *TaintVarargWrapperFnTy;
   FunctionType *TaintTraceCmpFnTy;
   FunctionType *TaintTraceCondFnTy;
+  FunctionType *TaintTraceSelectFnTy;
   FunctionType *TaintTraceIndirectCallFnTy;
   FunctionType *TaintTraceGEPFnTy;
   FunctionType *TaintPushStackFrameFnTy;
@@ -389,6 +390,7 @@ class Taint {
   FunctionCallee TaintVarargWrapperFn;
   FunctionCallee TaintTraceCmpFn;
   FunctionCallee TaintTraceCondFn;
+  FunctionCallee TaintTraceSelectFn;
   FunctionCallee TaintTraceIndirectCallFn;
   FunctionCallee TaintTraceGEPFn;
   FunctionCallee TaintPushStackFrameFn;
@@ -533,8 +535,9 @@ struct TaintFunction {
   Value *combineCastInstShadows(CastInst *CI, uint8_t op);
   Value *combineCmpInstShadows(CmpInst *CI, uint8_t op);
   void visitCmpInst(CmpInst *I);
-  void visitSwitchInst(SwitchInst *I);
   void visitCondition(Value *Cond, Instruction *I);
+  void visitSwitchInst(SwitchInst *I);
+  Value *visitSelectInst(Value *Cond, Value *TS, Value *FS, SelectInst *I);
   void visitGEPInst(GetElementPtrInst *I);
   Value *visitAllocaInst(AllocaInst *I, Value *ArraySize, Type *ElTy);
   void checkBounds(Value *Ptr, Value *Size, Instruction *Pos);
@@ -894,6 +897,10 @@ bool Taint::initializeModule(Module &M) {
   Type *TaintTraceCondArgs[3] = { PrimitiveShadowTy, Int8Ty, Int32Ty };
   TaintTraceCondFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCondArgs, false);
+  Type *TaintTraceSelectArgs[] = { PrimitiveShadowTy, PrimitiveShadowTy,
+      PrimitiveShadowTy, Int8Ty, Int8Ty, Int8Ty, Int32Ty };
+  TaintTraceSelectFnTy = FunctionType::get(
+      PrimitiveShadowTy, TaintTraceSelectArgs, false);
   TaintTraceIndirectCallFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), { PrimitiveShadowTy }, false);
   Type *TaintTraceGEPArgs[7] = { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy,
@@ -1160,6 +1167,16 @@ void Taint::initializeCallbackFunctions(Module &M) {
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
+    TaintTraceSelectFn =
+        Mod->getOrInsertFunction("__taint_trace_select", TaintTraceSelectFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     TaintTraceIndirectCallFn =
         Mod->getOrInsertFunction("__taint_trace_indcall", TaintTraceIndirectCallFnTy, AL);
   }
@@ -1236,6 +1253,8 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintTraceCmpFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintTraceCondFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintTraceSelectFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintTraceIndirectCallFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -2391,6 +2410,28 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
   }
 }
 
+Value* TaintFunction::visitSelectInst(Value *Cond, Value *TrueShadow,
+                                      Value *FalseShadow, SelectInst *I) {
+  Value *CondShadow = getShadow(Cond);
+  Type *T = I->getType();
+  if (!T->isIntegerTy(1)) {
+    // most cases
+    if (TT.isZeroShadow(CondShadow))
+      visitCondition(Cond, I);
+    return SelectInst::Create(Cond, TrueShadow, FalseShadow, "", I);
+  }
+
+  // special case, when select is used to implement logical AND and OR
+  IRBuilder<> IRB(I);
+  Cond = IRB.CreateZExt(Cond, TT.Int8Ty);
+  Value *TrueVal = IRB.CreateZExt(I->getTrueValue(), TT.Int8Ty);
+  Value *FalseVal = IRB.CreateZExt(I->getFalseValue(), TT.Int8Ty);
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  return IRB.CreateCall(TT.TaintTraceSelectFn,
+                        {CondShadow, TrueShadow, FalseShadow, Cond,
+                         TrueVal, FalseVal, CID});
+}
+
 void TaintVisitor::visitSelectInst(SelectInst &I) {
   Value *Condition = I.getCondition();
   Value *TrueShadow = TF.getShadow(I.getTrueValue());
@@ -2404,9 +2445,7 @@ void TaintVisitor::visitSelectInst(SelectInst &I) {
     if (TrueShadow == FalseShadow) {
       ShadowSel = TrueShadow;
     } else {
-      ShadowSel =
-          SelectInst::Create(Condition, TrueShadow, FalseShadow, "", &I);
-      TF.visitCondition(Condition, &I);
+      ShadowSel = TF.visitSelectInst(Condition, TrueShadow, FalseShadow, &I);
     }
     TF.setShadow(&I, ShadowSel);
   }

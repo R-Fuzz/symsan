@@ -172,6 +172,70 @@ __taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
   __solved_labels.insert(label);
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
+__taint_trace_select(dfsan_label cond_label, dfsan_label true_label,
+                     dfsan_label false_label, uint8_t r, uint8_t true_op,
+                     uint8_t false_op, uint32_t cid) {
+  if (cond_label == 0)
+    return r ? true_label : false_label;
+
+  void *addr = __builtin_return_address(0);
+  auto itr = __branches.find({__taint_trace_callstack, addr});
+  if (itr == __branches.end()) {
+    itr = __branches.insert({{__taint_trace_callstack, addr}, 1}).first;
+  } else if (itr->second < MAX_BRANCH_COUNT) {
+    itr->second += 1;
+  } else {
+    return r ? true_label : false_label;
+  }
+
+  AOUT("solving select: %u %u %u %u %u %u 0x%x @%p\n",
+       cond_label, true_label, false_label, r, true_op, false_op, cid, addr);
+
+  // check if it's actually a logical AND: select cond, label, false
+  dfsan_label solving_label = 0, ret_label = 0;
+  uint8_t solving_r = 0;
+  if (true_label != 0 && false_op == 0) {
+    solving_label = dfsan_union(cond_label, true_label, And, 1, r, true_op);
+    solving_r = (r && true_op) ? 1 : 0;
+    ret_label = solving_label;
+  } else if (false_label != 0 && true_op == 1) {
+    // logical OR: select cond, true, label
+    solving_label = dfsan_union(cond_label, false_label, Or, 1, r, false_op);
+    solving_r = (r || false_op) ? 1 : 0;
+    ret_label = solving_label;
+  } else {
+    // normal select?
+    AOUT("normal select?!\n");
+    solving_label = cond_label;
+    solving_r = r;
+    ret_label = r ? true_label : false_label;
+  }
+
+  if (__solved_labels.count(solving_label) != 0)
+    return ret_label;
+
+  std::vector<uint64_t> tasks;
+  if (__z3_parser->parse_cond(solving_label, solving_r, true, tasks)) {
+    AOUT("WARNING: failed to parse condition %d @%p\n", solving_label, addr);
+    return ret_label;
+  }
+
+  for (auto id : tasks) {
+    // solve
+    if (__solve_task(id)) {
+      AOUT("branch solved\n");
+    } else {
+      AOUT("branch not solvable @%p\n", addr);
+    }
+  }
+
+  // mark as flipped
+  __solved_labels.insert(solving_label);
+
+  return ret_label;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_indcall(dfsan_label label) {
   if (label == 0)

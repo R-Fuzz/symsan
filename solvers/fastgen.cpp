@@ -90,6 +90,38 @@ __taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
   __solve_cond(label, r, 1, cid, addr);
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
+__taint_trace_select(dfsan_label cond_label, dfsan_label true_label,
+                     dfsan_label false_label, uint8_t r, uint8_t true_op,
+                     uint8_t false_op, uint32_t cid) {
+  if (cond_label == 0)
+    return r ? true_label : false_label;
+
+  void *addr = __builtin_return_address(0);
+
+  AOUT("solving select: %u %u %u %u %u %u 0x%x @%p\n",
+       cond_label, true_label, false_label, r, true_op, false_op, cid, addr);
+
+  // check if it's actually a logical AND: select cond, label, false
+  if (true_label != 0 && false_op == 0) {
+    dfsan_label land = dfsan_union(cond_label, true_label, And, 1, r, true_op);
+    uint8_t lr = (r && true_op) ? 1 : 0;
+    __solve_cond(land, lr, 1, cid, addr);
+    return land;
+  } else if (false_label != 0 && true_op == 1) {
+    // logical OR: select cond, true, label
+    dfsan_label lor = dfsan_union(cond_label, false_label, Or, 1, r, false_op);
+    uint8_t lr = (r || false_op) ? 1 : 0;
+    __solve_cond(lor, lr, 1, cid, addr);
+    return lor;
+  } else {
+    // normal select?
+    AOUT("normal select?!\n");
+    __solve_cond(cond_label, r, 1, cid, addr);
+    return r ? true_label : false_label;
+  }
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_indcall(dfsan_label label) {
   if (label == 0)
