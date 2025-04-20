@@ -22,7 +22,7 @@ if [ ! -h $CXX ]; then
     exit 1
 fi
 
-LLVM_VERSION=12.0.1
+LLVM_VERSION=14.0.6
 
 NINJA_B=`which ninja 2>/dev/null`
 
@@ -35,41 +35,27 @@ fi
 set -euxo pipefail
 
 CUR_DIR=`pwd`
-LLVM_SRC="llvm_src"
+LLVM_SRC="llvm_project"
 
 if [ ! -d $LLVM_SRC ]; then
-  wget https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-${LLVM_VERSION}.src.tar.xz
-  wget https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/libcxx-${LLVM_VERSION}.src.tar.xz
-  wget https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/libcxxabi-${LLVM_VERSION}.src.tar.xz
-  wget https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/libunwind-${LLVM_VERSION}.src.tar.xz
-
-  tar -Jxf ${CUR_DIR}/llvm-${LLVM_VERSION}.src.tar.xz
-  mv llvm-${LLVM_VERSION}.src $LLVM_SRC
-  tar -Jxf ${CUR_DIR}/libcxx-${LLVM_VERSION}.src.tar.xz
-  mv libcxx-${LLVM_VERSION}.src libcxx
-  tar -Jxf ${CUR_DIR}/libcxxabi-${LLVM_VERSION}.src.tar.xz
-  mv libcxxabi-${LLVM_VERSION}.src libcxxabi
-  tar -Jxf ${CUR_DIR}/libunwind-${LLVM_VERSION}.src.tar.xz
-  mv libunwind-${LLVM_VERSION}.src libunwind
+  git clone --depth 1 --branch llvmorg-${LLVM_VERSION} https://github.com/llvm/llvm-project.git $LLVM_SRC
 fi
 
 mkdir -p build_taint
-cd build_taint
-rm -rf *
+rm -rf build_taint/*
 
 export KO_CONFIG=1
-export KO_CC=clang-12
-export KO_CXX=clang++-12
-cmake -G Ninja -DLLVM_TARGETS_TO_BUILD=X86 -DCMAKE_BUILD_TYPE=Release \
+export KO_CC=clang-14
+export KO_CXX=clang++-14
+cmake -G Ninja -S $LLVM_SRC/runtimes -B build_taint \
+    -DLLVM_TARGETS_TO_BUILD=X86 -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX} \
-    -DLLVM_ENABLE_PROJECTS="libcxx;libcxxabi;libunwind" \
+    -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
     -DLIBCXXABI_ENABLE_SHARED=OFF -DLIBCXX_ENABLE_SHARED=OFF \
     -DLIBCXX_CXX_ABI="libcxxabi" \
     -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
-    -DLIBCXX_CXX_ABI_INCLUDE_PATHS=../libcxxabi/include \
-    -DLLVM_DISTRIBUTION_COMPONENTS="cxx;cxxabi;unwind" \
-    ../$LLVM_SRC
+    -DLLVM_DISTRIBUTION_COMPONENTS="cxx;cxxabi;unwind"
 
 unset KO_CONFIG
-ninja distribution
+ninja -C build_taint cxx cxxabi unwind
 
