@@ -2416,9 +2416,9 @@ Value* TaintFunction::visitSelectInst(Value *Cond, Value *TrueShadow,
   Type *T = I->getType();
   if (!T->isIntegerTy(1)) {
     // most cases
-    if (TT.isZeroShadow(CondShadow))
-      visitCondition(Cond, I);
-    return SelectInst::Create(Cond, TrueShadow, FalseShadow, "", I);
+    visitCondition(Cond, I);
+    return TrueShadow == FalseShadow ? TrueShadow :
+        SelectInst::Create(Cond, TrueShadow, FalseShadow, "", I);
   }
 
   // special case, when select is used to implement logical AND and OR
@@ -2439,14 +2439,11 @@ void TaintVisitor::visitSelectInst(SelectInst &I) {
 
   if (isa<VectorType>(Condition->getType())) {
     //FIXME:
+    errs() << "WARNING: vector condition in Select" << I << "\n";
     TF.setShadow(&I, TF.TT.ZeroPrimitiveShadow);
   } else {
-    Value *ShadowSel;
-    if (TrueShadow == FalseShadow) {
-      ShadowSel = TrueShadow;
-    } else {
-      ShadowSel = TF.visitSelectInst(Condition, TrueShadow, FalseShadow, &I);
-    }
+    Value *ShadowSel =
+        TF.visitSelectInst(Condition, TrueShadow, FalseShadow, &I);
     TF.setShadow(&I, ShadowSel);
   }
 }
