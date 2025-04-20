@@ -212,9 +212,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
   z3::expr op1 = context_.bv_val((uint64_t)info->op1.i, size);
   if (info->l1 >= CONST_OFFSET) {
     op1 = serialize(info->l1, deps).simplify();
-    if (!op1.is_bool()) {
-      // XXX: fix size mismatch, not possible if op is bool
-      uint8_t op_size = get_label_info(info->l1)->size;
+    if (op1.is_bv() && info->op != __dfsan::Concat) {
+      // XXX: fix size mismatch, only for bv and not concat
+      uint8_t op_size = op1.get_sort().bv_size();
       if (op_size > size) {
         op1 = op1.extract(size - 1, 0);
       } else if (op_size < size) {
@@ -233,9 +233,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     input_dep_set_t deps2;
     op2 = serialize(info->l2, deps2).simplify();
     deps.insert(deps2.begin(), deps2.end());
-    if (!op2.is_bool()) {
-      // XXX: fix size mismatch
-      uint8_t op_size = get_label_info(info->l2)->size;
+    if (op2.is_bv() && info->op != __dfsan::Concat) {
+      // XXX: fix size mismatch, only for bv and not concat
+      uint8_t op_size = op2.get_sort().bv_size();
       if (op_size > size) {
         op2 = op2.extract(size - 1, 0);
       } else if (op_size < size) {
