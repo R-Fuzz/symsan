@@ -12,13 +12,13 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
     - uses: actions/checkout@v4
 
     - name: install dependencies
-      run: sudo apt-get update && sudo apt-get install -y llvm-12 clang-12 libc++-12-dev libc++abi-12-dev python3-minimal libz3-dev libgoogle-perftools-dev libboost-container-dev python3-dev
+      run: sudo apt-get update && sudo apt-get install -y llvm-14 clang-14 libc++-14-dev libc++abi-14-dev python3-minimal libz3-dev libgoogle-perftools-dev libboost-container-dev python3-dev
     #   run: |
     #     wget https://apt.llvm.org/llvm.sh
     #     chmod +x llvm.sh
@@ -31,13 +31,13 @@ jobs:
         path: ${{ github.workspace }}/aflpp
 
     - name: configure
-      run: CC=clang-12 CXX=clang++-12 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install -DAFLPP_PATH=${{ github.workspace }}/aflpp
+      run: CC=clang-14 CXX=clang++-14 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install -DAFLPP_PATH=${{ github.workspace }}/aflpp
 
     - name: build
-      run: CC=clang-12 CXX=clang++-12 cmake --build ${{ github.workspace }}/build
+      run: CC=clang-14 CXX=clang++-14 cmake --build ${{ github.workspace }}/build
 
     - name: install
-      run: CC=clang-12 CXX=clang++-12 cmake --install ${{ github.workspace }}/build
+      run: CC=clang-14 CXX=clang++-14 cmake --install ${{ github.workspace }}/build
 
     - name: install lit
       run: pip install lit
