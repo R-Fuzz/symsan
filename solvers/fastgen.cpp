@@ -56,6 +56,11 @@ static inline void __solve_cond(dfsan_label label, uint8_t result,
   }
 }
 
+static struct switch_true_case {
+  dfsan_label label;
+  uint32_t cid;
+} __switch_true_case = {0};
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
                   uint32_t predicate,
@@ -72,8 +77,35 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
   uint8_t r = get_const_result(c1, c2, predicate);
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
 
-  // add nested only for matching cases
-  __solve_cond(temp, r, 0, cid, addr);
+  if (r) {
+    // for the true case, we want to save it to solve the last,
+    // so the nested constraint will not affect other cases
+    __switch_true_case.label = temp;
+    __switch_true_case.cid = cid;
+  } else {
+    // solve without add_nested
+    __solve_cond(temp, r, 0, cid, addr);
+  }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_switch_end(uint32_t cid) {
+  if (__switch_true_case.label == 0) {
+    return;
+  } else if (__switch_true_case.cid != cid) {
+    AOUT("WARNING: switch end cid mismatch %u vs %u\n",
+         __switch_true_case.cid, cid);
+    return;
+  }
+
+  void *addr = __builtin_return_address(0);
+
+  AOUT("solving switch end: %u 0x%x @%p\n",
+       __switch_true_case.label, cid, addr);
+
+  // solve the true case
+  __solve_cond(__switch_true_case.label, 1, 1, cid, addr);
+  __switch_true_case.label = 0;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
