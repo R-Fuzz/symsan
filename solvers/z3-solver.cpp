@@ -6,9 +6,13 @@
 
 using namespace rgd;
 
+#define DEBUG 0
+
 #if !DEBUG
 #undef DEBUGF
 #define DEBUGF(_str...) do { } while (0)
+#elif !defined (DEBUGF)
+#define DEBUGF(_str...) do { fprintf(stderr, _str); } while (0)
 #endif
 
 #ifndef WARNF

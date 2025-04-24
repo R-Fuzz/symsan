@@ -25,8 +25,8 @@ Next, download and build AFL++:
 
 ```
 git clone --depth=1 https://github.com/AFLplusplus/AFLplusplus /workdir/aflpp
-ENV LLVM_CONFIG=llvm-config-12
-cd /workdir/aflpp && CC=clang-12 CXX=clang++-12 make source-only && make install
+ENV LLVM_CONFIG=llvm-config-14
+cd /workdir/aflpp && CC=clang-14 CXX=clang++-14 make source-only && make install
 ```
 
 Next, download symsan and build
@@ -34,7 +34,7 @@ Next, download symsan and build
 ```
 git clone https://github.com/R-Fuzz/symsan /workdir/symsan
 cd symsan/ && mkdir -p build && \
-  cd build && CC=clang-12 CXX=clang++-12 cmake -DAFLPP_PATH=/workdir/aflpp ../  && \
+  cd build && CC=clang-14 CXX=clang++-14 cmake -DAFLPP_PATH=/workdir/aflpp ../  && \
   make -j && make install
 ```
 
@@ -47,8 +47,8 @@ Please refer to the AFL++ manual for building options.
 
 For the symbolic tracing binary, set the following env options
 
-* `KO_CC=clang-12`: use clang-12 as the C compiler, because SymSan is compiled as a LLVM-12 pass
-* `KO_CXX=clang++-12`: using clang++-12 as the C++ compiler
+* `KO_CC=clang-14`: use clang-14 as the C compiler, because SymSan is compiled as a LLVM-12 pass
+* `KO_CXX=clang++-14`: using clang++-14 as the C++ compiler
 * `KO_USE_FASTGEN=1`: using the out-of-process solving mode (i.e., decoupled tracing and solving)
 * `KO_DONT_OPTIMIZE=1` (optional): keep the original optimization level, otherwise override with `-O3`
 * `KO_NO_NATIVE_ZLIB` (optional): if you're using instrumented libz

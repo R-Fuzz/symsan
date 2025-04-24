@@ -9,17 +9,17 @@
 
 using namespace rgd;
 
+#define DEBUG 0
+
 #if !DEBUG
 #undef DEBUGF
 #define DEBUGF(_str...) do { } while (0)
+#elif !defined (DEBUGF)
+#define DEBUGF(_str...) do { fprintf(stderr, _str); } while (0)
 #endif
 
 #ifndef WARNF
 #define WARNF(_str...) do { fprintf(stderr, _str); } while (0)
-// #define WARNF(x...) do { \
-//     SAYF(cYEL "[!] " cBRI "WARNING: " cRST x); \
-//     SAYF(cRST "\n"); \
-//   } while (0)
 #endif
 
 static const uint64_t kUsToS = 1000000;
