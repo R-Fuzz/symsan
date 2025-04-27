@@ -63,6 +63,7 @@ using namespace __dfsan;
 static bool NestedSolving = false;
 static int TraceBounds = 0;
 static int ForceStdin = 0;
+static bool SaveSolved = false;
 
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
@@ -275,6 +276,10 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   // XXX: force stdin? ugly hack for aixcc
   if (getenv("SYMSAN_FORCE_STDIN")) {
     ForceStdin = 1;
+  }
+  // enable saving solved tasks
+  if (getenv("SYMSAN_SAVE_SOLVED")) {
+    SaveSolved = true;
   }
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
@@ -594,6 +599,21 @@ size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
     DEBUGF("task solved\n");
     data->cur_mutation_state = MUTATION_IN_VALIDATION;
     *out_buf = data->output_buf;
+    if (SaveSolved) {
+      // save the solved task
+      char *solved_file = alloc_printf("%s/id_%zu", data->out_dir, solved_tasks);
+      if (solved_file != NULL) {
+        int fd = open(solved_file, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+          WARNF("Failed to create solved file %s: %s\n", solved_file, strerror(errno));
+        } else {
+          lseek(fd, 0, SEEK_SET);
+          ck_write(fd, data->output_buf, new_buf_size, solved_file);
+          close(fd);
+        }
+        free(solved_file);
+      }
+    }
     solved_tasks += 1;
   } else if (ret == rgd::SOLVER_TIMEOUT) {
     // if not solved, move on to next stage
