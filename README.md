@@ -92,7 +92,7 @@ It could also be used as a custom mutator for [AFL++](https://github.com/AFLplus
 
 ## Documentation
 
-Still under construction, unfortunately.
+Still under construction, unfortunately. [DeepWiki](https://deepwiki.com/R-Fuzz/symsan) seems okay.
 
 ## Reference
 
