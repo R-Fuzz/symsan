@@ -79,6 +79,16 @@ private:
   uint64_t matches;
   uint64_t mismatches;
   std::bitset<rgd::LastOp> binop_mask;
+
+  solver_result_t solve_icmp(std::shared_ptr<const Constraint> const& c,
+                             std::unique_ptr<ConsMeta> const& cm,
+                             uint32_t comparison,
+                             const uint8_t *in_buf, size_t in_size,
+                             uint8_t *out_buf, size_t &out_size);
+  solver_result_t solve_memcmp(std::shared_ptr<const Constraint> const& c,
+                               std::unique_ptr<ConsMeta> const& cm,
+                               const uint8_t *in_buf, size_t in_size,
+                               uint8_t *out_buf, size_t &out_size);
 };
 
 }; // namespace rgd
