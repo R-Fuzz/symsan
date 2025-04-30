@@ -1652,6 +1652,19 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     // TODO:
   }
 
+#if DEBUG
+#define DEBUG_SAVE_GEP(task) \
+  do { \
+    auto id = save_task(task); \
+    WARNF("save task %lu for %u at %d, const size = %lu, constmeta size = %lu\n", \
+      id, index_label, __LINE__, task->constraints.size(), task->consmeta.size()); \
+    tasks.push_back(id); \
+  } while (0)
+#else
+#define DEBUG_SAVE_GEP(task) \
+  tasks.push_back(save_task(task));
+#endif
+
   // bounds check
   if (num_elems > 0) {
     // array with known size
@@ -1664,14 +1677,14 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     uf_task->constraints.push_back(underflow);
     uf_task->comparisons.push_back(rgd::Sgt); // signed GT
     uf_task->finalize();
-    tasks.push_back(save_task(uf_task));
-    if (solve_nested_) {
+    DEBUG_SAVE_GEP(uf_task);
+    if (solve_nested_ && !nested_caluse.empty()) {
       task_t nested_task = std::make_shared<rgd::SearchTask>();
-      uf_task->constraints.push_back(underflow);
-      uf_task->comparisons.push_back(rgd::Sgt);
+      nested_task->constraints.push_back(underflow);
+      nested_task->comparisons.push_back(rgd::Sgt);
       add_nested_constraint(nested_task, nested_caluse);
       nested_task->finalize();
-      tasks.push_back(save_task(nested_task));
+      DEBUG_SAVE_GEP(nested_task);
     }
     // check overflow, num_elems <= index
     constraint_t overflow = std::make_shared<rgd::Constraint>(*partial_constraint);
@@ -1682,14 +1695,14 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     of_task->constraints.push_back(overflow);
     of_task->comparisons.push_back(rgd::Ule); // unsigned LE
     of_task->finalize();
-    tasks.push_back(save_task(of_task));
-    if (solve_nested_) {
+    DEBUG_SAVE_GEP(of_task);
+    if (solve_nested_ && !nested_caluse.empty()) {
       task_t nested_task = std::make_shared<rgd::SearchTask>();
-      of_task->constraints.push_back(overflow);
-      of_task->comparisons.push_back(rgd::Ule);
+      nested_task->constraints.push_back(overflow);
+      nested_task->comparisons.push_back(rgd::Ule);
       add_nested_constraint(nested_task, nested_caluse);
       nested_task->finalize();
-      tasks.push_back(save_task(nested_task));
+      DEBUG_SAVE_GEP(nested_task);
     }
   } else {
     // struct or array with unknown compile time size
@@ -1709,14 +1722,14 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
         uf_task->constraints.push_back(underflow);
         uf_task->comparisons.push_back(rgd::Ugt); // unsigned GT, automatically detects integer overflow
         uf_task->finalize();
-        tasks.push_back(save_task(uf_task));
-        if (solve_nested_) {
+        DEBUG_SAVE_GEP(uf_task);
+        if (solve_nested_ && !nested_caluse.empty()) {
           task_t nested_task = std::make_shared<rgd::SearchTask>();
-          uf_task->constraints.push_back(underflow);
-          uf_task->comparisons.push_back(rgd::Ugt);
+          nested_task->constraints.push_back(underflow);
+          nested_task->comparisons.push_back(rgd::Ugt);
           add_nested_constraint(nested_task, nested_caluse);
           nested_task->finalize();
-          tasks.push_back(save_task(nested_task));
+          DEBUG_SAVE_GEP(nested_task);
         }
         // check overflow, upper_bound <= index * elem_size + current_offset + ptr
         // => (upper_bound - current_offset - ptr) / elem_size <= index
@@ -1729,14 +1742,14 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
         of_task->constraints.push_back(overflow);
         of_task->comparisons.push_back(rgd::Ule); // unsigned LE
         of_task->finalize();
-        tasks.push_back(save_task(of_task));
-        if (solve_nested_) {
+        DEBUG_SAVE_GEP(of_task);
+        if (solve_nested_ && !nested_caluse.empty()) {
           task_t nested_task = std::make_shared<rgd::SearchTask>();
-          of_task->constraints.push_back(overflow);
-          of_task->comparisons.push_back(rgd::Ule);
+          nested_task->constraints.push_back(overflow);
+          nested_task->comparisons.push_back(rgd::Ule);
           add_nested_constraint(nested_task, nested_caluse);
           nested_task->finalize();
-          tasks.push_back(save_task(nested_task));
+          DEBUG_SAVE_GEP(nested_task);
         }
       } else {
         // TODO: check size overflow
