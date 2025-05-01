@@ -90,8 +90,8 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
     base_task = base_task->base_task;
   }
 
-  for (size_t i = 0; i < task->constraints.size(); i++) {
-    auto &c = task->constraints[i];
+  for (size_t i = 0, n = task->size(); i < n; i++) {
+    auto &c = task->constraints(i);
     DEBUGF("process constraint %d (fn=%p)\n", c->ast->label(), c->fn);
     // jit the AST into a native function if haven't done so
     if (c->fn == nullptr) {
@@ -133,9 +133,9 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
       out_buf[offset] = value;
     }
     // handle atoi bytes
-    if (!task->atoi_info.empty()) {
+    if (!task->atoi_info().empty()) {
       // if there are atoi bytes, handle them
-      for (auto const &[offset, info] : task->atoi_info) {
+      for (auto const &[offset, info] : task->atoi_info()) {
         uint64_t val = 0;
         uint32_t length = std::get<0>(info);
         memcpy(out_buf + offset, in_buf + offset, length); // restore??

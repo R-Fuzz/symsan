@@ -32,7 +32,7 @@ using namespace rgd;
 
 static void dump_results(MutInput &input, std::shared_ptr<SearchTask> task) {
   int i = 0;
-  for (auto it : task->inputs) {
+  for (auto it : task->inputs()) {
     std::cout << "index is " << it.first << " result is " << (int)input.value[i] << std::endl;
     i++;
   }
@@ -54,7 +54,7 @@ static void add_results(MutInput &input, std::shared_ptr<SearchTask> task) {
 
   // first, we order the inputs by their offset
   std::map<uint32_t, uint64_t> ordered_inputs;
-  for (auto it : task->inputs) {
+  for (auto it : task->inputs()) {
     ordered_inputs[it.first] = input.value[i];
     i++;
   }
@@ -72,7 +72,7 @@ static void add_results(MutInput &input, std::shared_ptr<SearchTask> task) {
   for (i = 0; i < ordered_inputs_v.size();) {
     start = ordered_inputs_v[i].first;
     result = ordered_inputs_v[i].second;
-    length = task->shapes[start];
+    length = task->shapes(start);
     if (length == 0) { ++i; continue; }
     if (length <= 8) { // 8 bytes or less
       // first, concatenate the bytes according to the shape
@@ -172,12 +172,12 @@ static uint64_t get_distance(uint32_t comp, uint64_t a, uint64_t b) {
 }
 
 
-static uint64_t single_distance(MutInput &input, std::vector<uint64_t> &distances, std::shared_ptr<SearchTask> task, int index) {
+static uint64_t single_distance(MutInput &input, std::vector<uint64_t> &distances, std::shared_ptr<SearchTask> task, const uint32_t index) {
   // only re-compute the distance of the constraints that are affected by the change
   uint64_t res = 0;
-  for (uint32_t cons_id : task->cmap[index]) {
-    auto& c = task->constraints[cons_id];
-    auto& cm = task->consmeta[cons_id];
+  for (uint32_t cons_id : task->cmap(index)) {
+    auto& c = task->constraints(cons_id);
+    auto& cm = task->consmetas(cons_id);
     int arg_idx = 0;
     for (auto const &arg : cm->input_args) {
       if (arg.first) {// symbolic
@@ -204,9 +204,9 @@ static uint64_t distance(MutInput &input, std::vector<uint64_t> &distances, std:
   static int solved= 0;
   uint64_t res = 0;
 
-  for (int i = 0; i < task->constraints.size(); i++) {
-    auto& c = task->constraints[i];
-    auto& cm = task->consmeta[i];
+  for (int i = 0, n = task->size(); i < n; i++) {
+    auto& c = task->constraints(i);
+    auto& cm = task->consmetas(i);
     // mapping symbolic args
     int arg_idx = 0;
     for (auto const &arg : cm->input_args) {
@@ -242,7 +242,7 @@ static uint64_t distance(MutInput &input, std::vector<uint64_t> &distances, std:
 }
 
 
-static void partial_derivative(MutInput &orig_input, size_t index, uint64_t f0, bool *sign, bool* is_linear, uint64_t *val, std::shared_ptr<SearchTask> task) {
+static void partial_derivative(MutInput &orig_input, const uint32_t index, uint64_t f0, bool *sign, bool* is_linear, uint64_t *val, std::shared_ptr<SearchTask> task) {
 
   uint64_t orig_val = orig_input.value[index];
   uint64_t delta = 1;
@@ -261,7 +261,7 @@ static void partial_derivative(MutInput &orig_input, size_t index, uint64_t f0, 
       return;
     }
     f_plus = 0;
-    for (int i = 0; i < task->constraints.size(); i++)
+    for (int i = 0, n = task->size(); i < n; i++)
       f_plus = sat_inc(f_plus, task->plus_distances[i]);
 
     task->attempts += 1;
@@ -289,7 +289,7 @@ static void partial_derivative(MutInput &orig_input, size_t index, uint64_t f0, 
       return;
     }
     f_minus = 0;
-    for (int i = 0; i < task->constraints.size(); i++)
+    for (int i = 0, n = task->size(); i < n; i++)
       f_minus = sat_inc(f_minus, task->minus_distances[i]);
 
     task->attempts += 1;
@@ -358,7 +358,7 @@ static void compute_delta_all(MutInput &input, Grad &grad, size_t step) {
 
 static void cal_gradient(MutInput &input, uint64_t f0, Grad &grad, std::shared_ptr<SearchTask> task) {
   uint64_t max = 0;
-  int index = 0;
+  uint32_t index = 0;
   for (auto &gradu : grad.get_value()) {
 
     if (task->stopped) {
@@ -432,7 +432,7 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
 #endif
 
         uint64_t single_dis = single_distance(input, task->distances, task, deltaIdx);
-        for (int i = 0; i < task->constraints.size(); i++)
+        for (int i = 0, n = task->size(); i < n; i++)
           f_new = sat_inc(f_new, task->distances[i]);
         task->attempts += 1;
         if (task->attempts > MAX_EXEC_TIMES)
@@ -509,7 +509,7 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
 }
 
 
-static uint64_t try_new_i2s_value(std::shared_ptr<const Constraint> &c, uint32_t comparison, uint64_t value, std::shared_ptr<SearchTask> task) {
+static uint64_t try_new_i2s_value(std::shared_ptr<const Constraint> const& c, uint32_t comparison, uint64_t value, std::shared_ptr<SearchTask> task) {
   int i = 0;
   for (auto const& [offset, lidx] : c->local_map) {
     uint64_t v = ((value >> i) & 0xff);
@@ -531,9 +531,9 @@ static uint64_t try_new_i2s_value(std::shared_ptr<const Constraint> &c, uint32_t
 static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, std::shared_ptr<SearchTask> task) {
   temp_input = input_min;
   bool updated = false;
-  for (int k = 0; k < task->constraints.size(); k++) {
-    auto& c = task->constraints[k];
-    auto& cm = task->consmeta[k];
+  for (int k = 0; k < task->size(); k++) {
+    auto& c = task->constraints(k);
+    auto& cm = task->consmetas(k);
     if (task->min_distances[k]) {
       if (likely(isRelationalKind(cm->comparison))) {
         // check consecutive input bytes against comparison operands
@@ -666,7 +666,7 @@ static uint64_t repick_start_point(MutInput &input_min, std::shared_ptr<SearchTa
 
 
 static uint64_t reload_input(MutInput &input_min, std::shared_ptr<SearchTask> task) {
-  input_min.assign(task->inputs);
+  input_min.assign(task->inputs());
 #if 0
   printf("assign realod\n");
   for(auto itr : task->inputs) {
@@ -678,8 +678,8 @@ static uint64_t reload_input(MutInput &input_min, std::shared_ptr<SearchTask> ta
 }
 
 bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
-  MutInput input(task->inputs.size());
-  MutInput scratch_input(task->inputs.size());
+  MutInput input(task->inputs_size());
+  MutInput scratch_input(task->inputs_size());
   task->attempts = 0;
 
   uint64_t f0 = reload_input(input, task);

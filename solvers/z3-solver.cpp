@@ -300,9 +300,9 @@ Z3Solver::solve(std::shared_ptr<SearchTask> task,
     }
 
     std::unordered_map<uint32_t, z3::expr> expr_cache;
-    for (size_t i = 0; i < task->constraints.size(); i++) {
-      auto const &c = task->constraints[i];
-      z3::expr z3expr = serialize_rel(task->comparisons[i], c->get_root(), c->input_args, expr_cache);
+    for (size_t i = 0, n = task->size(); i < n; i++) {
+      auto const &c = task->constraints(i);
+      z3::expr z3expr = serialize_rel(task->comparisons(i), c->get_root(), c->input_args, expr_cache);
       DEBUGF("adding expr %s\n", z3expr.to_string().c_str());
       solver_.add(z3expr);
     }
@@ -312,9 +312,9 @@ Z3Solver::solve(std::shared_ptr<SearchTask> task,
       out_size = in_size;
       z3::model m = solver_.get_model();
       extract_model(m, out_buf, out_size, task->solution);
-      if (!task->atoi_info.empty()) {
+      if (!task->atoi_info().empty()) {
         // if there are atoi bytes, handle them
-        for (auto const &[offset, info] : task->atoi_info) {
+        for (auto const &[offset, info] : task->atoi_info()) {
           uint64_t val = 0;
           uint32_t length = std::get<0>(info);
           memcpy(out_buf + offset, in_buf + offset, length); // restore?

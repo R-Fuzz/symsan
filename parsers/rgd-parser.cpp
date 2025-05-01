@@ -544,8 +544,7 @@ task_t RGDAstParser::construct_task(const clause_t &clause) {
   for (auto const& node: clause) {
     auto itr = constraint_cache.find(node->label());
     if (itr != constraint_cache.end()) {
-      task->constraints.push_back(itr->second);
-      task->comparisons.push_back(node->kind());
+      task->add_constraint(itr->second, node->kind());
       continue;
     }
     // save the comparison op because we may have negated it
@@ -554,12 +553,11 @@ task_t RGDAstParser::construct_task(const clause_t &clause) {
     // to maximize the resuability of the AST, the relational operator
     // is recorded elsewhere
     if (likely(constraint != nullptr)) {
-      task->constraints.push_back(constraint);
-      task->comparisons.push_back(node->kind());
+      task->add_constraint(constraint, node->kind());
       constraint_cache.insert({node->label(), constraint});
     }
   }
-  if (!task->constraints.empty()) {
+  if (!task->empty()) {
     task->finalize();
     return task;
   }
@@ -1497,15 +1495,13 @@ void RGDAstParser::add_nested_constraint(task_t task, const clause_t &nested_cal
     // check cache, should happen most of the time
     auto itr = constraint_cache.find(node->label());
     if (likely(itr != constraint_cache.end())) {
-      task->constraints.push_back(itr->second);
-      task->comparisons.push_back(node->kind());
+      task->add_constraint(itr->second, node->kind());
       continue;
     }
     // otherwise, parse the AST into a constraint
     constraint_t constraint = parse_constraint(node->label());
     if (likely(constraint != nullptr)) {
-      task->constraints.push_back(constraint);
-      task->comparisons.push_back(node->kind());
+      task->add_constraint(constraint, node->kind());
       constraint_cache.insert({node->label(), constraint});
     }
   }
@@ -1674,14 +1670,12 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     underflow->op1 = 0;
     underflow->op2 = index;
     task_t uf_task = std::make_shared<rgd::SearchTask>();
-    uf_task->constraints.push_back(underflow);
-    uf_task->comparisons.push_back(rgd::Sgt); // signed GT
+    uf_task->add_constraint(underflow, rgd::Sgt); // signed GT
     uf_task->finalize();
     DEBUG_SAVE_GEP(uf_task);
     if (solve_nested_ && !nested_caluse.empty()) {
       task_t nested_task = std::make_shared<rgd::SearchTask>();
-      nested_task->constraints.push_back(underflow);
-      nested_task->comparisons.push_back(rgd::Sgt);
+      nested_task->add_constraint(underflow, rgd::Sgt);
       add_nested_constraint(nested_task, nested_caluse);
       nested_task->finalize();
       DEBUG_SAVE_GEP(nested_task);
@@ -1692,14 +1686,12 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     overflow->op1 = num_elems;
     overflow->op2 = index;
     task_t of_task = std::make_shared<rgd::SearchTask>();
-    of_task->constraints.push_back(overflow);
-    of_task->comparisons.push_back(rgd::Ule); // unsigned LE
+    of_task->add_constraint(overflow, rgd::Ule); // unsigned LE
     of_task->finalize();
     DEBUG_SAVE_GEP(of_task);
     if (solve_nested_ && !nested_caluse.empty()) {
       task_t nested_task = std::make_shared<rgd::SearchTask>();
-      nested_task->constraints.push_back(overflow);
-      nested_task->comparisons.push_back(rgd::Ule);
+      nested_task->add_constraint(overflow, rgd::Ule);
       add_nested_constraint(nested_task, nested_caluse);
       nested_task->finalize();
       DEBUG_SAVE_GEP(nested_task);
@@ -1719,14 +1711,12 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
         underflow->op1 = lower_bound;
         underflow->op2 = index;
         task_t uf_task = std::make_shared<rgd::SearchTask>();
-        uf_task->constraints.push_back(underflow);
-        uf_task->comparisons.push_back(rgd::Ugt); // unsigned GT, automatically detects integer overflow
+        uf_task->add_constraint(underflow, rgd::Ugt); // unsigned GT, automatically detects integer overflow
         uf_task->finalize();
         DEBUG_SAVE_GEP(uf_task);
         if (solve_nested_ && !nested_caluse.empty()) {
           task_t nested_task = std::make_shared<rgd::SearchTask>();
-          nested_task->constraints.push_back(underflow);
-          nested_task->comparisons.push_back(rgd::Ugt);
+          nested_task->add_constraint(underflow, rgd::Ugt);
           add_nested_constraint(nested_task, nested_caluse);
           nested_task->finalize();
           DEBUG_SAVE_GEP(nested_task);
@@ -1739,14 +1729,12 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
         overflow->op1 = upper_bound;
         overflow->op2 = index;
         task_t of_task = std::make_shared<rgd::SearchTask>();
-        of_task->constraints.push_back(overflow);
-        of_task->comparisons.push_back(rgd::Ule); // unsigned LE
+        of_task->add_constraint(overflow, rgd::Ule); // unsigned LE
         of_task->finalize();
         DEBUG_SAVE_GEP(of_task);
         if (solve_nested_ && !nested_caluse.empty()) {
           task_t nested_task = std::make_shared<rgd::SearchTask>();
-          nested_task->constraints.push_back(overflow);
-          nested_task->comparisons.push_back(rgd::Ule);
+          nested_task->add_constraint(overflow, rgd::Ule);
           add_nested_constraint(nested_task, nested_caluse);
           nested_task->finalize();
           DEBUG_SAVE_GEP(nested_task);

@@ -548,15 +548,15 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
                  uint8_t *out_buf, size_t &out_size) {
 
   solver_result_t ret = SOLVER_TIMEOUT;
-  size_t n = task->constraints.size();
+  size_t n = task->size();
   DEBUGF("i2s: new task with %zu constraints\n", n);
   out_size = 0; // use this to indicate whether a copy has been made
   for (size_t i = 0; i < n; ++i) {
     // iterate through all constraints, hoping the stacked mutations would work,
     // instead of destroying each other
-    auto const& c = task->constraints[i];
-    auto const& cm = task->consmeta[i];
-    auto comparison = task->comparisons[i];
+    auto const& c = task->constraints(i);
+    auto const& cm = task->consmetas(i);
+    auto comparison = task->comparisons(i);
     if (likely(isRelationalKind(comparison))) {
       if (solve_icmp(c, cm, comparison, in_buf, in_size, out_buf, out_size) == SOLVER_SAT) {
         // be optimistic, as long as there's one match, we should try the output
