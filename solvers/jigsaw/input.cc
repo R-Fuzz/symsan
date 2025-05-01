@@ -26,7 +26,7 @@ uint8_t MutInput::get_rand()
   return r;
 }
 
-void MutInput::assign(std::vector<std::pair<uint32_t,uint8_t>> &input) {
+void MutInput::assign(std::vector<std::pair<uint32_t,uint8_t>> const& input) {
   for (int i = 0; i < size_; i++) {
     value[i] = input[i].second;
     //std::cout << "randomize " << i << " and assign value " << (int)value[i] << std::endl;

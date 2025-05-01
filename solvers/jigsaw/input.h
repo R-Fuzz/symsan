@@ -41,7 +41,7 @@ public:
   void update(size_t index, bool direction, uint64_t delta);
   void flip(size_t index, size_t bit_index);
   void set(const size_t index, uint8_t value);
-  void assign(std::vector<std::pair<uint32_t,uint8_t>> &input);
+  void assign(std::vector<std::pair<uint32_t,uint8_t>> const& input);
   MutInput& operator=(const MutInput &other);
 
   static void copy(MutInput *dst, const MutInput *src)
