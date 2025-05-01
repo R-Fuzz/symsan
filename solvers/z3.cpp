@@ -104,7 +104,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
     return;
   }
 
-  AOUT("solving cmp: %u %u %u %d %llu %llu 0x%x @%p\n",
+  AOUT("solving cmp: %u %u %u %d %lu %lu 0x%x @%p\n",
        op1, op2, size, predicate, c1, c2, cid, addr);
 
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
@@ -256,7 +256,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
   if (__buffers.count(ptr) != 0)
     return;
 
-  AOUT("tainted GEP index: %lld = %d, ne: %lld, es: %lld, offset: %lld\n",
+  AOUT("tainted GEP index: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
       index, index_label, num_elems, elem_size, current_offset);
 
   void *addr = __builtin_return_address(0);
