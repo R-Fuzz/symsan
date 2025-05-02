@@ -92,7 +92,7 @@ dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
 
 // taint source
-void taint_set_file(const char *filename, int fd);
+void taint_set_file(int dirfd, const char *filename, int fd);
 off_t taint_get_file(int fd);
 void taint_close_file(int fd);
 int is_taint_file(const char *filename);

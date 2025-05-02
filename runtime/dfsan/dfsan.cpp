@@ -284,7 +284,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   dfsan_check_label(label);
   assert(label > l1 && label > l2);
 
-  AOUT("%u = (%u, %u, %u, %u, %llu, %llu)\n", label, l1, l2, op, size, op1, op2);
+  AOUT("%u = (%u, %u, %u, %u, %lu, %lu)\n", label, l1, l2, op, size, op1, op2);
 
   internal_memcpy(&__dfsan_label_info[label], &label_info, sizeof(dfsan_label_info));
   __union_table.insert(&__dfsan_label_info[label], label);
@@ -319,7 +319,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
     }
     if (same) return label0;
   }
-  AOUT("label0 = %d, n = %d, ls = %p\n", label0, n, ls);
+  AOUT("label0 = %d, n = %lu, ls = %p\n", label0, n, ls);
 
   // shape
   bool shape = true;
@@ -340,7 +340,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
   if (shape) {
     if (n == 1) return label0;
 
-    AOUT("shape: label0: %d %d\n", label0, n);
+    AOUT("shape: label0: %d %lu\n", label0, n);
     return __taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0);
   }
 
@@ -377,13 +377,13 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
         i += next_size / 8;
         label = __taint_union(label, next_label, Concat, i * 8, 0, 0);
       } else {
-        Report("WARNING: partial loading expected=%d has=%d\n", n-i, next_size);
+        Report("WARNING: partial loading expected=%lu has=%d\n", n-i, next_size);
         uptr size = n - i;
         dfsan_label trunc = __taint_union(next_label, CONST_LABEL, Trunc, size * 8, 0, 0);
         return __taint_union(label, trunc, Concat, n * 8, 0, 0);
       }
     } else {
-      Report("WARNING: taint mixed with concrete %d\n", i);
+      Report("WARNING: taint mixed with concrete %lu\n", i);
       char *c = (char *)app_for(&ls[i]);
       ++i;
       label = __taint_union(label, 0, Concat, i * 8, 0, *c);
@@ -395,7 +395,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align) {
-  //AOUT("label = %d, n = %d, ls = %p\n", l, n, ls);
+  //AOUT("label = %d, n = %lu, ls = %p\n", l, n, ls);
   if ((uptr)ls < 4096) {
     AOUT("WARNING: nullptr deref\n");
     return;
@@ -431,7 +431,7 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
     // if source label is union load, just break it up
     dfsan_label label0 = info->l1;
     if (n > info->l2) {
-      Report("WARNING: store size=%u larger than load size=%d\n", n, info->l2);
+      Report("WARNING: store size=%lu larger than load size=%d\n", n, info->l2);
     }
     for (uptr i = 0; i < n; ++i)
       ls[i] = label0 + i;
@@ -464,8 +464,8 @@ dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size,
                                  uint64_t elem_size, uint64_t base) {
   if (flags().trace_bounds) {
     __alloca_stack_top -= 1;
-    AOUT("label = %d, base = %p, size = %lld, elem_size = %lld\n",
-        __alloca_stack_top, base, size, elem_size);
+    AOUT("label = %d, base = %p, size = %lu, elem_size = %lu\n",
+        __alloca_stack_top, (void*)base, size, elem_size);
     dfsan_label_info *info = get_label_info(__alloca_stack_top);
     internal_memset(info, 0, sizeof(dfsan_label_info));
     info->l2    = l;
@@ -492,8 +492,8 @@ dfsan_label __taint_trace_global(uint64_t addr, uint64_t size) {
     uint32_t hash = xxhash(h1, h2, Alloca);
 
     struct dfsan_label_info label_info = {
-      .l1 = 0, .l2 = 0, .op1 = addr, .op2 = addr + size, .op = Alloca,
-      .size = sizeof(void*) * 8, .hash = hash};
+      .l1 = 0, .l2 = 0, .op1 = {addr}, .op2 = {addr + size},
+      .op = __dfsan::Alloca, .size = sizeof(void*) * 8, .hash = hash};
 
     __taint::option res = __union_table.lookup(label_info);
     if (res != __taint::none()) {
@@ -508,7 +508,7 @@ dfsan_label __taint_trace_global(uint64_t addr, uint64_t size) {
     internal_memcpy(&__dfsan_label_info[label], &label_info, sizeof(dfsan_label_info));
     __union_table.insert(&__dfsan_label_info[label], label);
 
-    AOUT("adding global bounds %d=(%llx, %lld)\n", label, addr, size);
+    AOUT("adding global bounds %d=(%lx, %lu)\n", label, addr, size);
 
     return label;
   }
@@ -530,38 +530,40 @@ void __taint_check_bounds(dfsan_label addr_label, uptr addr,
   if (flags().trace_bounds) {
     void *retaddr = __builtin_return_address(0);
     if (addr == 0) {
-      AOUT("WARNING: null ptr deref %p = %d @%p\n", addr, addr_label, retaddr);
+      AOUT("WARNING: null ptr deref %p = %d @%p\n", (void*)addr, addr_label, retaddr);
       __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_NULL, retaddr);
       if (flags().exit_on_memerror) Die();
       else return;
     }
     if (addr_label == kInitializingLabel) {
-      AOUT("WARNING: uninitialized memory %p = %d @%p\n", addr, addr_label, retaddr);
+      AOUT("WARNING: uninitialized memory %p = %d @%p\n", (void*)addr, addr_label, retaddr);
       __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_UBI, retaddr);
       if (flags().exit_on_memerror) Die();
       else return;
     }
     dfsan_label_info *info = get_label_info(addr_label);
-    if (info->op == Free) {
+    if (info->op == __dfsan::Free) {
       // UAF
-      AOUT("ERROR: UAF detected %p = %d @%p\n", addr, addr_label, retaddr);
+      AOUT("ERROR: UAF detected %p = %d @%p\n", (void*)addr, addr_label, retaddr);
       __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_UAF, retaddr);
       if (flags().exit_on_memerror) Die();
-    } else if (info->op == Alloca) {
-      AOUT("addr = %p, lower = %p, upper = %p\n", addr, info->op1.i, info->op2.i);
+    } else if (info->op == __dfsan::Alloca) {
+      AOUT("addr = %p, lower = %p, upper = %p\n",
+           (void*)addr, (void*)info->op1.i, (void*)info->op2.i);
       if (addr < info->op1.i) {
-        AOUT("ERROR: OOB underflow detected %p = %d, %llu = %d @%p\n",
-             addr, addr_label, size, size_label, retaddr);
+        AOUT("ERROR: OOB underflow detected %p = %d, %lu = %d @%p\n",
+             (void*)addr, addr_label, size, size_label, retaddr);
         __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_OLB, retaddr);
         if (flags().exit_on_memerror) Die();
       } else if ((addr + size) > info->op2.i || (addr + size) < info->op1.i) {
-        AOUT("ERROR: OOB overflow detected %p = %d, %llu = %d @%p\n",
-             addr, addr_label, size, size_label, __builtin_return_address(0));
+        AOUT("ERROR: OOB overflow detected %p = %d, %lu = %d @%p\n",
+             (void*)addr, addr_label, size, size_label, __builtin_return_address(0));
         __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_OUB, retaddr);
         if (flags().exit_on_memerror) Die();
       }
     } else if (addr_label != 0) {
-      AOUT("WARNING: incorrect label %p = %d @%p\n", addr, addr_label, __builtin_return_address(0));
+      AOUT("WARNING: incorrect label %p = %d @%p\n",
+           (void*)addr, addr_label, __builtin_return_address(0));
     }
   }
 }
@@ -706,7 +708,7 @@ dfsan_dump_labels(int fd) {
   dfsan_label last_label =
       atomic_load(&__dfsan_last_label, memory_order_relaxed);
 
-  for (uptr l = 1; l <= last_label; ++l) {
+  for (dfsan_label l = 1; l <= last_label; ++l) {
     char buf[64];
     internal_snprintf(buf, sizeof(buf), "%u (%u %u %u %u)", l,
                       __dfsan_label_info[l].l1, __dfsan_label_info[l].l2,
@@ -723,8 +725,17 @@ __taint_debug(dfsan_label op1, dfsan_label op2, int predicate,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE void
-taint_set_file(const char *filename, int fd) {
+taint_set_file(int dirfd, const char *filename, int fd) {
   char path[PATH_MAX];
+  if (dirfd != AT_FDCWD) {
+    // only resolve dirfd if not CWD
+    ssize_t len = readlinkat(dirfd, filename, path, sizeof(path));
+    if (len < 0) {
+      AOUT("WARNING: readlinkat failed %s\n", filename);
+      return;
+    }
+    path[len] = '\0';
+  }
   realpath(filename, path);
   if (internal_strcmp(tainted.filename, path) == 0) {
     tainted.fd = fd;
@@ -906,7 +917,7 @@ static void InitializeTaintFile() {
       Printf("FATAL: failed to map a copy of input file\n");
       Die();
     }
-    AOUT("%s %lld size\n", filename, tainted.size);
+    AOUT("%s %ld size\n", filename, tainted.size);
   }
 
   if (tainted.fd != -1 && !tainted.is_stdin) {
@@ -1093,7 +1104,7 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, uint8_t,
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_switch_end, uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_trace_select, dfsan_label,
                              dfsan_label, dfsan_label, uint8_t, uint8_t, uint8_t,
-                             uint32_t) {}
+                             uint32_t) {return 0;}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
                              dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}

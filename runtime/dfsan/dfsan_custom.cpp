@@ -1609,7 +1609,22 @@ __dfsw_open(const char *path, int oflags, dfsan_label path_label,
   va_end(args);
 
   if (fd)
-    taint_set_file(path, fd);
+    taint_set_file(AT_FDCWD, path, fd);
+  *ret_label = 0;
+  return fd;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_openat(int dirfd, const char *path, int oflags, dfsan_label dirfd_label,
+              dfsan_label path_label, dfsan_label flag_label,
+              dfsan_label *va_labels, dfsan_label *ret_label, ...) {
+  va_list args;
+  va_start(args, ret_label);
+  int fd = openat(dirfd, path, oflags, args);
+  va_end(args);
+
+  if (fd)
+    taint_set_file(dirfd, path, fd);
   *ret_label = 0;
   return fd;
 }
@@ -1621,7 +1636,7 @@ __dfsw_fopen(const char *filename, const char *mode,
   FILE *ret = fopen(filename, mode);
   if (ret) {
     AOUT("%d fd is fopened\n", fileno(ret));
-    taint_set_file(filename, fileno(ret));
+    taint_set_file(AT_FDCWD, filename, fileno(ret));
   }
   *ret_label = 0;
   return ret;
@@ -1634,7 +1649,7 @@ __dfsw_fopen64(const char *filename, const char *mode,
   FILE *ret = fopen64(filename, mode);
   if (ret) {
     AOUT("%d fd is fopened\n", fileno(ret));
-    taint_set_file(filename, fileno(ret));
+    taint_set_file(AT_FDCWD, filename, fileno(ret));
   }
   *ret_label = 0;
   return ret;
@@ -1647,7 +1662,7 @@ __dfsw_freopen(const char *filename, const char *mode,
                dfsan_label *ret_label) {
   FILE *ret = freopen(filename, mode, stream);
   if (ret)
-    taint_set_file(filename, fileno(ret));
+    taint_set_file(AT_FDCWD, filename, fileno(ret));
   *ret_label = 0;
   return ret;
 }
