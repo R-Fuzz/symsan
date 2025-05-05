@@ -39,6 +39,7 @@ struct symsan_config {
   int pipefds[2];
   char *symsan_env;
   int symsan_pid;
+  size_t shm_size;
 
   int is_input_file;
   int is_input_sdtin;
@@ -70,6 +71,7 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   g_config.shm_name = NULL;
   g_config.shm_fd = -1;
   g_config.label_info = NULL;
+  g_config.shm_size = uniontable_size;
   g_config.pipefds[0] = -1;
   g_config.pipefds[1] = -1;
   g_config.symsan_env = NULL;
@@ -230,21 +232,35 @@ int symsan_run(int fd) {
     return SYMSAN_MISSING_INPUT;
   }
 
+  // unlikely but double check
+  if (g_config.pipefds[0] != -1) {
+    close(g_config.pipefds[0]);
+  }
+  if (g_config.pipefds[1] != -1) {
+    close(g_config.pipefds[1]);
+  }
+  if (g_config.symsan_env == NULL) {
+    free(g_config.symsan_env);
+  }
+
   int ret = pipe(g_config.pipefds);
   if (ret != 0) {
     return SYMSAN_NO_MEMORY;
   }
 
-  if (!g_config.symsan_env) {
-    g_config.symsan_env = alloc_printf(
-        "taint_file=\"%s\":shm_fd=%d:pipe_fd=%d:debug=%d:trace_bounds=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d",
-        g_config.input_file, g_config.shm_fd, g_config.pipefds[1],
-        g_config.enable_debug, g_config.enable_bounds_check,
-        g_config.exit_on_memerror, g_config.trace_file_size,
-        g_config.force_stdin);
-    if (!g_config.symsan_env) {
-      return SYMSAN_NO_MEMORY;
-    }
+  // fds and configs could have been changed, so always set up new ones
+  g_config.symsan_env = alloc_printf(
+      "taint_file=\"%s\":shm_fd=%d:pipe_fd=%d:debug=%d:trace_bounds=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d",
+      g_config.input_file, g_config.shm_fd, g_config.pipefds[1],
+      g_config.enable_debug, g_config.enable_bounds_check,
+      g_config.exit_on_memerror, g_config.trace_file_size,
+      g_config.force_stdin);
+  if (g_config.symsan_env == NULL) {
+    return SYMSAN_NO_MEMORY;
+  }
+
+  if (g_config.enable_debug) {
+    fprintf(stderr, "SYMSAN_ENV: %s\n", g_config.symsan_env);
   }
 
   g_config.symsan_pid = fork();
@@ -282,7 +298,10 @@ int symsan_run(int fd) {
     return g_config.symsan_pid;
   }
 
+  free(g_config.symsan_env);
+  g_config.symsan_env = NULL;
   close(g_config.pipefds[1]); // close the write fd
+  g_config.pipefds[1] = -1;
   g_config.is_killed = 0; // reset kill flag
 
   return 0;
@@ -323,6 +342,7 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
     waitpid(g_config.symsan_pid, &g_config.exit_status, 0);
     g_config.symsan_pid = -1;
     close(g_config.pipefds[0]); // close the read fd
+    g_config.pipefds[0] = -1;
   }
 
   return n;
@@ -359,35 +379,57 @@ __attribute__((visibility("default")))
 void symsan_destroy() {
   symsan_terminate();
 
+  if (g_config.label_info != NULL) {
+    munmap(g_config.label_info, g_config.shm_size);
+    g_config.label_info = NULL;
+  }
+
   if (g_config.dev_null_fd != -1) {
     close(g_config.dev_null_fd);
+    g_config.dev_null_fd = -1;
   }
 
   if (g_config.shm_fd != -1) {
     close(g_config.shm_fd);
+    g_config.shm_fd = -1;
   }
 
-  if (g_config.shm_name) {
+  if (g_config.shm_name != NULL) {
     shm_unlink(g_config.shm_name);
     free(g_config.shm_name);
+    g_config.shm_name = NULL;
   }
 
-  if (g_config.input_file) {
+  if (g_config.input_file != NULL) {
     free(g_config.input_file);
+    g_config.input_file = NULL;
   }
 
-  if (g_config.argv) {
+  if (g_config.argv != NULL) {
     for (int i = 0; g_config.argv[i]; i++) {
       free(g_config.argv[i]);
     }
     free(g_config.argv);
+    g_config.argv = NULL;
   }
 
-  if (g_config.symsan_env) {
+  if (g_config.symsan_env != NULL) {
     free(g_config.symsan_env);
+    g_config.symsan_env = NULL;
   }
 
-  if (g_config.symsan_bin) {
+  if (g_config.symsan_bin != NULL) {
     free(g_config.symsan_bin);
+    g_config.symsan_bin = NULL;
+  }
+
+  if (g_config.pipefds[0] != -1) {
+    close(g_config.pipefds[0]);
+    g_config.pipefds[0] = -1;
+  }
+
+  if (g_config.pipefds[1] != -1) {
+    close(g_config.pipefds[1]);
+    g_config.pipefds[1] = -1;
   }
 }
