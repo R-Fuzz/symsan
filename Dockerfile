@@ -11,8 +11,8 @@ COPY . /work/symsan
 
 RUN apt-get update
 RUN apt-get install -y cmake llvm-14 clang-14 libc++-14-dev libc++abi-14-dev python3-minimal python-is-python3 zlib1g-dev git joe libprotobuf-dev
-RUN git clone --depth=1 https://github.com/AFLplusplus/AFLplusplus /workdir/aflpp
-RUN cd /workdir/aflpp && git checkout v4.30 && make PERFORMANCE=1 LLVM_CONFIG=llvm-config-14 NO_NYX=1 source-only -j4 && make install
+RUN git clone https://github.com/AFLplusplus/AFLplusplus /workdir/aflpp
+RUN cd /workdir/aflpp && git checkout v4.30c && make PERFORMANCE=1 LLVM_CONFIG=llvm-config-14 NO_NYX=1 source-only -j4 && make install
 
 RUN apt-get install -y libz3-dev libgoogle-perftools-dev libboost-container-dev python3-dev
 RUN apt clean
