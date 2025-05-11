@@ -18,7 +18,7 @@ RUN apt-get install -y libz3-dev libgoogle-perftools-dev libboost-container-dev 
 RUN apt clean
 
 RUN cd /work/symsan/ && mkdir -p build && \
-    cd build && CC=clang-14 CXX=clang++-14 cmake -DCMAKE_INSTALL_PREFIX=. -DAFLPP_PATH=/work/aflpp ../  && \
+    cd build && CC=clang-14 CXX=clang++-14 cmake -DCMAKE_INSTALL_PREFIX=. -DAFLPP_PATH=/workdir/aflpp ../  && \
     make -j4 && make install
 
 ENV KO_CC=clang-14
