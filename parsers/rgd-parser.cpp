@@ -306,7 +306,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       return false;
     }
     dfsan_label_info *src = get_label_info(info->l2);
-    if (unlikely(src->op != Load)) {
+    if (unlikely(src->op != __dfsan::Load)) {
       WARNF("invalid atoi source label %u, op = %u\n", info->l2, src->op);
       return false;
     }
