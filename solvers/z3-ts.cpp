@@ -9,6 +9,8 @@
 
 using namespace symsan;
 
+const unsigned CheckTimeout = 1000; // 1s
+
 Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
   : ASTParser(base, size), context_(context) {
     input_name_format = "input-%u-%u";
@@ -289,6 +291,18 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
     // add negated last branch condition
     z3::expr r = context_.bool_val(result);
+
+    // double check if label is valid
+    {
+      z3::solver solver(context_, "QF_BV");
+      solver.set("timeout", CheckTimeout);
+      solver.add(cond == r);
+      if (solver.check() != z3::sat) {
+        // original condition must be satisfiable
+        return -1;
+      }
+    }
+
     task->push_back((cond != r));
 
     // collect additional input deps
@@ -375,6 +389,17 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
     input_dep_set_t inputs;
     z3::expr i = serialize(index_label, inputs);
 
+    // double check if label is valid
+    {
+      z3::solver solver(context_, "QF_BV");
+      solver.set("timeout", CheckTimeout);
+      solver.add(i == r);
+      if (solver.check() != z3::sat) {
+        // original index must match label
+        return -1;
+      }
+    }
+
     // collect nested constraints
     collect_more_deps(inputs);
     z3_task_t nested_tasks;
@@ -438,6 +463,16 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
     z3::expr r = context_.bv_val(result, size);
     // add constraint
     if (expr.is_bool()) r = context_.bool_val(result);
+    // double check if label is valid
+    {
+      z3::solver solver(context_, "QF_BV");
+      solver.set("timeout", CheckTimeout);
+      solver.add(expr == r);
+      if (solver.check() != z3::sat) {
+        // original expression must match result
+        return -1;
+      }
+    }
     save_constraint(expr == r, inputs);
   } catch (z3::exception e) {
     return -1;
