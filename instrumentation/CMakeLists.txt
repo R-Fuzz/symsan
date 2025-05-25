@@ -7,6 +7,6 @@ if(APPLE)
     set (CMAKE_MODULE_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -Wl,-flat_namespace -Wl,-undefined,suppress")
 endif(APPLE)
 
-add_library(TaintPass MODULE TaintPass.cpp)
-target_link_libraries(TaintPass LLVMPassConfig)
+include(AddLLVM)
+add_llvm_pass_plugin(TaintPass TaintPass.cpp)
 install (TARGETS TaintPass DESTINATION ${SYMSAN_LIB_DIR})

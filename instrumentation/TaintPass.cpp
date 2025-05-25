@@ -885,7 +885,8 @@ bool Taint::initializeModule(Module &M) {
       Type::getVoidTy(*Ctx), TaintUnionStoreArgs, /*isVarArg=*/ false);
   TaintUnimplementedFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), Type::getInt8PtrTy(*Ctx), /*isVarArg=*/false);
-  Type *TaintSetLabelArgs[3] = { PrimitiveShadowTy, Type::getInt8PtrTy(*Ctx), IntptrTy };
+  Type *TaintSetLabelArgs[3] = { PrimitiveShadowTy, Type::getInt8PtrTy(*Ctx),
+      IntptrTy };
   TaintSetLabelFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
                                         TaintSetLabelArgs, /*isVarArg=*/false);
   TaintNonzeroLabelFnTy = FunctionType::get(
@@ -896,7 +897,8 @@ bool Taint::initializeModule(Module &M) {
       Int32Ty, Int32Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceCmpFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCmpArgs, false);
-  Type *TaintTraceCondArgs[3] = { PrimitiveShadowTy, Int8Ty, Int32Ty };
+  Type *TaintTraceCondArgs[3] = { PrimitiveShadowTy, IntegerType::get(*Ctx, 1),
+      Int32Ty };
   TaintTraceCondFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCondArgs, false);
   TaintTraceSwitchEndFnTy = FunctionType::get(
@@ -1171,7 +1173,7 @@ void Taint::initializeCallbackFunctions(Module &M) {
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
     TaintTraceSwitchEndFn =
-        Mod->getOrInsertFunction("__taint_trace_switch_end", TaintTraceCondFnTy, AL);
+        Mod->getOrInsertFunction("__taint_trace_switch_end", TaintTraceSwitchEndFnTy, AL);
   }
   {
     AttributeList AL;
