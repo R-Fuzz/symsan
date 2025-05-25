@@ -235,12 +235,19 @@ enum pipe_msg_type {
   memerr_type = 4,
 };
 
-#define F_ADD_CONS  0x1
+static const uint8_t TrueBranchLoopLatch = 0x8;
+static const uint8_t FalseBranchLoopLatch = 0x4;
+static const uint8_t TrueBranchLoopExit = 0x2;
+static const uint8_t FalseBranchLoopExit = 0x1;
 
-#define F_MEMERR_UAF 0x1
-#define F_MEMERR_OLB 0x2
-#define F_MEMERR_OUB 0x4
-#define F_MEMERR_UBI 0x8
+#define F_ADD_CONS   0x1
+#define F_LOOP_EXIT  0x2
+#define F_LOOP_LATCH 0x4
+
+#define F_MEMERR_UAF  0x1
+#define F_MEMERR_OLB  0x2
+#define F_MEMERR_OUB  0x4
+#define F_MEMERR_UBI  0x8
 #define F_MEMERR_NULL 0x10
 
 struct pipe_msg {

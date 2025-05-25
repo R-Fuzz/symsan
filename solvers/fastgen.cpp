@@ -31,13 +31,33 @@ static int __pipe_fd;
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 
 static inline void __solve_cond(dfsan_label label, uint8_t result,
-                                uint8_t add_nested, uint32_t cid, void *addr) {
+                                uint8_t add_nested, uint8_t loop_flag,
+                                uint32_t cid, void *addr) {
 
   if (__pipe_fd < 0)
     return;
 
   uint16_t flags = 0;
   if (add_nested) flags |= F_ADD_CONS;
+
+  // set the loop flags according to branching results
+  switch (loop_flag) {
+    case TrueBranchLoopExit:
+      flags |= result ? F_LOOP_EXIT : F_LOOP_LATCH;
+      break;
+    case TrueBranchLoopLatch:
+      flags |= result ? F_LOOP_LATCH : F_LOOP_EXIT;
+      break;
+    case FalseBranchLoopExit:
+      flags |= result ? F_LOOP_LATCH : F_LOOP_EXIT;
+      break;
+    case FalseBranchLoopLatch:
+      flags |= result ? F_LOOP_EXIT : F_LOOP_LATCH;
+      break;
+    default:
+      // No loop flag or unrecognized flag, do nothing
+      break;
+  }
 
   // send info
   pipe_msg msg = {
@@ -84,7 +104,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
     __switch_true_case.cid = cid;
   } else {
     // solve without add_nested
-    __solve_cond(temp, r, 0, cid, addr);
+    __solve_cond(temp, r, 0, 0, cid, addr);
   }
 }
 
@@ -104,14 +124,18 @@ __taint_trace_switch_end(uint32_t cid) {
        __switch_true_case.label, cid, addr);
 
   // solve the true case
-  __solve_cond(__switch_true_case.label, 1, 1, cid, addr);
+  __solve_cond(__switch_true_case.label, 1, 1, 0, cid, addr);
   __switch_true_case.label = 0;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
-  if (label == 0)
-    return;
+__taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
+  if (label == 0) {
+    // check for real loop exit
+    if (!(((flag & FalseBranchLoopExit) && !r) ||
+          ((flag & TrueBranchLoopExit) && r)))
+      return;
+  }
 
   void *addr = __builtin_return_address(0);
 
@@ -119,7 +143,7 @@ __taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
        label, r, __taint_trace_callstack, cid, addr);
 
   // always add nested
-  __solve_cond(label, r, 1, cid, addr);
+  __solve_cond(label, r, 1, flag, cid, addr);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
@@ -138,18 +162,18 @@ __taint_trace_select(dfsan_label cond_label, dfsan_label true_label,
   if (true_label != 0 && false_op == 0) {
     dfsan_label land = dfsan_union(cond_label, true_label, And, 1, r, true_op);
     uint8_t lr = (r && true_op) ? 1 : 0;
-    __solve_cond(land, lr, 1, cid, addr);
+    __solve_cond(land, lr, 1, 0, cid, addr);
     return land;
   } else if (false_label != 0 && true_op == 1) {
     // logical OR: select cond, true, label
     dfsan_label lor = dfsan_union(cond_label, false_label, Or, 1, r, false_op);
     uint8_t lr = (r || false_op) ? 1 : 0;
-    __solve_cond(lor, lr, 1, cid, addr);
+    __solve_cond(lor, lr, 1, 0, cid, addr);
     return lor;
   } else {
     // normal select?
     AOUT("normal select?!\n");
-    __solve_cond(cond_label, r, 1, cid, addr);
+    __solve_cond(cond_label, r, 1, 0, cid, addr);
     return r ? true_label : false_label;
   }
 }

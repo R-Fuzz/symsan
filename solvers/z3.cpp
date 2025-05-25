@@ -88,6 +88,11 @@ static inline bool __solve_task(uint64_t task_id) {
   }
 }
 
+static struct switch_true_case {
+  dfsan_label label;
+  uint32_t cid;
+} __switch_true_case = {0};
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t predicate,
                   uint64_t c1, uint64_t c2, uint32_t cid) {
@@ -113,8 +118,16 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
   if (__solved_labels.count(temp) != 0)
     return;
 
+  if (r) {
+    // for the true case, we want to save it to solve the last,
+    // so the nested constraint will not affect other cases
+    __switch_true_case.label = temp;
+    __switch_true_case.cid = cid;
+    return;
+  }
+
   std::vector<uint64_t> tasks;
-  if (__z3_parser->parse_cond(temp, r, r, tasks)) {
+  if (__z3_parser->parse_cond(temp, r, 0, tasks)) {
     AOUT("WARNING: failed to parse cmp %d @%p\n", temp, addr);
     return;
   }
@@ -133,9 +146,50 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cond(dfsan_label label, uint8_t r, uint32_t cid) {
-  if (label == 0)
+__taint_trace_switch_end(uint32_t cid) {
+  if (__switch_true_case.label == 0) {
+    // filtering should have been done before
     return;
+  } else if (__switch_true_case.cid != cid) {
+    AOUT("WARNING: switch end cid mismatch %u vs %u\n",
+         __switch_true_case.cid, cid);
+    return;
+  }
+
+  void *addr = __builtin_return_address(0);
+  dfsan_label label = __switch_true_case.label;
+
+  AOUT("solving switch end: %u 0x%x @%p\n", label, cid, addr);
+
+  std::vector<uint64_t> tasks;
+  if (__z3_parser->parse_cond(label, 1, 1, tasks)) {
+    AOUT("WARNING: failed to parse cmp %d @%p\n", label, addr);
+    return;
+  }
+
+  for (auto id : tasks) {
+    // solve
+    if (__solve_task(id)) {
+      AOUT("cmp solved\n");
+    } else {
+      AOUT("cmp not solvable @%p\n", addr);
+    }
+  }
+
+  // mark as flipped
+  __solved_labels.insert(label);
+  // reset the switch label
+  __switch_true_case.label = 0;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
+  if (label == 0) {
+    // check for real loop exit
+    if (!(((flag & FalseBranchLoopExit) && !r) ||
+          ((flag & TrueBranchLoopExit) && r)))
+      return;
+  }
 
   void *addr = __builtin_return_address(0);
   auto itr = __branches.find({__taint_trace_callstack, addr});
