@@ -76,6 +76,27 @@ static inline void __solve_cond(dfsan_label label, uint8_t result,
   }
 }
 
+static inline void __send_ubi(dfsan_label label, uint64_t result,
+                              uint32_t cid, void *addr) {
+  if (__pipe_fd < 0)
+    return;
+
+  pipe_msg msg = {
+    .msg_type = memerr_type,
+    .flags = F_MEMERR_UBI,
+    .instance_id = __instance_id,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack,
+    .id = cid,
+    .label = label,
+    .result = result
+  };
+
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
+}
+
 static struct switch_true_case {
   dfsan_label label;
   uint32_t cid;
@@ -85,10 +106,25 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
                   uint32_t predicate,
                   uint64_t c1, uint64_t c2, uint32_t cid) {
-  if ((op1 == 0 && op2 == 0))
+  if (op1 == 0 && op2 == 0)
     return;
 
   void *addr = __builtin_return_address(0);
+
+  if (op1 == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", op1, addr);
+    if (flags().solve_ub) __send_ubi(op1, c1, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+  if (op2 == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", op2, addr);
+    if (flags().solve_ub) __send_ubi(op2, c2, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
 
   AOUT("solving cmp: %u %u %u %d %lu %lu 0x%x @%p\n",
        op1, op2, size, predicate, c1, c2, cid, addr);
@@ -139,6 +175,14 @@ __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
 
   void *addr = __builtin_return_address(0);
 
+  if (label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", label, addr);
+    if (flags().solve_ub) __send_ubi(label, r, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+
   AOUT("solving cond: %u %u 0x%x 0x%x %p\n",
        label, r, __taint_trace_callstack, cid, addr);
 
@@ -154,6 +198,14 @@ __taint_trace_select(dfsan_label cond_label, dfsan_label true_label,
     return r ? true_label : false_label;
 
   void *addr = __builtin_return_address(0);
+
+  if (cond_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", cond_label, addr);
+    if (flags().solve_ub) __send_ubi(cond_label, r, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return r ? true_label : false_label;
+  }
 
   AOUT("solving select: %u %u %u %u %u %u 0x%x @%p\n",
        cond_label, true_label, false_label, r, true_op, false_op, cid, addr);
@@ -187,12 +239,29 @@ __taint_trace_indcall(dfsan_label label) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, int64_t index,
-                  uint64_t num_elems, uint64_t elem_size, int64_t current_offset) {
+__taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
+                  dfsan_label index_label, int64_t index,
+                  uint64_t num_elems, uint64_t elem_size,
+                  int64_t current_offset, uint32_t cid) {
   if (index_label == 0)
     return;
 
   void *addr = __builtin_return_address(0);
+
+  if (index_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", index_label, addr);
+    if (flags().solve_ub) __send_ubi(index_label, index, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+  if (ptr_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", ptr_label, addr);
+    if (flags().solve_ub) __send_ubi(ptr_label, ptr, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
 
   AOUT("tainted GEP index: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
       index, index_label, num_elems, elem_size, current_offset);
@@ -244,6 +313,15 @@ __taint_trace_memcmp(dfsan_label label) {
     return;
 
   void *addr = __builtin_return_address(0);
+
+  if (label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", label, addr);
+    if (flags().solve_ub) __send_ubi(label, 0, 0, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+
   dfsan_label_info *info = get_label_info(label);
 
   AOUT("tainted memcmp: %d, size: %d\n", label, info->size);
@@ -317,6 +395,34 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
   if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
     Die();
   }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
+                          dfsan_label index_label, int64_t index,
+                          uint64_t num_elems, uint64_t elem_size,
+                          int64_t current_offset, uint32_t cid) {
+  if (index_label == 0 || !flags().solve_ub)
+    return;
+
+  void *addr = __builtin_return_address(0);
+
+  if (index_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", index_label, addr);
+    if (flags().solve_ub) __send_ubi(index_label, index, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+  if (ptr_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", ptr_label, addr);
+    if (flags().solve_ub) __send_ubi(ptr_label, ptr, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+
+  // construct bounds solving tasks here
 }
 
 extern "C" void InitializeSolver() {

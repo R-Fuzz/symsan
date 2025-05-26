@@ -174,6 +174,12 @@ static cl::opt<bool> ClTraceBound(
     cl::desc("Trace buffer bound info."),
     cl::Hidden, cl::init(true));
 
+// SYMSAN specific flags, enable generating solving tasks for undefined behaviour
+static cl::opt<bool> ClSolveUB(
+    "taint-solve-ub",
+    cl::desc("Solve undefined behaviours."),
+    cl::Hidden, cl::init(false));
+
 static StringRef getGlobalTypeString(const GlobalValue &G) {
   // Types of GlobalVariables are always pointer types.
   Type *GType = G.getValueType();
@@ -382,6 +388,7 @@ class Taint {
   FunctionType *TaintPopStackFrameFnTy;
   FunctionType *TaintTraceAllocaFnTy;
   FunctionType *TaintCheckBoundsFnTy;
+  FunctionType *TaintSolveBoundsFnTy;
   FunctionType *TaintTraceGlobalFnTy;
   FunctionType *TaintMemcmpFnTy;
   FunctionType *TaintStrcmpFnTy;
@@ -406,6 +413,7 @@ class Taint {
   FunctionCallee TaintPopStackFrameFn;
   FunctionCallee TaintTraceAllocaFn;
   FunctionCallee TaintCheckBoundsFn;
+  FunctionCallee TaintSolveBoundsFn;
   FunctionCallee TaintTraceGlobalFn;
   FunctionCallee TaintMemcmpFn;
   FunctionCallee TaintStrcmpFn;
@@ -554,6 +562,7 @@ struct TaintFunction {
   void visitGEPInst(GetElementPtrInst *I);
   Value *visitAllocaInst(AllocaInst *I, Value *ArraySize, Type *ElTy);
   void checkBounds(Value *Ptr, Value *Size, Instruction *Pos);
+  void solveBounds(Value *Ptr, Value *Size, Instruction *Pos);
 
   /// XXX: because we never collapse taint labels for aggregate types,
   ///      we also do not expand taint labels from an aggreated primitive
@@ -928,8 +937,8 @@ bool Taint::initializeModule(Module &M) {
       PrimitiveShadowTy, TaintTraceSelectArgs, false);
   TaintTraceIndirectCallFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), { PrimitiveShadowTy }, false);
-  Type *TaintTraceGEPArgs[7] = { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy,
-      Int64Ty, Int64Ty, Int64Ty, Int64Ty };
+  Type *TaintTraceGEPArgs[8] = { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy,
+      Int64Ty, Int64Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceGEPFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceGEPArgs, false);
   TaintPushStackFrameFnTy = FunctionType::get(
@@ -943,6 +952,8 @@ bool Taint::initializeModule(Module &M) {
   TaintCheckBoundsFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx),
       { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy, Int64Ty }, false);
+  TaintSolveBoundsFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), TaintTraceGEPArgs, false); // use the same args as GEP
   TaintTraceGlobalFnTy = FunctionType::get(
       PrimitiveShadowTy, { Int64Ty, Int64Ty }, false);
 
@@ -1268,6 +1279,15 @@ void Taint::initializeCallbackFunctions(Module &M) {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
+    TaintSolveBoundsFn =
+        Mod->getOrInsertFunction("__taint_solve_bounds", TaintSolveBoundsFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
     AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
     TaintMemcmpFn =
         Mod->getOrInsertFunction("__taint_memcmp", TaintMemcmpFnTy, AL);
@@ -1312,6 +1332,8 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintTraceGlobalFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintCheckBoundsFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintSolveBoundsFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintMemcmpFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -1756,8 +1778,16 @@ Value *TaintFunction::combineCastInstShadows(CastInst *CI,
                                              uint8_t op) {
   Value *Shadow1 = getShadow(CI->getOperand(0));
   Value *Shadow2 = TT.getZeroShadow(CI);
-  Value *Shadow = combineShadows(Shadow1, Shadow2, op, CI);
-  return Shadow;
+  if (op == Instruction::BitCast) {
+    // BitCast is a no-op, so we can just return the shadow of the operand.
+    return Shadow1;
+  } else if (op == Instruction::AddrSpaceCast) {
+    // AddrSpaceCast is also a no-op for taint, so we can just return the shadow
+    // of the operand.
+    return TT.ZeroPrimitiveShadow;
+  } else {
+    return combineShadows(Shadow1, Shadow2, op, CI);
+  }
 }
 
 Value *TaintFunction::combineCmpInstShadows(CmpInst *CI,
@@ -1789,6 +1819,30 @@ void TaintFunction::checkBounds(Value *Ptr, Value* Size, Instruction *Pos) {
     Value *Size64 = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
     IRB.CreateCall(TT.TaintCheckBoundsFn, {PtrShadow, Addr, SizeShadow, Size});
   }
+}
+
+void TaintFunction::solveBounds(Value *Ptr, Value* Size, Instruction *Pos) {
+  Value *SizeShadow = getShadow(Size);
+  if (TT.isZeroShadow(SizeShadow)) {
+    // If the size is not symbolic, we cannot check if it can go out of bounds.
+    return;
+  }
+  IRBuilder<> IRB(Pos);
+  // another place to check for global variable as the ptr
+  Value *PtrShadow = nullptr;
+  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts())) {
+    PtrShadow = getShadowForGlobal(GV, IRB);
+  } else {
+    PtrShadow = getShadow(Ptr);
+  }
+  Value *Addr = IRB.CreatePtrToInt(Ptr, TT.Int64Ty);
+  Value *Index = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
+  ConstantInt *NumEl = ConstantInt::get(TT.Int64Ty, 1); // one element
+  ConstantInt *ElSize = ConstantInt::get(TT.Int64Ty, 1); // bytes array
+  ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, 0); // no offset
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(Pos));
+  IRB.CreateCall(TT.TaintSolveBoundsFn,
+      {PtrShadow, Addr, SizeShadow, Index, NumEl, ElSize, Offset, CID});
 }
 
 // Generates IR to load shadow corresponding to bytes [Addr, Addr+Size), where
@@ -2353,8 +2407,15 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
           ConstantInt *NE = ConstantInt::get(TT.Int64Ty, NumElements);
           ConstantInt *ES = ConstantInt::get(TT.Int64Ty, ElemSize);
           Value *Ptr = IRB.CreatePtrToInt(I->getPointerOperand(), TT.Int64Ty);
+          ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
           IRB.CreateCall(TT.TaintTraceGEPFn,
-                         {Bounds, Ptr, Shadow, Index, NE, ES, Offset});
+                         {Bounds, Ptr, Shadow, Index, NE, ES, Offset, CID});
+          if (ClSolveUB) {
+            // check if index can go out of bounds
+            // -fsanitize=local-bounds
+            IRB.CreateCall(TT.TaintSolveBoundsFn,
+                           {Bounds, Ptr, Shadow, Index, NE, ES, Offset, CID});
+          }
         } else {
           break;
         }
@@ -2523,6 +2584,9 @@ void TaintVisitor::visitMemSetInst(MemSetInst &I) {
   if (ClTraceBound) {
     TF.checkBounds(I.getDest(), I.getLength(), &I);
   }
+  if (ClSolveUB) {
+    TF.solveBounds(I.getDest(), I.getLength(), &I);
+  }
   IRBuilder<> IRB(&I);
   Value *ValShadow = TF.getShadow(I.getValue());
   IRB.CreateCall(
@@ -2537,6 +2601,10 @@ void TaintVisitor::visitMemTransferInst(MemTransferInst &I) {
   if (ClTraceBound) {
     TF.checkBounds(I.getDest(), I.getLength(), &I);
     TF.checkBounds(I.getSource(), I.getLength(), &I);
+  }
+  if (ClSolveUB) {
+    TF.solveBounds(I.getDest(), I.getLength(), &I);
+    TF.solveBounds(I.getSource(), I.getLength(), &I);
   }
   IRBuilder<> IRB(&I);
   Value *DestShadow = TF.TT.getShadowAddress(I.getDest(), IRB);

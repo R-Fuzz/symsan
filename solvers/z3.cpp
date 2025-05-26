@@ -299,8 +299,9 @@ __taint_trace_indcall(dfsan_label label) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, int64_t index,
-                  uint64_t num_elems, uint64_t elem_size, int64_t current_offset) {
+__taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label,
+                  int64_t index, uint64_t num_elems, uint64_t elem_size,
+                  int64_t current_offset, uint32_t cid) {
   if (index_label == 0)
     return;
 

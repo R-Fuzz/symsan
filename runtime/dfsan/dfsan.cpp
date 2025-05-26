@@ -1108,9 +1108,13 @@ SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_trace_select, dfsan_label,
                              uint32_t) {return 0;}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
-                             dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}
+                             dfsan_label, int64_t, uint64_t, uint64_t, int64_t,
+                             uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
                              unsigned) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_solve_bounds, dfsan_label, uint64_t,
+                             dfsan_label, int64_t, uint64_t, uint64_t, int64_t,
+                             uint32_t) {}
 SANITIZER_WEAK_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 }  // extern "C"

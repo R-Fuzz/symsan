@@ -279,6 +279,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
 int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std::vector<uint64_t> &tasks) {
 
+  if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
+    // invalid label
+    return -1;
+  }
+
   // allocate a new task
   auto task = std::make_shared<z3_task_t>();
   try {
@@ -377,8 +382,11 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
                            uint64_t num_elems, uint64_t elem_size, int64_t current_offset,
                            bool enum_index, std::vector<uint64_t> &tasks) {
 
-  if (index_label < CONST_OFFSET || index_label == __dfsan::kInitializingLabel) {
-    return 0;
+  if (index_label < CONST_OFFSET ||
+      index_label == __dfsan::kInitializingLabel || index_label >= size_ ||
+      ptr_label == __dfsan::kInitializingLabel || ptr_label >= size_) {
+    // invalid label
+    return -1;
   }
 
   try {
@@ -454,6 +462,11 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
 }
 
 int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
+  if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
+    // invalid label
+    return -1;
+  }
+
   try {
     input_dep_set_t inputs;
     z3::expr expr = serialize(label, inputs);

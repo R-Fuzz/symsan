@@ -1513,7 +1513,8 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
                             int64_t current_offset, bool enum_index,
                             std::vector<uint64_t> &tasks) {
   // check validity of the labels
-  if (index_label < CONST_OFFSET || index_label == __dfsan::kInitializingLabel || index_label >= size_) {
+  if (index_label < CONST_OFFSET || index_label == __dfsan::kInitializingLabel
+      || index_label >= size_) {
     return -1;
   }
 
@@ -1701,7 +1702,7 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     auto bounds_info = get_label_info(ptr_label);
     if (bounds_info->op == __dfsan::Alloca) {
       // bounds information is available, check if allocation size is symbolic
-      if (bounds_info->l2 ==0) {
+      if (bounds_info->l2 == 0) {
         // concrete allocation size, check bounds
         // check underflow, lower_bound > index * elem_size + current_offset + ptr
         // => (lower_bound - current_offset - ptr) / elem_size > index
