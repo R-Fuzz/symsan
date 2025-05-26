@@ -6,7 +6,7 @@
    Written by Chengyu Song <csong@cs.ucr.edu> and
               Ju Chen <jchen757@ucr.edu>
 
-   Copyright 2021-2024 UC Riverside. All rights reserved.
+   Copyright 2021-2025 UC Riverside. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -422,19 +422,24 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
     else return;
   }
 
+  AOUT("solve bounds: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
+      index, index_label, num_elems, elem_size, current_offset);
+
   // construct bounds solving tasks here
   uint16_t index_bits = get_label_info(index_label)->size;
   if (num_elems > 0) {
     // array with known size
     //
     // check underflow, 0 > index
-    dfsan_label lb = dfsan_union(0, index_label, bvsgt, index_bits, 0, index);
+    dfsan_label lb = dfsan_union(0, index_label, (bvsgt << 8) | ICmp,
+        index_bits, 0, index);
     // assume the result is false, as bounds check should happen before solving
     // no flag, no nested
     __solve_cond(lb, 0, 0, 0, cid, addr);
 
     // check overflow, num_elems <= index
-    dfsan_label ub = dfsan_union(num_elems, index_label, bvsle, index_bits, num_elems, index);
+    dfsan_label ub = dfsan_union(0, index_label, (bvsle << 8) | ICmp,
+        index_bits, num_elems, index);
     __solve_cond(ub, 0, 0, 0, cid, addr);
   } else {
     // array with unknown size
@@ -448,13 +453,15 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
         // check underflow, lower_bound > index * elem_size + current_offset + ptr
         // => (lower_bound - current_offset - ptr) / elem_size > index
         uint64_t lower_bound = (bounds_info->op1.i - current_offset - ptr) / elem_size;
-        dfsan_label lb = dfsan_union(lower_bound, index_label, bvugt, 64, lower_bound, index);
+        dfsan_label lb = dfsan_union(0, index_label, (bvugt << 8) | ICmp,
+            64, lower_bound, index);
         __solve_cond(lb, 0, 0, 0, cid, addr);
 
         // check overflow, upper_bound <= index * elem_size + current_offset + ptr
         // => (upper_bound - current_offset - ptr) / elem_size <= index
         uint64_t upper_bound = (bounds_info->op2.i - current_offset - ptr) / elem_size;
-        dfsan_label ub = dfsan_union(upper_bound, index_label, bvule, 64, upper_bound, index);
+        dfsan_label ub = dfsan_union(0, index_label, (bvule << 8) | ICmp,
+            64, upper_bound, index);
         __solve_cond(ub, 0, 0, 0, cid, addr);
       } else {
         // index * elem_size + current_offset + (ptr - lower_bound) > array_size * alloc_elem_size
@@ -467,7 +474,8 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
         size += offset;
         uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
         dfsan_label overflow =
-            dfsan_union(size_label, bounds_info->l2, bvugt, 64, size, alloc_size);
+            dfsan_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
+                64, size, alloc_size);
         __solve_cond(overflow, 0, 0, 0, cid, addr);
       }
     } else {
