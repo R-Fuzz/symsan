@@ -2408,12 +2408,16 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
           ConstantInt *ES = ConstantInt::get(TT.Int64Ty, ElemSize);
           Value *Ptr = IRB.CreatePtrToInt(I->getPointerOperand(), TT.Int64Ty);
           ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
-          IRB.CreateCall(TT.TaintTraceGEPFn,
-                         {Bounds, Ptr, Shadow, Index, NE, ES, Offset, CID});
           if (ClSolveUB) {
             // check if index can go out of bounds
             // -fsanitize=local-bounds
+            // must be added before tracing GEP, otherwise index_label == index
+            // will be added as nested constraint
             IRB.CreateCall(TT.TaintSolveBoundsFn,
+                           {Bounds, Ptr, Shadow, Index, NE, ES, Offset, CID});
+          }
+          if (ClTraceGEPOffset) {
+            IRB.CreateCall(TT.TaintTraceGEPFn,
                            {Bounds, Ptr, Shadow, Index, NE, ES, Offset, CID});
           }
         } else {

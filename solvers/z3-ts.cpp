@@ -503,12 +503,12 @@ void Z3AstParser::collect_more_deps(input_dep_set_t &inputs) {
 size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, z3_task_t *task) {
   expr_set_t added;
   for (auto &off : inputs) {
-    //logf("adding offset %d\n", i.second);
+    // fprintf(stderr, "adding offset %d\n", off.second);
     auto deps = get_branch_dep(off);
     if (deps != nullptr) {
       for (auto &expr : deps->expr_deps) {
         if (added.insert(expr).second) {
-          //logf("adding expr: %s\n", expr.to_string().c_str());
+          // fprintf(stderr, "adding expr: %s\n", expr.to_string().c_str());
           task->push_back(expr);
         }
       }
@@ -549,6 +549,8 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           ret = nested_sat;
           m = solver.get_model();
         } else if (res == z3::unsat) {
+          // fprintf(stderr, "WARNING: nested unsat for task %lu: %s\n",
+          //     task_id, solver.to_smt2().data());
           ret = opt_sat_nested_unsat;
         } else {
           ret = opt_sat_nested_timeout;
