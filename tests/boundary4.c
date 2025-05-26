@@ -1,7 +1,6 @@
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out
 // RUN: python -c"import sys; sys.stdout.buffer.write(b'\x00\x00\x00\x00')" > %t.bin
-// RUN: clang -fsanitize=address -o %t.asan %s
 // RUN: env KO_USE_FASTGEN=1 KO_SOLVE_UB=1 %ko-clang -o %t.fg %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out solve_ub=1" %fgtest %t.fg %t.bin
 // RUN: not env TAINT_OPTIONS="debug=1 trace_bounds=1" %t.fg %t.out/id-0-0-1 2>&1 | FileCheck %s
@@ -20,7 +19,7 @@ int main (int argc, char** argv) {
   }
 
   int index = 0;
-  char alphabet[26] = {0};
+  char *alphabet = malloc(26);
 
   for (int i = 0; i < 26; i++) {
     alphabet[i] = 'A' + i;
@@ -30,6 +29,12 @@ int main (int argc, char** argv) {
   chk_fread(&index, sizeof(index), 1, fp);
   fclose(fp);
 
-  // BUG: out-of-boundary
+  // BUG: off-by-one if index == 26
+  if (index > 26U) {
+    printf("Bad\n");
+    return 0;
+  }
+
   printf("%c\n", alphabet[index]);
+  free(alphabet);
 }

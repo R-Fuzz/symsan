@@ -15,7 +15,7 @@ FILE *chk_fopen(const char *pathname, const char *mode) {
 
 void chk_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
   if (fread(ptr, size, nmemb, stream) != nmemb) {
-    fprintf(stderr, "Failed to read");
+    fprintf(stderr, "Failed to read\n");
     exit(0);
   }
 }

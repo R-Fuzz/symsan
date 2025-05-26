@@ -5,7 +5,7 @@
 // RUN: env KO_USE_FASTGEN=1 KO_SOLVE_UB=1 %ko-clang -o %t.fg %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out solve_ub=1" %fgtest %t.fg %t.bin
 // RUN: not env TAINT_OPTIONS="debug=1 trace_bounds=1" %t.fg %t.out/id-0-0-1 2>&1 | FileCheck %s
-// CHECK: ERROR: OOB overflow
+// CHECK: ERROR: OOB underflow
 
 #include <stdint.h>
 #include <stdio.h>
@@ -30,6 +30,11 @@ int main (int argc, char** argv) {
   chk_fread(&index, sizeof(index), 1, fp);
   fclose(fp);
 
-  // BUG: out-of-boundary
+  // BUG: index can be negative
+  if (index >= 26) {
+    printf("Bad\n");
+    return 0;
+  }
+
   printf("%c\n", alphabet[index]);
 }
