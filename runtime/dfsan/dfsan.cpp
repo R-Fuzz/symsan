@@ -178,6 +178,9 @@ static inline bool is_valid_op(uint16_t op) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2) {
   if (!is_valid_op(op)) {
@@ -255,6 +258,36 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         __dfsan_label_info[l1].op == __dfsan::SExt) {
       dfsan_label base = __dfsan_label_info[l1].l1;
       if (size == __dfsan_label_info[base].size) return base;
+    }
+  } else if (op == __dfsan::Xor && l1 == l2) {
+    // x ^ x = 0
+    return 0;
+  }
+
+  // ubsan checks
+  if (l2 && flags().solve_ub) {
+    dfsan_label cond = 0;
+    switch(op & 0xff) {
+      case __dfsan::Add:
+      case __dfsan::Sub:
+      case __dfsan::Mul:
+        // check for integer overflow
+        break;
+      case __dfsan::UDiv:
+      case __dfsan::SDiv:
+      case __dfsan::URem:
+      case __dfsan::SRem:
+        // check for division by zero
+        cond = __taint_union(0, l2, (bveq << 8) | ICmp, size, 0, op2);
+        __taint_trace_cond(cond, 0, 0, 0);
+        break;
+      case __dfsan::Shl:
+      case __dfsan::LShr:
+      case __dfsan::AShr:
+        // check for shift overflow
+        break;
+      default:
+        break;
     }
   }
 
