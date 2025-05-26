@@ -140,6 +140,7 @@ int main(int argc, char* const argv[]) {
   char *input = argv[2];
 
   int is_stdin = 0;
+  int solve_ub = 0;
   char *options = getenv("TAINT_OPTIONS");
   if (options) {
     // setup output dir
@@ -161,6 +162,14 @@ int main(int argc, char* const argv[]) {
       size_t n = end == NULL? strlen(taint_file) : (size_t)(end - taint_file);
       if (n == 5 && !strncmp(taint_file, "stdin", 5))
         is_stdin = 1;
+    }
+
+    // check if solve_ub is enabled
+    char *solve_ub_opt = strstr(options, "solve_ub=");
+    if (solve_ub_opt) {
+      solve_ub_opt += strlen("solve_ub="); // skip "solve_ub="
+      if (strcmp(solve_ub_opt, "1") == 0 || strcmp(solve_ub_opt, "true") == 0)
+        solve_ub = 1;
     }
   }
 
@@ -202,7 +211,7 @@ int main(int argc, char* const argv[]) {
 
   symsan_set_debug(1);
   symsan_set_bounds_check(1);
-  symsan_set_solve_ub(1);
+  symsan_set_solve_ub(solve_ub);
 
   // launch the target
   int ret = symsan_run(input_fd);
