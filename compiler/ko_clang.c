@@ -193,8 +193,8 @@ static void add_runtime() {
 
 static void add_taint_pass() {
   cc_params[cc_par_cnt++] = "-fexperimental-new-pass-manager";
-  cc_params[cc_par_cnt++] = alloc_printf("-fplugin=%s/../lib/symsan/libTaintPass.so", obj_path); // to enable options
-  cc_params[cc_par_cnt++] = alloc_printf("-fpass-plugin=%s/../lib/symsan/libTaintPass.so", obj_path);
+  cc_params[cc_par_cnt++] = alloc_printf("-fplugin=%s/../lib/symsan/TaintPass.so", obj_path); // to enable options
+  cc_params[cc_par_cnt++] = alloc_printf("-fpass-plugin=%s/../lib/symsan/TaintPass.so", obj_path);
   cc_params[cc_par_cnt++] = "-mllvm";
   cc_params[cc_par_cnt++] =
       alloc_printf("-taint-abilist=%s/../lib/symsan/dfsan_abilist.txt", obj_path);
@@ -213,6 +213,11 @@ static void add_taint_pass() {
   if (getenv("KO_NO_TRACE_BOUND")) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] = "-taint-trace-bound=false";
+  }
+
+  if (getenv("KO_SOLVE_UB")) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = "-taint-solve-ub=true";
   }
 
   if (is_cxx && use_native_cxx) {

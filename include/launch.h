@@ -33,6 +33,9 @@ int symsan_set_debug(int enable);
 /// @brief set the bounds check mode for the target binary
 int symsan_set_bounds_check(int enable);
 
+/// @brief set the solve UB mode for the target binary
+int symsan_set_solve_ub(int enable);
+
 /// @brief set the exit on memory error mode for the target binary
 int symsan_set_exit_on_memerror(int enable);
 

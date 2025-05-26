@@ -57,14 +57,17 @@ static PyObject* SymSanInit(PyObject *self, PyObject *args) {
 }
 
 static PyObject* SymSanConfig(PyObject *self, PyObject *args, PyObject *keywds) {
-  static const char *kwlist[] = {"input", "args", "debug", "bounds", NULL};
+  static const char *kwlist[]
+      = {"input", "args", "debug", "bounds", "undefined", NULL};
   const char *input = NULL;
   PyObject *iargs = NULL;
   int debug = 0;
   int bounds = 0;
+  int solve_ub = 0;
 
-  if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|O!ii",
-      const_cast<char**>(kwlist), &input, &PyList_Type, &iargs, &debug, &bounds)) {
+  if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|O!iii",
+      const_cast<char**>(kwlist), &input, &PyList_Type, &iargs,
+      &debug, &bounds, &solve_ub)) {
     return NULL;
   }
 
@@ -106,6 +109,11 @@ static PyObject* SymSanConfig(PyObject *self, PyObject *args, PyObject *keywds) 
 
   if (symsan_set_bounds_check(bounds) != 0) {
     PyErr_SetString(PyExc_ValueError, "invalid bounds");
+    return NULL;
+  }
+
+  if (symsan_set_solve_ub(solve_ub) != 0) {
+    PyErr_SetString(PyExc_ValueError, "invalid solve_ub");
     return NULL;
   }
 

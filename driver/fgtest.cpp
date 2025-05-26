@@ -79,6 +79,7 @@ static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
 
 static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *addr) {
 
+  AOUT("solving label %d = %d, add_nested: %d\n", label, r, add_nested);
   std::vector<uint64_t> tasks;
   if (__z3_parser->parse_cond(label, r, add_nested, tasks)) {
     AOUT("WARNING: failed to parse condition %d @%p\n", label, addr);
@@ -201,6 +202,7 @@ int main(int argc, char* const argv[]) {
 
   symsan_set_debug(1);
   symsan_set_bounds_check(1);
+  symsan_set_solve_ub(1);
 
   // launch the target
   int ret = symsan_run(input_fd);
