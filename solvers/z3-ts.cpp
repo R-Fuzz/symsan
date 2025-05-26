@@ -369,9 +369,8 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
   // early return if nothing to do
   if (!enum_index || // if we are not enumerating the index
       (num_elems == 0 && // if the GEP type is not an array,
-       // and we also don't have a pointer label, or we don't have bounds info
-       (ptr_label == 0 || get_label_info(ptr_label)->op != __dfsan::Alloca)
-      )) {
+       // and we also don't have a pointer label
+       ptr_label == 0)) {
     return 0;
   }
 
@@ -405,8 +404,12 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
       construct_index_tasks(idx, index, 0, num_elems, 1, nested_tasks, tasks);
     } else {
       dfsan_label_info *bounds = get_label_info(ptr_label);
+      // fprintf(stderr, "GEP bounds: lower=0x%lx, upper=0x%lx)\n",
+      //     bounds->op1.i, bounds->op2.i);
       // if the array size is unknow, check bound info
-      if (bounds->op == __dfsan::Alloca) {
+      if (bounds->op == __dfsan::Alloca ||
+          // due to async solving, we may have a Free op
+          bounds->op == __dfsan::Free) {
         z3::expr es = context_.bv_val(elem_size, 64);
         z3::expr co = context_.bv_val(current_offset, 64);
         if (bounds->l2 == 0) {

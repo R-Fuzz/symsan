@@ -1546,9 +1546,8 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
   // early return if nothing to do
   if (!enum_index || // if we are not enumerating the index
       (num_elems == 0 && // if the GEP type is not an array,
-       // and we also don't have a pointer label, or we don't have bounds info
-       (ptr_label == 0 || get_label_info(ptr_label)->op != __dfsan::Alloca)
-      )) {
+       // and we also don't have a pointer label
+       ptr_label)) {
     return 0;
   }
 
