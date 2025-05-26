@@ -423,6 +423,62 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
   }
 
   // construct bounds solving tasks here
+  uint16_t index_bits = get_label_info(index_label)->size;
+  if (num_elems > 0) {
+    // array with known size
+    //
+    // check underflow, 0 > index
+    dfsan_label lb = dfsan_union(0, index_label, bvsgt, index_bits, 0, index);
+    // assume the result is false, as bounds check should happen before solving
+    // no flag, no nested
+    __solve_cond(lb, 0, 0, 0, cid, addr);
+
+    // check overflow, num_elems <= index
+    dfsan_label ub = dfsan_union(num_elems, index_label, bvsle, index_bits, num_elems, index);
+    __solve_cond(ub, 0, 0, 0, cid, addr);
+  } else {
+    // array with unknown size
+    dfsan_label_info *bounds_info = get_label_info(ptr_label);
+    if (bounds_info->op == __dfsan::Alloca) {
+      // bounds information is available, check if allocation size is symbolic
+      if (index_bits < 64) // extends index to 64 bits
+        index_label = dfsan_union(index_label, 0, ZExt, 64, index, 0);
+      if (bounds_info->l2 == 0) {
+        // concrete allocation size, check bounds
+        // check underflow, lower_bound > index * elem_size + current_offset + ptr
+        // => (lower_bound - current_offset - ptr) / elem_size > index
+        uint64_t lower_bound = (bounds_info->op1.i - current_offset - ptr) / elem_size;
+        dfsan_label lb = dfsan_union(lower_bound, index_label, bvugt, 64, lower_bound, index);
+        __solve_cond(lb, 0, 0, 0, cid, addr);
+
+        // check overflow, upper_bound <= index * elem_size + current_offset + ptr
+        // => (upper_bound - current_offset - ptr) / elem_size <= index
+        uint64_t upper_bound = (bounds_info->op2.i - current_offset - ptr) / elem_size;
+        dfsan_label ub = dfsan_union(upper_bound, index_label, bvule, 64, upper_bound, index);
+        __solve_cond(ub, 0, 0, 0, cid, addr);
+      } else {
+        // index * elem_size + current_offset + (ptr - lower_bound) > array_size * alloc_elem_size
+        dfsan_label size_label = elem_size == 1 ? index_label :
+          dfsan_union(index_label, 0, Mul, 64, index, elem_size);
+        uint64_t size = index * elem_size;
+        uint64_t offset = current_offset + ptr - bounds_info->op1.i;
+        size_label = offset == 0 ? size :
+          dfsan_union(size_label, 0, Add, 64, size, offset);
+        size += offset;
+        uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
+        dfsan_label overflow =
+            dfsan_union(size_label, bounds_info->l2, bvugt, 64, size, alloc_size);
+        __solve_cond(overflow, 0, 0, 0, cid, addr);
+      }
+    } else {
+      // symbolic pointer but no bounds info?
+      AOUT("WARNING: symbolic pointer %p = %u with no bounds info @%p\n",
+           (void*)ptr, ptr_label, addr);
+      // check if null is possible?
+      dfsan_label null = dfsan_union(0, ptr_label, bveq, 64, 0, ptr);
+      __solve_cond(null, 0, 0, 0, cid, addr);
+    }
+  }
 }
 
 extern "C" void InitializeSolver() {

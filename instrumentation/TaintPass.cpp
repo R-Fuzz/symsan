@@ -1837,7 +1837,7 @@ void TaintFunction::solveBounds(Value *Ptr, Value* Size, Instruction *Pos) {
   }
   Value *Addr = IRB.CreatePtrToInt(Ptr, TT.Int64Ty);
   Value *Index = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
-  ConstantInt *NumEl = ConstantInt::get(TT.Int64Ty, 1); // one element
+  ConstantInt *NumEl = ConstantInt::get(TT.Int64Ty, 0); // no allocation size
   ConstantInt *ElSize = ConstantInt::get(TT.Int64Ty, 1); // bytes array
   ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, 0); // no offset
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(Pos));
@@ -2380,7 +2380,7 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
       if (PointerType *PTy = dyn_cast<PointerType>(ETy)) {
         assert(PTy == POTy && "inllegal pointer index");
         ETy = I->getSourceElementType();
-        NumElements = 1;
+        NumElements = 0; // we don't know the number of elements
         ElemSize = DL.getTypeAllocSize(ETy);
       } else if (ArrayType *ATy = dyn_cast<ArrayType>(ETy)) {
         ETy = ATy->getElementType();

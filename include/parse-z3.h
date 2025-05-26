@@ -87,8 +87,7 @@ private:
   inline void save_constraint(z3::expr expr, input_dep_set_t &inputs);
   void construct_index_tasks(z3::expr &index, uint64_t curr,
                              uint64_t lb, uint64_t ub, uint64_t step,
-                             z3_task_t &nested, bool enum_index,
-                             std::vector<uint64_t> &tasks);
+                             z3_task_t &nested, std::vector<uint64_t> &tasks);
 };
 
 class Z3ParserSolver : public Z3AstParser {

@@ -1543,12 +1543,13 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     return 0; // not an error, just skip
   }
 
-  // early return if nothing to check
-  if (!enum_index) {
-    if (num_elems == 0 &&
-        (ptr_label == 0 || get_label_info(ptr_label)->op != __dfsan::Alloca)) {
-      return 0;
-    }
+  // early return if nothing to do
+  if (!enum_index || // if we are not enumerating the index
+      (num_elems == 0 && // if the GEP type is not an array,
+       // and we also don't have a pointer label, or we don't have bounds info
+       (ptr_label == 0 || get_label_info(ptr_label)->op != __dfsan::Alloca)
+      )) {
+    return 0;
   }
 
   // hmm, since the gep constraints we want to solve are not in the union table,
@@ -1649,103 +1650,7 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     // TODO:
   }
 
-#if DEBUG
-#define DEBUG_SAVE_GEP(task) \
-  do { \
-    auto id = save_task(task); \
-    WARNF("save task %lu for %u at %d, const size = %lu, constmeta size = %lu\n", \
-      id, index_label, __LINE__, task->constraints.size(), task->consmeta.size()); \
-    tasks.push_back(id); \
-  } while (0)
-#else
-#define DEBUG_SAVE_GEP(task) \
-  tasks.push_back(save_task(task));
-#endif
-
-  // bounds check
-  if (num_elems > 0) {
-    // array with known size
-    //
-    // check underflow, 0 > index
-    constraint_t underflow = std::make_shared<rgd::Constraint>(*partial_constraint);
-    underflow->op1 = 0;
-    underflow->op2 = index;
-    task_t uf_task = std::make_shared<rgd::SearchTask>();
-    uf_task->add_constraint(underflow, rgd::Sgt); // signed GT
-    uf_task->finalize();
-    DEBUG_SAVE_GEP(uf_task);
-    if (solve_nested_ && !nested_caluse.empty()) {
-      task_t nested_task = std::make_shared<rgd::SearchTask>();
-      nested_task->add_constraint(underflow, rgd::Sgt);
-      add_nested_constraint(nested_task, nested_caluse);
-      nested_task->finalize();
-      DEBUG_SAVE_GEP(nested_task);
-    }
-    // check overflow, num_elems <= index
-    constraint_t overflow = std::make_shared<rgd::Constraint>(*partial_constraint);
-    overflow->input_args[0].second = num_elems; // IMPORTANT: fix the constant arg
-    overflow->op1 = num_elems;
-    overflow->op2 = index;
-    task_t of_task = std::make_shared<rgd::SearchTask>();
-    of_task->add_constraint(overflow, rgd::Ule); // unsigned LE
-    of_task->finalize();
-    DEBUG_SAVE_GEP(of_task);
-    if (solve_nested_ && !nested_caluse.empty()) {
-      task_t nested_task = std::make_shared<rgd::SearchTask>();
-      nested_task->add_constraint(overflow, rgd::Ule);
-      add_nested_constraint(nested_task, nested_caluse);
-      nested_task->finalize();
-      DEBUG_SAVE_GEP(nested_task);
-    }
-  } else {
-    // struct or array with unknown compile time size
-    auto bounds_info = get_label_info(ptr_label);
-    if (bounds_info->op == __dfsan::Alloca) {
-      // bounds information is available, check if allocation size is symbolic
-      if (bounds_info->l2 == 0) {
-        // concrete allocation size, check bounds
-        // check underflow, lower_bound > index * elem_size + current_offset + ptr
-        // => (lower_bound - current_offset - ptr) / elem_size > index
-        constraint_t underflow = std::make_shared<rgd::Constraint>(*partial_constraint);
-        uint64_t lower_bound = (bounds_info->op1.i - current_offset - ptr) / elem_size;
-        underflow->input_args[0].second = lower_bound; // IMPORTANT: fix the constant arg
-        underflow->op1 = lower_bound;
-        underflow->op2 = index;
-        task_t uf_task = std::make_shared<rgd::SearchTask>();
-        uf_task->add_constraint(underflow, rgd::Ugt); // unsigned GT, automatically detects integer overflow
-        uf_task->finalize();
-        DEBUG_SAVE_GEP(uf_task);
-        if (solve_nested_ && !nested_caluse.empty()) {
-          task_t nested_task = std::make_shared<rgd::SearchTask>();
-          nested_task->add_constraint(underflow, rgd::Ugt);
-          add_nested_constraint(nested_task, nested_caluse);
-          nested_task->finalize();
-          DEBUG_SAVE_GEP(nested_task);
-        }
-        // check overflow, upper_bound <= index * elem_size + current_offset + ptr
-        // => (upper_bound - current_offset - ptr) / elem_size <= index
-        constraint_t overflow = std::make_shared<rgd::Constraint>(*partial_constraint);
-        uint64_t upper_bound = (bounds_info->op2.i - current_offset - ptr) / elem_size;
-        overflow->input_args[0].second = upper_bound; // IMPORTANT: fix the constant arg
-        overflow->op1 = upper_bound;
-        overflow->op2 = index;
-        task_t of_task = std::make_shared<rgd::SearchTask>();
-        of_task->add_constraint(overflow, rgd::Ule); // unsigned LE
-        of_task->finalize();
-        DEBUG_SAVE_GEP(of_task);
-        if (solve_nested_ && !nested_caluse.empty()) {
-          task_t nested_task = std::make_shared<rgd::SearchTask>();
-          nested_task->add_constraint(overflow, rgd::Ule);
-          add_nested_constraint(nested_task, nested_caluse);
-          nested_task->finalize();
-          DEBUG_SAVE_GEP(nested_task);
-        }
-      } else {
-        // TODO: check size overflow
-        // index * elem_size + current_offset + ptr > array_size * alloc_elem_size
-      }
-    }
-  }
+  // bounds solving are seperated from index enumeration now
 
   return 0;
 }
