@@ -300,29 +300,43 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       case __dfsan::URem:
       case __dfsan::SRem:
         // check for division by zero
-        cond = __taint_union(0, l2, (bveq << 8) | ICmp, size, 0, op2);
-        __taint_trace_cond(cond, 0, UndefinedCheck, ub_division_by_zero);
+        // -fsanitize=integer-divide-by-zero
+        if (orig_op2 != 0) {
+          cond = __taint_union(l2, 0, (bveq << 8) | __dfsan::ICmp, size,
+                               orig_op2, 0);
+          __taint_trace_cond(cond, 0, UndefinedCheck, ub_division_by_zero);
+        }
         break;
       case __dfsan::Shl:
       case __dfsan::LShr:
       case __dfsan::AShr:
-        // check for too large value
-        cond = __taint_union(0, l2, (bvule << 8) | ICmp, op_size, size, op2),
-        __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
-        // check for negative value
-        cond = __taint_union(0, l2, (bvsgt << 8) | ICmp, op_size, 0, op2),
-        __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
-        if (op == __dfsan::Shl && orig_op1 != 0) {
+        // -fsanitize=shift-exponent
+        // check for too large value: exponent > size
+        if (orig_op2 < size) {
+          cond = __taint_union(l2, 0, (bvuge << 8) | __dfsan::ICmp,
+                              op_size, orig_op2, size),
+          __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
+        }
+        if ((int64_t)orig_op2 >= 0) {
+          // check for negative value
+          cond = __taint_union(l2, 0, (bvslt << 8) | __dfsan::ICmp,
+                               op_size, orig_op2, 0),
+          __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
+        }
+        if (op == __dfsan::Shl && orig_op1 != 0 &&
+            orig_op2 <= __builtin_clzl(orig_op1) - (64 - size)) {
           // check for shift overflow
           // op2 > leading zero bits in op1
-          cond = __taint_union(0, l2, (bvult << 8) | ICmp, op_size,
-              __builtin_clzl(orig_op1) - (64 - size), op2);
+          cond = __taint_union(l2, 0, (bvugt << 8) | __dfsan::ICmp, op_size,
+                               orig_op2, __builtin_clzl(orig_op1) - (64 - size));
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_overflow);
         }
-        if (l1) {
+        if (l1 && (int64_t)orig_op1 >= 0) {
           // check for negative base
-          cond = __taint_union(0, l1, (bvsgt << 8) | ICmp,
-              get_label_info(l1)->size, 0, op1);
+          // -fsanitize=shift-base
+          // op1 < 0
+          cond = __taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
+                               get_label_info(l1)->size, orig_op1, 0);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_base);
         }
         break;
@@ -340,6 +354,29 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
 
   internal_memcpy(&__dfsan_label_info[label], &label_info, sizeof(dfsan_label_info));
   __union_table.insert(&__dfsan_label_info[label], label);
+
+  if (l1 && op == __dfsan::Trunc && flags().solve_ub) {
+    // check for data loss, after the new label is created
+    // -fsanitize=implicit-unsigned-integer-truncation
+    // old_vale >= (1 << new_size)
+    if (orig_op1 < (1UL << size)) {
+      // if current value does not have loss
+      dfsan_label loss = __taint_union(l1, 0, (bvuge << 8) | __dfsan::ICmp,
+                                       get_label_info(l1)->size, orig_op1,
+                                       1UL << size);
+      __taint_trace_cond(loss, 0, UndefinedCheck, ub_unsigned_integer_truncation);
+    }
+    // -fsanitize=implicit-signed-integer-truncation
+    // old_value < signed(1 << (size - 1))
+    int64_t target = (int64_t)((0xFFFFFFFFFFFFFFFFUL >> (size-1)) << (size-1));
+    if ((int64_t)orig_op1 >= target) {
+      uint16_t old_size = get_label_info(l1)->size;
+      if (old_size < 64) target &= ~(1UL << old_size);
+      dfsan_label loss = __taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
+                                       old_size, orig_op1, target);
+      __taint_trace_cond(loss, 0, UndefinedCheck, ub_signed_integer_truncation);
+    }
+  }
   return label;
 }
 

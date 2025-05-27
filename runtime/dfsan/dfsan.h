@@ -252,6 +252,8 @@ enum undefined_check_ids {
   ub_index_overflow,
   ub_integer_to_buffer_overflow,
   ub_null_pointer,
+  ub_unsigned_integer_truncation,
+  ub_signed_integer_truncation,
 };
 
 #define F_ADD_CONS   0x1
