@@ -690,16 +690,16 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
   if (num_elems > 0) {
     // array with known size
     //
-    // check underflow, 0 > index
-    dfsan_label lb = __taint_union(0, index_label, (bvsgt << 8) | ICmp,
-        index_bits, 0, index);
+    // check underflow, index < 0
+    dfsan_label lb = __taint_union(index_label, 0, (bvslt << 8) | ICmp,
+                                   index_bits, index, 0);
     // assume the result is false, as bounds check should happen before solving
     // no flag, no nested
     __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
 
-    // check overflow, num_elems <= index
-    dfsan_label ub = __taint_union(0, index_label, (bvsle << 8) | ICmp,
-        index_bits, num_elems, index);
+    // check overflow, index >= num_elems
+    dfsan_label ub = __taint_union(index_label, 0, (bvsge << 8) | ICmp,
+                                   index_bits, index, num_elems);
     __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
   } else {
     // array with unknown size
@@ -710,34 +710,34 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
         index_label = __taint_union(index_label, 0, ZExt, 64, index, 0);
       if (bounds_info->l2 == 0) {
         // concrete allocation size, check bounds
-        // check underflow, lower_bound > index * elem_size + current_offset + ptr
-        // => (lower_bound - current_offset - ptr) / elem_size > index
+        // check underflow, index * elem_size + current_offset + ptr < lower_bound
+        // => index < (lower_bound - current_offset - ptr) / elem_size
         uint64_t lower_bound =
             (bounds_info->op1.i - current_offset - ptr) / elem_size;
-        dfsan_label lb = __taint_union(0, index_label, (bvugt << 8) | ICmp,
-            64, lower_bound, index);
+        dfsan_label lb = __taint_union(index_label, 0, (bvult << 8) | ICmp,
+                                       64, index, lower_bound);
         __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
 
-        // check overflow, upper_bound <= index * elem_size + current_offset + ptr
-        // => (upper_bound - current_offset - ptr) / elem_size <= index
+        // check overflow, index * elem_size + current_offset + ptr >= upper_bound
+        // => index >= (upper_bound - current_offset - ptr) / elem_size
         uint64_t upper_bound =
             (bounds_info->op2.i - current_offset - ptr) / elem_size;
-        dfsan_label ub = __taint_union(0, index_label, (bvule << 8) | ICmp,
-            64, upper_bound, index);
+        dfsan_label ub = __taint_union(index_label, 0, (bvuge << 8) | ICmp,
+                                       64, index, upper_bound);
         __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
       } else {
         // index * elem_size + current_offset + (ptr - lower_bound) > array_size * alloc_elem_size
         dfsan_label size_label = elem_size == 1 ? index_label :
-          __taint_union(index_label, 0, Mul, 64, index, elem_size);
+            __taint_union(index_label, 0, Mul, 64, index, elem_size);
         uint64_t size = index * elem_size;
         uint64_t offset = current_offset + ptr - bounds_info->op1.i;
         size_label = offset == 0 ? size :
-          __taint_union(size_label, 0, Add, 64, size, offset);
+            __taint_union(size_label, 0, Add, 64, size, offset);
         size += offset;
         uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
         dfsan_label overflow =
             __taint_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
-                64, size, alloc_size);
+                          64, size, alloc_size);
         __taint_trace_cond(overflow, 0, UndefinedCheck, ub_integer_to_buffer_overflow);
       }
     } else {
@@ -745,7 +745,7 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
       AOUT("WARNING: symbolic pointer %p = %u with no bounds info @%p\n",
            (void*)ptr, ptr_label, addr);
       // check if null is possible?
-      dfsan_label null = __taint_union(0, ptr_label, bveq, 64, 0, ptr);
+      dfsan_label null = __taint_union(ptr_label, 0, bveq, 64, ptr, 0);
       __taint_trace_cond(null, 0, UndefinedCheck, ub_null_pointer);
     }
   }
