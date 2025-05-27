@@ -1,11 +1,11 @@
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out
 // RUN: python -c"import sys; sys.stdout.buffer.write(b'\x00\x00\x00\x00')" > %t.bin
-// RUN: clang -fsanitize=address -o %t.asan %s
+// RUN: clang -fsanitize=bounds -o %t.ubsan %s
 // RUN: env KO_USE_FASTGEN=1 KO_SOLVE_UB=1 %ko-clang -o %t.fg %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out solve_ub=1" %fgtest %t.fg %t.bin
-// RUN: not env TAINT_OPTIONS="debug=1 trace_bounds=1" %t.fg %t.out/id-0-0-1 2>&1 | FileCheck %s
-// CHECK: ERROR: OOB overflow
+// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-1 2>&1 | FileCheck %s
+// CHECK: runtime error: index {{.*}} out of bounds for type 'char[26]'
 
 #include <stdint.h>
 #include <stdio.h>
