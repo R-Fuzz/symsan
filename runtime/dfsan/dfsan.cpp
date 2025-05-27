@@ -211,6 +211,9 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     }
   }
 
+  // backup old op-values
+  uint64_t orig_op1 = op1, orig_op2 = op2;
+
   // special handling for bounds, which may use all four fields
   // fatoi also uses both concrete operand fields
   // record icmp and fmemcmp operands as well
@@ -264,33 +267,6 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     return 0;
   }
 
-  // ubsan checks
-  if (l2 && flags().solve_ub) {
-    dfsan_label cond = 0;
-    switch(op & 0xff) {
-      case __dfsan::Add:
-      case __dfsan::Sub:
-      case __dfsan::Mul:
-        // check for integer overflow
-        break;
-      case __dfsan::UDiv:
-      case __dfsan::SDiv:
-      case __dfsan::URem:
-      case __dfsan::SRem:
-        // check for division by zero
-        cond = __taint_union(0, l2, (bveq << 8) | ICmp, size, 0, op2);
-        __taint_trace_cond(cond, 0, 0, 0);
-        break;
-      case __dfsan::Shl:
-      case __dfsan::LShr:
-      case __dfsan::AShr:
-        // check for shift overflow
-        break;
-      default:
-        break;
-    }
-  }
-
   // setup a hash tree for dedup
   uint32_t h1 = l1 ? __dfsan_label_info[l1].hash : 0;
   uint32_t h2 = l2 ? __dfsan_label_info[l2].hash : 0;
@@ -308,9 +284,52 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     AOUT("%u found\n", label);
     return label;
   }
-  // for debugging
-  dfsan_label l = atomic_load(&__dfsan_last_label, memory_order_relaxed);
-  // assert(l1 <= l && l2 <= l);
+
+  // ubsan checks, after dedup, so we don't do redundant checks
+  if (l2 && flags().solve_ub) {
+    dfsan_label cond = 0;
+    uint16_t op_size = get_label_info(l2)->size;
+    switch(op & 0xff) {
+      case __dfsan::Add:
+      case __dfsan::Sub:
+      case __dfsan::Mul:
+        // check for integer overflow
+        break;
+      case __dfsan::UDiv:
+      case __dfsan::SDiv:
+      case __dfsan::URem:
+      case __dfsan::SRem:
+        // check for division by zero
+        cond = __taint_union(0, l2, (bveq << 8) | ICmp, size, 0, op2);
+        __taint_trace_cond(cond, 0, 0, 0);
+        break;
+      case __dfsan::Shl:
+      case __dfsan::LShr:
+      case __dfsan::AShr:
+        // check for too large value
+        cond = __taint_union(0, l2, (bvule << 8) | ICmp, op_size, size, op2),
+        __taint_trace_cond(cond, 0, 0, 0);
+        // check for negative value
+        cond = __taint_union(0, l2, (bvsgt << 8) | ICmp, op_size, 0, op2),
+        __taint_trace_cond(cond, 0, 0, 0);
+        if (op == __dfsan::Shl && orig_op1 != 0) {
+          // check for shift overflow
+          // op2 > leading zero bits in op1
+          cond = __taint_union(0, l2, (bvult << 8) | ICmp, op_size,
+              __builtin_clzl(orig_op1) - (64 - size), op2);
+          __taint_trace_cond(cond, 0, 0, 0);
+        }
+        if (l1) {
+          // check for negative base
+          cond = __taint_union(0, l1, (bvsgt << 8) | ICmp,
+              get_label_info(l1)->size, 0, op1);
+          __taint_trace_cond(cond, 0, 0, 0);
+        }
+        break;
+      default:
+        break;
+    }
+  }
 
   dfsan_label label =
     atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
