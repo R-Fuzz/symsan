@@ -239,6 +239,20 @@ static const uint8_t TrueBranchLoopLatch = 0x8;
 static const uint8_t FalseBranchLoopLatch = 0x4;
 static const uint8_t TrueBranchLoopExit = 0x2;
 static const uint8_t FalseBranchLoopExit = 0x1;
+static const uint8_t LoopFlagMask = 0xF;
+static const uint8_t UndefinedCheck = 0x10;
+
+enum undefined_check_ids {
+  ub_integer_overflow = 1,
+  ub_division_by_zero,
+  ub_shift_exponent,
+  ub_shift_overflow,
+  ub_shift_base,
+  ub_index_underflow,
+  ub_index_overflow,
+  ub_integer_to_buffer_overflow,
+  ub_null_pointer,
+};
 
 #define F_ADD_CONS   0x1
 #define F_LOOP_EXIT  0x2

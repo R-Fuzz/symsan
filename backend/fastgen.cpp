@@ -186,8 +186,11 @@ __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
   AOUT("solving cond: %u %u 0x%x 0x%x %p\n",
        label, r, __taint_trace_callstack, cid, addr);
 
+  uint8_t add_nested = flag & UndefinedCheck ? 0 : 1;
+  uint8_t loop_flag = flag & LoopFlagMask;
+
   // always add nested
-  __solve_cond(label, r, 1, flag, cid, addr);
+  __solve_cond(label, r, add_nested, loop_flag, cid, addr);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
@@ -394,98 +397,6 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
 
   if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
     Die();
-  }
-}
-
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
-                          dfsan_label index_label, int64_t index,
-                          uint64_t num_elems, uint64_t elem_size,
-                          int64_t current_offset, uint32_t cid) {
-  if (index_label == 0 || !flags().solve_ub)
-    return;
-
-  void *addr = __builtin_return_address(0);
-
-  if (index_label == kInitializingLabel) {
-    // uninitialized label
-    AOUT("WARNING: uninitialized label %u @%p\n", index_label, addr);
-    if (flags().solve_ub) __send_ubi(index_label, index, cid, addr);
-    if (flags().exit_on_memerror) Die();
-    else return;
-  }
-  if (ptr_label == kInitializingLabel) {
-    // uninitialized label
-    AOUT("WARNING: uninitialized label %u @%p\n", ptr_label, addr);
-    if (flags().solve_ub) __send_ubi(ptr_label, ptr, cid, addr);
-    if (flags().exit_on_memerror) Die();
-    else return;
-  }
-
-  AOUT("solve bounds: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
-      index, index_label, num_elems, elem_size, current_offset);
-
-  // construct bounds solving tasks here
-  uint16_t index_bits = get_label_info(index_label)->size;
-  if (num_elems > 0) {
-    // array with known size
-    //
-    // check underflow, 0 > index
-    dfsan_label lb = dfsan_union(0, index_label, (bvsgt << 8) | ICmp,
-        index_bits, 0, index);
-    // assume the result is false, as bounds check should happen before solving
-    // no flag, no nested
-    __solve_cond(lb, 0, 0, 0, cid, addr);
-
-    // check overflow, num_elems <= index
-    dfsan_label ub = dfsan_union(0, index_label, (bvsle << 8) | ICmp,
-        index_bits, num_elems, index);
-    __solve_cond(ub, 0, 0, 0, cid, addr);
-  } else {
-    // array with unknown size
-    dfsan_label_info *bounds_info = get_label_info(ptr_label);
-    if (bounds_info->op == __dfsan::Alloca) {
-      // bounds information is available, check if allocation size is symbolic
-      if (index_bits < 64) // extends index to 64 bits
-        index_label = dfsan_union(index_label, 0, ZExt, 64, index, 0);
-      if (bounds_info->l2 == 0) {
-        // concrete allocation size, check bounds
-        // check underflow, lower_bound > index * elem_size + current_offset + ptr
-        // => (lower_bound - current_offset - ptr) / elem_size > index
-        uint64_t lower_bound = (bounds_info->op1.i - current_offset - ptr) / elem_size;
-        dfsan_label lb = dfsan_union(0, index_label, (bvugt << 8) | ICmp,
-            64, lower_bound, index);
-        __solve_cond(lb, 0, 0, 0, cid, addr);
-
-        // check overflow, upper_bound <= index * elem_size + current_offset + ptr
-        // => (upper_bound - current_offset - ptr) / elem_size <= index
-        uint64_t upper_bound = (bounds_info->op2.i - current_offset - ptr) / elem_size;
-        dfsan_label ub = dfsan_union(0, index_label, (bvule << 8) | ICmp,
-            64, upper_bound, index);
-        __solve_cond(ub, 0, 0, 0, cid, addr);
-      } else {
-        // index * elem_size + current_offset + (ptr - lower_bound) > array_size * alloc_elem_size
-        dfsan_label size_label = elem_size == 1 ? index_label :
-          dfsan_union(index_label, 0, Mul, 64, index, elem_size);
-        uint64_t size = index * elem_size;
-        uint64_t offset = current_offset + ptr - bounds_info->op1.i;
-        size_label = offset == 0 ? size :
-          dfsan_union(size_label, 0, Add, 64, size, offset);
-        size += offset;
-        uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
-        dfsan_label overflow =
-            dfsan_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
-                64, size, alloc_size);
-        __solve_cond(overflow, 0, 0, 0, cid, addr);
-      }
-    } else {
-      // symbolic pointer but no bounds info?
-      AOUT("WARNING: symbolic pointer %p = %u with no bounds info @%p\n",
-           (void*)ptr, ptr_label, addr);
-      // check if null is possible?
-      dfsan_label null = dfsan_union(0, ptr_label, bveq, 64, 0, ptr);
-      __solve_cond(null, 0, 0, 0, cid, addr);
-    }
   }
 }
 

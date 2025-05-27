@@ -301,29 +301,29 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       case __dfsan::SRem:
         // check for division by zero
         cond = __taint_union(0, l2, (bveq << 8) | ICmp, size, 0, op2);
-        __taint_trace_cond(cond, 0, 0, 0);
+        __taint_trace_cond(cond, 0, UndefinedCheck, ub_division_by_zero);
         break;
       case __dfsan::Shl:
       case __dfsan::LShr:
       case __dfsan::AShr:
         // check for too large value
         cond = __taint_union(0, l2, (bvule << 8) | ICmp, op_size, size, op2),
-        __taint_trace_cond(cond, 0, 0, 0);
+        __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
         // check for negative value
         cond = __taint_union(0, l2, (bvsgt << 8) | ICmp, op_size, 0, op2),
-        __taint_trace_cond(cond, 0, 0, 0);
+        __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
         if (op == __dfsan::Shl && orig_op1 != 0) {
           // check for shift overflow
           // op2 > leading zero bits in op1
           cond = __taint_union(0, l2, (bvult << 8) | ICmp, op_size,
               __builtin_clzl(orig_op1) - (64 - size), op2);
-          __taint_trace_cond(cond, 0, 0, 0);
+          __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_overflow);
         }
         if (l1) {
           // check for negative base
           cond = __taint_union(0, l1, (bvsgt << 8) | ICmp,
               get_label_info(l1)->size, 0, op1);
-          __taint_trace_cond(cond, 0, 0, 0);
+          __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_base);
         }
         break;
       default:
@@ -616,6 +616,100 @@ void __taint_check_bounds(dfsan_label addr_label, uptr addr,
     } else if (addr_label != 0) {
       AOUT("WARNING: incorrect label %p = %d @%p\n",
            (void*)addr, addr_label, __builtin_return_address(0));
+    }
+  }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
+                          dfsan_label index_label, int64_t index,
+                          uint64_t num_elems, uint64_t elem_size,
+                          int64_t current_offset, uint32_t cid) {
+  if (index_label == 0 || !flags().solve_ub)
+    return;
+
+  void *addr = __builtin_return_address(0);
+
+  if (index_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", index_label, addr);
+    __taint_trace_memerr(ptr_label, ptr, index_label, index, F_MEMERR_UBI, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+  if (ptr_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", ptr_label, addr);
+    __taint_trace_memerr(ptr_label, ptr, index_label, index, F_MEMERR_UBI, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+
+  AOUT("solve bounds: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
+      index, index_label, num_elems, elem_size, current_offset);
+
+  // construct bounds solving tasks here
+  uint16_t index_bits = get_label_info(index_label)->size;
+  if (num_elems > 0) {
+    // array with known size
+    //
+    // check underflow, 0 > index
+    dfsan_label lb = __taint_union(0, index_label, (bvsgt << 8) | ICmp,
+        index_bits, 0, index);
+    // assume the result is false, as bounds check should happen before solving
+    // no flag, no nested
+    __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
+
+    // check overflow, num_elems <= index
+    dfsan_label ub = __taint_union(0, index_label, (bvsle << 8) | ICmp,
+        index_bits, num_elems, index);
+    __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
+  } else {
+    // array with unknown size
+    dfsan_label_info *bounds_info = get_label_info(ptr_label);
+    if (bounds_info->op == __dfsan::Alloca) {
+      // bounds information is available, check if allocation size is symbolic
+      if (index_bits < 64) // extends index to 64 bits
+        index_label = __taint_union(index_label, 0, ZExt, 64, index, 0);
+      if (bounds_info->l2 == 0) {
+        // concrete allocation size, check bounds
+        // check underflow, lower_bound > index * elem_size + current_offset + ptr
+        // => (lower_bound - current_offset - ptr) / elem_size > index
+        uint64_t lower_bound =
+            (bounds_info->op1.i - current_offset - ptr) / elem_size;
+        dfsan_label lb = __taint_union(0, index_label, (bvugt << 8) | ICmp,
+            64, lower_bound, index);
+        __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
+
+        // check overflow, upper_bound <= index * elem_size + current_offset + ptr
+        // => (upper_bound - current_offset - ptr) / elem_size <= index
+        uint64_t upper_bound =
+            (bounds_info->op2.i - current_offset - ptr) / elem_size;
+        dfsan_label ub = __taint_union(0, index_label, (bvule << 8) | ICmp,
+            64, upper_bound, index);
+        __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
+      } else {
+        // index * elem_size + current_offset + (ptr - lower_bound) > array_size * alloc_elem_size
+        dfsan_label size_label = elem_size == 1 ? index_label :
+          __taint_union(index_label, 0, Mul, 64, index, elem_size);
+        uint64_t size = index * elem_size;
+        uint64_t offset = current_offset + ptr - bounds_info->op1.i;
+        size_label = offset == 0 ? size :
+          __taint_union(size_label, 0, Add, 64, size, offset);
+        size += offset;
+        uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
+        dfsan_label overflow =
+            __taint_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
+                64, size, alloc_size);
+        __taint_trace_cond(overflow, 0, UndefinedCheck, ub_integer_to_buffer_overflow);
+      }
+    } else {
+      // symbolic pointer but no bounds info?
+      AOUT("WARNING: symbolic pointer %p = %u with no bounds info @%p\n",
+           (void*)ptr, ptr_label, addr);
+      // check if null is possible?
+      dfsan_label null = __taint_union(0, ptr_label, bveq, 64, 0, ptr);
+      __taint_trace_cond(null, 0, UndefinedCheck, ub_null_pointer);
     }
   }
 }
@@ -1165,8 +1259,5 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
                              unsigned) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_solve_bounds, dfsan_label, uint64_t,
-                             dfsan_label, int64_t, uint64_t, uint64_t, int64_t,
-                             uint32_t) {}
 SANITIZER_WEAK_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 }  // extern "C"
