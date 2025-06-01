@@ -37,9 +37,10 @@ private:
   using input_dep_set_t = std::unordered_set<offset_t, offset_hash>;
 
   // caches
-  std::unordered_map<dfsan_label, uint32_t> tsize_cache_;
-  std::unordered_map<dfsan_label, input_dep_set_t> deps_cache_;
-  std::unordered_map<dfsan_label, z3::expr> expr_cache_;
+  std::vector<uint32_t> tsize_cache_;
+  std::vector<input_dep_set_t> deps_cache_;
+  std::vector<Z3_ast> expr_cache_;
+  static const size_t SIZE_INCREMENT = 2048;
 
   // dependencies
   struct expr_hash {
@@ -74,10 +75,27 @@ private:
     offset_deps[off.second] = std::move(dep);
   }
 
-  inline z3::expr cache_expr(dfsan_label label, z3::expr const &e, input_dep_set_t &deps) {
-    expr_cache_.insert({label, e});
-    deps_cache_.insert({label, deps});
-    return e;
+  inline void cache_expr(dfsan_label label, z3::expr const &e) {
+    if (label != expr_cache_.size()) {
+      // fprintf(stderr, "expected label %zu, got %u\n",
+      //         expr_cache_.size(), label);
+      throw z3::exception("missing or adding too many expressions");
+    }
+    Z3_ast ast = e;
+    Z3_inc_ref(context_, ast); // increment reference count
+    expr_cache_.emplace_back(ast);
+  }
+
+  inline z3::expr get_cached_expr(dfsan_label label, input_dep_set_t &deps) {
+    if (label >= expr_cache_.size()) {
+      throw z3::exception("invalid label");
+    }
+    Z3_ast ast = expr_cache_[label];
+    if (ast == nullptr) {
+      throw z3::exception("cannot find cached expression");
+    }
+    deps.insert(deps_cache_[label].begin(), deps_cache_[label].end());
+    return z3::expr(context_, ast);
   }
 
   z3::expr read_concrete(dfsan_label label, uint16_t size);

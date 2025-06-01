@@ -11,6 +11,8 @@ using namespace symsan;
 
 const unsigned CheckTimeout = 1000; // 1s
 
+#define FILTER_UNSAT_CONSTRAINTS 0
+
 Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
   : ASTParser(base, size), context_(context) {
     input_name_format = "input-%u-%u";
@@ -22,8 +24,16 @@ int Z3AstParser::restart(std::vector<input_t> &inputs) {
   // reset caches
   memcmp_cache_.clear();
   tsize_cache_.clear();
-  deps_cache_.clear();
+  tsize_cache_.resize(1); // reserve for CONST_OFFSET
+  for (Z3_ast ast : expr_cache_) {
+    if (ast != nullptr) {
+      Z3_dec_ref(context_, ast); // decrement reference count
+    }
+  }
   expr_cache_.clear();
+  expr_cache_.resize(1); // reserve for CONST_OFFSET
+  deps_cache_.clear();
+  deps_cache_.resize(1); // reserve for CONST_OFFSET
   branch_deps_.clear();
   branch_deps_.resize(inputs.size());
 
@@ -75,206 +85,229 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     throw z3::exception("invalid label");
   }
 
-  dfsan_label_info *info = get_label_info(label);
-  // printf("%u = (l1:%u, l2:%u, op:%u, size:%u, op1:%lu, op2:%lu)\n",
-  //       label, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i);
-
-  auto expr_itr = expr_cache_.find(label);
-  if (expr_itr != expr_cache_.end()) {
-    auto deps_itr = deps_cache_.find(label);
-    deps.insert(deps_itr->second.begin(), deps_itr->second.end());
-    return expr_itr->second;
+  dfsan_label last_label = expr_cache_.size() - 1;
+  if (label > expr_cache_.capacity()) {
+    // reserve more caches if needed
+    tsize_cache_.reserve(label + SIZE_INCREMENT);
+    expr_cache_.reserve(label + SIZE_INCREMENT);
+    deps_cache_.reserve(label + SIZE_INCREMENT);
   }
 
-  // special ops
-  char name[256];
-  if (info->op == 0) {
-    // input
-    uint32_t offset = info->op1.i; // legacy: offset in op1
-    uint32_t input = info->op2.i;
-    snprintf(name, sizeof(name), input_name_format, input, offset);
-    z3::symbol symbol = context_.str_symbol(name);
-    z3::sort sort = context_.bv_sort(8);
-    tsize_cache_[label] = 1; // lazy init
-    deps.insert(std::make_pair(input, offset));
-    // caching is not super helpful
-    return context_.constant(symbol, sort);
-  } else if (info->op == __dfsan::Load) {
-    uint32_t offset = get_label_info(info->l1)->op1.i; // legacy: offset in op1
-    uint32_t input = get_label_info(info->l1)->op2.i;
-    snprintf(name, sizeof(name), input_name_format, input, offset);
-    z3::symbol symbol = context_.str_symbol(name);
-    z3::sort sort = context_.bv_sort(8);
-    z3::expr out = context_.constant(symbol, sort);
-    deps.insert(std::make_pair(input, offset));
-    for (uint32_t i = 1; i < info->l2; i++) {
-      snprintf(name, sizeof(name), input_name_format, input, offset + i);
-      symbol = context_.str_symbol(name);
-      out = z3::concat(context_.constant(symbol, sort), out);
-      deps.insert(std::make_pair(input, offset + i));
-    }
-    tsize_cache_[label] = 1; // lazy init
-    return cache_expr(label, out, deps);
-  } else if (info->op == __dfsan::ZExt) {
-    z3::expr base = serialize(info->l1, deps);
-    if (base.is_bool()) // dirty hack since llvm lacks bool
-      base = z3::ite(base, context_.bv_val(1, 1),
-                           context_.bv_val(0, 1));
-    uint32_t base_size = base.get_sort().bv_size();
-    tsize_cache_[label] = tsize_cache_[info->l1]; // lazy init
-    return cache_expr(label, z3::zext(base, info->size - base_size), deps);
-  } else if (info->op == __dfsan::SExt) {
-    z3::expr base = serialize(info->l1, deps);
-    uint32_t base_size = base.get_sort().bv_size();
-    tsize_cache_[label] = tsize_cache_[info->l1]; // lazy init
-    return cache_expr(label, z3::sext(base, info->size - base_size), deps);
-  } else if (info->op == __dfsan::Trunc) {
-    z3::expr base = serialize(info->l1, deps);
-    tsize_cache_[label] = tsize_cache_[info->l1]; // lazy init
-    return cache_expr(label, base.extract(info->size - 1, 0), deps);
-  } else if (info->op == __dfsan::IntToPtr) {
-    z3::expr e = serialize(info->l1, deps);
-    tsize_cache_[label] = tsize_cache_[info->l1]; // lazy init
-    return cache_expr(label, e, deps);
-  } //FIXME: other casting ops (PtrToInt, BitCast)?
-  // symsan-defined
-  else if (info->op == __dfsan::Extract) {
-    z3::expr base = serialize(info->l1, deps);
-    tsize_cache_[label] = tsize_cache_[info->l1]; // lazy init
-    return cache_expr(label, base.extract((info->op2.i + info->size) - 1, info->op2.i), deps);
-  } else if (info->op == __dfsan::Not) {
-    if (info->l2 == 0 || info->size != 1) {
-      throw z3::exception("invalid Not operation");
-    }
-    z3::expr e = serialize(info->l2, deps);
-    tsize_cache_[label] = tsize_cache_[info->l2]; // lazy init
-    if (!e.is_bool()) {
-      throw z3::exception("Only LNot should be recorded");
-    }
-    return cache_expr(label, !e, deps);
-  } else if (info->op == __dfsan::Neg) {
-    if (info->l2 == 0) {
-      throw z3::exception("invalid Neg predicate");
-    }
-    z3::expr e = serialize(info->l2, deps);
-    tsize_cache_[label] = tsize_cache_[info->l2]; // lazy init
-    return cache_expr(label, -e, deps);
-  }
-  // higher-order
-  else if (info->op == __dfsan::fmemcmp) {
-    z3::expr op1 = (info->l1 >= CONST_OFFSET) ? serialize(info->l1, deps) :
-                   read_concrete(label, info->size); // memcmp size in bytes
-    if (info->l2 < CONST_OFFSET) {
-      throw z3::exception("invalid memcmp operand2");
-    }
-    z3::expr op2 = serialize(info->l2, deps);
-    tsize_cache_[label] = 1; // lazy init
-    z3::expr e = z3::ite(op1 == op2, context_.bv_val(0, 32),
-                                     context_.bv_val(1, 32));
-    return cache_expr(label, e, deps);
-  } else if (info->op == __dfsan::fsize) {
-    // file size
-    z3::symbol symbol = context_.str_symbol("fsize");
-    z3::sort sort = context_.bv_sort(info->size);
-    z3::expr base = context_.constant(symbol, sort);
-    tsize_cache_[label] = 1; // lazy init
-    has_fsize = true; // XXX: set a flag
-    // don't cache because of deps
-    if (info->op1.i) {
-      // minus the offset stored in op1
-      z3::expr offset = context_.bv_val((uint64_t)info->op1.i, info->size);
-      return base - offset;
-    } else {
-      return base;
-    }
-  } else if (info->op == __dfsan::fatoi) {
-    // string to integer conversion
-    assert(info->l1 == 0 && info->l2 >= CONST_OFFSET);
-    dfsan_label_info *src = get_label_info(info->l2);
-    assert(src->op == __dfsan::Load);
-    uint32_t offset = get_label_info(src->l1)->op1.i; // legacy: offset in op1
-    uint32_t input = get_label_info(src->l1)->op2.i;
-    int base = info->op1.i;
-    // FIXME: dependencies?
-    tsize_cache_[label] = 1; // lazy init
-    // XXX: hacky, avoid string theory
-    snprintf(name, sizeof(name), atoi_name_format, input, offset, base);
-    z3::symbol symbol = context_.str_symbol(name);
-    z3::sort sort = context_.bv_sort(info->size);
-    return context_.constant(symbol, sort);
-  }
+  for (dfsan_label l = last_label + 1; l <= label; l++) {
 
-  // common ops
-  uint8_t size = info->size;
-  // size for concat is a bit complicated ...
-  if (info->op == __dfsan::Concat && info->l1 == 0) {
-    assert(info->l2 >= CONST_OFFSET);
-    size = info->size - get_label_info(info->l2)->size;
-  }
-  z3::expr op1 = context_.bv_val((uint64_t)info->op1.i, size);
-  if (info->l1 >= CONST_OFFSET) {
-    op1 = serialize(info->l1, deps).simplify();
-    if (op1.is_bv() && info->op != __dfsan::Concat) {
-      // XXX: fix size mismatch, only for bv and not concat
-      uint8_t op_size = op1.get_sort().bv_size();
-      if (op_size > size) {
-        op1 = op1.extract(size - 1, 0);
-      } else if (op_size < size) {
-        op1 = z3::zext(op1, size - op_size);
+    dfsan_label_info *info = get_label_info(l);
+    // fprintf(stderr, "%u = (l1:%u, l2:%u, op:%u, size:%u, op1:%lu, op2:%lu)\n",
+    //         l, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i);
+    input_dep_set_t &input_deps = deps_cache_.emplace_back();
+
+    // special ops
+    char name[256];
+    if (info->op == 0) {
+      // input
+      uint32_t offset = info->op1.i; // legacy: offset in op1
+      uint32_t input = info->op2.i;
+      snprintf(name, sizeof(name), input_name_format, input, offset);
+      z3::symbol symbol = context_.str_symbol(name);
+      z3::sort sort = context_.bv_sort(8);
+      tsize_cache_.emplace_back(1); // lazy init
+      input_deps.insert(std::make_pair(input, offset));
+      // caching is not super helpful
+      cache_expr(l, context_.constant(symbol, sort));
+      continue;
+    } else if (info->op == __dfsan::Load) {
+      uint32_t offset = get_label_info(info->l1)->op1.i; // legacy: offset in op1
+      uint32_t input = get_label_info(info->l1)->op2.i;
+      snprintf(name, sizeof(name), input_name_format, input, offset);
+      z3::symbol symbol = context_.str_symbol(name);
+      z3::sort sort = context_.bv_sort(8);
+      z3::expr out = context_.constant(symbol, sort);
+      input_deps.insert(std::make_pair(input, offset));
+      for (uint32_t i = 1; i < info->l2; i++) {
+        snprintf(name, sizeof(name), input_name_format, input, offset + i);
+        symbol = context_.str_symbol(name);
+        out = z3::concat(context_.constant(symbol, sort), out);
+        input_deps.insert(std::make_pair(input, offset + i));
       }
-    }
-  } else if (info->size == 1) {
-    op1 = context_.bool_val(info->op1.i == 1);
-  }
-  if (info->op == __dfsan::Concat && info->l2 == 0) {
-    assert(info->l1 >= CONST_OFFSET);
-    size = info->size - get_label_info(info->l1)->size;
-  }
-  z3::expr op2 = context_.bv_val((uint64_t)info->op2.i, size);
-  if (info->l2 >= CONST_OFFSET) {
-    input_dep_set_t deps2;
-    op2 = serialize(info->l2, deps2).simplify();
-    deps.insert(deps2.begin(), deps2.end());
-    if (op2.is_bv() && info->op != __dfsan::Concat) {
-      // XXX: fix size mismatch, only for bv and not concat
-      uint8_t op_size = op2.get_sort().bv_size();
-      if (op_size > size) {
-        op2 = op2.extract(size - 1, 0);
-      } else if (op_size < size) {
-        op2 = z3::zext(op2, size - op_size);
+      tsize_cache_.emplace_back(1); // lazy init
+      cache_expr(l, out);
+      continue;
+    } else if (info->op == __dfsan::ZExt) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      if (base.is_bool()) // dirty hack since llvm lacks bool
+        base = z3::ite(base, context_.bv_val(1, 1),
+                            context_.bv_val(0, 1));
+      uint32_t base_size = base.get_sort().bv_size();
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      cache_expr(l, z3::zext(base, info->size - base_size));
+      continue;
+    } else if (info->op == __dfsan::SExt) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      uint32_t base_size = base.get_sort().bv_size();
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      cache_expr(l, z3::sext(base, info->size - base_size));
+      continue;
+    } else if (info->op == __dfsan::Trunc) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      cache_expr(l, base.extract(info->size - 1, 0));
+      continue;
+    } else if (info->op == __dfsan::IntToPtr) {
+      z3::expr e = get_cached_expr(info->l1, input_deps);
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      cache_expr(l, e);
+      continue;
+    } //FIXME: other casting ops (PtrToInt, BitCast)?
+    // symsan-defined
+    else if (info->op == __dfsan::Extract) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      cache_expr(l, base.extract((info->op2.i + info->size) - 1, info->op2.i));
+      continue;
+    } else if (info->op == __dfsan::Not) {
+      if (info->l2 == 0 || info->size != 1) {
+        throw z3::exception("invalid Not operation");
       }
+      z3::expr e = get_cached_expr(info->l2, input_deps);
+      tsize_cache_.emplace_back(tsize_cache_[info->l2]); // lazy init
+      if (!e.is_bool()) {
+        throw z3::exception("Only LNot should be recorded");
+      }
+      cache_expr(l, !e);
+      continue;
+    } else if (info->op == __dfsan::Neg) {
+      if (info->l2 == 0) {
+        throw z3::exception("invalid Neg predicate");
+      }
+      z3::expr e = get_cached_expr(info->l2, input_deps);
+      tsize_cache_.emplace_back(tsize_cache_[info->l2]); // lazy init
+      cache_expr(l, -e);
+      continue;
     }
-  } else if (info->size == 1) {
-    op2 = context_.bool_val(info->op2.i == 1);
-  }
-  // update tree_size
-  tsize_cache_[label] = tsize_cache_[info->l1] + tsize_cache_[info->l2];
+    // higher-order
+    else if (info->op == __dfsan::fmemcmp) {
+      z3::expr op1 = (info->l1 >= CONST_OFFSET) ?
+                     get_cached_expr(info->l1, input_deps) :
+                     read_concrete(l, info->size); // memcmp size in bytes
+      if (info->l2 < CONST_OFFSET) {
+        throw z3::exception("invalid memcmp operand2");
+      }
+      z3::expr op2 = get_cached_expr(info->l2, input_deps);
+      tsize_cache_.emplace_back(1); // lazy init
+      z3::expr e = z3::ite(op1 == op2, context_.bv_val(0, 32),
+                                       context_.bv_val(1, 32));
+      cache_expr(l, e);
+      continue;
+    } else if (info->op == __dfsan::fsize) {
+      // file size
+      z3::symbol symbol = context_.str_symbol("fsize");
+      z3::sort sort = context_.bv_sort(info->size);
+      z3::expr base = context_.constant(symbol, sort);
+      tsize_cache_.emplace_back(1); // lazy init
+      has_fsize = true; // XXX: set a flag
+      // don't cache because of deps
+      if (info->op1.i) {
+        // minus the offset stored in op1
+        z3::expr offset = context_.bv_val((uint64_t)info->op1.i, info->size);
+        cache_expr(l, base - offset);
+      } else {
+        cache_expr(l, base);
+      }
+      continue;
+    } else if (info->op == __dfsan::fatoi) {
+      // string to integer conversion
+      assert(info->l1 == 0 && info->l2 >= CONST_OFFSET);
+      dfsan_label_info *src = get_label_info(info->l2);
+      assert(src->op == __dfsan::Load);
+      uint32_t offset = get_label_info(src->l1)->op1.i; // legacy: offset in op1
+      uint32_t input = get_label_info(src->l1)->op2.i;
+      int base = info->op1.i;
+      // FIXME: dependencies?
+      tsize_cache_.emplace_back(1); // lazy init
+      // XXX: hacky, avoid string theory
+      snprintf(name, sizeof(name), atoi_name_format, input, offset, base);
+      z3::symbol symbol = context_.str_symbol(name);
+      z3::sort sort = context_.bv_sort(info->size);
+      cache_expr(l, context_.constant(symbol, sort));
+      continue;
+    } else if (info->op == __dfsan::Alloca || info->op == __dfsan::Free) {
+      // not expression, do nothing
+      tsize_cache_.emplace_back(0);
+      expr_cache_.emplace_back(nullptr);
+      continue;
+    }
 
-  switch((info->op & 0xff)) {
-    // llvm doesn't distinguish between logical and bitwise and/or/xor
-    case __dfsan::And:     return cache_expr(label, info->size != 1 ? (op1 & op2) : (op1 && op2), deps);
-    case __dfsan::Or:      return cache_expr(label, info->size != 1 ? (op1 | op2) : (op1 || op2), deps);
-    case __dfsan::Xor:     return cache_expr(label, op1 ^ op2, deps);
-    case __dfsan::Shl:     return cache_expr(label, z3::shl(op1, op2), deps);
-    case __dfsan::LShr:    return cache_expr(label, z3::lshr(op1, op2), deps);
-    case __dfsan::AShr:    return cache_expr(label, z3::ashr(op1, op2), deps);
-    case __dfsan::Add:     return cache_expr(label, op1 + op2, deps);
-    case __dfsan::Sub:     return cache_expr(label, op1 - op2, deps);
-    case __dfsan::Mul:     return cache_expr(label, op1 * op2, deps);
-    case __dfsan::UDiv:    return cache_expr(label, z3::udiv(op1, op2), deps);
-    case __dfsan::SDiv:    return cache_expr(label, op1 / op2, deps);
-    case __dfsan::URem:    return cache_expr(label, z3::urem(op1, op2), deps);
-    case __dfsan::SRem:    return cache_expr(label, z3::srem(op1, op2), deps);
-    // relational
-    case __dfsan::ICmp:    return cache_expr(label, get_cmd(op1, op2, info->op >> 8), deps);
-    // concat
-    case __dfsan::Concat:  return cache_expr(label, z3::concat(op2, op1), deps); // little endian
-    default:
-      throw z3::exception("unsupported operator");
-      break;
+    // common ops
+    uint8_t size = info->size;
+    // size for concat is a bit complicated ...
+    if (info->op == __dfsan::Concat && info->l1 == 0) {
+      assert(info->l2 >= CONST_OFFSET);
+      size = info->size - get_label_info(info->l2)->size;
+    }
+    z3::expr op1 = context_.bv_val((uint64_t)info->op1.i, size);
+    if (info->l1 >= CONST_OFFSET) {
+      op1 = get_cached_expr(info->l1, input_deps).simplify();
+      if (op1.is_bv() && info->op != __dfsan::Concat) {
+        // XXX: fix size mismatch, only for bv and not concat
+        uint8_t op_size = op1.get_sort().bv_size();
+        if (op_size > size) {
+          op1 = op1.extract(size - 1, 0);
+        } else if (op_size < size) {
+          op1 = z3::zext(op1, size - op_size);
+        }
+      }
+    } else if (info->size == 1) {
+      op1 = context_.bool_val(info->op1.i == 1);
+    }
+    if (info->op == __dfsan::Concat && info->l2 == 0) {
+      assert(info->l1 >= CONST_OFFSET);
+      size = info->size - get_label_info(info->l1)->size;
+    }
+    z3::expr op2 = context_.bv_val((uint64_t)info->op2.i, size);
+    if (info->l2 >= CONST_OFFSET) {
+      op2 = get_cached_expr(info->l2, input_deps).simplify();
+      if (op2.is_bv() && info->op != __dfsan::Concat) {
+        // XXX: fix size mismatch, only for bv and not concat
+        uint8_t op_size = op2.get_sort().bv_size();
+        if (op_size > size) {
+          op2 = op2.extract(size - 1, 0);
+        } else if (op_size < size) {
+          op2 = z3::zext(op2, size - op_size);
+        }
+      }
+    } else if (info->size == 1) {
+      op2 = context_.bool_val(info->op2.i == 1);
+    }
+    // update tree_size
+    tsize_cache_.emplace_back(tsize_cache_[info->l1] + tsize_cache_[info->l2]);
+
+    switch((info->op & 0xff)) {
+      // llvm doesn't distinguish between logical and bitwise and/or/xor
+      case __dfsan::And:     cache_expr(l, info->size != 1 ? (op1 & op2) : (op1 && op2)); break;
+      case __dfsan::Or:      cache_expr(l, info->size != 1 ? (op1 | op2) : (op1 || op2)); break;
+      case __dfsan::Xor:     cache_expr(l, op1 ^ op2); break;
+      case __dfsan::Shl:     cache_expr(l, z3::shl(op1, op2)); break;
+      case __dfsan::LShr:    cache_expr(l, z3::lshr(op1, op2)); break;
+      case __dfsan::AShr:    cache_expr(l, z3::ashr(op1, op2)); break;
+      case __dfsan::Add:     cache_expr(l, op1 + op2); break;
+      case __dfsan::Sub:     cache_expr(l, op1 - op2); break;
+      case __dfsan::Mul:     cache_expr(l, op1 * op2); break;
+      case __dfsan::UDiv:    cache_expr(l, z3::udiv(op1, op2)); break;
+      case __dfsan::SDiv:    cache_expr(l, op1 / op2); break;
+      case __dfsan::URem:    cache_expr(l, z3::urem(op1, op2)); break;
+      case __dfsan::SRem:    cache_expr(l, z3::srem(op1, op2)); break;
+      // relational
+      case __dfsan::ICmp:    cache_expr(l, get_cmd(op1, op2, info->op >> 8)); break;
+      // concat
+      case __dfsan::Concat:  cache_expr(l, z3::concat(op2, op1)); break; // little endian
+      default:
+        fprintf(stderr, "WARNING: unsupported operator %u for label %u\n",
+                info->op & 0xff, l);
+        throw z3::exception("unsupported operator");
+        break;
+    }
   }
-  // should never reach here
-  // std::unreachable();
+
+  return get_cached_expr(label, deps);
 }
 
 int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std::vector<uint64_t> &tasks) {
@@ -297,6 +330,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     // add negated last branch condition
     z3::expr r = context_.bool_val(result);
 
+#if FILTER_UNSAT_CONSTRAINTS
     // double check if label is valid
     {
       z3::solver solver(context_, "QF_BV");
@@ -307,6 +341,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
         return -1;
       }
     }
+#endif
 
     task->push_back((cond != r));
 
@@ -326,7 +361,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
     return 0; // success
   } catch (z3::exception e) {
-    // logf("WARNING: solving error: %s\n", e.msg());
+    // fprintf(stderr, "WARNING: solving error: %s\n", e.msg());
   }
 
   // exception happened, nothing added
@@ -382,6 +417,7 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
     input_dep_set_t inputs;
     z3::expr i = serialize(index_label, inputs);
 
+#if FILTER_UNSAT_CONSTRAINTS
     // double check if label is valid
     {
       z3::solver solver(context_, "QF_BV");
@@ -392,6 +428,7 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
         return -1;
       }
     }
+#endif
 
     // collect nested constraints
     collect_more_deps(inputs);
@@ -450,6 +487,8 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
     z3::expr r = context_.bv_val(result, size);
     // add constraint
     if (expr.is_bool()) r = context_.bool_val(result);
+
+#if FILTER_UNSAT_CONSTRAINTS
     // double check if label is valid
     {
       z3::solver solver(context_, "QF_BV");
@@ -460,6 +499,8 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
         return -1;
       }
     }
+#endif
+
     save_constraint(expr == r, inputs);
   } catch (z3::exception e) {
     return -1;
