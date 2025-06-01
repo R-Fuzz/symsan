@@ -142,7 +142,7 @@ static z3::expr get_cmd(z3::expr const &lhs, z3::expr const &rhs, uint32_t predi
   // std::unreachable();
 }
 
-static bool eval_icmp(uint16_t predicate, uint64_t val1, uint64_t val2) {
+static bool eval_icmp(uint16_t predicate, uint64_t val1, uint64_t val2, uint8_t bits) {
   switch (predicate) {
     case __dfsan::bveq:  return val1 == val2;
     case __dfsan::bvneq: return val1 != val2;
@@ -150,10 +150,42 @@ static bool eval_icmp(uint16_t predicate, uint64_t val1, uint64_t val2) {
     case __dfsan::bvuge: return val1 >= val2;
     case __dfsan::bvult: return val1 < val2;
     case __dfsan::bvule: return val1 <= val2;
-    case __dfsan::bvsgt: return (int64_t)val1 > (int64_t)val2;
-    case __dfsan::bvsge: return (int64_t)val1 >= (int64_t)val2;
-    case __dfsan::bvslt: return (int64_t)val1 < (int64_t)val2;
-    case __dfsan::bvsle: return (int64_t)val1 <= (int64_t)val2;
+    case __dfsan::bvsgt:
+      switch(bits) {
+        case 8:  return (int8_t)val1 > (int8_t)val2;
+        case 16: return (int16_t)val1 > (int16_t)val2;
+        case 32: return (int32_t)val1 > (int32_t)val2;
+        case 64: return (int64_t)val1 > (int64_t)val2;
+        default:
+          throw z3::exception("unsupported bits for signed comparison");
+      }
+    case __dfsan::bvsge:
+      switch(bits) {
+        case 8:  return (int8_t)val1 >= (int8_t)val2;
+        case 16: return (int16_t)val1 >= (int16_t)val2;
+        case 32: return (int32_t)val1 >= (int32_t)val2;
+        case 64: return (int64_t)val1 >= (int64_t)val2;
+        default:
+          throw z3::exception("unsupported bits for signed comparison");
+      }
+    case __dfsan::bvslt:
+      switch(bits) {
+        case 8:  return (int8_t)val1 < (int8_t)val2;
+        case 16: return (int16_t)val1 < (int16_t)val2;
+        case 32: return (int32_t)val1 < (int32_t)val2;
+        case 64: return (int64_t)val1 < (int64_t)val2;
+        default:
+          throw z3::exception("unsupported bits for signed comparison");
+      }
+    case __dfsan::bvsle:
+      switch(bits) {
+        case 8:  return (int8_t)val1 <= (int8_t)val2;
+        case 16: return (int16_t)val1 <= (int16_t)val2;
+        case 32: return (int32_t)val1 <= (int32_t)val2;
+        case 64: return (int64_t)val1 <= (int64_t)val2;
+        default:
+          throw z3::exception("unsupported bits for signed comparison");
+      }
     default:
       throw z3::exception("unsupported predicate");
       return false; // unsupported predicate
@@ -357,6 +389,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     if (info->op == __dfsan::Concat && info->l1 == 0) {
       assert(info->l2 >= CONST_OFFSET);
       size = info->size - get_label_info(info->l2)->size;
+      valmask = (1UL << size) - 1;
     }
     z3::expr op1 = context_.bv_val((uint64_t)info->op1.i, size);
     uint64_t val1 = info->op1.i & valmask;
@@ -381,6 +414,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     if (info->op == __dfsan::Concat && info->l2 == 0) {
       assert(info->l1 >= CONST_OFFSET);
       size = info->size - get_label_info(info->l1)->size;
+      valmask = (1UL << size) - 1;
     }
     z3::expr op2 = context_.bv_val((uint64_t)info->op2.i, size);
     uint64_t val2 = info->op2.i & valmask;
@@ -490,25 +524,39 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // relational
       case __dfsan::ICmp: {
         cache_expr(l, get_cmd(op1, op2, info->op >> 8));
-        RECORD_VALUE(eval_icmp(info->op >> 8, val1, val2) ? 1 : 0);
 #if FILTER_WRONG_AST
         // we have both operands recorded for ICmp
-        if (info->op1.i != val1 || info->op2.i != val2) {
+        if ((info->op1.i & valmask) != val1 ||
+            (info->op2.i & valmask) != val2) {
           // fprintf(stderr, "WARNING: value mismatch for label %u:"
           //         "expected op1 %lu, got %lu, expected op2 %lu, got %lu\n",
           //         l, info->op1.i, val1, info->op2.i, val2);
           // fprintf(stderr, "cond: %s\n", get_cmd(op1, op2, info->op >> 8).to_string().c_str());
-          // dump_value_cache(l);
-          throw z3::exception("value mismatch for ICmp");
+          // dump_value_cache(info->l1);
+          // dump_value_cache(info->l2);
+
+          // memcmp is a special case, just fix it for now
+          bool is_memcmp = false;
+          if (get_label_info(info->l1)->op == __dfsan::fmemcmp) {
+            value_cache_[info->l1] = val1 = info->op1.i;
+            is_memcmp = true;
+          }
+          if (get_label_info(info->l2)->op == __dfsan::fmemcmp) {
+            value_cache_[info->l2] = val2 = info->op2.i;
+            is_memcmp = true;
+          }
+          if (!is_memcmp)
+            throw z3::exception("value mismatch for ICmp");
         }
+        value_cache_.emplace_back(
+            eval_icmp(info->op >> 8, val1, val2, size) ? 1 : 0);
 #endif
         break;
       }
       // concat
       case __dfsan::Concat: {
         cache_expr(l, z3::concat(op2, op1)); // little endian
-        RECORD_VALUE((val2 << (info->size - get_label_info(info->l1)->size)) |
-                     (val1 & ((1UL << get_label_info(info->l1)->size) - 1)));
+        RECORD_VALUE((val2 << op1.get_sort().bv_size()) | (val1));
         break;
       }
       default:
