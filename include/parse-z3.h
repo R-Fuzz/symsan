@@ -11,7 +11,13 @@ class Z3AstParser : public ASTParser<z3_task_t> {
 public:
   Z3AstParser() = delete;
   Z3AstParser(void *base, size_t size, z3::context &context);
-  ~Z3AstParser() {}
+  ~Z3AstParser() {
+    for (Z3_ast ast : expr_cache_) {
+      if (ast != nullptr) {
+        Z3_dec_ref(context_, ast); // decrement reference count
+      }
+    }
+  }
 
   int restart(std::vector<input_t> &inputs) override;
   int parse_cond(dfsan_label label, bool result, bool add_nested,
@@ -37,9 +43,11 @@ private:
   using input_dep_set_t = std::unordered_set<offset_t, offset_hash>;
 
   // caches
+  std::vector<input_t> inputs_cache_;
   std::vector<uint32_t> tsize_cache_;
   std::vector<input_dep_set_t> deps_cache_;
   std::vector<Z3_ast> expr_cache_;
+  std::vector<uint64_t> value_cache_;
   static const size_t SIZE_INCREMENT = 2048;
 
   // dependencies
@@ -97,6 +105,8 @@ private:
     deps.insert(deps_cache_[label].begin(), deps_cache_[label].end());
     return z3::expr(context_, ast);
   }
+
+  inline void dump_value_cache(dfsan_label label);
 
   z3::expr read_concrete(dfsan_label label, uint16_t size);
   z3::expr serialize(dfsan_label label, input_dep_set_t &deps);

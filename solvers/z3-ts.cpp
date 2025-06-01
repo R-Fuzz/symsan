@@ -9,9 +9,65 @@
 
 using namespace symsan;
 
-const unsigned CheckTimeout = 1000; // 1s
+#define FILTER_WRONG_AST 1
 
-#define FILTER_UNSAT_CONSTRAINTS 0
+static const std::unordered_map<unsigned, const char*> OP_MAP {
+  {__dfsan::Extract, "Extract"},
+  {__dfsan::Trunc,   "Trunc"},
+  {__dfsan::Concat,  "Concat"},
+  {__dfsan::ZExt,    "Zext"},
+  {__dfsan::SExt,    "Sext"},
+  {__dfsan::Add,     "Add"},
+  {__dfsan::Sub,     "Sub"},
+  {__dfsan::Mul,     "Mul"},
+  {__dfsan::UDiv,    "Udiv"},
+  {__dfsan::SDiv,    "Sdiv"},
+  {__dfsan::URem,    "Urem"},
+  {__dfsan::SRem,    "Srem"},
+  {__dfsan::Shl,     "Shl"},
+  {__dfsan::LShr,    "Lshr"},
+  {__dfsan::AShr,    "Ashr"},
+  {__dfsan::And,     "And"},
+  {__dfsan::Or,      "Or"},
+  {__dfsan::Xor,     "Xor"},
+  // relational comparisons
+#define RELATIONAL_ICMP(cmp) (__dfsan::ICmp | (cmp << 8))
+  {RELATIONAL_ICMP(__dfsan::bveq),  "Equal"},
+  {RELATIONAL_ICMP(__dfsan::bvneq), "Distinct"},
+  {RELATIONAL_ICMP(__dfsan::bvugt), "Ugt"},
+  {RELATIONAL_ICMP(__dfsan::bvuge), "Uge"},
+  {RELATIONAL_ICMP(__dfsan::bvult), "Ult"},
+  {RELATIONAL_ICMP(__dfsan::bvule), "Ule"},
+  {RELATIONAL_ICMP(__dfsan::bvsgt), "Sgt"},
+  {RELATIONAL_ICMP(__dfsan::bvsge), "Sge"},
+  {RELATIONAL_ICMP(__dfsan::bvslt), "Slt"},
+  {RELATIONAL_ICMP(__dfsan::bvsle), "Sle"},
+#undef RELATIONAL_ICMP
+};
+
+static std::string get_op_name(uint32_t op) {
+  auto itr = OP_MAP.find(op);
+  if (itr != OP_MAP.end()) {
+    return itr->second;
+  }
+  return std::to_string(op);
+}
+
+void Z3AstParser::dump_value_cache(dfsan_label label) {
+  if (label >= value_cache_.size()) {
+    throw z3::exception("invalid label for value cache");
+  }
+  dfsan_label_info *info = get_label_info(label);
+  fprintf(stderr, "label %u = l1: %u, l2: %u, op: %s, size: %u, op1: %lu, op2: %lu\n",
+          label, info->l1, info->l2, get_op_name(info->op).c_str(), info->size,
+          info->op1.i, info->op2.i);
+  fprintf(stderr, "recalcuated value: %lu = op1: %lu, op2: %lu\n",
+          value_cache_[label], value_cache_[info->l1], value_cache_[info->l2]);
+  if (info->l1 != 0)
+    dump_value_cache(info->l1);
+  if (info->l2 != 0)
+    dump_value_cache(info->l2);
+}
 
 Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
   : ASTParser(base, size), context_(context) {
@@ -34,12 +90,18 @@ int Z3AstParser::restart(std::vector<input_t> &inputs) {
   expr_cache_.resize(1); // reserve for CONST_OFFSET
   deps_cache_.clear();
   deps_cache_.resize(1); // reserve for CONST_OFFSET
+#if FILTER_WRONG_AST
+  value_cache_.clear();
+  value_cache_.resize(1); // reserve for CONST_OFFSET
+#endif
   branch_deps_.clear();
   branch_deps_.resize(inputs.size());
 
   for (size_t i = 0; i < inputs.size(); i++) {
     auto &input = inputs[i];
-    // z3parser doesn't use inputs, so we don't need to make a copy of it
+#if FILTER_WRONG_AST
+    inputs_cache_.emplace_back(input.first, input.second);
+#endif
     // resize branch_deps_
     branch_deps_[i].resize(input.second);
   }
@@ -80,6 +142,26 @@ static z3::expr get_cmd(z3::expr const &lhs, z3::expr const &rhs, uint32_t predi
   // std::unreachable();
 }
 
+static bool eval_icmp(uint16_t predicate, uint64_t val1, uint64_t val2) {
+  switch (predicate) {
+    case __dfsan::bveq:  return val1 == val2;
+    case __dfsan::bvneq: return val1 != val2;
+    case __dfsan::bvugt: return val1 > val2;
+    case __dfsan::bvuge: return val1 >= val2;
+    case __dfsan::bvult: return val1 < val2;
+    case __dfsan::bvule: return val1 <= val2;
+    case __dfsan::bvsgt: return (int64_t)val1 > (int64_t)val2;
+    case __dfsan::bvsge: return (int64_t)val1 >= (int64_t)val2;
+    case __dfsan::bvslt: return (int64_t)val1 < (int64_t)val2;
+    case __dfsan::bvsle: return (int64_t)val1 <= (int64_t)val2;
+    default:
+      throw z3::exception("unsupported predicate");
+      return false; // unsupported predicate
+  }
+  // should never reach here
+  // std::unreachable();
+}
+
 z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel) {
     throw z3::exception("invalid label");
@@ -91,13 +173,25 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     tsize_cache_.reserve(label + SIZE_INCREMENT);
     expr_cache_.reserve(label + SIZE_INCREMENT);
     deps_cache_.reserve(label + SIZE_INCREMENT);
+#if FILTER_WRONG_AST
+    value_cache_.reserve(label + SIZE_INCREMENT);
+#endif
   }
 
   for (dfsan_label l = last_label + 1; l <= label; l++) {
 
+#if FILTER_WRONG_AST
+#define RECORD_VALUE(value) \
+  value_cache_.emplace_back((uint64_t)(value))
+#else
+#define RECORD_VALUE(value) \
+  do { } while (0)
+#endif
+
     dfsan_label_info *info = get_label_info(l);
-    // fprintf(stderr, "%u = (l1:%u, l2:%u, op:%u, size:%u, op1:%lu, op2:%lu)\n",
-    //         l, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i);
+    // fprintf(stderr, "%u = (l1:%u, l2:%u, op:%s, size:%u, op1:%lu, op2:%lu)\n",
+    //         l, info->l1, info->l2, get_op_name(info->op).c_str(),
+    //         info->size, info->op1.i, info->op2.i);
     input_dep_set_t &input_deps = deps_cache_.emplace_back();
 
     // special ops
@@ -109,10 +203,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       snprintf(name, sizeof(name), input_name_format, input, offset);
       z3::symbol symbol = context_.str_symbol(name);
       z3::sort sort = context_.bv_sort(8);
-      tsize_cache_.emplace_back(1); // lazy init
+      tsize_cache_.emplace_back(1);
       input_deps.insert(std::make_pair(input, offset));
       // caching is not super helpful
       cache_expr(l, context_.constant(symbol, sort));
+      RECORD_VALUE(inputs_cache_[input].first[offset]);
       continue;
     } else if (info->op == __dfsan::Load) {
       uint32_t offset = get_label_info(info->l1)->op1.i; // legacy: offset in op1
@@ -122,14 +217,21 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::sort sort = context_.bv_sort(8);
       z3::expr out = context_.constant(symbol, sort);
       input_deps.insert(std::make_pair(input, offset));
+#if FILTER_WRONG_AST
+      uint64_t val = inputs_cache_[input].first[offset];
+#endif
       for (uint32_t i = 1; i < info->l2; i++) {
         snprintf(name, sizeof(name), input_name_format, input, offset + i);
         symbol = context_.str_symbol(name);
         out = z3::concat(context_.constant(symbol, sort), out);
         input_deps.insert(std::make_pair(input, offset + i));
+#if FILTER_WRONG_AST
+        val |= (uint64_t)inputs_cache_[input].first[offset + i] << (i * 8);
+#endif
       }
-      tsize_cache_.emplace_back(1); // lazy init
+      tsize_cache_.emplace_back(1);
       cache_expr(l, out);
+      RECORD_VALUE(val);
       continue;
     } else if (info->op == __dfsan::ZExt) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
@@ -137,50 +239,58 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         base = z3::ite(base, context_.bv_val(1, 1),
                             context_.bv_val(0, 1));
       uint32_t base_size = base.get_sort().bv_size();
-      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, z3::zext(base, info->size - base_size));
+      RECORD_VALUE(value_cache_[info->l1] & ((1UL << base_size) - 1));
       continue;
     } else if (info->op == __dfsan::SExt) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
       uint32_t base_size = base.get_sort().bv_size();
-      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, z3::sext(base, info->size - base_size));
+      RECORD_VALUE((int64_t)(value_cache_[info->l1] & ((1UL << base_size) - 1)));
       continue;
     } else if (info->op == __dfsan::Trunc) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
-      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, base.extract(info->size - 1, 0));
+      RECORD_VALUE(value_cache_[info->l1] & ((1UL << info->size) - 1));
       continue;
     } else if (info->op == __dfsan::IntToPtr) {
       z3::expr e = get_cached_expr(info->l1, input_deps);
-      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, e);
+      RECORD_VALUE(value_cache_[info->l1]);
       continue;
     } //FIXME: other casting ops (PtrToInt, BitCast)?
     // symsan-defined
     else if (info->op == __dfsan::Extract) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
-      tsize_cache_.emplace_back(tsize_cache_[info->l1]); // lazy init
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, base.extract((info->op2.i + info->size) - 1, info->op2.i));
+      RECORD_VALUE((value_cache_[info->l1] >> info->op2.i) &
+                    ((1UL << info->size) - 1));
       continue;
     } else if (info->op == __dfsan::Not) {
       if (info->l2 == 0 || info->size != 1) {
         throw z3::exception("invalid Not operation");
       }
       z3::expr e = get_cached_expr(info->l2, input_deps);
-      tsize_cache_.emplace_back(tsize_cache_[info->l2]); // lazy init
+      tsize_cache_.emplace_back(tsize_cache_[info->l2]);
       if (!e.is_bool()) {
         throw z3::exception("Only LNot should be recorded");
       }
       cache_expr(l, !e);
+      RECORD_VALUE(!value_cache_[info->l2]);
       continue;
     } else if (info->op == __dfsan::Neg) {
       if (info->l2 == 0) {
         throw z3::exception("invalid Neg predicate");
       }
       z3::expr e = get_cached_expr(info->l2, input_deps);
-      tsize_cache_.emplace_back(tsize_cache_[info->l2]); // lazy init
+      tsize_cache_.emplace_back(tsize_cache_[info->l2]);
       cache_expr(l, -e);
+      RECORD_VALUE(-value_cache_[info->l2]);
       continue;
     }
     // higher-order
@@ -192,17 +302,18 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         throw z3::exception("invalid memcmp operand2");
       }
       z3::expr op2 = get_cached_expr(info->l2, input_deps);
-      tsize_cache_.emplace_back(1); // lazy init
+      tsize_cache_.emplace_back(1);
       z3::expr e = z3::ite(op1 == op2, context_.bv_val(0, 32),
                                        context_.bv_val(1, 32));
       cache_expr(l, e);
+      RECORD_VALUE(0); // memcmp result is always 0 or 1
       continue;
     } else if (info->op == __dfsan::fsize) {
       // file size
       z3::symbol symbol = context_.str_symbol("fsize");
       z3::sort sort = context_.bv_sort(info->size);
       z3::expr base = context_.constant(symbol, sort);
-      tsize_cache_.emplace_back(1); // lazy init
+      tsize_cache_.emplace_back(1);
       has_fsize = true; // XXX: set a flag
       // don't cache because of deps
       if (info->op1.i) {
@@ -212,6 +323,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       } else {
         cache_expr(l, base);
       }
+      RECORD_VALUE(0); // FIXME: map to input size
       continue;
     } else if (info->op == __dfsan::fatoi) {
       // string to integer conversion
@@ -222,28 +334,32 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       uint32_t input = get_label_info(src->l1)->op2.i;
       int base = info->op1.i;
       // FIXME: dependencies?
-      tsize_cache_.emplace_back(1); // lazy init
+      tsize_cache_.emplace_back(1);
       // XXX: hacky, avoid string theory
       snprintf(name, sizeof(name), atoi_name_format, input, offset, base);
       z3::symbol symbol = context_.str_symbol(name);
       z3::sort sort = context_.bv_sort(info->size);
       cache_expr(l, context_.constant(symbol, sort));
+      RECORD_VALUE(0); // FIXME: map to atoi result?
       continue;
     } else if (info->op == __dfsan::Alloca || info->op == __dfsan::Free) {
       // not expression, do nothing
       tsize_cache_.emplace_back(0);
       expr_cache_.emplace_back(nullptr);
+      RECORD_VALUE(0);
       continue;
     }
 
     // common ops
     uint8_t size = info->size;
+    uint64_t valmask = size < 64 ? (1UL << size) - 1 : ~0UL;
     // size for concat is a bit complicated ...
     if (info->op == __dfsan::Concat && info->l1 == 0) {
       assert(info->l2 >= CONST_OFFSET);
       size = info->size - get_label_info(info->l2)->size;
     }
     z3::expr op1 = context_.bv_val((uint64_t)info->op1.i, size);
+    uint64_t val1 = info->op1.i & valmask;
     if (info->l1 >= CONST_OFFSET) {
       op1 = get_cached_expr(info->l1, input_deps).simplify();
       if (op1.is_bv() && info->op != __dfsan::Concat) {
@@ -255,14 +371,19 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           op1 = z3::zext(op1, size - op_size);
         }
       }
+#if FILTER_WRONG_AST
+      val1 = value_cache_[info->l1] & valmask;
+#endif
     } else if (info->size == 1) {
       op1 = context_.bool_val(info->op1.i == 1);
     }
+    // handle op2
     if (info->op == __dfsan::Concat && info->l2 == 0) {
       assert(info->l1 >= CONST_OFFSET);
       size = info->size - get_label_info(info->l1)->size;
     }
     z3::expr op2 = context_.bv_val((uint64_t)info->op2.i, size);
+    uint64_t val2 = info->op2.i & valmask;
     if (info->l2 >= CONST_OFFSET) {
       op2 = get_cached_expr(info->l2, input_deps).simplify();
       if (op2.is_bv() && info->op != __dfsan::Concat) {
@@ -274,6 +395,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           op2 = z3::zext(op2, size - op_size);
         }
       }
+#if FILTER_WRONG_AST
+      val2 = value_cache_[info->l2] & valmask;
+#endif
     } else if (info->size == 1) {
       op2 = context_.bool_val(info->op2.i == 1);
     }
@@ -282,23 +406,111 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
     switch((info->op & 0xff)) {
       // llvm doesn't distinguish between logical and bitwise and/or/xor
-      case __dfsan::And:     cache_expr(l, info->size != 1 ? (op1 & op2) : (op1 && op2)); break;
-      case __dfsan::Or:      cache_expr(l, info->size != 1 ? (op1 | op2) : (op1 || op2)); break;
-      case __dfsan::Xor:     cache_expr(l, op1 ^ op2); break;
-      case __dfsan::Shl:     cache_expr(l, z3::shl(op1, op2)); break;
-      case __dfsan::LShr:    cache_expr(l, z3::lshr(op1, op2)); break;
-      case __dfsan::AShr:    cache_expr(l, z3::ashr(op1, op2)); break;
-      case __dfsan::Add:     cache_expr(l, op1 + op2); break;
-      case __dfsan::Sub:     cache_expr(l, op1 - op2); break;
-      case __dfsan::Mul:     cache_expr(l, op1 * op2); break;
-      case __dfsan::UDiv:    cache_expr(l, z3::udiv(op1, op2)); break;
-      case __dfsan::SDiv:    cache_expr(l, op1 / op2); break;
-      case __dfsan::URem:    cache_expr(l, z3::urem(op1, op2)); break;
-      case __dfsan::SRem:    cache_expr(l, z3::srem(op1, op2)); break;
+      case __dfsan::And: {
+        cache_expr(l, info->size != 1 ? (op1 & op2) : (op1 && op2));
+        RECORD_VALUE((info->size != 1) ? (val1 & val2) : (val1 && val2));
+        break;
+      }
+      case __dfsan::Or: {
+        cache_expr(l, info->size != 1 ? (op1 | op2) : (op1 || op2));
+        RECORD_VALUE((info->size != 1) ? (val1 | val2) : (val1 || val2));
+        break;
+      }
+      case __dfsan::Xor: {
+        cache_expr(l, op1 ^ op2);
+        RECORD_VALUE(val1 ^ val2);
+        break;
+      }
+      case __dfsan::Shl: {
+        cache_expr(l, z3::shl(op1, op2));
+        RECORD_VALUE(val1 << (val2 % size));
+        break;
+      }
+      case __dfsan::LShr: {
+        cache_expr(l, z3::lshr(op1, op2));
+        RECORD_VALUE(val1 >> (val2 % size));
+        break;
+      }
+      case __dfsan::AShr: {
+        cache_expr(l, z3::ashr(op1, op2));
+        RECORD_VALUE((int64_t)val1 >> (val2 % size));
+        break;
+      }
+      case __dfsan::Add: {
+        cache_expr(l, op1 + op2);
+        RECORD_VALUE(val1 + val2);
+        break;
+      }
+      case __dfsan::Sub: {
+        cache_expr(l, op1 - op2);
+        RECORD_VALUE(val1 - val2);
+        break;
+      }
+      case __dfsan::Mul: {
+        cache_expr(l, op1 * op2);
+        RECORD_VALUE(val1 * val2);
+        break;
+      }
+      case __dfsan::UDiv: {
+        cache_expr(l, z3::udiv(op1, op2));
+        if (val2 == 0) {
+          fprintf(stderr, "WARNING: division by zero for label %u\n", l);
+          RECORD_VALUE(0);
+        } else
+          RECORD_VALUE(val1 / val2);
+        break;
+      }
+      case __dfsan::SDiv: {
+        cache_expr(l, op1 / op2);
+        if (val2 == 0) {
+          fprintf(stderr, "WARNING: division by zero for label %u\n", l);
+          RECORD_VALUE(0);
+        } else
+          RECORD_VALUE((int64_t)val1 / (int64_t)val2);
+        break;
+      }
+      case __dfsan::URem: {
+        cache_expr(l, z3::urem(op1, op2));
+        if (val2 == 0) {
+          fprintf(stderr, "WARNING: division by zero for label %u\n", l);
+          RECORD_VALUE(0);
+        } else
+          RECORD_VALUE(val1 % val2);
+        break;
+      }
+      case __dfsan::SRem: {
+        cache_expr(l, z3::srem(op1, op2));
+        if (val2 == 0) {
+          fprintf(stderr, "WARNING: division by zero for label %u\n", l);
+          RECORD_VALUE(0);
+        } else
+          RECORD_VALUE((int64_t)val1 % (int64_t)val2);
+        break;
+      }
       // relational
-      case __dfsan::ICmp:    cache_expr(l, get_cmd(op1, op2, info->op >> 8)); break;
+      case __dfsan::ICmp: {
+        cache_expr(l, get_cmd(op1, op2, info->op >> 8));
+        RECORD_VALUE(eval_icmp(info->op >> 8, val1, val2) ? 1 : 0);
+#if FILTER_WRONG_AST
+        // we have both operands recorded for ICmp
+        if (info->op1.i != val1 || info->op2.i != val2) {
+          // fprintf(stderr, "WARNING: value mismatch for label %u:"
+          //         "expected op1 %lu, got %lu, expected op2 %lu, got %lu\n",
+          //         l, info->op1.i, val1, info->op2.i, val2);
+          // fprintf(stderr, "cond: %s\n", get_cmd(op1, op2, info->op >> 8).to_string().c_str());
+          // dump_value_cache(l);
+          throw z3::exception("value mismatch for ICmp");
+        }
+#endif
+        break;
+      }
       // concat
-      case __dfsan::Concat:  cache_expr(l, z3::concat(op2, op1)); break; // little endian
+      case __dfsan::Concat: {
+        cache_expr(l, z3::concat(op2, op1)); // little endian
+        RECORD_VALUE((val2 << (info->size - get_label_info(info->l1)->size)) |
+                     (val1 & ((1UL << get_label_info(info->l1)->size) - 1)));
+        break;
+      }
       default:
         fprintf(stderr, "WARNING: unsupported operator %u for label %u\n",
                 info->op & 0xff, l);
@@ -330,16 +542,14 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     // add negated last branch condition
     z3::expr r = context_.bool_val(result);
 
-#if FILTER_UNSAT_CONSTRAINTS
-    // double check if label is valid
-    {
-      z3::solver solver(context_, "QF_BV");
-      solver.set("timeout", CheckTimeout);
-      solver.add(cond == r);
-      if (solver.check() != z3::sat) {
-        // original condition must be satisfiable
-        return -1;
-      }
+#if FILTER_WRONG_AST
+    if (value_cache_[label] != result) {
+      // recalcuated value must match the recorded value
+      // fprintf(stderr, "WARNING: value mismatch for label %u: expected %ld, got %d\n",
+      //         label, value_cache_[label], result);
+      // fprintf(stderr, "cond: %s\n", cond.to_string().c_str());
+      // dump_value_cache(label);
+      return -1;
     }
 #endif
 
@@ -361,7 +571,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
     return 0; // success
   } catch (z3::exception e) {
-    // fprintf(stderr, "WARNING: solving error: %s\n", e.msg());
+    // fprintf(stderr, "WARNING: parsing error: %s\n", e.msg());
   }
 
   // exception happened, nothing added
@@ -417,16 +627,12 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
     input_dep_set_t inputs;
     z3::expr i = serialize(index_label, inputs);
 
-#if FILTER_UNSAT_CONSTRAINTS
-    // double check if label is valid
-    {
-      z3::solver solver(context_, "QF_BV");
-      solver.set("timeout", CheckTimeout);
-      solver.add(i == r);
-      if (solver.check() != z3::sat) {
-        // original index must match label
-        return -1;
-      }
+#if FILTER_WRONG_AST
+    if (value_cache_[index_label] != index) {
+      // recalculated value must match the recorded value
+      fprintf(stderr, "WARNING: value mismatch for label %u: expected %ld, got %ld\n",
+              index_label, value_cache_[index_label], index);
+      return -1;
     }
 #endif
 
@@ -488,16 +694,13 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
     // add constraint
     if (expr.is_bool()) r = context_.bool_val(result);
 
-#if FILTER_UNSAT_CONSTRAINTS
+#if FILTER_WRONG_AST
     // double check if label is valid
-    {
-      z3::solver solver(context_, "QF_BV");
-      solver.set("timeout", CheckTimeout);
-      solver.add(expr == r);
-      if (solver.check() != z3::sat) {
-        // original expression must match result
-        return -1;
-      }
+    if (value_cache_[label] != result) {
+      // recalculated value must match the recorded value
+      fprintf(stderr, "WARNING: value mismatch for label %u: expected %ld, got %ld\n",
+              label, value_cache_[label], result);
+      return -1;
     }
 #endif
 
