@@ -33,6 +33,7 @@
 #endif
 
 static char *obj_path;       /* Path to runtime libraries         */
+static char *taint_path;     /* Path to the taint pass            */
 static char **cc_params;     /* Parameters passed to the real CC  */
 static u32 cc_par_cnt = 1;   /* Param count, including argv0      */
 static u8 is_cxx = 0;
@@ -80,7 +81,7 @@ static char *find_executable_in_path(const char *filename) {
 /* Try to find the runtime libraries. If that fails, abort. */
 static void find_obj(const char *argv0) {
 
-  char *slash, *tmp;
+  char *slash;
   char path[PATH_MAX];
 
   if (strchr(argv0, '/') == NULL) {
@@ -106,18 +107,15 @@ static void find_obj(const char *argv0) {
     dir = ck_strdup(path);
     *slash = '/';
 
-    tmp = alloc_printf("%s/../lib/symsan/libTaintPass.so", dir);
-    if (!access(tmp, R_OK)) {
-      obj_path = dir;
-      ck_free(tmp);
-      return;
+    taint_path = alloc_printf("%s/../lib/symsan/TaintPass.so", dir);
+    if (!access(taint_path, R_OK)) {
+      obj_path = alloc_printf("%s/../lib/symsan", dir);
+    } else {
+      FATAL("Unable to find 'TaintPass.so' at %s", path);
     }
 
-    ck_free(tmp);
     ck_free(dir);
   }
-
-  FATAL("Unable to find 'libTaintPass.so' at %s", path);
 }
 
 static void check_type(char *name) {
@@ -147,18 +145,18 @@ static void add_runtime() {
   }
 
   cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
-  cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libdfsan_rt-x86_64.a", obj_path);
+  cc_params[cc_par_cnt++] = alloc_printf("%s/libdfsan_rt-x86_64.a", obj_path);
   cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
   cc_params[cc_par_cnt++] =
-      alloc_printf("-Wl,--dynamic-list=%s/../lib/symsan/libdfsan_rt-x86_64.a.syms", obj_path);
+      alloc_printf("-Wl,--dynamic-list=%s/libdfsan_rt-x86_64.a.syms", obj_path);
 
-  cc_params[cc_par_cnt++] = alloc_printf("-Wl,-T%s/../lib/symsan/taint.ld", obj_path);
+  cc_params[cc_par_cnt++] = alloc_printf("-Wl,-T%s/taint.ld", obj_path);
 
   if (is_cxx && !use_native_cxx) {
     // cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
-    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libc++.a", obj_path);
-    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libc++abi.a", obj_path);
-    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libunwind.a", obj_path);
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libc++.a", obj_path);
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libc++abi.a", obj_path);
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libunwind.a", obj_path);
     // cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
   } else {
     cc_params[cc_par_cnt++] = "-lc++";
@@ -179,30 +177,30 @@ static void add_runtime() {
 
   if (getenv("KO_USE_Z3")) {
     cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
-    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libZ3Solver.a", obj_path);
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libZ3Solver.a", obj_path);
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
     cc_params[cc_par_cnt++] = "-lz3";
   }
 
   if (getenv("KO_USE_FASTGEN")) {
     cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
-    cc_params[cc_par_cnt++] = alloc_printf("%s/../lib/symsan/libFastgen.a", obj_path);
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libFastgen.a", obj_path);
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
   }
 }
 
 static void add_taint_pass() {
   cc_params[cc_par_cnt++] = "-fexperimental-new-pass-manager";
-  cc_params[cc_par_cnt++] = alloc_printf("-fplugin=%s/../lib/symsan/TaintPass.so", obj_path); // to enable options
-  cc_params[cc_par_cnt++] = alloc_printf("-fpass-plugin=%s/../lib/symsan/TaintPass.so", obj_path);
+  cc_params[cc_par_cnt++] = alloc_printf("-fplugin=%s", taint_path); // to enable options
+  cc_params[cc_par_cnt++] = alloc_printf("-fpass-plugin=%s", taint_path);
   cc_params[cc_par_cnt++] = "-mllvm";
   cc_params[cc_par_cnt++] =
-      alloc_printf("-taint-abilist=%s/../lib/symsan/dfsan_abilist.txt", obj_path);
+      alloc_printf("-taint-abilist=%s/dfsan_abilist.txt", obj_path);
 
   if (use_native_zlib) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] =
-        alloc_printf("-taint-abilist=%s/../lib/symsan/zlib_abilist.txt", obj_path);
+        alloc_printf("-taint-abilist=%s/zlib_abilist.txt", obj_path);
   }
 
   if (getenv("KO_TRACE_FP")) {
@@ -223,7 +221,7 @@ static void add_taint_pass() {
   if (is_cxx && use_native_cxx) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] =
-        alloc_printf("-taint-abilist=%s/../lib/symsan/libc++_abilist.txt", obj_path);
+        alloc_printf("-taint-abilist=%s/libc++_abilist.txt", obj_path);
   }
 }
 
