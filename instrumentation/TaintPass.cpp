@@ -738,7 +738,7 @@ TransformedFunction Taint::getCustomFunctionType(FunctionType *T) {
     ArgTypes.push_back(PrimitiveShadowPtrTy);
   Type *RetType = T->getReturnType();
   if (!RetType->isVoidTy())
-    ArgTypes.push_back(getShadowTy(RetType));
+    ArgTypes.push_back(PointerType::getUnqual(getShadowTy(RetType)));
     // ArgTypes.push_back(PrimitiveShadowPtrTy);
   return TransformedFunction(
       T, FunctionType::get(T->getReturnType(), ArgTypes, T->isVarArg()),
@@ -2803,7 +2803,7 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     // Adds shadow arguments.
     const unsigned ShadowArgStart = Args.size();
     addShadowArguments(F, CB, Args, IRB);
-        
+
     // Adds variable arguments.
     append_range(Args, drop_begin(CB.args(), FT->getNumParams()));
 
