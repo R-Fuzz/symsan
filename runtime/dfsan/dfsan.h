@@ -201,10 +201,10 @@ static inline uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predic
     case bvuge: return c1 >= c2;
     case bvult: return c1 < c2;
     case bvule: return c1 <= c2;
-    case bvsgt: return (s64)c1 > (s64)c2;
-    case bvsge: return (s64)c1 >= (s64)c2;
-    case bvslt: return (s64)c1 < (s64)c2;
-    case bvsle: return (s64)c1 <= (s64)c2;
+    case bvsgt: return (int64_t)c1 > (int64_t)c2;
+    case bvsge: return (int64_t)c1 >= (int64_t)c2;
+    case bvslt: return (int64_t)c1 < (int64_t)c2;
+    case bvsle: return (int64_t)c1 <= (int64_t)c2;
     default: break;
   }
   return 0;
