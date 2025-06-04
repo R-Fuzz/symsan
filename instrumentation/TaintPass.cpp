@@ -2530,6 +2530,16 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
     }
     // set uninit shadow for allocation with constant size
     if (!AllLoadsStores && isa<ConstantInt>(ArraySize)) {
+      Value *Init = TF.TT.UninitializedPrimitiveShadow;
+      // XXX: skip __va_list_tag, as we don't trace llvm.va_start
+      if (ArrayType *AT = dyn_cast<ArrayType>(T)) {
+        T = AT->getElementType();
+      }
+      if (T->isStructTy() &&
+          T->getStructName() == "__va_list_tag") {
+        // FIXME: don't set uninit, assuming llvm.va_start will be called
+        Init = TF.TT.ZeroPrimitiveShadow;
+      }
       // handle not all loads and stores cases here
       IRBuilder<> IRB(I.getNextNode());
       auto DL = I.getModule()->getDataLayout();
@@ -2538,9 +2548,9 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
       Value *Size =
           ConstantInt::get(TF.TT.IntptrTy, (size->getFixedValue() + 7) >> 3);
       IRB.CreateCall(TF.TT.TaintSetLabelFn,
-                     {TF.TT.UninitializedPrimitiveShadow,
-                     IRB.CreateBitCast(&I, Type::getInt8PtrTy(*TF.TT.Ctx)),
-                     Size});
+                     {Init,
+                      IRB.CreateBitCast(&I, Type::getInt8PtrTy(*TF.TT.Ctx)),
+                      Size});
     }
   }
 }
