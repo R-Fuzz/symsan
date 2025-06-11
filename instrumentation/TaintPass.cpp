@@ -1919,7 +1919,7 @@ Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size,
   if (AllocaInst *AI = dyn_cast<AllocaInst>(Addr)) {
     const auto i = AllocaShadowMap.find(AI);
     if (i != AllocaShadowMap.end()) {
-      return IRB.CreateLoad(TT.PrimitiveShadowTy, i->second);
+      return IRB.CreateLoad(TT.getShadowTy(T), i->second);
     }
   }
 
@@ -2508,7 +2508,8 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
   }
   if (AllLoadsStores) {
     IRBuilder<> IRB(&I);
-    AllocaInst *AI = IRB.CreateAlloca(TF.TT.PrimitiveShadowTy);
+    AllocaInst *AI = IRB.CreateAlloca(TF.TT.getShadowTy(I.getAllocatedType()),
+                                      I.getArraySize(), I.getName() + ".shadow");
     TF.AllocaShadowMap[&I] = AI;
     if (ClTraceBound) {
       // set shadow to uninit
