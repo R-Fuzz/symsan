@@ -480,6 +480,9 @@ class Taint {
   /// Returns the shadow type of of V's type.
   Type *getShadowTy(Value *V);
 
+  /// Returns an uninitialized shadow value with the shadow type of OrigTy.
+  Constant *getUninitializedShadow(Type *OrigTy);
+
 public:
   Taint(const std::vector<std::string> &ABIListFiles);
 
@@ -754,6 +757,23 @@ bool Taint::isZeroShadow(Value *V) {
   }
 
   return isa<ConstantAggregateZero>(V);
+}
+
+Constant *Taint::getUninitializedShadow(Type *OrigTy) {
+  if (!isa<ArrayType>(OrigTy) && !isa<StructType>(OrigTy))
+    return UninitializedPrimitiveShadow;
+  Type *ShadowTy = getShadowTy(OrigTy);
+  if (ArrayType *AT = dyn_cast<ArrayType>(ShadowTy)) {
+    SmallVector<Constant *, 4> Elements(AT->getNumElements(),
+                                        getUninitializedShadow(AT->getElementType()));
+    return ConstantArray::get(AT, Elements);
+  } else if (StructType *ST = dyn_cast<StructType>(ShadowTy)) {
+    SmallVector<Constant *, 4> Elements(ST->getNumElements());
+    for (unsigned I = 0, N = ST->getNumElements(); I < N; ++I)
+      Elements[I] = getUninitializedShadow(ST->getElementType(I));
+    return ConstantStruct::get(ST, Elements);
+  }
+  llvm_unreachable("Unexpected type for uninitialized shadow");
 }
 
 Constant *Taint::getZeroShadow(Type *OrigTy) {
@@ -2509,11 +2529,11 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
   if (AllLoadsStores) {
     IRBuilder<> IRB(&I);
     AllocaInst *AI = IRB.CreateAlloca(TF.TT.getShadowTy(I.getAllocatedType()),
-                                      I.getArraySize(), I.getName() + ".shadow");
+                                      I.getArraySize(), I.getName() + ".taint");
     TF.AllocaShadowMap[&I] = AI;
     if (ClTraceBound) {
       // set shadow to uninit
-      IRB.CreateStore(TF.TT.UninitializedPrimitiveShadow, AI);
+      IRB.CreateStore(TF.TT.getUninitializedShadow(I.getAllocatedType()), AI);
     }
   }
   if (!ClTraceBound) {
