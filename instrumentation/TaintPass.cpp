@@ -811,6 +811,17 @@ Type *Taint::getShadowTy(Value *V) {
 }
 
 uint32_t Taint::getInstructionId(Instruction *Inst) {
+  // check if there is a bbid annotation
+  if (MDNode *BBID = Inst->getMetadata("bbid")) {
+    auto C = dyn_cast<ConstantAsMetadata>(BBID->getOperand(0));
+    if (ConstantInt *CI = dyn_cast<ConstantInt>(C->getValue())) {
+      uint64_t BBIDValue = CI->getZExtValue();
+      assert(BBIDValue < UINT32_MAX &&
+             "bbid value is too large for 32-bit hash");
+      return static_cast<uint32_t>(BBIDValue);
+    }
+  }
+  // otherwise, fallback to hash
   static uint32_t unamed = 0;
   auto SourceInfo = Mod->getSourceFileName();
   DILocation *Loc = Inst->getDebugLoc();
