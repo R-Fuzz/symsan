@@ -171,14 +171,19 @@ static void handle_cond(pipe_msg &msg, my_mutator_t *my_mutator) {
     lc += 1;
   }
 
+  // prase flags
+  bool always_solve = (msg.flags & F_ADD_CONS) == 0;
+  bool loop_latch = (msg.flags & F_LOOP_LATCH) != 0;
+  bool loop_exit = (msg.flags & F_LOOP_EXIT) != 0;
+
   const branch_ctx_t ctx = my_mutator->cov_mgr->add_branch((void*)msg.addr,
-      msg.id, msg.result != 0, msg.context, false, false);
+      msg.id, msg.result != 0, msg.context, loop_latch, loop_exit);
 
   branch_ctx_t neg_ctx = std::make_shared<rgd::BranchContext>();
   *neg_ctx = *ctx;
   neg_ctx->direction = !ctx->direction;
 
-  if (my_mutator->cov_mgr->is_branch_interesting(neg_ctx)) {
+  if (my_mutator->cov_mgr->is_branch_interesting(neg_ctx) || always_solve) {
     // parse the uniont table AST to solving tasks
     std::vector<uint64_t> tasks;
     if (my_mutator->parser->parse_cond(msg.label, ctx->direction, msg.flags & F_ADD_CONS, tasks) != 0) {
