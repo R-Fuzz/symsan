@@ -180,6 +180,12 @@ static cl::opt<bool> ClSolveUB(
     cl::desc("Solve undefined behaviours."),
     cl::Hidden, cl::init(false));
 
+// SYMSAN specific flags, only send events for annotated basic blocks
+static cl::opt<bool> ClTraceAnnotatedBB(
+    "taint-trace-annotated-bb",
+    cl::desc("Only trace annotated basic blocks."),
+    cl::Hidden, cl::init(false));
+
 static StringRef getGlobalTypeString(const GlobalValue &G) {
   // Types of GlobalVariables are always pointer types.
   Type *GType = G.getValueType();
@@ -448,6 +454,7 @@ class Taint {
   void addContextRecording(Function &F);
   void addFrameTracing(Function &F);
   uint32_t getInstructionId(Instruction *Inst);
+  const uint32_t InvalidInstructionId = -1;
 
   void initializeRuntimeFunctions(Module &M);
   void initializeCallbackFunctions(Module &M);
@@ -821,6 +828,9 @@ uint32_t Taint::getInstructionId(Instruction *Inst) {
       return static_cast<uint32_t>(BBIDValue);
     }
   }
+  if (ClTraceAnnotatedBB && Inst->isTerminator())
+    return InvalidInstructionId;
+
   // otherwise, fallback to hash
   static uint32_t unamed = 0;
   auto SourceInfo = Mod->getSourceFileName();
@@ -2333,10 +2343,13 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   Value *CondShadow = getShadow(Cond);
   if (TT.isZeroShadow(CondShadow))
     return;
+  uint32_t cid = TT.getInstructionId(I);
+  if (cid == TT.InvalidInstructionId)
+    return;
   unsigned size = DL.getTypeSizeInBits(Cond->getType());
   ConstantInt *Size = ConstantInt::get(TT.Int32Ty, size);
   ConstantInt *Predicate = ConstantInt::get(TT.Int32Ty, 32); // EQ, ==
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, cid);
 
   IRBuilder<> IRB(I);
   for (auto C : I->cases()) {
@@ -3057,8 +3070,11 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   // except for loop exit
   if (TT.isZeroShadow(Shadow) && (flag & LoopExitBranch) == 0)
     return;
+  uint32_t cid = TT.getInstructionId(I);
+  if (cid == TT.InvalidInstructionId)
+    return; // XXX: forget about loop?
   ConstantInt *LF = ConstantInt::get(TT.Int8Ty, flag);
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, cid);
   IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, LF, CID});
 }
 
