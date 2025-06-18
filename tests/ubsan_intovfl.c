@@ -4,7 +4,7 @@
 // RUN: clang -O0 -fsanitize=unsigned-integer-overflow -o %t.ubsan %s
 // RUN: env KO_DONT_OPTIMIZE=1 KO_USE_FASTGEN=1 KO_SOLVE_UB=1 %ko-clang -o %t.fg %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out solve_ub=1" %fgtest %t.fg %t.bin
-// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-0 2>&1 | FileCheck %s
+// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-2 2>&1 | FileCheck %s
 // CHECK: runtime error: unsigned integer overflow
 
 #include <stdint.h>

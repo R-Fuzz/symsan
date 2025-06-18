@@ -355,26 +355,54 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   internal_memcpy(&__dfsan_label_info[label], &label_info, sizeof(dfsan_label_info));
   __union_table.insert(&__dfsan_label_info[label], label);
 
-  if (l1 && op == __dfsan::Trunc && flags().solve_ub) {
-    // check for data loss, after the new label is created
-    // -fsanitize=implicit-unsigned-integer-truncation
-    // old_vale >= (1 << new_size)
-    if (orig_op1 < (1UL << size)) {
-      // if current value does not have loss
-      dfsan_label loss = __taint_union(l1, 0, (bvuge << 8) | __dfsan::ICmp,
-                                       get_label_info(l1)->size, orig_op1,
-                                       1UL << size);
-      __taint_trace_cond(loss, 0, UndefinedCheck, ub_unsigned_integer_truncation);
-    }
-    // -fsanitize=implicit-signed-integer-truncation
-    // old_value < signed(1 << (size - 1))
-    int64_t target = (int64_t)((0xFFFFFFFFFFFFFFFFUL >> (size-1)) << (size-1));
-    if ((int64_t)orig_op1 >= target) {
-      uint16_t old_size = get_label_info(l1)->size;
-      if (old_size < 64) target &= ~(1UL << old_size);
-      dfsan_label loss = __taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
-                                       old_size, orig_op1, target);
-      __taint_trace_cond(loss, 0, UndefinedCheck, ub_signed_integer_truncation);
+  if (flags().solve_ub) {
+    if (op == __dfsan::Trunc && l1) {
+      // check for data loss, after the new label is created
+      // -fsanitize=implicit-unsigned-integer-truncation
+      // old_vale >= (1 << new_size)
+      if (orig_op1 < (1UL << size)) {
+        // if current value does not have loss
+        dfsan_label loss = __taint_union(l1, 0, (bvuge << 8) | __dfsan::ICmp,
+                                        get_label_info(l1)->size, orig_op1,
+                                        1UL << size);
+        __taint_trace_cond(loss, 0, UndefinedCheck, ub_unsigned_integer_truncation);
+      }
+      // -fsanitize=implicit-signed-integer-truncation
+      // old_value < signed(1 << (size - 1))
+      int64_t target = (int64_t)((0xFFFFFFFFFFFFFFFFUL >> (size-1)) << (size-1));
+      if ((int64_t)orig_op1 >= target) {
+        uint16_t old_size = get_label_info(l1)->size;
+        if (old_size < 64) target &= ~(1UL << old_size);
+        dfsan_label loss = __taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
+                                        old_size, orig_op1, target);
+        __taint_trace_cond(loss, 0, UndefinedCheck, ub_signed_integer_truncation);
+      }
+    } else if (op == __dfsan::Add) {
+      // check for integer overflow
+      // -fsanitize=integer-overflow
+      //
+      // we only care about l2, which is always symbolic
+      const uint64_t mask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL : (1UL << size) - 1;
+      // signed overflow
+      dfsan_label cond = __taint_union(label, l2, (bvslt << 8) | __dfsan::ICmp,
+                                       size, (orig_op1 + orig_op2) & mask, orig_op2);
+      __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      // unsigned overflow
+      cond = __taint_union(label, l2, (bvule << 8) | __dfsan::ICmp,
+                           size, (orig_op1 + orig_op2) & mask, orig_op2);
+      __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+    } else if (op == __dfsan::Mul) {
+      // check for integer overflow
+      // we only care about l2, which is always symbolic
+      const uint64_t mask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL : (1UL << size) - 1;
+      // signed overflow
+      dfsan_label cond = __taint_union(label, l2, (bvslt << 8) | __dfsan::ICmp,
+                                       size, (orig_op1 * orig_op2) & mask, orig_op2);
+      __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      // unsigned overflow
+      cond = __taint_union(label, l2, (bvule << 8) | __dfsan::ICmp,
+                           size, (orig_op1 * orig_op2) & mask, orig_op2);
+      __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
     }
   }
   return label;

@@ -1981,7 +1981,7 @@ char *__dfsw_fgets_unlocked(char *s, int size, FILE *stream, dfsan_label s_label
   if (ret) {
     if (taint_get_file(fd)) {
       // including terminating \0
-      for(size_t i = 0; i < strlen(ret); i++) {
+      for (size_t i = 0; i < strlen(ret); i++) {
         char *buf = s + i;
         dfsan_set_label(get_label_for(fd, offset + i), buf, 1);
       }
@@ -2005,7 +2005,7 @@ static inline void __taint_check_malloc_size(size_t size, dfsan_label size_label
     AOUT("*alloc size: %lu = %d\n", size, size_label);
     // -fsanitize=unsigned-integer-overflow
     dfsan_label os = dfsan_union(0, size_label, (bveq << 8) | ICmp, 64, 0, size);
-    __taint_trace_cond(os, 0, 0, 0);
+    __taint_trace_cond(os, 0, UndefinedCheck, ub_integer_overflow);
   }
 }
 
