@@ -2581,7 +2581,7 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
         T = AT->getElementType();
       }
       if (T->isStructTy() &&
-          T->getStructName() == "__va_list_tag") {
+          T->getStructName().find("__va_list_tag") != StringRef::npos) {
         // FIXME: don't set uninit, assuming llvm.va_start will be called
         Init = TF.TT.ZeroPrimitiveShadow;
       }
