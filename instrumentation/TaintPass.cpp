@@ -1417,11 +1417,28 @@ bool Taint::runImpl(Module &M) {
   initializeRuntimeFunctions(M);
 
   std::vector<Function *> FnsToInstrument;
+  SmallPtrSet<Function *, 8> IFuncs;
   SmallPtrSet<Function *, 2> FnsWithNativeABI;
   SmallPtrSet<Function *, 2> FnsWithForceZeroLabel;
   SmallPtrSet<Constant *, 1> PersonalityFns;
+
+  // find ifunc resolvers and their dependencies, we can't instrument them
+  // as dfsan initialization is not done yet
+  for (auto &ifunc : M.ifuncs()) {
+    auto *resolver = ifunc.getResolverFunction();
+    IFuncs.insert(resolver);
+    for (auto &I : instructions(resolver)) {
+      if (CallBase *CB = dyn_cast<CallBase>(&I)) {
+        if (Function *Callee = CB->getCalledFunction()) {
+          IFuncs.insert(Callee);
+        }
+      }
+    }
+  }
+
   for (Function &F : M) {
-    if (!F.isIntrinsic() && !TaintRuntimeFunctions.count(&F)) {
+    if (!F.isIntrinsic() && !TaintRuntimeFunctions.count(&F) &&
+        !IFuncs.count(&F)) {
       FnsToInstrument.push_back(&F);
       if (F.hasPersonalityFn())
         PersonalityFns.insert(F.getPersonalityFn());
