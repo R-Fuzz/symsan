@@ -20,8 +20,16 @@
 #include <fcntl.h>
 
 extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+__attribute__((weak)) int LLVMFuzzerInitialize(int *argc, char ***argv);
+__attribute__((weak)) void LLVMFuzzerCleanup(void);
 
 int main(int argc, char* argv[]) {
+
+    // Initialize the fuzzer if the function is available
+    if (LLVMFuzzerInitialize) {
+        LLVMFuzzerInitialize(&argc, &argv);
+    }
+
     // open file
     int fd = open(argv[1], O_RDONLY);
     if (fd < 0) {
@@ -50,5 +58,11 @@ int main(int argc, char* argv[]) {
     int retval = LLVMFuzzerTestOneInput((const uint8_t *)string, fsize);
 
     free(string);
+
+    // Cleanup if the function is available
+    if (LLVMFuzzerCleanup) {
+        LLVMFuzzerCleanup();
+    }
+
     return retval;
 }
