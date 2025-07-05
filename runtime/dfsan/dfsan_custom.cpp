@@ -890,10 +890,28 @@ static dfsan_label taint_strtol(const char *nptr, uptr len, size_t ret_size, int
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_atoi(const char *nptr, dfsan_label nptr_label, dfsan_label *ret_label) {
   char *tmp_endptr;
+  int ret = (int)strtol(nptr, &tmp_endptr, 10);
+  uptr len = (uptr)tmp_endptr - (uptr)nptr;
+  *ret_label = taint_strtol(nptr, len, sizeof(ret), 10);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+long __dfsw_atol(const char *nptr, dfsan_label nptr_label, dfsan_label *ret_label) {
+  char *tmp_endptr;
   long ret = strtol(nptr, &tmp_endptr, 10);
   uptr len = (uptr)tmp_endptr - (uptr)nptr;
   *ret_label = taint_strtol(nptr, len, sizeof(ret), 10);
-  return (int)ret;
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+long long __dfsw_atoll(const char *nptr, dfsan_label nptr_label, dfsan_label *ret_label) {
+  char *tmp_endptr;
+  long long ret = strtoll(nptr, &tmp_endptr, 10);
+  uptr len = (uptr)tmp_endptr - (uptr)nptr;
+  *ret_label = taint_strtol(nptr, len, sizeof(ret), 10);
+  return ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE

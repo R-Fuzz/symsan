@@ -290,6 +290,8 @@ fun:strtoll=custom
 fun:strtoul=custom
 fun:strtoull=custom
 fun:atoi=custom
+fun:atol=custom
+fun:atoll=custom
 fun:tolower=custom
 fun:toupper=custom
 
