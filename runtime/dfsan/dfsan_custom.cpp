@@ -2635,6 +2635,23 @@ __dfsw_lseek(int fd, off_t offset, int whence, dfsan_label fd_label,
   return ret;
 }
 
+SANITIZER_INTERFACE_ATTRIBUTE off64_t
+__dfsw_lseek64(int fd, off64_t offset, int whence, dfsan_label fd_label,
+               dfsan_label offset_label, dfsan_label whence_label,
+               dfsan_label *ret_label) {
+  off64_t ret = lseek64(fd, offset, whence);
+  if (ret != (off64_t)-1) {
+    if (taint_get_file(fd)) {
+      taint_set_offset_label(offset_label);
+      if (offset_label) {
+        __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+      }
+    }
+    *ret_label = offset_label;
+  } else *ret_label = 0;
+  return ret;
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_fseek(FILE *stream, long offset, int whence, dfsan_label stream_label,
              dfsan_label offset_label, dfsan_label whence_label,
