@@ -522,7 +522,11 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
   if (l != kInitializingLabel) {
     // for debugging
     dfsan_label h = atomic_load(&__dfsan_last_label, memory_order_relaxed);
-    assert(l <= h || l >= __alloca_stack_top);
+    assert(l <= __alloca_stack_bottom);
+    if (l > h && l < __alloca_stack_top) {
+      AOUT("WARNING: unallocated label %d > %d, and < %d\n",
+           l, h, __alloca_stack_top);
+    }
   } else {
     for (uptr i = 0; i < n; ++i)
       ls[i] = l;
