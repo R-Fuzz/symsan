@@ -548,6 +548,29 @@ __dfsw_pread(int fd, void *buf, size_t count, off_t offset,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t
+__dfsw_pread64(int fd, void *buf, size_t count, off_t offset,
+               dfsan_label fd_label, dfsan_label buf_label,
+               dfsan_label count_label, dfsan_label offset_label,
+               dfsan_label *ret_label) {
+  __taint_check_bounds(buf_label, (uptr)buf, count_label, count);
+  if (count_label)
+    __taint_solve_bounds(buf_label, (uint64_t)buf, count_label, count, 0, 1, 0, 0);
+  ssize_t ret = pread64(fd, buf, count, offset);
+  *ret_label = 0;
+  if (ret >= 0) {
+    if (taint_get_file(fd)) {
+      for (ssize_t i = 0; i < ret; i++) {
+        dfsan_set_label(get_label_for(fd, offset + i), (char *)buf + i, 1);
+      }
+      // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
+    } else {
+      dfsan_set_label(0, buf, ret);
+    }
+  }
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE ssize_t
 __dfsw_read(int fd, void *buf, size_t count,
              dfsan_label fd_label, dfsan_label buf_label,
              dfsan_label count_label,

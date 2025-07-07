@@ -259,6 +259,7 @@ fun:getsockname=custom
 fun:getsockopt=custom
 fun:nanosleep=custom
 fun:pread=custom
+fun:pread64=custom
 fun:read=custom
 fun:recv=custom
 fun:recvfrom=custom
