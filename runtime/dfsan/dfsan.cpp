@@ -379,30 +379,76 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       }
     } else if (op == __dfsan::Add) {
       // check for integer overflow
-      // -fsanitize=integer-overflow
+      // -fsanitize=signed-integer-overflow, unsigned-integer-overflow
       //
       // we only care about l2, which is always symbolic
       const uint64_t mask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL : (1UL << size) - 1;
-      // signed overflow
-      dfsan_label cond = __taint_union(label, l2, (bvslt << 8) | __dfsan::ICmp,
-                                       size, (orig_op1 + orig_op2) & mask, orig_op2);
-      __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
-      // unsigned overflow
-      cond = __taint_union(label, l2, (bvule << 8) | __dfsan::ICmp,
-                           size, (orig_op1 + orig_op2) & mask, orig_op2);
-      __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      uint64_t result = (orig_op1 + orig_op2) & mask;
+
+      // Signed overflow detection:
+      // Overflow occurs when ((op1 ^ result) & (op2 ^ result)) has sign bit set
+      // This means both operands had same sign, but result has different sign
+      uint64_t xor1 = (orig_op1 ^ result) & mask;
+      uint64_t xor2 = (orig_op2 ^ result) & mask;
+      uint64_t overflow_check = xor1 & xor2;
+      uint64_t sign_bit = 1ULL << (size - 1);
+      bool has_signed_overflow = (overflow_check & sign_bit) != 0;
+
+      if (!has_signed_overflow) {
+        // Build symbolic expression: ((l1 ^ label) & (l2 ^ label)) < 0
+        dfsan_label xor_l1 = __taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
+        dfsan_label xor_l2 = __taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
+        dfsan_label and_xors = __taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
+        dfsan_label cond = __taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
+                                         size, overflow_check, 0);
+        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      }
+
+      // Unsigned overflow: result < op1 (for any non-zero op2)
+      // When adding two unsigned numbers, overflow means result wrapped around
+      if (result >= orig_op1 && orig_op2 != 0) {
+        dfsan_label cond = __taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
+                                         size, result, orig_op1);
+        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      }
     } else if (op == __dfsan::Mul) {
       // check for integer overflow
       // we only care about l2, which is always symbolic
       const uint64_t mask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL : (1UL << size) - 1;
-      // signed overflow
-      dfsan_label cond = __taint_union(label, l2, (bvslt << 8) | __dfsan::ICmp,
-                                       size, (orig_op1 * orig_op2) & mask, orig_op2);
-      __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
-      // unsigned overflow
-      cond = __taint_union(label, l2, (bvule << 8) | __dfsan::ICmp,
-                           size, (orig_op1 * orig_op2) & mask, orig_op2);
-      __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      uint64_t result = (orig_op1 * orig_op2) & mask;
+
+      // For multiplication, overflow is harder to detect symbolically
+      // Use the approach: if a != 0, then overflow iff result / a != b
+      // But we approximate with sign-based check similar to addition
+      uint64_t xor1 = (orig_op1 ^ result) & mask;
+      uint64_t xor2 = (orig_op2 ^ result) & mask;
+      uint64_t overflow_check = xor1 & xor2;
+      uint64_t sign_bit = 1ULL << (size - 1);
+
+      // For signed multiplication: check if signs are inconsistent
+      // Product of same signs should be positive, different signs should be negative
+      // This is an approximation - full check would need wider multiplication
+      bool has_signed_overflow = (overflow_check & sign_bit) != 0;
+
+      if (!has_signed_overflow && orig_op1 != 0 && orig_op2 != 0) {
+        dfsan_label xor_l1 = __taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
+        dfsan_label xor_l2 = __taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
+        dfsan_label and_xors = __taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
+        dfsan_label cond = __taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
+                                         size, overflow_check, 0);
+        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      }
+
+      // Unsigned overflow: for multiplication, check if result / op1 != op2 (when op1 != 0)
+      if (orig_op1 != 0 && result / orig_op1 == orig_op2) {
+        // No overflow currently, check if overflow can happen
+        // Approximate: result < op1 || result < op2 when both > 1
+        if (orig_op1 > 1 && orig_op2 > 1) {
+          dfsan_label cond = __taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
+                                           size, result, orig_op1);
+          __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+        }
+      }
     }
   }
   return label;
