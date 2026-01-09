@@ -377,6 +377,29 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                         old_size, orig_op1, target);
         __taint_trace_cond(loss, 0, UndefinedCheck, ub_signed_integer_truncation);
       }
+
+      // -fsanitize=implicit-integer-sign-change
+      // Check if sign bit changed during truncation
+      {
+        uint16_t src_size = get_label_info(l1)->size;
+        const uint64_t new_mask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL : (1UL << size) - 1;
+        uint64_t src_sign_bit = 1ULL << (src_size - 1);
+        uint64_t dst_sign_bit = 1ULL << (size - 1);
+        bool src_sign = (orig_op1 & src_sign_bit) != 0;
+        bool dst_sign = ((orig_op1 & new_mask) & dst_sign_bit) != 0;
+        if (src_sign == dst_sign) {
+          // Currently no sign change, check if it can happen
+          // Sign changes when: sign_bit(l1) != sign_bit(label)
+          // We check: (l1 < 0) XOR (label < 0)
+          dfsan_label src_neg = __taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
+                                              src_size, orig_op1, 0);
+          dfsan_label dst_neg = __taint_union(label, 0, (bvslt << 8) | __dfsan::ICmp,
+                                              size, orig_op1 & new_mask, 0);
+          dfsan_label sign_diff = __taint_union(src_neg, dst_neg, __dfsan::Xor, 1,
+                                                src_sign ? 1 : 0, dst_sign ? 1 : 0);
+          __taint_trace_cond(sign_diff, 0, UndefinedCheck, ub_integer_sign_change);
+        }
+      }
     } else if (op == __dfsan::Add) {
       // check for integer overflow
       // -fsanitize=signed-integer-overflow, unsigned-integer-overflow
