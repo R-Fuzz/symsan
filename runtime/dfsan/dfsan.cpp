@@ -449,6 +449,41 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
         }
       }
+    } else if (op == __dfsan::Sub) {
+      // check for integer overflow (underflow for subtraction)
+      // -fsanitize=signed-integer-overflow, unsigned-integer-overflow
+      const uint64_t mask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL : (1UL << size) - 1;
+      uint64_t result = (orig_op1 - orig_op2) & mask;
+
+      // Signed overflow detection for subtraction:
+      // Overflow occurs when sign(a) != sign(b) and sign(result) != sign(a)
+      // Formula: (a ^ b) & (a ^ result) has sign bit set
+      // Examples:
+      //   INT_MAX - (-1) = overflow (positive - negative, result should be more positive but wraps)
+      //   INT_MIN - 1 = overflow (negative - positive, result should be more negative but wraps)
+      uint64_t xor_ab = (orig_op1 ^ orig_op2) & mask;
+      uint64_t xor_ar = (orig_op1 ^ result) & mask;
+      uint64_t overflow_check = xor_ab & xor_ar;
+      uint64_t sign_bit = 1ULL << (size - 1);
+      bool has_signed_overflow = (overflow_check & sign_bit) != 0;
+
+      if (!has_signed_overflow) {
+        // Build symbolic expression: ((l1 ^ l2) & (l1 ^ label)) < 0
+        dfsan_label xor_l1l2 = __taint_union(l1, l2, __dfsan::Xor, size, orig_op1, orig_op2);
+        dfsan_label xor_l1r = __taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
+        dfsan_label and_xors = __taint_union(xor_l1l2, xor_l1r, __dfsan::And, size, xor_ab, xor_ar);
+        dfsan_label cond = __taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
+                                         size, overflow_check, 0);
+        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      }
+
+      // Unsigned underflow: result > op1 when op2 > 0
+      // When subtracting, if a < b, result wraps around to large value (result > a)
+      if (result <= orig_op1 && orig_op2 != 0) {
+        dfsan_label cond = __taint_union(label, l1, (bvugt << 8) | __dfsan::ICmp,
+                                         size, result, orig_op1);
+        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      }
     }
   }
   return label;
