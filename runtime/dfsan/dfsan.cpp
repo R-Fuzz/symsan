@@ -124,8 +124,15 @@ static void dfsan_check_label(dfsan_label label) {
   if (label == kInitializingLabel) {
     Report("FATAL: Taint: out of labels\n");
     Die();
-  } else if (label >= __alloca_stack_top) {
-    Report("FATAL: Exhausted labels\n");
+  }
+  // Alloca labels are in range [__alloca_stack_top, __alloca_stack_bottom]
+  if (label >= __alloca_stack_top && label <= __alloca_stack_bottom) {
+    return; // Valid Alloca label
+  }
+  // For regular labels, check against __dfsan_last_label
+  dfsan_label last = atomic_load(&__dfsan_last_label, memory_order_relaxed);
+  if (label > last) {
+    Report("FATAL: Invalid label %u > last %u\n", label, last);
     Die();
   }
 }
@@ -855,11 +862,11 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
                                        64, index, lower_bound);
         __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
 
-        // check overflow, index * elem_size + current_offset + ptr >= upper_bound
-        // => index >= (upper_bound - current_offset - ptr) / elem_size
+        // check overflow, (index + 1) * elem_size + current_offset + ptr > upper_bound
+        // => index > (upper_bound - current_offset - ptr) / elem_size - 1
         uint64_t upper_bound =
-            (bounds_info->op2.i - current_offset - ptr) / elem_size;
-        dfsan_label ub = __taint_union(index_label, 0, (bvuge << 8) | ICmp,
+            (bounds_info->op2.i - current_offset - ptr) / elem_size - 1;
+        dfsan_label ub = __taint_union(index_label, 0, (bvugt << 8) | ICmp,
                                        64, index, upper_bound);
         __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
       } else {
