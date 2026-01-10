@@ -182,10 +182,11 @@ enum operators {
   fstr_op_start = last_llvm_op + 11,
   fstrchr   = last_llvm_op + 11,  // strchr/memchr
   fstrrchr  = last_llvm_op + 12,  // strrchr/memrchr
-  fstrstr   = last_llvm_op + 13,  // strstr
+  fstrstr   = last_llvm_op + 13,  // strstr/memmem
   fsubstr   = last_llvm_op + 14,  // substr(s, 0, len) - for bounded search
-  fstr_op_end = last_llvm_op + 15,
-  LastOp    = last_llvm_op + 15,
+  fstrpbrk  = last_llvm_op + 15,  // strpbrk - find first char from set
+  fstr_op_end = last_llvm_op + 16,
+  LastOp    = last_llvm_op + 16,
 };
 
 enum predicate {

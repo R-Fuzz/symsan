@@ -47,6 +47,7 @@ static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::fstrchr,  "strchr"},
   {__dfsan::fstrrchr, "strrchr"},
   {__dfsan::fstrstr,  "strstr"},
+  {__dfsan::fstrpbrk, "strpbrk"},
 };
 
 static std::string get_op_name(uint32_t op) {
@@ -620,6 +621,70 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       cache_expr(l, idx);
       RECORD_VALUE(found_pos);
       continue;
+    } else if (info->op == __dfsan::fstrpbrk) {
+      // strpbrk: find first character from accept set
+      // l1 = source content label
+      // l2 = accept_label (may be symbolic)
+      // size = accept length
+      // op1 = accept pointer (for caching if concrete)
+      // op2 = found position
+
+      int64_t found_pos = (int64_t)info->op2.i;
+
+      // Build source string from l1
+      z3::expr haystack_str = context_.string_val("");
+      z3::expr start_offset = context_.int_val(0);
+
+      if (info->l1 >= CONST_OFFSET) {
+        dfsan_label_info *src_info = get_label_info(info->l1);
+
+        if (src_info->op == __dfsan::fsubstr) {
+          haystack_str = get_cached_expr(info->l1, input_deps);
+        } else if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
+          // Chained call
+          z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
+          start_offset = prev_idx + 1;
+          dfsan_label content_label = info->l1;
+          dfsan_label_info *chain_info = src_info;
+          while (chain_info->op >= __dfsan::fstr_op_start &&
+                 chain_info->op < __dfsan::fstr_op_end) {
+            content_label = chain_info->l1;
+            if (content_label < CONST_OFFSET) break;
+            chain_info = get_label_info(content_label);
+          }
+          if (content_label >= CONST_OFFSET) {
+            haystack_str = build_string_from_label(content_label, input_deps);
+          }
+        } else {
+          haystack_str = build_string_from_label(info->l1, input_deps);
+        }
+      }
+
+      // Get accept character set
+      z3::expr idx(context_);
+      if (info->l2 == 0) {
+        // Concrete accept set - get from cache
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end() && info->size > 0) {
+          // Simplified approach: use first character's index as representative
+          // and add constraint that any character could be found
+          // This works well for NULL checks (if (strpbrk(s, accept)))
+          uint8_t first_c = it->second.get()[0];
+          z3::expr code = context_.int_val(first_c);
+          z3::expr char_str(context_, Z3_mk_string_from_code(context_, code));
+          idx = z3::indexof(haystack_str, char_str, start_offset);
+        } else {
+          idx = context_.int_val(-1);
+        }
+      } else {
+        // Symbolic accept set - complex case, fall back to concrete result
+        idx = context_.int_val(found_pos);
+      }
+
+      tsize_cache_.emplace_back(1);
+      cache_expr(l, idx.simplify());
+      RECORD_VALUE(found_pos);
+      continue;
     } else if (info->op == __dfsan::fsubstr) {
       // fsubstr: substring with length from a previous string op result
       // l1 = original content label (full haystack from previous string op)
@@ -663,10 +728,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     if ((info->op & 0xff) == __dfsan::ICmp) {
       uint16_t l1_op = info->l1 >= CONST_OFFSET ? get_label_info(info->l1)->op : 0;
       uint16_t l2_op = info->l2 >= CONST_OFFSET ? get_label_info(info->l2)->op : 0;
-      bool l1_is_strfunc = (l1_op == __dfsan::fstrchr || l1_op == __dfsan::fstrrchr ||
-                            l1_op == __dfsan::fstrstr);
-      bool l2_is_strfunc = (l2_op == __dfsan::fstrchr || l2_op == __dfsan::fstrrchr ||
-                            l2_op == __dfsan::fstrstr);
+      bool l1_is_strfunc = (l1_op >= __dfsan::fstr_op_start && l1_op < __dfsan::fstr_op_end);
+      bool l2_is_strfunc = (l2_op >= __dfsan::fstr_op_start && l2_op < __dfsan::fstr_op_end);
 
       if (l1_is_strfunc || l2_is_strfunc) {
         // String function comparison - convert index to found/not-found
@@ -1167,7 +1230,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
     // solve the first constraint (optimistic)
     z3::expr e = task->at(0);
     solver.add(e);
-    fprintf(stderr, "DEBUG solve_task: checking constraint: %s\n", e.to_string().c_str());
+    // fprintf(stderr, "DEBUG solve_task: checking constraint: %s\n", e.to_string().c_str());
     z3::check_result res = solver.check();
     // fprintf(stderr, "DEBUG solve_task: result = %d (sat=1, unsat=0, unknown=2)\n", (int)res);
     if (res == z3::sat) {

@@ -297,19 +297,54 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
                                                    dfsan_label s_label,
                                                    dfsan_label accept_label,
                                                    dfsan_label *ret_label) {
-  *ret_label = 0;
   const char *ret = strpbrk(s, accept);
-  /* FIXME
-  if (flags().strict_data_dependencies) {
-    *ret_label = ret ? s_label : 0;
-  } else {
-    size_t s_bytes_read = (ret ? ret - s : strlen(s)) + 1;
-    *ret_label =
-        dfsan_union(dfsan_read_label(s, s_bytes_read),
-                    dfsan_union(dfsan_read_label(accept, strlen(accept) + 1),
-                                dfsan_union(s_label, accept_label)));
+  size_t accept_len = strlen(accept);
+
+  // Check if s_label is from a previous string op (for chaining)
+  // Otherwise read content label
+  dfsan_label src_label = 0;
+  if (s_label != 0) {
+    uint16_t op = dfsan_get_label_info(s_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      src_label = s_label;  // Reuse for chaining
+    }
   }
-  */
+  if (src_label == 0) {
+    src_label = dfsan_read_label(s, strlen(s) + 1);
+  }
+
+  // Check if accept is tainted (skip Alloca bounds labels)
+  dfsan_label real_accept_label = 0;
+  if (accept_label != 0) {
+    uint16_t op = dfsan_get_label_info(accept_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      real_accept_label = accept_label;  // Reuse for chaining
+    } else if (op != __dfsan::Alloca) {
+      real_accept_label = accept_label;
+    }
+  }
+  if (real_accept_label == 0) {
+    real_accept_label = dfsan_read_label(accept, accept_len + 1);
+  }
+
+  if (src_label != 0 || real_accept_label != 0) {
+    int64_t found_pos = ret ? (ret - s) : -1;
+    // l1 = src_label (source content)
+    // l2 = accept_label (character set - may be symbolic)
+    // op1 = accept pointer (for caching if concrete)
+    // op2 = found position
+    // size = accept length
+    dfsan_label label = dfsan_union(src_label, real_accept_label, __dfsan::fstrpbrk,
+                                    accept_len,
+                                    (uint64_t)accept, (uint64_t)found_pos);
+    // Cache accept content if concrete
+    if (real_accept_label == 0 && label) {
+      __taint_trace_memcmp(label);
+    }
+    *ret_label = label;
+  } else {
+    *ret_label = 0;
+  }
   return const_cast<char *>(ret);
 }
 
@@ -1452,6 +1487,82 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
     // size = needle length
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     needle_len,
+                                    (uint64_t)needle, (uint64_t)found_pos);
+
+    // Cache needle content only if needle is concrete
+    if (real_needle_label == 0 && label) {
+      __taint_trace_memcmp(label);
+    }
+    *ret_label = label;
+  } else {
+    *ret_label = 0;
+  }
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t haystacklen,
+                                                   const void *needle, size_t needlelen,
+                                                   dfsan_label haystack_label,
+                                                   dfsan_label haystacklen_label,
+                                                   dfsan_label needle_label,
+                                                   dfsan_label needlelen_label,
+                                                   dfsan_label *ret_label) {
+  void *ret = memmem(haystack, haystacklen, needle, needlelen);
+
+  // Check if haystack_label is from a previous string op (for chaining)
+  // Otherwise read content label - haystack_label may be Alloca bounds
+  dfsan_label src_label = 0;
+  if (haystack_label != 0) {
+    uint16_t op = dfsan_get_label_info(haystack_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      src_label = haystack_label;  // Reuse for chaining
+    }
+  }
+  if (src_label == 0) {
+    src_label = dfsan_read_label(haystack, haystacklen);
+  }
+
+  // Check if haystacklen derives from a string op (for bounded search)
+  dfsan_label str_op_label = find_string_op_source(haystacklen_label);
+  if (str_op_label != 0 && src_label != 0) {
+    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
+    dfsan_label str_op_content = str_op_info->l1;
+
+    if (str_op_content >= CONST_OFFSET) {
+      dfsan_label src_base = get_base_input_label(src_label);
+      dfsan_label str_op_base = get_base_input_label(str_op_content);
+
+      if (src_base != 0 && src_base == str_op_base) {
+        // Same underlying buffer - create fsubstr with original content
+        src_label = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
+                                sizeof(void*) * 8, (uint64_t)haystacklen, 0);
+      }
+    }
+  }
+
+  // Check if needle_label is from a previous string op (for chaining)
+  // Otherwise read content label - needle_label may be Alloca bounds
+  dfsan_label real_needle_label = 0;
+  if (needle_label != 0) {
+    uint16_t op = dfsan_get_label_info(needle_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      real_needle_label = needle_label;  // Reuse for chaining
+    }
+  }
+  if (real_needle_label == 0) {
+    real_needle_label = dfsan_read_label(needle, needlelen);
+  }
+
+  if (src_label != 0 || real_needle_label != 0) {
+    int64_t found_pos = ret ? ((const char*)ret - (const char*)haystack) : -1;
+
+    // l1 = src_label (source - for chaining or content dependencies)
+    // l2 = real_needle_label (may be symbolic!)
+    // op1 = needle pointer (for caching if concrete)
+    // op2 = found position
+    // size = needle length
+    dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
+                                    needlelen,
                                     (uint64_t)needle, (uint64_t)found_pos);
 
     // Cache needle content only if needle is concrete
