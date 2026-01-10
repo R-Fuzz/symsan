@@ -311,6 +311,7 @@ fun:strncmp=custom
 fun:strpbrk=custom
 fun:strrchr=custom
 fun:strstr=custom
+fun:memmem=custom
 
 ## from afl++
 # memcmp-like
