@@ -300,7 +300,29 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       cache_expr(l, e);
       RECORD_VALUE(value_cache_[info->l1]);
       continue;
-    } //FIXME: other casting ops (PtrToInt, BitCast)?
+    } else if (info->op == __dfsan::PtrToInt) {
+      // PtrToInt converts a pointer to integer
+      // If the source is a string op result, convert the index to bitvector
+      if (info->l1 >= CONST_OFFSET) {
+        dfsan_label_info *src_info = get_label_info(info->l1);
+        if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
+          // String op result - the "pointer" is semantically the index
+          // Convert the Int expression to a bitvector for downstream ops
+          z3::expr idx = get_cached_expr(info->l1, input_deps);
+          z3::expr bv_idx = z3::int2bv(info->size, idx);
+          tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+          cache_expr(l, bv_idx);
+          RECORD_VALUE(value_cache_[info->l1]);
+          continue;
+        }
+      }
+      // For other PtrToInt cases, pass through (shouldn't normally reach here)
+      z3::expr e = get_cached_expr(info->l1, input_deps);
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      cache_expr(l, e);
+      RECORD_VALUE(value_cache_[info->l1]);
+      continue;
+    } //FIXME: other casting ops (BitCast)?
     // symsan-defined
     else if (info->op == __dfsan::Extract) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
@@ -427,7 +449,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       continue;
     } else if (info->op == __dfsan::fstrchr) {
       // strchr/memchr: find character in string
-      // l1 = source pointer label (content bytes - may be previous strchr for chaining)
+      // l1 = source pointer label (content bytes, fsubstr, or previous strchr for chaining)
       // l2 = c_label (target character - may be symbolic!)
       // op1 = concrete c value
       // op2 = found position (runtime)
@@ -441,7 +463,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       if (info->l1 >= CONST_OFFSET) {
         dfsan_label_info *src_info = get_label_info(info->l1);
 
-        if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
+        if (src_info->op == __dfsan::fsubstr) {
+          // l1 is a fsubstr - use the cached substr expression directly
+          haystack_str = get_cached_expr(info->l1, input_deps);
+        } else if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
           // Chained call: search starts after previous match
           z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
           start_offset = prev_idx + 1;
@@ -489,17 +514,23 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       continue;
     } else if (info->op == __dfsan::fstrrchr) {
       // strrchr/memrchr: find LAST occurrence of character
-      // l1 = source pointer label (content bytes)
+      // l1 = source pointer label (content bytes or fsubstr)
       // l2 = c_label (target character - may be symbolic!)
       // op1 = concrete c value
       // op2 = found position (runtime)
 
       int64_t found_pos = (int64_t)info->op2.i;
 
-      // Build source string from l1 (content label)
+      // Build source string from l1 (content label or fsubstr)
       z3::expr haystack_str = context_.string_val("");
       if (info->l1 >= CONST_OFFSET) {
-        haystack_str = build_string_from_label(info->l1, input_deps);
+        dfsan_label_info *src_info = get_label_info(info->l1);
+        if (src_info->op == __dfsan::fsubstr) {
+          // l1 is a fsubstr - use the cached substr expression directly
+          haystack_str = get_cached_expr(info->l1, input_deps);
+        } else {
+          haystack_str = build_string_from_label(info->l1, input_deps);
+        }
       }
 
       // Get target character (concrete or symbolic)
@@ -588,6 +619,33 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx);
       RECORD_VALUE(found_pos);
+      continue;
+    } else if (info->op == __dfsan::fsubstr) {
+      // fsubstr: substring with length from a previous string op result
+      // l1 = original content label (full haystack from previous string op)
+      // l2 = string op label (whose cached index becomes the length)
+      // op1 = concrete length n
+
+      // Build the full string from l1 (the original content)
+      z3::expr full_str = context_.string_val("");
+      if (info->l1 >= CONST_OFFSET) {
+        full_str = build_string_from_label(info->l1, input_deps);
+      }
+
+      // Get the length from l2 (the string op's result index)
+      z3::expr len_expr = context_.int_val((int64_t)info->op1.i);
+      if (info->l2 >= CONST_OFFSET) {
+        // l2 is the string op label - its cached value is the index
+        len_expr = get_cached_expr(info->l2, input_deps);
+      }
+
+      // Generate substr(full_str, 0, len)
+      z3::expr substr_expr = full_str.extract(context_.int_val(0), len_expr);
+
+      tsize_cache_.emplace_back(1);
+      cache_expr(l, substr_expr);
+      // The substr itself doesn't have a numeric value, but downstream ops will use it
+      RECORD_VALUE(info->op1.i);
       continue;
     } else if (info->op == __dfsan::Alloca || info->op == __dfsan::Free) {
       // not expression, do nothing

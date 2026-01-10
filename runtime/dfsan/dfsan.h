@@ -183,8 +183,9 @@ enum operators {
   fstrchr   = last_llvm_op + 11,  // strchr/memchr
   fstrrchr  = last_llvm_op + 12,  // strrchr/memrchr
   fstrstr   = last_llvm_op + 13,  // strstr
-  fstr_op_end = last_llvm_op + 14,
-  LastOp    = last_llvm_op + 14,
+  fsubstr   = last_llvm_op + 14,  // substr(s, 0, len) - for bounded search
+  fstr_op_end = last_llvm_op + 15,
+  LastOp    = last_llvm_op + 15,
 };
 
 enum predicate {
