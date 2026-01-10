@@ -896,6 +896,84 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
+                        dfsan_label size_label, uint64_t size,
+                        uint32_t cid) {
+  if (size_label == 0 || !flags().solve_ub)
+    return;
+
+  void *addr = __builtin_return_address(0);
+
+  if (size_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized size label %u @%p\n", size_label, addr);
+    __taint_trace_memerr(ptr_label, ptr, size_label, size, F_MEMERR_UBI, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+  if (ptr_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized pointer label %u @%p\n", ptr_label, addr);
+    __taint_trace_memerr(ptr_label, ptr, size_label, size, F_MEMERR_UBI, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+
+  AOUT("solve size: %lu = %d, ptr: %p = %d\n",
+      size, size_label, (void*)ptr, ptr_label);
+
+  // construct size solving tasks here
+  uint16_t size_bits = get_label_info(size_label)->size;
+
+  // check overflow with buffer bounds if ptr has bounds info
+  if (ptr_label != 0) {
+    dfsan_label_info *bounds_info = get_label_info(ptr_label);
+    if (bounds_info->op == __dfsan::Alloca) {
+      // bounds information is available
+      if (size_bits < 64) // extend size to 64 bits
+        size_label = __taint_union(size_label, 0, ZExt, 64, size, 0);
+
+      if (bounds_info->l2 == 0) {
+        // concrete allocation size
+        // check underflow: ptr + size < lower_bound (wrap around)
+        // => size < lower_bound - ptr (when lower_bound > ptr, but this shouldn't happen in valid code)
+        // or equivalently, check that ptr < lower_bound (shouldn't happen)
+        uint64_t min_size = bounds_info->op1.i - ptr;
+        dfsan_label underflow = __taint_union(size_label, 0, (bvult << 8) | ICmp,
+                                              64, size, min_size);
+        __taint_trace_cond(underflow, 0, UndefinedCheck, ub_size_underflow);
+
+        // check overflow: ptr + size > upper_bound
+        // => size > upper_bound - ptr
+        uint64_t max_size = bounds_info->op2.i - ptr;
+        dfsan_label overflow = __taint_union(size_label, 0, (bvugt << 8) | ICmp,
+                                             64, size, max_size);
+        __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_overflow);
+      } else {
+        // symbolic allocation size
+        // check: size > alloc_size
+        uint64_t offset = ptr - bounds_info->op1.i;
+        uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
+        dfsan_label adjusted_size = offset == 0 ? size_label :
+            __taint_union(size_label, 0, Add, 64, size, offset);
+        uint64_t actual_size = size + offset;
+        dfsan_label overflow = __taint_union(adjusted_size, bounds_info->l2,
+                                             (bvugt << 8) | ICmp, 64,
+                                             actual_size, alloc_size);
+        __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_to_buffer_overflow);
+      }
+    } else if (ptr_label != 0) {
+      // symbolic pointer but no bounds info
+      AOUT("WARNING: symbolic pointer %p = %u with no bounds info @%p\n",
+           (void*)ptr, ptr_label, addr);
+      // check if null is possible
+      dfsan_label null = __taint_union(ptr_label, 0, bveq, 64, ptr, 0);
+      __taint_trace_cond(null, 0, UndefinedCheck, ub_null_pointer);
+    }
+  }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void dfsan_store_label(dfsan_label l, void *addr, uptr size) {
   if (l == 0) return;
   __taint_union_store(l, shadow_for(addr), size, sizeof(dfsan_label));

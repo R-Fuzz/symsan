@@ -395,6 +395,7 @@ class Taint {
   FunctionType *TaintTraceAllocaFnTy;
   FunctionType *TaintCheckBoundsFnTy;
   FunctionType *TaintSolveBoundsFnTy;
+  FunctionType *TaintSolveSizeFnTy;
   FunctionType *TaintTraceGlobalFnTy;
   FunctionType *TaintMemcmpFnTy;
   FunctionType *TaintStrcmpFnTy;
@@ -420,6 +421,7 @@ class Taint {
   FunctionCallee TaintTraceAllocaFn;
   FunctionCallee TaintCheckBoundsFn;
   FunctionCallee TaintSolveBoundsFn;
+  FunctionCallee TaintSolveSizeFn;
   FunctionCallee TaintTraceGlobalFn;
   FunctionCallee TaintMemcmpFn;
   FunctionCallee TaintStrcmpFn;
@@ -995,6 +997,9 @@ bool Taint::initializeModule(Module &M) {
       { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy, Int64Ty }, false);
   TaintSolveBoundsFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceGEPArgs, false); // use the same args as GEP
+  TaintSolveSizeFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx),
+      { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy, Int64Ty, Int32Ty }, false);
   TaintTraceGlobalFnTy = FunctionType::get(
       PrimitiveShadowTy, { Int64Ty, Int64Ty }, false);
 
@@ -1329,6 +1334,15 @@ void Taint::initializeCallbackFunctions(Module &M) {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
+    TaintSolveSizeFn =
+        Mod->getOrInsertFunction("__taint_solve_size", TaintSolveSizeFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
     AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
     TaintMemcmpFn =
         Mod->getOrInsertFunction("__taint_memcmp", TaintMemcmpFnTy, AL);
@@ -1375,6 +1389,8 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintCheckBoundsFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintSolveBoundsFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintSolveSizeFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintMemcmpFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -1894,14 +1910,10 @@ void TaintFunction::solveBounds(Value *Ptr, Value* Size, Instruction *Pos) {
     PtrShadow = getShadow(Ptr);
   }
   Value *Addr = IRB.CreatePtrToInt(Ptr, TT.Int64Ty);
-  Value *Index = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
-  ConstantInt *NumEl = ConstantInt::get(TT.Int64Ty, 0); // no allocation size
-  ConstantInt *ElSize = ConstantInt::get(TT.Int64Ty, 1); // bytes array
-  // set offset to 1 to adjust for size instead of index
-  ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, 1);
+  Value *Size64 = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(Pos));
-  IRB.CreateCall(TT.TaintSolveBoundsFn,
-      {PtrShadow, Addr, SizeShadow, Index, NumEl, ElSize, Offset, CID});
+  IRB.CreateCall(TT.TaintSolveSizeFn,
+      {PtrShadow, Addr, SizeShadow, Size64, CID});
 }
 
 // Generates IR to load shadow corresponding to bytes [Addr, Addr+Size), where
