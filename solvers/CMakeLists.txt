@@ -44,7 +44,7 @@ target_include_directories(rgd-solver PRIVATE
 
 target_link_libraries(rgd-solver PRIVATE
     tcmalloc
-    z3
+    ${Z3_LIBRARY}
     jigsaw
     profiler
 )

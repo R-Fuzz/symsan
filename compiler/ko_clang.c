@@ -179,7 +179,9 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
     cc_params[cc_par_cnt++] = alloc_printf("%s/libZ3Solver.a", obj_path);
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
+    cc_params[cc_par_cnt++] = "-L/usr/local/lib";
     cc_params[cc_par_cnt++] = "-lz3";
+    cc_params[cc_par_cnt++] = "-Wl,-rpath,/usr/local/lib";
   }
 
   if (getenv("KO_USE_FASTGEN")) {
