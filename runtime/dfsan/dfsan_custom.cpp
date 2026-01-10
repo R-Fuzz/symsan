@@ -196,21 +196,35 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
                                                   dfsan_label s_label,
                                                   dfsan_label c_label,
                                                   dfsan_label *ret_label) {
-  *ret_label = 0;
-  return strchr(s, c);
-  /* FIXME
-  for (size_t i = 0;; ++i) {
-    if (s[i] == c || s[i] == 0) {
-      if (flags().strict_data_dependencies) {
-        *ret_label = s_label;
-      } else {
-        *ret_label = taint_union(taint_read_label(s, i + 1),
-                                 taint_union(s_label, c_label));
-      }
-      return s[i] == 0 ? nullptr : const_cast<char *>(s+i);
+  char *ret = strchr(s, c);
+
+  // Check if s_label is from a previous string op (for chaining)
+  // Otherwise read content label - s_label may be Alloca bounds
+  dfsan_label src_label = 0;
+  if (s_label != 0) {
+    uint16_t op = dfsan_get_label_info(s_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      src_label = s_label;  // Reuse for chaining
     }
   }
-  */
+  if (src_label == 0) {
+    src_label = dfsan_read_label(s, strlen(s) + 1);
+  }
+
+  // Create label if source or char is tainted
+  if (src_label != 0 || c_label != 0) {
+    int64_t found_pos = ret ? (ret - s) : -1;
+    // l1 = src_label (source - for chaining or content dependencies)
+    // l2 = c_label (target char - may be symbolic!)
+    // op1 = concrete c value
+    // op2 = found position
+    *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
+                             sizeof(char*) * 8,
+                             (uint64_t)(uint8_t)c, (uint64_t)found_pos);
+  } else {
+    *ret_label = 0;
+  }
+  return ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
@@ -1195,7 +1209,29 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
                                                   dfsan_label n_label,
                                                   dfsan_label *ret_label) {
   void *ret = memchr(s, c, n);
-  *ret_label = ret ? s_label : 0;
+
+  // Check if s_label is from a previous string op (for chaining)
+  // Otherwise read content label - s_label may be Alloca bounds
+  dfsan_label src_label = 0;
+  if (s_label != 0) {
+    uint16_t op = dfsan_get_label_info(s_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      src_label = s_label;  // Reuse for chaining
+    }
+  }
+  if (src_label == 0) {
+    src_label = dfsan_read_label(s, n);
+  }
+
+  if (src_label != 0 || c_label != 0) {
+    int64_t found_pos = ret ? ((char*)ret - (char*)s) : -1;
+    // Same structure as strchr
+    *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
+                             sizeof(void*) * 8,
+                             (uint64_t)(uint8_t)c, (uint64_t)found_pos);
+  } else {
+    *ret_label = 0;
+  }
   return ret;
 }
 
@@ -1204,7 +1240,61 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
                                                    dfsan_label c_label,
                                                    dfsan_label *ret_label) {
   char *ret = strrchr(s, c);
-  *ret_label = ret ? s_label : 0;
+
+  // Check if s_label is from a previous string op (for chaining)
+  // Otherwise read content label - s_label may be Alloca bounds
+  dfsan_label src_label = 0;
+  if (s_label != 0) {
+    uint16_t op = dfsan_get_label_info(s_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      src_label = s_label;  // Reuse for chaining
+    }
+  }
+  if (src_label == 0) {
+    src_label = dfsan_read_label(s, strlen(s) + 1);
+  }
+
+  if (src_label != 0 || c_label != 0) {
+    int64_t found_pos = ret ? (ret - s) : -1;
+    // Use fstrrchr for reverse search
+    *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
+                             sizeof(char*) * 8,
+                             (uint64_t)(uint8_t)c, (uint64_t)found_pos);
+  } else {
+    *ret_label = 0;
+  }
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t n,
+                                                   dfsan_label s_label,
+                                                   dfsan_label c_label,
+                                                   dfsan_label n_label,
+                                                   dfsan_label *ret_label) {
+  void *ret = const_cast<void*>(memrchr(s, c, n));
+
+  // Check if s_label is from a previous string op (for chaining)
+  // Otherwise read content label - s_label may be Alloca bounds
+  dfsan_label src_label = 0;
+  if (s_label != 0) {
+    uint16_t op = dfsan_get_label_info(s_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      src_label = s_label;  // Reuse for chaining
+    }
+  }
+  if (src_label == 0) {
+    src_label = dfsan_read_label(s, n);
+  }
+
+  if (src_label != 0 || c_label != 0) {
+    int64_t found_pos = ret ? ((const char*)ret - (const char*)s) : -1;
+    // Use fstrrchr for reverse search
+    *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
+                             sizeof(void*) * 8,
+                             (uint64_t)(uint8_t)c, (uint64_t)found_pos);
+  } else {
+    *ret_label = 0;
+  }
   return ret;
 }
 
@@ -1213,7 +1303,54 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
                                                   dfsan_label needle_label,
                                                   dfsan_label *ret_label) {
   char *ret = strstr(haystack, needle);
-  *ret_label = ret ? haystack_label : 0;
+
+  // Check if haystack_label is from a previous string op (for chaining)
+  // Otherwise read content label - haystack_label may be Alloca bounds
+  dfsan_label src_label = 0;
+  if (haystack_label != 0) {
+    uint16_t op = dfsan_get_label_info(haystack_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      src_label = haystack_label;  // Reuse for chaining
+    }
+  }
+  if (src_label == 0) {
+    src_label = dfsan_read_label(haystack, strlen(haystack) + 1);
+  }
+
+  // Check if needle_label is from a previous string op (for chaining)
+  // Otherwise read content label - needle_label may be Alloca bounds
+  dfsan_label real_needle_label = 0;
+  if (needle_label != 0) {
+    uint16_t op = dfsan_get_label_info(needle_label)->op;
+    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+      real_needle_label = needle_label;  // Reuse for chaining
+    }
+  }
+  if (real_needle_label == 0) {
+    real_needle_label = dfsan_read_label(needle, strlen(needle));
+  }
+
+  if (src_label != 0 || real_needle_label != 0) {
+    size_t needle_len = strlen(needle);
+    int64_t found_pos = ret ? (ret - haystack) : -1;
+
+    // l1 = src_label (source pointer - for chaining or content dependencies)
+    // l2 = real_needle_label (may be symbolic string!)
+    // op1 = needle pointer (for caching if concrete)
+    // op2 = found position
+    // size = needle length
+    dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
+                                    needle_len,
+                                    (uint64_t)needle, (uint64_t)found_pos);
+
+    // Cache needle content only if needle is concrete
+    if (real_needle_label == 0 && label) {
+      __taint_trace_memcmp(label);
+    }
+    *ret_label = label;
+  } else {
+    *ret_label = 0;
+  }
   return ret;
 }
 
