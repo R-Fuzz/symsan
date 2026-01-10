@@ -13,7 +13,7 @@ target_include_directories(FGTest PUBLIC
 target_link_libraries(FGTest PRIVATE
   launcher
   z3parser
-  z3
+  ${Z3_LIBRARY}
   rt
 )
 install (TARGETS FGTest DESTINATION ${SYMSAN_BIN_DIR})

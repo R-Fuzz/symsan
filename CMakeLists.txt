@@ -4,6 +4,18 @@ project(symsan VERSION 1.2.2 LANGUAGES C CXX ASM)
 
 find_package(LLVM 14 REQUIRED CONFIG)
 
+# Find Z3 - prefer /usr/local over system
+find_library(Z3_LIBRARY NAMES z3 PATHS /usr/local/lib NO_DEFAULT_PATH)
+if (NOT Z3_LIBRARY)
+    find_library(Z3_LIBRARY NAMES z3)
+endif()
+find_path(Z3_INCLUDE_DIR NAMES z3.h PATHS /usr/local/include NO_DEFAULT_PATH)
+if (NOT Z3_INCLUDE_DIR)
+    find_path(Z3_INCLUDE_DIR NAMES z3.h)
+endif()
+message(STATUS "Z3_LIBRARY: ${Z3_LIBRARY}")
+message(STATUS "Z3_INCLUDE_DIR: ${Z3_INCLUDE_DIR}")
+
 if (LLVM_FOUND)
     message(STATUS "LLVM_VERSION_MAJOR: ${LLVM_VERSION_MAJOR}")
     message(STATUS "LLVM_VERSION_MINOR: ${LLVM_VERSION_MINOR}")
