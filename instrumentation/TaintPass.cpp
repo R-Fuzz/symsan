@@ -1897,7 +1897,8 @@ void TaintFunction::solveBounds(Value *Ptr, Value* Size, Instruction *Pos) {
   Value *Index = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
   ConstantInt *NumEl = ConstantInt::get(TT.Int64Ty, 0); // no allocation size
   ConstantInt *ElSize = ConstantInt::get(TT.Int64Ty, 1); // bytes array
-  ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, 0); // no offset
+  // set offset to 1 to adjust for size instead of index
+  ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, 1);
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(Pos));
   IRB.CreateCall(TT.TaintSolveBoundsFn,
       {PtrShadow, Addr, SizeShadow, Index, NumEl, ElSize, Offset, CID});
