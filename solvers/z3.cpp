@@ -42,6 +42,7 @@ static std::unordered_set<uptr> __buffers;
 
 
 static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
+  using op_t = symsan::Z3ParserSolver::solution_op_t;
 
   if (tainted.is_stdin) {
     // FIXME: input is stdin
@@ -49,6 +50,50 @@ static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
     return;
   }
 
+  // Build the new input in memory to handle INSERT/DELETE properly
+  std::vector<uint8_t> new_input((uint8_t*)tainted.buf,
+                                  (uint8_t*)tainted.buf + tainted.size);
+
+  // Sort solutions by offset in descending order so INSERT/DELETE don't
+  // invalidate subsequent offsets
+  std::vector<uptr> order(solutions.size());
+  for (uptr i = 0; i < order.size(); ++i) order[i] = i;
+  Sort(order.data(), order.size(), [&solutions](uptr a, uptr b) {
+    return solutions[a].offset > solutions[b].offset;
+  });
+
+  for (uptr idx : order) {
+    const auto& sol = solutions[idx];
+    switch (sol.op) {
+      case op_t::SET:
+        if (sol.offset < new_input.size()) {
+          AOUT("SET offset %d = %x\n", sol.offset, sol.val);
+          new_input[sol.offset] = sol.val;
+        }
+        break;
+
+      case op_t::INSERT:
+        if (sol.offset <= new_input.size()) {
+          AOUT("INSERT %zu bytes at offset %d\n", sol.data.size(), sol.offset);
+          new_input.insert(new_input.begin() + sol.offset,
+                          sol.data.begin(), sol.data.end());
+        }
+        break;
+
+      case op_t::DELETE:
+        if (sol.offset < new_input.size()) {
+          uptr del_len = sol.len;
+          if (sol.offset + del_len > new_input.size())
+            del_len = new_input.size() - sol.offset;
+          AOUT("DELETE %zu bytes at offset %d\n", del_len, sol.offset);
+          new_input.erase(new_input.begin() + sol.offset,
+                         new_input.begin() + sol.offset + del_len);
+        }
+        break;
+    }
+  }
+
+  // Write the new input to file
   char path[PATH_MAX];
   internal_snprintf(path, PATH_MAX, "%s/id-%d-%d-%d", __output_dir,
                     __instance_id, __session_id, __current_index++);
@@ -58,21 +103,12 @@ static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
     return;
   }
 
-  if (!WriteToFile(fd, tainted.buf, tainted.size)) {
-    AOUT("WARNING: failed to copy original input\n");
-    CloseFile(fd);
-    return;
-  }
-  AOUT("generate #%d output\n", __current_index - 1);
+  AOUT("generate #%d output (size: %zu -> %zu)\n",
+       __current_index - 1, tainted.size, new_input.size());
 
-  for (auto const& sol : solutions) {
-    uint8_t value = sol.val;
-    AOUT("offset %d = %x\n", sol.offset, value);
-    internal_lseek(fd, sol.offset, SEEK_SET);
-    WriteToFile(fd, &value, sizeof(value));
+  if (!WriteToFile(fd, new_input.data(), new_input.size())) {
+    AOUT("WARNING: failed to write new input\n");
   }
-
-  // FIXME: fsize
 
   CloseFile(fd);
 }
