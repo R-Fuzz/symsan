@@ -36,6 +36,9 @@ protected:
   const char* atoi_name_format;
   const char* strlen_name_format;
 
+  // String ranges for null-byte post-processing (input_id -> list of (start, end))
+  std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> string_ranges_;
+
 private:
   // Original input cache
   std::vector<input_t> inputs_cache_;
@@ -119,6 +122,10 @@ private:
   void construct_index_tasks(z3::expr &index, uint64_t curr,
                              uint64_t lb, uint64_t ub, uint64_t step,
                              z3_task_t &nested, std::vector<uint64_t> &tasks);
+
+  // String theory helpers for strchr/strstr
+  z3::expr build_string_from_label(dfsan_label content_label, input_dep_set_t &deps);
+  z3::expr get_byte_expr(uint32_t input, uint32_t offset, input_dep_set_t &deps);
 };
 
 class Z3ParserSolver : public Z3AstParser {
