@@ -127,7 +127,7 @@ static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *ad
   for (auto id : tasks) {
     // solve
     symsan::Z3ParserSolver::solution_t solutions;
-    auto status = __z3_parser->solve_task(id, 5000U, solutions);
+    auto status = __z3_parser->solve_task(id, 30000U, solutions);  // 30 seconds
     if (solutions.size() != 0) {
       AOUT("branch solved\n");
       generate_input(solutions);
@@ -156,7 +156,7 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
 
   for (auto id : tasks) {
     symsan::Z3ParserSolver::solution_t solutions;
-    auto status = __z3_parser->solve_task(id, 5000U, solutions);
+    auto status = __z3_parser->solve_task(id, 30000U, solutions);  // 30 seconds
     if (solutions.size() != 0) {
       AOUT("gep solved\n");
       generate_input(solutions);
@@ -209,6 +209,13 @@ int main(int argc, char* const argv[]) {
       debug_opt += strlen("debug="); // skip "debug="
       if (strcmp(debug_opt, "1") == 0 || strcmp(debug_opt, "true") == 0)
         debug = 1;
+    }
+
+    // check for session_id
+    char *session_opt = strstr(options, "session_id=");
+    if (session_opt) {
+      session_opt += strlen("session_id=");
+      __session_id = atoi(session_opt);
     }
 
     // check if solve_ub is enabled
