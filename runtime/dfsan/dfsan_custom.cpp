@@ -91,6 +91,11 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
                           int64_t current_offset, uint32_t cid);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
+                        dfsan_label size_label, uint64_t size,
+                        uint32_t cid);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_memerr(dfsan_label ptr_label, uptr ptr,
                           dfsan_label size_label, uint64_t size,
                           uint16_t flag, void *addr);
@@ -190,6 +195,66 @@ __dfsw_lstat(const char *path, struct stat *buf, dfsan_label path_label,
   }
   *ret_label = 0;
   return ret;
+}
+
+// Helper: Find the first (base) input byte label from a content label.
+// Walks through Concat chains and Load operations to find the starting input.
+// Returns the base label, or 0 if not found.
+static dfsan_label get_base_input_label(dfsan_label label) {
+  if (label < CONST_OFFSET) return 0;
+
+  dfsan_label_info *info = dfsan_get_label_info(label);
+
+  // Base input label has op == 0
+  if (info->op == 0) return label;
+
+  // For Concat (op 72), walk left (l1) to find the base
+  if (info->op == __dfsan::Concat) {
+    return get_base_input_label(info->l1);
+  }
+
+  // For Load (op 32), l1 is the starting label
+  if (info->op == __dfsan::Load) {
+    return info->l1;
+  }
+
+  // For other ops, try l1
+  if (info->l1 >= CONST_OFFSET) {
+    return get_base_input_label(info->l1);
+  }
+
+  return 0;
+}
+
+// Helper: Find if a label derives from a string op (fstrchr, fstrrchr, fstrstr)
+// by walking through PtrToInt, Sub, Add operations.
+// Returns the string op label if found, 0 otherwise.
+static dfsan_label find_string_op_source(dfsan_label label) {
+  if (label < CONST_OFFSET) return 0;
+
+  dfsan_label_info *info = dfsan_get_label_info(label);
+  uint16_t op = info->op;
+
+  // Check if this is directly a string op
+  if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
+    return label;
+  }
+
+  // Follow through PtrToInt, Sub, Add to find the source string op
+  if (op == __dfsan::PtrToInt || op == __dfsan::Sub || op == __dfsan::Add) {
+    // Recursively check l1 (the primary operand)
+    if (info->l1 >= CONST_OFFSET) {
+      dfsan_label result = find_string_op_source(info->l1);
+      if (result != 0) return result;
+    }
+    // For Sub/Add, also check l2
+    if ((op == __dfsan::Sub || op == __dfsan::Add) && info->l2 >= CONST_OFFSET) {
+      dfsan_label result = find_string_op_source(info->l2);
+      if (result != 0) return result;
+    }
+  }
+
+  return 0;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
@@ -1223,6 +1288,27 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     src_label = dfsan_read_label(s, n);
   }
 
+  // Check if n_label derives from a string op (e.g., ptr arithmetic on memchr result).
+  // If so, create a fsubstr label to represent substr(content, 0, n) so the solver
+  // can use Z3's str.substr instead of dealing with PtrToInt.
+  dfsan_label str_op_label = find_string_op_source(n_label);
+  if (str_op_label != 0 && src_label != 0) {
+    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
+    dfsan_label str_op_content = str_op_info->l1;
+
+    // Verify that src_label and str_op_content refer to the same underlying string
+    if (str_op_content >= CONST_OFFSET) {
+      dfsan_label src_base = get_base_input_label(src_label);
+      dfsan_label str_op_base = get_base_input_label(str_op_content);
+
+      if (src_base != 0 && src_base == str_op_base) {
+        // Same underlying buffer - create fsubstr with original content
+        src_label = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
+                                sizeof(void*) * 8, (uint64_t)n, 0);
+      }
+    }
+  }
+
   if (src_label != 0 || c_label != 0) {
     int64_t found_pos = ret ? ((char*)ret - (char*)s) : -1;
     // Same structure as strchr
@@ -1284,6 +1370,31 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
   }
   if (src_label == 0) {
     src_label = dfsan_read_label(s, n);
+  }
+
+  // Check if n_label derives from a string op (e.g., ptr arithmetic on memrchr result).
+  // If so, create a fsubstr label to represent substr(content, 0, n) so the solver
+  // can use Z3's str.substr instead of dealing with PtrToInt.
+  dfsan_label str_op_label = find_string_op_source(n_label);
+  if (str_op_label != 0 && src_label != 0) {
+    // Get the string op's content label (l1) - this is the original haystack
+    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
+    dfsan_label str_op_content = str_op_info->l1;
+
+    // Verify that src_label and str_op_content refer to the same underlying string
+    // by checking if they share the same base input label.
+    // This guards against the (unlikely) case of ptr arithmetic across different buffers.
+    if (str_op_content >= CONST_OFFSET) {
+      dfsan_label src_base = get_base_input_label(src_label);
+      dfsan_label str_op_base = get_base_input_label(str_op_content);
+
+      if (src_base != 0 && src_base == str_op_base) {
+        // Same underlying buffer - create fsubstr with original content
+        // fsubstr: l1 = original content from string op, l2 = string op label (index)
+        src_label = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
+                                sizeof(void*) * 8, (uint64_t)n, 0);
+      }
+    }
   }
 
   if (src_label != 0 || c_label != 0) {
