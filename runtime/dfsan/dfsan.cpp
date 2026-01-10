@@ -214,18 +214,19 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   // backup old op-values
   uint64_t orig_op1 = op1, orig_op2 = op2;
 
-  // special handling for bounds, which may use all four fields
-  // fatoi also uses both concrete operand fields
-  // record icmp and fmemcmp operands as well
+  // Preserve op1/op2 for certain operations:
+  // - Alloca: uses op1/op2 for bounds tracking
+  // - ICmp: records both operands for comparison
+  // - Higher-order ops (>= fmemcmp): use op1/op2 for various purposes
   if (op == __dfsan::fmemcmp) {
-    // XXX: hacky, but maybe good enough for i2s inference
-    // for symbolic operand, record a piece (up to 8 bytes) of the data
+    // fmemcmp special: copy up to 8 bytes of the data for i2s inference
     uint16_t len = size > 8 ? 8 : size; // for fmemcmp, size is in bytes, not bits
     if (l1 >= CONST_OFFSET) internal_memcpy(&op1, (void*)op1, len);
     if (l2 >= CONST_OFFSET) internal_memcpy(&op2, (void*)op2, len);
-  } else if (op != __dfsan::Alloca &&
-             (op & 0xff) != __dfsan::ICmp &&
-             op != __dfsan::fatoi) {
+  } else if (op < __dfsan::fmemcmp &&
+             op != __dfsan::Alloca &&
+             (op & 0xff) != __dfsan::ICmp) {
+    // Not a higher-order op and not Alloca/ICmp - zero out for symbolic operands
     if (l1 >= CONST_OFFSET) op1 = 0;
     if (l2 >= CONST_OFFSET) op2 = 0;
   }

@@ -375,13 +375,26 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
 SANITIZER_INTERFACE_ATTRIBUTE size_t
 __dfsw_strlen(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
   size_t ret = strlen(s);
-  *ret_label = 0;
-  /*
-  if (flags().strict_data_dependencies) {
+  dfsan_label str_label = dfsan_read_label(s, ret + 1);
+
+  if (str_label == 0) {
     *ret_label = 0;
   } else {
-    *ret_label = taint_read_label(s, ret + 1);
-  }*/
+    // Check if the null terminator byte is from input (tainted)
+    // If not, it was added programmatically (e.g., by the program setting '\0')
+    dfsan_label null_label = dfsan_read_label(s + ret, 1);
+    bool null_from_input = (null_label != 0);
+
+    // Create fstrlen label:
+    // - l1 = 0 (following fsize/fatoi pattern to avoid Alloca rejection)
+    // - l2 = str_label (content label for dependencies)
+    // - op1 = null_from_input flag (1 if null is from input, 0 if programmatic)
+    // - op2 = actual length (for solution generation)
+    // Note: str_label contains the offset info via Load labels
+    *ret_label = dfsan_union(0, str_label, fstrlen,
+                             sizeof(size_t) * 8,
+                             null_from_input ? 1 : 0, ret);
+  }
   return ret;
 }
 
