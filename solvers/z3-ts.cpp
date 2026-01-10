@@ -72,7 +72,8 @@ void Z3AstParser::dump_value_cache(dfsan_label label) {
 Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
   : ASTParser(base, size), context_(context) {
     input_name_format = "input-%u-%u";
-    atoi_name_format = "atoi-%u-%u-%d";
+    atoi_name_format = "atoi-%u-%u-%d-%lu";       // input, offset, base, original_len
+    strlen_name_format = "strlen-%u-%u-%lu-%u";   // input, offset, original_len, null_from_input
   }
 
 int Z3AstParser::restart(std::vector<input_t> &inputs) {
@@ -365,14 +366,59 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       uint32_t offset = get_label_info(src->l1)->op1.i; // legacy: offset in op1
       uint32_t input = get_label_info(src->l1)->op2.i;
       int base = info->op1.i;
+      uint64_t orig_len = info->op2.i;
       // FIXME: dependencies?
       tsize_cache_.emplace_back(1);
       // XXX: hacky, avoid string theory
-      snprintf(name, sizeof(name), atoi_name_format, input, offset, base);
+      snprintf(name, sizeof(name), atoi_name_format, input, offset, base, orig_len);
       z3::symbol symbol = context_.str_symbol(name);
       z3::sort sort = context_.bv_sort(info->size);
       cache_expr(l, context_.constant(symbol, sort));
       RECORD_VALUE(0); // FIXME: map to atoi result?
+      continue;
+    } else if (info->op == __dfsan::fstrlen) {
+      // Symbolic string length
+      // - l1 = 0 (following fsize/fatoi pattern)
+      // - l2 = content label (for input dependencies)
+      // - op1 = null_from_input flag (1 if null terminator is from input, 0 if programmatic)
+      // - op2 = actual length
+
+      // Extract offset and input_id from content label (l2)
+      uint32_t offset = 0;
+      uint32_t input_id = 0;
+      uint32_t null_from_input = info->op1.i;
+
+      if (info->l2 >= CONST_OFFSET) {
+        // Walk the content label to find base input offset
+        dfsan_label_info *str_info = get_label_info(info->l2);
+
+        // Handle Concat chain (common for multi-byte strings)
+        while (str_info->op == __dfsan::Concat && str_info->l1 >= CONST_OFFSET) {
+          str_info = get_label_info(str_info->l1);
+        }
+
+        // Base input labels have op=0, offset in op1
+        // (created by dfsan_create_label, not dfsan_union)
+        if (str_info->op == 0) {
+          // Direct input byte - offset stored in op1
+          offset = str_info->op1.i;
+          input_id = 0; // default input
+        } else if (str_info->op == __dfsan::Load) {
+          // Load from memory - get offset from pointer label
+          dfsan_label_info *ptr_info = get_label_info(str_info->l1);
+          offset = ptr_info->op1.i;
+          input_id = ptr_info->op2.i;
+        }
+      }
+
+      tsize_cache_.emplace_back(1);
+      // Create symbolic variable: strlen-input-offset-origlen-null_from_input
+      snprintf(name, sizeof(name), strlen_name_format, input_id, offset,
+               info->op2.i, null_from_input);
+      z3::symbol symbol = context_.str_symbol(name);
+      z3::sort sort = context_.bv_sort(info->size);
+      cache_expr(l, context_.constant(symbol, sort));
+      RECORD_VALUE(info->op2.i); // actual length for value cache
       continue;
     } else if (info->op == __dfsan::Alloca || info->op == __dfsan::Free) {
       // not expression, do nothing
@@ -535,17 +581,20 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // dump_value_cache(info->l1);
           // dump_value_cache(info->l2);
 
-          // memcmp is a special case, just fix it for now
-          bool is_memcmp = false;
-          if (get_label_info(info->l1)->op == __dfsan::fmemcmp) {
+          // memcmp and atoi are special cases where we don't have the actual
+          // value cached, so we fix it using the runtime value from ICmp
+          bool is_special = false;
+          uint16_t l1_op = get_label_info(info->l1)->op;
+          uint16_t l2_op = get_label_info(info->l2)->op;
+          if (l1_op == __dfsan::fmemcmp || l1_op == __dfsan::fatoi) {
             value_cache_[info->l1] = val1 = info->op1.i;
-            is_memcmp = true;
+            is_special = true;
           }
-          if (get_label_info(info->l2)->op == __dfsan::fmemcmp) {
+          if (l2_op == __dfsan::fmemcmp || l2_op == __dfsan::fatoi) {
             value_cache_[info->l2] = val2 = info->op2.i;
-            is_memcmp = true;
+            is_special = true;
           }
-          if (!is_memcmp)
+          if (!is_special)
             throw z3::exception("value mismatch for ICmp");
         }
         value_cache_.emplace_back(
@@ -593,7 +642,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 #if FILTER_WRONG_AST
     if (value_cache_[label] != result) {
       // recalcuated value must match the recorded value
-      // fprintf(stderr, "WARNING: value mismatch for label %u: expected %ld, got %d\n",
+      // fprintf(stderr, "WARNING: value mismatch for label %u: expected %lu, got %d\n",
       //         label, value_cache_[label], result);
       // fprintf(stderr, "cond: %s\n", cond.to_string().c_str());
       // dump_value_cache(label);
@@ -853,6 +902,76 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
       } else {
         ret = nested_sat; // XXX: upgrade to nested_sat?
       }
+
+      // Check if model contains strlen symbols and optimize if needed
+      std::vector<std::pair<z3::expr, uint64_t>> strlen_vars; // (var, max_len)
+      const uint64_t MAX_STRLEN_EXTEND = 4096; // Reasonable max extension
+
+      for (unsigned i = 0; i < m.num_consts(); ++i) {
+        z3::func_decl decl = m.get_const_decl(i);
+        if (decl.name().kind() == Z3_STRING_SYMBOL &&
+            decl.name().str().find("strlen") == 0) {
+          uint32_t input, offset, null_from_input;
+          uint64_t orig_len;
+          if (sscanf(decl.name().str().c_str(), strlen_name_format,
+                     &input, &offset, &orig_len, &null_from_input) == 4) {
+            z3::expr strlen_var = context_.constant(decl.name(), decl.range());
+            uint64_t max_len = orig_len + MAX_STRLEN_EXTEND;
+            strlen_vars.emplace_back(strlen_var, max_len);
+          }
+        }
+      }
+
+      if (!strlen_vars.empty()) {
+        // Step 1: Try optimizer to minimize strlen values (no hard bounds)
+        z3::optimize opt(context_);
+        z3::params p(context_);
+        p.set("timeout", timeout);
+        opt.set(p);
+
+        for (const auto &expr : *task) {
+          opt.add(expr);
+        }
+        for (const auto &sv : strlen_vars) {
+          opt.minimize(sv.first);
+        }
+
+        bool use_optimized = false;
+        if (opt.check() == z3::sat) {
+          z3::model opt_model = opt.get_model();
+          // Check if all strlen values are within bounds
+          bool all_within_bounds = true;
+          for (const auto &sv : strlen_vars) {
+            z3::expr val = opt_model.eval(sv.first, true);
+            uint64_t strlen_val = val.get_numeral_uint64();
+            if (strlen_val > sv.second) {
+              all_within_bounds = false;
+              break;
+            }
+          }
+          if (all_within_bounds) {
+            m = opt_model;
+            use_optimized = true;
+          }
+        }
+
+        // Step 2: If optimization failed or exceeded bounds, try solver with bound constraints
+        if (!use_optimized) {
+          solver.push();
+          for (const auto &sv : strlen_vars) {
+            solver.add(z3::ule(sv.first, context_.bv_val(sv.second, sv.first.get_sort().bv_size())));
+          }
+          if (solver.check() == z3::sat) {
+            m = solver.get_model();
+          } else {
+            // Step 3: Unsolvable within bounds, skip
+            solver.pop();
+            return ret;
+          }
+          solver.pop();
+        }
+      }
+
       generate_solution(m, solutions);
     } else if (res == z3::unsat) {
       ret = opt_unsat;
@@ -883,7 +1002,7 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         uint32_t offset;
         sscanf(name.str().c_str(), input_name_format, &input, &offset);
         uint8_t value = (uint8_t)e.get_numeral_int();
-        solutions.push_back({input, offset, value});
+        solutions.emplace_back(input, offset, value);
       } else if (!name.str().compare("fsize")) {
         // FIXME:
         // off_t size = (off_t)e.get_numeral_int64();
@@ -900,8 +1019,12 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         uint32_t input;
         uint32_t offset;
         int base;
+        uint64_t orig_len;
         char buf[64];
-        sscanf(name.str().c_str(), atoi_name_format, &input, &offset, &base);
+        int parsed = sscanf(name.str().c_str(), atoi_name_format, &input, &offset, &base, &orig_len);
+        if (parsed != 4) {
+          continue;
+        }
         const char *format = NULL;
         switch (base) {
           case 2: format = "%lb"; break;
@@ -911,12 +1034,63 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
           default: throw z3::exception("unsupported base");
         }
         // XXX: assumed signed
-        int len = snprintf(buf, 64, format, (int)e.get_numeral_int());
-        // len excludes \0
-        for (int i = 0; i < len; ++i) {
-          solutions.push_back({input, offset + i, (uint8_t)buf[i]});
+        int new_len = snprintf(buf, 64, format, (int)e.get_numeral_int());
+
+        if ((uint64_t)new_len > orig_len) {
+          // Extending: insert extra digits
+          std::vector<uint8_t> insert_bytes(buf + orig_len, buf + new_len);
+          solutions.emplace_back(input, offset + (uint32_t)orig_len, std::move(insert_bytes));
+          // Set the common prefix
+          for (uint64_t i = 0; i < orig_len; ++i) {
+            solutions.emplace_back(input, offset + (uint32_t)i, (uint8_t)buf[i]);
+          }
+        } else if ((uint64_t)new_len < orig_len) {
+          // Shrinking: delete extra bytes
+          solutions.emplace_back(solution_op_t::DELETE, input,
+                                 offset + (uint32_t)new_len,
+                                 (uint32_t)(orig_len - new_len));
+          // Set the new digits
+          for (int i = 0; i < new_len; ++i) {
+            solutions.emplace_back(input, offset + i, (uint8_t)buf[i]);
+          }
+        } else {
+          // Same length: just set the digits
+          for (int i = 0; i < new_len; ++i) {
+            solutions.emplace_back(input, offset + i, (uint8_t)buf[i]);
+          }
         }
-        solutions.push_back({input, offset + len, 0});
+        // Set null terminator at the new end
+        solutions.emplace_back(input, offset + new_len, (uint8_t)0);
+      } else if (name.str().find("strlen") == 0) {
+        uint32_t input;
+        uint32_t offset;
+        uint64_t orig_len;
+        uint32_t null_from_input;
+        if (sscanf(name.str().c_str(), strlen_name_format,
+                   &input, &offset, &orig_len, &null_from_input) != 4) {
+          throw z3::exception("malformed strlen symbol name");
+        }
+
+        uint64_t target_len = e.get_numeral_uint64();
+
+        if (target_len > orig_len) {
+          // Extending: insert bytes to make the string longer
+          uint64_t extend_by = target_len - orig_len;
+          std::vector<uint8_t> fill_bytes(extend_by, 'A');
+          solutions.emplace_back(input, offset + (uint32_t)orig_len, std::move(fill_bytes));
+          // For plain strings (null_from_input=1), add null terminator at new end
+          // For structured formats (null_from_input=0), delimiter handles termination
+          if (null_from_input) {
+            solutions.emplace_back(input, offset + (uint32_t)target_len, (uint8_t)0);
+          }
+        } else if (target_len < orig_len) {
+          // Shrinking: delete bytes to make the string shorter
+          uint64_t shrink_by = orig_len - target_len;
+          solutions.emplace_back(solution_op_t::DELETE, input,
+                                 offset + (uint32_t)target_len,
+                                 (uint32_t)shrink_by);
+        }
+        // target_len == orig_len: no change needed
       } else {
         throw z3::exception("unknown symbol");
       }
