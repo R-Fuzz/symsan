@@ -178,7 +178,13 @@ enum operators {
   fsize     = last_llvm_op + 8,
   fatoi     = last_llvm_op + 9,
   fstrlen   = last_llvm_op + 10,
-  LastOp    = last_llvm_op + 11,
+  // string search ops (for chaining detection)
+  fstr_op_start = last_llvm_op + 11,
+  fstrchr   = last_llvm_op + 11,  // strchr/memchr
+  fstrrchr  = last_llvm_op + 12,  // strrchr/memrchr
+  fstrstr   = last_llvm_op + 13,  // strstr
+  fstr_op_end = last_llvm_op + 14,
+  LastOp    = last_llvm_op + 14,
 };
 
 enum predicate {

@@ -301,6 +301,7 @@ fun:toupper=custom
 fun:bcmp=custom
 fun:memchr=custom
 fun:memcmp=custom
+fun:memrchr=custom
 fun:strcasecmp=custom
 fun:strchr=custom
 fun:strcmp=custom
