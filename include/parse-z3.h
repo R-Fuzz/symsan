@@ -34,8 +34,12 @@ protected:
   z3::context &context_;
   const char* input_name_format;
   const char* atoi_name_format;
+  const char* strlen_name_format;
 
 private:
+  // Original input cache
+  std::vector<input_t> inputs_cache_;
+
   // fsize flag
   bool has_fsize;
 
@@ -43,7 +47,6 @@ private:
   using input_dep_set_t = std::unordered_set<offset_t, offset_hash>;
 
   // caches
-  std::vector<input_t> inputs_cache_;
   std::vector<uint32_t> tsize_cache_;
   std::vector<input_dep_set_t> deps_cache_;
   std::vector<Z3_ast> expr_cache_;
@@ -125,10 +128,35 @@ public:
       : Z3AstParser(base, size, context) {}
   ~Z3ParserSolver() {}
 
+  // Solution operation types
+  enum class solution_op_t : uint8_t {
+    SET,     // Set byte at offset to val
+    INSERT,  // Insert bytes at offset (shifts following bytes right)
+    DELETE   // Delete len bytes starting at offset (shifts following bytes left)
+  };
+
   struct solution_val {
-    uint32_t id;
-    uint32_t offset;
-    uint8_t val;
+    solution_op_t op;
+    uint32_t id;       // input id
+    uint32_t offset;   // position in file
+    union {
+      uint8_t val;     // for SET: the byte value
+      uint32_t len;    // for DELETE: number of bytes to delete
+    };
+    std::vector<uint8_t> data; // for INSERT: bytes to insert
+
+    // Constructors for convenience
+    // SET: set single byte at offset
+    solution_val(uint32_t id, uint32_t offset, uint8_t val)
+        : op(solution_op_t::SET), id(id), offset(offset), val(val) {}
+
+    // INSERT: insert bytes at offset
+    solution_val(uint32_t id, uint32_t offset, std::vector<uint8_t> data)
+        : op(solution_op_t::INSERT), id(id), offset(offset), data(std::move(data)) {}
+
+    // DELETE: delete len bytes at offset
+    solution_val(solution_op_t op, uint32_t id, uint32_t offset, uint32_t len)
+        : op(op), id(id), offset(offset), len(len) {}
   };
 
   enum solving_status {

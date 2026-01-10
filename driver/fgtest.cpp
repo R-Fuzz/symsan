@@ -10,6 +10,7 @@ extern "C" {
 
 #include "parse-z3.h"
 
+#include <algorithm>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,27 +52,64 @@ static z3::context __z3_context;
 symsan::Z3ParserSolver *__z3_parser = nullptr;
 
 static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
+  using op_t = symsan::Z3ParserSolver::solution_op_t;
+
+  // Build the new input in memory to handle INSERT/DELETE properly
+  std::vector<uint8_t> new_input(input_buf, input_buf + input_size);
+
+  // Sort solutions by offset in descending order so INSERT/DELETE don't
+  // invalidate subsequent offsets
+  std::vector<size_t> order(solutions.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&solutions](size_t a, size_t b) {
+    return solutions[a].offset > solutions[b].offset;
+  });
+
+  for (size_t idx : order) {
+    const auto& sol = solutions[idx];
+    switch (sol.op) {
+      case op_t::SET:
+        if (sol.offset < new_input.size()) {
+          AOUT("SET offset %d = %x\n", sol.offset, sol.val);
+          new_input[sol.offset] = sol.val;
+        }
+        break;
+
+      case op_t::INSERT:
+        if (sol.offset <= new_input.size()) {
+          AOUT("INSERT %zu bytes at offset %d\n", sol.data.size(), sol.offset);
+          new_input.insert(new_input.begin() + sol.offset,
+                          sol.data.begin(), sol.data.end());
+        }
+        break;
+
+      case op_t::DELETE:
+        if (sol.offset < new_input.size()) {
+          size_t del_len = std::min((size_t)sol.len,
+                                    new_input.size() - sol.offset);
+          AOUT("DELETE %zu bytes at offset %d\n", del_len, sol.offset);
+          new_input.erase(new_input.begin() + sol.offset,
+                         new_input.begin() + sol.offset + del_len);
+        }
+        break;
+    }
+  }
+
+  // Write the new input to file
   char path[PATH_MAX];
   snprintf(path, PATH_MAX, "%s/id-%d-%d-%d", __output_dir,
            __instance_id, __session_id, __current_index++);
-  int fd = open(path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
+  int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
   if (fd == -1) {
     AOUT("failed to open new input file for write");
     return;
   }
 
-  if (write(fd, input_buf, input_size) == -1) {
-    AOUT("failed to copy original input\n");
-    close(fd);
-    return;
-  }
-  AOUT("generate #%d output\n", __current_index - 1);
+  AOUT("generate #%d output (size: %zu -> %zu)\n",
+       __current_index - 1, input_size, new_input.size());
 
-  for (auto const& sol : solutions) {
-    uint8_t value = sol.val;
-    AOUT("offset %d = %x\n", sol.offset, value);
-    lseek(fd, sol.offset, SEEK_SET);
-    write(fd, &value, sizeof(value));
+  if (write(fd, new_input.data(), new_input.size()) == -1) {
+    AOUT("failed to write new input\n");
   }
 
   close(fd);
