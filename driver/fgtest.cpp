@@ -46,6 +46,7 @@ static const char* __output_dir = ".";
 static uint32_t __instance_id = 0;
 static uint32_t __session_id = 0;
 static uint32_t __current_index = 0;
+static int __enum_gep = 0;  // GEP enumeration enabled by default
 static z3::context __z3_context;
 
 // z3parser
@@ -149,7 +150,7 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
 
   std::vector<uint64_t> tasks;
   if (__z3_parser->parse_gep(ptr_label, ptr, index_label, index, num_elems,
-                             elem_size, current_offset, true, tasks)) {
+                             elem_size, current_offset, __enum_gep, tasks)) {
     AOUT("WARNING: failed to parse gep %d @%p\n", index_label, addr);
     return;
   }
@@ -224,6 +225,14 @@ int main(int argc, char* const argv[]) {
       solve_ub_opt += strlen("solve_ub="); // skip "solve_ub="
       if (strcmp(solve_ub_opt, "1") == 0 || strcmp(solve_ub_opt, "true") == 0)
         solve_ub = 1;
+    }
+
+    // check if GEP enumeration is disabled
+    char *enum_gep_opt = strstr(options, "enum_gep=");
+    if (enum_gep_opt) {
+      enum_gep_opt += strlen("enum_gep="); // skip "enum_gep="
+      if (strncmp(enum_gep_opt, "0", 1) == 0 || strncmp(enum_gep_opt, "false", 5) == 0)
+        __enum_gep = 0;
     }
   }
 
