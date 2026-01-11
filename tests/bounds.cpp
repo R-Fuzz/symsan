@@ -6,10 +6,10 @@
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out solve_ub=1" %fgtest %t.fg %t.bin
 // RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-0 2>&1 FileCheck %s --check-prefix=CHECK-A2
 // RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-1 2>&1 FileCheck %s --check-prefix=CHECK-A2
+// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-2 2>&1 FileCheck %s --check-prefix=CHECK-B-3
 // RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-3 2>&1 FileCheck %s --check-prefix=CHECK-B-3
-// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-4 2>&1 FileCheck %s --check-prefix=CHECK-B-3
-// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-7 2>&1 FileCheck %s --check-prefix=CHECK-C-4
-// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-8 2>&1 FileCheck %s --check-prefix=CHECK-C-4
+// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-4 2>&1 FileCheck %s --check-prefix=CHECK-C-4
+// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-5 2>&1 FileCheck %s --check-prefix=CHECK-C-4
 
 #include <stdint.h>
 #include <stdio.h>
