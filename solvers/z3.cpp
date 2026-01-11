@@ -388,6 +388,23 @@ __taint_trace_offset(dfsan_label offset_label, int64_t offset, unsigned size) {
   __solved_labels.insert(offset_label);
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_memcmp(dfsan_label label) {
+  if (label == 0)
+    return;
+
+  dfsan_label_info *info = dfsan_get_label_info(label);
+
+  AOUT("tainted memcmp: %d, size: %d\n", label, info->size);
+
+  // If both operands are symbolic, no concrete content to cache
+  if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
+    return;
+
+  // Cache the concrete content for later solving, concrete oprand is always in op1
+  __z3_parser->record_memcmp(label, (uint8_t*)info->op1.i, info->size);
+}
+
 extern "C" void InitializeSolver() {
   __output_dir = flags().output_dir;
   __instance_id = flags().instance_id;
