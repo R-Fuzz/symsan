@@ -232,8 +232,10 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     if (l2 >= CONST_OFFSET) internal_memcpy(&op2, (void*)op2, len);
   } else if (op < __dfsan::fmemcmp &&
              op != __dfsan::Alloca &&
+             op != __dfsan::PtrToInt &&
              (op & 0xff) != __dfsan::ICmp) {
-    // Not a higher-order op and not Alloca/ICmp - zero out for symbolic operands
+    // Not a higher-order op and not Alloca/ICmp/PtrToInt - zero out for symbolic operands
+    // PtrToInt needs op1 preserved to compute base pointer for string ops
     if (l1 >= CONST_OFFSET) op1 = 0;
     if (l2 >= CONST_OFFSET) op2 = 0;
   }

@@ -368,6 +368,7 @@ class Taint {
   IntegerType *PrimitiveShadowTy;
   PointerType *PrimitiveShadowPtrTy;
   IntegerType *IntptrTy;
+  PointerType *VoidPtrTy;
   ConstantInt *ZeroPrimitiveShadow;
   ConstantInt *UninitializedPrimitiveShadow;
   ConstantInt *ShadowPtrAndMask;
@@ -390,6 +391,7 @@ class Taint {
   FunctionType *TaintTraceSelectFnTy;
   FunctionType *TaintTraceIndirectCallFnTy;
   FunctionType *TaintTraceGEPFnTy;
+  FunctionType *TaintTraceGEPPtrFnTy;
   FunctionType *TaintPushStackFrameFnTy;
   FunctionType *TaintPopStackFrameFnTy;
   FunctionType *TaintTraceAllocaFnTy;
@@ -416,6 +418,7 @@ class Taint {
   FunctionCallee TaintTraceSelectFn;
   FunctionCallee TaintTraceIndirectCallFn;
   FunctionCallee TaintTraceGEPFn;
+  FunctionCallee TaintTraceGEPPtrFn;
   FunctionCallee TaintPushStackFrameFn;
   FunctionCallee TaintPopStackFrameFn;
   FunctionCallee TaintTraceAllocaFn;
@@ -930,6 +933,7 @@ bool Taint::initializeModule(Module &M) {
   PrimitiveShadowTy = IntegerType::get(*Ctx, ShadowWidthBits);
   PrimitiveShadowPtrTy = PointerType::getUnqual(PrimitiveShadowTy);
   IntptrTy = DL.getIntPtrType(*Ctx);
+  VoidPtrTy = PointerType::getUnqual(Int8Ty);
   ZeroPrimitiveShadow = ConstantInt::getSigned(PrimitiveShadowTy, 0);
   UninitializedPrimitiveShadow = ConstantInt::getSigned(PrimitiveShadowTy, -1);
   ShadowPtrMul = ConstantInt::get(IntptrTy, ShadowWidthBytes);
@@ -984,6 +988,9 @@ bool Taint::initializeModule(Module &M) {
       Int64Ty, Int64Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceGEPFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceGEPArgs, false);
+  // __taint_trace_gep_ptr(base_label, offset) -> new_label
+  TaintTraceGEPPtrFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), { PrimitiveShadowTy, VoidPtrTy, VoidPtrTy }, false);
   TaintPushStackFrameFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), {}, false);
   TaintPopStackFrameFnTy = FunctionType::get(
@@ -1288,6 +1295,13 @@ void Taint::initializeCallbackFunctions(Module &M) {
   {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    TaintTraceGEPPtrFn =
+        Mod->getOrInsertFunction("__taint_trace_gep_ptr", TaintTraceGEPPtrFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     TaintPushStackFrameFn =
         Mod->getOrInsertFunction("__taint_push_stack_frame", TaintPushStackFrameFnTy, AL);
   }
@@ -1377,6 +1391,8 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintTraceIndirectCallFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintTraceGEPFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintTraceGEPPtrFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintPushStackFrameFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -2505,6 +2521,13 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
     // propagate bounds info
     setShadow(I, Bounds);
   }
+
+  // For constant offset GEPs on string op pointers, create fstr_off label
+  // to track the offset (e.g., sep + 1 where sep is from strchr)
+  if (CurrentOffset != 0 && !TT.isZeroShadow(Bounds)) {
+    IRBuilder<> IRB(I->getNextNode());
+    Bounds = IRB.CreateCall(TT.TaintTraceGEPPtrFn, {Bounds, I, Base});
+  }
 }
 
 void TaintVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
@@ -2915,6 +2938,7 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       LoadInst *LabelLoad =
           IRB.CreateLoad(TF.TT.getShadowTy(RetTy), TF.LabelReturnAlloca);
       TF.setShadow(CustomCI, LabelLoad);
+
     }
 
     CI->replaceAllUsesWith(CustomCI);

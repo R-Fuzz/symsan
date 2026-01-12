@@ -63,6 +63,172 @@ SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE void f(__VA_ARGS__);
 
 static off_t current_stdin_offset = 0;
 
+// Runtime map to track fsubstr labels by buffer address
+// This allows strcmp to find fsubstr even when buffer content is overwritten
+// Use a simple fixed-size array to avoid STL dependencies in runtime
+static const uptr FSUBSTR_MAP_SIZE = 64;
+static struct {
+  uptr addr;
+  dfsan_label label;
+} fsubstr_map[FSUBSTR_MAP_SIZE];
+static uptr fsubstr_map_count = 0;
+
+static inline void set_fsubstr_label(void *addr, dfsan_label label) {
+  AOUT("set_fsubstr_label: addr=%p, label=%u\n", addr, label);
+  // Check if already exists
+  for (uptr i = 0; i < fsubstr_map_count; i++) {
+    if (fsubstr_map[i].addr == (uptr)addr) {
+      fsubstr_map[i].label = label;
+      return;
+    }
+  }
+  // Add new entry if space available
+  if (fsubstr_map_count < FSUBSTR_MAP_SIZE) {
+    fsubstr_map[fsubstr_map_count].addr = (uptr)addr;
+    fsubstr_map[fsubstr_map_count].label = label;
+    fsubstr_map_count++;
+  }
+}
+
+static inline dfsan_label get_fsubstr_label(const void *addr) {
+  for (uptr i = 0; i < fsubstr_map_count; i++) {
+    if (fsubstr_map[i].addr == (uptr)addr) {
+      AOUT("get_fsubstr_label: addr=%p, found label=%u\n", addr, fsubstr_map[i].label);
+      return fsubstr_map[i].label;
+    }
+  }
+  AOUT("get_fsubstr_label: addr=%p, not found\n", addr);
+  return 0;
+}
+
+// Check if an op is a string operation (fstr_op_start to fstr_op_end)
+static inline bool is_string_op(uint16_t op) {
+  return op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end;
+}
+
+// Helper: Find the first (base) input byte label from a content label.
+// Walks through Concat chains and Load operations to find the starting input.
+// Returns the base label, or 0 if not found.
+static dfsan_label get_base_input_label(dfsan_label label) {
+  if (label < CONST_OFFSET) return 0;
+
+  dfsan_label_info *info = dfsan_get_label_info(label);
+
+  // Base input label has op == 0
+  if (info->op == 0) return label;
+
+  // For Concat (op 72), walk left (l1) to find the base
+  if (info->op == __dfsan::Concat) {
+    return get_base_input_label(info->l1);
+  }
+
+  // For Load (op 32), l1 is the starting label
+  if (info->op == __dfsan::Load) {
+    return info->l1;
+  }
+
+  // For other ops, try l1
+  if (info->l1 >= CONST_OFFSET) {
+    return get_base_input_label(info->l1);
+  }
+
+  return 0;
+}
+
+// Helper: Find if a label derives from a string op (fstrchr, fstrrchr, fstrstr)
+// by walking through PtrToInt, Sub, Add operations.
+// Returns the string op label if found, 0 otherwise.
+static dfsan_label find_string_op_source(dfsan_label label) {
+  if (label < CONST_OFFSET) return 0;
+
+  dfsan_label_info *info = dfsan_get_label_info(label);
+  uint16_t op = info->op;
+
+  // Check if this is directly a string op
+  if (is_string_op(op)) {
+    return label;
+  }
+
+  // Follow through PtrToInt, Sub, Add to find the source string op
+  if (op == __dfsan::PtrToInt || op == __dfsan::Sub || op == __dfsan::Add) {
+    // Recursively check l1 (the primary operand)
+    if (info->l1 >= CONST_OFFSET) {
+      dfsan_label result = find_string_op_source(info->l1);
+      if (result != 0) return result;
+    }
+    // For Sub/Add, also check l2
+    if ((op == __dfsan::Sub || op == __dfsan::Add) && info->l2 >= CONST_OFFSET) {
+      dfsan_label result = find_string_op_source(info->l2);
+      if (result != 0) return result;
+    }
+  }
+
+  return 0;
+}
+
+// Unified method to get string label with explicit length
+// Checks (in order):
+// 1. Runtime fsubstr_map (for strncpy with symbolic length)
+// 2. Pointer label itself being a string op (for chaining)
+// 3. If n_label derives from a string op, create fsubstr to preserve constraint
+// 4. Buffer content labels via dfsan_read_label
+static inline dfsan_label get_str_label_n(const void *s, dfsan_label s_label,
+                                           size_t n, dfsan_label n_label) {
+  // 1. Check runtime fsubstr_map first (highest priority)
+  dfsan_label fsubstr = get_fsubstr_label(s);
+  if (fsubstr != 0) {
+    return fsubstr;
+  }
+
+  // 2. Check if pointer label itself is a string op (for chaining)
+  if (s_label >= CONST_OFFSET) {
+    dfsan_label_info *info = dfsan_get_label_info(s_label);
+    if (info && is_string_op(info->op)) {
+      return s_label;
+    }
+  }
+
+  // 3. Check if n_label derives from a string op (e.g., ptr arithmetic on memchr result)
+  // If so, create fsubstr to represent substr(content, 0, idx) where idx is the string op result
+  // IMPORTANT: Do this even when n=0 to preserve the symbolic constraint!
+  dfsan_label str_op_label = find_string_op_source(n_label);
+  if (str_op_label != 0) {
+    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
+    dfsan_label str_op_content = str_op_info->l1;
+
+    if (str_op_content >= CONST_OFFSET) {
+      // Get content label from buffer if available for same-buffer verification
+      dfsan_label content_label = (n > 0) ? dfsan_read_label(s, n) : 0;
+
+      // Verify same underlying buffer only if content is available
+      bool same_buffer = true;
+      if (content_label != 0) {
+        dfsan_label src_base = get_base_input_label(content_label);
+        dfsan_label str_op_base = get_base_input_label(str_op_content);
+        same_buffer = (src_base != 0 && src_base == str_op_base);
+      }
+      // When n=0, trust that n_label derives from same buffer
+      // (the alternative is losing the constraint entirely)
+
+      if (same_buffer) {
+        // Create fsubstr: substr(str_op_content, 0, str_op_label)
+        // l1 = original content, l2 = string op label (index), op1 = concrete n
+        return dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
+                           sizeof(void*) * 8, (uint64_t)n, 0);
+      }
+    }
+  }
+
+  // 4. Fall back to reading buffer content labels
+  return dfsan_read_label(s, n);
+}
+
+// Unified method to get string label for null-terminated strings
+// Uses strlen to determine length
+static inline dfsan_label get_str_label(const char *s, dfsan_label s_label) {
+  return get_str_label_n(s, s_label, strlen(s) + 1, 0);
+}
+
 static inline dfsan_label get_label_for(int fd, off_t offset) {
   // check if fd is stdin, if so, the label hasn't been pre-allocated
   if (is_stdin_taint() || (fd ==0 && flags().force_stdin))
@@ -197,64 +363,30 @@ __dfsw_lstat(const char *path, struct stat *buf, dfsan_label path_label,
   return ret;
 }
 
-// Helper: Find the first (base) input byte label from a content label.
-// Walks through Concat chains and Load operations to find the starting input.
-// Returns the base label, or 0 if not found.
-static dfsan_label get_base_input_label(dfsan_label label) {
-  if (label < CONST_OFFSET) return 0;
+// Create a label for string op + constant offset (for pointer arithmetic like sep + 1)
+// If base_label is a string op, returns a new fstr_off label; otherwise returns base_label
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_trace_gep_ptr(dfsan_label base_label, char *result, char *base) {
+  if (base_label < CONST_OFFSET) return;
 
-  dfsan_label_info *info = dfsan_get_label_info(label);
-
-  // Base input label has op == 0
-  if (info->op == 0) return label;
-
-  // For Concat (op 72), walk left (l1) to find the base
-  if (info->op == __dfsan::Concat) {
-    return get_base_input_label(info->l1);
+  // Check if base_label is or derives from a string op
+  dfsan_label str_op_label = find_string_op_source(base_label);
+  if (str_op_label == 0) {
+    // Not a string op - return base label unchanged
+    return;
   }
 
-  // For Load (op 32), l1 is the starting label
-  if (info->op == __dfsan::Load) {
-    return info->l1;
-  }
+  // Create fstr_off label: l1=str_op_label, op1=offset
+  // This represents the content at (string_op_position + offset)
+  uint64_t offset = (uint64_t)(result - base);
+  dfsan_label off_label = dfsan_union(str_op_label, 0, __dfsan::fstr_off,
+                                       sizeof(void*) * 8,
+                                       (uint64_t)offset, 0);
+  AOUT("gep_ptr: base=%u, str_op=%u, offset=%ld, result=%u\n",
+       base_label, str_op_label, offset, off_label);
 
-  // For other ops, try l1
-  if (info->l1 >= CONST_OFFSET) {
-    return get_base_input_label(info->l1);
-  }
-
-  return 0;
-}
-
-// Helper: Find if a label derives from a string op (fstrchr, fstrrchr, fstrstr)
-// by walking through PtrToInt, Sub, Add operations.
-// Returns the string op label if found, 0 otherwise.
-static dfsan_label find_string_op_source(dfsan_label label) {
-  if (label < CONST_OFFSET) return 0;
-
-  dfsan_label_info *info = dfsan_get_label_info(label);
-  uint16_t op = info->op;
-
-  // Check if this is directly a string op
-  if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-    return label;
-  }
-
-  // Follow through PtrToInt, Sub, Add to find the source string op
-  if (op == __dfsan::PtrToInt || op == __dfsan::Sub || op == __dfsan::Add) {
-    // Recursively check l1 (the primary operand)
-    if (info->l1 >= CONST_OFFSET) {
-      dfsan_label result = find_string_op_source(info->l1);
-      if (result != 0) return result;
-    }
-    // For Sub/Add, also check l2
-    if ((op == __dfsan::Sub || op == __dfsan::Add) && info->l2 >= CONST_OFFSET) {
-      dfsan_label result = find_string_op_source(info->l2);
-      if (result != 0) return result;
-    }
-  }
-
-  return 0;
+  // record the label
+  set_fsubstr_label(result, off_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
@@ -263,18 +395,9 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
                                                   dfsan_label *ret_label) {
   char *ret = strchr(s, c);
 
-  // Check if s_label is from a previous string op (for chaining)
-  // Otherwise read content label - s_label may be Alloca bounds
-  dfsan_label src_label = 0;
-  if (s_label != 0) {
-    uint16_t op = dfsan_get_label_info(s_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      src_label = s_label;  // Reuse for chaining
-    }
-  }
-  if (src_label == 0) {
-    src_label = dfsan_read_label(s, strlen(s) + 1);
-  }
+  // Use unified get_str_label to get source label
+  // Handles fsubstr_map, pointer label fsubstr, and buffer content
+  dfsan_label src_label = get_str_label(s, s_label);
 
   // Create label if source or char is tainted
   if (src_label != 0 || c_label != 0) {
@@ -300,32 +423,11 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
   const char *ret = strpbrk(s, accept);
   size_t accept_len = strlen(accept);
 
-  // Check if s_label is from a previous string op (for chaining)
-  // Otherwise read content label
-  dfsan_label src_label = 0;
-  if (s_label != 0) {
-    uint16_t op = dfsan_get_label_info(s_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      src_label = s_label;  // Reuse for chaining
-    }
-  }
-  if (src_label == 0) {
-    src_label = dfsan_read_label(s, strlen(s) + 1);
-  }
+  // Use unified get_str_label for source string
+  dfsan_label src_label = get_str_label(s, s_label);
 
-  // Check if accept is tainted (skip Alloca bounds labels)
-  dfsan_label real_accept_label = 0;
-  if (accept_label != 0) {
-    uint16_t op = dfsan_get_label_info(accept_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      real_accept_label = accept_label;  // Reuse for chaining
-    } else if (op != __dfsan::Alloca) {
-      real_accept_label = accept_label;
-    }
-  }
-  if (real_accept_label == 0) {
-    real_accept_label = dfsan_read_label(accept, accept_len + 1);
-  }
+  // Use unified get_str_label for accept string
+  dfsan_label real_accept_label = get_str_label(accept, accept_label);
 
   if (src_label != 0 || real_accept_label != 0) {
     int64_t found_pos = ret ? (ret - s) : -1;
@@ -372,8 +474,56 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
   __taint_check_bounds(s1_label, (uptr)s1, n_label, n);
   __taint_check_bounds(s2_label, (uptr)s2, n_label, n);
   int ret = memcmp(s1, s2, n);
-  //AOUT("memcmp: n = %lu\n", n);
-  *ret_label = __taint_memcmp(s1, s2, n);
+
+  // Check for fsubstr labels
+  dfsan_label l1 = get_str_label_n(s1, s1_label, n, n_label);
+  dfsan_label l2 = get_str_label_n(s2, s2_label, n, n_label);
+
+  if (l1 == 0 && l2 == 0) {
+    *ret_label = 0;
+    return ret;
+  }
+
+  // Check if n_label derives from a string op (e.g., strchr index)
+  dfsan_label str_op_label = n_label ? find_string_op_source(n_label) : 0;
+
+  if (str_op_label != 0) {
+    // n is symbolic from string op - create fsubstr for matching buffer
+    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
+    dfsan_label str_op_content = str_op_info->l1;
+
+    // Check which buffer matches the string op's content
+    if (l1 >= CONST_OFFSET && str_op_content >= CONST_OFFSET) {
+      dfsan_label l1_base = get_base_input_label(l1);
+      dfsan_label str_op_base = get_base_input_label(str_op_content);
+      if (l1_base != 0 && l1_base == str_op_base) {
+        l1 = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
+                          sizeof(void*) * 8, (uint64_t)n, 0);
+      }
+    }
+    if (l2 >= CONST_OFFSET && str_op_content >= CONST_OFFSET) {
+      dfsan_label l2_base = get_base_input_label(l2);
+      dfsan_label str_op_base = get_base_input_label(str_op_content);
+      if (l2_base != 0 && l2_base == str_op_base) {
+        l2 = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
+                          sizeof(void*) * 8, (uint64_t)n, 0);
+      }
+    }
+  }
+
+  // Check if either side is a string op - use string theory comparison
+  bool l1_is_string_op = (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
+  bool l2_is_string_op = (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
+
+  if (l1_is_string_op || l2_is_string_op) {
+    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+                                   (uint64_t)s1, (uint64_t)s2);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
+  } else {
+    // Normal case: use fmemcmp
+    *ret_label = __taint_memcmp(s1, s2, n);
+  }
   return ret;
 }
 
@@ -385,8 +535,30 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   __taint_check_bounds(s1_label, (uptr)s1, n_label, n);
   __taint_check_bounds(s2_label, (uptr)s2, n_label, n);
   int ret = bcmp(s1, s2, n);
-  //AOUT("bcmp: n = %lu\n", n);
-  *ret_label = __taint_memcmp(s1, s2, n);
+
+  // Check for fsubstr labels (from strncpy with symbolic length)
+  dfsan_label l1 = get_str_label_n(s1, s1_label, n, n_label);
+  dfsan_label l2 = get_str_label_n(s2, s2_label, n, n_label);
+
+  if (l1 == 0 && l2 == 0) {
+    *ret_label = 0;
+    return ret;
+  }
+
+  // Check if either side is a string op - use string theory comparison
+  bool l1_is_string_op = (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
+  bool l2_is_string_op = (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
+
+  if (l1_is_string_op || l2_is_string_op) {
+    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
+    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+                                   (uint64_t)s1, (uint64_t)s2);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
+  } else {
+    // Normal case: use fmemcmp
+    *ret_label = __taint_memcmp(s1, s2, n);
+  }
   return ret;
 }
 
@@ -395,10 +567,34 @@ dfsan_label __taint_strcmp(const char *s1, const char *s2) {
   size_t n = strlen(s1) + 1; // including tailing '\0'
   if (dfsan_get_label(s1) != 0)
     n = strlen(s2) + 1; // including tailing '\0'
-  dfsan_label l1 = dfsan_read_label(s1, n);
-  dfsan_label l2 = dfsan_read_label(s2, n);
-  // ugly hack ...
-  dfsan_label ret = dfsan_union(l1, l2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
+
+  // Check if first byte of s1 or s2 has an fsubstr label
+  // If so, use it directly instead of dfsan_read_label to avoid mixing String/BV sorts
+  dfsan_label l1 = 0;
+  dfsan_label s1_first = dfsan_get_label((char*)s1);
+  if (s1_first >= CONST_OFFSET) {
+    dfsan_label_info *info = dfsan_get_label_info(s1_first);
+    if (info->op == __dfsan::fsubstr) {
+      l1 = s1_first;  // Use fsubstr directly
+    }
+  }
+  if (l1 == 0) {
+    l1 = dfsan_read_label(s1, n);
+  }
+
+  dfsan_label l2 = 0;
+  dfsan_label s2_first = dfsan_get_label((char*)s2);
+  if (s2_first >= CONST_OFFSET) {
+    dfsan_label_info *info = dfsan_get_label_info(s2_first);
+    if (info->op == __dfsan::fsubstr) {
+      l2 = s2_first;  // Use fsubstr directly
+    }
+  }
+  if (l2 == 0) {
+    l2 = dfsan_read_label(s2, n);
+  }
+
+  dfsan_label ret = dfsan_union(l1, l2, __dfsan::fstrcmp, n, (uint64_t)s1, (uint64_t)s2);
   if (ret) __taint_trace_memcmp(ret);
   return ret;
 }
@@ -414,9 +610,30 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
   CALL_WEAK_INTERCEPTOR_HOOK(dfsan_weak_hook_strcmp, GET_CALLER_PC(), s1, s2,
                              s1_label, s2_label);
   int ret = strcmp(s1, s2);
-  // check which one is tainted
-  //AOUT("strcmp: %s <=> %s\n", s1, s2);
-  *ret_label = __taint_strcmp(s1, s2);
+
+  AOUT("strcmp: s1=%p s2=%p s1_label=%u s2_label=%u\n", s1, s2, s1_label, s2_label);
+
+  // Use unified get_str_label to get labels for both strings
+  // Handles fsubstr_map, pointer label fsubstr, and buffer content
+  dfsan_label l1 = get_str_label(s1, s1_label);
+  dfsan_label l2 = get_str_label(s2, s2_label);
+  AOUT("strcmp: l1=%u l2=%u\n", l1, l2);
+
+  if (l1 == 0 && l2 == 0) {
+    *ret_label = 0;
+  } else {
+    // Determine length for comparison (use concrete side if one is fsubstr)
+    size_t n = strlen(s1) + 1;
+    dfsan_label s1_fsubstr = get_fsubstr_label(s1);
+    if (s1_fsubstr != 0)
+      n = strlen(s2) + 1;  // use concrete side for length
+
+    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
+    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+                                   (uint64_t)s1, (uint64_t)s2);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
+  }
   return ret;
 }
 
@@ -425,9 +642,24 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
                   dfsan_label s2_label, dfsan_label *ret_label) {
   int ret = strcasecmp(s1, s2);
   // doing an optimistic solving, hoping we can get the same case
-  // check which one is tainted
-  //AOUT("strcasecmp: %s <=> %s\n", s1, s2);
-  *ret_label = __taint_strcmp(s1, s2);
+  // Use unified get_str_label for fsubstr support
+  dfsan_label l1 = get_str_label(s1, s1_label);
+  dfsan_label l2 = get_str_label(s2, s2_label);
+
+  if (l1 == 0 && l2 == 0) {
+    *ret_label = 0;
+  } else {
+    size_t n = strlen(s1) + 1;
+    dfsan_label s1_fsubstr = get_fsubstr_label(s1);
+    if (s1_fsubstr != 0)
+      n = strlen(s2) + 1;
+
+    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
+    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+                                   (uint64_t)s1, (uint64_t)s2);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
+  }
   return ret;
 }
 
@@ -440,8 +672,8 @@ dfsan_label __taint_strncmp(const char *s1, const char *s2, size_t n) {
     n = strlen(s2) + 1;
   dfsan_label l1 = dfsan_read_label(s1, n);
   dfsan_label l2 = dfsan_read_label(s2, n);
-  // ugly hack ...
-  dfsan_label ret = dfsan_union(l1, l2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
+  // Use string theory comparison (fstrcmp) for all strncmp
+  dfsan_label ret = dfsan_union(l1, l2, __dfsan::fstrcmp, n, (uint64_t)s1, (uint64_t)s2);
   if (ret) __taint_trace_memcmp(ret);
   return ret;
 }
@@ -465,8 +697,25 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
                              n, s1_label, s2_label, n_label);
 
   int ret = strncmp(s1, s2, n);
-  //AOUT("strncmp: %s <=> %s\n", s1, s2);
-  *ret_label = __taint_strncmp(s1, s2, n);
+
+  // Use unified get_str_label for fsubstr support
+  dfsan_label l1 = get_str_label(s1, s1_label);
+  dfsan_label l2 = get_str_label(s2, s2_label);
+
+  if (l1 == 0 && l2 == 0) {
+    *ret_label = 0;
+  } else {
+    // Adjust n for shorter strings when one side is concrete
+    if (l1 == 0 && strlen(s1) < (n - 1))
+      n = strlen(s1) + 1;
+    if (l2 == 0 && strlen(s2) < (n - 1))
+      n = strlen(s2) + 1;
+
+    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+                                   (uint64_t)s1, (uint64_t)s2);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
+  }
   return ret;
 }
 
@@ -478,11 +727,27 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
     *ret_label = 0;
     return 0;
   }
-  
+
   int ret = strncasecmp(s1, s2, n);
-  // doing an optimistic solving here too, hoping the case can be the seame
-  //AOUT("strncmp: %s <=> %s\n", s1, s2);
-  *ret_label = __taint_strncmp(s1, s2, n);
+  // doing an optimistic solving here too, hoping the case can be the same
+  // Use unified get_str_label for fsubstr support
+  dfsan_label l1 = get_str_label(s1, s1_label);
+  dfsan_label l2 = get_str_label(s2, s2_label);
+
+  if (l1 == 0 && l2 == 0) {
+    *ret_label = 0;
+  } else {
+    // Adjust n for shorter strings when one side is concrete
+    if (l1 == 0 && strlen(s1) < (n - 1))
+      n = strlen(s1) + 1;
+    if (l2 == 0 && strlen(s2) < (n - 1))
+      n = strlen(s2) + 1;
+
+    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+                                   (uint64_t)s1, (uint64_t)s2);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
+  }
   return ret;
 }
 
@@ -638,13 +903,63 @@ __dfsw_strncpy(char *s1, const char *s2, size_t n, dfsan_label s1_label,
                dfsan_label s2_label, dfsan_label n_label,
                dfsan_label *ret_label) {
   size_t len = strlen(s2);
+  size_t copy_len = len < n ? len : n;
+
   if (n_label)
     __taint_solve_bounds(s1_label, (uint64_t)s1, n_label, n, 0, 1, 0, 0);
+
+  // Check if n_label derives from a string op (e.g., strchr index)
+  dfsan_label str_op_label = n_label ? find_string_op_source(n_label) : 0;
+  bool created_fsubstr = false;
+
+  if (str_op_label != 0) {
+    // Get the content label from the string op
+    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
+    dfsan_label str_op_content = str_op_info->l1;  // content from strchr
+
+    // Verify buffers match: str_op searched the same buffer we're copying
+    // When copy_len = 0, we can't read from s2, so trust str_op_content
+    bool buffers_match = false;
+    if (str_op_content >= CONST_OFFSET) {
+      if (copy_len > 0) {
+        dfsan_label src_content = dfsan_read_label(s2, copy_len);
+        if (src_content >= CONST_OFFSET) {
+          dfsan_label src_base = get_base_input_label(src_content);
+          dfsan_label str_op_base = get_base_input_label(str_op_content);
+          buffers_match = (src_base != 0 && src_base == str_op_base);
+        }
+      } else {
+        // copy_len = 0: trust the str_op_content (empty substring case)
+        buffers_match = true;
+      }
+    }
+
+    if (buffers_match) {
+      // Create fsubstr: represents substr(src, 0, len) where len is symbolic
+      // Use str_op_content (full haystack) for proper string theory solving
+      dfsan_label substr_label = dfsan_union(str_op_content, str_op_label,
+                                              __dfsan::fsubstr,
+                                              sizeof(void*) * 8,
+                                              (uint64_t)n, 0);
+
+      // Store fsubstr label in runtime map keyed by destination address
+      // This survives buffer content being overwritten (e.g., key[len] = '\0')
+      set_fsubstr_label(s1, substr_label);
+
+      *ret_label = s1_label;
+    }
+  }
+
+  // Normal case: copy byte-by-byte labels
   if (len < n) {
-    dfsan_memcpy(s1, s2, len+1);
-    dfsan_memset(s1+len+1, 0, 0, n-len-1);
+    dfsan_memcpy(s1, s2, len + 1);
   } else {
     dfsan_memcpy(s1, s2, n);
+  }
+
+  // Handle padding (strncpy pads with zeros if len < n)
+  if (len < n) {
+    dfsan_memset(s1 + len + 1, 0, 0, n - len - 1);
   }
 
   *ret_label = s1_label;
@@ -1015,11 +1330,23 @@ char *__dfsw_strcpy(char *dest, const char *src, dfsan_label dst_label,
   size_t len = strlen(src) + 1;
   __taint_check_bounds(dst_label, (uptr)dest, 0, len);
   char *ret = strcpy(dest, src);
+  *ret_label = dst_label;
+
+  // Use get_str_label to properly get the source label
+  // This handles fsubstr_map, pointer label string ops, and buffer content
+  dfsan_label real_src_label = get_str_label(src, src_label);
+  AOUT("strcpy: src='%p', src_label=%d, real_src_label=%d\n", src, src_label, real_src_label);
+
+  if (real_src_label != 0) {
+    // Store the label in runtime map keyed by destination address
+    set_fsubstr_label(dest, real_src_label);
+    *ret_label = real_src_label;
+  }
+
   if (ret) {
     internal_memcpy(shadow_for(dest), shadow_for(src),
                     sizeof(dfsan_label) * len);
   }
-  *ret_label = dst_label;
   return ret;
 }
 
@@ -1310,39 +1637,9 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
                                                   dfsan_label *ret_label) {
   void *ret = memchr(s, c, n);
 
-  // Check if s_label is from a previous string op (for chaining)
-  // Otherwise read content label - s_label may be Alloca bounds
-  dfsan_label src_label = 0;
-  if (s_label != 0) {
-    uint16_t op = dfsan_get_label_info(s_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      src_label = s_label;  // Reuse for chaining
-    }
-  }
-  if (src_label == 0) {
-    src_label = dfsan_read_label(s, n);
-  }
-
-  // Check if n_label derives from a string op (e.g., ptr arithmetic on memchr result).
-  // If so, create a fsubstr label to represent substr(content, 0, n) so the solver
-  // can use Z3's str.substr instead of dealing with PtrToInt.
-  dfsan_label str_op_label = find_string_op_source(n_label);
-  if (str_op_label != 0 && src_label != 0) {
-    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
-    dfsan_label str_op_content = str_op_info->l1;
-
-    // Verify that src_label and str_op_content refer to the same underlying string
-    if (str_op_content >= CONST_OFFSET) {
-      dfsan_label src_base = get_base_input_label(src_label);
-      dfsan_label str_op_base = get_base_input_label(str_op_content);
-
-      if (src_base != 0 && src_base == str_op_base) {
-        // Same underlying buffer - create fsubstr with original content
-        src_label = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
-                                sizeof(void*) * 8, (uint64_t)n, 0);
-      }
-    }
-  }
+  // Use unified get_str_label_n for source label
+  // Pass n_label to handle fsubstr creation when n derives from a string op
+  dfsan_label src_label = get_str_label_n(s, s_label, n, n_label);
 
   if (src_label != 0 || c_label != 0) {
     int64_t found_pos = ret ? ((char*)ret - (char*)s) : -1;
@@ -1362,18 +1659,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
                                                    dfsan_label *ret_label) {
   char *ret = strrchr(s, c);
 
-  // Check if s_label is from a previous string op (for chaining)
-  // Otherwise read content label - s_label may be Alloca bounds
-  dfsan_label src_label = 0;
-  if (s_label != 0) {
-    uint16_t op = dfsan_get_label_info(s_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      src_label = s_label;  // Reuse for chaining
-    }
-  }
-  if (src_label == 0) {
-    src_label = dfsan_read_label(s, strlen(s) + 1);
-  }
+  // Use unified get_str_label for source label
+  dfsan_label src_label = get_str_label(s, s_label);
 
   if (src_label != 0 || c_label != 0) {
     int64_t found_pos = ret ? (ret - s) : -1;
@@ -1394,43 +1681,9 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
                                                    dfsan_label *ret_label) {
   void *ret = const_cast<void*>(memrchr(s, c, n));
 
-  // Check if s_label is from a previous string op (for chaining)
-  // Otherwise read content label - s_label may be Alloca bounds
-  dfsan_label src_label = 0;
-  if (s_label != 0) {
-    uint16_t op = dfsan_get_label_info(s_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      src_label = s_label;  // Reuse for chaining
-    }
-  }
-  if (src_label == 0) {
-    src_label = dfsan_read_label(s, n);
-  }
-
-  // Check if n_label derives from a string op (e.g., ptr arithmetic on memrchr result).
-  // If so, create a fsubstr label to represent substr(content, 0, n) so the solver
-  // can use Z3's str.substr instead of dealing with PtrToInt.
-  dfsan_label str_op_label = find_string_op_source(n_label);
-  if (str_op_label != 0 && src_label != 0) {
-    // Get the string op's content label (l1) - this is the original haystack
-    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
-    dfsan_label str_op_content = str_op_info->l1;
-
-    // Verify that src_label and str_op_content refer to the same underlying string
-    // by checking if they share the same base input label.
-    // This guards against the (unlikely) case of ptr arithmetic across different buffers.
-    if (str_op_content >= CONST_OFFSET) {
-      dfsan_label src_base = get_base_input_label(src_label);
-      dfsan_label str_op_base = get_base_input_label(str_op_content);
-
-      if (src_base != 0 && src_base == str_op_base) {
-        // Same underlying buffer - create fsubstr with original content
-        // fsubstr: l1 = original content from string op, l2 = string op label (index)
-        src_label = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
-                                sizeof(void*) * 8, (uint64_t)n, 0);
-      }
-    }
-  }
+  // Use unified get_str_label_n for source label
+  // Pass n_label to handle fsubstr creation when n derives from a string op
+  dfsan_label src_label = get_str_label_n(s, s_label, n, n_label);
 
   if (src_label != 0 || c_label != 0) {
     int64_t found_pos = ret ? ((const char*)ret - (const char*)s) : -1;
@@ -1450,31 +1703,9 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
                                                   dfsan_label *ret_label) {
   char *ret = strstr(haystack, needle);
 
-  // Check if haystack_label is from a previous string op (for chaining)
-  // Otherwise read content label - haystack_label may be Alloca bounds
-  dfsan_label src_label = 0;
-  if (haystack_label != 0) {
-    uint16_t op = dfsan_get_label_info(haystack_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      src_label = haystack_label;  // Reuse for chaining
-    }
-  }
-  if (src_label == 0) {
-    src_label = dfsan_read_label(haystack, strlen(haystack) + 1);
-  }
-
-  // Check if needle_label is from a previous string op (for chaining)
-  // Otherwise read content label - needle_label may be Alloca bounds
-  dfsan_label real_needle_label = 0;
-  if (needle_label != 0) {
-    uint16_t op = dfsan_get_label_info(needle_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      real_needle_label = needle_label;  // Reuse for chaining
-    }
-  }
-  if (real_needle_label == 0) {
-    real_needle_label = dfsan_read_label(needle, strlen(needle));
-  }
+  // Use unified get_str_label for haystack and needle
+  dfsan_label src_label = get_str_label(haystack, haystack_label);
+  dfsan_label real_needle_label = get_str_label(needle, needle_label);
 
   if (src_label != 0 || real_needle_label != 0) {
     size_t needle_len = strlen(needle);
@@ -1509,49 +1740,14 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
                                                    dfsan_label *ret_label) {
   void *ret = memmem(haystack, haystacklen, needle, needlelen);
 
-  // Check if haystack_label is from a previous string op (for chaining)
-  // Otherwise read content label - haystack_label may be Alloca bounds
-  dfsan_label src_label = 0;
-  if (haystack_label != 0) {
-    uint16_t op = dfsan_get_label_info(haystack_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      src_label = haystack_label;  // Reuse for chaining
-    }
-  }
-  if (src_label == 0) {
-    src_label = dfsan_read_label(haystack, haystacklen);
-  }
+  // Use unified get_str_label_n for haystack and needle
+  // Pass haystacklen_label to handle fsubstr creation when haystacklen derives from a string op
+  dfsan_label src_label =
+      get_str_label_n(haystack, haystack_label, haystacklen, haystacklen_label);
 
-  // Check if haystacklen derives from a string op (for bounded search)
-  dfsan_label str_op_label = find_string_op_source(haystacklen_label);
-  if (str_op_label != 0 && src_label != 0) {
-    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
-    dfsan_label str_op_content = str_op_info->l1;
-
-    if (str_op_content >= CONST_OFFSET) {
-      dfsan_label src_base = get_base_input_label(src_label);
-      dfsan_label str_op_base = get_base_input_label(str_op_content);
-
-      if (src_base != 0 && src_base == str_op_base) {
-        // Same underlying buffer - create fsubstr with original content
-        src_label = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
-                                sizeof(void*) * 8, (uint64_t)haystacklen, 0);
-      }
-    }
-  }
-
-  // Check if needle_label is from a previous string op (for chaining)
-  // Otherwise read content label - needle_label may be Alloca bounds
-  dfsan_label real_needle_label = 0;
-  if (needle_label != 0) {
-    uint16_t op = dfsan_get_label_info(needle_label)->op;
-    if (op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end) {
-      real_needle_label = needle_label;  // Reuse for chaining
-    }
-  }
-  if (real_needle_label == 0) {
-    real_needle_label = dfsan_read_label(needle, needlelen);
-  }
+  // Use unified get_str_label_n for needle
+  dfsan_label real_needle_label =
+      get_str_label_n(needle, needle_label, needlelen, needlelen_label);
 
   if (src_label != 0 || real_needle_label != 0) {
     int64_t found_pos = ret ? ((const char*)ret - (const char*)haystack) : -1;

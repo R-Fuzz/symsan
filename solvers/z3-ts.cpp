@@ -58,6 +58,30 @@ static std::string get_op_name(uint32_t op) {
   return std::to_string(op);
 }
 
+// Decode Z3's escaped string format (e.g., "\u{1}\u{2}" -> bytes 0x01, 0x02)
+static std::vector<uint8_t> decode_z3_string(const std::string &str) {
+  std::vector<uint8_t> result;
+  size_t i = 0;
+  while (i < str.size()) {
+    if (i + 3 < str.size() && str[i] == '\\' && str[i+1] == 'u' && str[i+2] == '{') {
+      // Parse \u{XXXX} escape sequence
+      size_t end = str.find('}', i + 3);
+      if (end != std::string::npos) {
+        std::string hex_str = str.substr(i + 3, end - (i + 3));
+        uint32_t code_point = std::stoul(hex_str, nullptr, 16);
+        // For simplicity, assume code points fit in a byte (for ASCII/Latin-1)
+        result.push_back((uint8_t)(code_point & 0xFF));
+        i = end + 1;
+        continue;
+      }
+    }
+    // Regular character
+    result.push_back((uint8_t)str[i]);
+    i++;
+  }
+  return result;
+}
+
 void Z3AstParser::dump_value_cache(dfsan_label label) {
   if (label >= value_cache_.size()) {
     throw z3::exception("invalid label for value cache");
@@ -468,20 +492,28 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // l1 is a fsubstr - use the cached substr expression directly
           haystack_str = get_cached_expr(info->l1, input_deps);
         } else if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
-          // Chained call: search starts after previous match
-          z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
-          start_offset = prev_idx + 1;
-          // Walk back to find original haystack content
-          dfsan_label content_label = info->l1;
-          dfsan_label_info *chain_info = src_info;
-          while (chain_info->op >= __dfsan::fstr_op_start &&
-                 chain_info->op < __dfsan::fstr_op_end) {
-            content_label = chain_info->l1;
-            if (content_label < CONST_OFFSET) break;
-            chain_info = get_label_info(content_label);
-          }
-          if (content_label >= CONST_OFFSET) {
-            haystack_str = build_string_from_label(content_label, input_deps);
+          if (src_info->op == __dfsan::fstr_off) {
+            // Chained call via pointer arithmetic: strchr(t1 + N, c)
+            // Use build_string_from_label which handles fstr_off specially
+            // (creates insertion point if beyond end, or suffix if within bounds)
+            haystack_str = build_string_from_label(info->l1, input_deps);
+            // start_offset stays 0 since we're searching from the start of the suffix/insertion point
+          } else {
+            // Chained call: search starts after previous match
+            z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
+            start_offset = prev_idx + 1;
+            // Walk back to find original haystack content
+            dfsan_label content_label = info->l1;
+            dfsan_label_info *chain_info = src_info;
+            while (chain_info->op >= __dfsan::fstr_op_start &&
+                   chain_info->op < __dfsan::fstr_op_end) {
+              content_label = chain_info->l1;
+              if (content_label < CONST_OFFSET) break;
+              chain_info = get_label_info(content_label);
+            }
+            if (content_label >= CONST_OFFSET) {
+              haystack_str = build_string_from_label(content_label, input_deps);
+            }
           }
         } else {
           // Build string from byte content (Load, Concat, or single byte)
@@ -577,20 +609,25 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         dfsan_label_info *src_info = get_label_info(info->l1);
 
         if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
-          // Chained call: search starts after previous match
-          z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
-          start_offset = prev_idx + 1;
-          // Walk back to find original haystack content
-          dfsan_label content_label = info->l1;
-          dfsan_label_info *chain_info = src_info;
-          while (chain_info->op >= __dfsan::fstr_op_start &&
-                 chain_info->op < __dfsan::fstr_op_end) {
-            content_label = chain_info->l1;
-            if (content_label < CONST_OFFSET) break;
-            chain_info = get_label_info(content_label);
-          }
-          if (content_label >= CONST_OFFSET) {
-            haystack_str = build_string_from_label(content_label, input_deps);
+          if (src_info->op == __dfsan::fstr_off) {
+            // Chained call via pointer arithmetic
+            haystack_str = build_string_from_label(info->l1, input_deps);
+          } else {
+            // Chained call: search starts after previous match
+            z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
+            start_offset = prev_idx + 1;
+            // Walk back to find original haystack content
+            dfsan_label content_label = info->l1;
+            dfsan_label_info *chain_info = src_info;
+            while (chain_info->op >= __dfsan::fstr_op_start &&
+                   chain_info->op < __dfsan::fstr_op_end) {
+              content_label = chain_info->l1;
+              if (content_label < CONST_OFFSET) break;
+              chain_info = get_label_info(content_label);
+            }
+            if (content_label >= CONST_OFFSET) {
+              haystack_str = build_string_from_label(content_label, input_deps);
+            }
           }
         } else {
           // Build string from byte content
@@ -641,19 +678,24 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         if (src_info->op == __dfsan::fsubstr) {
           haystack_str = get_cached_expr(info->l1, input_deps);
         } else if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
-          // Chained call
-          z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
-          start_offset = prev_idx + 1;
-          dfsan_label content_label = info->l1;
-          dfsan_label_info *chain_info = src_info;
-          while (chain_info->op >= __dfsan::fstr_op_start &&
-                 chain_info->op < __dfsan::fstr_op_end) {
-            content_label = chain_info->l1;
-            if (content_label < CONST_OFFSET) break;
-            chain_info = get_label_info(content_label);
-          }
-          if (content_label >= CONST_OFFSET) {
-            haystack_str = build_string_from_label(content_label, input_deps);
+          if (src_info->op == __dfsan::fstr_off) {
+            // Chained call via pointer arithmetic
+            haystack_str = build_string_from_label(info->l1, input_deps);
+          } else {
+            // Chained call
+            z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
+            start_offset = prev_idx + 1;
+            dfsan_label content_label = info->l1;
+            dfsan_label_info *chain_info = src_info;
+            while (chain_info->op >= __dfsan::fstr_op_start &&
+                   chain_info->op < __dfsan::fstr_op_end) {
+              content_label = chain_info->l1;
+              if (content_label < CONST_OFFSET) break;
+              chain_info = get_label_info(content_label);
+            }
+            if (content_label >= CONST_OFFSET) {
+              haystack_str = build_string_from_label(content_label, input_deps);
+            }
           }
         } else {
           haystack_str = build_string_from_label(info->l1, input_deps);
@@ -704,13 +746,98 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         len_expr = get_cached_expr(info->l2, input_deps);
       }
 
-      // Generate substr(full_str, 0, len)
-      z3::expr substr_expr = full_str.extract(context_.int_val(0), len_expr);
+      // Generate substr(full_str, 0, len) using Z3 string theory
+      z3::expr substr_expr(context_, Z3_mk_seq_extract(context_,
+                                                        full_str,
+                                                        context_.int_val(0),
+                                                        len_expr));
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, substr_expr);
       // The substr itself doesn't have a numeric value, but downstream ops will use it
       RECORD_VALUE(info->op1.i);
+      continue;
+    } else if (info->op == __dfsan::fstrcmp) {
+      // String comparison using Z3 string theory
+      // l1 = first string label (may be fsubstr or content)
+      // l2 = second string label (may be fsubstr or content)
+      // size = comparison length (in bytes, for memcmp_cache lookup)
+      // op1 = s1 pointer (for memcmp_cache lookup)
+      // op2 = s2 pointer (for memcmp_cache lookup)
+
+      z3::expr str1 = context_.string_val("");
+      z3::expr str2 = context_.string_val("");
+
+      // Build first string
+      if (info->l1 >= CONST_OFFSET) {
+        dfsan_label_info *l1_info = get_label_info(info->l1);
+        if (l1_info->op == __dfsan::fsubstr) {
+          // l1 is fsubstr - get the cached substr expression
+          str1 = get_cached_expr(info->l1, input_deps);
+        } else {
+          // Regular content - build string from labels
+          str1 = build_string_from_label(info->l1, input_deps);
+        }
+      } else {
+        // Concrete - get from memcmp_cache
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
+          str1 = context_.string_val(s);
+        }
+      }
+
+      // Build second string
+      if (info->l2 >= CONST_OFFSET) {
+        dfsan_label_info *l2_info = get_label_info(info->l2);
+        if (l2_info->op == __dfsan::fsubstr) {
+          // l2 is fsubstr - get the cached substr expression
+          str2 = get_cached_expr(info->l2, input_deps);
+        } else {
+          // Regular content - build string from labels
+          str2 = build_string_from_label(info->l2, input_deps);
+        }
+      } else {
+        // Concrete - get from memcmp_cache
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
+          str2 = context_.string_val(s);
+        }
+      }
+
+      // Create equality: strcmp returns 0 when equal, non-zero otherwise
+      z3::expr eq = z3::ite(str1 == str2,
+                             context_.bv_val(0, 32),
+                             context_.bv_val(1, 32));
+      tsize_cache_.emplace_back(1);
+      cache_expr(l, eq);
+      RECORD_VALUE(0);
+      continue;
+    } else if (info->op == __dfsan::fstr_off) {
+      // fstr_off: string op pointer + constant offset (from GEP)
+      // l1 = string op label (fstrchr result)
+      // op1 = byte offset (e.g., 1 for sep + 1)
+      // The result is a pointer with the offset recorded for later substr calculation
+
+      if (info->l1 >= CONST_OFFSET) {
+        // Get the index expression for the base string op
+        z3::expr idx_expr = get_cached_expr(info->l1, input_deps);
+        int64_t gep_offset = (int64_t)info->op1.i;
+
+        // The fstr_off result is idx + offset (still an Int for string indexing)
+        z3::expr offset_idx = idx_expr + (int)gep_offset;
+
+        tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+        cache_expr(l, offset_idx);
+        // Record the concrete position + offset
+        RECORD_VALUE(value_cache_[info->l1] + gep_offset);
+      } else {
+        // No base label, just return zero
+        tsize_cache_.emplace_back(0);
+        cache_expr(l, context_.int_val(0));
+        RECORD_VALUE(0);
+      }
       continue;
     } else if (info->op == __dfsan::Alloca || info->op == __dfsan::Free) {
       // not expression, do nothing
@@ -873,6 +1000,24 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         break;
       }
       case __dfsan::Sub: {
+        // Check for pointer arithmetic pattern: (ptr_with_string_op) - base_addr
+        // When l1 is PtrToInt of a string op and l2 is constant (untainted base),
+        // the result is just the index (since ptr = base + index, so ptr - base = index)
+        if (info->l1 >= CONST_OFFSET && info->l2 == 0) {
+          dfsan_label_info *l1_info = get_label_info(info->l1);
+          if (l1_info->op == __dfsan::PtrToInt && l1_info->l1 >= CONST_OFFSET) {
+            dfsan_label_info *src_info = get_label_info(l1_info->l1);
+            if (src_info->op >= __dfsan::fstr_op_start &&
+                src_info->op < __dfsan::fstr_op_end) {
+              // This is (PtrToInt(string_op)) - base_addr = index
+              // The expression is just the index (op1 already contains int2bv(idx))
+              cache_expr(l, op1);
+              // The value is just the index, not idx - base_addr
+              RECORD_VALUE(val1);
+              break;
+            }
+          }
+        }
         cache_expr(l, op1 - op2);
         RECORD_VALUE(val1 - val2);
         break;
@@ -924,11 +1069,16 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         uint16_t l1_op = info->l1 >= CONST_OFFSET ? get_label_info(info->l1)->op : 0;
         uint16_t l2_op = info->l2 >= CONST_OFFSET ? get_label_info(info->l2)->op : 0;
 
-        cache_expr(l, get_cmd(op1, op2, info->op >> 8));
+        // fprintf(stderr, "DEBUG serialize ICmp label %u: l1=%u (op=%u), l2=%u (op=%u), predicate=%u\n",
+        //         l, info->l1, l1_op, info->l2, l2_op, info->op >> 8);
+        // fprintf(stderr, "DEBUG serialize ICmp: val1=%lu (cached), val2=%lu (cached), op1.i=%lu (runtime), op2.i=%lu (runtime)\n",
+        //         val1, val2, (uint64_t)info->op1.i, (uint64_t)info->op2.i);
+
 #if FILTER_WRONG_AST
         // we have both operands recorded for ICmp
         if ((info->op1.i & valmask) != val1 ||
             (info->op2.i & valmask) != val2) {
+          fprintf(stderr, "DEBUG serialize ICmp: VALUE MISMATCH detected\n");
           // fprintf(stderr, "WARNING: value mismatch for label %u:"
           //         "expected op1 %lu, got %lu, expected op2 %lu, got %lu\n",
           //         l, info->op1.i, val1, info->op2.i, val2);
@@ -939,24 +1089,53 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // memcmp and atoi are special cases where we don't have the actual
           // value cached, so we fix it using the runtime value from ICmp
           bool is_special = false;
-          if (l1_op == __dfsan::fmemcmp || l1_op == __dfsan::fatoi) {
+          if (l1_op == __dfsan::fmemcmp || l1_op == __dfsan::fatoi || l1_op == __dfsan::fstrcmp) {
+            fprintf(stderr, "DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
+                    info->l1, value_cache_[info->l1], (uint64_t)info->op1.i, l1_op);
             value_cache_[info->l1] = val1 = info->op1.i;
             is_special = true;
           }
-          if (l2_op == __dfsan::fmemcmp || l2_op == __dfsan::fatoi) {
+          if (l2_op == __dfsan::fmemcmp || l2_op == __dfsan::fatoi || l2_op == __dfsan::fstrcmp) {
+            fprintf(stderr, "DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
+                    info->l2, value_cache_[info->l2], (uint64_t)info->op2.i, l2_op);
             value_cache_[info->l2] = val2 = info->op2.i;
             is_special = true;
           }
-          if (!is_special)
+          if (!is_special) {
             throw z3::exception("value mismatch for ICmp");
+          }
         }
-        value_cache_.emplace_back(
-            eval_icmp(info->op >> 8, val1, val2, size) ? 1 : 0);
+        uint64_t icmp_result = eval_icmp(info->op >> 8, val1, val2, size) ? 1 : 0;
+        // fprintf(stderr, "DEBUG serialize ICmp: recording value_cache_[%u] = %lu\n", l, icmp_result);
+        value_cache_.emplace_back(icmp_result);
 #endif
+        // Cache the expression AFTER updating value_cache to maintain consistency
+        // if an exception is thrown above
+        cache_expr(l, get_cmd(op1, op2, info->op >> 8));
         break;
       }
       // concat
       case __dfsan::Concat: {
+        // Check if either operand is a String (from fsubstr or string ops)
+        // We can't concat String with bitvector
+        if (!op1.is_bv() || !op2.is_bv()) {
+          // If one operand is String and the other is constant 0 (label 0),
+          // just use the String. The constant bytes don't contribute to constraints.
+          if (!op1.is_bv() && info->l2 == 0) {
+            cache_expr(l, op1);
+            RECORD_VALUE(val1);
+            break;
+          }
+          if (!op2.is_bv() && info->l1 == 0) {
+            cache_expr(l, op2);
+            RECORD_VALUE(val2);
+            break;
+          }
+          fprintf(stderr, "DEBUG Concat %u: l1=%u (sort=%s, is_bv=%d), l2=%u (sort=%s, is_bv=%d)\n",
+                  l, info->l1, op1.get_sort().to_string().c_str(), op1.is_bv(),
+                  info->l2, op2.get_sort().to_string().c_str(), op2.is_bv());
+          throw z3::exception("concat with non-bitvector operand (string op involved)");
+        }
         cache_expr(l, z3::concat(op2, op1)); // little endian
         RECORD_VALUE((val2 << op1.get_sort().bv_size()) | (val1));
         break;
@@ -1230,27 +1409,32 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
     // solve the first constraint (optimistic)
     z3::expr e = task->at(0);
     solver.add(e);
-    // fprintf(stderr, "DEBUG solve_task: checking constraint: %s\n", e.to_string().c_str());
+    // fprintf(stderr, "DEBUG solve_task[%lu]: checking first constraint: %s\n", task_id, e.to_string().c_str());
     z3::check_result res = solver.check();
-    // fprintf(stderr, "DEBUG solve_task: result = %d (sat=1, unsat=0, unknown=2)\n", (int)res);
+    // fprintf(stderr, "DEBUG solve_task[%lu]: result = %d (sat=1, unsat=0, unknown=2)\n", task_id, (int)res);
     if (res == z3::sat) {
       ret = opt_sat;
       // optimistic sat, save a model
       z3::model m = solver.get_model();
+      // fprintf(stderr, "DEBUG solve_task[%lu]: optimistic SAT model:\n%s\n", task_id, m.to_string().c_str());
       // check nested, if any
       if (task->size() > 1) {
         solver.push();
         // add nested constraints
+        // fprintf(stderr, "DEBUG solve_task[%lu]: adding %zu nested constraints\n", task_id, task->size() - 1);
         for (size_t i = 1; i < task->size(); i++) {
+          // fprintf(stderr, "DEBUG solve_task[%lu]: nested[%zu]: %s\n", task_id, i, task->at(i).to_string().c_str());
           solver.add(task->at(i));
         }
         res = solver.check();
+        // fprintf(stderr, "DEBUG solve_task[%lu]: nested result = %d (sat=1, unsat=0, unknown=2)\n", task_id, (int)res);
         if (res == z3::sat) {
           ret = nested_sat;
           m = solver.get_model();
+          // fprintf(stderr, "DEBUG solve_task[%lu]: nested SAT model:\n%s\n", task_id, m.to_string().c_str());
         } else if (res == z3::unsat) {
-          // fprintf(stderr, "WARNING: nested unsat for task %lu: %s\n",
-          //     task_id, solver.to_smt2().data());
+          fprintf(stderr, "WARNING: nested unsat for task %lu: %s\n",
+              task_id, solver.to_smt2().c_str());
           ret = opt_sat_nested_unsat;
         } else {
           ret = opt_sat_nested_timeout;
@@ -1279,6 +1463,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
       }
 
       if (!strlen_vars.empty()) {
+        // fprintf(stderr, "DEBUG solve_task[%lu]: found %zu strlen variables, optimizing...\n", task_id, strlen_vars.size());
         // Step 1: Try optimizer to minimize strlen values (no hard bounds)
         z3::optimize opt(context_);
         z3::params p(context_);
@@ -1289,12 +1474,14 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           opt.add(expr);
         }
         for (const auto &sv : strlen_vars) {
+          // fprintf(stderr, "DEBUG solve_task[%lu]: minimizing %s (max=%lu)\n", task_id, sv.first.to_string().c_str(), sv.second);
           opt.minimize(sv.first);
         }
 
         bool use_optimized = false;
         if (opt.check() == z3::sat) {
           z3::model opt_model = opt.get_model();
+          // fprintf(stderr, "DEBUG solve_task[%lu]: optimized SAT model:\n%s\n", task_id, opt_model.to_string().c_str());
           // Check if all strlen values are within bounds
           bool all_within_bounds = true;
           for (const auto &sv : strlen_vars) {
@@ -1308,17 +1495,21 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           if (all_within_bounds) {
             m = opt_model;
             use_optimized = true;
+            // fprintf(stderr, "DEBUG solve_task[%lu]: using optimized model (all within bounds)\n", task_id);
           }
+          // else: optimized model exceeds bounds, fall back to bounded solver
         }
 
         // Step 2: If optimization failed or exceeded bounds, try solver with bound constraints
         if (!use_optimized) {
+          // fprintf(stderr, "DEBUG solve_task[%lu]: adding bound constraints and re-checking\n", task_id);
           solver.push();
           for (const auto &sv : strlen_vars) {
             solver.add(z3::ule(sv.first, context_.bv_val(sv.second, sv.first.get_sort().bv_size())));
           }
           if (solver.check() == z3::sat) {
             m = solver.get_model();
+            // fprintf(stderr, "DEBUG solve_task[%lu]: bounded SAT model:\n%s\n", task_id, m.to_string().c_str());
           } else {
             // Step 3: Unsolvable within bounds, skip
             solver.pop();
@@ -1329,42 +1520,42 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
       }
 
       generate_solution(m, solutions);
-      // fprintf(stderr, "DEBUG solve_task: after generate_solution, solutions.size() = %zu\n", solutions.size());
+      // fprintf(stderr, "DEBUG solve_task[%lu]: after generate_solution, solutions.size() = %zu\n", task_id, solutions.size());
     } else if (res == z3::unsat) {
+      // fprintf(stderr, "DEBUG solve_task[%lu]: UNSAT\n", task_id);
       ret = opt_unsat;
-      //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
-      //AOUT("  tree_size = %d", __dfsan_label_info[label].tree_size);
     } else {
+      // fprintf(stderr, "DEBUG solve_task[%lu]: TIMEOUT\n", task_id);
       ret = opt_timeout;
     }
   } catch (z3::exception ze) {
-    // fprintf(stderr, "DEBUG solve_task: EXCEPTION caught: %s\n", ze.msg());
+    fprintf(stderr, "WARNING: solve_task[%lu]: EXCEPTION: %s\n", task_id, ze.msg());
     ret = unknown_error;
   }
 
-  // fprintf(stderr, "DEBUG solve_task: returning with solutions.size() = %zu\n", solutions.size());
+  // fprintf(stderr, "DEBUG solve_task[%lu]: returning with ret=%d, solutions.size() = %zu\n", task_id, ret, solutions.size());
   return ret;
 }
 
 void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
   // from qsym
   unsigned num_constants = m.num_consts();
-  // fprintf(stderr, "DEBUG generate_solution: num_constants = %u\n", num_constants);
+  // fprintf(stderr, "DEBUG generate_solution: model has %u constants\n", num_constants);
   for (unsigned i = 0; i < num_constants; i++) {
     z3::func_decl decl = m.get_const_decl(i);
     z3::expr e = m.get_const_interp(decl);
     z3::symbol name = decl.name();
 
-    // all values should be string symbols
-    // fprintf(stderr, "DEBUG generate_solution: var[%u] = %s (kind=%d)\n", i,
-    //         name.kind() == Z3_STRING_SYMBOL ? name.str().c_str() : "(int)", name.kind());
     if (name.kind() == Z3_STRING_SYMBOL) {
+      // fprintf(stderr, "DEBUG generate_solution: processing symbol '%s' = %s\n",
+      //         name.str().c_str(), e.to_string().c_str());
       if (name.str().find("input") == 0) {
         uint32_t input;
         uint32_t offset;
         sscanf(name.str().c_str(), input_name_format, &input, &offset);
         uint8_t value = (uint8_t)e.get_numeral_int();
-        // fprintf(stderr, "DEBUG generate_solution: found input-%u-%u = %u\n", input, offset, value);
+        // fprintf(stderr, "DEBUG generate_solution: input-%u-%u = 0x%02x ('%c')\n",
+        //         input, offset, value, (value >= 32 && value < 127) ? value : '.');
         solutions.emplace_back(input, offset, value);
       } else if (!name.str().compare("fsize")) {
         // FIXME:
@@ -1435,6 +1626,8 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         }
 
         uint64_t target_len = e.get_numeral_uint64();
+        // fprintf(stderr, "DEBUG generate_solution: strlen-%u-%u: orig=%lu, target=%lu, null_from_input=%u\n",
+        //         input, offset, orig_len, target_len, null_from_input);
 
         if (target_len > orig_len) {
           // Extending: insert bytes to make the string longer
@@ -1457,19 +1650,44 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
       } else if (name.str().find("str-") == 0) {
         // String variable from strchr/strstr: str-input-offset-len
         // Extract byte values from the string and generate solutions
+        // Handle length changes with INSERT/DELETE like strlen does
         uint32_t input;
         uint32_t offset;
-        uint32_t len;
-        if (sscanf(name.str().c_str(), "str-%u-%u-%u", &input, &offset, &len) != 3) {
+        uint32_t orig_len;
+        if (sscanf(name.str().c_str(), "str-%u-%u-%u", &input, &offset, &orig_len) != 3) {
           continue;  // Skip malformed string variable
         }
 
-        // Get the string value from Z3
+        // Get the string value from Z3 and decode escape sequences
         if (e.is_string_value()) {
-          std::string str_val = e.get_string();
-          // Generate solutions for each byte
-          for (uint32_t j = 0; j < len && j < str_val.size(); j++) {
-            solutions.emplace_back(input, offset + j, (uint8_t)str_val[j]);
+          std::string raw_str = e.get_string();
+          std::vector<uint8_t> bytes = decode_z3_string(raw_str);
+          uint32_t new_len = bytes.size();
+          // fprintf(stderr, "DEBUG generate_solution: str-%u-%u: orig=%u, new=%u, raw='%s'\n",
+          //         input, offset, orig_len, new_len, raw_str.c_str());
+
+          if (new_len > orig_len) {
+            // Extending: set common prefix, then insert extra bytes
+            for (uint32_t j = 0; j < orig_len; j++) {
+              solutions.emplace_back(input, offset + j, bytes[j]);
+            }
+            // Insert the extra bytes after the original range
+            std::vector<uint8_t> insert_bytes(bytes.begin() + orig_len, bytes.end());
+            solutions.emplace_back(input, offset + orig_len, std::move(insert_bytes));
+          } else if (new_len < orig_len) {
+            // Shrinking: set new content, then delete extra bytes
+            for (uint32_t j = 0; j < new_len; j++) {
+              solutions.emplace_back(input, offset + j, bytes[j]);
+            }
+            // Delete the bytes we no longer need
+            solutions.emplace_back(solution_op_t::DELETE, input,
+                                   offset + new_len,
+                                   orig_len - new_len);
+          } else {
+            // Same length: just set all bytes
+            for (uint32_t j = 0; j < new_len; j++) {
+              solutions.emplace_back(input, offset + j, bytes[j]);
+            }
           }
         }
       } else if (name.str().find("strrchr_idx_") == 0 ||
@@ -1477,8 +1695,7 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         // Index variables from strchr/strrchr - skip, they're intermediate
         continue;
       } else {
-        // fprintf(stderr, "DEBUG generate_solution: UNKNOWN symbol '%s', skipping\n", name.str().c_str());
-        // Skip unknown symbols instead of throwing - Z3 string theory creates internal variables
+        // Skip unknown symbols - Z3 string theory creates internal variables
         continue;
       }
     }
@@ -1488,12 +1705,12 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
   // for bytes within string ranges. Z3 doesn't model C null-termination so may put
   // nulls before the target character position.
 
-  // Debug: print string ranges
-  // fprintf(stderr, "DEBUG: string_ranges_ has %zu entries\n", string_ranges_.size());
+  // // Debug: print string ranges
+  // fprintf(stderr, "DEBUG generate_solution: string_ranges_ has %zu entries\n", string_ranges_.size());
   // for (const auto &entry : string_ranges_) {
-  //   fprintf(stderr, "DEBUG: input %u has %zu ranges\n", entry.first, entry.second.size());
+  //   fprintf(stderr, "DEBUG generate_solution: input %u has %zu ranges\n", entry.first, entry.second.size());
   //   for (const auto &range : entry.second) {
-  //     fprintf(stderr, "DEBUG:   range [%u, %u)\n", range.first, range.second);
+  //     fprintf(stderr, "DEBUG generate_solution:   range [%u, %u)\n", range.first, range.second);
   //   }
   // }
 
@@ -1505,7 +1722,7 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         for (const auto &range : it->second) {
           // If this offset is within a string range (but not at the end), replace null
           if (sol.offset >= range.first && sol.offset < range.second) {
-            // fprintf(stderr, "DEBUG: replacing null at offset %u (in range [%u,%u))\n",
+            // fprintf(stderr, "DEBUG generate_solution: replacing null at offset %u (in range [%u,%u))\n",
             //         sol.offset, range.first, range.second);
             sol.val = 'A';  // Replace null with 'A'
             break;
@@ -1519,7 +1736,7 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
 }
 
 // Build Z3 string from a content label (Load or Concat of bytes)
-// Converts byte bitvectors to strings using Z3_mk_string_from_code
+// Creates a symbolic string variable with naming convention: str-input-offset-len
 z3::expr Z3AstParser::build_string_from_label(dfsan_label content_label, input_dep_set_t &deps) {
   if (content_label < CONST_OFFSET) {
     return context_.string_val("");  // No tainted content
@@ -1527,7 +1744,7 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label content_label, input_d
 
   dfsan_label_info *info = get_label_info(content_label);
 
-  // Handle Load: multi-byte load from input
+  // Handle Load: multi-byte load from input - create a single symbolic string
   if (info->op == __dfsan::Load) {
     uint32_t offset = get_label_info(info->l1)->op1.i;
     uint32_t input = get_label_info(info->l1)->op2.i;
@@ -1536,21 +1753,215 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label content_label, input_d
     // Track string range for null-byte post-processing
     string_ranges_[input].emplace_back(offset, offset + len);
 
-    // Build string by concatenating str.from_code for each byte
-    z3::expr result = context_.string_val("");
+    // Add dependencies for all bytes in the range
     for (uint32_t i = 0; i < len; i++) {
-      z3::expr byte = get_byte_expr(input, offset + i, deps);
-      z3::expr code = z3::bv2int(byte, false);
-      z3::expr char_str(context_, Z3_mk_string_from_code(context_, code));
-      result = z3::concat(result, char_str);
+      deps.insert(std::make_pair(input, offset + i));
     }
-    return result;
+
+    // Create a single symbolic string variable: str-input-offset-len
+    char name[256];
+    snprintf(name, sizeof(name), "str-%u-%u-%u", input, offset, len);
+    z3::symbol symbol = context_.str_symbol(name);
+    z3::expr str_var = context_.constant(symbol, context_.string_sort());
+
+    return str_var;
   }
 
-  // Handle Concat: concatenation of byte expressions
+  // Handle fsubstr: substring from previous string op
+  if (info->op == __dfsan::fsubstr) {
+    // fsubstr should be cached from earlier processing
+    return get_cached_expr(content_label, deps);
+  }
+
+  // Handle fstr_off: string op pointer + constant offset (from GEP)
+  // l1 = string op label (fstrchr, etc.), op1 = byte offset
+  if (info->op == __dfsan::fstr_off) {
+    if (info->l1 >= CONST_OFFSET) {
+      dfsan_label_info *str_op_info = get_label_info(info->l1);
+
+      // The string op's l1 is the haystack content
+      if (str_op_info->l1 >= CONST_OFFSET) {
+        int64_t gep_offset = (int64_t)info->op1.i;
+
+        // Get concrete values to check if we're beyond the end
+        // Bounds check: value_cache_ is indexed by label
+        if (info->l1 >= value_cache_.size()) {
+          // Label not in cache, fall back to empty string
+          return context_.string_val("");
+        }
+        int64_t str_op_pos = (int64_t)value_cache_[info->l1];  // position of found char
+        int64_t concrete_start = str_op_pos + gep_offset;
+
+        // Find the original haystack length by tracing back to Load
+        dfsan_label content_label = str_op_info->l1;
+        dfsan_label_info *content_info = get_label_info(content_label);
+        uint32_t haystack_len = 0;
+        uint32_t input_id = 0;
+        uint32_t base_offset = 0;
+
+        // Trace back through chain to find Load and get length
+        while (content_info->op != 0 && content_info->op != __dfsan::Load) {
+          if (content_info->l1 >= CONST_OFFSET) {
+            content_label = content_info->l1;
+            content_info = get_label_info(content_label);
+          } else {
+            break;
+          }
+        }
+        if (content_info->op == __dfsan::Load) {
+          haystack_len = content_info->l2;  // Load's length
+          base_offset = get_label_info(content_info->l1)->op1.i;
+          input_id = get_label_info(content_info->l1)->op2.i;
+        } else if (content_info->op == 0) {
+          haystack_len = 1;  // Single byte
+          base_offset = content_info->op1.i;
+          input_id = content_info->op2.i;
+        }
+
+        // Check if start is beyond the end of the haystack
+        if (concrete_start >= (int64_t)(base_offset + haystack_len)) {
+          // Beyond end: create a new insertion point variable
+          // str-<input>-<offset>-0 means "string at offset with no original content"
+          char name[256];
+          snprintf(name, sizeof(name), "str-%u-%ld-0", input_id, concrete_start);
+          // fprintf(stderr, "DEBUG build_string_from_label: fstr_off beyond end, creating insertion point %s\n", name);
+          z3::symbol symbol = context_.str_symbol(name);
+          z3::expr str_var = context_.constant(symbol, context_.string_sort());
+
+          // Don't add dependency for insertion point - it's beyond file bounds
+          // The insertion point is virtual and will be handled during solution generation
+
+          return str_var;
+        }
+
+        // Within bounds: use original suffix extraction
+        z3::expr idx_expr = get_cached_expr(info->l1, deps);
+        z3::expr haystack = build_string_from_label(str_op_info->l1, deps);
+        z3::expr suffix_start = idx_expr + (int)gep_offset;
+        z3::expr haystack_len_expr(context_, Z3_mk_seq_length(context_, haystack));
+        z3::expr suffix_len = haystack_len_expr - idx_expr - (int)gep_offset;
+
+        return z3::to_expr(context_, Z3_mk_seq_extract(context_,
+                                                        haystack,
+                                                        suffix_start,
+                                                        suffix_len));
+      }
+    }
+    return context_.string_val("");
+  }
+
+  // Handle string search ops (fstrchr, fstrrchr, fstrstr, fstrpbrk):
+  // These labels represent pointer results. When used as content directly
+  // (without GEP offset), we build content at the found position.
+  if (info->op >= __dfsan::fstr_op_start && info->op < __dfsan::fstr_op_end) {
+    if (info->l1 >= CONST_OFFSET) {
+      // Get the index expression for this string op (if already cached)
+      z3::expr idx_expr = get_cached_expr(content_label, deps);
+
+      // Build the full haystack string
+      z3::expr haystack = build_string_from_label(info->l1, deps);
+
+      // Create suffix starting at the found position (no offset)
+      // substr(haystack, idx, len-idx) - content from found position to end
+      z3::expr haystack_len(context_, Z3_mk_seq_length(context_, haystack));
+      z3::expr suffix_len = haystack_len - idx_expr;
+
+      return z3::to_expr(context_, Z3_mk_seq_extract(context_,
+                                                      haystack,
+                                                      idx_expr,
+                                                      suffix_len));
+    }
+    return context_.string_val("");  // No tainted content
+  }
+
+  // Handle Concat: check if it's a chain of consecutive input bytes
+  // If so, create a single string variable for the whole range
   if (info->op == __dfsan::Concat) {
-    z3::expr left = build_string_from_label(info->l1, deps);
-    z3::expr right = build_string_from_label(info->l2, deps);
+    // Try to find the range of consecutive input bytes
+    uint32_t min_offset = UINT32_MAX;
+    uint32_t max_offset = 0;
+    uint32_t input_id = UINT32_MAX;
+    bool is_consecutive = true;
+    std::vector<uint32_t> offsets;
+
+    // Helper lambda to collect offsets from a label
+    std::function<void(dfsan_label)> collect_offsets = [&](dfsan_label label) {
+      if (!is_consecutive) return;
+      if (label < CONST_OFFSET) {
+        // Concrete byte in the chain - mark as non-consecutive
+        is_consecutive = false;
+        return;
+      }
+      dfsan_label_info *linfo = get_label_info(label);
+      if (linfo->op == 0) {
+        // Single input byte
+        uint32_t off = linfo->op1.i;
+        uint32_t inp = linfo->op2.i;
+        if (input_id == UINT32_MAX) input_id = inp;
+        else if (input_id != inp) { is_consecutive = false; return; }
+        offsets.push_back(off);
+        if (off < min_offset) min_offset = off;
+        if (off > max_offset) max_offset = off;
+      } else if (linfo->op == __dfsan::Concat) {
+        collect_offsets(linfo->l1);
+        collect_offsets(linfo->l2);
+      } else {
+        // Other operation - not a simple byte chain
+        is_consecutive = false;
+      }
+    };
+
+    collect_offsets(content_label);
+
+    // Check if offsets are truly consecutive
+    if (is_consecutive && !offsets.empty() && input_id != UINT32_MAX) {
+      std::sort(offsets.begin(), offsets.end());
+      for (size_t i = 1; i < offsets.size(); i++) {
+        if (offsets[i] != offsets[i-1] + 1) {
+          is_consecutive = false;
+          break;
+        }
+      }
+    }
+
+    if (is_consecutive && !offsets.empty()) {
+      // Create a single string variable for the whole range
+      uint32_t len = offsets.size();
+      uint32_t start_offset = offsets[0];
+
+      // Track string range for null-byte post-processing
+      string_ranges_[input_id].emplace_back(start_offset, start_offset + len);
+
+      // Add dependencies for all bytes
+      for (uint32_t off : offsets) {
+        deps.insert(std::make_pair(input_id, off));
+      }
+
+      // Create single symbolic string variable
+      char name[256];
+      snprintf(name, sizeof(name), "str-%u-%u-%u", input_id, start_offset, len);
+      z3::symbol symbol = context_.str_symbol(name);
+      return context_.constant(symbol, context_.string_sort());
+    }
+
+    // Fall back to recursive concatenation if not consecutive
+    z3::expr left(context_);
+    z3::expr right(context_);
+
+    if (info->l1 >= CONST_OFFSET) {
+      left = build_string_from_label(info->l1, deps);
+    } else {
+      char c = (char)(info->op1.i & 0xff);
+      left = context_.string_val(std::string(1, c));
+    }
+
+    if (info->l2 >= CONST_OFFSET) {
+      right = build_string_from_label(info->l2, deps);
+    } else {
+      char c = (char)(info->op2.i & 0xff);
+      right = context_.string_val(std::string(1, c));
+    }
+
     return z3::concat(left, right);
   }
 
@@ -1561,17 +1972,13 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label content_label, input_d
 
     // Track string range for null-byte post-processing (single byte)
     string_ranges_[input].emplace_back(offset, offset + 1);
+    deps.insert(std::make_pair(input, offset));
 
-    z3::expr byte = get_byte_expr(input, offset, deps);
-    z3::expr code = z3::bv2int(byte, false);
-    return z3::expr(context_, Z3_mk_string_from_code(context_, code));
-  }
-
-  // Fallback: try to serialize the label and convert to string
-  z3::expr byte_expr = get_cached_expr(content_label, deps);
-  if (byte_expr.is_bv() && byte_expr.get_sort().bv_size() == 8) {
-    z3::expr code = z3::bv2int(byte_expr, false);
-    return z3::expr(context_, Z3_mk_string_from_code(context_, code));
+    // Create a single-char symbolic string
+    char name[256];
+    snprintf(name, sizeof(name), "str-%u-%u-%u", input, offset, 1);
+    z3::symbol symbol = context_.str_symbol(name);
+    return context_.constant(symbol, context_.string_sort());
   }
 
   // Last resort: empty string
