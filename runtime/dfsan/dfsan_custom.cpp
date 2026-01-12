@@ -484,33 +484,6 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
     return ret;
   }
 
-  // Check if n_label derives from a string op (e.g., strchr index)
-  dfsan_label str_op_label = n_label ? find_string_op_source(n_label) : 0;
-
-  if (str_op_label != 0) {
-    // n is symbolic from string op - create fsubstr for matching buffer
-    dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
-    dfsan_label str_op_content = str_op_info->l1;
-
-    // Check which buffer matches the string op's content
-    if (l1 >= CONST_OFFSET && str_op_content >= CONST_OFFSET) {
-      dfsan_label l1_base = get_base_input_label(l1);
-      dfsan_label str_op_base = get_base_input_label(str_op_content);
-      if (l1_base != 0 && l1_base == str_op_base) {
-        l1 = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
-                          sizeof(void*) * 8, (uint64_t)n, 0);
-      }
-    }
-    if (l2 >= CONST_OFFSET && str_op_content >= CONST_OFFSET) {
-      dfsan_label l2_base = get_base_input_label(l2);
-      dfsan_label str_op_base = get_base_input_label(str_op_content);
-      if (l2_base != 0 && l2_base == str_op_base) {
-        l2 = dfsan_union(str_op_content, str_op_label, __dfsan::fsubstr,
-                          sizeof(void*) * 8, (uint64_t)n, 0);
-      }
-    }
-  }
-
   // Check if either side is a string op - use string theory comparison
   bool l1_is_string_op = (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
   bool l2_is_string_op = (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
