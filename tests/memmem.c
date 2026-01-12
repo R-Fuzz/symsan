@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "lib.h"
 
 int main(int argc, char **argv) {
   if (argc < 2) {
@@ -22,14 +21,18 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  char buf[20];
-  FILE* fp = chk_fopen(argv[1], "rb");
-  chk_fread(buf, 1, sizeof(buf), fp);
+  char buf[256] = {0};
+  FILE* fp = fopen(argv[1], "rb");
+  if (!fp) {
+    fprintf(stderr, "Failed to open\n");
+    return -1;
+  }
+  size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
   fclose(fp);
 
   // memmem with explicit lengths (needle is "ab\0c" including null byte)
   const char needle[] = "ABCD";
-  void *t1 = memmem(buf, 20, needle, 4);
+  void *t1 = memmem(buf, n, needle, 4);
   if (t1) {
     // CHECK-GEN: Found pattern
     printf("Found pattern at position %ld\n", (long)((char*)t1 - buf));

@@ -12,7 +12,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "lib.h"
 
 int main(int argc, char **argv) {
   if (argc < 2) {
@@ -20,12 +19,16 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  char buf[20];
-  FILE* fp = chk_fopen(argv[1], "rb");
-  chk_fread(buf, 1, sizeof(buf), fp);
+  char buf[256] = {0};
+  FILE* fp = fopen(argv[1], "rb");
+  if (!fp) {
+    fprintf(stderr, "Failed to open\n");
+    return -1;
+  }
+  size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
   fclose(fp);
 
-  void *p = memrchr(buf, 0x7f, sizeof(buf));
+  void *p = memrchr(buf, 0x7f, n);
   if (p != NULL) {
     // CHECK-GEN: Found byte
     printf("Found byte\n");
