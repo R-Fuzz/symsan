@@ -500,14 +500,25 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
 
   // Create label if source or char is tainted
   if (src_label != 0 || c_label != 0) {
-    int64_t found_pos = ret ? (ret - s) : -1;
+    // Determine which operand is concrete and set size accordingly
+    size_t haystack_len = strlen(s);
+    uint16_t content_len = (src_label == 0) ? (uint16_t)haystack_len : 0;
+
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = c_label (target char - may be symbolic!)
-    // op1 = concrete c value
-    // op2 = found position
+    // op1 = haystack pointer (for concrete content retrieval)
+    // op2 = char value
+    // size = haystack length if concrete, else 0
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
-                             sizeof(char*) * 8,
-                             (uint64_t)found_pos, (uint64_t)(uint8_t)c);
+                             content_len,
+                             (uint64_t)s,
+                             (uint64_t)(uint8_t)c);
+
+    // Send concrete haystack content if haystack is concrete
+    if (content_len > 0 && *ret_label) {
+      __taint_trace_memcmp(*ret_label);
+    }
+
     // Store the result pointer to recover symbolic length
     if (ret) {
       set_indexof_label(ret, *ret_label);
@@ -533,19 +544,30 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
   dfsan_label real_accept_label = get_str_label(accept, accept_label);
 
   if (src_label != 0 || real_accept_label != 0) {
-    int64_t found_pos = ret ? (ret - s) : -1;
+    // Determine which operand is concrete and set size accordingly
+    size_t haystack_len = strlen(s);
+    uint16_t content_len = 0;
+    if (src_label == 0) {
+      content_len = (uint16_t)haystack_len;
+    } else if (real_accept_label == 0) {
+      content_len = (uint16_t)accept_len;
+    }
+
     // l1 = src_label (source content)
     // l2 = accept_label (character set - may be symbolic)
-    // op1 = accept pointer (for caching if concrete)
-    // op2 = found position
-    // size = accept length
+    // op1 = haystack pointer (for concrete content retrieval)
+    // op2 = accept pointer (for concrete content retrieval)
+    // size = haystack length if haystack concrete, else accept length if accept concrete, else 0
     dfsan_label label = dfsan_union(src_label, real_accept_label, __dfsan::fstrpbrk,
-                                    accept_len,
-                                    (uint64_t)found_pos, (uint64_t)accept);
-    // Cache accept content if concrete
-    if (real_accept_label == 0 && label) {
+                                    content_len,
+                                    (uint64_t)s,
+                                    (uint64_t)accept);
+
+    // Send concrete content (haystack or accept)
+    if (content_len > 0 && label) {
       __taint_trace_memcmp(label);
     }
+
     *ret_label = label;
     // Store the result pointer to recover symbolic length
     if (ret) {
@@ -1853,11 +1875,25 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
   dfsan_label src_label = get_str_label(s, s_label);
 
   if (src_label != 0 || c_label != 0) {
-    int64_t found_pos = ret ? (ret - s) : -1;
-    // Use fstrrchr for reverse search
+    // Determine which operand is concrete and set size accordingly
+    size_t haystack_len = strlen(s);
+    uint16_t content_len = (src_label == 0) ? (uint16_t)haystack_len : 0;
+
+    // l1 = src_label (source - for chaining or content dependencies)
+    // l2 = c_label (target char - may be symbolic!)
+    // op1 = haystack pointer (for concrete content retrieval)
+    // op2 = char value
+    // size = haystack length if concrete, else 0
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
-                             sizeof(char*) * 8,
-                             (uint64_t)found_pos, (uint64_t)(uint8_t)c);
+                             content_len,
+                             (uint64_t)s,
+                             (uint64_t)(uint8_t)c);
+
+    // Send concrete haystack content if haystack is concrete
+    if (content_len > 0 && *ret_label) {
+      __taint_trace_memcmp(*ret_label);
+    }
+
     // Store the result pointer to recover symbolic length
     if (ret) {
       set_indexof_label(ret, *ret_label);
@@ -1906,22 +1942,31 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
   dfsan_label real_needle_label = get_str_label(needle, needle_label);
 
   if (src_label != 0 || real_needle_label != 0) {
+    // Determine which operand is concrete and set size accordingly
+    size_t haystack_len = strlen(haystack);
     size_t needle_len = strlen(needle);
-    int64_t found_pos = ret ? (ret - haystack) : -1;
+    uint16_t content_len = 0;
+    if (src_label == 0) {
+      content_len = (uint16_t)haystack_len;
+    } else if (real_needle_label == 0) {
+      content_len = (uint16_t)needle_len;
+    }
 
-    // l1 = src_label (source pointer - for chaining or content dependencies)
+    // l1 = src_label (source - for chaining or content dependencies)
     // l2 = real_needle_label (may be symbolic string!)
-    // op1 = needle pointer (for caching if concrete)
-    // op2 = found position
-    // size = needle length
+    // op1 = haystack pointer (for concrete content retrieval)
+    // op2 = needle pointer (for concrete content retrieval)
+    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
-                                    needle_len,
-                                    (uint64_t)found_pos, (uint64_t)needle);
+                                    content_len,
+                                    (uint64_t)haystack,
+                                    (uint64_t)needle);
 
-    // Cache needle content only if needle is concrete
-    if (real_needle_label == 0 && label) {
+    // Send concrete content (haystack or needle)
+    if (content_len > 0 && label) {
       __taint_trace_memcmp(label);
     }
+
     *ret_label = label;
     // Store the result pointer to recover symbolic length
     if (ret) {

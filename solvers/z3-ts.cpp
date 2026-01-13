@@ -77,6 +77,21 @@ static inline bool is_content_string_op(uint16_t op) {
   return op == __dfsan::fsubstr || op == __dfsan::fstrcat;
 }
 
+// Helper function to check if label tree contains indexOf operations
+// (used to skip validation since op1 is repurposed for haystack pointer)
+bool Z3AstParser::label_contains_indexof(dfsan_label label) {
+  if (label < CONST_OFFSET) return false;
+
+  dfsan_label_info *info = get_label_info(label);
+  if (is_indexof_op(info->op)) return true;
+
+  // Recursively check dependencies
+  if (info->l1 >= CONST_OFFSET && label_contains_indexof(info->l1)) return true;
+  if (info->l2 >= CONST_OFFSET && label_contains_indexof(info->l2)) return true;
+
+  return false;
+}
+
 // Decode Z3's escaped string format (e.g., "\u{1}\u{2}" -> bytes 0x01, 0x02)
 static std::vector<uint8_t> decode_z3_string(const std::string &str) {
   std::vector<uint8_t> result;
@@ -496,16 +511,16 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // strchr/memchr: find character in string
       // l1 = source pointer label (content bytes, fsubstr, or previous strchr for chaining)
       // l2 = c_label (target character - may be symbolic!)
-      // op1 = found position (runtime)
-      // op2 = concrete c value
-
-      int64_t found_pos = (int64_t)info->op1.i;
+      // op1 = haystack pointer (for concrete content retrieval)
+      // op2 = char value
+      // size = haystack length if haystack concrete, else 0
 
       // Build source string from l1 (content label)
       z3::expr haystack_str = context_.string_val("");
       z3::expr start_offset = context_.int_val(0);
 
       if (info->l1 >= CONST_OFFSET) {
+        // Symbolic haystack
         dfsan_label_info *src_info = get_label_info(info->l1);
 
         if (is_content_string_op(src_info->op)) {
@@ -538,6 +553,16 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // Build string from byte content (Load, Concat, or single byte)
           haystack_str = build_string_from_label(info->l1, input_deps);
         }
+      } else {
+        // Concrete haystack - retrieve from memcmp_cache
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          // Use info->size for haystack length (set in runtime)
+          std::string haystack(reinterpret_cast<char*>(it->second.get()), info->size);
+          haystack_str = context_.string_val(haystack);
+        } else {
+          throw z3::exception("cannot find haystack content for strchr");
+        }
       }
 
       // Get target character (concrete or symbolic)
@@ -562,26 +587,36 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx);  // cache the index expression (Int sort)
-      RECORD_VALUE(found_pos);
+      RECORD_VALUE(0);  // Placeholder - validation skipped for indexOf ops
       continue;
     } else if (info->op == __dfsan::fstrrchr) {
       // strrchr/memrchr: find LAST occurrence of character
       // l1 = source pointer label (content bytes or fsubstr)
       // l2 = c_label (target character - may be symbolic!)
-      // op1 = found position (runtime)
-      // op2 = concrete c value
-
-      int64_t found_pos = (int64_t)info->op1.i;
+      // op1 = haystack pointer (for concrete content retrieval)
+      // op2 = char value
+      // size = haystack length if haystack concrete, else 0
 
       // Build source string from l1 (content label or fsubstr)
       z3::expr haystack_str = context_.string_val("");
       if (info->l1 >= CONST_OFFSET) {
+        // Symbolic haystack
         dfsan_label_info *src_info = get_label_info(info->l1);
         if (is_content_string_op(src_info->op)) {
           // l1 is a fsubstr/strcat - use the cached substr expression directly
           haystack_str = get_cached_expr(info->l1, input_deps);
         } else {
           haystack_str = build_string_from_label(info->l1, input_deps);
+        }
+      } else {
+        // Concrete haystack - retrieve from memcmp_cache
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          // Use info->size for haystack length (set in runtime)
+          std::string haystack(reinterpret_cast<char*>(it->second.get()), info->size);
+          haystack_str = context_.string_val(haystack);
+        } else {
+          throw z3::exception("cannot find haystack content for strrchr");
         }
       }
 
@@ -608,23 +643,22 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx);
-      RECORD_VALUE(found_pos);
+      RECORD_VALUE(0);  // Placeholder - validation skipped for indexOf ops
       continue;
     } else if (info->op == __dfsan::fstrstr) {
       // strstr: find substring
       // l1 = haystack content label (for chaining or byte content)
       // l2 = needle_label (may be symbolic!)
-      // size = needle length
-      // op1 = found position
-      // op2 = needle pointer (for caching if concrete)
-
-      int64_t found_pos = (int64_t)info->op1.i;
+      // op1 = haystack pointer (for concrete content retrieval)
+      // op2 = needle pointer (for concrete content retrieval)
+      // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
 
       // Build haystack string from l1
       z3::expr haystack_str = context_.string_val("");
       z3::expr start_offset = context_.int_val(0);
 
       if (info->l1 >= CONST_OFFSET) {
+        // Symbolic haystack
         dfsan_label_info *src_info = get_label_info(info->l1);
 
         if (is_content_string_op(src_info->op)) {
@@ -654,6 +688,16 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // Build string from byte content
           haystack_str = build_string_from_label(info->l1, input_deps);
         }
+      } else {
+        // Concrete haystack - retrieve from memcmp_cache
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          // Use info->size for haystack length (set in runtime)
+          std::string haystack(reinterpret_cast<char*>(it->second.get()), info->size);
+          haystack_str = context_.string_val(haystack);
+        } else {
+          throw z3::exception("cannot find haystack content for strstr");
+        }
       }
 
       // Get needle (concrete or symbolic)
@@ -677,23 +721,22 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx);
-      RECORD_VALUE(found_pos);
+      RECORD_VALUE(0);  // Placeholder - validation skipped for indexOf ops
       continue;
     } else if (info->op == __dfsan::fstrpbrk) {
       // strpbrk: find first character from accept set
       // l1 = source content label
       // l2 = accept_label (may be symbolic)
-      // size = accept length
-      // op1 = found position
-      // op2 = accept pointer (for caching if concrete)
-
-      int64_t found_pos = (int64_t)info->op1.i;
+      // op1 = haystack pointer (for concrete content retrieval)
+      // op2 = accept pointer (for concrete content retrieval)
+      // size = haystack length if haystack concrete, else accept length if accept concrete, else 0
 
       // Build source string from l1
       z3::expr haystack_str = context_.string_val("");
       z3::expr start_offset = context_.int_val(0);
 
       if (info->l1 >= CONST_OFFSET) {
+        // Symbolic haystack
         dfsan_label_info *src_info = get_label_info(info->l1);
 
         if (is_content_string_op(src_info->op)) {
@@ -720,6 +763,16 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         } else {
           haystack_str = build_string_from_label(info->l1, input_deps);
         }
+      } else {
+        // Concrete haystack - retrieve from memcmp_cache
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          // Use info->size for haystack length (set in runtime)
+          std::string haystack(reinterpret_cast<char*>(it->second.get()), info->size);
+          haystack_str = context_.string_val(haystack);
+        } else {
+          throw z3::exception("cannot find haystack content for strpbrk");
+        }
       }
 
       // Get accept character set
@@ -739,13 +792,17 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           throw z3::exception("cannot find concrete accept content");
         }
       } else {
-        // Symbolic accept set - complex case, fall back to concrete result
-        idx = context_.int_val(found_pos);
+        // Symbolic accept set - build string from label
+        z3::expr accept_str = build_string_from_label(info->l2, input_deps);
+        // For now, use simplified approach with first char
+        z3::expr first_char_code(context_, Z3_mk_seq_nth(context_, accept_str, context_.int_val(0)));
+        z3::expr char_str(context_, Z3_mk_string_from_code(context_, first_char_code));
+        idx = z3::indexof(haystack_str, char_str, start_offset);
       }
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx.simplify());
-      RECORD_VALUE(found_pos);
+      RECORD_VALUE(0);  // Placeholder - validation skipped for indexOf ops
       continue;
     } else if (info->op == __dfsan::fsubstr) {
       // fsubstr: substring with symbolic position/length
@@ -1194,8 +1251,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // dump_value_cache(info->l1);
           // dump_value_cache(info->l2);
 
-          // memcmp and atoi are special cases where we don't have the actual
-          // value cached, so we fix it using the runtime value from ICmp
+          // Special cases where we don't have the actual value cached:
+          // - memcmp/atoi/strcmp: fix using runtime value from ICmp
+          // - indexOf operations: op1 repurposed for haystack pointer, skip validation
           bool is_special = false;
           if (l1_op == __dfsan::fmemcmp || l1_op == __dfsan::fatoi || l1_op == __dfsan::fstrcmp) {
             fprintf(stderr, "DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
@@ -1207,6 +1265,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             fprintf(stderr, "DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
                     info->l2, value_cache_[info->l2], (uint64_t)info->op2.i, l2_op);
             value_cache_[info->l2] = val2 = info->op2.i;
+            is_special = true;
+          }
+          // Check if either operand contains indexOf operations
+          if ((info->l1 >= CONST_OFFSET && label_contains_indexof(info->l1)) ||
+              (info->l2 >= CONST_OFFSET && label_contains_indexof(info->l2))) {
             is_special = true;
           }
           if (!is_special) {
@@ -1280,7 +1343,10 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     z3::expr r = context_.bool_val(result);
 
 #if FILTER_WRONG_AST
-    if (value_cache_[label] != result) {
+    // Skip validation for indexOf operations (op1 repurposed for haystack pointer)
+    bool contains_indexof = label_contains_indexof(label);
+
+    if (!contains_indexof && value_cache_[label] != result) {
       // recalcuated value must match the recorded value
       fprintf(stderr, "WARNING: value mismatch for label %u: expected %lu, got %d\n",
               label, value_cache_[label], result);

@@ -134,6 +134,7 @@ private:
   // String theory helpers for strchr/strstr
   z3::expr build_string_from_label(dfsan_label content_label, input_dep_set_t &deps);
   z3::expr get_byte_expr(uint32_t input, uint32_t offset, input_dep_set_t &deps);
+  bool label_contains_indexof(dfsan_label label);
 };
 
 class Z3ParserSolver : public Z3AstParser {
