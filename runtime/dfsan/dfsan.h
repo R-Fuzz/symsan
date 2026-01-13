@@ -183,9 +183,9 @@ enum operators {
   fstrchr   = last_llvm_op + 11,  // 78 strchr/memchr
   fstrrchr  = last_llvm_op + 12,  // 79 strrchr/memrchr
   fstrstr   = last_llvm_op + 13,  // 80 strstr/memmem
-  fsubstr   = last_llvm_op + 14,  // 81 substr(s, 0, len) - for bounded search
-  fstrpbrk  = last_llvm_op + 15,  // 82 strpbrk - find first char from set
-  fstr_off  = last_llvm_op + 16,  // 83 string op + constant offset (for ptr arithmetic)
+  fstrpbrk  = last_llvm_op + 14,  // 81 strpbrk - find first char from set
+  fstr_off  = last_llvm_op + 15,  // 82 string op + constant offset (for ptr arithmetic)
+  fsubstr   = last_llvm_op + 16,  // 83 substr(s, 0, len) - for bounded search
   fstrcat   = last_llvm_op + 17,  // 84 strcat/strncat - string concatenation
   fstr_op_end = last_llvm_op + 18, // 85
   // string comparison (returns 0/1, NOT a position - must be outside fstr_op range)
