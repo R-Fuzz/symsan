@@ -398,11 +398,13 @@ __taint_trace_memcmp(dfsan_label label) {
   AOUT("tainted memcmp: %d, size: %d\n", label, info->size);
 
   // If both operands are symbolic, no concrete content to cache
-  if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
+  if ((info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) || info->size == 0)
     return;
 
+  uint8_t *content_ptr = (info->l1 == CONST_LABEL) ? (uint8_t*)info->op1.i
+                                                   : (uint8_t*)info->op2.i;
   // Cache the concrete content for later solving, concrete oprand is always in op1
-  __z3_parser->record_memcmp(label, (uint8_t*)info->op1.i, info->size);
+  __z3_parser->record_memcmp(label, content_ptr, info->size);
 }
 
 extern "C" void InitializeSolver() {
