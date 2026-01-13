@@ -334,7 +334,7 @@ __taint_trace_memcmp(dfsan_label label) {
 
   uint16_t has_content = 1;
   // if both operands are symbolic, skip sending the content
-  if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
+  if ((info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) || info->size == 0)
     has_content = 0;
 
   pipe_msg msg = {
@@ -357,7 +357,10 @@ __taint_trace_memcmp(dfsan_label label) {
   size_t msg_size = sizeof(memcmp_msg) + info->size;
   memcmp_msg *mmsg = (memcmp_msg*)__builtin_alloca(msg_size);
   mmsg->label = label;
-  internal_memcpy(mmsg->content, (void*)info->op1.i, info->size); // concrete oprand is always in op1
+  // Copy concrete content: use op1 if l1 is concrete, else op2
+  void *concrete_ptr = (info->l1 == CONST_LABEL) ? (void*)info->op1.i : (void*)info->op2.i;
+  internal_memcpy(mmsg->content, concrete_ptr, info->size);
+  AOUT("sending memcmp content for label %d, size %u, msg_size=%lu\n", label, info->size, msg_size);
 
   // FIXME: assuming single writer so msg will arrive in the same order
   if (internal_write(__pipe_fd, mmsg, msg_size) < 0) {
