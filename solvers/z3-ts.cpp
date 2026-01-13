@@ -519,46 +519,52 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr haystack_str = context_.string_val("");
       z3::expr start_offset = context_.int_val(0);
 
-      if (info->l1 >= CONST_OFFSET) {
+      dfsan_label haystack_label = info->l1;
+      dfsan_label concrete_label = l;  // Track which label sent the concrete content
+      if (haystack_label >= CONST_OFFSET) {
         // Symbolic haystack
-        dfsan_label_info *src_info = get_label_info(info->l1);
+        dfsan_label_info *src_info = get_label_info(haystack_label);
 
         if (is_content_string_op(src_info->op)) {
           // l1 is a fsubstr/strcat - use the cached substr expression directly
-          haystack_str = get_cached_expr(info->l1, input_deps);
+          haystack_str = get_cached_expr(haystack_label, input_deps);
         } else if (is_indexof_op(src_info->op)) {
           if (src_info->op == __dfsan::fstr_off) {
             // Chained call via pointer arithmetic: strchr(t1 + N, c)
             // Use build_string_from_label which handles fstr_off specially
             // (creates insertion point if beyond end, or suffix if within bounds)
-            haystack_str = build_string_from_label(info->l1, input_deps);
+            haystack_label = src_info->l1;
             // start_offset stays 0 since we're searching from the start of the suffix/insertion point
           } else {
             // Chained call: search starts after previous match
             z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
             start_offset = prev_idx + 1;
             // Walk back to find original haystack content
-            dfsan_label content_label = info->l1;
+            haystack_label = info->l1;
             dfsan_label_info *chain_info = src_info;
             while (is_indexof_op(chain_info->op)) {
-              content_label = chain_info->l1;
-              if (content_label < CONST_OFFSET) break;
-              chain_info = get_label_info(content_label);
+              concrete_label = haystack_label;  // Save before updating
+              haystack_label = chain_info->l1;
+              if (haystack_label < CONST_OFFSET) break;
+              chain_info = get_label_info(haystack_label);
             }
-            if (content_label >= CONST_OFFSET) {
-              haystack_str = build_string_from_label(content_label, input_deps);
-            }
+          }
+          // Build string from original haystack label
+          if (haystack_label >= CONST_OFFSET) {
+              haystack_str = build_string_from_label(haystack_label, input_deps);
           }
         } else {
           // Build string from byte content (Load, Concat, or single byte)
-          haystack_str = build_string_from_label(info->l1, input_deps);
+          haystack_str = build_string_from_label(haystack_label, input_deps);
         }
-      } else {
-        // Concrete haystack - retrieve from memcmp_cache
-        auto it = memcmp_cache_.find(l);
+      }
+
+      if (haystack_label < CONST_OFFSET) {
+        // Concrete haystack - retrieve from memcmp_cache using concrete_label
+        auto it = memcmp_cache_.find(concrete_label);
         if (it != memcmp_cache_.end()) {
-          // Use info->size for haystack length (set in runtime)
-          std::string haystack(reinterpret_cast<char*>(it->second.get()), info->size);
+          dfsan_label_info *concrete_info = get_label_info(concrete_label);
+          std::string haystack(reinterpret_cast<char*>(it->second.get()), concrete_info->size);
           haystack_str = context_.string_val(haystack);
         } else {
           throw z3::exception("cannot find haystack content for strchr");
@@ -657,43 +663,49 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr haystack_str = context_.string_val("");
       z3::expr start_offset = context_.int_val(0);
 
-      if (info->l1 >= CONST_OFFSET) {
+      dfsan_label haystack_label = info->l1;
+      dfsan_label concrete_label = l;  // Track which label sent the concrete content
+      if (haystack_label >= CONST_OFFSET) {
         // Symbolic haystack
-        dfsan_label_info *src_info = get_label_info(info->l1);
+        dfsan_label_info *src_info = get_label_info(haystack_label);
 
         if (is_content_string_op(src_info->op)) {
           // l1 is a fsubstr/strcat - use the cached substr expression directly
-          haystack_str = get_cached_expr(info->l1, input_deps);
+          haystack_str = get_cached_expr(haystack_label, input_deps);
         } else if (is_indexof_op(src_info->op)) {
           if (src_info->op == __dfsan::fstr_off) {
             // Chained call via pointer arithmetic
-            haystack_str = build_string_from_label(info->l1, input_deps);
+            haystack_label = src_info->l1;
           } else {
             // Chained call: search starts after previous match
             z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
             start_offset = prev_idx + 1;
             // Walk back to find original haystack content
-            dfsan_label content_label = info->l1;
+            haystack_label = info->l1;
             dfsan_label_info *chain_info = src_info;
             while (is_indexof_op(chain_info->op)) {
-              content_label = chain_info->l1;
-              if (content_label < CONST_OFFSET) break;
-              chain_info = get_label_info(content_label);
+              concrete_label = haystack_label;  // Save before updating
+              haystack_label = chain_info->l1;
+              if (haystack_label < CONST_OFFSET) break;
+              chain_info = get_label_info(haystack_label);
             }
-            if (content_label >= CONST_OFFSET) {
-              haystack_str = build_string_from_label(content_label, input_deps);
-            }
+          }
+          // Build string from original haystack label
+          if (haystack_label >= CONST_OFFSET) {
+            haystack_str = build_string_from_label(haystack_label, input_deps);
           }
         } else {
           // Build string from byte content
-          haystack_str = build_string_from_label(info->l1, input_deps);
+          haystack_str = build_string_from_label(haystack_label, input_deps);
         }
-      } else {
-        // Concrete haystack - retrieve from memcmp_cache
-        auto it = memcmp_cache_.find(l);
+      }
+
+      if (haystack_label < CONST_OFFSET) {
+        // Concrete haystack - retrieve from memcmp_cache using concrete_label
+        auto it = memcmp_cache_.find(concrete_label);
         if (it != memcmp_cache_.end()) {
-          // Use info->size for haystack length (set in runtime)
-          std::string haystack(reinterpret_cast<char*>(it->second.get()), info->size);
+          dfsan_label_info *concrete_info = get_label_info(concrete_label);
+          std::string haystack(reinterpret_cast<char*>(it->second.get()), concrete_info->size);
           haystack_str = context_.string_val(haystack);
         } else {
           throw z3::exception("cannot find haystack content for strstr");
@@ -735,40 +747,46 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr haystack_str = context_.string_val("");
       z3::expr start_offset = context_.int_val(0);
 
-      if (info->l1 >= CONST_OFFSET) {
+      dfsan_label haystack_label = info->l1;
+      dfsan_label concrete_label = l;  // Track which label sent the concrete content
+      if (haystack_label >= CONST_OFFSET) {
         // Symbolic haystack
-        dfsan_label_info *src_info = get_label_info(info->l1);
+        dfsan_label_info *src_info = get_label_info(haystack_label);
 
         if (is_content_string_op(src_info->op)) {
-          haystack_str = get_cached_expr(info->l1, input_deps);
+          haystack_str = get_cached_expr(haystack_label, input_deps);
         } else if (is_indexof_op(src_info->op)) {
           if (src_info->op == __dfsan::fstr_off) {
             // Chained call via pointer arithmetic
-            haystack_str = build_string_from_label(info->l1, input_deps);
+            haystack_label = src_info->l1;
           } else {
             // Chained call
             z3::expr prev_idx = get_cached_expr(info->l1, input_deps);
             start_offset = prev_idx + 1;
-            dfsan_label content_label = info->l1;
+            haystack_label = info->l1;
             dfsan_label_info *chain_info = src_info;
             while (is_indexof_op(chain_info->op)) {
-              content_label = chain_info->l1;
-              if (content_label < CONST_OFFSET) break;
-              chain_info = get_label_info(content_label);
-            }
-            if (content_label >= CONST_OFFSET) {
-              haystack_str = build_string_from_label(content_label, input_deps);
+              concrete_label = haystack_label;  // Save before updating
+              haystack_label = chain_info->l1;
+              if (haystack_label < CONST_OFFSET) break;
+              chain_info = get_label_info(haystack_label);
             }
           }
+          // Build string from original haystack label
+          if (haystack_label >= CONST_OFFSET) {
+            haystack_str = build_string_from_label(haystack_label, input_deps);
+          }
         } else {
-          haystack_str = build_string_from_label(info->l1, input_deps);
+          haystack_str = build_string_from_label(haystack_label, input_deps);
         }
-      } else {
-        // Concrete haystack - retrieve from memcmp_cache
-        auto it = memcmp_cache_.find(l);
+      }
+
+      if (haystack_label < CONST_OFFSET) {
+        // Concrete haystack - retrieve from memcmp_cache using concrete_label
+        auto it = memcmp_cache_.find(concrete_label);
         if (it != memcmp_cache_.end()) {
-          // Use info->size for haystack length (set in runtime)
-          std::string haystack(reinterpret_cast<char*>(it->second.get()), info->size);
+          dfsan_label_info *concrete_info = get_label_info(concrete_label);
+          std::string haystack(reinterpret_cast<char*>(it->second.get()), concrete_info->size);
           haystack_str = context_.string_val(haystack);
         } else {
           throw z3::exception("cannot find haystack content for strpbrk");
