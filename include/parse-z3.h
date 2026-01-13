@@ -39,6 +39,14 @@ protected:
   // String ranges for null-byte post-processing (input_id -> list of (start, end))
   std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> string_ranges_;
 
+  // String info cache: label -> (input_id, offset, length)
+  struct string_info_t {
+    uint32_t input_id;
+    uint32_t offset;
+    uint32_t length;
+  };
+  std::unordered_map<dfsan_label, string_info_t> string_info_cache_;
+
 private:
   // Original input cache
   std::vector<input_t> inputs_cache_;
