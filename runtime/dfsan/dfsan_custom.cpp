@@ -146,9 +146,7 @@ static inline bool is_string_op(uint16_t op) {
 // Check if an op is an indexOf-type operation (returns position, not content)
 // These are: fstrchr, fstrrchr, fstrstr, fstrpbrk, fstr_off
 static inline bool is_indexof_op(uint16_t op) {
-  return op == __dfsan::fstrchr || op == __dfsan::fstrrchr ||
-         op == __dfsan::fstrstr || op == __dfsan::fstrpbrk ||
-         op == __dfsan::fstr_off;
+  return op >= __dfsan::fstrchr && op <= __dfsan::fstr_off;
 }
 
 // Check if an op is a content-type string operation (fsubstr, fstrcat)
@@ -509,7 +507,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
     // op2 = found position
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
                              sizeof(char*) * 8,
-                             (uint64_t)(uint8_t)c, (uint64_t)found_pos);
+                             (uint64_t)found_pos, (uint64_t)(uint8_t)c);
     // Store the result pointer to recover symbolic length
     if (ret) {
       set_indexof_label(ret, *ret_label);
@@ -543,7 +541,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
     // size = accept length
     dfsan_label label = dfsan_union(src_label, real_accept_label, __dfsan::fstrpbrk,
                                     accept_len,
-                                    (uint64_t)accept, (uint64_t)found_pos);
+                                    (uint64_t)found_pos, (uint64_t)accept);
     // Cache accept content if concrete
     if (real_accept_label == 0 && label) {
       __taint_trace_memcmp(label);
@@ -954,14 +952,82 @@ char *__dfsw_strcat(char *dest, const char *src, dfsan_label d_label,
 
   // If either string is tainted, create fstrcat label
   if (dest_str_label != 0 || src_str_label != 0) {
-    // Create fstrcat: l1=dest, l2=src, op1=dest_len, op2=src_len (excluding null)
+    // Create fstrcat: l1=dest, l2=src
+    // op1=dest pointer, op2=src pointer (for concrete content access)
+    // size = length of concrete operand (for memcmp_cache), 0 if both symbolic
+    size_t src_len = copy_len - 1;  // excluding null
+    uint16_t concrete_len = 0;
+    if (dest_str_label == 0) {
+      concrete_len = (uint16_t)dest_len;
+    } else if (src_str_label == 0) {
+      concrete_len = (uint16_t)src_len;
+    }
     dfsan_label concat_label = dfsan_union(dest_str_label, src_str_label,
                                             __dfsan::fstrcat,
-                                            sizeof(char*) * 8,
-                                            (uint64_t)dest_len,
-                                            (uint64_t)(copy_len - 1));
+                                            concrete_len,
+                                            (uint64_t)dest,
+                                            (uint64_t)src);
     AOUT("strcat: created fstrcat label=%u\n", concat_label);
+    // Send concrete content through pipe if one side is concrete
+    if (concrete_len > 0) {
+      __taint_trace_memcmp(concat_label);
+    }
     // Store in str_map so downstream ops can find it
+    set_content_label(dest, concat_label);
+  }
+
+  *ret_label = d_label;
+  return dest;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE char *
+__dfsw_strncat(char *dest, const char *src, size_t n,
+               dfsan_label d_label, dfsan_label s_label, dfsan_label n_label,
+               dfsan_label *ret_label) {
+  size_t dest_len = strlen(dest);
+  size_t src_len = strlen(src);
+  size_t copy_len = (n < src_len) ? n : src_len;  // min(n, strlen(src))
+  __taint_check_bounds(d_label, (uptr)dest, 0, dest_len + copy_len + 1);
+
+  AOUT("strncat: dest=%p, src=%p, n=%zu, d_label=%u, s_label=%u, n_label=%u\n",
+       dest, src, n, d_label, s_label, n_label);
+
+  // Get dest label using unified label retrieval
+  dfsan_label dest_str_label = get_str_label(dest, d_label);
+
+  // Get src label - use get_str_label_n to handle symbolic n
+  // This will create fsubstr if n_label derives from a string op (e.g., strchr)
+  dfsan_label src_str_label = get_str_label_n(src, s_label, copy_len, n_label);
+
+  AOUT("strncat: dest_str_label=%u, src_str_label=%u, copy_len=%zu\n",
+       dest_str_label, src_str_label, copy_len);
+
+  // Perform the actual strncat
+  dfsan_memcpy(dest + dest_len, src, copy_len);
+  dest[dest_len + copy_len] = '\0';
+
+  // If either string is tainted, create fstrcat label
+  if (dest_str_label != 0 || src_str_label != 0) {
+    // Create fstrcat: l1=dest, l2=src
+    // op1=dest pointer, op2=src pointer (for concrete content access)
+    // size = length of concrete operand (for memcmp_cache), 0 if both symbolic
+    uint16_t concrete_len = 0;
+    if (dest_str_label == 0) {
+      concrete_len = (uint16_t)dest_len;
+    } else if (src_str_label == 0) {
+      concrete_len = (uint16_t)copy_len;
+    }
+    dfsan_label concat_label = dfsan_union(dest_str_label, src_str_label,
+                                            __dfsan::fstrcat,
+                                            concrete_len,
+                                            (uint64_t)dest,
+                                            (uint64_t)src);
+    AOUT("strncat: created fstrcat label=%u\n", concat_label);
+    // Send concrete content through pipe if one side is concrete
+    if (concrete_len > 0) {
+      __taint_trace_memcmp(concat_label);
+    }
+    // Store in content map so downstream ops can find it
     set_content_label(dest, concat_label);
   }
 
@@ -1766,7 +1832,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     // Same structure as strchr
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
                              sizeof(void*) * 8,
-                             (uint64_t)(uint8_t)c, (uint64_t)found_pos);
+                             (uint64_t)found_pos, (uint64_t)(uint8_t)c);
     // Store the result pointer to recover symbolic length
     if (ret) {
       set_indexof_label(ret, *ret_label);
@@ -1791,7 +1857,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
     // Use fstrrchr for reverse search
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
                              sizeof(char*) * 8,
-                             (uint64_t)(uint8_t)c, (uint64_t)found_pos);
+                             (uint64_t)found_pos, (uint64_t)(uint8_t)c);
     // Store the result pointer to recover symbolic length
     if (ret) {
       set_indexof_label(ret, *ret_label);
@@ -1818,7 +1884,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
     // Use fstrrchr for reverse search
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
                              sizeof(void*) * 8,
-                             (uint64_t)(uint8_t)c, (uint64_t)found_pos);
+                             (uint64_t)found_pos, (uint64_t)(uint8_t)c);
     // Store the result pointer to recover symbolic length
     if (ret) {
       set_indexof_label(ret, *ret_label);
@@ -1850,7 +1916,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
     // size = needle length
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     needle_len,
-                                    (uint64_t)needle, (uint64_t)found_pos);
+                                    (uint64_t)found_pos, (uint64_t)needle);
 
     // Cache needle content only if needle is concrete
     if (real_needle_label == 0 && label) {
@@ -1895,7 +1961,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
     // size = needle length
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     needlelen,
-                                    (uint64_t)needle, (uint64_t)found_pos);
+                                    (uint64_t)found_pos, (uint64_t)needle);
 
     // Cache needle content only if needle is concrete
     if (real_needle_label == 0 && label) {

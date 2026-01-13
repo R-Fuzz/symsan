@@ -48,6 +48,8 @@ static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::fstrrchr, "strrchr"},
   {__dfsan::fstrstr,  "strstr"},
   {__dfsan::fstrpbrk, "strpbrk"},
+  {__dfsan::fstr_off, "stroff"},
+  {__dfsan::fsubstr,  "substr"},
   {__dfsan::fstrcat,  "strcat"},
 };
 
@@ -62,6 +64,17 @@ static std::string get_op_name(uint32_t op) {
 // Check if an op is a string operation (fstr_op_start to fstr_op_end)
 static inline bool is_string_op(uint16_t op) {
   return op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end;
+}
+
+// Check if an op is an indexOf-type operation (returns position, not content)
+// These are: fstrchr, fstrrchr, fstrstr, fstrpbrk, fstr_off
+static inline bool is_indexof_op(uint16_t op) {
+  return op >= __dfsan::fstrchr && op <= __dfsan::fstr_off;
+}
+
+// Check if an op is a content-type string operation (fsubstr, fstrcat)
+static inline bool is_content_string_op(uint16_t op) {
+  return op == __dfsan::fsubstr || op == __dfsan::fstrcat;
 }
 
 // Decode Z3's escaped string format (e.g., "\u{1}\u{2}" -> bytes 0x01, 0x02)
@@ -483,10 +496,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // strchr/memchr: find character in string
       // l1 = source pointer label (content bytes, fsubstr, or previous strchr for chaining)
       // l2 = c_label (target character - may be symbolic!)
-      // op1 = concrete c value
-      // op2 = found position (runtime)
+      // op1 = found position (runtime)
+      // op2 = concrete c value
 
-      int64_t found_pos = (int64_t)info->op2.i;
+      int64_t found_pos = (int64_t)info->op1.i;
 
       // Build source string from l1 (content label)
       z3::expr haystack_str = context_.string_val("");
@@ -495,10 +508,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       if (info->l1 >= CONST_OFFSET) {
         dfsan_label_info *src_info = get_label_info(info->l1);
 
-        if (src_info->op == __dfsan::fsubstr) {
-          // l1 is a fsubstr - use the cached substr expression directly
+        if (is_content_string_op(src_info->op)) {
+          // l1 is a fsubstr/strcat - use the cached substr expression directly
           haystack_str = get_cached_expr(info->l1, input_deps);
-        } else if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
+        } else if (is_indexof_op(src_info->op)) {
           if (src_info->op == __dfsan::fstr_off) {
             // Chained call via pointer arithmetic: strchr(t1 + N, c)
             // Use build_string_from_label which handles fstr_off specially
@@ -533,7 +546,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr code(context_);
       if (info->l2 == 0) {
         // Concrete character
-        uint8_t c = (uint8_t)info->op1.i;
+        uint8_t c = (uint8_t)info->op2.i;
         code = context_.int_val(c);
       } else {
         // Symbolic character - convert bitvector to int
@@ -556,10 +569,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // strrchr/memrchr: find LAST occurrence of character
       // l1 = source pointer label (content bytes or fsubstr)
       // l2 = c_label (target character - may be symbolic!)
-      // op1 = concrete c value
-      // op2 = found position (runtime)
+      // op1 = found position (runtime)
+      // op2 = concrete c value
 
-      int64_t found_pos = (int64_t)info->op2.i;
+      int64_t found_pos = (int64_t)info->op1.i;
 
       // Build source string from l1 (content label or fsubstr)
       z3::expr haystack_str = context_.string_val("");
@@ -578,7 +591,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr code(context_);
       if (info->l2 == 0) {
         // Concrete character
-        uint8_t c = (uint8_t)info->op1.i;
+        uint8_t c = (uint8_t)info->op2.i;
         code = context_.int_val(c);
       } else {
         // Symbolic character - convert bitvector to int
@@ -603,10 +616,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // l1 = haystack content label (for chaining or byte content)
       // l2 = needle_label (may be symbolic!)
       // size = needle length
-      // op1 = needle pointer (for caching if concrete)
-      // op2 = found position
+      // op1 = found position
+      // op2 = needle pointer (for caching if concrete)
 
-      int64_t found_pos = (int64_t)info->op2.i;
+      int64_t found_pos = (int64_t)info->op1.i;
 
       // Build haystack string from l1
       z3::expr haystack_str = context_.string_val("");
@@ -652,7 +665,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           std::string needle(reinterpret_cast<char*>(it->second.get()), info->size);
           needle_str = context_.string_val(needle);
         } else {
-          needle_str = context_.string_val("");
+          throw z3::exception("cannot find concrete needle content");
         }
       } else {
         // Symbolic needle - build string from l2 (Load of tainted buffer)
@@ -670,10 +683,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // l1 = source content label
       // l2 = accept_label (may be symbolic)
       // size = accept length
-      // op1 = accept pointer (for caching if concrete)
-      // op2 = found position
+      // op1 = found position
+      // op2 = accept pointer (for caching if concrete)
 
-      int64_t found_pos = (int64_t)info->op2.i;
+      int64_t found_pos = (int64_t)info->op1.i;
 
       // Build source string from l1
       z3::expr haystack_str = context_.string_val("");
@@ -723,7 +736,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           z3::expr char_str(context_, Z3_mk_string_from_code(context_, code));
           idx = z3::indexof(haystack_str, char_str, start_offset);
         } else {
-          idx = context_.int_val(-1);
+          throw z3::exception("cannot find concrete accept content");
         }
       } else {
         // Symbolic accept set - complex case, fall back to concrete result
@@ -795,8 +808,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // strcat: string concatenation
       // l1 = dest string label
       // l2 = src string label
-      // op1 = dest_len (original dest length before concat)
-      // op2 = src_len (source string length, excluding null)
+      // op1 = dest pointer (for concrete content access)
+      // op2 = src pointer (for concrete content access)
+      // size = length of concrete operand (for memcmp_cache), 0 if both symbolic
 
       z3::expr dest_str = context_.string_val("");
       z3::expr src_str = context_.string_val("");
@@ -810,6 +824,15 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         } else {
           dest_str = build_string_from_label(info->l1, input_deps);
         }
+      } else {
+        // Concrete dest - get from memcmp_cache
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
+          dest_str = context_.string_val(s);
+        } else {
+          throw z3::exception("cannot find strcat content");
+        }
       }
 
       // Build src string from l2
@@ -820,6 +843,15 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         } else {
           src_str = build_string_from_label(info->l2, input_deps);
         }
+      } else {
+        // Concrete src - get from memcmp_cache
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
+          src_str = context_.string_val(s);
+        } else {
+          throw z3::exception("cannot find strcat content");
+        }
       }
 
       // Create Z3 string concatenation
@@ -827,8 +859,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, concat_result);
-      // Record combined length as the value
-      RECORD_VALUE(info->op1.i + info->op2.i);
+      RECORD_VALUE(0);
       continue;
     } else if (info->op == __dfsan::fstrcmp) {
       // String comparison using Z3 string theory
@@ -844,8 +875,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // Build first string
       if (info->l1 >= CONST_OFFSET) {
         dfsan_label_info *l1_info = get_label_info(info->l1);
-        if (l1_info->op == __dfsan::fsubstr) {
-          // l1 is fsubstr - get the cached substr expression
+        if (is_content_string_op(l1_info->op)) {
+          // fsubstr/fstrcat - get the cached String expression
           str1 = get_cached_expr(info->l1, input_deps);
         } else {
           // Regular content - build string from labels
@@ -863,8 +894,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // Build second string
       if (info->l2 >= CONST_OFFSET) {
         dfsan_label_info *l2_info = get_label_info(info->l2);
-        if (l2_info->op == __dfsan::fsubstr) {
-          // l2 is fsubstr - get the cached substr expression
+        if (is_content_string_op(l2_info->op)) {
+          // fsubstr/fstrcat - get the cached String expression
           str2 = get_cached_expr(info->l2, input_deps);
         } else {
           // Regular content - build string from labels
@@ -1844,7 +1875,7 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
   }
 
   // Handle fsubstr and fstrcat: these ops cache String expressions
-  if (info->op == __dfsan::fsubstr || info->op == __dfsan::fstrcat) {
+  if (is_content_string_op(info->op)) {
     // Should be cached from earlier processing
     return get_cached_expr(label, deps);
   }
@@ -1917,7 +1948,7 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
   // Handle string search ops (fstrchr, fstrrchr, fstrstr, fstrpbrk):
   // These labels represent pointer results. When used as content directly
   // (without GEP offset), we build content at the found position.
-  if (is_string_op(info->op)) {
+  if (is_indexof_op(info->op)) {
     if (info->l1 >= CONST_OFFSET) {
       // Get the index expression for this string op (if already cached)
       z3::expr idx_expr = get_cached_expr(label, deps);
