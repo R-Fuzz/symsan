@@ -73,8 +73,8 @@ static struct {
 } fsubstr_map[FSUBSTR_MAP_SIZE];
 static uptr fsubstr_map_count = 0;
 
-static inline void set_fsubstr_label(void *addr, dfsan_label label) {
-  AOUT("set_fsubstr_label: addr=%p, label=%u\n", addr, label);
+static inline void set_str_label(void *addr, dfsan_label label) {
+  AOUT("set_str_label: addr=%p, label=%u\n", addr, label);
   // Check if already exists
   for (uptr i = 0; i < fsubstr_map_count; i++) {
     if (fsubstr_map[i].addr == (uptr)addr) {
@@ -90,14 +90,14 @@ static inline void set_fsubstr_label(void *addr, dfsan_label label) {
   }
 }
 
-static inline dfsan_label get_fsubstr_label(const void *addr) {
+static inline dfsan_label get_str_label(const void *addr) {
   for (uptr i = 0; i < fsubstr_map_count; i++) {
     if (fsubstr_map[i].addr == (uptr)addr) {
-      AOUT("get_fsubstr_label: addr=%p, found label=%u\n", addr, fsubstr_map[i].label);
+      AOUT("get_str_label: addr=%p, found label=%u\n", addr, fsubstr_map[i].label);
       return fsubstr_map[i].label;
     }
   }
-  AOUT("get_fsubstr_label: addr=%p, not found\n", addr);
+  AOUT("get_str_label: addr=%p, not found\n", addr);
   return 0;
 }
 
@@ -175,7 +175,7 @@ static dfsan_label find_string_op_source(dfsan_label label) {
 static inline dfsan_label get_str_label_n(const void *s, dfsan_label s_label,
                                            size_t n, dfsan_label n_label) {
   // 1. Check runtime fsubstr_map first (highest priority)
-  dfsan_label fsubstr = get_fsubstr_label(s);
+  dfsan_label fsubstr = get_str_label(s);
   if (fsubstr != 0) {
     return fsubstr;
   }
@@ -381,12 +381,12 @@ void __taint_trace_gep_ptr(dfsan_label base_label, char *result, char *base) {
   uint64_t offset = (uint64_t)(result - base);
   dfsan_label off_label = dfsan_union(str_op_label, 0, __dfsan::fstr_off,
                                        sizeof(void*) * 8,
-                                       (uint64_t)offset, 0);
+                                       0, (uint64_t)offset);
   AOUT("gep_ptr: base=%u, str_op=%u, offset=%ld, result=%u\n",
        base_label, str_op_label, offset, off_label);
 
   // record the label
-  set_fsubstr_label(result, off_label);
+  set_str_label(result, off_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
@@ -597,7 +597,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
   } else {
     // Determine length for comparison (use concrete side if one is fsubstr)
     size_t n = strlen(s1) + 1;
-    dfsan_label s1_fsubstr = get_fsubstr_label(s1);
+    dfsan_label s1_fsubstr = get_str_label(s1);
     if (s1_fsubstr != 0)
       n = strlen(s2) + 1;  // use concrete side for length
 
@@ -623,7 +623,7 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
     *ret_label = 0;
   } else {
     size_t n = strlen(s1) + 1;
-    dfsan_label s1_fsubstr = get_fsubstr_label(s1);
+    dfsan_label s1_fsubstr = get_str_label(s1);
     if (s1_fsubstr != 0)
       n = strlen(s2) + 1;
 
@@ -831,7 +831,31 @@ char *__dfsw_strcat(char *dest, const char *src, dfsan_label d_label,
   size_t dest_len = strlen(dest);
   size_t copy_len = strlen(src) + 1; // including tailing '\0'
   __taint_check_bounds(d_label, (uptr)dest, 0, dest_len + copy_len);
+
+  // Get labels for both strings using unified label retrieval
+  dfsan_label dest_str_label = get_str_label(dest, d_label);
+  dfsan_label src_str_label = get_str_label(src, s_label);
+
+  AOUT("strcat: dest=%p, src=%p, dest_label=%u, src_label=%u, "
+       "dest_str_label=%u, src_str_label=%u\n",
+       dest, src, d_label, s_label, dest_str_label, src_str_label);
+
+  // Perform the actual strcat (copy src to dest + dest_len)
   dfsan_memcpy(dest + dest_len, src, copy_len);
+
+  // If either string is tainted, create fstrcat label
+  if (dest_str_label != 0 || src_str_label != 0) {
+    // Create fstrcat: l1=dest, l2=src, op1=dest_len, op2=src_len (excluding null)
+    dfsan_label concat_label = dfsan_union(dest_str_label, src_str_label,
+                                            __dfsan::fstrcat,
+                                            sizeof(char*) * 8,
+                                            (uint64_t)dest_len,
+                                            (uint64_t)(copy_len - 1));
+    AOUT("strcat: created fstrcat label=%u\n", concat_label);
+    // Store in fsubstr_map so downstream ops can find it
+    set_str_label(dest, concat_label);
+  }
+
   *ret_label = d_label;
   return dest;
 }
@@ -917,7 +941,7 @@ __dfsw_strncpy(char *s1, const char *s2, size_t n, dfsan_label s1_label,
 
       // Store fsubstr label in runtime map keyed by destination address
       // This survives buffer content being overwritten (e.g., key[len] = '\0')
-      set_fsubstr_label(s1, substr_label);
+      set_str_label(s1, substr_label);
 
       *ret_label = s1_label;
     }
@@ -1312,7 +1336,7 @@ char *__dfsw_strcpy(char *dest, const char *src, dfsan_label dst_label,
 
   if (real_src_label != 0) {
     // Store the label in runtime map keyed by destination address
-    set_fsubstr_label(dest, real_src_label);
+    set_str_label(dest, real_src_label);
     *ret_label = real_src_label;
   }
 

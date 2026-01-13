@@ -167,29 +167,30 @@ enum operators {
 #undef HANDLE_MEMORY_INST
 #undef HANDLE_CAST_INST
 #undef HANDLE_OTHER_INST
-#undef LAST_OTHER_INST
+#undef LAST_OTHER_INST // last_llvm_op = 67 for llvm14
   // self-defined
-  Free      = last_llvm_op + 3,
-  Extract   = last_llvm_op + 4,
-  Concat    = last_llvm_op + 5,
-  Arg       = last_llvm_op + 6,
+  Free      = last_llvm_op + 3, // 70
+  Extract   = last_llvm_op + 4, // 71
+  Concat    = last_llvm_op + 5, // 72
+  Arg       = last_llvm_op + 6, // 73
   // higher-order
-  fmemcmp   = last_llvm_op + 7,
-  fsize     = last_llvm_op + 8,
-  fatoi     = last_llvm_op + 9,
-  fstrlen   = last_llvm_op + 10,
+  fmemcmp   = last_llvm_op + 7, // 74
+  fsize     = last_llvm_op + 8, // 75
+  fatoi     = last_llvm_op + 9, // 76
+  fstrlen   = last_llvm_op + 10, // 77
   // string search ops that return positions (for chaining detection)
-  fstr_op_start = last_llvm_op + 11,
-  fstrchr   = last_llvm_op + 11,  // strchr/memchr
-  fstrrchr  = last_llvm_op + 12,  // strrchr/memrchr
-  fstrstr   = last_llvm_op + 13,  // strstr/memmem
-  fsubstr   = last_llvm_op + 14,  // substr(s, 0, len) - for bounded search
-  fstrpbrk  = last_llvm_op + 15,  // strpbrk - find first char from set
-  fstr_off  = last_llvm_op + 16,  // string op + constant offset (for ptr arithmetic)
-  fstr_op_end = last_llvm_op + 17,
+  fstr_op_start = last_llvm_op + 11, // 78
+  fstrchr   = last_llvm_op + 11,  // 78 strchr/memchr
+  fstrrchr  = last_llvm_op + 12,  // 79 strrchr/memrchr
+  fstrstr   = last_llvm_op + 13,  // 80 strstr/memmem
+  fsubstr   = last_llvm_op + 14,  // 81 substr(s, 0, len) - for bounded search
+  fstrpbrk  = last_llvm_op + 15,  // 82 strpbrk - find first char from set
+  fstr_off  = last_llvm_op + 16,  // 83 string op + constant offset (for ptr arithmetic)
+  fstrcat   = last_llvm_op + 17,  // 84 strcat/strncat - string concatenation
+  fstr_op_end = last_llvm_op + 18, // 85
   // string comparison (returns 0/1, NOT a position - must be outside fstr_op range)
-  fstrcmp   = last_llvm_op + 17,  // strcmp using Z3 string theory
-  LastOp    = last_llvm_op + 18,
+  fstrcmp   = last_llvm_op + 18, // 85 strcmp using Z3 string theory
+  LastOp    = last_llvm_op + 19, // 86
 };
 
 enum predicate {
