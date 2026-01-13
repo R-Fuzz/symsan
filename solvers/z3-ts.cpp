@@ -735,10 +735,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       RECORD_VALUE(found_pos);
       continue;
     } else if (info->op == __dfsan::fsubstr) {
-      // fsubstr: substring with length from a previous string op result
+      // fsubstr: substring with symbolic position/length
       // l1 = original content label (full haystack from previous string op)
-      // l2 = string op label (whose cached index becomes the length)
+      // l2 = string op label (position or length depending on mode)
       // op1 = concrete length n
+      // op2 = 0 for prefix mode (from 0 to l2), 1 for suffix mode (from l2 to end)
 
       // Build the full string from l1 (the original content)
       z3::expr full_str = context_.string_val("");
@@ -746,18 +747,44 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         full_str = build_string_from_label(info->l1, input_deps);
       }
 
-      // Get the length from l2 (the string op's result index)
-      z3::expr len_expr = context_.int_val((int64_t)info->op1.i);
-      if (info->l2 >= CONST_OFFSET) {
-        // l2 is the string op label - its cached value is the index
-        len_expr = get_cached_expr(info->l2, input_deps);
-      }
+      z3::expr substr_expr(context_);
+      bool suffix_mode = (info->op2.i == 1);
 
-      // Generate substr(full_str, 0, len) using Z3 string theory
-      z3::expr substr_expr(context_, Z3_mk_seq_extract(context_,
-                                                        full_str,
-                                                        context_.int_val(0),
-                                                        len_expr));
+      if (suffix_mode) {
+        // Suffix mode: substr(str, start_pos, remaining_len)
+        // l2 is fstr_off - need to extract the start position
+        z3::expr start_pos = context_.int_val(0);
+        if (info->l2 >= CONST_OFFSET) {
+          dfsan_label_info *l2_info = get_label_info(info->l2);
+          if (l2_info->op == __dfsan::fstr_off) {
+            // fstr_off: l1 = indexOf op, op2 = byte offset
+            // start_pos = indexOf_result + offset
+            z3::expr base_idx = get_cached_expr(l2_info->l1, input_deps);
+            start_pos = base_idx + context_.int_val((int64_t)l2_info->op2.i);
+          } else {
+            // Direct indexOf op
+            start_pos = get_cached_expr(info->l2, input_deps);
+          }
+        }
+        // Use large length to get "rest of string" - Z3 will clamp to actual length
+        z3::expr full_len(context_, Z3_mk_seq_length(context_, full_str));
+        z3::expr len_expr = full_len - start_pos;
+        substr_expr = z3::expr(context_, Z3_mk_seq_extract(context_,
+                                                           full_str,
+                                                           start_pos,
+                                                           len_expr));
+      } else {
+        // Prefix mode: substr(str, 0, len)
+        z3::expr len_expr = context_.int_val((int64_t)info->op1.i);
+        if (info->l2 >= CONST_OFFSET) {
+          // l2 is the string op label - its cached value is the index/length
+          len_expr = get_cached_expr(info->l2, input_deps);
+        }
+        substr_expr = z3::expr(context_, Z3_mk_seq_extract(context_,
+                                                           full_str,
+                                                           context_.int_val(0),
+                                                           len_expr));
+      }
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, substr_expr);
