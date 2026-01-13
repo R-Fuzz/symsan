@@ -888,6 +888,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         if (it != memcmp_cache_.end()) {
           std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
           str1 = context_.string_val(s);
+        } else {
+          throw z3::exception("cannot find strcmp content");
         }
       }
 
@@ -907,6 +909,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         if (it != memcmp_cache_.end()) {
           std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
           str2 = context_.string_val(s);
+        } else {
+          throw z3::exception("cannot find strcmp content");
         }
       }
 
