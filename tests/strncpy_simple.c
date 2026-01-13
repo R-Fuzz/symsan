@@ -7,7 +7,7 @@
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg %t.bin
 // First iteration finds colon, second iteration solves prefix constraint
 // RUN: env TAINT_OPTIONS="taint_file=%t.out/id-0-0-0 output_dir=%t.out session_id=1 enum_gep=0" %fgtest %t.fg %t.out/id-0-0-0
-// RUN: env TAINT_OPTIONS="taint_file=%t.out/id-0-1-1 output_dir=%t.out session_id=2 enum_gep=0 debug=1" %fgtest %t.fg %t.out/id-0-1-1
+// RUN: env TAINT_OPTIONS="taint_file=%t.out/id-0-1-1 output_dir=%t.out session_id=2 enum_gep=0" %fgtest %t.fg %t.out/id-0-1-1
 // RUN: %t.uninstrumented %t.out/id-0-2-2 | FileCheck --check-prefix=CHECK-GEN %s
 
 // Test: strchr to find delimiter, strncpy prefix, check first byte

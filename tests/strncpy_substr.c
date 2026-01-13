@@ -9,7 +9,7 @@
 // Second iteration solves value='password'
 // RUN: env TAINT_OPTIONS="taint_file=%t.out/id-0-0-0 output_dir=%t.out session_id=1 enum_gep=0" %fgtest %t.fg %t.out/id-0-0-0
 // Third iteration checks both key and value constraints
-// RUN: env TAINT_OPTIONS="taint_file=%t.out/id-0-1-1 output_dir=%t.out session_id=2 enum_gep=0 debug=1" %fgtest %t.fg %t.out/id-0-1-1
+// RUN: env TAINT_OPTIONS="taint_file=%t.out/id-0-1-1 output_dir=%t.out session_id=2 enum_gep=0" %fgtest %t.fg %t.out/id-0-1-1
 // RUN: %t.uninstrumented %t.out/id-0-2-2 | FileCheck --check-prefix=CHECK-GEN %s
 
 // Test: key-value parsing pattern "key:value"
