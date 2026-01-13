@@ -525,8 +525,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             // Walk back to find original haystack content
             dfsan_label content_label = info->l1;
             dfsan_label_info *chain_info = src_info;
-            while (chain_info->op >= __dfsan::fstr_op_start &&
-                   chain_info->op < __dfsan::fstr_op_end) {
+            while (is_indexof_op(chain_info->op)) {
               content_label = chain_info->l1;
               if (content_label < CONST_OFFSET) break;
               chain_info = get_label_info(content_label);
@@ -578,8 +577,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr haystack_str = context_.string_val("");
       if (info->l1 >= CONST_OFFSET) {
         dfsan_label_info *src_info = get_label_info(info->l1);
-        if (src_info->op == __dfsan::fsubstr) {
-          // l1 is a fsubstr - use the cached substr expression directly
+        if (is_content_string_op(src_info->op)) {
+          // l1 is a fsubstr/strcat - use the cached substr expression directly
           haystack_str = get_cached_expr(info->l1, input_deps);
         } else {
           haystack_str = build_string_from_label(info->l1, input_deps);
@@ -628,7 +627,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       if (info->l1 >= CONST_OFFSET) {
         dfsan_label_info *src_info = get_label_info(info->l1);
 
-        if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
+        if (is_content_string_op(src_info->op)) {
+          // l1 is a fsubstr/strcat - use the cached substr expression directly
+          haystack_str = get_cached_expr(info->l1, input_deps);
+        } else if (is_indexof_op(src_info->op)) {
           if (src_info->op == __dfsan::fstr_off) {
             // Chained call via pointer arithmetic
             haystack_str = build_string_from_label(info->l1, input_deps);
@@ -639,8 +641,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             // Walk back to find original haystack content
             dfsan_label content_label = info->l1;
             dfsan_label_info *chain_info = src_info;
-            while (chain_info->op >= __dfsan::fstr_op_start &&
-                   chain_info->op < __dfsan::fstr_op_end) {
+            while (is_indexof_op(chain_info->op)) {
               content_label = chain_info->l1;
               if (content_label < CONST_OFFSET) break;
               chain_info = get_label_info(content_label);
@@ -695,9 +696,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       if (info->l1 >= CONST_OFFSET) {
         dfsan_label_info *src_info = get_label_info(info->l1);
 
-        if (src_info->op == __dfsan::fsubstr) {
+        if (is_content_string_op(src_info->op)) {
           haystack_str = get_cached_expr(info->l1, input_deps);
-        } else if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
+        } else if (is_indexof_op(src_info->op)) {
           if (src_info->op == __dfsan::fstr_off) {
             // Chained call via pointer arithmetic
             haystack_str = build_string_from_label(info->l1, input_deps);
@@ -707,8 +708,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             start_offset = prev_idx + 1;
             dfsan_label content_label = info->l1;
             dfsan_label_info *chain_info = src_info;
-            while (chain_info->op >= __dfsan::fstr_op_start &&
-                   chain_info->op < __dfsan::fstr_op_end) {
+            while (is_indexof_op(chain_info->op)) {
               content_label = chain_info->l1;
               if (content_label < CONST_OFFSET) break;
               chain_info = get_label_info(content_label);
@@ -819,7 +819,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // Only fsubstr and fstrcat cache String expressions; other string ops cache Int (position)
       if (info->l1 >= CONST_OFFSET) {
         dfsan_label_info *l1_info = get_label_info(info->l1);
-        if (l1_info->op == __dfsan::fsubstr || l1_info->op == __dfsan::fstrcat) {
+        if (is_content_string_op(l1_info->op)) {
           dest_str = get_cached_expr(info->l1, input_deps);
         } else {
           dest_str = build_string_from_label(info->l1, input_deps);
@@ -838,7 +838,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // Build src string from l2
       if (info->l2 >= CONST_OFFSET) {
         dfsan_label_info *l2_info = get_label_info(info->l2);
-        if (l2_info->op == __dfsan::fsubstr || l2_info->op == __dfsan::fstrcat) {
+        if (is_content_string_op(l2_info->op)) {
           src_str = get_cached_expr(info->l2, input_deps);
         } else {
           src_str = build_string_from_label(info->l2, input_deps);
