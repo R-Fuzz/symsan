@@ -865,6 +865,13 @@ __dfsw_strdup(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
   size_t len = strlen(s);
   void *p = malloc(len+1);
   dfsan_memcpy(p, s, len+1);
+
+  // Propagate string label to duplicated string
+  dfsan_label str_label = get_str_label(s, s_label);
+  if (str_label != 0) {
+    set_str_label(static_cast<char *>(p), str_label);
+  }
+
   *ret_label = 0;
   return static_cast<char *>(p);
 }
@@ -874,6 +881,13 @@ __dfsw___strdup(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
   size_t len = strlen(s);
   void *p = malloc(len+1);
   dfsan_memcpy(p, s, len+1);
+
+  // Propagate string label to duplicated string
+  dfsan_label str_label = get_str_label(s, s_label);
+  if (str_label != 0) {
+    set_str_label(static_cast<char *>(p), str_label);
+  }
+
   *ret_label = 0;
   return static_cast<char *>(p);
 }

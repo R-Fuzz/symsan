@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Failed to open\n");
     return -1;
   }
-  size_t n = fread(buf, 1, 20, fp);
+  size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
   fclose(fp);
   buf[n] = '\0';
 
