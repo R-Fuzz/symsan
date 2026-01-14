@@ -1061,6 +1061,10 @@ SANITIZER_INTERFACE_ATTRIBUTE char *
 __dfsw_strdup(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
   size_t len = strlen(s);
   void *p = malloc(len+1);
+  if (p == nullptr) {
+    *ret_label = 0;
+    return nullptr;
+  }
   dfsan_memcpy(p, s, len+1);
 
   // Propagate string label to duplicated string
@@ -1074,9 +1078,35 @@ __dfsw_strdup(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE char *
+__dfsw_strndup(const char *s, size_t n, dfsan_label s_label,
+               dfsan_label n_label, dfsan_label *ret_label) {
+  size_t len = strnlen(s, n);
+  void *p = malloc(len + 1);
+  if (p == nullptr) {
+    *ret_label = 0;
+    return nullptr;
+  }
+  dfsan_memcpy(p, s, len);
+  ((char *)p)[len] = '\0';
+
+  // Propagate string label to duplicated string
+  dfsan_label str_label = get_str_label_n(s, s_label, len, n_label);
+  if (str_label != 0) {
+    set_content_label(static_cast<char *>(p), str_label);
+  }
+
+  *ret_label = 0;
+  return static_cast<char *>(p);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE char *
 __dfsw___strdup(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
   size_t len = strlen(s);
   void *p = malloc(len+1);
+  if (p == nullptr) {
+    *ret_label = 0;
+    return nullptr;
+  }
   dfsan_memcpy(p, s, len+1);
 
   // Propagate string label to duplicated string
@@ -1092,8 +1122,7 @@ __dfsw___strdup(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
 SANITIZER_INTERFACE_ATTRIBUTE char *
 __dfsw___strndup(const char *s, size_t n, dfsan_label s_label,
                  dfsan_label n_label, dfsan_label *ret_label) {
-  size_t len = strlen(s);
-  len = len > n ? n : len;
+  size_t len = strnlen(s, n);
   char *p = static_cast<char *>(malloc(len+1));
   if (p == nullptr) {
     *ret_label = 0;
@@ -1101,7 +1130,13 @@ __dfsw___strndup(const char *s, size_t n, dfsan_label s_label,
   }
   dfsan_memcpy(p, s, len); // copy at most n bytes
   p[len] = '\0';
-  dfsan_set_label(0, p + len, 1);
+
+  // Propagate string label to duplicated string
+  dfsan_label str_label = get_str_label_n(s, s_label, len, n_label);
+  if (str_label != 0) {
+    set_content_label(static_cast<char *>(p), str_label);
+  }
+
   *ret_label = 0;
   return p;
 }
