@@ -287,6 +287,8 @@ fun:strdup=custom
 fun:strncat=custom
 fun:strncpy=custom
 fun:strndup=custom
+
+# transformation
 fun:strtod=custom
 fun:strtol=custom
 fun:strtoll=custom
@@ -313,6 +315,9 @@ fun:strncmp=custom
 fun:strpbrk=custom
 fun:strrchr=custom
 fun:strstr=custom
+fun:strnstr=custom
+# not standard Linux
+fun:strnstr=uninstrumented
 fun:memmem=custom
 
 ## from afl++
@@ -337,13 +342,6 @@ fun:g_ascii_strcasecmp=strcmp
 fun:Curl_strcasecompare=strcmp
 fun:Curl_safe_strcasecompare=strcmp
 fun:cmsstrcasecmp=strcmp
-# FIXME: strstr??
-fun:g_strstr_len=strcmp
-fun:ap_strcasestr=strcmp
-fun:xmlStrstr=strcmp
-fun:xmlStrcasestr=strcmp
-fun:g_str_has_prefix=strcmp
-fun:g_str_has_suffix=strcmp
 
 # strncmp-like
 fun:xmlStrncmp=strncmp
@@ -355,6 +353,19 @@ fun:xmlStrncasecmp=strncmp
 fun:g_ascii_strncasecmp=strcmp
 fun:Curl_strncasecompare=strncmp
 fun:g_strncasecmp=strncmp
+
+# strstr
+fun:g_strstr_len=strstr
+fun:ap_strcasestr=strstr
+fun:xmlStrstr=strstr
+fun:xmlStrcasestr=strstr
+
+# prefixof
+fun:g_str_has_prefix=prefixof
+
+# suffixof
+fun:g_str_has_suffix=suffixof
+
 
 # Functions which take action based on global state, such as running a callback
 # set by a separate function.
