@@ -1850,11 +1850,23 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
   dfsan_label src_label = get_str_label_n(s, s_label, n, n_label);
 
   if (src_label != 0 || c_label != 0) {
-    int64_t found_pos = ret ? ((char*)ret - (char*)s) : -1;
-    // Same structure as strchr
+    // Determine which operand is concrete and set size accordingly
+    uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
+
+    // l1 = src_label (haystack content)
+    // l2 = c_label (character to find)
+    // op1 = haystack pointer (for concrete content retrieval)
+    // op2 = character value
+    // size = haystack length if haystack concrete, else 0
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
-                             sizeof(void*) * 8,
-                             (uint64_t)found_pos, (uint64_t)(uint8_t)c);
+                             content_len,
+                             (uint64_t)s, (uint64_t)(uint8_t)c);
+
+    // Send concrete content if haystack is concrete
+    if (content_len > 0 && *ret_label) {
+      __taint_trace_memcmp(*ret_label);
+    }
+
     // Store the result pointer to recover symbolic length
     if (ret) {
       set_indexof_label(ret, *ret_label);
@@ -1916,11 +1928,23 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
   dfsan_label src_label = get_str_label_n(s, s_label, n, n_label);
 
   if (src_label != 0 || c_label != 0) {
-    int64_t found_pos = ret ? ((const char*)ret - (const char*)s) : -1;
-    // Use fstrrchr for reverse search
+    // Determine which operand is concrete and set size accordingly
+    uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
+
+    // l1 = src_label (haystack content)
+    // l2 = c_label (character to find)
+    // op1 = haystack pointer (for concrete content retrieval)
+    // op2 = character value
+    // size = haystack length if haystack concrete, else 0
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
-                             sizeof(void*) * 8,
-                             (uint64_t)found_pos, (uint64_t)(uint8_t)c);
+                             content_len,
+                             (uint64_t)s, (uint64_t)(uint8_t)c);
+
+    // Send concrete content if haystack is concrete
+    if (content_len > 0 && *ret_label) {
+      __taint_trace_memcmp(*ret_label);
+    }
+
     // Store the result pointer to recover symbolic length
     if (ret) {
       set_indexof_label(ret, *ret_label);
@@ -1997,19 +2021,25 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
       get_str_label_n(needle, needle_label, needlelen, needlelen_label);
 
   if (src_label != 0 || real_needle_label != 0) {
-    int64_t found_pos = ret ? ((const char*)ret - (const char*)haystack) : -1;
+    // Determine which operand is concrete and set size accordingly
+    uint16_t content_len = 0;
+    if (src_label == 0) {
+      content_len = (uint16_t)haystacklen;
+    } else if (real_needle_label == 0) {
+      content_len = (uint16_t)needlelen;
+    }
 
-    // l1 = src_label (source - for chaining or content dependencies)
-    // l2 = real_needle_label (may be symbolic!)
-    // op1 = needle pointer (for caching if concrete)
-    // op2 = found position
-    // size = needle length
+    // l1 = src_label (haystack content)
+    // l2 = real_needle_label (needle content - may be symbolic!)
+    // op1 = haystack pointer (for concrete content retrieval)
+    // op2 = needle pointer (for concrete content retrieval)
+    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
-                                    needlelen,
-                                    (uint64_t)found_pos, (uint64_t)needle);
+                                    content_len,
+                                    (uint64_t)haystack, (uint64_t)needle);
 
-    // Cache needle content only if needle is concrete
-    if (real_needle_label == 0 && label) {
+    // Send concrete content (haystack or needle)
+    if (content_len > 0 && label) {
       __taint_trace_memcmp(label);
     }
     *ret_label = label;
