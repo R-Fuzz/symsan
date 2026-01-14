@@ -2037,6 +2037,75 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
   return ret;
 }
 
+// strnstr implementation (BSD function not available on Linux)
+static char *strnstr_impl(const char *haystack, const char *needle, size_t len) {
+  size_t needle_len = strlen(needle);
+  if (needle_len == 0)
+    return (char *)haystack;
+
+  if (len == 0)
+    return NULL;
+
+  for (size_t i = 0; i < len && haystack[i]; i++) {
+    if (i + needle_len > len)
+      break;
+    if (strncmp(haystack + i, needle, needle_len) == 0)
+      return (char *)(haystack + i);
+  }
+  return NULL;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strnstr(char *haystack, char *needle,
+                                                   size_t len,
+                                                   dfsan_label haystack_label,
+                                                   dfsan_label needle_label,
+                                                   dfsan_label len_label,
+                                                   dfsan_label *ret_label) {
+  char *ret = strnstr_impl(haystack, needle, len);
+
+  // Use unified get_str_label_n for haystack (respects length parameter)
+  dfsan_label src_label = get_str_label_n(haystack, haystack_label,
+                                          strnlen(haystack, len), len_label);
+  // Use unified get_str_label for needle
+  dfsan_label real_needle_label = get_str_label(needle, needle_label);
+
+  if (src_label != 0 || real_needle_label != 0) {
+    // Determine which operand is concrete and set size accordingly
+    size_t haystack_len = strnlen(haystack, len);
+    size_t needle_len = strlen(needle);
+    uint16_t content_len = 0;
+    if (src_label == 0) {
+      content_len = (uint16_t)haystack_len;
+    } else if (real_needle_label == 0) {
+      content_len = (uint16_t)needle_len;
+    }
+
+    // l1 = src_label (source - for chaining or content dependencies)
+    // l2 = real_needle_label (may be symbolic string!)
+    // op1 = haystack pointer (for concrete content retrieval)
+    // op2 = needle pointer (for concrete content retrieval)
+    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
+    dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
+                                    content_len,
+                                    (uint64_t)haystack,
+                                    (uint64_t)needle);
+
+    // Send concrete content (haystack or needle)
+    if (content_len > 0 && label) {
+      __taint_trace_memcmp(label);
+    }
+
+    *ret_label = label;
+    // Store the result pointer to recover symbolic length
+    if (ret) {
+      set_indexof_label(ret, *ret_label);
+    }
+  } else {
+    *ret_label = 0;
+  }
+  return ret;
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t haystacklen,
                                                    const void *needle, size_t needlelen,
                                                    dfsan_label haystack_label,
