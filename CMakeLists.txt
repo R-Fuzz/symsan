@@ -4,7 +4,8 @@ project(symsan VERSION 1.2.2 LANGUAGES C CXX ASM)
 
 find_package(LLVM 14 REQUIRED CONFIG)
 
-# Find Z3 - prefer /usr/local over system
+# Find Z3 (minimum version 4.8.7 required for string theory APIs)
+# Prefer /usr/local over system
 find_library(Z3_LIBRARY NAMES z3 PATHS /usr/local/lib NO_DEFAULT_PATH)
 if (NOT Z3_LIBRARY)
     find_library(Z3_LIBRARY NAMES z3)
@@ -13,8 +14,31 @@ find_path(Z3_INCLUDE_DIR NAMES z3.h PATHS /usr/local/include NO_DEFAULT_PATH)
 if (NOT Z3_INCLUDE_DIR)
     find_path(Z3_INCLUDE_DIR NAMES z3.h)
 endif()
+
+# Check Z3 version
+if (Z3_INCLUDE_DIR)
+    file(READ "${Z3_INCLUDE_DIR}/z3_version.h" Z3_VERSION_CONTENT)
+    string(REGEX MATCH "#define Z3_MAJOR_VERSION[ \t]+([0-9]+)" _ "${Z3_VERSION_CONTENT}")
+    set(Z3_VERSION_MAJOR ${CMAKE_MATCH_1})
+    string(REGEX MATCH "#define Z3_MINOR_VERSION[ \t]+([0-9]+)" _ "${Z3_VERSION_CONTENT}")
+    set(Z3_VERSION_MINOR ${CMAKE_MATCH_1})
+    string(REGEX MATCH "#define Z3_BUILD_NUMBER[ \t]+([0-9]+)" _ "${Z3_VERSION_CONTENT}")
+    set(Z3_VERSION_PATCH ${CMAKE_MATCH_1})
+    set(Z3_VERSION "${Z3_VERSION_MAJOR}.${Z3_VERSION_MINOR}.${Z3_VERSION_PATCH}")
+
+    message(STATUS "Found Z3 version: ${Z3_VERSION}")
+
+    # Require at least version 4.8.7
+    if (Z3_VERSION_MAJOR LESS 4 OR
+        (Z3_VERSION_MAJOR EQUAL 4 AND Z3_VERSION_MINOR LESS 8) OR
+        (Z3_VERSION_MAJOR EQUAL 4 AND Z3_VERSION_MINOR EQUAL 8 AND Z3_VERSION_PATCH LESS 7))
+        message(FATAL_ERROR "Z3 version ${Z3_VERSION} found, but version 4.8.7 or later is required (for string theory APIs)")
+    endif()
+endif()
+
 message(STATUS "Z3_LIBRARY: ${Z3_LIBRARY}")
 message(STATUS "Z3_INCLUDE_DIR: ${Z3_INCLUDE_DIR}")
+message(STATUS "Z3_VERSION: ${Z3_VERSION}")
 
 if (LLVM_FOUND)
     message(STATUS "LLVM_VERSION_MAJOR: ${LLVM_VERSION_MAJOR}")
