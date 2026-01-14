@@ -100,6 +100,12 @@ int is_stdin_taint(void);
 void taint_set_offset_label(dfsan_label label);
 dfsan_label taint_get_offset_label();
 
+// taint tracking for string operations
+void taint_set_str_content_label(void *addr, dfsan_label label);
+dfsan_label taint_get_str_content_label(const void *addr);
+void taint_set_str_indexof_label(void *addr, dfsan_label label);
+dfsan_label taint_get_str_indexof_label(const void *addr);
+
 // taint source utmp
 off_t get_utmp_offset(void);
 void set_utmp_offset(off_t offset);

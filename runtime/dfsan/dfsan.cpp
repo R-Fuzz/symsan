@@ -19,6 +19,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "sanitizer_common/sanitizer_atomic.h"
+#include "sanitizer_common/sanitizer_allocator_internal.h"
 #include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_file.h"
 #include "sanitizer_common/sanitizer_flags.h"
@@ -1380,6 +1381,188 @@ static void InitializeTaintSocket() {
   }
 }
 
+// Hash tables for string label tracking
+static uptr content_map_capacity = 0;
+static struct {
+  uptr addr;
+  dfsan_label label;
+} *__taint_content_map = nullptr;
+static uptr content_map_count = 0;
+
+static uptr indexof_map_capacity = 0;
+static struct {
+  uptr addr;
+  dfsan_label label;
+} *__taint_indexof_map = nullptr;
+static uptr indexof_map_count = 0;
+
+// Hash function optimized for shadow memory addresses (0x700000040000 ~ 0x800000000000)
+// Focus on middle bits where entropy is highest
+static inline uptr hash_addr(uptr addr, uptr capacity) {
+  addr >>= 3;  // Remove low 3 bits (8-byte alignment)
+  addr *= 2654435769UL;  // Multiplicative hash
+  return addr & (capacity - 1);  // Fast modulo for power-of-2
+}
+
+// Grow content map when load factor exceeds 0.7
+static void grow_content_map() {
+  uptr new_capacity = content_map_capacity * 2;
+  typeof(__taint_content_map) new_map = (typeof(__taint_content_map))InternalAlloc(
+      new_capacity * sizeof(*__taint_content_map));
+  internal_memset(new_map, 0, new_capacity * sizeof(*__taint_content_map));
+
+  // Rehash existing entries
+  for (uptr i = 0; i < content_map_capacity; i++) {
+    if (__taint_content_map[i].addr != 0) {
+      uptr hash = hash_addr(__taint_content_map[i].addr, new_capacity);
+      while (new_map[hash].addr != 0) {
+        hash = (hash + 1) & (new_capacity - 1);
+      }
+      new_map[hash] = __taint_content_map[i];
+    }
+  }
+
+  InternalFree(__taint_content_map);
+  __taint_content_map = new_map;
+  content_map_capacity = new_capacity;
+}
+
+// Grow indexOf map
+static void grow_indexof_map() {
+  uptr new_capacity = indexof_map_capacity * 2;
+  typeof(__taint_indexof_map) new_map = (typeof(__taint_indexof_map))InternalAlloc(
+      new_capacity * sizeof(*__taint_indexof_map));
+  internal_memset(new_map, 0, new_capacity * sizeof(*__taint_indexof_map));
+
+  for (uptr i = 0; i < indexof_map_capacity; i++) {
+    if (__taint_indexof_map[i].addr != 0) {
+      uptr hash = hash_addr(__taint_indexof_map[i].addr, new_capacity);
+      while (new_map[hash].addr != 0) {
+        hash = (hash + 1) & (new_capacity - 1);
+      }
+      new_map[hash] = __taint_indexof_map[i];
+    }
+  }
+
+  InternalFree(__taint_indexof_map);
+  __taint_indexof_map = new_map;
+  indexof_map_capacity = new_capacity;
+}
+
+static void InitializeStringMaps() {
+  // Round up to nearest power of 2 for efficient hashing
+  uptr capacity = flags().string_map_capacity;
+  if (capacity < 16) capacity = 16;  // Minimum size
+  // Round up to power of 2
+  capacity--;
+  capacity |= capacity >> 1;
+  capacity |= capacity >> 2;
+  capacity |= capacity >> 4;
+  capacity |= capacity >> 8;
+  capacity |= capacity >> 16;
+  capacity |= capacity >> 32;
+  capacity++;
+
+  // Content map
+  content_map_capacity = capacity;
+  __taint_content_map = (typeof(__taint_content_map))InternalAlloc(
+      content_map_capacity * sizeof(*__taint_content_map));
+  internal_memset(__taint_content_map, 0,
+      content_map_capacity * sizeof(*__taint_content_map));
+  content_map_count = 0;
+
+  // IndexOf map
+  indexof_map_capacity = capacity;
+  __taint_indexof_map = (typeof(__taint_indexof_map))InternalAlloc(
+      indexof_map_capacity * sizeof(*__taint_indexof_map));
+  internal_memset(__taint_indexof_map, 0,
+      indexof_map_capacity * sizeof(*__taint_indexof_map));
+  indexof_map_count = 0;
+}
+
+extern "C" void taint_set_str_content_label(void *addr, dfsan_label label) {
+  AOUT("taint_set_str_content_label: addr=%p, label=%u\n", addr, label);
+
+  // Grow if needed
+  if (content_map_count > (content_map_capacity * 7 / 10)) {
+    grow_content_map();
+  }
+
+  uptr hash = hash_addr((uptr)addr, content_map_capacity);
+
+  // Linear probing
+  while (__taint_content_map[hash].addr != 0 &&
+         __taint_content_map[hash].addr != (uptr)addr) {
+    hash = (hash + 1) & (content_map_capacity - 1);
+  }
+
+  if (__taint_content_map[hash].addr == 0) {
+    content_map_count++;
+  } else {
+    AOUT("update content label: old = %u\n", __taint_content_map[hash].label);
+  }
+
+  __taint_content_map[hash].addr = (uptr)addr;
+  __taint_content_map[hash].label = label;
+}
+
+extern "C" dfsan_label taint_get_str_content_label(const void *addr) {
+  uptr hash = hash_addr((uptr)addr, content_map_capacity);
+  uptr start = hash;
+
+  while (__taint_content_map[hash].addr != 0) {
+    if (__taint_content_map[hash].addr == (uptr)addr) {
+      AOUT("taint_get_str_content_label: addr=%p, found label=%u\n",
+           addr, __taint_content_map[hash].label);
+      return __taint_content_map[hash].label;
+    }
+    hash = (hash + 1) & (content_map_capacity - 1);
+    if (hash == start) break;
+  }
+  AOUT("addr=%p, not found\n", addr);
+  return 0;
+}
+
+extern "C" void taint_set_str_indexof_label(void *addr, dfsan_label label) {
+  AOUT("taint_set_str_indexof_label: addr=%p, label=%u\n", addr, label);
+
+  if (indexof_map_count > (indexof_map_capacity * 7 / 10)) {
+    grow_indexof_map();
+  }
+
+  uptr hash = hash_addr((uptr)addr, indexof_map_capacity);
+
+  while (__taint_indexof_map[hash].addr != 0 &&
+         __taint_indexof_map[hash].addr != (uptr)addr) {
+    hash = (hash + 1) & (indexof_map_capacity - 1);
+  }
+
+  if (__taint_indexof_map[hash].addr == 0) {
+    indexof_map_count++;
+  } else {
+    AOUT("update indexof label: old = %u\n", __taint_indexof_map[hash].label);
+  }
+
+  __taint_indexof_map[hash].addr = (uptr)addr;
+  __taint_indexof_map[hash].label = label;
+}
+
+extern "C" dfsan_label taint_get_str_indexof_label(const void *addr) {
+  uptr hash = hash_addr((uptr)addr, indexof_map_capacity);
+  uptr start = hash;
+
+  while (__taint_indexof_map[hash].addr != 0) {
+    if (__taint_indexof_map[hash].addr == (uptr)addr) {
+      AOUT("addr=%p, found label=%u\n", addr, __taint_indexof_map[hash].label);
+      return __taint_indexof_map[hash].label;
+    }
+    hash = (hash + 1) & (indexof_map_capacity - 1);
+    if (hash == start) break;
+  }
+  AOUT("addr=%p, not found\n", addr);
+  return 0;
+}
+
 // information is passed implicitly through flags()
 extern "C" void InitializeSolver();
 
@@ -1486,6 +1669,8 @@ if (flags().shm_fd != -1) {
   InitializeTaintFile();
 
   InitializeTaintSocket();
+
+  InitializeStringMaps();
 
   InitializeSolver();
 
