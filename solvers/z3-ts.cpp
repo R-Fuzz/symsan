@@ -812,10 +812,12 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       } else {
         // Symbolic accept set - build string from label
         z3::expr accept_str = build_string_from_label(info->l2, input_deps);
-        // For now, use simplified approach with first char
-        z3::expr first_char_code(context_, Z3_mk_seq_nth(context_, accept_str, context_.int_val(0)));
-        z3::expr char_str(context_, Z3_mk_string_from_code(context_, first_char_code));
-        idx = z3::indexof(haystack_str, char_str, start_offset);
+        // Get the length of accept string
+        z3::expr accept_len(context_, Z3_mk_seq_length(context_, accept_str));
+        // strpbrk returns NULL if accept is empty, so: if (len > 0) indexOf else -1
+        z3::expr first_char_str(context_, Z3_mk_seq_extract(context_, accept_str, context_.int_val(0), context_.int_val(1)));
+        z3::expr idx_if_nonempty = z3::indexof(haystack_str, first_char_str, start_offset);
+        idx = z3::ite(accept_len > 0, idx_if_nonempty, context_.int_val(-1));
       }
 
       tsize_cache_.emplace_back(1);
@@ -1746,8 +1748,8 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         uint32_t offset;
         sscanf(name.str().c_str(), input_name_format, &input, &offset);
         uint8_t value = (uint8_t)e.get_numeral_int();
-        // fprintf(stderr, "DEBUG generate_solution: input-%u-%u = 0x%02x ('%c')\n",
-        //         input, offset, value, (value >= 32 && value < 127) ? value : '.');
+        // fprintf(stderr, "DEBUG input-%u-%u: SET offset %u = 0x%02x (individual byte)\n",
+        //         input, offset, offset, value);
         solutions.emplace_back(input, offset, value);
       } else if (!name.str().compare("fsize")) {
         // FIXME:
