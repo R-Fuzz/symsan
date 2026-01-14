@@ -196,7 +196,9 @@ enum operators {
   fstr_op_end = last_llvm_op + 18, // 85
   // string comparison (returns 0/1, NOT a position - must be outside fstr_op range)
   fstrcmp   = last_llvm_op + 18, // 85 strcmp using Z3 string theory
-  LastOp    = last_llvm_op + 19, // 86
+  fprefixof = last_llvm_op + 19, // 86 prefixof(str, prefix) using Z3 string theory
+  fsuffixof = last_llvm_op + 20, // 87 suffixof(str, suffix) using Z3 string theory
+  LastOp    = last_llvm_op + 21, // 88
 };
 
 enum predicate {

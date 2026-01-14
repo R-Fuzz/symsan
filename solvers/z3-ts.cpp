@@ -51,6 +51,8 @@ static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::fstr_off, "stroff"},
   {__dfsan::fsubstr,  "substr"},
   {__dfsan::fstrcat,  "strcat"},
+  {__dfsan::fprefixof, "prefixof"},
+  {__dfsan::fsuffixof, "suffixof"},
 };
 
 static std::string get_op_name(uint32_t op) {
@@ -997,6 +999,110 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
                              context_.bv_val(1, 32));
       tsize_cache_.emplace_back(1);
       cache_expr(l, eq);
+      RECORD_VALUE(0);
+      continue;
+    } else if (info->op == __dfsan::fprefixof) {
+      // prefixof: check if str starts with prefix
+      // l1 = string label, l2 = prefix label
+      // size = comparison length, op1 = str ptr, op2 = prefix ptr
+
+      z3::expr str = context_.string_val("");
+      z3::expr prefix = context_.string_val("");
+
+      // Build first string (str)
+      if (info->l1 >= CONST_OFFSET) {
+        dfsan_label_info *l1_info = get_label_info(info->l1);
+        if (is_content_string_op(l1_info->op)) {
+          str = get_cached_expr(info->l1, input_deps);
+        } else {
+          str = build_string_from_label(info->l1, input_deps);
+        }
+      } else {
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
+          str = context_.string_val(s);
+        } else {
+          throw z3::exception("cannot find prefixof str content");
+        }
+      }
+
+      // Build second string (prefix)
+      if (info->l2 >= CONST_OFFSET) {
+        dfsan_label_info *l2_info = get_label_info(info->l2);
+        if (is_content_string_op(l2_info->op)) {
+          prefix = get_cached_expr(info->l2, input_deps);
+        } else {
+          prefix = build_string_from_label(info->l2, input_deps);
+        }
+      } else {
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
+          prefix = context_.string_val(s);
+        } else {
+          throw z3::exception("cannot find prefixof prefix content");
+        }
+      }
+
+      // Use Z3's prefixof: returns 1 if str starts with prefix, else 0
+      z3::expr result = z3::ite(z3::prefixof(prefix, str),
+                                 context_.bv_val(1, 32),
+                                 context_.bv_val(0, 32));
+      tsize_cache_.emplace_back(1);
+      cache_expr(l, result);
+      RECORD_VALUE(0);
+      continue;
+    } else if (info->op == __dfsan::fsuffixof) {
+      // suffixof: check if str ends with suffix
+      // l1 = string label, l2 = suffix label
+      // size = comparison length, op1 = str ptr, op2 = suffix ptr
+
+      z3::expr str = context_.string_val("");
+      z3::expr suffix = context_.string_val("");
+
+      // Build first string (str) - same pattern as fprefixof
+      if (info->l1 >= CONST_OFFSET) {
+        dfsan_label_info *l1_info = get_label_info(info->l1);
+        if (is_content_string_op(l1_info->op)) {
+          str = get_cached_expr(info->l1, input_deps);
+        } else {
+          str = build_string_from_label(info->l1, input_deps);
+        }
+      } else {
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
+          str = context_.string_val(s);
+        } else {
+          throw z3::exception("cannot find suffixof str content");
+        }
+      }
+
+      // Build second string (suffix)
+      if (info->l2 >= CONST_OFFSET) {
+        dfsan_label_info *l2_info = get_label_info(info->l2);
+        if (is_content_string_op(l2_info->op)) {
+          suffix = get_cached_expr(info->l2, input_deps);
+        } else {
+          suffix = build_string_from_label(info->l2, input_deps);
+        }
+      } else {
+        auto it = memcmp_cache_.find(l);
+        if (it != memcmp_cache_.end()) {
+          std::string s(reinterpret_cast<char*>(it->second.get()), info->size);
+          suffix = context_.string_val(s);
+        } else {
+          throw z3::exception("cannot find suffixof suffix content");
+        }
+      }
+
+      // Use Z3's suffixof: returns 1 if str ends with suffix, else 0
+      z3::expr result = z3::ite(z3::suffixof(suffix, str),
+                                 context_.bv_val(1, 32),
+                                 context_.bv_val(0, 32));
+      tsize_cache_.emplace_back(1);
+      cache_expr(l, result);
       RECORD_VALUE(0);
       continue;
     } else if (info->op == __dfsan::fstr_off) {

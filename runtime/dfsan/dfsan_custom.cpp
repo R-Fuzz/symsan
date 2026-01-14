@@ -664,6 +664,77 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
   return ret;
 }
 
+SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_prefixof(
+    const char *str, const char *prefix,
+    dfsan_label str_label, dfsan_label prefix_label,
+    dfsan_label *ret_label) {
+
+  // Execute concrete operation (simple check)
+  int ret = 0;
+  size_t prefix_len = strlen(prefix);
+  size_t str_len = strlen(str);
+  if (str_len >= prefix_len && memcmp(str, prefix, prefix_len) == 0) {
+    ret = 1;
+  }
+
+  // Get unified labels (handles fsubstr chaining and content maps)
+  dfsan_label l1 = get_str_label(str, str_label);
+  dfsan_label l2 = get_str_label(prefix, prefix_label);
+
+  if (l1 == 0 && l2 == 0) {
+    *ret_label = 0;
+  } else {
+    // Determine length for memcmp_cache (use concrete side if one is fsubstr)
+    size_t n = strlen(str) + 1;
+    dfsan_label str_fsubstr = taint_get_str_content_label(str);
+    if (str_fsubstr != 0)
+      n = strlen(prefix) + 1;  // use concrete side for length
+
+    // Create label - fprefixof is commutative, dfsan_union will normalize
+    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fprefixof, n,
+                                   (uint64_t)str, (uint64_t)prefix);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
+  }
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_suffixof(
+    const char *str, const char *suffix,
+    dfsan_label str_label, dfsan_label suffix_label,
+    dfsan_label *ret_label) {
+
+  // Execute concrete operation
+  int ret = 0;
+  size_t suffix_len = strlen(suffix);
+  size_t str_len = strlen(str);
+  if (str_len >= suffix_len &&
+      memcmp(str + (str_len - suffix_len), suffix, suffix_len) == 0) {
+    ret = 1;
+  }
+
+  // Get unified labels
+  dfsan_label l1 = get_str_label(str, str_label);
+  dfsan_label l2 = get_str_label(suffix, suffix_label);
+
+  if (l1 == 0 && l2 == 0) {
+    *ret_label = 0;
+  } else {
+    // Determine length for memcmp_cache
+    size_t n = strlen(str) + 1;
+    dfsan_label str_fsubstr = taint_get_str_content_label(str);
+    if (str_fsubstr != 0)
+      n = strlen(suffix) + 1;
+
+    // Create label
+    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fsuffixof, n,
+                                   (uint64_t)str, (uint64_t)suffix);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
+  }
+  return ret;
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
                   dfsan_label s2_label, dfsan_label *ret_label) {
