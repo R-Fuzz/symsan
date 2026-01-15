@@ -2,6 +2,7 @@
 
 #include "parse-z3.h"
 
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
