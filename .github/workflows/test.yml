@@ -34,9 +34,10 @@ jobs:
           unzip z3-4.15.4-x64-glibc-2.39.zip
           mv z3-4.15.4-x64-glibc-2.39 ~/z3
         fi
-        sudo cp -r ~/z3/bin/* /usr/local/bin/
+        sudo cp ~/z3/bin/z3 /usr/local/bin/
+        sudo cp ~/z3/bin/libz3.so /usr/local/lib/
+        sudo cp ~/z3/bin/libz3.a /usr/local/lib/
         sudo cp -r ~/z3/include/* /usr/local/include/
-        sudo cp -r ~/z3/lib/* /usr/local/lib/
         sudo ldconfig
     #   run: |
     #     wget https://apt.llvm.org/llvm.sh
