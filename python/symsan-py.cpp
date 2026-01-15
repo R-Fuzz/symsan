@@ -380,11 +380,29 @@ static PyObject* SolveTask(PyObject *self, PyObject *args) {
 
   PyObject *sols = PyList_New(solutions.size());
   for (size_t i = 0; i < solutions.size(); i++) {
-    PyObject *sol = PyTuple_New(3);
-    auto val = solutions[i];
-    PyTuple_SetItem(sol, 0, PyLong_FromUnsignedLong(val.id));
-    PyTuple_SetItem(sol, 1, PyLong_FromUnsignedLong(val.offset));
-    PyTuple_SetItem(sol, 2, PyLong_FromUnsignedLong(val.val));
+    auto &val = solutions[i];
+    PyObject *sol = PyDict_New();
+
+    // Common fields for all operations
+    PyDict_SetItemString(sol, "op", PyLong_FromLong((int)val.op));
+    PyDict_SetItemString(sol, "id", PyLong_FromUnsignedLong(val.id));
+    PyDict_SetItemString(sol, "offset", PyLong_FromUnsignedLong(val.offset));
+
+    // Operation-specific fields
+    using op_t = symsan::Z3ParserSolver::solution_op_t;
+    switch (val.op) {
+      case op_t::SET:
+        PyDict_SetItemString(sol, "val", PyLong_FromUnsignedLong(val.val));
+        break;
+      case op_t::INSERT:
+        PyDict_SetItemString(sol, "data",
+            PyBytes_FromStringAndSize((char*)val.data.data(), val.data.size()));
+        break;
+      case op_t::DELETE:
+        PyDict_SetItemString(sol, "len", PyLong_FromUnsignedLong(val.len));
+        break;
+    }
+
     PyList_SetItem(sols, i, sol);
   }
 
@@ -429,5 +447,46 @@ PyInit_symsan(void) {
     delete __z3_parser;
     symsan_destroy();
   }
-  return PyModule_Create(&SymSanModule);
+
+  PyObject *module = PyModule_Create(&SymSanModule);
+  if (module == NULL) {
+    return NULL;
+  }
+
+  // Create OpType enum class
+  PyObject *enum_module = PyImport_ImportModule("enum");
+  if (enum_module == NULL) {
+    Py_DECREF(module);
+    return NULL;
+  }
+
+  PyObject *int_enum = PyObject_GetAttrString(enum_module, "IntEnum");
+  Py_DECREF(enum_module);
+  if (int_enum == NULL) {
+    Py_DECREF(module);
+    return NULL;
+  }
+
+  // Create OpType enum with SET=0, INSERT=1, DELETE=2
+  PyObject *enum_dict = PyDict_New();
+  PyDict_SetItemString(enum_dict, "SET", PyLong_FromLong(0));
+  PyDict_SetItemString(enum_dict, "INSERT", PyLong_FromLong(1));
+  PyDict_SetItemString(enum_dict, "DELETE", PyLong_FromLong(2));
+
+  PyObject *enum_args = PyTuple_Pack(2, PyUnicode_FromString("OpType"), enum_dict);
+  Py_DECREF(enum_dict);
+
+  PyObject *op_type_enum = PyObject_CallObject(int_enum, enum_args);
+  Py_DECREF(int_enum);
+  Py_DECREF(enum_args);
+
+  if (op_type_enum == NULL) {
+    Py_DECREF(module);
+    return NULL;
+  }
+
+  // Add OpType to module
+  PyModule_AddObject(module, "OpType", op_type_enum);
+
+  return module;
 }

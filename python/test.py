@@ -58,8 +58,15 @@ while True:
         symsan.record_memcmp(label, buf.content)
 
     for task in tasks:
-        r, sol = symsan.solve_task(task)
-        print(sol)
+        r, sols = symsan.solve_task(task)
+        print(f"Status: {r}")
+        for sol in sols:
+            if sol['op'] == symsan.OpType.SET:
+                print(f"  SET id={sol['id']} offset={sol['offset']} val={sol['val']:#x}")
+            elif sol['op'] == symsan.OpType.INSERT:
+                print(f"  INSERT id={sol['id']} offset={sol['offset']} data={sol['data'].hex()}")
+            elif sol['op'] == symsan.OpType.DELETE:
+                print(f"  DELETE id={sol['id']} offset={sol['offset']} len={sol['len']}")
 
 status, is_killed = symsan.terminate()
 print(f"exit status {status}, killed? {is_killed}")
