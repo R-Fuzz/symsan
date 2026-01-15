@@ -356,6 +356,13 @@ class Taint {
     WK_Memcmp,
     WK_Strcmp,
     WK_Strncmp,
+    WK_Strchr,    // strchr/memchr - find first char occurrence
+    WK_Strrchr,   // strrchr/memrchr - find last char occurrence
+    WK_Strstr,    // strstr/memmem - find substring
+    WK_Prefixof,  // prefix check (e.g., g_str_has_prefix)
+    WK_Suffixof,  // suffix check (e.g., g_str_has_suffix)
+    WK_Strcat,    // strcat/strncat - string concatenation
+    WK_Strsub,    // substr(s, start, len) - substring from start with len
   };
 
   Module *Mod;
@@ -399,9 +406,6 @@ class Taint {
   FunctionType *TaintSolveBoundsFnTy;
   FunctionType *TaintSolveSizeFnTy;
   FunctionType *TaintTraceGlobalFnTy;
-  FunctionType *TaintMemcmpFnTy;
-  FunctionType *TaintStrcmpFnTy;
-  FunctionType *TaintStrncmpFnTy;
   FunctionType *TaintDebugFnTy;
   FunctionCallee TaintUnionFn;
   FunctionCallee TaintCheckedUnionFn;
@@ -426,9 +430,6 @@ class Taint {
   FunctionCallee TaintSolveBoundsFn;
   FunctionCallee TaintSolveSizeFn;
   FunctionCallee TaintTraceGlobalFn;
-  FunctionCallee TaintMemcmpFn;
-  FunctionCallee TaintStrcmpFn;
-  FunctionCallee TaintStrncmpFn;
   FunctionCallee TaintDebugFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
   Constant *CallStack;
@@ -1010,16 +1011,6 @@ bool Taint::initializeModule(Module &M) {
   TaintTraceGlobalFnTy = FunctionType::get(
       PrimitiveShadowTy, { Int64Ty, Int64Ty }, false);
 
-  TaintMemcmpFnTy = FunctionType::get(
-      PrimitiveShadowTy,
-      { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx), Int64Ty }, false);
-  TaintStrcmpFnTy = FunctionType::get(
-      PrimitiveShadowTy,
-      { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx) }, false);
-  TaintStrncmpFnTy = FunctionType::get(
-      PrimitiveShadowTy,
-      { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx), Int64Ty }, false);
-
   TaintDebugFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
       {PrimitiveShadowTy, PrimitiveShadowTy, PrimitiveShadowTy,
        PrimitiveShadowTy, PrimitiveShadowTy}, false);
@@ -1050,6 +1041,20 @@ Taint::WrapperKind Taint::getWrapperKind(Function *F) {
     return WK_Strcmp;
   if (ABIList.isIn(*F, "strncmp"))
     return WK_Strncmp;
+  if (ABIList.isIn(*F, "strchr"))
+    return WK_Strchr;
+  if (ABIList.isIn(*F, "strrchr"))
+    return WK_Strrchr;
+  if (ABIList.isIn(*F, "strstr"))
+    return WK_Strstr;
+  if (ABIList.isIn(*F, "prefixof"))
+    return WK_Prefixof;
+  if (ABIList.isIn(*F, "suffixof"))
+    return WK_Suffixof;
+  if (ABIList.isIn(*F, "strcat"))
+    return WK_Strcat;
+  if (ABIList.isIn(*F, "strsub"))
+    return WK_Strsub;
   if (ABIList.isIn(*F, "functional"))
     return WK_Functional;
   if (ABIList.isIn(*F, "discard"))
@@ -1353,29 +1358,6 @@ void Taint::initializeCallbackFunctions(Module &M) {
     TaintSolveSizeFn =
         Mod->getOrInsertFunction("__taint_solve_size", TaintSolveSizeFnTy, AL);
   }
-  {
-    AttributeList AL;
-    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
-    AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
-    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
-    TaintMemcmpFn =
-        Mod->getOrInsertFunction("__taint_memcmp", TaintMemcmpFnTy, AL);
-  }
-  {
-    AttributeList AL;
-    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
-    AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
-    TaintStrcmpFn =
-        Mod->getOrInsertFunction("__taint_strcmp", TaintStrcmpFnTy, AL);
-  }
-  {
-    AttributeList AL;
-    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
-    AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
-    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
-    TaintStrncmpFn =
-        Mod->getOrInsertFunction("__taint_strncmp", TaintStrncmpFnTy, AL);
-  }
 
   TaintRuntimeFunctions.insert(
       TaintTraceCmpFn.getCallee()->stripPointerCasts());
@@ -1407,12 +1389,6 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintSolveBoundsFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintSolveSizeFn.getCallee()->stripPointerCasts());
-  TaintRuntimeFunctions.insert(
-      TaintMemcmpFn.getCallee()->stripPointerCasts());
-  TaintRuntimeFunctions.insert(
-      TaintStrcmpFn.getCallee()->stripPointerCasts());
-  TaintRuntimeFunctions.insert(
-      TaintStrncmpFn.getCallee()->stripPointerCasts());
 }
 
 bool Taint::runImpl(Module &M) {
@@ -2820,6 +2796,7 @@ void TaintVisitor::addShadowArguments(Function *F, CallBase &CB,
 bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
   IRBuilder<> IRB(&CB);
   Value *Shadow = nullptr;
+  FunctionType *FT = F->getFunctionType();
   switch (TF.TT.getWrapperKind(F)) {
   case Taint::WK_Warning:
     CB.setCalledFunction(F);
@@ -2836,32 +2813,209 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     //FIXME:
     // visitOperandShadowInst(CS);
     return true;
-  case Taint::WK_Memcmp:
-    CB.setCalledFunction(F);
-    assert(CB.arg_size() == 3);
-    Shadow = IRB.CreateCall(TF.TT.TaintMemcmpFn,
-                            {CB.getArgOperand(0),
-                             CB.getArgOperand(1),
-                             CB.getArgOperand(2)});
-    TF.setShadow(&CB, Shadow);
+  case Taint::WK_Memcmp: {
+    // int memcmp(const void *s1, const void *s2, size_t n)
+    assert(CB.arg_size() == 3 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_memcmp", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    // Add original arguments
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    // Add shadow arguments (including return label pointer)
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    // Load return shadow
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
     return true;
-  case Taint::WK_Strcmp:
-    CB.setCalledFunction(F);
-    assert(CB.arg_size() == 2);
-    Shadow = IRB.CreateCall(TF.TT.TaintStrcmpFn,
-                            {CB.getArgOperand(0),
-                             CB.getArgOperand(1)});
-    TF.setShadow(&CB, Shadow);
+  }
+  case Taint::WK_Strcmp: {
+    // int strcmp(const char *s1, const char *s2)
+    assert(CB.arg_size() == 2 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_strcmp", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
     return true;
-  case Taint::WK_Strncmp:
-    CB.setCalledFunction(F);
-    assert(CB.arg_size() == 3);
-    Shadow = IRB.CreateCall(TF.TT.TaintStrncmpFn,
-                            {CB.getArgOperand(0),
-                             CB.getArgOperand(1),
-                             CB.getArgOperand(2)});
-    TF.setShadow(&CB, Shadow);
+  }
+  case Taint::WK_Strncmp: {
+    // int strncmp(const char *s1, const char *s2, size_t n)
+    assert(CB.arg_size() == 3 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_strncmp", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
     return true;
+  }
+  case Taint::WK_Strchr: {
+    // char *strchr(char *s, int c)
+    assert(CB.arg_size() == 2 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_strchr", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
+    return true;
+  }
+  case Taint::WK_Strrchr: {
+    // char *strrchr(char *s, int c)
+    assert(CB.arg_size() == 2 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_strrchr", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
+    return true;
+  }
+  case Taint::WK_Strstr: {
+    // char *strstr(char *haystack, char *needle)
+    assert(CB.arg_size() == 2 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_strstr", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
+    return true;
+  }
+  case Taint::WK_Prefixof: {
+    // int prefixof(const char *str, const char *prefix)
+    assert(CB.arg_size() == 2 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_prefixof", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
+    return true;
+  }
+  case Taint::WK_Suffixof: {
+    // int suffixof(const char *str, const char *suffix)
+    assert(CB.arg_size() == 2 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_suffixof", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
+    return true;
+  }
+  case Taint::WK_Strcat: {
+    // char *strcat(char *dest, const char *src)
+    assert(CB.arg_size() == 2 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_strcat", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
+    return true;
+  }
+  case Taint::WK_Strsub: {
+    // char *strsub(char *s, size_t len)
+    assert(CB.arg_size() == 3 && !FT->getReturnType()->isVoidTy());
+    TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
+    FunctionCallee DfswFn = TF.TT.Mod->getOrInsertFunction("__dfsw_strsub", CustomFn.TransformedType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0; i < FT->getNumParams(); i++)
+      Args.push_back(CB.getArgOperand(i));
+    addShadowArguments(F, CB, Args, IRB);
+
+    CallInst *CustomCI = IRB.CreateCall(DfswFn, Args);
+
+    LoadInst *LabelLoad = IRB.CreateLoad(TF.TT.getShadowTy(FT->getReturnType()), TF.LabelReturnAlloca);
+    TF.setShadow(CustomCI, LabelLoad);
+
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
+    return true;
+  }
   case Taint::WK_Custom:
     // Don't try to handle invokes of custom functions, it's too complicated.
     // Instead, invoke the dfsw$ wrapper, which will in turn call the __dfsw_

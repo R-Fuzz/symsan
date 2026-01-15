@@ -288,7 +288,7 @@ fun:strncat=custom
 fun:strncpy=custom
 fun:strndup=custom
 
-# transformation
+# transformation (fatoi)
 fun:strtod=custom
 fun:strtol=custom
 fun:strtoll=custom
@@ -327,7 +327,7 @@ fun:OPENSSL_memcmp=memcmp
 fun:memcmp_const_time=memcmp
 fun:memcmpct=memcmp
 
-# strcmp-like
+# strcmp-like (fstrcmp)
 fun:xmlStrcmp=strcmp
 fun:xmlStrEqual=strcmp
 fun:g_strcmp0=strcmp
@@ -343,7 +343,7 @@ fun:Curl_strcasecompare=strcmp
 fun:Curl_safe_strcasecompare=strcmp
 fun:cmsstrcasecmp=strcmp
 
-# strncmp-like
+# strncmp-like (fstrcmp)
 fun:xmlStrncmp=strncmp
 fun:curl_strnequal=strncmp
 fun:strnicmp=strncmp
@@ -354,18 +354,25 @@ fun:g_ascii_strncasecmp=strcmp
 fun:Curl_strncasecompare=strncmp
 fun:g_strncasecmp=strncmp
 
-# strstr
+# fstrchr
+fun:xmlStrchr=strchr
+
+# fstrrchr
+
+# strstr (fstrstr)
 fun:g_strstr_len=strstr
 fun:ap_strcasestr=strstr
 fun:xmlStrstr=strstr
 fun:xmlStrcasestr=strstr
 
-# prefixof
+# fprefixof
 fun:g_str_has_prefix=prefixof
 
-# suffixof
+# fsuffixof
 fun:g_str_has_suffix=suffixof
 
+# fsubstr
+fun:xmlStrsub=substr
 
 # Functions which take action based on global state, such as running a callback
 # set by a separate function.
