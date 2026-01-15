@@ -4,7 +4,7 @@ project(symsan VERSION 1.2.2 LANGUAGES C CXX ASM)
 
 find_package(LLVM 14 REQUIRED CONFIG)
 
-# Find Z3 (minimum version 4.8.7 required for string theory APIs)
+# Find Z3 (minimum version 4.8.15 required for string theory APIs)
 # Prefer /usr/local over system
 find_library(Z3_LIBRARY NAMES z3 PATHS /usr/local/lib NO_DEFAULT_PATH)
 if (NOT Z3_LIBRARY)
@@ -28,11 +28,11 @@ if (Z3_INCLUDE_DIR)
 
     message(STATUS "Found Z3 version: ${Z3_VERSION}")
 
-    # Require at least version 4.8.7
+    # Require at least version 4.8.15
     if (Z3_VERSION_MAJOR LESS 4 OR
         (Z3_VERSION_MAJOR EQUAL 4 AND Z3_VERSION_MINOR LESS 8) OR
-        (Z3_VERSION_MAJOR EQUAL 4 AND Z3_VERSION_MINOR EQUAL 8 AND Z3_VERSION_PATCH LESS 7))
-        message(FATAL_ERROR "Z3 version ${Z3_VERSION} found, but version 4.8.7 or later is required (for string theory APIs)")
+        (Z3_VERSION_MAJOR EQUAL 4 AND Z3_VERSION_MINOR EQUAL 8 AND Z3_VERSION_PATCH LESS 15))
+        message(FATAL_ERROR "Z3 version ${Z3_VERSION} found, but version 4.8.15 or later is required (for string theory APIs)")
     endif()
 endif()
 
