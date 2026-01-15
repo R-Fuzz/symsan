@@ -261,6 +261,21 @@ static inline dfsan_label get_label_for(int fd, off_t offset) {
   else return (offset + CONST_OFFSET);
 }
 
+static void *dfsan_memcpy(void *dest, const void *src, size_t n) {
+  if (n == 0) return dest;
+  dfsan_label *sdest = shadow_for(dest);
+  const dfsan_label *ssrc = shadow_for(src);
+  // FIXME: check and avoid copying labels?
+  internal_memcpy((void *)sdest, (const void *)ssrc, n * sizeof(dfsan_label));
+  return internal_memcpy(dest, src, n);
+}
+
+static void dfsan_memset(void *s, int c, dfsan_label c_label, size_t n) {
+  if (n == 0) return;
+  internal_memset(s, c, n);
+  dfsan_set_label(c_label, s, n);
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, int64_t offset, unsigned size);
 
@@ -504,15 +519,6 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
   return const_cast<char *>(ret);
 }
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_memcmp(const void *s1, const void *s2, size_t n) {
-  dfsan_label l1 = dfsan_read_label(s1, n);
-  dfsan_label l2 = dfsan_read_label(s2, n);
-  dfsan_label ret = dfsan_union(l1, l2, fmemcmp, n, (uint64_t)s1, (uint64_t)s2);
-  if (ret) __taint_trace_memcmp(ret);
-  return ret;
-}
-
 DECLARE_WEAK_INTERCEPTOR_HOOK(dfsan_weak_hook_memcmp, uptr caller_pc,
                               const void *s1, const void *s2, size_t n,
                               dfsan_label s1_label, dfsan_label s2_label,
@@ -542,15 +548,10 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
   bool l1_is_string_op = (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
   bool l2_is_string_op = (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
 
-  if (l1_is_string_op || l2_is_string_op) {
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
-    if (cmp) __taint_trace_memcmp(cmp);
+  uint16_t op = (l1_is_string_op || l2_is_string_op) ? __dfsan::fstrcmp : __dfsan::fmemcmp;
+  dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
+  if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
-  } else {
-    // Normal case: use fmemcmp
-    *ret_label = __taint_memcmp(s1, s2, n);
-  }
   return ret;
 }
 
@@ -576,53 +577,10 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   bool l1_is_string_op = (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
   bool l2_is_string_op = (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
 
-  if (l1_is_string_op || l2_is_string_op) {
-    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
-    if (cmp) __taint_trace_memcmp(cmp);
+  uint16_t op = (l1_is_string_op || l2_is_string_op) ? __dfsan::fstrcmp : __dfsan::fmemcmp;
+  dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
+  if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
-  } else {
-    // Normal case: use fmemcmp
-    *ret_label = __taint_memcmp(s1, s2, n);
-  }
-  return ret;
-}
-
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_strcmp(const char *s1, const char *s2) {
-  size_t n = strlen(s1) + 1; // including tailing '\0'
-  if (dfsan_get_label(s1) != 0)
-    n = strlen(s2) + 1; // including tailing '\0'
-
-  // Check if first byte of s1 or s2 has an fsubstr label
-  // If so, use it directly instead of dfsan_read_label to avoid mixing String/BV sorts
-  dfsan_label l1 = 0;
-  dfsan_label s1_first = dfsan_get_label((char*)s1);
-  if (s1_first >= CONST_OFFSET) {
-    dfsan_label_info *info = dfsan_get_label_info(s1_first);
-    if (info->op == __dfsan::fsubstr) {
-      l1 = s1_first;  // Use fsubstr directly
-    }
-  }
-  if (l1 == 0) {
-    l1 = dfsan_read_label(s1, n);
-  }
-
-  dfsan_label l2 = 0;
-  dfsan_label s2_first = dfsan_get_label((char*)s2);
-  if (s2_first >= CONST_OFFSET) {
-    dfsan_label_info *info = dfsan_get_label_info(s2_first);
-    if (info->op == __dfsan::fsubstr) {
-      l2 = s2_first;  // Use fsubstr directly
-    }
-  }
-  if (l2 == 0) {
-    l2 = dfsan_read_label(s2, n);
-  }
-
-  dfsan_label ret = dfsan_union(l1, l2, __dfsan::fstrcmp, n, (uint64_t)s1, (uint64_t)s2);
-  if (ret) __taint_trace_memcmp(ret);
   return ret;
 }
 
@@ -735,6 +693,71 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_suffixof(
   return ret;
 }
 
+SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strsub(
+    const char *s, size_t start, size_t len,
+    dfsan_label s_label, dfsan_label start_label, dfsan_label len_label,
+    dfsan_label *ret_label) {
+
+  *ret_label = 0;
+  // Execute concrete operation
+  // Skip 'start' characters, then duplicate 'len' characters
+  if (s == NULL || len == 0) {
+    return NULL;
+  }
+
+  size_t str_len = strlen(s);
+  if (start >= str_len) {
+    return NULL;
+  }
+
+  // Point to start position
+  const char *src = s + start;
+  size_t remaining = str_len - start;
+  size_t copy_len = (len < remaining) ? len : remaining;
+
+  // Allocate and copy substring (like strndup)
+  char *p = (char *)malloc(copy_len + 1);
+  if (p == NULL) {
+    return NULL;
+  }
+  dfsan_memcpy(p, src, copy_len);
+  p[copy_len] = '\0';
+
+  // Get unified label for the string
+  dfsan_label str_label = get_str_label(s, s_label);
+
+  if (str_label == 0 && start_label == 0 && len_label == 0) {
+    // No taint, nothing to propagate
+  } else {
+    // Compose strsub(str, start, len) using two fsubstr operations:
+    // 1. suffix_from_pos(str, start) = str[start:] using fsubstr with op2=1 (suffix mode)
+    // 2. prefix(suffix, len) = suffix[0:len] using fsubstr with op2=0 (prefix mode)
+
+    // Step 1: Create suffix label representing str[start:]
+    // l1 = string content, l2 = start position label
+    // op1 = concrete remaining length, op2 = 1 (suffix mode)
+    dfsan_label suffix_label = str_label;
+    if (start_label != 0 || start > 0) {
+      suffix_label = dfsan_union(str_label, start_label, __dfsan::fsubstr,
+                                  sizeof(void*) * 8, (uint64_t)remaining, 1);
+    }
+
+    // Step 2: Take first len chars from suffix: suffix[0:len]
+    // l1 = suffix label, l2 = len label
+    // op1 = concrete len, op2 = 0 (prefix mode)
+    dfsan_label substr_label = dfsan_union(suffix_label, len_label, __dfsan::fsubstr,
+                                            sizeof(void*) * 8, (uint64_t)copy_len, 0);
+
+    // Store label in content map so downstream ops can find it
+    if (substr_label != 0) {
+      taint_set_str_content_label(p, substr_label);
+      *ret_label = substr_label;
+    }
+  }
+
+  return p;
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
                   dfsan_label s2_label, dfsan_label *ret_label) {
@@ -758,21 +781,6 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
   }
-  return ret;
-}
-
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_strncmp(const char *s1, const char *s2, size_t n) {
-  if (n == 0) return 0;
-  if (dfsan_get_label(s1) == 0 && strlen(s1) < (n - 1))
-    n = strlen(s1) + 1;
-  if (dfsan_get_label(s2) == 0 && strlen(s2) < (n - 1))
-    n = strlen(s2) + 1;
-  dfsan_label l1 = dfsan_read_label(s1, n);
-  dfsan_label l2 = dfsan_read_label(s2, n);
-  // Use string theory comparison (fstrcmp) for all strncmp
-  dfsan_label ret = dfsan_union(l1, l2, __dfsan::fstrcmp, n, (uint64_t)s1, (uint64_t)s2);
-  if (ret) __taint_trace_memcmp(ret);
   return ret;
 }
 
@@ -873,21 +881,6 @@ __dfsw_strlen(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
                              null_from_input ? 1 : 0, ret);
   }
   return ret;
-}
-
-static void *dfsan_memcpy(void *dest, const void *src, size_t n) {
-  if (n == 0) return dest;
-  dfsan_label *sdest = shadow_for(dest);
-  const dfsan_label *ssrc = shadow_for(src);
-  // FIXME: check and avoid copying labels?
-  internal_memcpy((void *)sdest, (const void *)ssrc, n * sizeof(dfsan_label));
-  return internal_memcpy(dest, src, n);
-}
-
-static void dfsan_memset(void *s, int c, dfsan_label c_label, size_t n) {
-  if (n == 0) return;
-  internal_memset(s, c, n);
-  dfsan_set_label(c_label, s, n);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
