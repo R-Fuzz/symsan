@@ -1446,7 +1446,8 @@ bool Taint::runImpl(Module &M) {
 
   for (Function &F : M) {
     if (!F.isIntrinsic() && !TaintRuntimeFunctions.count(&F) &&
-        !IFuncs.count(&F)) {
+        !IFuncs.count(&F) &&
+        !F.hasFnAttribute(Attribute::DisableSanitizerInstrumentation)) {
       FnsToInstrument.push_back(&F);
       if (F.hasPersonalityFn())
         PersonalityFns.insert(F.getPersonalityFn());
@@ -1471,6 +1472,10 @@ bool Taint::runImpl(Module &M) {
     // instrumentedness of overridden weak aliases.
     auto F = dyn_cast<Function>(GA.getAliaseeObject());
     if (!F)
+      continue;
+
+    // Skip functions with nosanitize metadata
+    if (F->hasFnAttribute(Attribute::DisableSanitizerInstrumentation))
       continue;
 
     bool GAInst = isInstrumented(&GA), FInst = isInstrumented(F);
@@ -1618,7 +1623,7 @@ bool Taint::runImpl(Module &M) {
         // TaintVisitor may delete Inst, so keep track of whether it was a
         // terminator.
         bool IsTerminator = Inst->isTerminator();
-        if (!TF.SkipInsts.count(Inst))
+        if (!TF.SkipInsts.count(Inst) && !Inst->getMetadata("nosanitize"))
           TaintVisitor(TF).visit(Inst);
         if (IsTerminator)
           break;
@@ -2124,7 +2129,6 @@ void TaintVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
 }
 
 void TaintVisitor::visitLoadInst(LoadInst &LI) {
-  if (LI.getMetadata("nosanitize")) return;
   auto &DL = LI.getModule()->getDataLayout();
   uint64_t Size = DL.getTypeStoreSize(LI.getType());
   if (Size == 0) {
@@ -2263,8 +2267,6 @@ void TaintFunction::storeShadow(Value *Addr, Type *T, uint64_t Size,
 }
 
 void TaintVisitor::visitStoreInst(StoreInst &SI) {
-  if (SI.getMetadata("nosanitize")) return;
-
   auto &DL = SI.getModule()->getDataLayout();
   Value *Val = SI.getValueOperand();
   Type* VT = SI.getValueOperand()->getType();
@@ -2301,7 +2303,6 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
 //}
 
 void TaintVisitor::visitBinaryOperator(BinaryOperator &BO) {
-  if (BO.getMetadata("nosanitize")) return;
   if (BO.getType()->isFloatingPointTy()) return;
   Value *CombinedShadow =
     TF.combineBinaryOperatorShadows(&BO, BO.getOpcode());
@@ -2309,7 +2310,6 @@ void TaintVisitor::visitBinaryOperator(BinaryOperator &BO) {
 }
 
 void TaintVisitor::visitCastInst(CastInst &CI) {
-  if (CI.getMetadata("nosanitize")) return;
   // Special case: if this is the bitcast (there is exactly 1 allowed) between
   // a musttail call and a ret, don't instrument. New instructions are not
   // allowed after a musttail call.
@@ -2346,7 +2346,6 @@ void TaintFunction::visitCmpInst(CmpInst *I) {
 }
 
 void TaintVisitor::visitCmpInst(CmpInst &CI) {
-  if (CI.getMetadata("nosanitize")) return;
   // FIXME: integer only now
   if (!ClTraceFP && !isa<ICmpInst>(CI)) return;
 #if 0 //TODO make an option
@@ -2386,7 +2385,6 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
 }
 
 void TaintVisitor::visitSwitchInst(SwitchInst &SWI) {
-  if (SWI.getMetadata("nosanitize")) return;
   TF.visitSwitchInst(&SWI);
 }
 
@@ -2508,7 +2506,6 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
 
 void TaintVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
   if (!ClTraceGEPOffset && !ClTraceBound) return;
-  if (GEPI.getMetadata("nosanitize")) return;
   TF.visitGEPInst(&GEPI);
 }
 
@@ -2525,8 +2522,6 @@ void TaintVisitor::visitShuffleVectorInst(ShuffleVectorInst &I) {
 }
 
 void TaintVisitor::visitExtractValueInst(ExtractValueInst &I) {
-  if (I.getMetadata("nosanitize")) return;
-
   IRBuilder<> IRB(&I);
   Value *Agg = I.getAggregateOperand();
   Value *AggShadow = TF.getShadow(Agg);
@@ -2535,8 +2530,6 @@ void TaintVisitor::visitExtractValueInst(ExtractValueInst &I) {
 }
 
 void TaintVisitor::visitInsertValueInst(InsertValueInst &I) {
-  if (I.getMetadata("nosanitize")) return;
-
   IRBuilder<> IRB(&I);
   Value *AggShadow = TF.getShadow(I.getAggregateOperand());
   Value *InsShadow = TF.getShadow(I.getInsertedValueOperand());
@@ -3287,7 +3280,6 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
 }
 
 void TaintVisitor::visitBranchInst(BranchInst &BR) {
-  if (BR.getMetadata("nosanitize")) return;
   if (BR.isUnconditional()) return;
   TF.visitCondition(BR.getCondition(), &BR);
 }
