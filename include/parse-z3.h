@@ -3,6 +3,7 @@
 #include "parse.h"
 
 #include <z3++.h>
+#include <set>
 
 namespace symsan {
 
@@ -36,8 +37,34 @@ protected:
   const char* atoi_name_format;
   const char* strlen_name_format;
 
-  // String ranges for null-byte post-processing (input_id -> list of (start, end))
-  std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> string_ranges_;
+  // String range entry with cached str- expr for linking constraints
+  struct string_range_t {
+    uint32_t start;
+    uint32_t end;
+    z3::expr str_expr;  // cached str-X-Y-Z expr (z3::expr handles refcount)
+
+    string_range_t(uint32_t s, uint32_t e, z3::expr expr)
+        : start(s), end(e), str_expr(expr) {}
+  };
+
+  // Transparent comparator for O(log n) lookup with just uint32_t
+  struct string_range_cmp {
+    using is_transparent = void;  // Enable heterogeneous lookup
+
+    bool operator()(const string_range_t &a, const string_range_t &b) const {
+      return a.start < b.start;
+    }
+    bool operator()(const string_range_t &a, uint32_t offset) const {
+      return a.start < offset;
+    }
+    bool operator()(uint32_t offset, const string_range_t &b) const {
+      return offset < b.start;
+    }
+  };
+
+  // String ranges for null-byte post-processing and linking constraints
+  // vector indexed by input_id, each contains a sorted set of ranges
+  std::vector<std::set<string_range_t, string_range_cmp>> string_ranges_;
 
   // String info cache: label -> (input_id, offset, length)
   struct string_info_t {
@@ -64,6 +91,10 @@ private:
   std::vector<uint64_t> value_cache_;
   static const size_t SIZE_INCREMENT = 2048;
 
+  // Label-level tracking: what type of variables does each expression involve?
+  std::vector<bool> is_label_bv_;   // involves bitvec variables (input-X-Y)
+  std::vector<bool> is_label_seq_;  // involves string/seq variables (str-X-Y-Z)
+
   // dependencies
   struct expr_hash {
     std::size_t operator()(const z3::expr &expr) const {
@@ -76,15 +107,21 @@ private:
     }
   };
   using expr_set_t = std::unordered_set<z3::expr, expr_hash, expr_equal>;
-  struct branch_dependency {
+  struct branch_dependency_t {
     expr_set_t expr_deps;
     input_dep_set_t input_deps;
+    bool used_in_bv = false;   // any saved constraint involves bitvec
+    bool used_in_seq = false;  // any saved constraint involves string/seq
+    z3::expr input_expr;  // cached input-X-Y expr (z3::expr handles refcount)
+
+    // Only constructor: must have input_expr (linear scan guarantees this)
+    branch_dependency_t(z3::expr e) : input_expr(e) {}
   };
-  using branch_dep_t = std::unique_ptr<struct branch_dependency>;
+  using branch_dep_t = std::unique_ptr<struct branch_dependency_t>;
   using offset_dep_t = std::vector<branch_dep_t>;
   std::vector<offset_dep_t> branch_deps_;
 
-  inline struct branch_dependency* get_branch_dep(offset_t off) {
+  inline struct branch_dependency_t* get_branch_dep(offset_t off) {
     auto &offset_deps = branch_deps_.at(off.first);
     return offset_deps.at(off.second).get();
   }
@@ -125,6 +162,7 @@ private:
   z3::expr read_concrete(dfsan_label label, uint16_t size);
   z3::expr serialize(dfsan_label label, input_dep_set_t &deps);
   inline void collect_more_deps(input_dep_set_t &deps);
+  inline void mark_expr_type(dfsan_label label, input_dep_set_t &inputs);
   inline size_t add_nested_constraints(input_dep_set_t &deps, z3_task_t *task);
   inline void save_constraint(z3::expr expr, input_dep_set_t &inputs);
   void construct_index_tasks(z3::expr &index, uint64_t curr,
@@ -135,6 +173,9 @@ private:
   z3::expr build_string_from_label(dfsan_label content_label, input_dep_set_t &deps);
   z3::expr get_byte_expr(uint32_t input, uint32_t offset, input_dep_set_t &deps);
   bool label_contains_indexof(dfsan_label label);
+
+  // Helper for linking bitvec and string constraints on shared offsets
+  void add_string_bitvec_link(offset_t off, z3_task_t *task);
 };
 
 class Z3ParserSolver : public Z3AstParser {

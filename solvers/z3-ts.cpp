@@ -147,6 +147,7 @@ int Z3AstParser::restart(std::vector<input_t> &inputs) {
   // reset caches
   memcmp_cache_.clear();
   string_ranges_.clear();
+  string_ranges_.resize(inputs.size()); // vector indexed by input_id
   tsize_cache_.clear();
   tsize_cache_.resize(1); // reserve for CONST_OFFSET
   for (Z3_ast ast : expr_cache_) {
@@ -162,6 +163,12 @@ int Z3AstParser::restart(std::vector<input_t> &inputs) {
   value_cache_.clear();
   value_cache_.resize(1); // reserve for CONST_OFFSET
 #endif
+  // Label-level tracking caches
+  is_label_bv_.clear();
+  is_label_bv_.resize(1);  // reserve for CONST_OFFSET
+  is_label_seq_.clear();
+  is_label_seq_.resize(1); // reserve for CONST_OFFSET
+
   string_info_cache_.clear();
   branch_deps_.clear();
   branch_deps_.resize(inputs.size());
@@ -277,6 +284,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 #if FILTER_WRONG_AST
     value_cache_.reserve(label + SIZE_INCREMENT);
 #endif
+    is_label_bv_.reserve(label + SIZE_INCREMENT);
+    is_label_seq_.reserve(label + SIZE_INCREMENT);
   }
 
   for (dfsan_label l = last_label + 1; l <= label; l++) {
@@ -288,6 +297,28 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 #define RECORD_VALUE(value) \
   do { } while (0)
 #endif
+
+// Helper macros for tracking label types (bitvec vs string/seq)
+// Most ops are bitvec; string ops are seq; And/Or/ICmp propagate from children
+#define TRACK_LABEL_BV_ONLY() \
+  is_label_bv_.emplace_back(true); \
+  is_label_seq_.emplace_back(false)
+
+#define TRACK_LABEL_SEQ_ONLY() \
+  is_label_bv_.emplace_back(false); \
+  is_label_seq_.emplace_back(true)
+
+#define TRACK_LABEL_PROPAGATE_BOTH() \
+  do { \
+    bool bv = (info->l1 >= CONST_OFFSET) ? is_label_bv_[info->l1] : false; \
+    bool seq = (info->l1 >= CONST_OFFSET) ? is_label_seq_[info->l1] : false; \
+    if (info->l2 >= CONST_OFFSET) { \
+      bv = bv || is_label_bv_[info->l2]; \
+      seq = seq || is_label_seq_[info->l2]; \
+    } \
+    is_label_bv_.emplace_back(bv); \
+    is_label_seq_.emplace_back(seq); \
+  } while (0)
 
     dfsan_label_info *info = get_label_info(l);
     // fprintf(stderr, "%u = (l1:%u, l2:%u, op:%s, size:%u, op1:%lu, op2:%lu)\n",
@@ -307,7 +338,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       tsize_cache_.emplace_back(1);
       input_deps.insert(std::make_pair(input, offset));
       // caching is not super helpful
-      cache_expr(l, context_.constant(symbol, sort));
+      z3::expr input_expr = context_.constant(symbol, sort);
+      cache_expr(l, input_expr);
+      // Cache input expr in branch_dependency for linking (linear scan: always new)
+      set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(input_expr));
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(inputs_cache_[input].first[offset]);
       continue;
     } else if (info->op == __dfsan::Load) {
@@ -316,22 +351,29 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       snprintf(name, sizeof(name), input_name_format, input, offset);
       z3::symbol symbol = context_.str_symbol(name);
       z3::sort sort = context_.bv_sort(8);
-      z3::expr out = context_.constant(symbol, sort);
+      z3::expr first_byte = context_.constant(symbol, sort);
+      z3::expr out = first_byte;
       input_deps.insert(std::make_pair(input, offset));
+      // Cache first byte expr in branch_dependency (linear scan: always new)
+      set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(first_byte));
 #if FILTER_WRONG_AST
       uint64_t val = inputs_cache_[input].first[offset];
 #endif
       for (uint32_t i = 1; i < info->l2; i++) {
         snprintf(name, sizeof(name), input_name_format, input, offset + i);
         symbol = context_.str_symbol(name);
-        out = z3::concat(context_.constant(symbol, sort), out);
+        z3::expr byte_expr = context_.constant(symbol, sort);
+        out = z3::concat(byte_expr, out);
         input_deps.insert(std::make_pair(input, offset + i));
+        // Cache each byte expr in branch_dependency (linear scan: always new)
+        set_branch_dep({input, offset + i}, std::make_unique<branch_dependency_t>(byte_expr));
 #if FILTER_WRONG_AST
         val |= (uint64_t)inputs_cache_[input].first[offset + i] << (i * 8);
 #endif
       }
       tsize_cache_.emplace_back(1);
       cache_expr(l, out);
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(val);
       continue;
     } else if (info->op == __dfsan::ZExt) {
@@ -342,6 +384,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       uint32_t base_size = base.get_sort().bv_size();
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, z3::zext(base, info->size - base_size));
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(value_cache_[info->l1] & ((1UL << base_size) - 1));
       continue;
     } else if (info->op == __dfsan::SExt) {
@@ -349,18 +392,21 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       uint32_t base_size = base.get_sort().bv_size();
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, z3::sext(base, info->size - base_size));
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE((int64_t)(value_cache_[info->l1] & ((1UL << base_size) - 1)));
       continue;
     } else if (info->op == __dfsan::Trunc) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, base.extract(info->size - 1, 0));
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(value_cache_[info->l1] & ((1UL << info->size) - 1));
       continue;
     } else if (info->op == __dfsan::IntToPtr) {
       z3::expr e = get_cached_expr(info->l1, input_deps);
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, e);
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(value_cache_[info->l1]);
       continue;
     } else if (info->op == __dfsan::PtrToInt) {
@@ -375,6 +421,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           z3::expr bv_idx = z3::int2bv(info->size, idx);
           tsize_cache_.emplace_back(tsize_cache_[info->l1]);
           cache_expr(l, bv_idx);
+          TRACK_LABEL_BV_ONLY();
           RECORD_VALUE(value_cache_[info->l1]);
           continue;
         }
@@ -383,6 +430,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr e = get_cached_expr(info->l1, input_deps);
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, e);
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(value_cache_[info->l1]);
       continue;
     } //FIXME: other casting ops (BitCast)?
@@ -391,6 +439,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, base.extract((info->op2.i + info->size) - 1, info->op2.i));
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE((value_cache_[info->l1] >> info->op2.i) &
                     ((1UL << info->size) - 1));
       continue;
@@ -404,6 +453,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         throw z3::exception("Only LNot should be recorded");
       }
       cache_expr(l, !e);
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(!value_cache_[info->l2]);
       continue;
     } else if (info->op == __dfsan::Neg) {
@@ -413,6 +463,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr e = get_cached_expr(info->l2, input_deps);
       tsize_cache_.emplace_back(tsize_cache_[info->l2]);
       cache_expr(l, -e);
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(-value_cache_[info->l2]);
       continue;
     }
@@ -429,6 +480,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr e = z3::ite(op1 == op2, context_.bv_val(0, 32),
                                        context_.bv_val(1, 32));
       cache_expr(l, e);
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(0); // memcmp result is always 0 or 1
       continue;
     } else if (info->op == __dfsan::fsize) {
@@ -446,6 +498,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       } else {
         cache_expr(l, base);
       }
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(0); // FIXME: map to input size
       continue;
     } else if (info->op == __dfsan::fatoi) {
@@ -464,6 +517,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::symbol symbol = context_.str_symbol(name);
       z3::sort sort = context_.bv_sort(info->size);
       cache_expr(l, context_.constant(symbol, sort));
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(0); // FIXME: map to atoi result?
       continue;
     } else if (info->op == __dfsan::fstrlen) {
@@ -508,6 +562,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::symbol symbol = context_.str_symbol(name);
       z3::sort sort = context_.bv_sort(info->size);
       cache_expr(l, context_.constant(symbol, sort));
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(info->op2.i); // actual length for value cache
       continue;
     } else if (info->op == __dfsan::fstrchr) {
@@ -596,6 +651,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx);  // cache the index expression (Int sort)
+      TRACK_LABEL_SEQ_ONLY();
       RECORD_VALUE(0);  // Placeholder - validation skipped for indexOf ops
       continue;
     } else if (info->op == __dfsan::fstrrchr) {
@@ -652,6 +708,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx);
+      TRACK_LABEL_SEQ_ONLY();
       RECORD_VALUE(0);  // Placeholder - validation skipped for indexOf ops
       continue;
     } else if (info->op == __dfsan::fstrstr) {
@@ -736,6 +793,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx);
+      TRACK_LABEL_SEQ_ONLY();
       RECORD_VALUE(0);  // Placeholder - validation skipped for indexOf ops
       continue;
     } else if (info->op == __dfsan::fstrpbrk) {
@@ -825,6 +883,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx.simplify());
+      TRACK_LABEL_SEQ_ONLY();
       RECORD_VALUE(0);  // Placeholder - validation skipped for indexOf ops
       continue;
     } else if (info->op == __dfsan::fsubstr) {
@@ -881,6 +940,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, substr_expr);
+      TRACK_LABEL_SEQ_ONLY();
       // The substr itself doesn't have a numeric value, but downstream ops will use it
       RECORD_VALUE(info->op1.i);
       continue;
@@ -939,6 +999,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, concat_result);
+      TRACK_LABEL_SEQ_ONLY();
       RECORD_VALUE(0);
       continue;
     } else if (info->op == __dfsan::fstrcmp) {
@@ -1000,6 +1061,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
                              context_.bv_val(1, 32));
       tsize_cache_.emplace_back(1);
       cache_expr(l, eq);
+      TRACK_LABEL_SEQ_ONLY();
       RECORD_VALUE(0);
       continue;
     } else if (info->op == __dfsan::fprefixof) {
@@ -1052,6 +1114,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
                                  context_.bv_val(0, 32));
       tsize_cache_.emplace_back(1);
       cache_expr(l, result);
+      TRACK_LABEL_SEQ_ONLY();
       RECORD_VALUE(0);
       continue;
     } else if (info->op == __dfsan::fsuffixof) {
@@ -1104,6 +1167,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
                                  context_.bv_val(0, 32));
       tsize_cache_.emplace_back(1);
       cache_expr(l, result);
+      TRACK_LABEL_SEQ_ONLY();
       RECORD_VALUE(0);
       continue;
     } else if (info->op == __dfsan::fstr_off) {
@@ -1122,12 +1186,14 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
         tsize_cache_.emplace_back(tsize_cache_[info->l1]);
         cache_expr(l, offset_idx);
+        TRACK_LABEL_SEQ_ONLY();
         // Record the concrete position + offset
         RECORD_VALUE(value_cache_[info->l1] + gep_offset);
       } else {
         // No base label, just return zero
         tsize_cache_.emplace_back(0);
         cache_expr(l, context_.int_val(0));
+        TRACK_LABEL_SEQ_ONLY();
         RECORD_VALUE(0);
       }
       continue;
@@ -1135,6 +1201,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // not expression, do nothing
       tsize_cache_.emplace_back(0);
       expr_cache_.emplace_back(nullptr);
+      TRACK_LABEL_BV_ONLY();  // placeholder, doesn't matter
       RECORD_VALUE(0);
       continue;
     }
@@ -1191,6 +1258,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
         tsize_cache_.emplace_back(tsize_cache_[info->l1] + tsize_cache_[info->l2]);
         cache_expr(l, cmp_expr);
+        TRACK_LABEL_SEQ_ONLY();  // string function comparison is purely seq
 #if FILTER_WRONG_AST
         // For string ops, calculate value based on found/not-found semantics
         bool cmp_result = (predicate == __dfsan::bvneq) ? found : !found;
@@ -1258,36 +1326,43 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // llvm doesn't distinguish between logical and bitwise and/or/xor
       case __dfsan::And: {
         cache_expr(l, info->size != 1 ? (op1 & op2) : (op1 && op2));
+        TRACK_LABEL_PROPAGATE_BOTH();
         RECORD_VALUE((info->size != 1) ? (val1 & val2) : (val1 && val2));
         break;
       }
       case __dfsan::Or: {
         cache_expr(l, info->size != 1 ? (op1 | op2) : (op1 || op2));
+        TRACK_LABEL_PROPAGATE_BOTH();
         RECORD_VALUE((info->size != 1) ? (val1 | val2) : (val1 || val2));
         break;
       }
       case __dfsan::Xor: {
         cache_expr(l, op1 ^ op2);
+        TRACK_LABEL_BV_ONLY();
         RECORD_VALUE(val1 ^ val2);
         break;
       }
       case __dfsan::Shl: {
         cache_expr(l, z3::shl(op1, op2));
+        TRACK_LABEL_BV_ONLY();
         RECORD_VALUE(val1 << (val2 % size));
         break;
       }
       case __dfsan::LShr: {
         cache_expr(l, z3::lshr(op1, op2));
+        TRACK_LABEL_BV_ONLY();
         RECORD_VALUE(val1 >> (val2 % size));
         break;
       }
       case __dfsan::AShr: {
         cache_expr(l, z3::ashr(op1, op2));
+        TRACK_LABEL_BV_ONLY();
         RECORD_VALUE((int64_t)val1 >> (val2 % size));
         break;
       }
       case __dfsan::Add: {
         cache_expr(l, op1 + op2);
+        TRACK_LABEL_BV_ONLY();
         RECORD_VALUE(val1 + val2);
         break;
       }
@@ -1304,6 +1379,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
               // This is (PtrToInt(string_op)) - base_addr = index
               // The expression is just the index (op1 already contains int2bv(idx))
               cache_expr(l, op1);
+              TRACK_LABEL_SEQ_ONLY();
               // The value is just the index, not idx - base_addr
               RECORD_VALUE(val1);
               break;
@@ -1311,16 +1387,19 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           }
         }
         cache_expr(l, op1 - op2);
+        TRACK_LABEL_BV_ONLY();
         RECORD_VALUE(val1 - val2);
         break;
       }
       case __dfsan::Mul: {
         cache_expr(l, op1 * op2);
+        TRACK_LABEL_BV_ONLY();
         RECORD_VALUE(val1 * val2);
         break;
       }
       case __dfsan::UDiv: {
         cache_expr(l, z3::udiv(op1, op2));
+        TRACK_LABEL_BV_ONLY();
         if (val2 == 0) {
           fprintf(stderr, "WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
@@ -1330,6 +1409,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       }
       case __dfsan::SDiv: {
         cache_expr(l, op1 / op2);
+        TRACK_LABEL_BV_ONLY();
         if (val2 == 0) {
           fprintf(stderr, "WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
@@ -1339,6 +1419,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       }
       case __dfsan::URem: {
         cache_expr(l, z3::urem(op1, op2));
+        TRACK_LABEL_BV_ONLY();
         if (val2 == 0) {
           fprintf(stderr, "WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
@@ -1348,6 +1429,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       }
       case __dfsan::SRem: {
         cache_expr(l, z3::srem(op1, op2));
+        TRACK_LABEL_BV_ONLY();
         if (val2 == 0) {
           fprintf(stderr, "WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
@@ -1410,6 +1492,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         // Cache the expression AFTER updating value_cache to maintain consistency
         // if an exception is thrown above
         cache_expr(l, get_cmd(op1, op2, info->op >> 8));
+        TRACK_LABEL_PROPAGATE_BOTH();
         break;
       }
       // concat
@@ -1421,11 +1504,13 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // just use the String. The constant bytes don't contribute to constraints.
           if (!op1.is_bv() && info->l2 == 0) {
             cache_expr(l, op1);
+            TRACK_LABEL_BV_ONLY();
             RECORD_VALUE(val1);
             break;
           }
           if (!op2.is_bv() && info->l1 == 0) {
             cache_expr(l, op2);
+            TRACK_LABEL_BV_ONLY();
             RECORD_VALUE(val2);
             break;
           }
@@ -1435,6 +1520,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           throw z3::exception("concat with non-bitvector operand (string op involved)");
         }
         cache_expr(l, z3::concat(op2, op1)); // little endian
+        TRACK_LABEL_BV_ONLY();
         RECORD_VALUE((val2 << op1.get_sort().bv_size()) | (val1));
         break;
       }
@@ -1484,6 +1570,9 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 #endif
 
     task->push_back((cond != r));
+
+    // mark expression type for linking detection
+    mark_expr_type(label, inputs);
 
     // collect additional input deps
     collect_more_deps(inputs);
@@ -1566,8 +1655,12 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
     }
 #endif
 
+    // mark expression type for linking detection
+    mark_expr_type(index_label, inputs);
+
     // collect nested constraints
     collect_more_deps(inputs);
+
     z3_task_t nested_tasks;
     add_nested_constraints(inputs, &nested_tasks);
 
@@ -1617,7 +1710,12 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
   try {
     input_dep_set_t inputs;
     z3::expr expr = serialize(label, inputs);
+
+    // mark expression type for linking detection
+    mark_expr_type(label, inputs);
+
     collect_more_deps(inputs);
+
     // prepare result
     uint16_t size = get_label_info(label)->size;
     z3::expr r = context_.bv_val(result, size);
@@ -1642,20 +1740,32 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
   return 0;
 }
 
+void Z3AstParser::mark_expr_type(dfsan_label label, input_dep_set_t &inputs) {
+  bool is_bv = is_label_bv_.at(label);
+  bool is_seq = is_label_seq_.at(label);
+  // fprintf(stderr, "DEBUG mark_expr_type: label %u is_bv=%d is_seq=%d\n", label, is_bv, is_seq);
+
+  for (auto off : inputs) {
+    auto c = get_branch_dep(off);
+    if (c == nullptr) {
+      throw z3::exception("branch_dep not found for input byte");
+    }
+    // Update type flags (accumulate, don't overwrite)
+    c->used_in_bv |= is_bv;
+    c->used_in_seq |= is_seq;
+    // fprintf(stderr, "DEBUG mark_expr_type: offset (%u, %u), used_in_bv=%d, used_in_seq=%d\n",
+    //         off.first, off.second, c->used_in_bv, c->used_in_seq);
+  }
+}
+
 void Z3AstParser::save_constraint(z3::expr expr, input_dep_set_t &inputs) {
   for (auto off : inputs) {
     auto c = get_branch_dep(off);
     if (c == nullptr) {
-      auto nc = std::make_unique<struct branch_dependency>();
-      c = nc.get();
-      set_branch_dep(off, std::move(nc));
+      throw z3::exception("branch_dep not found for input byte");
     }
-    if (c == nullptr) {
-      throw z3::exception("out of memory");
-    } else {
-      c->input_deps.insert(inputs.begin(), inputs.end());
-      c->expr_deps.insert(expr);
-    }
+    c->input_deps.insert(inputs.begin(), inputs.end());
+    c->expr_deps.insert(expr);
   }
 }
 
@@ -1679,10 +1789,18 @@ void Z3AstParser::collect_more_deps(input_dep_set_t &inputs) {
 
 size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, z3_task_t *task) {
   expr_set_t added;
+  std::vector<offset_t> need_linking;
+
   for (auto &off : inputs) {
     // fprintf(stderr, "adding offset %d\n", off.second);
     auto deps = get_branch_dep(off);
     if (deps != nullptr) {
+      // Check if this offset is used in both constraint types
+      if (deps->used_in_bv && deps->used_in_seq) {
+        // fprintf(stderr, "DEBUG: need linking for offset (%u, %u)\n", off.first, off.second);
+        need_linking.push_back(off);
+      }
+
       for (auto &expr : deps->expr_deps) {
         if (added.insert(expr).second) {
           // fprintf(stderr, "adding expr: %s\n", expr.to_string().c_str());
@@ -1691,7 +1809,51 @@ size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, z3_task_t *t
       }
     }
   }
+
+  // Add linking constraints for overlapping offsets
+  for (auto &off : need_linking) {
+    add_string_bitvec_link(off, task);
+  }
+
   return added.size();
+}
+
+void Z3AstParser::add_string_bitvec_link(offset_t off, z3_task_t *task) {
+  // Check if input_id is valid
+  if (off.first >= string_ranges_.size()) return;
+
+  auto &ranges = string_ranges_[off.first];
+
+  // Use upper_bound with transparent comparator - search with just uint32_t
+  // Find first range where start > off.second, then go back one
+  auto it = ranges.upper_bound(off.second);
+
+  if (it != ranges.begin()) {
+    --it;
+    if (off.second >= it->start && off.second < it->end) {
+      // Found covering range, use cached exprs directly
+      uint32_t pos_in_string = off.second - it->start;
+
+      z3::expr str_var = it->str_expr;  // cached str- expr
+
+      // Get cached input- expr from branch_dependency
+      z3::expr input_var = get_branch_dep(off)->input_expr;
+
+      // str_var[pos] as integer == input_var as integer
+      // Extract single-char substring, then convert to code point
+      z3::expr pos_expr = context_.int_val(pos_in_string);
+      z3::expr one = context_.int_val(1);
+      z3::expr single_char_str(context_, Z3_mk_seq_extract(context_, str_var, pos_expr, one));
+      z3::expr char_code(context_, Z3_mk_string_to_code(context_, single_char_str));
+      z3::expr byte_val = z3::bv2int(input_var, false);
+
+      // Add the linking constraint
+      task->push_back(char_code == byte_val);
+
+      // fprintf(stderr, "DEBUG: adding link constraint: %s\n",
+      //         (char_code == byte_val).to_string().c_str());
+    }
+  }
 }
 
 Z3ParserSolver::solving_status
@@ -2018,13 +2180,13 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
   // Replace null bytes within string ranges (tracked in string_ranges_)
   for (auto &sol : solutions) {
     if (sol.op == solution_op_t::SET && sol.val == 0x00) {
-      auto it = string_ranges_.find(sol.id);
-      if (it != string_ranges_.end()) {
-        for (const auto &range : it->second) {
+      if (sol.id < string_ranges_.size()) {
+        auto &ranges = string_ranges_[sol.id];
+        for (const auto &range : ranges) {
           // If this offset is within a string range (but not at the end), replace null
-          if (sol.offset >= range.first && sol.offset < range.second) {
+          if (sol.offset >= range.start && sol.offset < range.end) {
             // fprintf(stderr, "DEBUG generate_solution: replacing null at offset %u (in range [%u,%u))\n",
-            //         sol.offset, range.first, range.second);
+            //         sol.offset, range.start, range.end);
             sol.val = 'A';  // Replace null with 'A'
             break;
           }
@@ -2051,9 +2213,6 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
     uint32_t input = get_label_info(info->l1)->op2.i;
     uint32_t len = info->l2;  // number of bytes loaded
 
-    // Track string range for null-byte post-processing
-    string_ranges_[input].emplace_back(offset, offset + len);
-
     // Add dependencies for all bytes in the range
     for (uint32_t i = 0; i < len; i++) {
       deps.insert(std::make_pair(input, offset + i));
@@ -2064,6 +2223,11 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
     snprintf(name, sizeof(name), "str-%u-%u-%u", input, offset, len);
     z3::symbol symbol = context_.str_symbol(name);
     z3::expr str_var = context_.constant(symbol, context_.string_sort());
+
+    // Track string range for null-byte post-processing and linking constraints
+    if (input < string_ranges_.size()) {
+      string_ranges_[input].emplace(offset, offset + len, str_var);
+    }
 
     // Cache string info for this label
     string_info_cache_[label] = {input, offset, len};
@@ -2221,9 +2385,6 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
       uint32_t len = offsets.size();
       uint32_t start_offset = offsets[0];
 
-      // Track string range for null-byte post-processing
-      string_ranges_[input_id].emplace_back(start_offset, start_offset + len);
-
       // Add dependencies for all bytes
       for (uint32_t off : offsets) {
         deps.insert(std::make_pair(input_id, off));
@@ -2233,11 +2394,17 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
       char name[256];
       snprintf(name, sizeof(name), "str-%u-%u-%u", input_id, start_offset, len);
       z3::symbol symbol = context_.str_symbol(name);
+      z3::expr str_var = context_.constant(symbol, context_.string_sort());
+
+      // Track string range for null-byte post-processing and linking constraints
+      if (input_id < string_ranges_.size()) {
+        string_ranges_[input_id].emplace(start_offset, start_offset + len, str_var);
+      }
 
       // Cache string info for this label
       string_info_cache_[label] = {input_id, start_offset, len};
 
-      return context_.constant(symbol, context_.string_sort());
+      return str_var;
     }
 
     // Fall back to recursive concatenation if not consecutive
@@ -2285,19 +2452,23 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
     uint32_t offset = info->op1.i;
     uint32_t input = info->op2.i;
 
-    // Track string range for null-byte post-processing (single byte)
-    string_ranges_[input].emplace_back(offset, offset + 1);
     deps.insert(std::make_pair(input, offset));
 
     // Create a single-char symbolic string
     char name[256];
     snprintf(name, sizeof(name), "str-%u-%u-%u", input, offset, 1);
     z3::symbol symbol = context_.str_symbol(name);
+    z3::expr str_var = context_.constant(symbol, context_.string_sort());
+
+    // Track string range for null-byte post-processing and linking constraints
+    if (input < string_ranges_.size()) {
+      string_ranges_[input].emplace(offset, offset + 1, str_var);
+    }
 
     // Cache string info for this label
     string_info_cache_[label] = {input, offset, 1};
 
-    return context_.constant(symbol, context_.string_sort());
+    return str_var;
   }
 
   // Last resort: empty string
