@@ -34,11 +34,18 @@
 
 static char *obj_path;       /* Path to runtime libraries         */
 static char *taint_path;     /* Path to the taint pass            */
+static char *ucsan_path;     /* Path to the ucsan pass            */
 static char **cc_params;     /* Parameters passed to the real CC  */
 static u32 cc_par_cnt = 1;   /* Param count, including argv0      */
 static u8 is_cxx = 0;
 static u8 use_native_cxx = 0;
 static u8 use_native_zlib = 1; /* Use system zlib by default */
+static u8 use_ucsan = 0;
+static u8 use_z3_runtime = 0;
+static u8 use_fastgen = 0;
+static u8 use_thoroupy = 0;
+static u8 use_ucsan_only = 0;
+static u8 use_symsan_only = 0;
 
 /* Try to find the executable from PATH */
 static char *find_executable_in_path(const char *filename) {
@@ -113,6 +120,10 @@ static void find_obj(const char *argv0) {
     } else {
       FATAL("Unable to find 'TaintPass.so' at %s", path);
     }
+    ucsan_path = alloc_printf("%s/../lib/symsan/UCSanPass.so", dir);
+    if (access(ucsan_path, R_OK)) {
+      FATAL("Unable to find 'UCSanPass.so' at %s", path);
+    }
 
     ck_free(dir);
   }
@@ -124,19 +135,29 @@ static void check_type(char *name) {
   }
 }
 
-static u8 check_if_assembler(u32 argc, char **argv) {
-  /* Check if a file with an assembler extension ("s" or "S") appears in argv */
+static u8 should_skip_instrumentation(u32 argc, char **argv) {
+  /*
+   * Skip instrumentation if (1) doing assembler:
+   * a file with an assembler extension ("s" or "S") appears in argv
+   * or (2) no source file is present (linking only)
+   */
 
+  u8 has_source_file = 0;
   while (--argc) {
     const char *cur = *(++argv);
 
     const char *ext = strrchr(cur, '.');
-    if (ext && (!strcmp(ext + 1, "s") || !strcmp(ext + 1, "S"))) {
-      return 1;
+    if (ext) {
+      if (!strcmp(ext + 1, "s") || !strcmp(ext + 1, "S")) {
+        return 1;
+      } else if (!strcmp(ext + 1, "c") || !strcmp(ext + 1, "cc") ||
+                 !strcmp(ext + 1, "cpp") || !strcmp(ext + 1, "cxx")) {
+        has_source_file = 1;
+      }
     }
   }
 
-  return 0;
+  return has_source_file ? 0 : 1;
 }
 
 static void add_runtime() {
@@ -144,8 +165,27 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = alloc_printf("-L%s", getenv("KO_LIBRARY_PATH"));
   }
 
+  // Select runtime library based on environment variables:
+  // - KO_USE_UCSAN_ONLY: standalone UCSan (under-constrained execution only)
+  // - KO_USE_SYMSAN_ONLY: standalone SymSan (symbolic execution only)
+  // - has METADATA and !KO_USE_UCSAN_ONLY: combined UCSan+SymSan
+  // - Default: standalone SymSan
+
+  u8 use_both = use_ucsan && !use_ucsan_only;
+
+  const char *runtime_lib;
+  if (use_ucsan_only) {
+    runtime_lib = "libucsan_rt-x86_64.a";
+  } else if (use_symsan_only) {
+    runtime_lib = "libsymsan_rt-x86_64.a";
+  } else if (use_both) {
+    runtime_lib = "libdfsan_rt-x86_64.a";
+  } else {
+    runtime_lib = "libsymsan_rt-x86_64.a";
+  }
+
   cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
-  cc_params[cc_par_cnt++] = alloc_printf("%s/libdfsan_rt-x86_64.a", obj_path);
+  cc_params[cc_par_cnt++] = alloc_printf("%s/%s", obj_path, runtime_lib);
   cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
   cc_params[cc_par_cnt++] =
       alloc_printf("-Wl,--dynamic-list=%s/libdfsan_rt-x86_64.a.syms", obj_path);
@@ -175,24 +215,25 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = "-lz";
   }
 
-  if (getenv("KO_USE_Z3")) {
-    cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
-    cc_params[cc_par_cnt++] = alloc_printf("%s/libZ3Solver.a", obj_path);
-    cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
-    cc_params[cc_par_cnt++] = "-L/usr/local/lib";
-    cc_params[cc_par_cnt++] = "-lz3";
-    cc_params[cc_par_cnt++] = "-Wl,-rpath,/usr/local/lib";
-  }
-
-  if (getenv("KO_USE_FASTGEN")) {
+  if (use_fastgen) {
     cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
     cc_params[cc_par_cnt++] = alloc_printf("%s/libFastgen.a", obj_path);
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
+  } else if (use_thoroupy) {
+    cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libThoroupy.a", obj_path);
+    cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
+  } else if (use_z3_runtime) {
+    cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libZ3Solver.a", obj_path);
+    cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
+    cc_params[cc_par_cnt++] = "-L/usr/local/lib"; // prefer local
+    cc_params[cc_par_cnt++] = "-lz3";
+    cc_params[cc_par_cnt++] = "-Wl,-rpath,/usr/local/lib";
   }
 }
 
 static void add_taint_pass() {
-  cc_params[cc_par_cnt++] = "-fexperimental-new-pass-manager";
   cc_params[cc_par_cnt++] = alloc_printf("-fplugin=%s", taint_path); // to enable options
   cc_params[cc_par_cnt++] = alloc_printf("-fpass-plugin=%s", taint_path);
   cc_params[cc_par_cnt++] = "-mllvm";
@@ -227,10 +268,18 @@ static void add_taint_pass() {
   }
 }
 
+static void add_ucsan_pass() {
+  cc_params[cc_par_cnt++] = alloc_printf("-fplugin=%s", ucsan_path); // to enable options
+  cc_params[cc_par_cnt++] = alloc_printf("-fpass-plugin=%s", ucsan_path);
+  cc_params[cc_par_cnt++] = "-mllvm";
+  cc_params[cc_par_cnt++] =
+      alloc_printf("-ucsan-abilist=%s/ucsan_abilist.txt", obj_path);
+}
+
 static void edit_params(u32 argc, char **argv) {
 
   u8 fortify_set = 0, asan_set = 0, x_set = 0, maybe_linking = 1, bit_mode = 0;
-  u8 maybe_assembler = 0;
+  u8 skip_instrumentation = 0;
   char *name;
 
   cc_params = ck_alloc((argc + 128) * sizeof(char *));
@@ -250,11 +299,7 @@ static void edit_params(u32 argc, char **argv) {
     cc_params[0] = alt_cc ? alt_cc : "clang";
   }
 
-  maybe_assembler = check_if_assembler(argc, argv);
-
-  use_native_cxx = getenv("KO_USE_NATIVE_LIBCXX") ? 1 : 0;
-
-  use_native_zlib = getenv("KO_NO_NATIVE_ZLIB") ? 0 : 1;
+  skip_instrumentation = should_skip_instrumentation(argc, argv);
 
   /* Detect stray -v calls from ./configure scripts. */
   if (argc == 1 && !strcmp(argv[1], "-v"))
@@ -328,8 +373,40 @@ static void edit_params(u32 argc, char **argv) {
     return;
   }
 
-  if (!maybe_assembler) {
-    add_taint_pass();
+  use_native_cxx = getenv("KO_USE_NATIVE_LIBCXX") ? 1 : 0;
+
+  use_native_zlib = getenv("KO_NO_NATIVE_ZLIB") ? 0 : 1;
+
+  use_ucsan = getenv("METADATA") ? 1 : 0;
+
+  use_ucsan_only = getenv("KO_USE_UCSAN_ONLY") ? 1 : 0;
+  use_symsan_only = getenv("KO_USE_SYMSAN_ONLY") ? 1 : 0;
+
+  use_z3_runtime = getenv("KO_USE_Z3") ? 1 : 0;
+  use_fastgen = getenv("KO_USE_FASTGEN") ? 1 : 0;
+  use_thoroupy = getenv("KO_USE_THOROUPY") ? 1 : 0;
+
+  // sanity checks
+  if (use_ucsan_only && !use_ucsan) {
+    FATAL("KO_USE_UCSAN_ONLY requires METADATA to be set");
+  }
+  if (use_ucsan_only && use_symsan_only) {
+    FATAL("KO_USE_UCSAN_ONLY and KO_USE_SYMSAN_ONLY cannot be set together");
+  }
+  if (use_symsan_only && use_ucsan) {
+    FATAL("KO_USE_SYMSAN_ONLY cannot be set together with METADATA");
+  }
+
+  if (!skip_instrumentation) {
+    cc_params[cc_par_cnt++] = "-fexperimental-new-pass-manager";
+    // add UCSanPass first, if specified
+    if (use_ucsan) {
+      add_ucsan_pass();
+    }
+    // Then add TaintPass
+    if (!use_ucsan_only) {
+      add_taint_pass();
+    }
   }
 
   cc_params[cc_par_cnt++] = "-pie";
@@ -373,6 +450,22 @@ static void edit_params(u32 argc, char **argv) {
   }
 
   if (maybe_linking) {
+
+    // sanity checks
+    if (use_ucsan) {
+      if (use_z3_runtime) {
+        FATAL("KO_USE_Z3 cannot be set together with METADATA");
+      } else if (use_fastgen) {
+        FATAL("KO_USE_FASTGEN cannot be set together with METADATA");
+      }
+    } else if (use_thoroupy) {
+      FATAL("Thoroupy runtime requires METADATA to be set");
+    }
+
+    if (use_z3_runtime + use_fastgen + use_thoroupy > 1) {
+      FATAL("Multiple symbolic execution runtimes selected: z3=%d, fastgen=%d, thoroupy=%d",
+            use_z3_runtime, use_fastgen, use_thoroupy);
+    }
 
     if (x_set) {
       cc_params[cc_par_cnt++] = "-x";
