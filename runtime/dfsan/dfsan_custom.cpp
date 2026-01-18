@@ -256,7 +256,7 @@ static inline dfsan_label get_str_label(const char *s, dfsan_label s_label) {
 static inline dfsan_label get_label_for(int fd, off_t offset) {
   // check if fd is stdin, if so, the label hasn't been pre-allocated
   if (is_stdin_taint() || (fd ==0 && flags().force_stdin))
-    return dfsan_create_label(current_stdin_offset++);
+    return dfsan_create_label((uint64_t)fd, (uint64_t)(current_stdin_offset++), 1);
   // if fd is a tainted file, the label should have been pre-allocated
   else return (offset + CONST_OFFSET);
 }
@@ -883,6 +883,9 @@ __dfsw_strlen(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
   return ret;
 }
 
+// When USE_UCSAN_CUSTOM is defined, ucsan_custom.cpp provides these functions
+// which handle both UCSan and SymSan shadow memory via the bridge.
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_memcpy(void *dest, const void *src, size_t n,
                     dfsan_label dest_label, dfsan_label src_label,
@@ -928,6 +931,7 @@ void *__dfsw_memset(void *s, int c, size_t n,
   *ret_label = s_label;
   return s;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_tolower(int c, dfsan_label c_label, dfsan_label *ret_label) {
@@ -2177,7 +2181,8 @@ SANITIZER_INTERFACE_ATTRIBUTE ssize_t __dfsw_recv(
     if (offset >= 0) {
       AOUT("recv: fd = %d, offset = %ld, ret = %ld\n", sockfd, offset, ret);
       for (ssize_t i = 0; i < ret; i++) {
-        dfsan_set_label(dfsan_create_label(offset + i), (char *)buf + i, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)sockfd, (uint64_t)(offset + i), 1);
+        dfsan_set_label(lbl, (char *)buf + i, 1);
       }
       taint_update_socket_offset(sockfd, ret);
     } else {
@@ -2209,7 +2214,8 @@ SANITIZER_INTERFACE_ATTRIBUTE ssize_t __dfsw_recvfrom(
     off_t offset = taint_get_socket(sockfd);
     if (offset >= 0) {
       for (ssize_t i = 0; i < ret; i++) {
-        dfsan_set_label(dfsan_create_label(offset + i), (char *)buf + i, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)sockfd, (uint64_t)(offset + i), 1);
+        dfsan_set_label(lbl, (char *)buf + i, 1);
       }
       taint_update_socket_offset(sockfd, ret);
     } else {
@@ -2239,7 +2245,8 @@ static void taint_handle_msg(int sockfd, struct msghdr *msg, size_t msg_len) {
         bytes_written < iov->iov_len ? bytes_written : iov->iov_len;
     if (offset >= 0) {
       for (size_t j = 0; j < iov_written; ++j) {
-        dfsan_set_label(dfsan_create_label(offset + j), (char *)iov->iov_base + j, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)sockfd, (uint64_t)(offset + j), 1);
+        dfsan_set_label(lbl, (char *)iov->iov_base + j, 1);
       }
       taint_update_socket_offset(sockfd, iov_written);
       offset += iov_written;
@@ -2722,7 +2729,8 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
       fwrite(ptr, size, nmemb, stream);
       // update taint
       for (size_t i = 0; i < size * nmemb; i++) {
-        dfsan_set_label(dfsan_create_label(offset + i), (char *)ptr + i, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)fd, (uint64_t)(offset + i), 1);
+        dfsan_set_label(lbl, (char *)ptr + i, 1);
       }
       return nmemb; // directly return
     }
@@ -2771,7 +2779,8 @@ __dfsw_fread_unlocked(
       fwrite(ptr, size, nmemb, stream);
       // update taint
       for (size_t i = 0; i < size * nmemb; i++) {
-        dfsan_set_label(dfsan_create_label(offset + i), (char *)ptr + i, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)fd, (uint64_t)(offset + i), 1);
+        dfsan_set_label(lbl, (char *)ptr + i, 1);
       }
       return nmemb; // directly return
     }
@@ -2992,6 +3001,7 @@ static inline void __taint_check_malloc_size(size_t size, dfsan_label size_label
   }
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE void *
 __dfsw_realloc(void *ptr, size_t new_size,
                dfsan_label ptr_label, dfsan_label new_size_label,
@@ -3445,6 +3455,7 @@ void __dfsw___libc_free(void *ptr, dfsan_label ptr_label) {
     free(ptr);
   }
 }
+#endif // USE_UCSAN_CUSTOM
 
 static dfsan_label taint_getc(int fd, off_t offset, int ret) {
   if (ret != EOF && taint_get_file(fd)) {

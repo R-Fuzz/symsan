@@ -1016,16 +1016,16 @@ dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label dfsan_create_label(off_t offset) {
+dfsan_label dfsan_create_label(uint64_t input_id, uint64_t offset, uint32_t size_in_bytes) {
   dfsan_label label =
     atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
   dfsan_check_label(label);
   internal_memset(&__dfsan_label_info[label], 0, sizeof(dfsan_label_info));
-  __dfsan_label_info[label].size = 8;
-  // label may not equal to offset when using stdin
+  __dfsan_label_info[label].size = 8 * size_in_bytes;
   __dfsan_label_info[label].op1.i = offset;
+  __dfsan_label_info[label].op2.i = input_id;
   // init a non-zero hash
-  __dfsan_label_info[label].hash = xxhash(offset, 0, 8);
+  __dfsan_label_info[label].hash = xxhash(offset, input_id, 8);
   return label;
 }
 
@@ -1330,7 +1330,7 @@ static void InitializeTaintFile() {
 
   if (tainted.fd != -1 && !tainted.is_stdin) {
     for (off_t i = 0; i < tainted.size; i++) {
-      dfsan_label label = dfsan_create_label(i);
+      dfsan_label label = dfsan_create_label(0, i, 1);
       dfsan_check_label(label);
     }
   }
@@ -1707,4 +1707,75 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_distance, uint64_t, uint64_t) {}
 SANITIZER_WEAK_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
+}  // extern "C"
+
+//===----------------------------------------------------------------------===//
+// SymSan Bridge - Strong Implementations
+//===----------------------------------------------------------------------===//
+// These strong definitions override the weak stubs in ucsan.cpp when linked.
+// They enable UCSan to propagate symbolic state to SymSan.
+
+extern "C" {
+
+// Create a SymSan label for input bytes
+// @param input_id: input source identifier (fd, socket, ucsan object, etc.)
+// @param offset: byte offset within the source
+// @param size_in_bytes: size of the input in bytes
+// Overrides weak stub in ucsan.cpp
+SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_create_label(uint32_t input_id, uint64_t offset, uint32_t size_in_bytes) {
+  return dfsan_create_label(input_id, offset, size_in_bytes);
+}
+
+// Set SymSan arg TLS entry
+// Overrides weak stub in ucsan.cpp
+SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_set_arg_tls(uint32_t index, dfsan_label label, uint32_t size_in_bits) {
+  if (index < kArgTlsSize / sizeof(dfsan_label)) {
+    // Truncate if size_in_bits is not byte-aligned
+    uint32_t size_in_bytes = (size_in_bits + 7) / 8;
+    if (size_in_bits < size_in_bytes * 8) {
+      label = __taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
+    }
+    __dfsan_arg_tls[index] = label;
+  }
+}
+
+// Set SymSan retval TLS entry
+// Overrides weak stub in ucsan.cpp
+SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_set_retval_tls(dfsan_label label, uint32_t size_in_bits) {
+  // Truncate if size_in_bits is not byte-aligned
+  uint32_t size_in_bytes = (size_in_bits + 7) / 8;
+  if (size_in_bits < size_in_bytes * 8) {
+    label = __taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
+  }
+  __dfsan_retval_tls[0] = label;
+}
+
+// Set SymSan shadow memory for a region
+// Overrides weak stub in ucsan.cpp
+SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_set_label(dfsan_label label, void *addr, uint64_t size) {
+  dfsan_set_label(label, addr, size);
+}
+
+// Copy SymSan shadow memory from src to dst
+// Overrides weak stub in ucsan.cpp
+SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_copy_shadow(void *dst, void *src, uint64_t size) {
+  dfsan_label *dst_shadow = shadow_for(dst);
+  dfsan_label *src_shadow = shadow_for(src);
+  internal_memcpy(dst_shadow, src_shadow, size * sizeof(dfsan_label));
+}
+
+// Move SymSan shadow memory from src to dst (handles overlapping regions)
+// Overrides weak stub in ucsan.cpp
+SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_move_shadow(void *dst, void *src, uint64_t size) {
+  dfsan_label *dst_shadow = shadow_for(dst);
+  dfsan_label *src_shadow = shadow_for(src);
+  internal_memmove(dst_shadow, src_shadow, size * sizeof(dfsan_label));
+}
+
 }  // extern "C"

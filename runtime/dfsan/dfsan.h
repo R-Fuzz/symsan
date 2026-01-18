@@ -87,7 +87,7 @@ dfsan_label dfsan_read_label(const void *addr, uptr size);
 void dfsan_store_label(dfsan_label l1, void *addr, uptr size);
 dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
                         uint64_t op1, uint64_t op2);
-dfsan_label dfsan_create_label(off_t offset);
+dfsan_label dfsan_create_label(uint64_t input_id, uint64_t offset, uint32_t size_in_bytes);
 dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
 
