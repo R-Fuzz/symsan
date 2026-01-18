@@ -1,0 +1,42 @@
+# UCSan ABI list - custom functions for under-constrained execution
+
+# Memory allocation functions (need to track shadow)
+fun:aligned_alloc=custom
+fun:calloc=custom
+fun:free=custom
+fun:malloc=custom
+fun:memalign=custom
+fun:posix_memalign=custom
+fun:pvalloc=custom
+fun:realloc=custom
+fun:reallocarray=custom
+fun:valloc=custom
+
+# libc internal versions
+fun:__libc_calloc=custom
+fun:__libc_free=custom
+fun:__libc_malloc=custom
+fun:__libc_memalign=custom
+fun:__libc_pvalloc=custom
+fun:__libc_realloc=custom
+fun:__libc_reallocarray=custom
+fun:__libc_valloc=custom
+
+# String and memory functions
+fun:memcpy=custom
+fun:memmove=custom
+fun:memset=custom
+
+# kernel
+fun:kmalloc_large=custom
+fun:__kmalloc=custom
+fun:kmalloc=custom
+fun:panic=custom
+fun:_copy_from_user=custom
+fun:printk=uninstrumented
+fun:printk=discard
+fun:_copy_to_user=uninstrumented
+fun:_copy_to_user=discard
+
+# buffer size
+fun:_copy_from_user=size3
