@@ -8,5 +8,14 @@ if(APPLE)
 endif(APPLE)
 
 include(AddLLVM)
+
+# Declare source files as optional to avoid LLVM CMake validation errors
+set(LLVM_OPTIONAL_SOURCES
+  TaintPass.cpp
+  UCSanPass.cpp
+)
+
 add_llvm_pass_plugin(TaintPass TaintPass.cpp)
-install (TARGETS TaintPass DESTINATION ${SYMSAN_LIB_DIR})
+add_llvm_pass_plugin(UCSanPass UCSanPass.cpp)
+
+install (TARGETS TaintPass UCSanPass DESTINATION ${SYMSAN_LIB_DIR})
