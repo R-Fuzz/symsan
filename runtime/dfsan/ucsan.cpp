@@ -39,6 +39,9 @@ void __taint_trace_event_addr(__ucsan::ucsan_label label, uint32_t event_id, uin
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_global_var(__ucsan::ucsan_label label, uint64_t size, void *gv);
 
+// Forward declaration for UCSan solver initialization (thoroupy backend)
+extern "C" void InitializeUCSanSolver();
+
 // Forward declarations for SymSan bridge functions (weak stubs, overridden when linked with SymSan)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_create_label(uint32_t object_id, uint64_t offset, uint32_t size_in_bytes);
@@ -203,6 +206,61 @@ char* ucsan_input::dump() {
 
   buf_size = length;
   return ret;
+}
+
+uint64_t ucsan_input::load(const char *buf, size_t file_size) {
+  // Parse deseralized objects from buffer:
+  // [object_cnt: uint64_t]
+  // [offset1: uint32_t, offset2: uint32_t, ...] (object_cnt entries)
+  // [size1: uint64_t, size2: uint64_t, ...] (object_cnt entries)
+  // [data1, data2, ...] (variable length)
+  // [metadata: obj_id + offset pairs] (optional)
+
+  uint64_t *header = (uint64_t *)buf;
+  uint64_t object_cnt = *header;
+  header++;
+
+  uint32_t *offsets = (uint32_t *)header;
+  uint64_t *sizes = (uint64_t *)(offsets + object_cnt);
+
+  const char *cursor = buf + sizeof(uint64_t) + // object_cnt
+                       sizeof(uint32_t) * object_cnt + // offset entries
+                       sizeof(uint64_t) * object_cnt; // size entries
+
+  // Initialize objects storage
+  if (!ucsan_tainted.objects) {
+    ucsan_tainted.objects = new ObjectStorage();
+  }
+  ucsan_tainted.objects->clear();
+
+  for (uint64_t i = 0; i < object_cnt; ++i) {
+    ucsan_tainted.objects->emplace_back(UCSanObject{
+      .offset = offsets[i],
+      .data = std::vector<unsigned char>(cursor, cursor + sizes[i]),
+      .origin = {0, 0}
+    });
+    cursor += sizes[i];
+  }
+
+  // Load metadata if present
+  if (cursor < buf + file_size) {
+    for (uint64_t i = 0; i < object_cnt && cursor + sizeof(uint64_t) * 2 <= buf + file_size; ++i) {
+      ucsan_tainted.objects->at(i).origin.obj_id = *(uint64_t *)cursor;
+      cursor += sizeof(uint64_t);
+      ucsan_tainted.objects->at(i).origin.offset = *(uint64_t *)cursor;
+      cursor += sizeof(uint64_t);
+    }
+  }
+
+  // Build object map for lookup
+  if (object_cnt > 1) {
+    ucsan_tainted.build_obj_map();
+  }
+
+  ucsan_tainted.buf = buf;
+  ucsan_tainted.buf_size = file_size;
+
+  return object_cnt;
 }
 
 void ucsan_input::build_obj_map() {
@@ -604,7 +662,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
     if (ucsan_flags().no_upcast && desired_offset < 0) {
       UCSAN_OUT("Upcast disallowed by no_upcast flag\n");
-      exit(exit_reason::CHECKER_OOB_UPCAST);
+      exit(exit_reason::EVENT_OOB_UPCAST);
     }
 
     // Fast path: within current bounds
@@ -726,7 +784,7 @@ void ucsan_check_ptr_arg(ucsan_label *label, uint32_t arg_index, void* ret_addr)
   if (label[0] == kUninitializedLabel) {
     // Trace use-before-initialization event
     __taint_trace_event_addr(label[0], EVENT_UBI, arg_index, ret_addr, 0);
-    exit(exit_reason::CHECKER_UBI);
+    exit(exit_reason::EVENT_UBI);
   }
 }
 
@@ -1214,6 +1272,9 @@ void ucsan_init() {
     ucsan_init_input(ucsan_flags_data.input_file);
   }
 
+  // Initialize UCSan solver (thoroupy backend)
+  InitializeUCSanSolver();
+
   // Register cleanup callback
   Atexit(ucsan_fini_internal);
   AddDieCallback(ucsan_fini_internal);
@@ -1245,54 +1306,7 @@ void ucsan_init_input(const char *filename) {
     return;
   }
 
-  // Parse file format (same as dfsan):
-  // [object_cnt: uint64_t]
-  // [offset1: uint32_t, offset2: uint32_t, ...] (object_cnt entries)
-  // [size1: uint64_t, size2: uint64_t, ...] (object_cnt entries)
-  // [data1, data2, ...] (variable length)
-  // [metadata: obj_id + offset pairs] (optional)
-
-  uint64_t *header = (uint64_t *)buf;
-  uint64_t object_cnt = *header;
-  header++;
-
-  uint32_t *offsets = (uint32_t *)header;
-  uint64_t *sizes = (uint64_t *)(offsets + object_cnt);
-
-  char *cursor = buf + sizeof(uint64_t) + sizeof(uint32_t) * object_cnt + sizeof(uint64_t) * object_cnt;
-
-  // Initialize objects storage
-  if (!ucsan_tainted.objects) {
-    ucsan_tainted.objects = new ObjectStorage();
-  }
-  ucsan_tainted.objects->clear();
-
-  for (uint64_t i = 0; i < object_cnt; ++i) {
-    ucsan_tainted.objects->emplace_back(UCSanObject{
-      .offset = offsets[i],
-      .data = std::vector<unsigned char>(cursor, cursor + sizes[i]),
-      .origin = {0, 0}
-    });
-    cursor += sizes[i];
-  }
-
-  // Load metadata if present
-  if (cursor < buf + file_size) {
-    for (uint64_t i = 0; i < object_cnt && cursor + sizeof(uint64_t) * 2 <= buf + file_size; ++i) {
-      ucsan_tainted.objects->at(i).origin.obj_id = *(uint64_t *)cursor;
-      cursor += sizeof(uint64_t);
-      ucsan_tainted.objects->at(i).origin.offset = *(uint64_t *)cursor;
-      cursor += sizeof(uint64_t);
-    }
-  }
-
-  // Build object map for lookup
-  if (object_cnt > 1) {
-    ucsan_tainted.build_obj_map();
-  }
-
-  ucsan_tainted.buf = buf;
-  ucsan_tainted.buf_size = file_size;
+  uint64_t object_cnt = ucsan_tainted.load(buf, file_size);
 
   UCSAN_OUT("Loaded %llu objects from %s\n", object_cnt, filename);
 }
@@ -1331,6 +1345,9 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_event_addr,
 // Weak definition for global variable tracing
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_global_var,
                              __ucsan::ucsan_label, uint64_t, void*) {}
+
+// Weak definition for UCSan solver initialization
+SANITIZER_INTERFACE_WEAK_DEF(void, InitializeUCSanSolver, void) {}
 
 //===----------------------------------------------------------------------===//
 // SymSan Bridge - Weak Stubs

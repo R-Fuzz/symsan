@@ -32,6 +32,8 @@ using __sanitizer::atomic_uint32_t;
 using __sanitizer::atomic_uint64_t;
 using __sanitizer::memory_order_relaxed;
 
+typedef uint32_t dfsan_label;
+
 //===----------------------------------------------------------------------===//
 // UCSan Configuration
 //===----------------------------------------------------------------------===//
@@ -169,9 +171,9 @@ struct ucsan_input {
   ucsan_label offset_label;     // label for offset (if symbolic)
   ucsan_label label;            // base label
   off_t size;                   // input size
-  uint8_t is_stdin;                  // is stdin input
-  uint8_t is_utmp;                   // is utmp input
-  char *buf;                    // mapped input buffer
+  uint8_t is_stdin;             // is stdin input
+  uint8_t is_utmp;              // is utmp input
+  const char *buf;              // mapped input buffer
   uptr buf_size;                // buffer size
 
   // Object management (same pattern as dfsan)
@@ -188,6 +190,9 @@ struct ucsan_input {
 
   // Serialize objects to buffer
   char* dump();
+
+  // Deserialize objects from buffer
+  uint64_t load(const char *buf, size_t file_size);
 
   // Build object map from objects
   void build_obj_map();

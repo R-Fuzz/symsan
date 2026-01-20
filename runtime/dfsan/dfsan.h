@@ -57,7 +57,8 @@ struct dfsan_label_info {
 #define CONST_OFFSET 1
 #define CONST_LABEL 0
 
-static const size_t uniontable_size = 0xc00000000; // FIXME
+static const size_t minimum_uniontable_size = 0x10000 * sizeof(dfsan_label_info); // 64K entries
+static size_t uniontable_size = 0xc00000000; // FIXME
 
 struct taint_file {
   char filename[PATH_MAX];
@@ -253,8 +254,14 @@ enum pipe_msg_type {
   cond_type = 0,
   gep_type = 1,
   memcmp_type = 2,
-  fsize_type = 3,
+  add_constraint_type = 3,
   memerr_type = 4,
+  // from thoroupy
+  exit_type,
+  loop_type,
+  bb_type,
+  event_type,
+  gv_type,
 };
 
 static const uint8_t TrueBranchLoopLatch = 0x8;

@@ -341,7 +341,11 @@ int main(int argc, char* const argv[]) {
         __z3_parser->record_memcmp(msg.label, mmsg->content, msg.result);
         free(mmsg);
         break;
-      case fsize_type:
+      case add_constraint_type:
+        if (__z3_parser->add_constraints(msg.label, msg.result) != 0) {
+          fprintf(stderr, "Failed to add constraint %d = %lu @%p\n",
+                  msg.label, msg.result, (void*)msg.addr);
+        }
         break;
       default:
         break;

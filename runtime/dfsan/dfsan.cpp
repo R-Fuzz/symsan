@@ -1564,7 +1564,7 @@ extern "C" dfsan_label taint_get_str_indexof_label(const void *addr) {
 }
 
 // information is passed implicitly through flags()
-extern "C" void InitializeSolver();
+extern "C" void InitializeSymSanSolver();
 
 static void InitializeFlags() {
   SetCommonFlagsDefaults();
@@ -1612,7 +1612,7 @@ static void dfsan_fini() {
   if (tainted.buf) {
     UnmapOrDie(tainted.buf, tainted.buf_size);
   }
-  if (flags().shm_fd != -1) {
+  if (flags().shm_fd != -1 || internal_strcmp(flags().shm_name, "") != 0) {
     internal_munmap((void *)UnionTableAddr(), uniontable_size);
   }
 }
@@ -1632,10 +1632,27 @@ static void dfsan_init(int argc, char **argv, char **envp) {
 
   // init union table
   __dfsan_label_info = (dfsan_label_info *)UnionTableAddr();
-if (flags().shm_fd != -1) {
+  if (flags().shm_size != 0) {
+    if (flags().shm_size > minimum_uniontable_size) {
+      uniontable_size = flags().shm_size;
+    } else {
+      Report("Warning: shm_size %zu is smaller than minimum %zu\n",
+             flags().shm_size, minimum_uniontable_size);
+      // use the default size
+    }
+  }
+  if (flags().shm_fd != -1) {
     AOUT("shm_fd %d\n", flags().shm_fd);
     ret = internal_mmap((void*)UnionTableAddr(), uniontable_size,
         PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, flags().shm_fd, 0);
+  } else if (internal_strcmp(flags().shm_name, "")  != 0) {
+    int shm = shm_open(flags().shm_name, O_RDWR, S_IRUSR | S_IWUSR);
+    if (shm == -1) {
+      Printf("FATAL: error creating shared union table\n");
+      Die();
+    }
+    ret = internal_mmap((void *)UnionTableAddr(), uniontable_size,
+        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, shm, 0);
   } else {
     ret = MmapFixedSuperNoReserve(UnionTableAddr(), uniontable_size);
   }
@@ -1672,7 +1689,7 @@ if (flags().shm_fd != -1) {
 
   InitializeStringMaps();
 
-  InitializeSolver();
+  InitializeSymSanSolver();
 
   // Register the fini callback to run when the program terminates successfully
   // or it is killed by the runtime.
@@ -1686,7 +1703,7 @@ static void (*dfsan_init_ptr)(int, char **, char **) = dfsan_init;
 #endif
 
 extern "C" {
-SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSolver, void) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanSolver, void) {}
 
 // Default empty implementations (weak) for hooks
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,

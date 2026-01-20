@@ -26,7 +26,7 @@ static z3::solver __z3_solver(__z3_context, "QF_BV");
 static symsan::Z3ParserSolver *__z3_parser = nullptr;
 
 // filter?
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
+extern SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 
 static std::unordered_set<dfsan_label> __solved_labels;
 typedef std::pair<uint32_t, void*> trace_context;
@@ -407,7 +407,7 @@ __taint_trace_memcmp(dfsan_label label) {
   __z3_parser->record_memcmp(label, content_ptr, info->size);
 }
 
-extern "C" void InitializeSolver() {
+extern "C" void InitializeSymSanSolver() {
   __output_dir = flags().output_dir;
   __instance_id = flags().instance_id;
   __session_id = flags().session_id;
