@@ -79,10 +79,10 @@ bool print_debug;
 static const int kArgTlsSize = 800;
 static const int kRetvalTlsSize = 800;
 
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint64_t
-    __dfsan_retval_tls[kRetvalTlsSize / sizeof(uint64_t)];
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint64_t
-    __dfsan_arg_tls[kArgTlsSize / sizeof(uint64_t)];
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL dfsan_label
+    __dfsan_retval_tls[kRetvalTlsSize / sizeof(dfsan_label)];
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL dfsan_label
+    __dfsan_arg_tls[kArgTlsSize / sizeof(dfsan_label)];
 
 SANITIZER_INTERFACE_ATTRIBUTE uptr __dfsan_shadow_ptr_mask;
 
@@ -1020,6 +1020,8 @@ dfsan_label dfsan_create_label(uint64_t input_id, uint64_t offset, uint32_t size
   dfsan_label label =
     atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
   dfsan_check_label(label);
+  AOUT("creating label %u: input %lu, offset %lu, size %u\n",
+       label, input_id, offset, size_in_bytes);
   internal_memset(&__dfsan_label_info[label], 0, sizeof(dfsan_label_info));
   __dfsan_label_info[label].size = 8 * size_in_bytes;
   __dfsan_label_info[label].op1.i = offset;
@@ -1754,6 +1756,7 @@ void __taint_set_arg_tls(uint32_t index, dfsan_label label, uint32_t size_in_bit
     if (size_in_bits < size_in_bytes * 8) {
       label = __taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
     }
+    AOUT("set arg tls[%u] = %u\n", index, label);
     __dfsan_arg_tls[index] = label;
   }
 }
