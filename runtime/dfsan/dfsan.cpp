@@ -185,6 +185,46 @@ static inline bool is_valid_op(uint16_t op) {
   return op >= __dfsan::Add && op < __dfsan::LastOp || op == __dfsan::Not;
 }
 
+static inline dfsan_label add_taint_info(dfsan_label_info *info) {
+  dfsan_label label =
+    atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
+  dfsan_check_label(label);
+
+  AOUT("%u = (%u, %u, %u, %u, %lu, %lu)\n", label, info->l1, info->l2,
+       info->op, info->size, info->op1.i, info->op2.i);
+
+  internal_memcpy(&__dfsan_label_info[label], info, sizeof(dfsan_label_info));
+  return label;
+}
+
+// for internal use only, skip optimization and ubsan checks
+// caller must ensure op is valid, handle commutative conventions
+static dfsan_label do_taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
+                                  uint16_t size, uint64_t op1, uint64_t op2) {
+  // dedup
+  uint32_t h1 = l1 ? __dfsan_label_info[l1].hash : 0;
+  uint32_t h2 = l2 ? __dfsan_label_info[l2].hash : 0;
+  uint32_t h3 = op;
+  h3 = (h3 << 16) | size;
+  uint32_t hash = xxhash(h1, h2, h3);
+
+  struct dfsan_label_info label_info = {
+    .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2}, .op = op, .size = size,
+    .hash = hash};
+
+  __taint::option res = __union_table.lookup(label_info);
+  if (res != __taint::none()) {
+    dfsan_label label = *res;
+    AOUT("%u found\n", label);
+    return label;
+  }
+
+  dfsan_label label = add_taint_info(&label_info);
+  __union_table.insert(&__dfsan_label_info[label], label);
+
+  return label;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid);
 
@@ -212,7 +252,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     // propagate if it's casting op
     if (op == __dfsan::BitCast) return l1;
     if (op == __dfsan::PtrToInt) {AOUT("WARNING: ptrtoint %d\n", l1); return 0;}
-    if ((op & 0xff) == __dfsan::ICmp) { return 0;} // ptr1 op ptr2
+    if ((op & 0xff) == __dfsan::ICmp) { return 0; } // ptr1 op ptr2
     if (op != __dfsan::Extract) {
       AOUT("WARNING: unsupported op %d over ptr1 %d ptr2 %d\n", op, l1, l2);
       return 0;
@@ -313,8 +353,8 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         // check for division by zero
         // -fsanitize=integer-divide-by-zero
         if (orig_op2 != 0) {
-          cond = __taint_union(l2, 0, (bveq << 8) | __dfsan::ICmp, size,
-                               orig_op2, 0);
+          cond = do_taint_union(l2, 0, (bveq << 8) | __dfsan::ICmp, size,
+                                orig_op2, 0);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_division_by_zero);
         }
         break;
@@ -324,30 +364,30 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         // -fsanitize=shift-exponent
         // check for too large value: exponent > size
         if (orig_op2 < size) {
-          cond = __taint_union(l2, 0, (bvuge << 8) | __dfsan::ICmp,
-                              op_size, orig_op2, size),
+          cond = do_taint_union(l2, 0, (bvuge << 8) | __dfsan::ICmp,
+                               op_size, orig_op2, size);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
         }
         if ((int64_t)orig_op2 >= 0) {
           // check for negative value
-          cond = __taint_union(l2, 0, (bvslt << 8) | __dfsan::ICmp,
-                               op_size, orig_op2, 0),
+          cond = do_taint_union(l2, 0, (bvslt << 8) | __dfsan::ICmp,
+                                op_size, orig_op2, 0);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
         }
         if (op == __dfsan::Shl && orig_op1 != 0 &&
             orig_op2 <= __builtin_clzl(orig_op1) - (64 - size)) {
           // check for shift overflow
           // op2 > leading zero bits in op1
-          cond = __taint_union(l2, 0, (bvugt << 8) | __dfsan::ICmp, op_size,
-                               orig_op2, __builtin_clzl(orig_op1) - (64 - size));
+          cond = do_taint_union(l2, 0, (bvugt << 8) | __dfsan::ICmp, op_size,
+                                orig_op2, __builtin_clzl(orig_op1) - (64 - size));
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_overflow);
         }
         if (l1 && (int64_t)orig_op1 >= 0) {
           // check for negative base
           // -fsanitize=shift-base
           // op1 < 0
-          cond = __taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
-                               get_label_info(l1)->size, orig_op1, 0);
+          cond = do_taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
+                                get_label_info(l1)->size, orig_op1, 0);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_base);
         }
         break;
@@ -356,14 +396,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     }
   }
 
-  dfsan_label label =
-    atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
-  dfsan_check_label(label);
-  assert(label > l1 && label > l2);
-
-  AOUT("%u = (%u, %u, %u, %u, %lu, %lu)\n", label, l1, l2, op, size, op1, op2);
-
-  internal_memcpy(&__dfsan_label_info[label], &label_info, sizeof(dfsan_label_info));
+  dfsan_label label = add_taint_info(&label_info);
   __union_table.insert(&__dfsan_label_info[label], label);
 
   if (flags().solve_ub) {
@@ -373,9 +406,9 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       // old_vale >= (1 << new_size)
       if (orig_op1 < (1UL << size)) {
         // if current value does not have loss
-        dfsan_label loss = __taint_union(l1, 0, (bvuge << 8) | __dfsan::ICmp,
-                                        get_label_info(l1)->size, orig_op1,
-                                        1UL << size);
+        dfsan_label loss = do_taint_union(l1, 0, (bvuge << 8) | __dfsan::ICmp,
+                                          get_label_info(l1)->size, orig_op1,
+                                          1UL << size);
         __taint_trace_cond(loss, 0, UndefinedCheck, ub_unsigned_integer_truncation);
       }
       // -fsanitize=implicit-signed-integer-truncation
@@ -384,8 +417,8 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       if ((int64_t)orig_op1 >= target) {
         uint16_t old_size = get_label_info(l1)->size;
         if (old_size < 64) target &= ~(1UL << old_size);
-        dfsan_label loss = __taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
-                                        old_size, orig_op1, target);
+        dfsan_label loss = do_taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
+                                          old_size, orig_op1, target);
         __taint_trace_cond(loss, 0, UndefinedCheck, ub_signed_integer_truncation);
       }
 
@@ -402,12 +435,12 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           // Currently no sign change, check if it can happen
           // Sign changes when: sign_bit(l1) != sign_bit(label)
           // We check: (l1 < 0) XOR (label < 0)
-          dfsan_label src_neg = __taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
-                                              src_size, orig_op1, 0);
-          dfsan_label dst_neg = __taint_union(label, 0, (bvslt << 8) | __dfsan::ICmp,
-                                              size, orig_op1 & new_mask, 0);
-          dfsan_label sign_diff = __taint_union(src_neg, dst_neg, __dfsan::Xor, 1,
-                                                src_sign ? 1 : 0, dst_sign ? 1 : 0);
+          dfsan_label src_neg = do_taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
+                                               src_size, orig_op1, 0);
+          dfsan_label dst_neg = do_taint_union(label, 0, (bvslt << 8) | __dfsan::ICmp,
+                                               size, orig_op1 & new_mask, 0);
+          dfsan_label sign_diff = do_taint_union(src_neg, dst_neg, __dfsan::Xor, 1,
+                                                 src_sign ? 1 : 0, dst_sign ? 1 : 0);
           __taint_trace_cond(sign_diff, 0, UndefinedCheck, ub_integer_sign_change);
         }
       }
@@ -430,19 +463,19 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
 
       if (!has_signed_overflow) {
         // Build symbolic expression: ((l1 ^ label) & (l2 ^ label)) < 0
-        dfsan_label xor_l1 = __taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
-        dfsan_label xor_l2 = __taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
-        dfsan_label and_xors = __taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
-        dfsan_label cond = __taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
-                                         size, overflow_check, 0);
+        dfsan_label xor_l1 = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
+        dfsan_label xor_l2 = do_taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
+        dfsan_label and_xors = do_taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
+        dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
+                                          size, overflow_check, 0);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
       }
 
       // Unsigned overflow: result < op1 (for any non-zero op2)
       // When adding two unsigned numbers, overflow means result wrapped around
       if (result >= orig_op1 && orig_op2 != 0) {
-        dfsan_label cond = __taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
-                                         size, result, orig_op1);
+        dfsan_label cond = do_taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
+                                          size, result, orig_op1);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
       }
     } else if (op == __dfsan::Mul) {
@@ -465,11 +498,11 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       bool has_signed_overflow = (overflow_check & sign_bit) != 0;
 
       if (!has_signed_overflow && orig_op1 != 0 && orig_op2 != 0) {
-        dfsan_label xor_l1 = __taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
-        dfsan_label xor_l2 = __taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
-        dfsan_label and_xors = __taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
-        dfsan_label cond = __taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
-                                         size, overflow_check, 0);
+        dfsan_label xor_l1 = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
+        dfsan_label xor_l2 = do_taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
+        dfsan_label and_xors = do_taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
+        dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
+                                          size, overflow_check, 0);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
       }
 
@@ -478,8 +511,8 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         // No overflow currently, check if overflow can happen
         // Approximate: result < op1 || result < op2 when both > 1
         if (orig_op1 > 1 && orig_op2 > 1) {
-          dfsan_label cond = __taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
-                                           size, result, orig_op1);
+          dfsan_label cond = do_taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
+                                            size, result, orig_op1);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
         }
       }
@@ -503,24 +536,72 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
 
       if (!has_signed_overflow) {
         // Build symbolic expression: ((l1 ^ l2) & (l1 ^ label)) < 0
-        dfsan_label xor_l1l2 = __taint_union(l1, l2, __dfsan::Xor, size, orig_op1, orig_op2);
-        dfsan_label xor_l1r = __taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
-        dfsan_label and_xors = __taint_union(xor_l1l2, xor_l1r, __dfsan::And, size, xor_ab, xor_ar);
-        dfsan_label cond = __taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
-                                         size, overflow_check, 0);
+        dfsan_label xor_l1l2 = do_taint_union(l1, l2, __dfsan::Xor, size, orig_op1, orig_op2);
+        dfsan_label xor_l1r = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
+        dfsan_label and_xors = do_taint_union(xor_l1l2, xor_l1r, __dfsan::And, size, xor_ab, xor_ar);
+        dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
+                                          size, overflow_check, 0);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
       }
 
       // Unsigned underflow: result > op1 when op2 > 0
       // When subtracting, if a < b, result wraps around to large value (result > a)
       if (result <= orig_op1 && orig_op2 != 0) {
-        dfsan_label cond = __taint_union(label, l1, (bvugt << 8) | __dfsan::ICmp,
-                                         size, result, orig_op1);
+        dfsan_label cond = do_taint_union(label, l1, (bvugt << 8) | __dfsan::ICmp,
+                                          size, result, orig_op1);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
       }
     }
   }
   return label;
+}
+
+// If label is zero or kInitializingLabel, return it directly
+// If label is bounds (Alloca), return it directly
+// If label is a string op, create a new fstr_off label
+// If label is other symbolic label, create an Add label with offset
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_gep_offset(dfsan_label label, char* result, char* base) {
+  // check label
+  if (label == 0 || label == kInitializingLabel)
+    return label;
+
+  dfsan_label_info *info = get_label_info(label);
+
+  // concrete ptrs, op == Alloca, just propagate bounds info
+  if (info->op == __dfsan::Alloca) {
+    return label;
+  }
+
+  // symbolic ptrs, record the offset
+  int64_t offset = result - base;
+
+  // Check if base_label is or derives from a string op
+  dfsan_label str_op_label = taint_find_string_op_source(label);
+  if (str_op_label != 0) {
+    // string op - create fstr_off label: l1=str_op_label, op1=offset
+    // This represents the content at (string_op_position + offset)
+    dfsan_label off_label = do_taint_union(str_op_label, 0, __dfsan::fstr_off,
+                                           sizeof(void*) * 8,
+                                           0, (uint64_t)offset);
+    AOUT("str: label=%u, str_op=%u, offset=%ld, result=%u\n",
+         label, str_op_label, offset, off_label);
+
+    // record the label (fstr_off is an indexOf-type op)
+    taint_set_str_indexof_label(result, off_label);
+
+    return off_label;
+  } else if (offset == 0) {
+    // no offset, return original label
+    return label;
+  }
+
+  if (info->size != sizeof(base) * 8) {
+    AOUT("WARNING: unexpected size %u for label %u\n", info->size, label);
+    return label;
+  }
+
+  return do_taint_union(0, label, __dfsan::Add, info->size, (uint64_t)offset, 0);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -573,7 +654,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
     if (n == 1) return label0;
 
     AOUT("shape: label0: %d %lu\n", label0, n);
-    return __taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0);
+    return do_taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0);
   }
 
   // fast path 2: all labels are extracted from a n-size label,
@@ -607,18 +688,18 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
     if (!is_constant_label(next_label)) {
       if (next_size <= (n - i) * 8) {
         i += next_size / 8;
-        label = __taint_union(label, next_label, Concat, i * 8, 0, 0);
+        label = do_taint_union(label, next_label, Concat, i * 8, 0, 0);
       } else {
         Report("WARNING: partial loading expected=%lu has=%d\n", n-i, next_size);
         uptr size = n - i;
-        dfsan_label trunc = __taint_union(next_label, CONST_LABEL, Trunc, size * 8, 0, 0);
-        return __taint_union(label, trunc, Concat, n * 8, 0, 0);
+        dfsan_label trunc = do_taint_union(next_label, CONST_LABEL, Trunc, size * 8, 0, 0);
+        return do_taint_union(label, trunc, Concat, n * 8, 0, 0);
       }
     } else {
       Report("WARNING: taint mixed with concrete %lu\n", i);
       char *c = (char *)app_for(&ls[i]);
       ++i;
-      label = __taint_union(label, 0, Concat, i * 8, 0, *c);
+      label = do_taint_union(label, 0, Concat, i * 8, 0, *c);
     }
   }
   AOUT("\n");
@@ -676,7 +757,7 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
 
   // default fall through
   for (uptr i = 0; i < n; ++i) {
-    ls[i] = __taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8);
+    ls[i] = do_taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8);
   }
 }
 
@@ -838,15 +919,15 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
     // array with known size
     //
     // check underflow, index < 0
-    dfsan_label lb = __taint_union(index_label, 0, (bvslt << 8) | ICmp,
-                                   index_bits, index, 0);
+    dfsan_label lb = do_taint_union(index_label, 0, (bvslt << 8) | ICmp,
+                                    index_bits, index, 0);
     // assume the result is false, as bounds check should happen before solving
     // no flag, no nested
     __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
 
     // check overflow, index >= num_elems
-    dfsan_label ub = __taint_union(index_label, 0, (bvsge << 8) | ICmp,
-                                   index_bits, index, num_elems);
+    dfsan_label ub = do_taint_union(index_label, 0, (bvsge << 8) | ICmp,
+                                    index_bits, index, num_elems);
     __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
   } else {
     // array with unknown size
@@ -854,46 +935,46 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
     if (bounds_info->op == __dfsan::Alloca) {
       // bounds information is available, check if allocation size is symbolic
       if (index_bits < 64) // extends index to 64 bits
-        index_label = __taint_union(index_label, 0, ZExt, 64, index, 0);
+        index_label = do_taint_union(index_label, 0, ZExt, 64, index, 0);
       if (bounds_info->l2 == 0) {
         // concrete allocation size, check bounds
         // check underflow, index * elem_size + current_offset + ptr < lower_bound
         // => index < (lower_bound - current_offset - ptr) / elem_size
         uint64_t lower_bound =
             (bounds_info->op1.i - current_offset - ptr) / elem_size;
-        dfsan_label lb = __taint_union(index_label, 0, (bvult << 8) | ICmp,
-                                       64, index, lower_bound);
+        dfsan_label lb = do_taint_union(index_label, 0, (bvult << 8) | ICmp,
+                                        64, index, lower_bound);
         __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
 
         // check overflow, (index + 1) * elem_size + current_offset + ptr > upper_bound
         // => index > (upper_bound - current_offset - ptr) / elem_size - 1
         uint64_t upper_bound =
             (bounds_info->op2.i - current_offset - ptr) / elem_size - 1;
-        dfsan_label ub = __taint_union(index_label, 0, (bvugt << 8) | ICmp,
-                                       64, index, upper_bound);
+        dfsan_label ub = do_taint_union(index_label, 0, (bvugt << 8) | ICmp,
+                                        64, index, upper_bound);
         __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
       } else {
         // index * elem_size + current_offset + (ptr - lower_bound) > array_size * alloc_elem_size
         dfsan_label size_label = elem_size == 1 ? index_label :
-            __taint_union(index_label, 0, Mul, 64, index, elem_size);
+            do_taint_union(index_label, 0, Mul, 64, index, elem_size);
         uint64_t size = index * elem_size;
         uint64_t offset = current_offset + ptr - bounds_info->op1.i;
         size_label = offset == 0 ? size :
-            __taint_union(size_label, 0, Add, 64, size, offset);
+            do_taint_union(size_label, 0, Add, 64, size, offset);
         size += offset;
         uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
         dfsan_label overflow =
-            __taint_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
-                          64, size, alloc_size);
+            do_taint_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
+                           64, size, alloc_size);
         __taint_trace_cond(overflow, 0, UndefinedCheck, ub_integer_to_buffer_overflow);
       }
     } else {
       // symbolic pointer but no bounds info?
       AOUT("WARNING: symbolic pointer %p = %u with no bounds info @%p\n",
            (void*)ptr, ptr_label, addr);
-      // check if null is possible?
-      dfsan_label null = __taint_union(ptr_label, 0, bveq, 64, ptr, 0);
-      __taint_trace_cond(null, 0, UndefinedCheck, ub_null_pointer);
+      // FIXME: check if null is possible?
+      // dfsan_label null = do_taint_union(ptr_label, 0, bveq, 64, ptr, 0);
+      // __taint_trace_cond(null, 0, UndefinedCheck, ub_null_pointer);
     }
   }
 }
@@ -934,7 +1015,7 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
     if (bounds_info->op == __dfsan::Alloca) {
       // bounds information is available
       if (size_bits < 64) // extend size to 64 bits
-        size_label = __taint_union(size_label, 0, ZExt, 64, size, 0);
+        size_label = do_taint_union(size_label, 0, ZExt, 64, size, 0);
 
       if (bounds_info->l2 == 0) {
         // concrete allocation size
@@ -942,15 +1023,15 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
         // => size < lower_bound - ptr (when lower_bound > ptr, but this shouldn't happen in valid code)
         // or equivalently, check that ptr < lower_bound (shouldn't happen)
         uint64_t min_size = bounds_info->op1.i - ptr;
-        dfsan_label underflow = __taint_union(size_label, 0, (bvult << 8) | ICmp,
-                                              64, size, min_size);
+        dfsan_label underflow = do_taint_union(size_label, 0, (bvult << 8) | ICmp,
+                                               64, size, min_size);
         __taint_trace_cond(underflow, 0, UndefinedCheck, ub_size_underflow);
 
         // check overflow: ptr + size > upper_bound
         // => size > upper_bound - ptr
         uint64_t max_size = bounds_info->op2.i - ptr;
-        dfsan_label overflow = __taint_union(size_label, 0, (bvugt << 8) | ICmp,
-                                             64, size, max_size);
+        dfsan_label overflow = do_taint_union(size_label, 0, (bvugt << 8) | ICmp,
+                                              64, size, max_size);
         __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_overflow);
       } else {
         // symbolic allocation size
@@ -958,20 +1039,20 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
         uint64_t offset = ptr - bounds_info->op1.i;
         uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
         dfsan_label adjusted_size = offset == 0 ? size_label :
-            __taint_union(size_label, 0, Add, 64, size, offset);
+            do_taint_union(size_label, 0, Add, 64, size, offset);
         uint64_t actual_size = size + offset;
-        dfsan_label overflow = __taint_union(adjusted_size, bounds_info->l2,
-                                             (bvugt << 8) | ICmp, 64,
-                                             actual_size, alloc_size);
+        dfsan_label overflow = do_taint_union(adjusted_size, bounds_info->l2,
+                                              (bvugt << 8) | ICmp, 64,
+                                              actual_size, alloc_size);
         __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_to_buffer_overflow);
       }
     } else if (ptr_label != 0) {
       // symbolic pointer but no bounds info
       AOUT("WARNING: symbolic pointer %p = %u with no bounds info @%p\n",
            (void*)ptr, ptr_label, addr);
-      // check if null is possible
-      dfsan_label null = __taint_union(ptr_label, 0, bveq, 64, ptr, 0);
-      __taint_trace_cond(null, 0, UndefinedCheck, ub_null_pointer);
+      // FIXME: check if null is possible
+      // dfsan_label null = do_taint_union(ptr_label, 0, bveq, 64, ptr, 0);
+      // __taint_trace_cond(null, 0, UndefinedCheck, ub_null_pointer);
     }
   }
 }
@@ -1058,8 +1139,7 @@ void dfsan_set_label(dfsan_label label, void *addr, uptr size) {
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void dfsan_add_label(dfsan_label label, uint8_t op, void *addr, uptr size) {
-  for (dfsan_label *labelp = shadow_for(addr); size != 0; --size, ++labelp)
-    *labelp = __taint_union(*labelp, label, op, 1, 0, 0);
+  return; // not used, do nothing
 }
 
 // Unlike the other dfsan interface functions the behavior of this function
@@ -1565,6 +1645,66 @@ extern "C" dfsan_label taint_get_str_indexof_label(const void *addr) {
   return 0;
 }
 
+// Helper: Find if a label derives from a string op (fstrchr, fstrrchr, fstrstr)
+// by walking through PtrToInt, Sub, Add operations.
+// Returns the string op label if found, 0 otherwise.
+extern "C" dfsan_label taint_find_string_op_source(dfsan_label label) {
+  if (label < CONST_OFFSET) return 0;
+
+  dfsan_label_info *info = dfsan_get_label_info(label);
+  uint16_t op = info->op;
+
+  // Check if this is directly a string op
+  if (is_string_op(op)) {
+    return label;
+  }
+
+  // Follow through PtrToInt, Sub, Add to find the source string op
+  if (op == __dfsan::PtrToInt || op == __dfsan::Sub || op == __dfsan::Add) {
+    // Recursively check l1 (the primary operand)
+    if (info->l1 >= CONST_OFFSET) {
+      dfsan_label result = taint_find_string_op_source(info->l1);
+      if (result != 0) return result;
+    }
+    // For Sub/Add, also check l2
+    if ((op == __dfsan::Sub || op == __dfsan::Add) && info->l2 >= CONST_OFFSET) {
+      dfsan_label result = taint_find_string_op_source(info->l2);
+      if (result != 0) return result;
+    }
+  }
+
+  return 0;
+}
+
+// Helper: Find the first (base) input byte label from a content label.
+// Walks through Concat chains and Load operations to find the starting input.
+// Returns the base label, or 0 if not found.
+extern "C" dfsan_label taint_get_base_input_label(dfsan_label label) {
+  if (label < CONST_OFFSET) return 0;
+
+  dfsan_label_info *info = dfsan_get_label_info(label);
+
+  // Base input label has op == 0
+  if (info->op == 0) return label;
+
+  // For Concat (op 72), walk left (l1) to find the base
+  if (info->op == __dfsan::Concat) {
+    return taint_get_base_input_label(info->l1);
+  }
+
+  // For Load (op 32), l1 is the starting label
+  if (info->op == __dfsan::Load) {
+    return info->l1;
+  }
+
+  // For other ops, try l1
+  if (info->l1 >= CONST_OFFSET) {
+    return taint_get_base_input_label(info->l1);
+  }
+
+  return 0;
+}
+
 // information is passed implicitly through flags()
 extern "C" void InitializeSymSanSolver();
 
@@ -1754,7 +1894,7 @@ void __taint_set_arg_tls(uint32_t index, dfsan_label label, uint32_t size_in_bit
     // Truncate if size_in_bits is not byte-aligned
     uint32_t size_in_bytes = (size_in_bits + 7) / 8;
     if (size_in_bits < size_in_bytes * 8) {
-      label = __taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
+      label = do_taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
     }
     AOUT("set arg tls[%u] = %u\n", index, label);
     __dfsan_arg_tls[index] = label;
@@ -1768,7 +1908,7 @@ void __taint_set_retval_tls(dfsan_label label, uint32_t size_in_bits) {
   // Truncate if size_in_bits is not byte-aligned
   uint32_t size_in_bytes = (size_in_bits + 7) / 8;
   if (size_in_bits < size_in_bytes * 8) {
-    label = __taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
+    label = do_taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
   }
   __dfsan_retval_tls[0] = label;
 }

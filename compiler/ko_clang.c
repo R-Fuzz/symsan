@@ -261,6 +261,11 @@ static void add_taint_pass() {
     cc_params[cc_par_cnt++] = "-taint-solve-ub=true";
   }
 
+  if (use_ucsan) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = "-taint-with-ucsan=true";
+  }
+
   if (is_cxx && use_native_cxx) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] =

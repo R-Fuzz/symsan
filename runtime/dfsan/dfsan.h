@@ -106,6 +106,8 @@ void taint_set_str_content_label(void *addr, dfsan_label label);
 dfsan_label taint_get_str_content_label(const void *addr);
 void taint_set_str_indexof_label(void *addr, dfsan_label label);
 dfsan_label taint_get_str_indexof_label(const void *addr);
+dfsan_label taint_find_string_op_source(dfsan_label label);
+dfsan_label taint_get_base_input_label(dfsan_label label);
 
 // taint source utmp
 off_t get_utmp_offset(void);
@@ -232,7 +234,7 @@ static inline uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predic
   return 0;
 }
 
-static inline bool is_commutative(unsigned char op) {
+static inline bool is_commutative(uint16_t op) {
   switch(op) {
     case Not:
     case And:
@@ -246,6 +248,22 @@ static inline bool is_commutative(unsigned char op) {
     default:
       return false;
   }
+}
+
+// Check if an op is a string operation (fstr_op_start to fstr_op_end)
+static inline bool is_string_op(uint16_t op) {
+  return op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end;
+}
+
+// Check if an op is an indexOf-type operation (returns position, not content)
+// These are: fstrchr, fstrrchr, fstrstr, fstrpbrk, fstr_off
+static inline bool is_indexof_op(uint16_t op) {
+  return op >= __dfsan::fstrchr && op <= __dfsan::fstr_off;
+}
+
+// Check if an op is a content-type string operation (fsubstr, fstrcat)
+static inline bool is_content_string_op(uint16_t op) {
+  return op == __dfsan::fsubstr || op == __dfsan::fstrcat;
 }
 
 // for out-of-process solving

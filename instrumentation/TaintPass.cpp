@@ -186,6 +186,12 @@ static cl::opt<bool> ClTraceAnnotatedBB(
     cl::desc("Only trace annotated basic blocks."),
     cl::Hidden, cl::init(false));
 
+// SYMSAN specific flags, if runs with UCSan
+static cl::opt<bool> ClWithUCSan(
+    "taint-with-ucsan",
+    cl::desc("Performs under-constrained symbolic execution."),
+    cl::Hidden, cl::init(false));
+
 static StringRef getGlobalTypeString(const GlobalValue &G) {
   // Types of GlobalVariables are always pointer types.
   Type *GType = G.getValueType();
@@ -387,6 +393,7 @@ class Taint {
   FunctionType *TaintUnionFnTy;
   FunctionType *TaintUnionLoadFnTy;
   FunctionType *TaintUnionStoreFnTy;
+  FunctionType *TaintGEPOffsetFnTy;
   FunctionType *TaintUnimplementedFnTy;
   FunctionType *TaintSetLabelFnTy;
   FunctionType *TaintNonzeroLabelFnTy;
@@ -398,7 +405,6 @@ class Taint {
   FunctionType *TaintTraceSelectFnTy;
   FunctionType *TaintTraceIndirectCallFnTy;
   FunctionType *TaintTraceGEPFnTy;
-  FunctionType *TaintTraceGEPPtrFnTy;
   FunctionType *TaintPushStackFrameFnTy;
   FunctionType *TaintPopStackFrameFnTy;
   FunctionType *TaintTraceAllocaFnTy;
@@ -408,9 +414,9 @@ class Taint {
   FunctionType *TaintTraceGlobalFnTy;
   FunctionType *TaintDebugFnTy;
   FunctionCallee TaintUnionFn;
-  FunctionCallee TaintCheckedUnionFn;
   FunctionCallee TaintUnionLoadFn;
   FunctionCallee TaintUnionStoreFn;
+  FunctionCallee TaintGEPOffsetFn;
   FunctionCallee TaintUnimplementedFn;
   FunctionCallee TaintSetLabelFn;
   FunctionCallee TaintNonzeroLabelFn;
@@ -422,7 +428,6 @@ class Taint {
   FunctionCallee TaintTraceSelectFn;
   FunctionCallee TaintTraceIndirectCallFn;
   FunctionCallee TaintTraceGEPFn;
-  FunctionCallee TaintTraceGEPPtrFn;
   FunctionCallee TaintPushStackFrameFn;
   FunctionCallee TaintPopStackFrameFn;
   FunctionCallee TaintTraceAllocaFn;
@@ -957,6 +962,9 @@ bool Taint::initializeModule(Module &M) {
       IntptrTy, Int64Ty };
   TaintUnionStoreFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintUnionStoreArgs, /*isVarArg=*/ false);
+  TaintGEPOffsetFnTy = FunctionType::get(
+      PrimitiveShadowTy,
+      { PrimitiveShadowTy, VoidPtrTy, VoidPtrTy }, /*isVarArg=*/ false);
   TaintUnimplementedFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), Type::getInt8PtrTy(*Ctx), /*isVarArg=*/false);
   Type *TaintSetLabelArgs[3] = { PrimitiveShadowTy, Type::getInt8PtrTy(*Ctx),
@@ -989,9 +997,6 @@ bool Taint::initializeModule(Module &M) {
       Int64Ty, Int64Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceGEPFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceGEPArgs, false);
-  // __taint_trace_gep_ptr(base_label, offset) -> new_label
-  TaintTraceGEPPtrFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), { PrimitiveShadowTy, VoidPtrTy, VoidPtrTy }, false);
   TaintPushStackFrameFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), {}, false);
   TaintPopStackFrameFnTy = FunctionType::get(
@@ -1174,15 +1179,6 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
-    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
-    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
-    TaintCheckedUnionFn =
-        Mod->getOrInsertFunction("taint_union", TaintUnionFnTy, AL);
-  }
-  {
-    AttributeList AL;
-    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
-    AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
     TaintUnionLoadFn =
         Mod->getOrInsertFunction("__taint_union_load", TaintUnionLoadFnTy, AL);
   }
@@ -1192,6 +1188,14 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     TaintUnionStoreFn =
         Mod->getOrInsertFunction("__taint_union_store", TaintUnionStoreFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    TaintGEPOffsetFn =
+        Mod->getOrInsertFunction("__taint_gep_offset", TaintGEPOffsetFnTy, AL);
   }
   {
     TaintUnimplementedFn =
@@ -1219,15 +1223,15 @@ void Taint::initializeRuntimeFunctions(Module &M) {
   TaintRuntimeFunctions.insert(
       TaintUnionFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
-      TaintCheckedUnionFn.getCallee()->stripPointerCasts());
-  TaintRuntimeFunctions.insert(
       TaintUnionLoadFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintUnionStoreFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
-      TaintSetLabelFn.getCallee()->stripPointerCasts());
+      TaintGEPOffsetFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintUnimplementedFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintSetLabelFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintNonzeroLabelFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -1300,13 +1304,6 @@ void Taint::initializeCallbackFunctions(Module &M) {
   {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
-    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
-    TaintTraceGEPPtrFn =
-        Mod->getOrInsertFunction("__taint_trace_gep_ptr", TaintTraceGEPPtrFnTy, AL);
-  }
-  {
-    AttributeList AL;
-    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     TaintPushStackFrameFn =
         Mod->getOrInsertFunction("__taint_push_stack_frame", TaintPushStackFrameFnTy, AL);
   }
@@ -1373,8 +1370,6 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintTraceIndirectCallFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintTraceGEPFn.getCallee()->stripPointerCasts());
-  TaintRuntimeFunctions.insert(
-      TaintTraceGEPPtrFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintPushStackFrameFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -2410,19 +2405,12 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
 
   IRBuilder<> IRB(I);
   Value *Base = I->getPointerOperand();
-  Value *Bounds = TT.getZeroShadow(Base);
-  if (ClTraceBound) {
-    // get bounds info for base pointer
-    if (auto *GV = dyn_cast<GlobalVariable>(Base->stripPointerCasts())) {
-      // if the base pointer is a global variable
-      // we can't get its shadow from the shadow map
-      Bounds = getShadowForGlobal(GV, IRB);
-    } else {
-      Bounds = getShadow(Base);
-      if (TT.isZeroShadow(Bounds)) {
-        // try striping the pointer cast
-        Bounds = getShadow(Base->stripPointerCasts());
-      }
+  Value *Shadow = getShadow(Base->stripPointerCasts());
+  if (auto *GV = dyn_cast<GlobalVariable>(Base->stripPointerCasts())) {
+    // if the base pointer is a global variable, and without ucsan,
+    // we can't get its shadow from the shadow map
+    if (!ClWithUCSan) {
+      Shadow = getShadowForGlobal(GV, IRB);
     }
   }
 
@@ -2464,8 +2452,8 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
         CurrentOffset += arrayIdx * ElemSize;
       } else if (Index->getType()->isIntegerTy()) { // FIXEME: handle vector type
         // non-constant index, check if it's tainted
-        Value *Shadow = getShadow(Index);
-        if (!TT.isZeroShadow(Shadow)) {
+        Value *IndexShadow = getShadow(Index);
+        if (!TT.isZeroShadow(IndexShadow)) {
           Index = IRB.CreateZExtOrTrunc(Index, TT.Int64Ty);
           ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, CurrentOffset);
           ConstantInt *NE = ConstantInt::get(TT.Int64Ty, NumElements);
@@ -2478,11 +2466,11 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
             // must be added before tracing GEP, otherwise index_label == index
             // will be added as nested constraint
             IRB.CreateCall(TT.TaintSolveBoundsFn,
-                           {Bounds, Ptr, Shadow, Index, NE, ES, Offset, CID});
+                           {Shadow, Ptr, IndexShadow, Index, NE, ES, Offset, CID});
           }
           if (ClTraceGEPOffset) {
             IRB.CreateCall(TT.TaintTraceGEPFn,
-                           {Bounds, Ptr, Shadow, Index, NE, ES, Offset, CID});
+                           {Shadow, Ptr, IndexShadow, Index, NE, ES, Offset, CID});
           }
         } else {
           break;
@@ -2491,21 +2479,19 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
     }
   }
 
-  if (ClTraceBound) {
-    // propagate bounds info
-    setShadow(I, Bounds);
+  // we need to check GEP for two reasons:
+  // 1. For constant offset GEPs on string op pointers, create fstr_off label
+  // to track the offset (e.g., sep + 1 where sep is from strchr)
+  // 2. For symbolic ptr (e.g., from UCSan), we need to trace the offset
+  if (!TT.isZeroShadow(Shadow)) {
+    IRBuilder<> IRB(I->getNextNode());
+    Shadow = IRB.CreateCall(TT.TaintGEPOffsetFn, {Shadow, I, Base});
   }
 
-  // For constant offset GEPs on string op pointers, create fstr_off label
-  // to track the offset (e.g., sep + 1 where sep is from strchr)
-  if (CurrentOffset != 0 && !TT.isZeroShadow(Bounds)) {
-    IRBuilder<> IRB(I->getNextNode());
-    Bounds = IRB.CreateCall(TT.TaintTraceGEPPtrFn, {Bounds, I, Base});
-  }
+  setShadow(I, Shadow);
 }
 
 void TaintVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
-  if (!ClTraceGEPOffset && !ClTraceBound) return;
   TF.visitGEPInst(&GEPI);
 }
 
