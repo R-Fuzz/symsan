@@ -230,6 +230,12 @@ public:
   using solution_t = std::vector<struct solution_val>;
   solving_status solve_task(uint64_t task_id, unsigned timeout, solution_t &solutions);
 
+  /// @brief Export task constraints to SMT2 format
+  /// @param task_id the task to export
+  /// @param fd file descriptor to write to
+  /// @return 0 on success, -1 on failure
+  int export_task_smt2(uint64_t task_id, int fd);
+
 private:
   void generate_solution(z3::model &m, solution_t &solutions);
 

@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 using namespace symsan;
 
 #define FILTER_WRONG_AST 1
@@ -2196,6 +2198,34 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
   }
 
   // fprintf(stderr, "DEBUG generate_solution: finished with %zu solutions\n", solutions.size());
+}
+
+int Z3ParserSolver::export_task_smt2(uint64_t task_id, int fd) {
+  // Use tasks_.find() to peek without removing
+  auto it = tasks_.find(task_id);
+  if (it == tasks_.end()) {
+    return -1;
+  }
+  auto task = it->second;
+
+  try {
+    // Create solver and add all constraints
+    z3::solver solver(context_);
+    for (const auto &expr : *task) {
+      solver.add(expr);
+    }
+
+    // Export as SMT2
+    std::string smt2 = solver.to_smt2();
+    ssize_t written = write(fd, smt2.c_str(), smt2.size());
+    if (written < 0 || (size_t)written != smt2.size()) {
+      return -1;
+    }
+    return 0;
+  } catch (z3::exception &e) {
+    fprintf(stderr, "WARNING: export_task_smt2[%lu]: %s\n", task_id, e.msg());
+    return -1;
+  }
 }
 
 // Build Z3 string from a content label (Load or Concat of bytes)
