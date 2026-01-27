@@ -34,20 +34,25 @@ using namespace __sanitizer;
 
 // Forward declarations for trace callbacks (implemented in solvers)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_trace_event_addr(__ucsan::ucsan_label label, uint32_t event_id, uint64_t info, void* addr, uint16_t flags);
+void __taint_trace_event_addr(__ucsan::ucsan_label label, uint32_t event_id,
+                              uint64_t info, void* addr, uint32_t info2);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_trace_global_var(__ucsan::ucsan_label label, uint64_t size, void *gv);
+void __taint_trace_global_var(__ucsan::ucsan_label label, uint64_t size,
+                              void *gv);
 
 // Forward declaration for UCSan solver initialization (thoroupy backend)
 extern "C" void InitializeUCSanSolver();
 
-// Forward declarations for SymSan bridge functions (weak stubs, overridden when linked with SymSan)
+// Forward declarations for SymSan bridge functions
+// (weak stubs, overridden when linked with SymSan)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_create_label(uint32_t object_id, uint64_t offset, uint32_t size_in_bytes);
+dfsan_label __taint_create_label(uint32_t object_id, uint64_t offset,
+                                 uint32_t size_in_bytes);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_set_arg_tls(uint32_t index, dfsan_label label, uint32_t size_in_bits);
+void __taint_set_arg_tls(uint32_t index, dfsan_label label,
+                         uint32_t size_in_bits);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_set_retval_tls(dfsan_label label, uint32_t size_in_bits);
@@ -335,6 +340,8 @@ UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr
   if (label) {
     ucsan_label_info *label_info = get_label_info(label);
     uint64_t object_id = 0;
+    uint64_t parent_obj_id = 0;
+    uint64_t offset_in_parent = 0;
 
     uint16_t op = label_info->common.op;
     if (op == OP_NONE) {
@@ -342,40 +349,36 @@ UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr
       ucsan_byte_info *byte = &label_info->byte;
       UCSAN_OUT("lookup_object: label=%u, op=BYTE, obj_id=%u, offset=%lld\n",
                 label, byte->object_id, byte->offset);
-      auto find_result = ucsan_tainted.obj_map->find(
-          {byte->object_id, (uint64_t)byte->offset});
-      if (find_result != ucsan_tainted.obj_map->end()) {
-        object_id = find_result->second;
-        UCSAN_OUT("  found object_id=%llu\n", object_id);
-      }
+      parent_obj_id = byte->object_id;
+      offset_in_parent = (uint64_t)byte->offset;
     } else if (op == OP_EXTERNAL) {
       // External pointer - look up by (parent_obj_id, offset)
       // This matches dfsan's {op2.i, op1.i} pattern
       ucsan_ptr_info *ptr = &label_info->ptr;
-      uint64_t parent_obj_id = ptr->obj_label;
-      uint64_t offset_in_parent = (uint64_t)ptr->pseudo_base;
+      parent_obj_id = ptr->obj_label;
+      offset_in_parent = (uint64_t)ptr->pseudo_base;
       UCSAN_OUT("lookup_object: label=%u, op=EXTERNAL, parent_obj=%llu, offset=%llu\n",
                 label, parent_obj_id, offset_in_parent);
       UCSAN_OUT("  obj_map size=%llu, searching for {%llu, %llu}\n",
                 (uint64_t)ucsan_tainted.obj_map->size(), parent_obj_id, offset_in_parent);
-      auto find_result = ucsan_tainted.obj_map->find({parent_obj_id, offset_in_parent});
-      if (find_result != ucsan_tainted.obj_map->end()) {
-        object_id = find_result->second;
-        UCSAN_OUT("  found object_id=%llu\n", object_id);
-      } else {
-        UCSAN_OUT("  NOT found in obj_map\n");
-      }
     } else if (op == OP_DUMMY) {
       // Dummy label for constant pointer - track with counter
       ucsan_ptr_info *ptr = &label_info->ptr;
-      uint64_t ptr_val = (uint64_t)ptr->pseudo_base;
-      uint64_t counter = -((*ucsan_tainted.const_ptr_counter)[ptr_val]++);
-      auto find_result = ucsan_tainted.obj_map->find({ptr_val, counter});
-      if (find_result != ucsan_tainted.obj_map->end()) {
-        object_id = find_result->second;
-      }
+      parent_obj_id = (uint64_t)ptr->pseudo_base;
+      offset_in_parent = -((*ucsan_tainted.const_ptr_counter)[parent_obj_id]++);
+      UCSAN_OUT("lookup_object: label=%u, op=DUMMY, ptr_val=%lu, counter=%lu\n",
+                label, parent_obj_id, offset_in_parent);
     } else {
-      UCSAN_OUT("lookup_object: label=%u, op=%u (unexpected)\n", label, op);
+      UCSAN_OUT("WARNING: unexpected op=%u label=%u\n", op, label);
+    }
+
+    auto find_result = ucsan_tainted.obj_map->find(
+        {parent_obj_id, offset_in_parent});
+    if (find_result != ucsan_tainted.obj_map->end()) {
+      object_id = find_result->second;
+      UCSAN_OUT("  found object_id=%llu\n", object_id);
+    } else {
+      UCSAN_OUT("  NOT found in obj_map\n");
     }
 
     bool created = false;
@@ -397,9 +400,25 @@ UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr
 
     // Trace lazy init event if enabled
     if (created && ucsan_flags().trace_object) {
-      __taint_trace_event_addr(label, EVENT_LAZY_INIT, object_id, return_addr, 0);
+      if (object_id >= UINT32_MAX) {
+        UCSAN_OUT("WARNING: UCSan: object_id too large for tracing: %lu\n", object_id);
+        goto out;
+      }
+      if (parent_obj_id >= UINT32_MAX) {
+        UCSAN_OUT("WARNING: UCSan: parent_obj_id too large for tracing: %lu\n", parent_obj_id);
+        goto out;
+      }
+      if (offset_in_parent > UCSAN_OBJECT_SIZE_LIMIT) {
+        UCSAN_OUT("WARNING: UCSan: offset_in_parent too large: %lu\n", offset_in_parent);
+        goto out;
+      }
+      // Pack object_id (lower 32 bits) and parent_obj_id (upper 32 bits) into uint64_t
+      uint64_t info = (parent_obj_id << 32) | (object_id & 0xFFFFFFFF);
+      __taint_trace_event_addr(label, EVENT_LAZY_INIT, info, return_addr,
+                               (uint32_t)offset_in_parent);
     }
 
+out:
     if (ret_object_id) *ret_object_id = object_id;
     return ucsan_tainted.objects->at(object_id);
   }
@@ -1340,7 +1359,8 @@ extern "C" {
 
 // Weak definition for event tracing
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_event_addr,
-                             __ucsan::ucsan_label, uint32_t, uint64_t, void*, uint16_t) {}
+                             __ucsan::ucsan_label, uint32_t, uint64_t, void*,
+                             uint32_t) {}
 
 // Weak definition for global variable tracing
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_global_var,

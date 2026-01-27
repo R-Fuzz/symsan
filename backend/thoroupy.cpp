@@ -181,7 +181,8 @@ __taint_trace_loop(uint32_t bid, int depth) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_event_addr(dfsan_label label, uint32_t event_id, uint64_t info, void* addr, uint16_t flags) {
+__taint_trace_event_addr(dfsan_label label, uint32_t event_id, uint64_t info,
+                         void* addr, uint32_t info2) {
   AOUT("event: %u %u %llu @%p\n", label, event_id, info, addr);
 
   if (__pipe_fd < 0)
@@ -189,10 +190,11 @@ __taint_trace_event_addr(dfsan_label label, uint32_t event_id, uint64_t info, vo
 
   pipe_msg msg = {
     .msg_type = event_type,
-    .flags = flags,
+    .flags = 0,
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = event_id,
+    .id = info2,
     .label = label,
     .result = info
   };
