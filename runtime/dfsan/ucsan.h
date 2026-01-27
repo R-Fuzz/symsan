@@ -140,8 +140,8 @@ inline ucsan_byte_info* to_byte_info(ucsan_label_info *info) {
 
 // Metadata about where an object originated
 struct ObjectOrigin {
-  uint64_t obj_id;   // parent object ID (0 = super object)
-  uint64_t offset;   // offset within parent object
+  uint32_t obj_id;   // parent object ID (0 = super object)
+  int32_t offset;    // offset within parent object
 };
 
 // An object tracked by UCSan
@@ -155,7 +155,7 @@ struct UCSanObject {
 typedef std::vector<UCSanObject> ObjectStorage;
 
 // Object map key type: (parent_obj_id, offset)
-typedef std::pair<uint64_t, uint64_t> ObjectMapKey;
+typedef std::pair<uint32_t, int32_t> ObjectMapKey;
 
 // Object map: maps (parent_obj_id, offset) -> object_id
 typedef std::map<ObjectMapKey, uint32_t> ObjectMap;
@@ -180,7 +180,7 @@ struct ucsan_input {
   // All pointers to avoid C++ constructor ordering issues
   ObjectStorage *objects;       // pointer - allocated dynamically
   ObjectMap *obj_map;           // pointer - allocated dynamically
-  std::map<uint64_t, uint32_t> *const_ptr_counter;  // pointer - allocated dynamically
+  std::map<uint32_t, int32_t> *const_ptr_counter;  // pointer - allocated dynamically
 
   // Super object offset tracking
   atomic_uint64_t arg_used;     // bytes used from super object

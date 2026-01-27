@@ -161,7 +161,7 @@ static void ucsan_init_input_struct() {
     ucsan_tainted.obj_map = new ObjectMap();
   }
   if (!ucsan_tainted.const_ptr_counter) {
-    ucsan_tainted.const_ptr_counter = new std::map<uint64_t, uint32_t>();
+    ucsan_tainted.const_ptr_counter = new std::map<uint32_t, int32_t>();
   }
   ucsan_tainted.arg_used.val_dont_use = 0;
 }
@@ -270,23 +270,23 @@ uint64_t ucsan_input::load(const char *buf, size_t file_size) {
 
 void ucsan_input::build_obj_map() {
   uint32_t object_id = 1;
-  UCSAN_OUT("build_obj_map: objects->size()=%llu\n", (uint64_t)objects->size());
+  UCSAN_OUT("build_obj_map: objects->size()=%lu\n", (uint64_t)objects->size());
 
   for (; object_id < objects->size(); ++object_id) {
     auto& object_meta = objects->at(object_id).origin;
-    UCSAN_OUT("  obj[%u]: from.obj_id=%llu, from.offset=%llu\n",
+    UCSAN_OUT("  obj[%u]: from.obj_id=%u, from.offset=%d\n",
               object_id, object_meta.obj_id, object_meta.offset);
     (*obj_map)[{object_meta.obj_id, object_meta.offset}] = object_id;
   }
 
   atomic_store(&__ucsan_inited_objects, object_id, memory_order_relaxed);
-  UCSAN_OUT("build_obj_map done: __ucsan_inited_objects=%u, obj_map->size()=%llu\n",
+  UCSAN_OUT("build_obj_map done: __ucsan_inited_objects=%u, obj_map->size()=%lu\n",
             object_id, (uint64_t)obj_map->size());
 
   // Debug: dump obj_map contents
   UCSAN_OUT("obj_map contents:\n");
   for (auto &entry : *obj_map) {
-    UCSAN_OUT("  {%llu, %llu} -> %u\n", entry.first.first, entry.first.second, entry.second);
+    UCSAN_OUT("  {%u, %d} -> %u\n", entry.first.first, entry.first.second, entry.second);
   }
 }
 
@@ -315,7 +315,7 @@ void check_label(ucsan_label label) {
 
 void* customized_malloc(uint64_t size) {
   if (size > UCSAN_OBJECT_SIZE_LIMIT) {
-    UCSAN_OUT("Object size too large: %llu\n", size);
+    UCSAN_OUT("Object size too large: %lu\n", size);
     exit(exit_reason::REASON_OBJ_OOB);
   }
   uint64_t gap = Max((uint64_t)UCSAN_SAFE_GAP, UCSAN_ROUNDUPGAP(size));
@@ -339,44 +339,62 @@ static inline bool is_writeable(void *p) {
 UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr, uint32_t *ret_object_id) {
   if (label) {
     ucsan_label_info *label_info = get_label_info(label);
-    uint64_t object_id = 0;
-    uint64_t parent_obj_id = 0;
-    uint64_t offset_in_parent = 0;
+    uint32_t object_id = 0;
+    // Use wider types for range checking before casting
+    uint64_t parent_obj_id_64 = 0;
+    int64_t offset_in_parent_64 = 0;
 
     uint16_t op = label_info->common.op;
     if (op == OP_NONE) {
       // Byte info - look up by (object_id, offset)
       ucsan_byte_info *byte = &label_info->byte;
-      UCSAN_OUT("lookup_object: label=%u, op=BYTE, obj_id=%u, offset=%lld\n",
+      UCSAN_OUT("lookup_object: label=%u, op=BYTE, obj_id=%u, offset=%ld\n",
                 label, byte->object_id, byte->offset);
-      parent_obj_id = byte->object_id;
-      offset_in_parent = (uint64_t)byte->offset;
+      parent_obj_id_64 = byte->object_id;
+      offset_in_parent_64 = byte->offset;
     } else if (op == OP_EXTERNAL) {
       // External pointer - look up by (parent_obj_id, offset)
       // This matches dfsan's {op2.i, op1.i} pattern
       ucsan_ptr_info *ptr = &label_info->ptr;
-      parent_obj_id = ptr->obj_label;
-      offset_in_parent = (uint64_t)ptr->pseudo_base;
-      UCSAN_OUT("lookup_object: label=%u, op=EXTERNAL, parent_obj=%llu, offset=%llu\n",
-                label, parent_obj_id, offset_in_parent);
-      UCSAN_OUT("  obj_map size=%llu, searching for {%llu, %llu}\n",
-                (uint64_t)ucsan_tainted.obj_map->size(), parent_obj_id, offset_in_parent);
+      parent_obj_id_64 = ptr->obj_label;
+      offset_in_parent_64 = (int64_t)(uint64_t)ptr->pseudo_base;
+      UCSAN_OUT("lookup_object: label=%u, op=EXTERNAL, parent_obj=%lu, offset=%ld\n",
+                label, parent_obj_id_64, offset_in_parent_64);
+      UCSAN_OUT("  obj_map size=%lu, searching for {%lu, %ld}\n",
+                (uint64_t)ucsan_tainted.obj_map->size(), parent_obj_id_64, offset_in_parent_64);
     } else if (op == OP_DUMMY) {
-      // Dummy label for constant pointer - track with counter
+      // Dummy label for constant pointer - track with negative counter
       ucsan_ptr_info *ptr = &label_info->ptr;
-      parent_obj_id = (uint64_t)ptr->pseudo_base;
-      offset_in_parent = -((*ucsan_tainted.const_ptr_counter)[parent_obj_id]++);
-      UCSAN_OUT("lookup_object: label=%u, op=DUMMY, ptr_val=%lu, counter=%lu\n",
-                label, parent_obj_id, offset_in_parent);
+      parent_obj_id_64 = (uint64_t)ptr->pseudo_base;
+      // Range check for parent_obj_id before using as map key
+      if (parent_obj_id_64 > UINT32_MAX) {
+        UCSAN_OUT("WARNING: UCSan: ptr value too large for tracking: %lu\n", parent_obj_id_64);
+        goto out_default;
+      }
+      offset_in_parent_64 = -((*ucsan_tainted.const_ptr_counter)[(uint32_t)parent_obj_id_64]++);
+      UCSAN_OUT("lookup_object: label=%u, op=DUMMY, ptr_val=%lu, counter=%ld\n",
+                label, parent_obj_id_64, offset_in_parent_64);
     } else {
       UCSAN_OUT("WARNING: unexpected op=%u label=%u\n", op, label);
     }
 
-    auto find_result = ucsan_tainted.obj_map->find(
-        {parent_obj_id, offset_in_parent});
+    // Range check before casting to narrower types for map key
+    if (parent_obj_id_64 > UINT32_MAX) {
+      UCSAN_OUT("WARNING: UCSan: parent_obj_id too large: %lu\n", parent_obj_id_64);
+      goto out_default;
+    }
+    if (offset_in_parent_64 > INT32_MAX || offset_in_parent_64 < INT32_MIN) {
+      UCSAN_OUT("WARNING: UCSan: offset_in_parent out of range: %ld\n", offset_in_parent_64);
+      goto out_default;
+    }
+
+    uint32_t parent_obj_id = (uint32_t)parent_obj_id_64;
+    int32_t offset_in_parent = (int32_t)offset_in_parent_64;
+
+    auto find_result = ucsan_tainted.obj_map->find({parent_obj_id, offset_in_parent});
     if (find_result != ucsan_tainted.obj_map->end()) {
       object_id = find_result->second;
-      UCSAN_OUT("  found object_id=%llu\n", object_id);
+      UCSAN_OUT("  found object_id=%u\n", object_id);
     } else {
       UCSAN_OUT("  NOT found in obj_map\n");
     }
@@ -400,28 +418,17 @@ UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr
 
     // Trace lazy init event if enabled
     if (created && ucsan_flags().trace_object) {
-      if (object_id >= UINT32_MAX) {
-        UCSAN_OUT("WARNING: UCSan: object_id too large for tracing: %lu\n", object_id);
-        goto out;
-      }
-      if (parent_obj_id >= UINT32_MAX) {
-        UCSAN_OUT("WARNING: UCSan: parent_obj_id too large for tracing: %lu\n", parent_obj_id);
-        goto out;
-      }
-      if (offset_in_parent > UCSAN_OBJECT_SIZE_LIMIT) {
-        UCSAN_OUT("WARNING: UCSan: offset_in_parent too large: %lu\n", offset_in_parent);
-        goto out;
-      }
       // Pack object_id (lower 32 bits) and parent_obj_id (upper 32 bits) into uint64_t
-      uint64_t info = (parent_obj_id << 32) | (object_id & 0xFFFFFFFF);
+      uint64_t info = ((uint64_t)parent_obj_id << 32) | object_id;
       __taint_trace_event_addr(label, EVENT_LAZY_INIT, info, return_addr,
                                (uint32_t)offset_in_parent);
     }
 
-out:
     if (ret_object_id) *ret_object_id = object_id;
     return ucsan_tainted.objects->at(object_id);
   }
+
+out_default:
 
   // Should not reach here with label == 0
   static UCSanObject empty_object;
@@ -483,7 +490,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
           shadow = ucsan_shadow_for(byte_addr);
           auto ret = create_label_from_super_object(1, false);
           *shadow = ret.label;
-          UCSAN_OUT("Symbolize global variable byte @%p with %u from offset %llu\n",
+          UCSAN_OUT("Symbolize global variable byte @%p with %u from offset %lu\n",
                     ((char*)p+i), ret.label, ret.offset);
 
           // Bridge to SymSan: create symbolic label for this byte and set shadow
@@ -720,7 +727,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     if (desired_offset < 0 && desired_offset < -(int64_t)new_lower_bound) {
       extended_lower = -desired_offset - new_lower_bound;
       new_lower_bound = -desired_offset;
-      UCSAN_OUT("Extended lower bound: %llu, new lower bound: %llu\n", extended_lower, new_lower_bound);
+      UCSAN_OUT("Extended lower bound: %lu, new lower bound: %lu\n", extended_lower, new_lower_bound);
       if (ucsan_flags().trace_object)
         __taint_trace_event_addr(label, EVENT_EXTENSION, object_id, (void*)new_lower_bound, 0);
     }
@@ -729,12 +736,12 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
                                          (int64_t)obj_label_info->upper_bound);
 
     if (new_size > UCSAN_OBJECT_SIZE_LIMIT) {
-      UCSAN_OUT("Object size too large: %llu\n", new_size);
+      UCSAN_OUT("Object size too large: %lu\n", new_size);
       exit(exit_reason::REASON_OBJ_OOB);
     }
 
     void *np = customized_malloc(new_size);
-    UCSAN_OUT("Enlarged object: np=%p, new_size=%llu\n", np, new_size);
+    UCSAN_OUT("Enlarged object: np=%p, new_size=%lu\n", np, new_size);
 
     // Copy and extend shadow memory
     // Padding the left lower bounds with new labels
@@ -858,7 +865,7 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
 
   ucsan_label label0 = ls[0];
 
-  UCSAN_OUT("load_pointer_shadow: *label(%p)=%d is_pointer=%d, size=%llu\n",
+  UCSAN_OUT("load_pointer_shadow: *label(%p)=%d is_pointer=%d, size=%lu\n",
             ls, label0, is_pointer, n);
 
   // Allow loading kUninitializedLabel for UBI detection
@@ -891,7 +898,7 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_store_pointer_shadow(ucsan_label l, ucsan_label *ls, uint64_t n) {
-  UCSAN_OUT("store_pointer_shadow: label=%d, n=%llu, ls=%p\n", l, n, ls);
+  UCSAN_OUT("store_pointer_shadow: label=%d, n=%lu, ls=%p\n", l, n, ls);
 
   if (l == 0 || l == kUninitializedLabel) {
     for (uint64_t i = 0; i < n; ++i) ls[i] = l;
@@ -912,7 +919,7 @@ void ucsan_store_pointer_shadow(ucsan_label l, ucsan_label *ls, uint64_t n) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_set_label(ucsan_label label, void *addr, uint64_t size) {
-  UCSAN_OUT("ucsan_set_label: label=%d, addr=%p, size=%llu\n", label, addr, size);
+  UCSAN_OUT("ucsan_set_label: label=%d, addr=%p, size=%lu\n", label, addr, size);
 
   // Get shadow address for the memory region
   ucsan_label *shadow = ucsan_shadow_for(addr);
@@ -954,7 +961,7 @@ void* ucsan_set_label_for_args(uint32_t index, uint32_t size_in_bits, uint8_t is
   if (ucsan_tainted.objects->size() &&
       last_offset + size_in_bytes <= ucsan_tainted.objects->at(0).data.size()) {
     uint64_t result = *((uint64_t*)(ucsan_tainted.objects->at(0).data.data() + last_offset));
-    UCSAN_OUT("Returning: 0x%llx\n", result);
+    UCSAN_OUT("Returning: 0x%lx\n", result);
     return (void*)result;
   }
 
@@ -992,7 +999,7 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
         if (*lp == kUninitializedLabel) {
           // Allocate a byte from super object
           auto ret = create_label_from_super_object(1, false);
-          UCSAN_OUT("resign alloca ret: %u %llu\n", ret.label, ret.offset);
+          UCSAN_OUT("resign alloca ret: %u %lu\n", ret.label, ret.offset);
           *lp = ret.label;
 
           // Bridge to SymSan: create symbolic label for this byte
@@ -1029,7 +1036,7 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       ret_addr = __builtin_return_address(0);
     }
 
-    UCSAN_OUT("Concrete external object: p=%p, size=%llu\n", ptr, n);
+    UCSAN_OUT("Concrete external object: p=%p, size=%lu\n", ptr, n);
 
     // Create a dummy label for constant pointer tracking
     ucsan_label dummy_label = allocate_label();
@@ -1085,7 +1092,7 @@ void* ucsan_wrap_retval(uint64_t size, ucsan_label *ret_label, bool is_ptr, void
   ucsan_label label = lbl.label;
   uint64_t last_offset = lbl.offset;
 
-  UCSAN_OUT("Ret object created: label=%u, offset=%llu\n", label, last_offset);
+  UCSAN_OUT("Ret object created: label=%u, offset=%lu\n", label, last_offset);
 
   // Note: create_label_from_super_object already initializes the label_info
   // with the correct op (OP_EXTERNAL for pointers, OP_NONE for bytes)
@@ -1101,7 +1108,7 @@ void* ucsan_wrap_retval(uint64_t size, ucsan_label *ret_label, bool is_ptr, void
 
   if (ucsan_tainted.objects->size() &&
       last_offset + size <= ucsan_tainted.objects->at(0).data.size()) {
-    UCSAN_OUT("offset (%llu + %llu) in the seed\n", last_offset, size);
+    UCSAN_OUT("offset (%lu + %lu) in the seed\n", last_offset, size);
     for (uptr i = 0; i < size; ++i) {
       __ucsan_wrapped_return_tls[i] = ucsan_tainted.objects->at(0).data[last_offset + i];
     }
@@ -1132,7 +1139,7 @@ ucsan_label ucsan_trace_alloca(uint64_t size, uint64_t elem_size, uint64_t addr)
     __alloca_stack_top -= 1;
     ucsan_label label = __alloca_stack_top;
 
-    UCSAN_OUT("ucsan_trace_alloca: label=%u, base=%p, size=%llu, elem_size=%llu, total=%llu\n",
+    UCSAN_OUT("ucsan_trace_alloca: label=%u, base=%p, size=%lu, elem_size=%lu, total=%lu\n",
               label, ptr, size, elem_size, total_size);
 
     ucsan_label_info *info = get_label_info(label);
@@ -1299,9 +1306,9 @@ void ucsan_init() {
   AddDieCallback(ucsan_fini_internal);
 
   UCSAN_OUT("UCSan runtime initialized\n");
-  UCSAN_OUT("  Shadow:      0x%llx - 0x%llx\n", (uint64_t)kShadowBase, (uint64_t)kUnionTableAddr);
-  UCSAN_OUT("  UnionTable:  0x%llx (size: 0x%llx)\n", (uint64_t)kUnionTableAddr, (uint64_t)kUnionTableSize);
-  UCSAN_OUT("  Max labels:  %llu\n", (uint64_t)(kUnionTableSize / sizeof(ucsan_label_info)));
+  UCSAN_OUT("  Shadow:      0x%lx - 0x%lx\n", (uint64_t)kShadowBase, (uint64_t)kUnionTableAddr);
+  UCSAN_OUT("  UnionTable:  0x%lx (size: 0x%lx)\n", (uint64_t)kUnionTableAddr, (uint64_t)kUnionTableSize);
+  UCSAN_OUT("  Max labels:  %lu\n", (uint64_t)(kUnionTableSize / sizeof(ucsan_label_info)));
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1327,7 +1334,7 @@ void ucsan_init_input(const char *filename) {
 
   uint64_t object_cnt = ucsan_tainted.load(buf, file_size);
 
-  UCSAN_OUT("Loaded %llu objects from %s\n", object_cnt, filename);
+  UCSAN_OUT("Loaded %lu objects from %s\n", object_cnt, filename);
 }
 
 //===----------------------------------------------------------------------===//
