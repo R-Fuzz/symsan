@@ -108,7 +108,7 @@ static void printAst(FILE* f, const rgd::AstNode *node, int indent) {
   fprintf(f, ")\n");
 }
 
-int RGDAstParser::restart(std::vector<symsan::input_t> &inputs) {
+int RGDAstParser::restart(std::vector<symsan::input_t> &inputs, bool copy_input) {
   // save a copy of the inputs
   inputs_cache = inputs;
   // clear caches

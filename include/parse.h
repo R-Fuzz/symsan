@@ -37,8 +37,9 @@ public:
       prev_task_id_(0) {}
   virtual ~ASTParser() {}
 
-  virtual int restart(std::vector<input_t> &inputs) {
+  virtual int restart(std::vector<input_t> &inputs, bool copy_input = false) {
     (void)inputs;
+    (void)copy_input;
     memcmp_cache_.clear();
     return 0;
   }

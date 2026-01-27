@@ -20,7 +20,7 @@ public:
     }
   }
 
-  int restart(std::vector<input_t> &inputs) override;
+  int restart(std::vector<input_t> &inputs, bool copy_input = false) override;
   int parse_cond(dfsan_label label, bool result, bool add_nested,
                  std::vector<uint64_t> &tasks) override;
   int parse_gep(dfsan_label ptr_label, uptr ptr,
@@ -75,8 +75,11 @@ protected:
   std::unordered_map<dfsan_label, string_info_t> string_info_cache_;
 
 private:
-  // Original input cache
+  // Original input cache (stores pointers to input data)
   std::vector<input_t> inputs_cache_;
+
+  // Copied input data (when copy_input=true, owns the data)
+  std::vector<std::vector<uint8_t>> inputs_copy_;
 
   // fsize flag
   bool has_fsize;
@@ -161,6 +164,8 @@ private:
 
   z3::expr read_concrete(dfsan_label label, uint16_t size);
   z3::expr serialize(dfsan_label label, input_dep_set_t &deps);
+  uint64_t serialize_input(dfsan_label label, uint32_t input, uint32_t offset,
+                           uint32_t bytes, input_dep_set_t &input_deps);
   inline void collect_more_deps(input_dep_set_t &deps);
   inline void mark_expr_type(dfsan_label label, input_dep_set_t &inputs);
   inline size_t add_nested_constraints(input_dep_set_t &deps, z3_task_t *task);

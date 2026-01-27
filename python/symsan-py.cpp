@@ -22,20 +22,29 @@ extern "C" {
 #include <unistd.h>
 
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <errno.h>
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+
+// For attach mode - track mapped shm for cleanup
+static void *__attached_shm = nullptr;
+static size_t __attached_shm_size = 0;
 
 // z3parser
 static z3::context __z3_context;
 symsan::Z3ParserSolver *__z3_parser = nullptr;
 
 
-static PyObject* SymSanInit(PyObject *self, PyObject *args) {
+static PyObject* SymSanInit(PyObject *self, PyObject *args, PyObject *keywds) {
+  static const char *kwlist[] = {"program", "shm_size", "init_solver", NULL};
   const char *program;
   unsigned long long ut_size = uniontable_size;
+  int init_solver = 1;  // default True
 
-  if (!PyArg_ParseTuple(args, "s|K", &program, &ut_size)) {
+  if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|Kp",
+      const_cast<char**>(kwlist), &program, &ut_size, &init_solver)) {
     return NULL;
   }
 
@@ -46,11 +55,13 @@ static PyObject* SymSanInit(PyObject *self, PyObject *args) {
     return PyErr_SetFromErrno(PyExc_OSError);
   }
 
-  // setup parser
-  __z3_parser = new symsan::Z3ParserSolver(shm_base, ut_size, __z3_context);
-  if (__z3_parser == nullptr) {
-    fprintf(stderr, "Failed to initialize parser\n");
-    return PyErr_NoMemory();
+  // setup parser (optional)
+  if (init_solver) {
+    __z3_parser = new symsan::Z3ParserSolver(shm_base, ut_size, __z3_context);
+    if (__z3_parser == nullptr) {
+      fprintf(stderr, "Failed to initialize parser\n");
+      return PyErr_NoMemory();
+    }
   }
 
   return PyCapsule_New(shm_base, "dfsan_label_info", NULL);
@@ -200,13 +211,104 @@ static PyObject* SymSanTerminate(PyObject *self) {
 static PyObject* SymSanDestroy(PyObject *self) {
   if (__z3_parser != nullptr) {
     delete __z3_parser;
-    symsan_destroy();
     __z3_parser = nullptr;
   }
+
+  // Clean up attached shm (from init_parser with shm name)
+  if (__attached_shm != nullptr) {
+    munmap(__attached_shm, __attached_shm_size);
+    __attached_shm = nullptr;
+    __attached_shm_size = 0;
+  } else {
+    // Only call symsan_destroy if we used init (launcher mode)
+    symsan_destroy();
+  }
+
   Py_RETURN_NONE;
 }
 
+// Initialize parser from shared memory (by name or address)
+// Usage: init_parser(shm_name, size) or init_parser(shm_capsule, size)
 static PyObject* InitParser(PyObject *self, PyObject *args) {
+  PyObject *shm_arg = NULL;
+  unsigned long long shm_size = 0;
+
+  if (!PyArg_ParseTuple(args, "OK", &shm_arg, &shm_size)) {
+    return NULL;
+  }
+
+  // Clean up any previous parser
+  if (__z3_parser != nullptr) {
+    delete __z3_parser;
+    __z3_parser = nullptr;
+  }
+  if (__attached_shm != nullptr) {
+    munmap(__attached_shm, __attached_shm_size);
+    __attached_shm = nullptr;
+    __attached_shm_size = 0;
+  }
+
+  void *shm_base = nullptr;
+
+  if (PyUnicode_Check(shm_arg)) {
+    // shm_arg is a string (shared memory name)
+    const char *shm_name = PyUnicode_AsUTF8(shm_arg);
+    if (shm_name == NULL) {
+      return NULL;
+    }
+
+    int shm_fd = shm_open(shm_name, O_RDWR, S_IRUSR | S_IWUSR);
+    if (shm_fd == -1) {
+      fprintf(stderr, "Failed to open shm '%s': %s\n", shm_name, strerror(errno));
+      return PyErr_SetFromErrno(PyExc_OSError);
+    }
+
+    shm_base = mmap(0, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+
+    if (shm_base == MAP_FAILED) {
+      fprintf(stderr, "Failed to mmap shm: %s\n", strerror(errno));
+      return PyErr_SetFromErrno(PyExc_OSError);
+    }
+
+    __attached_shm = shm_base;
+    __attached_shm_size = shm_size;
+  } else if (PyCapsule_CheckExact(shm_arg)) {
+    // shm_arg is a capsule (already mapped address)
+    shm_base = PyCapsule_GetPointer(shm_arg, "dfsan_label_info");
+    if (shm_base == NULL) {
+      return NULL;
+    }
+    // Don't track for munmap - caller owns this memory
+  } else if (PyLong_Check(shm_arg)) {
+    // shm_arg is an integer address
+    shm_base = (void *)PyLong_AsUnsignedLongLong(shm_arg);
+    if (PyErr_Occurred()) {
+      return NULL;
+    }
+    // Don't track for munmap - caller owns this memory
+  } else {
+    PyErr_SetString(PyExc_TypeError, "first argument must be shm name (str), capsule, or address (int)");
+    return NULL;
+  }
+
+  // Create the parser
+  __z3_parser = new symsan::Z3ParserSolver(shm_base, shm_size, __z3_context);
+  if (__z3_parser == nullptr) {
+    if (__attached_shm != nullptr) {
+      munmap(__attached_shm, __attached_shm_size);
+      __attached_shm = nullptr;
+      __attached_shm_size = 0;
+    }
+    fprintf(stderr, "Failed to initialize parser\n");
+    return PyErr_NoMemory();
+  }
+
+  Py_RETURN_NONE;
+}
+
+// Reset parser with new input data
+static PyObject* ResetParser(PyObject *self, PyObject *args) {
   if (__z3_parser == nullptr) {
     PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
     return NULL;
@@ -239,7 +341,8 @@ static PyObject* InitParser(PyObject *self, PyObject *args) {
     inputs.push_back({(uint8_t*)data, size});
   }
 
-  if (__z3_parser->restart(inputs) != 0) {
+  // Always copy input data in Python to avoid dangling pointers
+  if (__z3_parser->restart(inputs, true) != 0) {
     PyErr_SetString(PyExc_RuntimeError, "failed to restart parser");
     return NULL;
   }
@@ -414,13 +517,14 @@ static PyObject* SolveTask(PyObject *self, PyObject *args) {
 }
 
 static PyMethodDef SymSanMethods[] = {
-  {"init", SymSanInit, METH_VARARGS, "initialize symsan target"},
+  {"init", (PyCFunction)SymSanInit, METH_VARARGS | METH_KEYWORDS, "initialize symsan target"},
   {"config", (PyCFunction)SymSanConfig, METH_VARARGS | METH_KEYWORDS, "config symsan"},
   {"run", (PyCFunction)SymSanRun, METH_VARARGS | METH_KEYWORDS, "run symsan target, optional stdin=file"},
   {"read_event", SymSanReadEvent, METH_VARARGS, "read a symsan event"},
   {"terminate", (PyCFunction)SymSanTerminate, METH_NOARGS, "terminate current symsan instance"},
   {"destroy", (PyCFunction)SymSanDestroy, METH_NOARGS, "destroy symsan target"},
-  {"reset_input", InitParser, METH_VARARGS, "reset the symbolic expression parser with a new input"},
+  {"init_parser", InitParser, METH_VARARGS, "initialize parser from shared memory (name or address)"},
+  {"reset_input", ResetParser, METH_VARARGS, "reset the symbolic expression parser with a new input"},
   {"parse_cond", ParseCond, METH_VARARGS, "parse trace_cond event into solving tasks"},
   {"parse_gep", ParseGEP, METH_VARARGS, "parse trace_gep event into solving tasks"},
   {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},

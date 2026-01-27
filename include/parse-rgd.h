@@ -17,7 +17,7 @@ public:
       solve_nested_(solve_nested), max_ast_size_(max_ast_size) {}
   ~RGDAstParser() {}
 
-  int restart(std::vector<symsan::input_t> &inputs) override;
+  int restart(std::vector<symsan::input_t> &inputs, bool copy_input = false) override;
   int parse_cond(dfsan_label label, bool result, bool add_nested,
                  std::vector<uint64_t> &tasks) override;
   int parse_gep(dfsan_label ptr_label, uptr ptr,

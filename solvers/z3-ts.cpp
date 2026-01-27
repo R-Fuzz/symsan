@@ -144,7 +144,7 @@ Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
     strlen_name_format = "strlen-%u-%u-%lu-%u";   // input, offset, original_len, null_from_input
   }
 
-int Z3AstParser::restart(std::vector<input_t> &inputs) {
+int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
 
   // reset caches
   memcmp_cache_.clear();
@@ -174,15 +174,32 @@ int Z3AstParser::restart(std::vector<input_t> &inputs) {
   string_info_cache_.clear();
   branch_deps_.clear();
   branch_deps_.resize(inputs.size());
-
   for (size_t i = 0; i < inputs.size(); i++) {
     auto &input = inputs[i];
-#if FILTER_WRONG_AST
-    inputs_cache_.emplace_back(input.first, input.second);
-#endif
-    // resize branch_deps_
     branch_deps_[i].resize(input.second);
   }
+
+  // Clear old cached data
+  inputs_cache_.clear();
+  inputs_copy_.clear();
+
+#if FILTER_WRONG_AST
+  if (copy_input) {
+    // Copy input data and point inputs_cache_ to our owned copies
+    inputs_copy_.resize(inputs.size());
+    for (size_t i = 0; i < inputs.size(); i++) {
+      auto &input = inputs[i];
+      inputs_copy_[i].assign(input.first, input.first + input.second);
+      inputs_cache_.emplace_back(inputs_copy_[i].data(), inputs_copy_[i].size());
+    }
+  } else {
+    // Just store pointers (caller must keep data alive)
+    for (size_t i = 0; i < inputs.size(); i++) {
+      auto &input = inputs[i];
+      inputs_cache_.emplace_back(input.first, input.second);
+    }
+  }
+#endif
 
   return 0;
 }
@@ -272,6 +289,50 @@ static bool eval_icmp(uint16_t predicate, uint64_t val1, uint64_t val2, uint8_t 
   // std::unreachable();
 }
 
+uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_t offset,
+                                      uint32_t bytes, input_dep_set_t &input_deps) {
+  char name[256];
+  snprintf(name, sizeof(name), input_name_format, input, offset);
+  z3::symbol symbol = context_.str_symbol(name);
+  z3::sort sort = context_.bv_sort(8);
+  z3::expr first_byte = context_.constant(symbol, sort);
+  z3::expr out = first_byte;
+  { // for ucsan, due to lazy init, the input may be empty
+    if (input >= branch_deps_.size()) branch_deps_.resize(input + 1);
+    if (offset >= branch_deps_[input].size())
+      branch_deps_[input].resize(offset + bytes);
+  }
+  // Cache first byte in branch_dependency for linking (linear scan: always new)
+  set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(first_byte));
+  uint64_t val = 0;
+#if FILTER_WRONG_AST
+  if (inputs_cache_.size() > input &&
+      inputs_cache_[input].second > offset) {
+    val = (uint64_t)inputs_cache_[input].first[offset];
+  }
+#endif
+  for (uint32_t i = 1; i < bytes; i++) {
+    snprintf(name, sizeof(name), input_name_format, input, offset + i);
+    symbol = context_.str_symbol(name);
+    z3::expr byte_expr = context_.constant(symbol, sort);
+    out = z3::concat(byte_expr, out);
+    input_deps.insert(std::make_pair(input, offset + i));
+    // Cache each byte expr in branch_dependency (linear scan: always new)
+    set_branch_dep({input, offset + i}, std::make_unique<branch_dependency_t>(byte_expr));
+#if FILTER_WRONG_AST
+    if (inputs_cache_.size() > input &&
+        inputs_cache_[input].second > offset + i) {
+      val |= (uint64_t)inputs_cache_[input].first[offset + i] << (i * 8);
+    }
+#endif
+  }
+
+  tsize_cache_.emplace_back(1);
+  cache_expr(label, out);
+
+  return val;
+}
+
 z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel) {
     throw z3::exception("invalid label");
@@ -334,47 +395,15 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // input
       uint32_t offset = info->op1.i; // legacy: offset in op1
       uint32_t input = info->op2.i;
-      snprintf(name, sizeof(name), input_name_format, input, offset);
-      z3::symbol symbol = context_.str_symbol(name);
-      z3::sort sort = context_.bv_sort(8);
-      tsize_cache_.emplace_back(1);
-      input_deps.insert(std::make_pair(input, offset));
-      // caching is not super helpful
-      z3::expr input_expr = context_.constant(symbol, sort);
-      cache_expr(l, input_expr);
-      // Cache input expr in branch_dependency for linking (linear scan: always new)
-      set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(input_expr));
+      uint64_t val = serialize_input(l, input, offset, info->size / 8, input_deps);
       TRACK_LABEL_BV_ONLY();
-      RECORD_VALUE(inputs_cache_[input].first[offset]);
+      RECORD_VALUE(val);
       continue;
     } else if (info->op == __dfsan::Load) {
       uint32_t offset = get_label_info(info->l1)->op1.i; // legacy: offset in op1
       uint32_t input = get_label_info(info->l1)->op2.i;
-      snprintf(name, sizeof(name), input_name_format, input, offset);
-      z3::symbol symbol = context_.str_symbol(name);
-      z3::sort sort = context_.bv_sort(8);
-      z3::expr first_byte = context_.constant(symbol, sort);
-      z3::expr out = first_byte;
       input_deps.insert(std::make_pair(input, offset));
-      // Cache first byte expr in branch_dependency (linear scan: always new)
-      set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(first_byte));
-#if FILTER_WRONG_AST
-      uint64_t val = inputs_cache_[input].first[offset];
-#endif
-      for (uint32_t i = 1; i < info->l2; i++) {
-        snprintf(name, sizeof(name), input_name_format, input, offset + i);
-        symbol = context_.str_symbol(name);
-        z3::expr byte_expr = context_.constant(symbol, sort);
-        out = z3::concat(byte_expr, out);
-        input_deps.insert(std::make_pair(input, offset + i));
-        // Cache each byte expr in branch_dependency (linear scan: always new)
-        set_branch_dep({input, offset + i}, std::make_unique<branch_dependency_t>(byte_expr));
-#if FILTER_WRONG_AST
-        val |= (uint64_t)inputs_cache_[input].first[offset + i] << (i * 8);
-#endif
-      }
-      tsize_cache_.emplace_back(1);
-      cache_expr(l, out);
+      uint64_t val = serialize_input(l, input, offset, info->l2, input_deps);
       TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(val);
       continue;
@@ -1593,6 +1622,10 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     return 0; // success
   } catch (z3::exception e) {
     fprintf(stderr, "WARNING: parsing error: %s\n", e.msg());
+  } catch (std::exception& e) {
+    fprintf(stderr, "WARNING: std::exception in parse_cond: %s\n", e.what());
+  } catch (...) {
+    fprintf(stderr, "WARNING: unknown exception in parse_cond\n");
   }
 
   // exception happened, nothing added
@@ -1697,6 +1730,10 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
     return 0; // success
   } catch (z3::exception e) {
     // logf("WARNING: solving error: %s\n", e.msg());
+  } catch (std::exception& e) {
+    fprintf(stderr, "WARNING: std::exception in parse_gep: %s\n", e.what());
+  } catch (...) {
+    fprintf(stderr, "WARNING: unknown exception in parse_gep\n");
   }
 
   // exception happened, nothing added
@@ -1736,6 +1773,12 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
 
     save_constraint(expr == r, inputs);
   } catch (z3::exception e) {
+    return -1;
+  } catch (std::exception& e) {
+    fprintf(stderr, "WARNING: std::exception in add_constraints: %s\n", e.what());
+    return -1;
+  } catch (...) {
+    fprintf(stderr, "WARNING: unknown exception in add_constraints\n");
     return -1;
   }
 
