@@ -829,8 +829,14 @@ Type *Taint::getShadowTy(Value *V) {
 }
 
 uint32_t Taint::getInstructionId(Instruction *Inst) {
-  // check if there is a bbid annotation
-  if (MDNode *BBID = Inst->getMetadata("bbid")) {
+  // check if there is a bbid annotation from UCSan ("dfsan.bb")
+  MDNode *BBID = Inst->getMetadata("dfsan.bb");
+  // For non-terminator instructions, try getting bbid from the block's terminator
+  if (!BBID && !Inst->isTerminator()) {
+    Instruction *Term = Inst->getParent()->getTerminator();
+    BBID = Term->getMetadata("dfsan.bb");
+  }
+  if (BBID) {
     auto C = dyn_cast<ConstantAsMetadata>(BBID->getOperand(0));
     if (ConstantInt *CI = dyn_cast<ConstantInt>(C->getValue())) {
       uint64_t BBIDValue = CI->getZExtValue();
