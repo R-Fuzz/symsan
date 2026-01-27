@@ -1965,6 +1965,10 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
   UF.UC.markNosanitize(And);
   // if not null and not symbolic, we can call it directly
   SplitBlockAndInsertIfThenElse(And, &CB, &TB, &EB);
+  // get the correct merge bb
+  curBB = TB->getParent()->getSingleSuccessor();
+  assert(curBB != nullptr && "Expected single successor after if-then-else");
+  IRB.SetInsertPoint(curBB->getFirstNonPHI());
   // remove bbid from then else blocks, and reannotate current block
   if (BBID) {
     TB->getParent()->getTerminator()->setMetadata(BBIDName, nullptr);
@@ -2038,8 +2042,7 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
     // wrap the returned value
     if (!RT->isVoidTy()) {
       std::vector<Value *> Args;
-      Type *SRT = UF.UC.getShadowTy(RT);
-      ConstantInt *Size = ConstantInt::get(UF.UC.Int64Ty, DL.getTypeSizeInBits(SRT));
+      ConstantInt *Size = ConstantInt::get(UF.UC.Int64Ty, DL.getTypeSizeInBits(RT));
       ConstantInt *isPtr = ConstantInt::get(UF.UC.Int1Ty, RT->isPointerTy());
       Args.push_back(Size);
       Args.push_back(UF.getRetvalTLS(RT, IRB_EB));
