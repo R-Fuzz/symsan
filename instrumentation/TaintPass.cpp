@@ -3133,10 +3133,18 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
   IRBuilder<> IRB(&CB);
 
   // trace indirect call
+  bool isUCSanCheckedIndirectCall = false;
   if (CB.getCalledFunction() == nullptr) {
     Value *Shadow = TF.getShadow(CB.getCalledOperand());
     if (!TF.TT.isZeroShadow(Shadow))
       IRB.CreateCall(TF.TT.TaintTraceIndirectCallFn, {Shadow});
+
+    // Check if the function pointer is from UCSan (ucsan_check_pointer)
+    Value *FPtr = CB.getCalledOperand()->stripPointerCasts();
+    auto *FPtrInst = dyn_cast<Instruction>(FPtr);
+    if (ClWithUCSan || (FPtrInst && FPtrInst->getMetadata("ucsan.checked"))) {
+      isUCSanCheckedIndirectCall = true;
+    }
   }
 
   DenseMap<Value *, Function *>::iterator UnwrappedFnIt =
@@ -3173,6 +3181,21 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
 
   Instruction *Next = nullptr;
   if (!CB.getType()->isVoidTy()) {
+    // For UCSan-checked indirect calls, find the PHINode introduced by UCSanPass.
+    // The return value may come from either the actual call or ucsan_wrap_retval,
+    // merged via a PHINode. We need to load the shadow after the PHINode.
+    PHINode *RetPhiNode = nullptr;
+    Instruction *ShadowTarget = &CB;
+    if (isUCSanCheckedIndirectCall) {
+      for (User *U : CB.users()) {
+        if (PHINode *PN = dyn_cast<PHINode>(U)) {
+          RetPhiNode = PN;
+          ShadowTarget = PN;
+          break;
+        }
+      }
+    }
+
     if (InvokeInst *II = dyn_cast<InvokeInst>(&CB)) {
       if (II->getNormalDest()->getSinglePredecessor()) {
         Next = &II->getNormalDest()->front();
@@ -3183,7 +3206,12 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       }
     } else {
       assert(CB.getIterator() != CB.getParent()->end());
-      Next = CB.getNextNode();
+      if (RetPhiNode) {
+        // Load shadow after the PHINode
+        Next = RetPhiNode->getParent()->getFirstNonPHI();
+      } else {
+        Next = CB.getNextNode();
+      }
     }
 
     // Don't emit the epilogue for musttail call returns.
@@ -3195,13 +3223,13 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
     unsigned Size = DL.getTypeAllocSize(TF.TT.getShadowTy(&CB));
     if (Size > RetvalTLSSize) {
       // Set overflowed return shadow to be zero.
-      TF.setShadow(&CB, TF.TT.getZeroShadow(&CB));
+      TF.setShadow(ShadowTarget, TF.TT.getZeroShadow(&CB));
     } else {
       LoadInst *LI = NextIRB.CreateAlignedLoad(
           TF.TT.getShadowTy(&CB), TF.getRetvalTLS(CB.getType(), NextIRB),
           ShadowTLSAlignment, "_dfsret");
       TF.SkipInsts.insert(LI);
-      TF.setShadow(&CB, LI);
+      TF.setShadow(ShadowTarget, LI);
       TF.NonZeroChecks.push_back(LI);
     }
   }
