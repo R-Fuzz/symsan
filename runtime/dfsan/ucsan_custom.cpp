@@ -11,14 +11,14 @@ using namespace __ucsan;
 
 // External symbols for real libc functions
 extern "C" {
-  void *__libc_malloc(uptr size);
-  void *__libc_calloc(uptr nmemb, uptr size);
-  void *__libc_realloc(void *ptr, uptr size);
+  void *__libc_malloc(size_t size);
+  void *__libc_calloc(size_t nmemb, size_t size);
   void __libc_free(void *ptr);
-  void *__libc_memalign(uptr alignment, uptr size);
-  void *__libc_valloc(uptr size);
-  void *__libc_pvalloc(uptr size);
-  int posix_memalign(void **memptr, uptr alignment, uptr size);
+  // [[deprecated]] void *memalign(size_t alignment, size_t size);
+  // [[deprecated]] void *valloc(size_t size);
+  // [[deprecated]] void *pvalloc(size_t size);
+  void *aligned_alloc(size_t alignment, size_t size);
+  int posix_memalign(void **memptr, size_t alignment, size_t size);
 
   // SymSan bridge functions (weak stubs in ucsan.cpp, strong in dfsan.cpp)
   void __taint_copy_shadow(void *dst, void *src, u64 size);
@@ -33,7 +33,7 @@ extern "C" {
 
 // Helper to create an alloca-style bounds label for heap allocations
 // Also sets shadow memory to kUninitializedLabel for UBI detection
-static ucsan_label create_alloca_label(void *ptr, uptr size) {
+static ucsan_label create_alloca_label(void *ptr, size_t size) {
   ucsan_label label = allocate_label();
   check_label(label);
 
@@ -49,7 +49,7 @@ static ucsan_label create_alloca_label(void *ptr, uptr size) {
 
   // Set shadow memory to kUninitializedLabel for UBI detection
   ucsan_label *shadow = ucsan_shadow_for(ptr);
-  for (uptr i = 0; i < size; i++) {
+  for (size_t i = 0; i < size; i++) {
     shadow[i] = kUninitializedLabel;
   }
 
@@ -57,8 +57,9 @@ static ucsan_label create_alloca_label(void *ptr, uptr size) {
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_malloc(uptr size, u16 size_label, u16 *ret_label) {
+void *__dfsw_malloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = __libc_malloc(size);
+  UCSAN_OUT("__dfsw_malloc(%zu) = %p\n", size, ret);
   if (ret) {
     // Create bounds label (sets shadow to kUninitializedLabel for UBI)
     *ret_label = create_alloca_label(ret, size);
@@ -69,27 +70,30 @@ void *__dfsw_malloc(uptr size, u16 size_label, u16 *ret_label) {
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_kmalloc_large(uptr size, u32 unused, u16 size_label, u16 unused2,
-                           u16 *ret_label) {
+void *__dfsw_kmalloc_large(size_t size, unsigned int flags,
+                           ucsan_label size_label, ucsan_label flags_label,
+                           ucsan_label *ret_label) {
   return __dfsw_malloc(size, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw___kmalloc(uptr size, u32 unused1, u16 size_label, u16 unused2,
-                       u16 *ret_label) {
+void *__dfsw___kmalloc(size_t size, unsigned int flags,
+                       ucsan_label size_label, ucsan_label flags_label,
+                       ucsan_label *ret_label) {
   return __dfsw_malloc(size, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_kmalloc(uptr size, u32 unused1, u16 size_label, u16 unused2,
-                     u16 *ret_label) {
+void *__dfsw_kmalloc(size_t size, unsigned int flags, ucsan_label size_label,
+                     ucsan_label flags_label, ucsan_label *ret_label) {
   return __dfsw_malloc(size, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_calloc(uptr nmemb, uptr size, u16 nmemb_label, u16 size_label, u16 *ret_label) {
+void *__dfsw_calloc(size_t nmemb, size_t size, ucsan_label nmemb_label,
+                    ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = __libc_calloc(nmemb, size);
-  uptr total_size = nmemb * size;
+  size_t total_size = nmemb * size;
   if (ret) {
     // Create bounds label (sets shadow to kUninitializedLabel for UBI)
     // (calloc zeros memory, but we still want to detect reads before writes)
@@ -101,7 +105,8 @@ void *__dfsw_calloc(uptr nmemb, uptr size, u16 nmemb_label, u16 size_label, u16 
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_realloc(void *ptr, uptr size, u16 ptr_label, u16 size_label, u16 *ret_label) {
+void *__dfsw_realloc(void *ptr, size_t size, ucsan_label ptr_label,
+                     ucsan_label size_label, ucsan_label *ret_label) {
   // If ptr has an alloca label, mark it as freed
   if (ptr && ptr_label > UCSAN_CONST_LABEL) {
     ucsan_label_info *old_info = get_label_info(ptr_label);
@@ -110,7 +115,8 @@ void *__dfsw_realloc(void *ptr, uptr size, u16 ptr_label, u16 size_label, u16 *r
     }
   }
 
-  void *ret = __libc_realloc(ptr, size);
+  // don't actually free the buffer
+  void *ret = __libc_malloc(size);
   if (ret) {
     // Create bounds label (sets shadow to kUninitializedLabel for UBI)
     *ret_label = create_alloca_label(ret, size);
@@ -121,7 +127,16 @@ void *__dfsw_realloc(void *ptr, uptr size, u16 ptr_label, u16 size_label, u16 *r
 }
 
 __attribute__((visibility("default")))
-void __dfsw_free(void *ptr, u16 ptr_label) {
+void *__dfsw_reallocarray(void *ptr, size_t nmemb, size_t size,
+                          ucsan_label ptr_label, ucsan_label nmemb_label,
+                          ucsan_label size_label, ucsan_label *ret_label) {
+  size_t total_size = nmemb * size;
+
+  return __dfsw_realloc(ptr, total_size, ptr_label, size_label, ret_label);
+}
+
+__attribute__((visibility("default")))
+void __dfsw_free(void *ptr, ucsan_label ptr_label) {
   // Mark buffer as freed for UAF detection
   if (ptr && ptr_label > UCSAN_CONST_LABEL) {
     ucsan_label_info *info = get_label_info(ptr_label);
@@ -129,12 +144,15 @@ void __dfsw_free(void *ptr, u16 ptr_label) {
       info->common.op = OP_FREE;
     }
   }
-  __libc_free(ptr);
+  // don't actually free the buffer, to capture UAFs
+  // __libc_free(ptr);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_memalign(uptr alignment, uptr size, u16 alignment_label, u16 size_label, u16 *ret_label) {
-  void *ret = __libc_memalign(alignment, size);
+void *__dfsw_memalign(size_t alignment, size_t size,
+                      ucsan_label alignment_label, ucsan_label size_label,
+                      ucsan_label *ret_label) {
+  void *ret = aligned_alloc(alignment, size);
   if (ret) {
     // Create bounds label (sets shadow to kUninitializedLabel for UBI)
     *ret_label = create_alloca_label(ret, size);
@@ -145,8 +163,24 @@ void *__dfsw_memalign(uptr alignment, uptr size, u16 alignment_label, u16 size_l
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_aligned_alloc(uptr alignment, uptr size, u16 alignment_label, u16 size_label, u16 *ret_label) {
-  void *ret = __libc_memalign(alignment, size);
+void *__dfsw_aligned_alloc(size_t alignment, size_t size,
+                           ucsan_label alignment_label, ucsan_label size_label,
+                           ucsan_label *ret_label) {
+  void *ret = aligned_alloc(alignment, size);
+  if (ret) {
+    // Create bounds label (sets shadow to kUninitializedLabel for UBI)
+    *ret_label = create_alloca_label(ret, size);
+  } else {
+    *ret_label = UCSAN_CONST_LABEL;
+  }
+  return ret;
+}
+
+#define PAGE_SIZE 4096
+
+__attribute__((visibility("default")))
+void *__dfsw_valloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
+  void *ret = aligned_alloc(PAGE_SIZE, size);
   if (ret) {
     // Create bounds label (sets shadow to kUninitializedLabel for UBI)
     *ret_label = create_alloca_label(ret, size);
@@ -157,8 +191,8 @@ void *__dfsw_aligned_alloc(uptr alignment, uptr size, u16 alignment_label, u16 s
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_valloc(uptr size, u16 size_label, u16 *ret_label) {
-  void *ret = __libc_valloc(size);
+void *__dfsw_pvalloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
+  void *ret = aligned_alloc(PAGE_SIZE, size);
   if (ret) {
     // Create bounds label (sets shadow to kUninitializedLabel for UBI)
     *ret_label = create_alloca_label(ret, size);
@@ -169,21 +203,9 @@ void *__dfsw_valloc(uptr size, u16 size_label, u16 *ret_label) {
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_pvalloc(uptr size, u16 size_label, u16 *ret_label) {
-  void *ret = __libc_pvalloc(size);
-  if (ret) {
-    // Create bounds label (sets shadow to kUninitializedLabel for UBI)
-    *ret_label = create_alloca_label(ret, size);
-  } else {
-    *ret_label = UCSAN_CONST_LABEL;
-  }
-  return ret;
-}
-
-__attribute__((visibility("default")))
-int __dfsw_posix_memalign(void **memptr, uptr alignment, uptr size,
-                          u16 memptr_label, u16 alignment_label, u16 size_label,
-                          u16 *ret_label) {
+int __dfsw_posix_memalign(void **memptr, size_t alignment, size_t size,
+                          ucsan_label memptr_label, ucsan_label alignment_label,
+                          ucsan_label size_label, ucsan_label *ret_label) {
   int result = posix_memalign(memptr, alignment, size);
   if (result == 0 && *memptr) {
     *ret_label = UCSAN_CONST_LABEL;  // Return value is int, no pointer label
@@ -200,43 +222,55 @@ int __dfsw_posix_memalign(void **memptr, uptr alignment, uptr size,
 // Wrappers for __libc versions - delegate to main wrappers for bounds tracking
 
 __attribute__((visibility("default")))
-void *__dfsw___libc_malloc(uptr size, u16 size_label, u16 *ret_label) {
+void *__dfsw___libc_malloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   return __dfsw_malloc(size, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw___libc_calloc(uptr nmemb, uptr size, u16 nmemb_label, u16 size_label, u16 *ret_label) {
+void *__dfsw___libc_calloc(size_t nmemb, size_t size, ucsan_label nmemb_label,
+                           ucsan_label size_label, ucsan_label *ret_label) {
   return __dfsw_calloc(nmemb, size, nmemb_label, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw___libc_realloc(void *ptr, uptr size, u16 ptr_label, u16 size_label, u16 *ret_label) {
+void *__dfsw___libc_realloc(void *ptr, size_t size, ucsan_label ptr_label,
+                            ucsan_label size_label, ucsan_label *ret_label) {
   return __dfsw_realloc(ptr, size, ptr_label, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
-void __dfsw___libc_free(void *ptr, u16 ptr_label) {
+void *__dfsw___libc_reallocarray(void *ptr, size_t nmemb, size_t size,
+                                 ucsan_label ptr_label, ucsan_label nmemb_label,
+                                 ucsan_label size_label, ucsan_label *ret_label) {
+  return __dfsw_reallocarray(ptr, nmemb, size, ptr_label, nmemb_label, size_label, ret_label);
+}
+
+__attribute__((visibility("default")))
+void __dfsw___libc_free(void *ptr, ucsan_label ptr_label) {
   __dfsw_free(ptr, ptr_label);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw___libc_memalign(uptr alignment, uptr size, u16 alignment_label, u16 size_label, u16 *ret_label) {
+void *__dfsw___libc_memalign(size_t alignment, size_t size,
+                             ucsan_label alignment_label, ucsan_label size_label,
+                             ucsan_label *ret_label) {
   return __dfsw_memalign(alignment, size, alignment_label, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw___libc_valloc(uptr size, u16 size_label, u16 *ret_label) {
+void *__dfsw___libc_valloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   return __dfsw_valloc(size, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw___libc_pvalloc(uptr size, u16 size_label, u16 *ret_label) {
+void *__dfsw___libc_pvalloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   return __dfsw_pvalloc(size, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_memcpy(void *dest, const void *src, uptr n,
-                    u16 dest_label, u16 src_label, u16 n_label, u16 *ret_label) {
+void *__dfsw_memcpy(void *dest, const void *src, size_t n,
+                    ucsan_label dest_label, ucsan_label src_label,
+                    ucsan_label n_label, ucsan_label *ret_label) {
   *ret_label = dest_label;
   // Copy UCSan shadow memory from src to dest
   ucsan_label *sdest = ucsan_shadow_for(dest);
@@ -249,8 +283,9 @@ void *__dfsw_memcpy(void *dest, const void *src, uptr n,
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_memmove(void *dest, const void *src, uptr n,
-                     u16 dest_label, u16 src_label, u16 n_label, u16 *ret_label) {
+void *__dfsw_memmove(void *dest, const void *src, size_t n,
+                     ucsan_label dest_label, ucsan_label src_label,
+                     ucsan_label n_label, ucsan_label *ret_label) {
   *ret_label = dest_label;
   ucsan_label *sdest = ucsan_shadow_for(dest);
   const ucsan_label *ssrc = ucsan_shadow_for(src);
@@ -262,14 +297,15 @@ void *__dfsw_memmove(void *dest, const void *src, uptr n,
 }
 
 __attribute__((visibility("default")))
-void *__dfsw_memset(void *s, int c, uptr n,
-                    u16 s_label, u16 c_label, u16 n_label, u16 *ret_label) {
+void *__dfsw_memset(void *s, int c, size_t n,
+                    ucsan_label s_label, ucsan_label c_label,
+                    ucsan_label n_label, ucsan_label *ret_label) {
   *ret_label = s_label;
   // Set actual memory
   internal_memset(s, c, n);
   // Set UCSan shadow memory - propagate c_label to all bytes
   ucsan_label *shadow = ucsan_shadow_for(s);
-  for (uptr i = 0; i < n; i++) {
+  for (size_t i = 0; i < n; i++) {
     shadow[i] = c_label;
   }
   // Bridge to SymSan: set SymSan shadow memory
