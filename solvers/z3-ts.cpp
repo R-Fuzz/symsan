@@ -424,7 +424,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, z3::sext(base, info->size - base_size));
       TRACK_LABEL_BV_ONLY();
-      RECORD_VALUE((int64_t)(value_cache_[info->l1] & ((1UL << base_size) - 1)));
+      // Sign extend: shift left to put sign bit at MSB, then arithmetic shift right
+      uint64_t base_val = value_cache_[info->l1] & ((1UL << base_size) - 1);
+      RECORD_VALUE(((int64_t)(base_val << (64 - base_size))) >> (64 - base_size));
       continue;
     } else if (info->op == __dfsan::Trunc) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
@@ -1484,7 +1486,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         if ((info->op1.i & valmask) != val1 ||
             (info->op2.i & valmask) != val2) {
           fprintf(stderr, "DEBUG serialize ICmp: VALUE MISMATCH detected\n");
-          // fprintf(stderr, "WARNING: value mismatch for label %u:"
+          // fprintf(stderr, "WARNING: value mismatch for label %u: "
           //         "expected op1 %lu, got %lu, expected op2 %lu, got %lu\n",
           //         l, info->op1.i, val1, info->op2.i, val2);
           // fprintf(stderr, "cond: %s\n", get_cmd(op1, op2, info->op >> 8).to_string().c_str());
