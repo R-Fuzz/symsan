@@ -2051,7 +2051,7 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
         Type *PRT = RT->getPointerTo();
         Ret = IRB_EB.CreatePointerCast(Ret, PRT);
         UF.UC.markNosanitize(Ret);
-        Ret = IRB_EB.CreateLoad(PRT, Ret);
+        Ret = IRB_EB.CreateLoad(RT, Ret);
         UF.UC.markNosanitize(Ret);
       } else {
         Ret = IRB_EB.CreatePointerCast(Ret, RT);
