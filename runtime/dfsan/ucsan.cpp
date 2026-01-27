@@ -507,8 +507,16 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
         // Trace global variable usage
         if (ucsan_flags().trace_object) {
-          __taint_trace_event_addr(*(ucsan_shadow_for(p)), EVENT_USAGE_CITE, size,
-                                   __builtin_return_address(0), 0);
+          ucsan_label first_label = *(ucsan_shadow_for(p));
+          ucsan_label_info *info = get_label_info(first_label);
+          // globals are from super object, so object_id is always 0
+          int64_t offset = to_byte_info(info)->offset;
+          if (offset > INT32_MAX || offset < INT32_MIN || size > UINT32_MAX) {
+            UCSAN_OUT("WARNING: global variable offset (%ld) or size (%lu) too large\n", offset, size);
+          } else {
+            __taint_trace_event_addr(*(ucsan_shadow_for(p)), EVENT_USAGE_CITE, size,
+                                     __builtin_return_address(0), (uint32_t)offset);
+          }
         }
 
         // Send initial data if needed
@@ -727,9 +735,12 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     if (desired_offset < 0 && desired_offset < -(int64_t)new_lower_bound) {
       extended_lower = -desired_offset - new_lower_bound;
       new_lower_bound = -desired_offset;
-      UCSAN_OUT("Extended lower bound: %lu, new lower bound: %lu\n", extended_lower, new_lower_bound);
+      UCSAN_OUT("Extended lower bound: %lu, new lower bound: %lu\n",
+                extended_lower, new_lower_bound);
       if (ucsan_flags().trace_object)
-        __taint_trace_event_addr(label, EVENT_EXTENSION, object_id, (void*)new_lower_bound, 0);
+        __taint_trace_event_addr(label, EVENT_EXTENSION, object_id,
+                                 __builtin_return_address(0),
+                                 (uint32_t)new_lower_bound);
     }
 
     uint64_t new_size = new_lower_bound + Max(desired_offset + (int64_t)size,
