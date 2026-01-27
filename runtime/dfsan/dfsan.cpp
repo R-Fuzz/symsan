@@ -1904,13 +1904,15 @@ void __taint_set_arg_tls(uint32_t index, dfsan_label label, uint32_t size_in_bit
 // Set SymSan retval TLS entry
 // Overrides weak stub in ucsan.cpp
 SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_set_retval_tls(dfsan_label label, uint32_t size_in_bits) {
+void __taint_set_retval_tls(uint32_t index, dfsan_label label, uint32_t size_in_bits) {
+  if (index >= kRetvalTlsSize / sizeof(dfsan_label)) return;
   // Truncate if size_in_bits is not byte-aligned
   uint32_t size_in_bytes = (size_in_bits + 7) / 8;
   if (size_in_bits < size_in_bytes * 8) {
     label = do_taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
   }
-  __dfsan_retval_tls[0] = label;
+  AOUT("set retval tls[%u] = %u\n", index, label);
+  __dfsan_retval_tls[index] = label;
 }
 
 // Set SymSan shadow memory for a region

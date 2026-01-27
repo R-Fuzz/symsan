@@ -55,7 +55,7 @@ void __taint_set_arg_tls(uint32_t index, dfsan_label label,
                          uint32_t size_in_bits);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_set_retval_tls(dfsan_label label, uint32_t size_in_bits);
+void __taint_set_retval_tls(uint32_t index, dfsan_label label, uint32_t size_in_bits);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_set_label(dfsan_label label, void *addr, uint64_t size);
@@ -907,6 +907,8 @@ void ucsan_store_pointer_shadow(ucsan_label l, ucsan_label *ls, uint64_t n) {
 
   ucsan_label_info *label_info = get_label_info(l);
   if (label_info->common.op == OP_EXTERNAL ||
+      label_info->common.op == OP_NONE ||
+      label_info->common.op == OP_DUMMY ||
       label_info->common.op == OP_ALLOCA ||
       label_info->common.op == OP_FREE) {
     assert(n == sizeof(void*));
@@ -1102,9 +1104,11 @@ void* ucsan_wrap_retval(uint64_t size, ucsan_label *ret_label, bool is_ptr, void
 
   *ret_label = label;
 
-  // Bridge to SymSan: create symbolic label and set retval TLS
+  // Bridge to SymSan: create symbolic label and set retval TLS at correct index
+  // Calculate index from pointer offset into __ucsan_retval_tls
+  uint32_t retval_tls_index = (uint32_t)(ret_label - __ucsan_retval_tls);
   dfsan_label symsan_label = __taint_create_label(0, last_offset, (uint32_t)size);
-  __taint_set_retval_tls(symsan_label, (uint32_t)bits);
+  __taint_set_retval_tls(retval_tls_index, symsan_label, (uint32_t)bits);
 
   if (ucsan_tainted.objects->size() &&
       last_offset + size <= ucsan_tainted.objects->at(0).data.size()) {
@@ -1398,9 +1402,10 @@ SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_create_label, uint32_t, uint64
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_arg_tls, uint32_t, dfsan_label, uint32_t) {}
 
 // Set SymSan retval TLS entry
+// @param index: index into retval TLS array (for struct elements)
 // @param label: SymSan label to set
 // @param size_in_bits: size of return value in bits (for truncation)
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_retval_tls, dfsan_label, uint32_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_retval_tls, uint32_t, dfsan_label, uint32_t) {}
 
 // Set SymSan shadow memory for a region
 // @param label: SymSan label to set

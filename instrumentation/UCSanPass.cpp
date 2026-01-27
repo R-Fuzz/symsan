@@ -527,9 +527,9 @@ private:
   Value *loadPrimitiveShadow(Value *Addr, uint64_t Size, Align Align,
                              Type *Ty, IRBuilder<> &IRB);
   /// Loads shadow recursively for aggregate types
-  void loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
-                           Type *SubTy, Value *Addr, uint64_t Size,
-                           Align Align, IRBuilder<> &IRB);
+  Value *loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
+                             Type *SubTy, Value *Addr, uint64_t Size,
+                             Align Align, IRBuilder<> &IRB);
   /// Stores an aggregate shadow label
   void storeShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                             Type *SubTy, Value *Addr, uint64_t Size,
@@ -627,9 +627,10 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
-  // Return value wrapping: i16* ucsan_wrap_retval(i64, i16*, i1, void*)
+  // Return value wrapping: void* ucsan_wrap_retval(i64, i16*, i1, void*)
+  // Returns pointer to __ucsan_wrapped_return_tls where the actual return value is stored
   UCWrapRetvalFnTy = FunctionType::get(
-    PrimitiveShadowPtrTy,
+    VoidPtrTy,
     {Int64Ty, PrimitiveShadowPtrTy, Int1Ty, VoidPtrTy},
     false);
   UCWrapRetvalFn = M.getOrInsertFunction("ucsan_wrap_retval", UCWrapRetvalFnTy);
@@ -979,7 +980,7 @@ Value *UCSanFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size, Align Alig
 }
 
 /// Recursive helper to load shadow for aggregate types.
-void UCSanFunction::loadShadowRecursive(
+Value *UCSanFunction::loadShadowRecursive(
     Value *Shadow, SmallVector<unsigned, 4> &Indices, Type *SubTy,
     Value *Addr, uint64_t Size, Align InstAlign, IRBuilder<> &IRB) {
   auto &DL = F->getParent()->getDataLayout();
@@ -993,7 +994,7 @@ void UCSanFunction::loadShadowRecursive(
     // then insert the primitive shadow into the sub-field
     Value *Insert = IRB.CreateInsertValue(Shadow, PrimitiveShadow, Indices);
     UC.markNosanitize(Insert);
-    return;
+    return Insert;
   }
 
   if (ArrayType *AT = dyn_cast<ArrayType>(SubTy)) {
@@ -1007,11 +1008,11 @@ void UCSanFunction::loadShadowRecursive(
       // get the address of the array element
       Value *SubAddr = IRB.CreateConstGEP2_32(AT, Addr, 0, Idx);
       UC.markNosanitize(SubAddr);
-      loadShadowRecursive(Shadow, Indices, ElemTy,
-                          SubAddr, Size - Offset, InstAlign, IRB);
+      Shadow = loadShadowRecursive(Shadow, Indices, ElemTy,
+                                   SubAddr, Size - Offset, InstAlign, IRB);
       Indices.pop_back();
     }
-    return;
+    return Shadow;
   }
 
   if (StructType *ST = dyn_cast<StructType>(SubTy)) {
@@ -1025,11 +1026,11 @@ void UCSanFunction::loadShadowRecursive(
       // get the address of the struct field
       Value *SubAddr = IRB.CreateConstGEP2_32(ST, Addr, 0, Idx);
       UC.markNosanitize(SubAddr);
-      loadShadowRecursive(Shadow, Indices, ElemTy,
-                          SubAddr, Size - Offset, InstAlign, IRB);
+      Shadow = loadShadowRecursive(Shadow, Indices, ElemTy,
+                                   SubAddr, Size - Offset, InstAlign, IRB);
       Indices.pop_back();
     }
-    return;
+    return Shadow;
   }
   llvm_unreachable("Unexpected shadow type");
 }
@@ -1073,7 +1074,7 @@ Value *UCSanFunction::loadShadow(Value *Addr, uint64_t Size, Align Align,
   SmallVector<unsigned, 4> Indices;
   Type *ShadowTy = UC.getShadowTy(Ty);
   Value *Shadow = UndefValue::get(ShadowTy);
-  loadShadowRecursive(Shadow, Indices, Ty, Addr, Size, ShadowAlign, IRB);
+  Shadow = loadShadowRecursive(Shadow, Indices, Ty, Addr, Size, ShadowAlign, IRB);
   return Shadow;
 }
 
@@ -1249,14 +1250,63 @@ Function *UCSan::buildDangleFunction(Function *F) {
   // Wrap return value
   Type *RT = FT->getReturnType();
   if (!RT->isVoidTy()) {
-    ConstantInt *size = ConstantInt::get(Int64Ty, DL.getTypeSizeInBits(RT));
-    ConstantInt *is_ptr = ConstantInt::get(Int1Ty, RT->isPointerTy());
     Value *retvaltls = UF.getRetvalTLS(RT, IRB);
 
-    Value *ret = IRB.CreateCall(UCWrapRetvalFn, {size, retvaltls, is_ptr, RetAddr});
-    Value *ret_ptr = IRB.CreateBitOrPointerCast(ret, RT->getPointerTo());
-    Value *loaded_ret = IRB.CreateLoad(RT, ret_ptr);
-    IRB.CreateRet(loaded_ret);
+    // For struct/array return types, we need to call ucsan_wrap_retval for each
+    // primitive element so that both ucsan and symsan labels are properly wrapped.
+    // ucsan_wrap_retval returns a pointer to __ucsan_wrapped_return_tls where
+    // the actual return value is stored. We must load immediately after each call
+    // before the next call overwrites it, then assemble the struct.
+    std::function<Value *(Type *, Value *, SmallVector<unsigned, 4> &)> wrapRetvalRecursive =
+        [&](Type *SubTy, Value *ShadowAddr, SmallVector<unsigned, 4> &Indices) -> Value * {
+      if (!isa<ArrayType>(SubTy) && !isa<StructType>(SubTy)) {
+        // Primitive type: call ucsan_wrap_retval and load from returned pointer
+        ConstantInt *size = ConstantInt::get(Int64Ty, DL.getTypeSizeInBits(SubTy));
+        ConstantInt *is_ptr = ConstantInt::get(Int1Ty, SubTy->isPointerTy());
+        Value *ret_ptr = IRB.CreateCall(UCWrapRetvalFn, {size, ShadowAddr, is_ptr, RetAddr});
+        // Load the value from the returned pointer (pointing to __ucsan_wrapped_return_tls)
+        Value *typed_ptr = IRB.CreateBitOrPointerCast(ret_ptr, SubTy->getPointerTo());
+        Value *loaded_val = IRB.CreateLoad(SubTy, typed_ptr);
+        return loaded_val;
+      }
+
+      // For aggregate types, recursively wrap each element and assemble
+      Value *Result = UndefValue::get(SubTy);
+
+      if (ArrayType *AT = dyn_cast<ArrayType>(SubTy)) {
+        Type *ElemTy = AT->getElementType();
+        for (unsigned Idx = 0; Idx < AT->getNumElements(); Idx++) {
+          Value *SubShadowAddr = IRB.CreateConstGEP2_32(
+              getShadowTy(SubTy), ShadowAddr, 0, Idx);
+          markNosanitize(SubShadowAddr);
+          Indices.push_back(Idx);
+          Value *ElemVal = wrapRetvalRecursive(ElemTy, SubShadowAddr, Indices);
+          Indices.pop_back();
+          Result = IRB.CreateInsertValue(Result, ElemVal, Idx);
+        }
+        return Result;
+      }
+
+      if (StructType *ST = dyn_cast<StructType>(SubTy)) {
+        for (unsigned Idx = 0; Idx < ST->getNumElements(); Idx++) {
+          Type *ElemTy = ST->getElementType(Idx);
+          Value *SubShadowAddr = IRB.CreateConstGEP2_32(
+              getShadowTy(SubTy), ShadowAddr, 0, Idx);
+          markNosanitize(SubShadowAddr);
+          Indices.push_back(Idx);
+          Value *ElemVal = wrapRetvalRecursive(ElemTy, SubShadowAddr, Indices);
+          Indices.pop_back();
+          Result = IRB.CreateInsertValue(Result, ElemVal, Idx);
+        }
+        return Result;
+      }
+
+      llvm_unreachable("Unexpected type in wrapRetvalRecursive");
+    };
+
+    SmallVector<unsigned, 4> Indices;
+    Value *RetVal = wrapRetvalRecursive(RT, retvaltls, Indices);
+    IRB.CreateRet(RetVal);
   } else {
     IRB.CreateRetVoid();
   }
@@ -2285,7 +2335,7 @@ void UCSanVisitor::visitReturnInst(ReturnInst &RI) {
   if (RI.getReturnValue()) {
     Value *S = UF.getShadow(RI.getReturnValue());
     Type *RT = UF.F->getFunctionType()->getReturnType();
-    unsigned Size = getDataLayout().getTypeAllocSize(UF.UC.PrimitiveShadowTy);
+    unsigned Size = getDataLayout().getTypeAllocSize(UF.UC.getShadowTy(RT));
     if (Size <= kRetvalTLSSize) {
       StoreInst *SI = IRB.CreateAlignedStore(S, UF.getRetvalTLS(RT, IRB), ShadowTLSAlignment);
       UF.UC.markNosanitize(SI);

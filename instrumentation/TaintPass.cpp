@@ -616,9 +616,9 @@ private:
   Value *loadPrimitiveShadow(Value *Addr, uint64_t Size, uint64_t Align,
                              IRBuilder<> &IRB);
   /// Loads shadow recursively for aggregate types
-  void loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
-                           Type *SubTy, Value *Addr, uint64_t Size,
-                           uint64_t Align, IRBuilder<> &IRB);
+  Value *loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
+                             Type *SubTy, Value *Addr, uint64_t Size,
+                             uint64_t Align, IRBuilder<> &IRB);
   /// Stores an aggregate shadow label
   void storeShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                             Type *SubShadowTy, Value *ShadowAddr, uint64_t Size,
@@ -1929,7 +1929,7 @@ Value *TaintFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size,
   return FallbackCall;
 }
 
-void TaintFunction::loadShadowRecursive(
+Value *TaintFunction::loadShadowRecursive(
     Value *Shadow, SmallVector<unsigned, 4> &Indices, Type *SubTy,
     Value *Addr, uint64_t Size, uint64_t Align, IRBuilder<> &IRB) {
   auto &DL = F->getParent()->getDataLayout();
@@ -1941,8 +1941,7 @@ void TaintFunction::loadShadowRecursive(
     // load a primitive shadow from address
     Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, Align, IRB);
     // then insert the primitive shadow into the sub-field
-    IRB.CreateInsertValue(Shadow, PrimitiveShadow, Indices);
-    return;
+    return IRB.CreateInsertValue(Shadow, PrimitiveShadow, Indices);
   }
 
   if (ArrayType *AT = dyn_cast<ArrayType>(SubTy)) {
@@ -1955,11 +1954,11 @@ void TaintFunction::loadShadowRecursive(
       assert(Offset <= Size);
       // get the address of the array element
       Value *SubAddr = IRB.CreateConstGEP2_32(AT, Addr, 0, Idx);
-      loadShadowRecursive(Shadow, Indices, ElemTy,
-                          SubAddr, Size - Offset, Align, IRB);
+      Shadow = loadShadowRecursive(Shadow, Indices, ElemTy,
+                                   SubAddr, Size - Offset, Align, IRB);
       Indices.pop_back();
     }
-    return;
+    return Shadow;
   }
 
   if (StructType *ST = dyn_cast<StructType>(SubTy)) {
@@ -1972,11 +1971,11 @@ void TaintFunction::loadShadowRecursive(
       Type *ElemTy = ST->getElementType(Idx);
       // get the address of the struct field
       Value *SubAddr = IRB.CreateConstGEP2_32(ST, Addr, 0, Idx);
-      loadShadowRecursive(Shadow, Indices, ElemTy,
-                          SubAddr, Size - Offset, Align, IRB);
+      Shadow = loadShadowRecursive(Shadow, Indices, ElemTy,
+                                   SubAddr, Size - Offset, Align, IRB);
       Indices.pop_back();
     }
-    return;
+    return Shadow;
   }
   llvm_unreachable("Unexpected shadow type");
 }
@@ -2021,7 +2020,7 @@ Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size,
   SmallVector<unsigned, 4> Indices;
   Type *ShadowTy = TT.getShadowTy(T);
   Value *Shadow = UndefValue::get(ShadowTy);
-  loadShadowRecursive(Shadow, Indices, T, Addr, Size, ShadowAlign, IRB);
+  Shadow = loadShadowRecursive(Shadow, Indices, T, Addr, Size, ShadowAlign, IRB);
   return Shadow;
 }
 
