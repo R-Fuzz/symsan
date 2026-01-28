@@ -82,7 +82,7 @@ struct ucsan_byte_info {
 // Pointer info - tracks symbolic/external pointers (op == OP_EXTERNAL)
 // Offset is computed dynamically as (current_ptr - pseudo_base)
 struct ucsan_ptr_info {
-  uint16_t op;                 // OP_EXTERNAL, OP_DUMMY, etc.
+  uint16_t op;                 // OP_EXTERNAL, OP_NONE, etc.
   uint16_t status;             // PTR_STATE
   ucsan_label obj_label;  // label pointing to backing ucsan_obj_info
   uint16_t _reserved;
@@ -180,7 +180,6 @@ struct ucsan_input {
   // All pointers to avoid C++ constructor ordering issues
   ObjectStorage *objects;       // pointer - allocated dynamically
   ObjectMap *obj_map;           // pointer - allocated dynamically
-  std::map<uint32_t, int32_t> *const_ptr_counter;  // pointer - allocated dynamically
 
   // Super object offset tracking
   atomic_uint64_t arg_used;     // bytes used from super object
@@ -230,7 +229,6 @@ enum ucsan_op : uint16_t {
   OP_EXTERNAL = 102,      // external/symbolic pointer
   OP_INITP = 103,         // initialized pointer
   OP_RESERVED_OBJ = 104,  // reserved object label
-  OP_DUMMY = 105,         // dummy label for constant pointers
 };
 
 //===----------------------------------------------------------------------===//

@@ -160,9 +160,6 @@ static void ucsan_init_input_struct() {
   if (!ucsan_tainted.obj_map) {
     ucsan_tainted.obj_map = new ObjectMap();
   }
-  if (!ucsan_tainted.const_ptr_counter) {
-    ucsan_tainted.const_ptr_counter = new std::map<uint32_t, int32_t>();
-  }
   ucsan_tainted.arg_used.val_dont_use = 0;
 }
 
@@ -171,7 +168,7 @@ static void ucsan_fini_input_struct() {
     delete ucsan_tainted.objects;
     ucsan_tainted.objects = nullptr;
   }
-  // obj_map and const_ptr_counter are objects, not pointers - no need to delete
+  // obj_map is an object, not a pointer - no need to delete
 }
 
 char* ucsan_input::dump() {
@@ -362,18 +359,6 @@ UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr
                 label, parent_obj_id_64, offset_in_parent_64);
       UCSAN_OUT("  obj_map size=%lu, searching for {%lu, %ld}\n",
                 (uint64_t)ucsan_tainted.obj_map->size(), parent_obj_id_64, offset_in_parent_64);
-    } else if (op == OP_DUMMY) {
-      // Dummy label for constant pointer - track with negative counter
-      ucsan_ptr_info *ptr = &label_info->ptr;
-      parent_obj_id_64 = (uint64_t)ptr->pseudo_base;
-      // Range check for parent_obj_id before using as map key
-      if (parent_obj_id_64 > UINT32_MAX) {
-        UCSAN_OUT("WARNING: UCSan: ptr value too large for tracking: %lu\n", parent_obj_id_64);
-        goto out_default;
-      }
-      offset_in_parent_64 = -((*ucsan_tainted.const_ptr_counter)[(uint32_t)parent_obj_id_64]++);
-      UCSAN_OUT("lookup_object: label=%u, op=DUMMY, ptr_val=%lu, counter=%ld\n",
-                label, parent_obj_id_64, offset_in_parent_64);
     } else {
       UCSAN_OUT("WARNING: unexpected op=%u label=%u\n", op, label);
     }
@@ -919,7 +904,6 @@ void ucsan_store_pointer_shadow(ucsan_label l, ucsan_label *ls, uint64_t n) {
   ucsan_label_info *label_info = get_label_info(l);
   if (label_info->common.op == OP_EXTERNAL ||
       label_info->common.op == OP_NONE ||
-      label_info->common.op == OP_DUMMY ||
       label_info->common.op == OP_ALLOCA ||
       label_info->common.op == OP_FREE) {
     assert(n == sizeof(void*));
@@ -1051,17 +1035,10 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
 
     UCSAN_OUT("Concrete external object: p=%p, size=%lu\n", ptr, n);
 
-    // Create a dummy label for constant pointer tracking
-    ucsan_label dummy_label = allocate_label();
-    ucsan_label_info *dummy_info = get_label_info(dummy_label);
-    ucsan_ptr_info *dummy_ptr = to_ptr_info(dummy_info);
-    dummy_ptr->op = OP_DUMMY;
-    dummy_ptr->status = PTR_UNINITIALIZED;
-    dummy_ptr->obj_label = UCSAN_CONST_LABEL;
-    dummy_ptr->pseudo_base = ptr;  // Store the constant pointer value
-
+    // allocate from super object
+    auto ret = create_label_from_super_object(n, true);
     uint32_t object_id = 0;
-    auto& object = lookup_object(dummy_label, 0, ret_addr, &object_id);
+    auto& object = lookup_object(ret.label, 0, ret_addr, &object_id);
 
     // Set up shadow memory for object bytes
     ucsan_label *shadow = ucsan_shadow_for(ptr);
@@ -1088,7 +1065,7 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       ((uint8_t*)ptr)[i] = object.data[i];
     }
 
-    return dummy_label;
+    return ret.label;
   }
 }
 
