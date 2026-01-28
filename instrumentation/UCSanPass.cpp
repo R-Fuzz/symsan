@@ -2350,6 +2350,12 @@ void UCSanVisitor::visitReturnInst(ReturnInst &RI) {
       UF.UC.markNosanitize(SI);
     }
   }
+
+  if (ClTraceBB) {
+    CallInst::Create(UF.UC.UCTraceBBFn,
+      { ConstantInt::get(UF.UC.Int32Ty, -1), ConstantInt::get(UF.UC.Int32Ty, 0)},
+      "", &RI);
+  }
 }
 
 void UCSanVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
@@ -2680,23 +2686,27 @@ bool UCSan::runImpl(Module &M) {
     if (!F || F->isDeclaration()) continue;
 
     // Add driver wrapper for entry point
+    bool isEntry = false;
     if (F->getName() == Scope.entry ||
         (Scope.entry == "main" && F->getName() == "__original$main")) {
       buildDriverWrapperFunction(F);
+      isEntry = true;
     }
 
-    // Annotate BBs for all functions (including entry)
-    unsigned int Idx = find(Scope.scope, F->getName()) - Scope.scope.begin() + 1;
-    unsigned int BBCount = 0;
-    for (Function::iterator BB = F->begin(); BB != F->end(); BB++, BBCount++) {
-      auto *BBID = ConstantInt::get(Int32Ty, Idx * 100000 + BBCount);
-      if (ClTraceBB) {
-        CallInst::Create(UCTraceBBFn, {ConstantInt::get(Int32Ty, Idx), BBID},
-                         "", &*BB->getFirstNonPHI());
+    // Annotate BBs for all functions (excluding entry)
+    if (!isEntry) {
+      unsigned int Idx = find(Scope.scope, F->getName()) - Scope.scope.begin() + 1;
+      unsigned int BBCount = 0;
+      for (Function::iterator BB = F->begin(); BB != F->end(); BB++, BBCount++) {
+        auto *BBID = ConstantInt::get(Int32Ty, Idx * 100000 + BBCount);
+        if (ClTraceBB) {
+          CallInst::Create(UCTraceBBFn, {ConstantInt::get(Int32Ty, Idx), BBID},
+                          "", &*BB->getFirstNonPHI());
+        }
+        MDNode *MD = MDNode::get(Mod->getContext(),
+                                {ConstantAsMetadata::get(BBID)});
+        BB->getTerminator()->setMetadata(BBIDName, MD);
       }
-      MDNode *MD = MDNode::get(Mod->getContext(),
-                               {ConstantAsMetadata::get(BBID)});
-      BB->getTerminator()->setMetadata(BBIDName, MD);
     }
 
     if (F->getLinkage() == GlobalValue::AvailableExternallyLinkage)
