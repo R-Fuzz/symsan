@@ -761,12 +761,16 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
   }
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __taint_trace_loop_push_stack();
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __taint_trace_loop_pop_stack();
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_push_stack_frame() {
   if (flags().trace_bounds) {
     if (__current_saved_stack_index < MAX_SAVED_STACK_ENTRIES)
       __saved_alloca_stack_top[++__current_saved_stack_index] = __alloca_stack_top;
   }
+  __taint_trace_loop_push_stack();
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -774,6 +778,7 @@ void __taint_pop_stack_frame() {
   if (flags().trace_bounds) {
     __alloca_stack_top = __saved_alloca_stack_top[__current_saved_stack_index--];
   }
+  __taint_trace_loop_pop_stack();
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1853,6 +1858,8 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, bool,
                              uint8_t, uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop, uint32_t, uint32_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop_push_stack, void) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop_pop_stack, void) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_switch_end, uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_trace_select, dfsan_label,
                              dfsan_label, dfsan_label, uint8_t, uint8_t, uint8_t,

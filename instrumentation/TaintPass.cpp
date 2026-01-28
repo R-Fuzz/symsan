@@ -1587,34 +1587,42 @@ bool Taint::runImpl(Module &M) {
     // TaintVisitor may create new basic blocks, which confuses df_iterator.
     // Build a copy of the list before iterating over it.
     SmallVector<BasicBlock *, 4> BBList(depth_first(&F->getEntryBlock()));
+    std::unordered_map<uint32_t, SmallPtrSet<BasicBlock *, 4>> LoopExits;
 
     for (BasicBlock *BB : BBList) {
       // check for loop header
-      if (ClTraceLoop) {
-        if (TF.LI->isLoopHeader(BB)) {
-          // This is a loop header
-          Instruction *FI = &*(BB->getFirstInsertionPt());
-          ConstantInt *CID = ConstantInt::get(Int32Ty, getInstructionId(FI));
-          ConstantInt *LoopDepth = ConstantInt::get(Int32Ty, TF.LI->getLoopDepth(BB));
-          IRBuilder<> IRB(FI);
-          IRB.CreateCall(TaintTraceLoopFn, {CID, LoopDepth});
-        }
+      if (ClTraceLoop && TF.LI) {
         Loop *L = TF.LI->getLoopFor(BB);
         if (L) {
+          auto *Header = L->getHeader();
+          uint32_t LoopIdVal = getInstructionId(Header->getTerminator());
+          ConstantInt *LoopID = ConstantInt::get(Int32Ty, LoopIdVal);
+          if (Header == BB) {
+            // This is a loop header
+            Instruction *FI = &*(BB->getFirstInsertionPt());
+            ConstantInt *LoopDepth = ConstantInt::get(Int32Ty, TF.LI->getLoopDepth(BB));
+            IRBuilder<> IRB(FI);
+            IRB.CreateCall(TaintTraceLoopFn, {LoopID, LoopDepth});
+          }
+          // try to find exits, we do this because predecessors could be incomplete
           for (BasicBlock *Succ : successors(BB)) {
             if (!L->contains(Succ)) {
-              Instruction *FI = &*(Succ->getFirstInsertionPt());
-              IRBuilder<> IRB(FI);
-              ConstantInt *CID = ConstantInt::get(Int32Ty, getInstructionId(FI));
-              Loop *SuccL = TF.LI->getLoopFor(Succ);
-              int succ_depth = SuccL ? SuccL->getLoopDepth() : 0;
-              int depth = L->getLoopDepth();
-              ConstantInt *LoopDepth = ConstantInt::get(Int32Ty, succ_depth - depth);
-              IRB.CreateCall(TaintTraceLoopFn, {CID, LoopDepth});
+              auto &Exits = LoopExits[LoopIdVal];
+              if (Exits.insert(Succ).second) {
+                // only instrument once
+                Instruction *FI = &*(Succ->getFirstInsertionPt());
+                IRBuilder<> IRB(FI);
+                Loop *SuccL = TF.LI->getLoopFor(Succ);
+                int succ_depth = SuccL ? SuccL->getLoopDepth() : 0;
+                int depth = L->getLoopDepth();
+                ConstantInt *LoopDepth = ConstantInt::get(Int32Ty, succ_depth - depth);
+                IRB.CreateCall(TaintTraceLoopFn, {LoopID, LoopDepth});
+              }
             }
           }
         }
       }
+
       Instruction *Inst = &BB->front();
       while (true) {
         // TaintVisitor may split the current basic block, changing the current
