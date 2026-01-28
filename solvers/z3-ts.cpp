@@ -1585,6 +1585,11 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     input_dep_set_t inputs;
     z3::expr cond = serialize(label, inputs);
 
+    // fix cond if it's bv1
+    if (cond.is_bv() && cond.get_sort().bv_size() == 1) {
+      cond = (cond != context_.bv_val(0, 1));
+    }
+
     // add negated last branch condition
     z3::expr r = context_.bool_val(result);
 
