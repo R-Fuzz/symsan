@@ -1659,6 +1659,57 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
   if (StoreSize == 0) return;
 
   Value *Ptr = LI.getPointerOperand();
+  Value *Base = Ptr->stripPointerCasts();
+
+  // Check if loading from a constant global variable
+  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Base)) {
+    if (GV->isConstant()) {
+      UF.setShadow(&LI, UF.UC.getZeroShadow(Ty));
+      return;
+    }
+  }
+
+  // For pointer loads, check if derived from a non-null initialized global
+  if (Ty->isPointerTy()) {
+    Constant *Init = nullptr;
+    if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Base)) {
+      // Direct load from GV
+      if (GV->hasInitializer()) {
+        Init = GV->getInitializer();
+      }
+    } else if (auto *GEP = dyn_cast<GEPOperator>(Base)) {
+      // Load from GEP of GV - try to extract the initialized value
+      GlobalVariable *GV = dyn_cast<GlobalVariable>(
+          GEP->getPointerOperand()->stripPointerCasts());
+      if (GV && GV->hasInitializer() && GEP->hasAllConstantIndices()) {
+        SmallVector<unsigned, 4> Indices;
+        for (auto It = GEP->idx_begin(); It != GEP->idx_end(); ++It) {
+          if (auto *CI = dyn_cast<ConstantInt>(*It)) {
+            Indices.push_back(CI->getZExtValue());
+          }
+        }
+        // Skip the first index (pointer offset), extract from aggregate
+        if (Indices.size() > 1) {
+          Constant *Agg = GV->getInitializer();
+          for (unsigned I = 1; I < Indices.size() && Agg; ++I) {
+            if (auto *AT = dyn_cast<ArrayType>(Agg->getType())) {
+              Agg = Agg->getAggregateElement(Indices[I]);
+            } else if (auto *ST = dyn_cast<StructType>(Agg->getType())) {
+              Agg = Agg->getAggregateElement(Indices[I]);
+            } else {
+              Agg = nullptr;
+            }
+          }
+          Init = Agg;
+        }
+      }
+    }
+    // If the initialized value is a non-null pointer, don't symbolize
+    if (Init && !Init->isNullValue()) {
+      UF.setShadow(&LI, UF.UC.getZeroShadow(Ty));
+      return;
+    }
+  }
   ConstantInt *Size = ConstantInt::get(UF.UC.Int64Ty, StoreSize);
 
   // Check and replace pointer
