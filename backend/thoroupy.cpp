@@ -207,7 +207,7 @@ __taint_trace_event_addr(dfsan_label label, uint32_t event_id, uint64_t info,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__dfsan_trace_bb(uint32_t function_index, uint64_t bb_index) {
+__taint_trace_bb(uint32_t function_index, uint32_t bb_index) {
   AOUT("bb: %u %llu\n", function_index, bb_index);
 
   if (__pipe_fd < 0)

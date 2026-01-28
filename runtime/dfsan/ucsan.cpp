@@ -1388,6 +1388,10 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_event_addr,
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_global_var,
                              __ucsan::ucsan_label, uint64_t, void*) {}
 
+// Weak definition for basic block tracing
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_basic_block,
+                             uint32_t, uint32_t) {}
+
 // Weak definition for UCSan solver initialization
 SANITIZER_INTERFACE_WEAK_DEF(void, InitializeUCSanSolver, void) {}
 

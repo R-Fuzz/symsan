@@ -279,6 +279,16 @@ static void add_ucsan_pass() {
   cc_params[cc_par_cnt++] = "-mllvm";
   cc_params[cc_par_cnt++] =
       alloc_printf("-ucsan-abilist=%s/ucsan_abilist.txt", obj_path);
+
+  if (getenv("KO_NO_TRACE_BOUND")) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = "-ucsan-trace-bound=false";
+  }
+
+  if (getenv("KO_TRACE_BB")) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = "-ucsan-trace-bb=true";
+  }
 }
 
 static void edit_params(u32 argc, char **argv) {

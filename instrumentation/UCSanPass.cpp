@@ -99,7 +99,11 @@ static const char *BBIDName = "dfsan.bb";
 // Command line options
 static cl::opt<bool> ClTraceBound("ucsan-trace-bound",
                                    cl::desc("Enable bounds checking"),
-                                   cl::Hidden, cl::init(false));
+                                   cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClTraceBB("ucsan-trace-bb",
+                                cl::desc("Enable basic block tracing"),
+                                cl::Hidden, cl::init(false));
 
 // The ABI list files control how shadow parameters are passed.
 static cl::list<std::string> ClABIListFiles(
@@ -691,15 +695,17 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
-  // void ucsan_trace_bb(i32, i32)
-  UCTraceBBFnTy = FunctionType::get(
-    Type::getVoidTy(*Ctx),
-    {Int32Ty, Int32Ty},
-    false);
-  UCTraceBBFn = M.getOrInsertFunction("ucsan_trace_bb", UCTraceBBFnTy);
-  F = dyn_cast<Function>(UCTraceBBFn.getCallee()->stripPointerCasts());
-  markFunctionNosanitize(F);
-  UCRuntimeFunctions.insert(F);
+  if (ClTraceBB) {
+    // void __taint_trace_bb(i32, i32)
+    UCTraceBBFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx),
+      {Int32Ty, Int32Ty},
+      false);
+    UCTraceBBFn = M.getOrInsertFunction("__taint_trace_bb", UCTraceBBFnTy);
+    F = dyn_cast<Function>(UCTraceBBFn.getCallee()->stripPointerCasts());
+    markFunctionNosanitize(F);
+    UCRuntimeFunctions.insert(F);
+  }
 
   // i16 ucsan_trace_alloca(i64 Size, i64 ElemSize, i64 Address)
   // Returns a shadow label representing bounds for this stack allocation
@@ -1373,7 +1379,7 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
   IRB.CreateRet(ConstantInt::get(Int32Ty, 0));
 
   // Add basic block tracing to entry point if enabled
-  if (getenv("KO_TRACE_BB")) {
+  if (ClTraceBB) {
     unsigned int BBCount = 0;
     for (Function::iterator BI = F->begin(), BE = F->end(); BI != BE; ++BI, ++BBCount) {
       ConstantInt *BBID = ConstantInt::get(Int32Ty, BBCount);
@@ -2684,6 +2690,10 @@ bool UCSan::runImpl(Module &M) {
     unsigned int BBCount = 0;
     for (Function::iterator BB = F->begin(); BB != F->end(); BB++, BBCount++) {
       auto *BBID = ConstantInt::get(Int32Ty, Idx * 100000 + BBCount);
+      if (ClTraceBB) {
+        CallInst::Create(UCTraceBBFn, {ConstantInt::get(Int32Ty, Idx), BBID},
+                         "", &*BB->getFirstNonPHI());
+      }
       MDNode *MD = MDNode::get(Mod->getContext(),
                                {ConstantAsMetadata::get(BBID)});
       BB->getTerminator()->setMetadata(BBIDName, MD);
