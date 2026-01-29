@@ -230,6 +230,11 @@ void __taint_trace_memerr(dfsan_label ptr_label, uptr ptr,
                           uint16_t flag, void *addr);
 
 extern "C" {
+SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
+__dfsw_exit(int status, dfsan_label status_label) {
+  exit(status);
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_stat(const char *path, struct stat *buf, dfsan_label path_label,
             dfsan_label buf_label, dfsan_label *ret_label) {
