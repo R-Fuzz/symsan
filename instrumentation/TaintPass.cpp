@@ -2498,7 +2498,9 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   // 2. For symbolic ptr (e.g., from UCSan), we need to trace the offset
   if (!TT.isZeroShadow(Shadow)) {
     IRBuilder<> IRB(I->getNextNode());
-    Shadow = IRB.CreateCall(TT.TaintGEPOffsetFn, {Shadow, I, Base});
+    Shadow = IRB.CreateCall(TT.TaintGEPOffsetFn,
+        {Shadow, IRB.CreateBitOrPointerCast(I, TT.VoidPtrTy),
+                 IRB.CreateBitOrPointerCast(Base, TT.VoidPtrTy)});
   }
 
   setShadow(I, Shadow);
