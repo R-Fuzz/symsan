@@ -27,6 +27,30 @@ fun:memcpy=custom
 fun:memmove=custom
 fun:memset=custom
 
+fun:stpcpy=custom
+fun:strcat=custom
+fun:strcpy=custom
+fun:strdup=custom
+fun:strncat=custom
+fun:strncpy=custom
+fun:strndup=custom
+
+fun:bcmp=custom
+fun:memchr=custom
+fun:memcmp=custom
+fun:memrchr=custom
+fun:strcasecmp=custom
+fun:strchr=custom
+fun:strcmp=custom
+fun:strlen=custom
+fun:strncasecmp=custom
+fun:strncmp=custom
+fun:strpbrk=custom
+fun:strrchr=custom
+fun:strstr=custom
+fun:strnstr=custom
+fun:memmem=custom
+
 # kernel
 fun:kmalloc_large=custom
 fun:__kmalloc=custom
