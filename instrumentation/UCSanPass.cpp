@@ -1441,8 +1441,9 @@ Function *UCSan::getCustomFunction(const Function *F) {
   // Create UCSanFunction context for shadow memory access
   UCSanFunction UF(*this, WrapperFunc);
 
-  // Get or insert the referenced function
-  FunctionCallee RefedFunc = Mod->getOrInsertFunction(RefedName, RefedFuncType);
+  // Get or insert the referenced function with transformed type (includes shadow args)
+  TransformedFunction TransformedFn = getCustomFunctionType(RefedFuncType);
+  FunctionCallee RefedFunc = Mod->getOrInsertFunction(RefedName, TransformedFn.TransformedType);
 
   // Build argument mapping
   std::map<unsigned int, unsigned int> ArgMap;
@@ -2143,11 +2144,12 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
   case UCSan::WK_AutoCustom:
     // invoke the custom function
     {
-      int n = CB.arg_size(), I = 0;
-      auto FT = CB.getFunctionType();
+      // Only store shadows for fixed parameters, varargs are not tracked in TLS
+      // FIXME: add vararg shadow tracking support
+      unsigned NumFixedParams = FT->getNumParams();
       unsigned ArgOffset = 0;
 
-      for (auto arg = CB.arg_begin(); n != 0; ++arg, --n, I++) {
+      for (unsigned I = 0; I < NumFixedParams; ++I) {
         unsigned Size =
             DL.getTypeAllocSize(UF.UC.getShadowTy(FT->getParamType(I)));
         // Stop storing if arguments' size overflows. Inside a function,
@@ -2194,6 +2196,8 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       if (!FT->getReturnType()->isVoidTy()) {
         CustomFnPtr->removeFnAttrs(UF.UC.ReadOnlyNoneAttrs);
       }
+      // mark as nosanitize
+      UF.UC.markFunctionNosanitize(CustomFnPtr);
     }
 
     std::vector<Value *> Args;
