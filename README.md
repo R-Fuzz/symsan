@@ -90,6 +90,13 @@ SymSan needs a driver to perform hybrid fuzzing, like [FastGen](https://github.c
 It could also be used as a custom mutator for [AFL++](https://github.com/AFLplusplus/AFLplusplus)
 (check the [plugin readme](driver/aflpp/README.md)).
 
+Check out our integration with Magma to see how to compile and run targets:
+[aflplusplus_symsan](https://github.com/R-Fuzz/magma/tree/mazerunner/fuzzers/aflplusplus_symsan).
+
+It should also be easy to use the [Python binding](https://github.com/R-Fuzz/symsan/tree/main/python).
+
+NOTE: fgtest is for running tests, not for continnous fuzzing, please don't use it for benchmark.
+
 ## Documentation
 
 Still under construction, unfortunately. [DeepWiki](https://deepwiki.com/R-Fuzz/symsan) seems okay.
