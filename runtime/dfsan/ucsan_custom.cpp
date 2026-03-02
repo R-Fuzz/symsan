@@ -313,4 +313,39 @@ void *__dfsw_memset(void *s, int c, size_t n,
   return s;
 }
 
+// Kernel-specific stubs for __get_user and __put_user inline asm helpers
+SANITIZER_INTERFACE_WEAK_DEF(int, __get_user_1, void) { return 0; }
+SANITIZER_INTERFACE_WEAK_DEF(int, __get_user_2, void) { return 0; }
+SANITIZER_INTERFACE_WEAK_DEF(int, __get_user_4, void) { return 0; }
+SANITIZER_INTERFACE_WEAK_DEF(int, __get_user_8, void) { return 0; }
+SANITIZER_INTERFACE_WEAK_DEF(void, __put_user_1, void) { }
+SANITIZER_INTERFACE_WEAK_DEF(void, __put_user_2, void) { }
+SANITIZER_INTERFACE_WEAK_DEF(void, __put_user_4, void) { }
+SANITIZER_INTERFACE_WEAK_DEF(void, __put_user_8, void) { }
+
+// _copy_from_user: copy n bytes from user-space pointer to kernel buffer
+// Propagates shadow/labels from source to destination
+__attribute__((visibility("default")))
+unsigned long __dfsw__copy_from_user(void *to, const void *from, unsigned long n,
+                                     ucsan_label to_label, ucsan_label from_label,
+                                     ucsan_label n_label, ucsan_label *ret_label) {
+  UCSAN_OUT("copy_from_user(%u(%p), %u(%p), %lu)\n", to_label, to, from_label, from, n);
+  if (from_label) {
+    // assume from ptr has been checked/initialized before calling
+    ucsan_ptr_info *ptr_info = to_ptr_info(get_label_info(from_label));
+    if (ptr_info->op != OP_EXTERNAL) {
+      UCSAN_OUT("WARNING: copy_from_user: from_label %d is not external, op %d\n", from_label, ptr_info->op);
+    }
+    ucsan_label *sdest = ucsan_shadow_for(to);
+    const ucsan_label *ssrc = ucsan_shadow_for(from);
+    internal_memcpy((void *)sdest, (const void *)ssrc, n * sizeof(ucsan_label));
+    // Bridge to SymSan
+    __taint_copy_shadow(to, (void *)from, n);
+  }
+  // Copy actual data
+  internal_memcpy(to, from, n);
+  *ret_label = 0;
+  return 0;
+}
+
 } // extern "C"
