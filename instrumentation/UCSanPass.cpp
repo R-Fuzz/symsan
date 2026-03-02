@@ -1960,6 +1960,15 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
 
       // If not found, the symbol is only referenced in inline asm
       if (!Callee) {
+        // If the inline asm has side effects (volatile), insert a compiler
+        // barrier to preserve ordering before removing it
+        if (IA->hasSideEffects()) {
+          auto *Barrier = InlineAsm::get(
+              FunctionType::get(Type::getVoidTy(*UF.UC.Ctx), false),
+              "", "~{memory}", true);
+          auto *BarrierCall = IRB.CreateCall(Barrier);
+          UF.UC.markNosanitize(BarrierCall);
+        }
         if (CB.getType()->isVoidTy() || CB.use_empty()) {
           // No return value or no uses — safe to just delete
           CB.eraseFromParent();
