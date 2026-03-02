@@ -1242,7 +1242,7 @@ Function *UCSan::buildDangleFunction(Function *F) {
 
         // Resign shadow if enabled
         if (resign_ptrargs) {
-          Value *BCI = IRB.CreatePointerCast(&*arg, PrimitiveShadowPtrTy);
+          Value *BCI = IRB.CreatePointerCast(&*arg, VoidPtrTy);
           IRB.CreateCall(UCResignShadowFn, {BCI, shadow, CI, RetAddr});
         }
       }
@@ -1869,36 +1869,46 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
   IRBuilder<> IRB(&CB);
   auto DL = CB.getModule()->getDataLayout();
 
-  // first for each argument, use check pointer to get the real pointer
-  for (unsigned I = 0; I < CB.arg_size(); ++I) {
-    Value* Arg = CB.getArgOperand(I);
-    Type* ArgTy = Arg->getType();
-    if (ArgTy->isPointerTy()) {
-      // if the arg is a compile time constant, we don't need to check
-      if (isa<Constant>(Arg)) continue;
-      // alloca doesn't need checking
-      if (AllocaInst *AI = dyn_cast<AllocaInst>(Arg->stripPointerCasts())) {
-        continue;
-      }
-      // get size of pointed-to type, if available
-      unsigned ObjSize = 0;
-      if (ArgTy->getPointerElementType()->isSized()) {
-        ObjSize = DL.getTypeAllocSize(ArgTy->getPointerElementType());
-      }
-
-      Value *Size = ConstantInt::get(UF.UC.Int64Ty, ObjSize);
-      Value *Ptr = UF.checkPointer(Arg, Size, true, IRB); // dereference pointer
-      CB.setArgOperand(I, Ptr);
+  // Use ParseConstraints to identify memory operands and check their pointers
+  auto Constraints = IA->ParseConstraints();
+  unsigned ArgIdx = 0;
+  for (auto &CI : Constraints) {
+    // clobbers don't have corresponding arguments
+    if (CI.Type == InlineAsm::isClobber)
+      continue;
+    // non-indirect outputs don't have a pointer argument
+    if (CI.Type == InlineAsm::isOutput && !CI.isIndirect) {
+      continue;
     }
+    // bounds check
+    if (ArgIdx >= CB.arg_size())
+      break;
+
+    Value *Arg = CB.getArgOperand(ArgIdx);
+    // only check indirect (memory) operands that are pointers
+    if (CI.isIndirect && Arg->getType()->isPointerTy()) {
+      // skip compile time constants and allocas
+      if (!isa<Constant>(Arg) &&
+          !isa<AllocaInst>(Arg->stripPointerCasts())) {
+        unsigned ObjSize = 0;
+        if (Arg->getType()->getPointerElementType()->isSized()) {
+          ObjSize = DL.getTypeAllocSize(Arg->getType()->getPointerElementType());
+        }
+        Value *Size = ConstantInt::get(UF.UC.Int64Ty, ObjSize);
+        Value *Ptr = UF.checkPointer(Arg, Size, true, IRB); // dereference pointer
+        CB.setArgOperand(ArgIdx, Ptr);
+      }
+    }
+    ++ArgIdx;
   }
 
   // Next, handle specific inline assembly patterns
   // FIXME: inline asm
   auto AsmStr = IA->getAsmString();
-  auto Constraints = IA->getConstraintString();
+  auto ConstraintStr = IA->getConstraintString();
 
   if (AsmStr == " btq  $2,$1\x0A\x09/* output condition code c*/\x0A" &&
-      Constraints == "={@ccc},*m,Ir,~{memory},~{dirflag},~{fpsr},~{flags}") {
+      ConstraintStr == "={@ccc},*m,Ir,~{memory},~{dirflag},~{fpsr},~{flags}") {
     // handle bt instruction
     Value *BitBase = CB.getArgOperand(0);
     Value *BitOffset = CB.getArgOperand(1);
@@ -1914,7 +1924,7 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     CB.replaceAllUsesWith(Result);
     CB.eraseFromParent();
   } else if (AsmStr == ".byte 0x0f, 0x0b" &&
-             Constraints == "~{dirflag},~{fpsr},~{flags}") {
+             ConstraintStr == "~{dirflag},~{fpsr},~{flags}") {
     // handle ud2 instruction
     Value *Result = IRB.CreateCall(UF.UC.ExitFn,
                                    {ConstantInt::get(UF.UC.Int32Ty, 180)});
@@ -1922,7 +1932,7 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     CB.replaceAllUsesWith(Result);
     CB.eraseFromParent();
   } else if (AsmStr == "movq ${1:P}, $0" &&
-             Constraints == "=r,im,~{dirflag},~{fpsr},~{flags}") {
+             ConstraintStr == "=r,im,~{dirflag},~{fpsr},~{flags}") {
     Type *PT = PointerType::getUnqual(CB.getType());
     Value *Base = IRB.CreateBitCast(CB.getArgOperand(0), PT);
     UF.UC.markNosanitize(Base);
@@ -2084,7 +2094,7 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
         } else {
           CI = ConstantInt::get(UF.UC.Int64Ty, 0);
         }
-        auto BCI = IRB_EB.CreateBitCast(Arg, UF.UC.PrimitiveShadowPtrTy); // FIXME: cast to i32* (defined as void *)
+        auto BCI = IRB_EB.CreateBitCast(Arg, UF.UC.VoidPtrTy); // FIXME: cast to i32* (defined as void *)
         auto ArgTLS = UF.getArgTLS(Arg->getType(), ArgOffset, IRB_EB);
         Args.push_back(BCI);
         Args.push_back(ArgTLS);
