@@ -642,9 +642,9 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
-  // Argument initialization: i16* ucsan_set_label_for_args(i32, i32, i8, i64)
+  // Argument initialization: void* ucsan_set_label_for_args(i32, i32, i8, i64)
   UCSetLabelForArgsFnTy = FunctionType::get(
-    PrimitiveShadowPtrTy,
+    VoidPtrTy,
     {Int32Ty, Int32Ty, Int8Ty, Int64Ty},
     false);
   UCSetLabelForArgsFn = M.getOrInsertFunction("ucsan_set_label_for_args", UCSetLabelForArgsFnTy);
@@ -1200,6 +1200,10 @@ Function *UCSan::buildDangleFunction(Function *F) {
   std::string FN = "__external$" + F->getName().str();
   Function *NewF = Function::Create(FT, GlobalValue::LinkageTypes::PrivateLinkage,
                                     F->getAddressSpace(), FN, Mod);
+  // Some inputs are compiled with non-standard stack alignment; force realignment
+  // so calls into UCSan runtime vararg logging are always safe.
+  NewF->addFnAttr(Attribute::getWithStackAlignment(*Ctx, Align(16)));
+  NewF->addFnAttr("stackrealign");
   markFunctionNosanitize(NewF);  // Mark dangle wrapper so TaintPass skips it
   FunctionType *NewFT = NewF->getFunctionType();
   BasicBlock *BB = BasicBlock::Create(*Ctx, "entry", NewF);
@@ -1334,13 +1338,12 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
   FunctionType *FT = FunctionType::get(Int32Ty, {Int32Ty, ArgvTy}, false);
   Function *NewF = Function::Create(FT, GlobalValue::LinkageTypes::ExternalLinkage,
                                     F->getAddressSpace(), "main", Mod);
-  // Set argument names for clarity
   NewF->getArg(0)->setName("argc");
   NewF->getArg(1)->setName("argv");
 
-  // Only copy function-level attributes, not parameter or return attributes
-  NewF->setAttributes(AttributeList::get(*Ctx, F->getAttributes().getFnAttrs(),
-                                         AttributeSet(), {}));
+  // Ensure 16-byte stack alignment for calls into sanitizer vararg code (Printf).
+  NewF->addFnAttr(Attribute::getWithStackAlignment(*Ctx, Align(16)));
+  NewF->addFnAttr("stackrealign");
   markFunctionNosanitize(NewF);  // Mark driver wrapper so TaintPass skips it
 
   BasicBlock *BB = BasicBlock::Create(*Ctx, "entry", NewF);
@@ -1434,6 +1437,9 @@ Function *UCSan::getCustomFunction(const Function *F) {
                                                 F->isVarArg());
 
   Function *WrapperFunc = Function::Create(WrapperType, Linkage, WrappedName, *Mod);
+  // Keep wrapper/runtime call ABI robust even when module stack alignment is 8.
+  WrapperFunc->addFnAttr(Attribute::getWithStackAlignment(*Ctx, Align(16)));
+  WrapperFunc->addFnAttr("stackrealign");
   markFunctionNosanitize(WrapperFunc);  // Mark custom wrapper so TaintPass skips it
   BasicBlock *BB = BasicBlock::Create(*Ctx, "entry", WrapperFunc);
   IRBuilder<> IRB(BB);
@@ -1902,106 +1908,190 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     ++ArgIdx;
   }
 
-  // Next, handle specific inline assembly patterns
-  // FIXME: inline asm
+  // Next, handle inline assembly patterns using parsed constraints
   auto AsmStr = IA->getAsmString();
-  auto ConstraintStr = IA->getConstraintString();
 
-  if (AsmStr == " btq  $2,$1\x0A\x09/* output condition code c*/\x0A" &&
-      ConstraintStr == "={@ccc},*m,Ir,~{memory},~{dirflag},~{fpsr},~{flags}") {
-    // handle bt instruction
-    Value *BitBase = CB.getArgOperand(0);
-    Value *BitOffset = CB.getArgOperand(1);
-    Value *Load = IRB.CreateLoad(BitBase->getType()->getPointerElementType(), BitBase);
-    UF.UC.markNosanitize(Load);
-    Value *Shift = IRB.CreateShl(Load, BitOffset);
-    UF.UC.markNosanitize(Shift);
-    Value *And = IRB.CreateAnd(Shift, 1);
-    UF.UC.markNosanitize(And);
-    Value *Result = IRB.CreateTrunc(And, Type::getInt8Ty(*UF.UC.Ctx));
-    UF.UC.markNosanitize(Result);
+  // Check if all constraints are clobbers (no inputs/outputs)
+  bool allClobbers = true;
+  for (auto &CI : Constraints) {
+    if (CI.Type != InlineAsm::isClobber) {
+      allClobbers = false;
+      break;
+    }
+  }
 
-    CB.replaceAllUsesWith(Result);
-    CB.eraseFromParent();
-  } else if (AsmStr == ".byte 0x0f, 0x0b" &&
-             ConstraintStr == "~{dirflag},~{fpsr},~{flags}") {
-    // handle ud2 instruction
+  // Handle trap/crash instructions: ud2, int3, .byte 0x0f,0x0b, etc.
+  // These have only clobber constraints and should be replaced with exit()
+  if (allClobbers &&
+      (AsmStr.find("ud2") != StringRef::npos ||
+       AsmStr.find(".byte 0x0f, 0x0b") != StringRef::npos ||
+       AsmStr.find("int3") != StringRef::npos ||
+       AsmStr.find("int $3") != StringRef::npos ||
+       AsmStr.find("hlt") != StringRef::npos)) {
     Value *Result = IRB.CreateCall(UF.UC.ExitFn,
                                    {ConstantInt::get(UF.UC.Int32Ty, 180)});
     UF.UC.markNosanitize(Result);
     CB.replaceAllUsesWith(Result);
     CB.eraseFromParent();
-  } else if (AsmStr == "movq ${1:P}, $0" &&
-             ConstraintStr == "=r,im,~{dirflag},~{fpsr},~{flags}") {
-    Type *PT = PointerType::getUnqual(CB.getType());
-    Value *Base = IRB.CreateBitCast(CB.getArgOperand(0), PT);
-    UF.UC.markNosanitize(Base);
-    Value *Result = IRB.CreateLoad(PT, Base);
-    UF.UC.markNosanitize(Result);
-    CB.replaceAllUsesWith(Result);
-    CB.eraseFromParent();
-  } else if (AsmStr.find("__get_user_${") != StringRef::npos) {
-    // handle __get_user_ inline assembly
-    // get the number of bytes to read
-    ConstantInt *SizeArg = dyn_cast<ConstantInt>(CB.getArgOperand(1));
-    if (!SizeArg) {
-      errs() << "Unsupported __get_user argument: " << CB << "\n";
-      return;
-    }
-    unsigned Size = SizeArg->getZExtValue();
-    if (Size != 1 && Size != 2 && Size != 4 && Size != 8) {
-      errs() << "Unsupported size for __get_user: " << AsmStr << "\n";
-      return;
-    }
-    // check uses before replacing
-    for (auto *U : CB.users()) {
-      if (auto *EI = dyn_cast<ExtractValueInst>(U)) {
-        if (EI->getNumIndices() != 1) {
-          errs() << "Unhandled extract of __get_user:" << *U << "\n";
+    return;
+  }
+
+  // Handle call/callq instructions in inline asm
+  // Extract the callee symbol and route through normal call handling
+  StringRef AsmStrRef(AsmStr);
+  auto CallPos = AsmStrRef.find("callq ");
+  if (CallPos == StringRef::npos)
+    CallPos = AsmStrRef.find("call ");
+  if (CallPos != StringRef::npos) {
+    // Extract symbol name after call/callq
+    StringRef After = AsmStrRef.substr(
+        CallPos + (AsmStrRef[CallPos + 4] == 'q' ? 6 : 5));
+    // Trim leading whitespace
+    After = After.ltrim();
+    // Symbol name ends at whitespace, newline, or end of string
+    auto EndPos = After.find_first_of(" \t\n\r;");
+    StringRef Symbol = (EndPos != StringRef::npos) ?
+        After.substr(0, EndPos) : After;
+    // Strip operand modifiers like ${0:P} - if it starts with $, it's a register operand
+    if (!Symbol.empty() && Symbol[0] != '$' && Symbol[0] != '%' &&
+        Symbol[0] != '*') {
+      // Look up the function in the module
+      Function *Callee = CB.getModule()->getFunction(Symbol);
+
+      // If not found, the symbol is only referenced in inline asm
+      if (!Callee) {
+        if (CB.getType()->isVoidTy() || CB.use_empty()) {
+          // No return value or no uses — safe to just delete
+          CB.eraseFromParent();
           return;
         }
-      } else {
-        errs() << "Unhandled use of __get_user:" << *U << "\n";
+        // Has uses — try to find a type-matching input as passthrough
+        // e.g., "={rsp},{rsp}" means rsp is passed through unchanged
+        Value *Passthrough = nullptr;
+        for (unsigned I = 0; I < CB.arg_size(); ++I) {
+          if (CB.getArgOperand(I)->getType() == CB.getType()) {
+            Passthrough = CB.getArgOperand(I);
+            break;
+          }
+        }
+        if (Passthrough) {
+          CB.replaceAllUsesWith(Passthrough);
+        } else {
+          CB.replaceAllUsesWith(Constant::getNullValue(CB.getType()));
+        }
+        CB.eraseFromParent();
+        return;
+      }
+      {
+        // Build input args from parsed constraints
+        SmallVector<Value *, 4> CallArgs;
+        unsigned InArgIdx = 0;
+        for (auto &CI : Constraints) {
+          if (CI.Type == InlineAsm::isClobber)
+            continue;
+          if (CI.Type == InlineAsm::isOutput && !CI.isIndirect)
+            continue;
+          if (InArgIdx >= CB.arg_size())
+            break;
+          if (CI.Type == InlineAsm::isInput) {
+            CallArgs.push_back(CB.getArgOperand(InArgIdx));
+          }
+          ++InArgIdx;
+        }
+
+        // Check if the callee has a wrapper (custom or auto-custom)
+        DenseMap<Value *, Function *>::iterator UnwrappedFnIt =
+            UF.UC.UnwrappedFnMap.find(Callee);
+        if (UnwrappedFnIt != UF.UC.UnwrappedFnMap.end()) {
+          // Replace inline asm with a direct call to the callee
+          // visitWrappedCallBase will redirect to the wrapper
+          FunctionType *FT = Callee->getFunctionType();
+
+          // Adjust args to match function signature
+          SmallVector<Value *, 4> AdjustedArgs;
+          for (unsigned I = 0; I < FT->getNumParams() && I < CallArgs.size(); ++I) {
+            Value *Arg = CallArgs[I];
+            if (Arg->getType() != FT->getParamType(I)) {
+              Arg = IRB.CreateBitOrPointerCast(Arg, FT->getParamType(I));
+              UF.UC.markNosanitize(Arg);
+            }
+            AdjustedArgs.push_back(Arg);
+          }
+
+          CallInst *NewCall = IRB.CreateCall(Callee, AdjustedArgs);
+          UF.UC.markNosanitize(NewCall);
+
+          if (!CB.getType()->isVoidTy()) {
+            // Handle return value: replace all uses of the inline asm result
+            if (CB.getType() == NewCall->getType()) {
+              CB.replaceAllUsesWith(NewCall);
+            } else if (StructType *ST = dyn_cast<StructType>(CB.getType())) {
+              // Inline asm may return a struct; replace ExtractValue uses
+              for (auto *U : CB.users()) {
+                if (auto *EI = dyn_cast<ExtractValueInst>(U)) {
+                  if (EI->getIndices()[0] == 0) {
+                    // First element is typically the return value
+                    Value *Cast = IRB.CreateBitOrPointerCast(NewCall, EI->getType());
+                    UF.UC.markNosanitize(Cast);
+                    EI->replaceAllUsesWith(Cast);
+                  } else {
+                    // Other elements get zero/null
+                    EI->replaceAllUsesWith(Constant::getNullValue(EI->getType()));
+                  }
+                  UF.SkipInsts.insert(EI);
+                  UF.RemovalInsts.push_back(EI);
+                }
+              }
+            }
+          }
+          CB.eraseFromParent();
+
+          // Now handle the new call through the normal wrapped call path
+          visitWrappedCallBase(UnwrappedFnIt->second, *NewCall);
+          return;
+        }
+
+        // For in-scope or normal out-of-scope functions, replace with direct call
+        FunctionType *FT = Callee->getFunctionType();
+        SmallVector<Value *, 4> AdjustedArgs;
+        for (unsigned I = 0; I < FT->getNumParams() && I < CallArgs.size(); ++I) {
+          Value *Arg = CallArgs[I];
+          if (Arg->getType() != FT->getParamType(I)) {
+            Arg = IRB.CreateBitOrPointerCast(Arg, FT->getParamType(I));
+            UF.UC.markNosanitize(Arg);
+          }
+          AdjustedArgs.push_back(Arg);
+        }
+
+        CallInst *NewCall = IRB.CreateCall(Callee, AdjustedArgs);
+        UF.UC.markNosanitize(NewCall);
+
+        if (!CB.getType()->isVoidTy()) {
+          if (CB.getType() == NewCall->getType()) {
+            CB.replaceAllUsesWith(NewCall);
+          } else if (isa<StructType>(CB.getType())) {
+            for (auto *U : CB.users()) {
+              if (auto *EI = dyn_cast<ExtractValueInst>(U)) {
+                if (EI->getIndices()[0] == 0) {
+                  Value *Cast = IRB.CreateBitOrPointerCast(NewCall, EI->getType());
+                  UF.UC.markNosanitize(Cast);
+                  EI->replaceAllUsesWith(Cast);
+                } else {
+                  EI->replaceAllUsesWith(Constant::getNullValue(EI->getType()));
+                }
+                UF.SkipInsts.insert(EI);
+                UF.RemovalInsts.push_back(EI);
+              }
+            }
+          }
+        }
+        CB.eraseFromParent();
+
+        // Handle shadow propagation for the new call through visitCallBase
+        visitCallBase(*NewCall);
         return;
       }
     }
-    // replace with a load
-    for (auto *U : CB.users()) {
-      auto *EI = cast<ExtractValueInst>(U);
-      auto Idx = EI->getIndices()[0];
-      switch (Idx) {
-        case 0: // return value
-        {
-          // replace with a nullptr
-          auto *PTy = dyn_cast<PointerType>(EI->getType());
-          assert(PTy && "Expected pointer type for __get_user return value 1");
-          EI->replaceAllUsesWith(ConstantPointerNull::get(PTy));
-          break;
-        }
-        case 1: // loaded value
-        {
-          LoadInst *LI = IRB.CreateLoad(EI->getType(), CB.getArgOperand(0));
-          UF.UC.markNosanitize(LI);
-          Value *Shadow = UF.loadShadow(CB.getArgOperand(0), Size, Align(1), EI->getType(), LI);
-          UF.setShadow(LI, Shadow);
-          EI->replaceAllUsesWith(LI);
-          break;
-        }
-        case 2: // rsp
-        {
-          // use the original rsp value
-          EI->replaceAllUsesWith(CB.getArgOperand(2));
-          break;
-        }
-        default:
-          errs() << "Unhandled index for __get_user: " << Idx << "\n";
-      }
-      // set as skipped
-      UF.SkipInsts.insert(EI);
-      // add for removal
-      UF.RemovalInsts.push_back(EI);
-    }
-    CB.eraseFromParent();
   }
 
   return;
@@ -2750,6 +2840,11 @@ bool UCSan::runImpl(Module &M) {
   for (Function *F : FnsToInstrument) {
     if (!F || F->isDeclaration()) continue;
 
+    // Kernel-style inputs may use 8-byte stack alignment; force realignment so
+    // inserted UCSan runtime calls follow userspace ABI requirements.
+    F->addFnAttr(Attribute::getWithStackAlignment(*Ctx, Align(16)));
+    F->addFnAttr("stackrealign");
+
     // Add driver wrapper for entry point
     bool isEntry = false;
     if (F->getName() == Scope.entry ||
@@ -2826,11 +2921,20 @@ bool UCSan::runImpl(Module &M) {
   }
 
   // Fix initializer for declared global variables with external linkage
+  // Also strip dso_local so llc generates PIC-compatible relocations
+  // (needed for code compiled without -fPIC, e.g. kernel)
   for (GlobalVariable &GV : M.globals()) {
+    if (GV.isDSOLocal()) {
+      GV.setDSOLocal(false);
+    }
     if (GV.isDeclaration() && GV.hasExternalLinkage()) {
       GV.setLinkage(GlobalValue::WeakAnyLinkage);
-      Constant *ZeroInit = Constant::getNullValue(GV.getValueType());
-      GV.setInitializer(ZeroInit);
+      GV.setInitializer(Constant::getNullValue(GV.getValueType()));
+    }
+  }
+  for (Function &F : M) {
+    if (F.isDSOLocal()) {
+      F.setDSOLocal(false);
     }
   }
 
