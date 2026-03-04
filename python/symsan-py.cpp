@@ -394,12 +394,13 @@ static PyObject* ParseGEP(PyObject *self, PyObject *args) {
   uint64_t num_elems = 0;
   uint64_t elem_size = 0;
   int64_t current_offset = 0;
-  bool enum_index = false; // XXX: default to false?
+  int enum_index_i = 0; // PyArg 'p' expects int*
 
   if (!PyArg_ParseTuple(args, "IKILKKLp", &ptr_label, &ptr, &index_label, &index,
-      &num_elems, &elem_size, &current_offset, &enum_index)) {
+      &num_elems, &elem_size, &current_offset, &enum_index_i)) {
     return NULL;
   }
+  bool enum_index = (enum_index_i != 0);
 
   std::vector<uint64_t> tasks;
   if (__z3_parser->parse_gep(ptr_label, ptr, index_label, index, num_elems,

@@ -1706,8 +1706,27 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
     z3_task_t nested_tasks;
     add_nested_constraints(inputs, &nested_tasks);
 
+    // Normalize index expr to 64-bit bitvector.
+    // String-derived constraints may produce Int-sort indices.
+    z3::expr idx = i;
+    if (idx.is_bool()) {
+      // Defensive normalization: bool -> 1-bit BV.
+      idx = z3::ite(idx, context_.bv_val(1, 1), context_.bv_val(0, 1));
+    }
+    if (idx.is_int()) {
+      idx = z3::int2bv(64, idx);
+    } else if (idx.is_bv()) {
+      unsigned idx_bits = idx.get_sort().bv_size();
+      if (idx_bits < 64) {
+        idx = z3::zext(idx, 64 - idx_bits);
+      } else if (idx_bits > 64) {
+        idx = idx.extract(63, 0);
+      }
+    } else {
+      throw z3::exception("GEP index has unsupported sort");
+    }
+
     // first, check against fixed array bounds if available
-    z3::expr idx = z3::zext(i, 64 - size);
     if (num_elems > 0) {
       construct_index_tasks(idx, index, 0, num_elems, 1, nested_tasks, tasks);
     } else {
