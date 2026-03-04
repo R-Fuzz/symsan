@@ -307,14 +307,31 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     else if (op == __dfsan::LShr) return l1; // x >> 0 = x
     else if (op == __dfsan::AShr) return l1; // x >> 0 = x
   }
+  // Simplify PtrToInt(string_op) - base_addr to just PtrToInt (the index)
+  // This is the ptr2int+sub equivalent of what __taint_gep_offset does for GEP:
+  // ptr = base + index, so PtrToInt(ptr) - base = index,
+  // and PtrToInt already represents the index as a bitvector
+  if (op == __dfsan::Sub && l2 == 0 && l1 >= CONST_OFFSET) {
+    dfsan_label_info *l1_info = get_label_info(l1);
+    if (l1_info->op == __dfsan::PtrToInt && l1_info->l1 >= CONST_OFFSET) {
+      dfsan_label_info *src_info = get_label_info(l1_info->l1);
+      if (src_info->op >= __dfsan::fstr_op_start &&
+          src_info->op < __dfsan::fstr_op_end &&
+          src_info->op1.i == op2) {
+        AOUT("simplify ptr2int(string_op) - base: %d\n", l1);
+        return l1;
+      }
+    }
+  }
   if (op == __dfsan::Trunc) {
     if (__dfsan_label_info[l1].op == __dfsan::ZExt ||
         __dfsan_label_info[l1].op == __dfsan::SExt) {
       dfsan_label base = __dfsan_label_info[l1].l1;
       if (size == __dfsan_label_info[base].size) return base;
     }
-  } else if (op == __dfsan::Xor && l1 == l2) {
+  } else if ((op == __dfsan::Xor || op == __dfsan::Sub) && l1 == l2) {
     // x ^ x = 0
+    // x - x = 0
     return 0;
   }
 
