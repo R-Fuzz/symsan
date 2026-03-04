@@ -1649,7 +1649,7 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
 
     CallInst *NewAddr = IRB.CreateCall(
       UC.UCCheckPointerFn, {Addr, Shadow, ExtSize, Deref});
-    UC.markNosanitize(NewAddr);
+    // UC.markNosanitize(NewAddr); // don't mark as nonsanitize
 
     Value *Checked = NewAddr;
     if (Ty != NewAddr->getType()) {

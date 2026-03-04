@@ -3135,6 +3135,16 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
     return;
   }
 
+  // handle ucsan_check_pointer
+  if (F && ClWithUCSan && F->getName().equals("ucsan_check_pointer")) {
+    // just propagate the label
+    Value *Shadow = TF.getShadow(CB.getArgOperand(0));
+    if (!TF.TT.isZeroShadow(Shadow)) {
+      TF.setShadow(&CB, Shadow);
+    }
+    return;
+  }
+
   // Calls to this function are synthesized in wrappers, and we shouldn't
   // instrument them.
   if (F == TF.TT.TaintVarargWrapperFn.getCallee()->stripPointerCasts())
