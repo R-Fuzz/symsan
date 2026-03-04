@@ -289,6 +289,12 @@ static void add_ucsan_pass() {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] = "-ucsan-trace-bb=true";
   }
+
+  if (!use_ucsan_only) {
+    // TaintPass will run after UCSanPass
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = "-ucsan-with-taint=true";
+  }
 }
 
 static void edit_params(u32 argc, char **argv) {

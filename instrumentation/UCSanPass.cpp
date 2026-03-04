@@ -105,6 +105,11 @@ static cl::opt<bool> ClTraceBB("ucsan-trace-bb",
                                 cl::desc("Enable basic block tracing"),
                                 cl::Hidden, cl::init(false));
 
+static cl::opt<bool> ClWithTaintPass(
+    "ucsan-with-taint",
+    cl::desc("TaintPass will run after UCSanPass, defer taint custom functions"),
+    cl::Hidden, cl::init(false));
+
 // The ABI list files control how shadow parameters are passed.
 static cl::list<std::string> ClABIListFiles(
     "ucsan-abilist",
@@ -313,6 +318,7 @@ class UCSan {
   enum WrapperKind {
     WK_None,
     WK_Custom,
+    WK_TaintCustom, // custom in dfsan abilist, defer to TaintPass if available
     WK_AutoCustom
   };
 
@@ -1508,6 +1514,10 @@ Function *UCSan::getCustomFunction(const Function *F) {
 }
 
 UCSan::WrapperKind UCSan::getWrapperKind(Function *F) {
+  // Check ABIList for taint custom functions (handled by TaintPass if available)
+  if (ABIList.isIn(*F, "taint"))
+    return WK_TaintCustom;
+
   // Check ABIList for custom functions (priority)
   if (ABIList.isIn(*F, "custom"))
     return WK_Custom;
@@ -2286,6 +2296,25 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     }
     return true;
 
+  case UCSan::WK_TaintCustom:
+  {
+    // TaintPass will handle the __dfsw_ wrapping with proper taint labels.
+    // Just check pointer arguments here, skip ucsan arg/retval TLS.
+    auto *I = CB.arg_begin();
+    for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
+      if ((*I)->getType()->isPointerTy()) {
+        Value *sizeArg = ConstantInt::get(UF.UC.Int64Ty,
+            DL.getTypeAllocSize((*I)->getType()->getPointerElementType()));
+        Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB);
+        CB.setArgOperand(FT->getNumParams() - N, rptr);
+      }
+    }
+    // Set zero ucsan shadow for the return value; TaintPass will set the taint label.
+    if (!FT->getReturnType()->isVoidTy()) {
+      UF.setShadow(&CB, UF.UC.getZeroShadow(&CB));
+    }
+    return true; // fully handled, skip normal arg/retval TLS stores
+  }
   case UCSan::WK_Custom:
   {
     // Call the __dfsw_ wrapper with shadow arguments
@@ -2823,12 +2852,16 @@ bool UCSan::runImpl(Module &M) {
     if (inScope) {
       FnsToInstrument.push_back(&F);
     } else {
-      if (getWrapperKind(&F) != WK_Custom &&
-          getWrapperKind(&F) != WK_AutoCustom) {
-        FnsOutOfScope.push_back(&F);
-      } else {
+      auto WK = getWrapperKind(&F);
+      if (WK == WK_TaintCustom && ClWithTaintPass) {
+        // TaintPass will call the custom wrapper and pass taint labels.
+        // UCSan will only do check_pointer on pointer args at call sites.
+        UnwrappedFnMap[&F] = &F;
+      } else if (WK == WK_Custom || WK == WK_AutoCustom) {
         if (!F.isDeclaration()) F.deleteBody();
         UnwrappedFnMap[&F] = &F;
+      } else {
+        FnsOutOfScope.push_back(&F);
       }
     }
 

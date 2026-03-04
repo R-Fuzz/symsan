@@ -92,6 +92,8 @@ if args.taint:
     if not os.path.exists(taint_pass_path):
         print(f"Cannot find {taint_pass_path}")
         os._exit(1)
+    # Tell UCSanPass that TaintPass will run after it
+    cc += f" -ucsan-with-taint=true"
     # Load TaintPass library for cl::opt and pass registration
     cc += f" -load {taint_pass_path}" \
           f" -load-pass-plugin={taint_pass_path}" \
