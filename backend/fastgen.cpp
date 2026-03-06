@@ -279,6 +279,35 @@ __taint_trace_offset(dfsan_label offset_label, s64 offset, unsigned size) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_add_constraint(dfsan_label label, uint8_t result) {
+  if (label == 0)
+    return;
+
+  void *addr = __builtin_return_address(0);
+
+  AOUT("tainted add_constraint: %d, result: %u @%p\n", label, result, addr);
+
+  if (__pipe_fd < 0)
+    return;
+
+  pipe_msg msg = {
+    .msg_type = add_constraint_type,
+    .flags = 0,
+    .instance_id = __instance_id,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack,
+    .label = label,
+    .result = (uint64_t)result
+  };
+
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
+
+  return;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_memcmp(dfsan_label label) {
   if (label == 0)
     return;

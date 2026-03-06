@@ -204,6 +204,9 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, int64_t offset, unsigned size);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_add_constraint(dfsan_label label, uint8_t result);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_memcmp(dfsan_label label);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1802,6 +1805,21 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     if (ret) {
       taint_set_str_indexof_label(ret, *ret_label);
     }
+
+    // Emit length constraint: length(src) >= n, only when n is symbolic.
+    // When n is concrete, the buffer size is fixed and cannot diverge.
+    // When n is symbolic (from input), we must tie string length to n
+    // so Z3 does not shrink the string while leaving n large.
+    if (src_label != 0 && n_label != 0) {
+      dfsan_label len_label = dfsan_union(src_label, 0, __dfsan::flength,
+                                          sizeof(size_t) * 8, 0, (uint64_t)n);
+      if (len_label) {
+        dfsan_label ge_label = dfsan_union(len_label, n_label,
+                          (__dfsan::bvuge << 8) | __dfsan::ICmp, 1, n, n);
+        if (ge_label)
+          __taint_add_constraint(ge_label, 1);
+      }
+    }
   } else {
     *ret_label = 0;
   }
@@ -1879,6 +1897,21 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
     // Store the result pointer to recover symbolic length
     if (ret) {
       taint_set_str_indexof_label(ret, *ret_label);
+    }
+
+    // Emit length constraint: length(src) >= n, only when n is symbolic.
+    // When n is concrete, the buffer size is fixed and cannot diverge.
+    // When n is symbolic (from input), we must tie string length to n
+    // so Z3 does not shrink the string while leaving n large.
+    if (src_label != 0 && n_label != 0) {
+      dfsan_label len_label = dfsan_union(src_label, 0, __dfsan::flength,
+                                          sizeof(size_t) * 8, 0, (uint64_t)n);
+      if (len_label) {
+        dfsan_label ge_label = dfsan_union(len_label, n_label,
+                          (__dfsan::bvuge << 8) | __dfsan::ICmp, 1, n, n);
+        if (ge_label)
+          __taint_add_constraint(ge_label, 1);
+      }
     }
   } else {
     *ret_label = 0;

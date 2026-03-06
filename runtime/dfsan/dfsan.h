@@ -201,7 +201,8 @@ enum operators {
   fstrcmp   = last_llvm_op + 18, // 85 strcmp using Z3 string theory
   fprefixof = last_llvm_op + 19, // 86 prefixof(str, prefix) using Z3 string theory
   fsuffixof = last_llvm_op + 20, // 87 suffixof(str, suffix) using Z3 string theory
-  LastOp    = last_llvm_op + 21, // 88
+  flength   = last_llvm_op + 21, // 88 z3::length(str_var), Int sort
+  LastOp    = last_llvm_op + 22, // 89
 };
 
 enum predicate {
