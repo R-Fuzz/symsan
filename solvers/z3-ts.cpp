@@ -56,6 +56,7 @@ static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::fstrcat,  "strcat"},
   {__dfsan::fprefixof, "prefixof"},
   {__dfsan::fsuffixof, "suffixof"},
+  {__dfsan::flength, "length"},
 };
 
 static std::string get_op_name(uint32_t op) {
@@ -142,6 +143,8 @@ Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
     input_name_format = "input-%u-%u";
     atoi_name_format = "atoi-%u-%u-%d-%lu";       // input, offset, base, original_len
     strlen_name_format = "strlen-%u-%u-%lu-%u";   // input, offset, original_len, null_from_input
+    str_name_format = "str-%u-%u-%u";             // input, offset, length
+    int_name_format = "int-%u-%u-%u";             // input, offset, bits
   }
 
 int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
@@ -171,6 +174,7 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
   is_label_seq_.clear();
   is_label_seq_.resize(1); // reserve for CONST_OFFSET
 
+  aux_constraints_.clear();
   string_info_cache_.clear();
   branch_deps_.clear();
   branch_deps_.resize(inputs.size());
@@ -218,13 +222,16 @@ z3::expr Z3AstParser::read_concrete(dfsan_label label, uint16_t size) {
 }
 
 static z3::expr get_cmd(z3::expr const &lhs, z3::expr const &rhs, uint32_t predicate) {
+  // For Int operands, unsigned comparisons reduce to regular Int comparisons
+  // since Int variables are bounded to [0, 2^bits) by aux_constraints_
+  bool is_int = lhs.get_sort().is_int();
   switch (predicate) {
     case __dfsan::bveq:  return lhs == rhs;
     case __dfsan::bvneq: return lhs != rhs;
-    case __dfsan::bvugt: return z3::ugt(lhs, rhs);
-    case __dfsan::bvuge: return z3::uge(lhs, rhs);
-    case __dfsan::bvult: return z3::ult(lhs, rhs);
-    case __dfsan::bvule: return z3::ule(lhs, rhs);
+    case __dfsan::bvugt: return is_int ? (lhs > rhs) : z3::ugt(lhs, rhs);
+    case __dfsan::bvuge: return is_int ? (lhs >= rhs) : z3::uge(lhs, rhs);
+    case __dfsan::bvult: return is_int ? (lhs < rhs) : z3::ult(lhs, rhs);
+    case __dfsan::bvule: return is_int ? (lhs <= rhs) : z3::ule(lhs, rhs);
     case __dfsan::bvsgt: return lhs > rhs;
     case __dfsan::bvsge: return lhs >= rhs;
     case __dfsan::bvslt: return lhs < rhs;
@@ -448,13 +455,14 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       if (info->l1 >= CONST_OFFSET) {
         dfsan_label_info *src_info = get_label_info(info->l1);
         if (src_info->op >= __dfsan::fstr_op_start && src_info->op < __dfsan::fstr_op_end) {
-          // String op result - the "pointer" is semantically the index
-          // Convert the Int expression to a bitvector for downstream ops
+          // String op result (indexof) is Int sort — keep it as Int
+          // instead of int2bv which creates expensive mixed BV+string theory.
+          // Downstream Add/Sub/ICmp will detect Int operands and stay in Int domain,
+          // converting BV operands to fresh Int variables (intbyte-...) as needed.
           z3::expr idx = get_cached_expr(info->l1, input_deps);
-          z3::expr bv_idx = z3::int2bv(info->size, idx);
           tsize_cache_.emplace_back(tsize_cache_[info->l1]);
-          cache_expr(l, bv_idx);
-          TRACK_LABEL_BV_ONLY();
+          cache_expr(l, idx);  // keep Int sort
+          TRACK_LABEL_SEQ_ONLY();
           RECORD_VALUE(value_cache_[info->l1]);
           continue;
         }
@@ -597,6 +605,16 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       cache_expr(l, context_.constant(symbol, sort));
       TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(info->op2.i); // actual length for value cache
+      continue;
+    } else if (info->op == __dfsan::flength) {
+      // length(str_var) -> Int sort
+      // l1 = content label, l2 = 0, op2 = concrete length
+      z3::expr str_var = build_string_from_label(info->l1, input_deps);
+      z3::expr len_expr(context_, Z3_mk_seq_length(context_, str_var));
+      tsize_cache_.emplace_back(1);
+      cache_expr(l, len_expr);  // Int sort
+      TRACK_LABEL_SEQ_ONLY();
+      RECORD_VALUE(info->op2.i);
       continue;
     } else if (info->op == __dfsan::fstrchr) {
       // strchr/memchr: find character in string
@@ -1249,6 +1267,54 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       uint16_t l2_op = info->l2 >= CONST_OFFSET ? get_label_info(info->l2)->op : 0;
       bool l1_is_strfunc = (l1_op >= __dfsan::fstr_op_start && l1_op < __dfsan::fstr_op_end);
       bool l2_is_strfunc = (l2_op >= __dfsan::fstr_op_start && l2_op < __dfsan::fstr_op_end);
+      bool l1_is_flength = (l1_op == __dfsan::flength);
+      bool l2_is_flength = (l2_op == __dfsan::flength);
+
+      if (l1_is_flength || l2_is_flength) {
+        // Length comparison - produce Int sort comparison
+        uint16_t predicate = info->op >> 8;
+        z3::expr len_expr = l1_is_flength
+            ? get_cached_expr(info->l1, input_deps)
+            : get_cached_expr(info->l2, input_deps);
+        // Get the other operand as Int
+        z3::expr other(context_);
+        if (l1_is_flength && info->l2 == 0) {
+          other = context_.int_val((uint64_t)info->op2.i);
+        } else if (l2_is_flength && info->l1 == 0) {
+          other = context_.int_val((uint64_t)info->op1.i);
+        } else {
+          // Both symbolic - get other operand as Int
+          dfsan_label other_l = l1_is_flength ? info->l2 : info->l1;
+          other = get_cached_expr(other_l, input_deps);
+          if (other.is_bv()) {
+            other = z3::expr(context_, Z3_mk_bv2int(context_, other, false));
+          }
+          // else already Int (from sort coercion), use as-is
+        }
+        // If flength is on the right side, swap the comparison direction
+        if (l2_is_flength && !l1_is_flength) {
+          std::swap(len_expr, other);
+        }
+        z3::expr cmp_expr(context_);
+        switch (predicate) {
+          case __dfsan::bvuge: cmp_expr = len_expr >= other; break;
+          case __dfsan::bvugt: cmp_expr = len_expr > other; break;
+          case __dfsan::bvule: cmp_expr = len_expr <= other; break;
+          case __dfsan::bvult: cmp_expr = len_expr < other; break;
+          case __dfsan::bveq:  cmp_expr = len_expr == other; break;
+          case __dfsan::bvneq: cmp_expr = len_expr != other; break;
+          case __dfsan::bvsge: cmp_expr = len_expr >= other; break;
+          case __dfsan::bvsgt: cmp_expr = len_expr > other; break;
+          case __dfsan::bvsle: cmp_expr = len_expr <= other; break;
+          case __dfsan::bvslt: cmp_expr = len_expr < other; break;
+          default: throw z3::exception("unsupported predicate for flength comparison");
+        }
+        tsize_cache_.emplace_back(tsize_cache_[info->l1] + tsize_cache_[info->l2]);
+        cache_expr(l, cmp_expr);
+        TRACK_LABEL_SEQ_ONLY();
+        RECORD_VALUE(info->op2.i);
+        continue;
+      }
 
       if (l1_is_strfunc || l2_is_strfunc) {
         // String function comparison - convert index to found/not-found
@@ -1352,6 +1418,44 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     } else if (info->size == 1) {
       op2 = context_.bool_val(info->op2.i == 1);
     }
+
+    // Sort coercion: when one operand is Int (from string ops via PtrToInt)
+    // and the other is BV, convert the BV side to Int to avoid expensive int2bv.
+    // Tier 1: direct input bytes get a fresh named Int variable (int-id-offset-bits)
+    // Tier 2: complex BV expressions use bv2int (still cheaper than int2bv of indexof)
+    bool op1_is_int = op1.get_sort().is_int();
+    bool op2_is_int = op2.get_sort().is_int();
+    if (op1_is_int != op2_is_int) {
+      auto convert_bv_to_int = [&](z3::expr &bv_op, dfsan_label lbl, uint64_t concrete_val) {
+        if (lbl < CONST_OFFSET) {
+          // Constant — just use int_val
+          bv_op = context_.int_val(concrete_val);
+        } else {
+          dfsan_label_info *lbl_info = get_label_info(lbl);
+          if (lbl_info->op == 0) {
+            // Direct input byte — create named Int variable with bounds
+            char intname[256];
+            snprintf(intname, sizeof(intname), int_name_format,
+                     lbl_info->op2.i, lbl_info->op1.i, lbl_info->size);
+            z3::symbol sym = context_.str_symbol(intname);
+            bv_op = context_.constant(sym, context_.int_sort());
+            aux_constraints_.push_back(bv_op >= 0);
+            if (lbl_info->size < 64) {
+              aux_constraints_.push_back(bv_op < context_.int_val((uint64_t)(1ULL << lbl_info->size)));
+            }
+          } else {
+            // Complex BV expression — use bv2int (unsigned)
+            bv_op = z3::expr(context_, Z3_mk_bv2int(context_, bv_op, false));
+          }
+        }
+      };
+      if (!op1_is_int && op2_is_int) {
+        convert_bv_to_int(op1, info->l1, info->op1.i);
+      } else {
+        convert_bv_to_int(op2, info->l2, info->op2.i);
+      }
+    }
+
     // update tree_size
     tsize_cache_.emplace_back(tsize_cache_[info->l1] + tsize_cache_[info->l2]);
 
@@ -1395,7 +1499,13 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       }
       case __dfsan::Add: {
         cache_expr(l, op1 + op2);
-        TRACK_LABEL_BV_ONLY();
+        if (op1_is_int || op2_is_int) {
+          // After sort coercion, result is pure Int - no BV variables remain.
+          // SEQ_ONLY prevents spurious linking of string bytes as used_in_bv.
+          TRACK_LABEL_SEQ_ONLY();
+        } else {
+          TRACK_LABEL_BV_ONLY();
+        }
         RECORD_VALUE(val1 + val2);
         break;
       }
@@ -1410,7 +1520,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             if (src_info->op >= __dfsan::fstr_op_start &&
                 src_info->op < __dfsan::fstr_op_end) {
               // This is (PtrToInt(string_op)) - base_addr = index
-              // The expression is just the index (op1 already contains int2bv(idx))
+              // The expression is just the index (op1 already contains the idx)
               cache_expr(l, op1);
               TRACK_LABEL_SEQ_ONLY();
               // The value is just the index, not idx - base_addr
@@ -1420,7 +1530,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           }
         }
         cache_expr(l, op1 - op2);
-        TRACK_LABEL_BV_ONLY();
+        if (op1_is_int || op2_is_int) {
+          TRACK_LABEL_SEQ_ONLY();
+        } else {
+          TRACK_LABEL_BV_ONLY();
+        }
         RECORD_VALUE(val1 - val2);
         break;
       }
@@ -1525,7 +1639,13 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         // Cache the expression AFTER updating value_cache to maintain consistency
         // if an exception is thrown above
         cache_expr(l, get_cmd(op1, op2, info->op >> 8));
-        TRACK_LABEL_PROPAGATE_BOTH();
+        if (op1_is_int || op2_is_int) {
+          // After sort coercion, comparison is pure Int - no BV variables.
+          // SEQ_ONLY prevents spurious linking of string bytes.
+          TRACK_LABEL_SEQ_ONLY();
+        } else {
+          TRACK_LABEL_PROPAGATE_BOTH();
+        }
         break;
       }
       // concat
@@ -1940,6 +2060,10 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
     // Use default solver to auto-detect theory (needed for string constraints)
     z3::solver solver(context_);
     solver.set("timeout", timeout);
+    // add auxiliary constraints (e.g., Int variable bounds from sort coercion)
+    for (const auto &ac : aux_constraints_) {
+      solver.add(ac);
+    }
     // solve the first constraint (optimistic)
     z3::expr e = task->at(0);
     solver.add(e);
@@ -1977,26 +2101,33 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
         ret = nested_sat; // XXX: upgrade to nested_sat?
       }
 
-      // Check if model contains strlen symbols and optimize if needed
+      // Check if model contains strlen/str symbols and optimize if needed
       std::vector<std::pair<z3::expr, uint64_t>> strlen_vars; // (var, max_len)
+      std::vector<z3::expr> str_len_minimize; // str.len(str_var) to minimize
       const uint64_t MAX_STRLEN_EXTEND = 4096; // Reasonable max extension
 
       for (unsigned i = 0; i < m.num_consts(); ++i) {
         z3::func_decl decl = m.get_const_decl(i);
-        if (decl.name().kind() == Z3_STRING_SYMBOL &&
-            decl.name().str().find("strlen") == 0) {
-          uint32_t input, offset, null_from_input;
-          uint64_t orig_len;
-          if (sscanf(decl.name().str().c_str(), strlen_name_format,
-                     &input, &offset, &orig_len, &null_from_input) == 4) {
-            z3::expr strlen_var = context_.constant(decl.name(), decl.range());
-            uint64_t max_len = orig_len + MAX_STRLEN_EXTEND;
-            strlen_vars.emplace_back(strlen_var, max_len);
+        if (decl.name().kind() == Z3_STRING_SYMBOL) {
+          if (decl.name().str().find("strlen") == 0) {
+            uint32_t input, offset, null_from_input;
+            uint64_t orig_len;
+            if (sscanf(decl.name().str().c_str(), strlen_name_format,
+                       &input, &offset, &orig_len, &null_from_input) == 4) {
+              z3::expr strlen_var = context_.constant(decl.name(), decl.range());
+              uint64_t max_len = orig_len + MAX_STRLEN_EXTEND;
+              strlen_vars.emplace_back(strlen_var, max_len);
+            }
+          } else if (decl.name().str().find("str-") == 0) {
+            // Minimize string variable lengths to avoid unnecessarily large strings
+            z3::expr str_var = context_.constant(decl.name(), decl.range());
+            z3::expr len_expr(context_, Z3_mk_seq_length(context_, str_var));
+            str_len_minimize.push_back(len_expr);
           }
         }
       }
 
-      if (!strlen_vars.empty()) {
+      if (!strlen_vars.empty() || !str_len_minimize.empty()) {
         // fprintf(stderr, "DEBUG solve_task[%lu]: found %zu strlen variables, optimizing...\n", task_id, strlen_vars.size());
         // Step 1: Try optimizer to minimize strlen values (no hard bounds)
         z3::optimize opt(context_);
@@ -2004,12 +2135,18 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
         p.set("timeout", timeout);
         opt.set(p);
 
+        for (const auto &ac : aux_constraints_) {
+          opt.add(ac);
+        }
         for (const auto &expr : *task) {
           opt.add(expr);
         }
         for (const auto &sv : strlen_vars) {
           // fprintf(stderr, "DEBUG solve_task[%lu]: minimizing %s (max=%lu)\n", task_id, sv.first.to_string().c_str(), sv.second);
           opt.minimize(sv.first);
+        }
+        for (const auto &sl : str_len_minimize) {
+          opt.minimize(sl);
         }
 
         bool use_optimized = false;
@@ -2188,7 +2325,7 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         uint32_t input;
         uint32_t offset;
         uint32_t orig_len;
-        if (sscanf(name.str().c_str(), "str-%u-%u-%u", &input, &offset, &orig_len) != 3) {
+        if (sscanf(name.str().c_str(), str_name_format, &input, &offset, &orig_len) != 3) {
           continue;  // Skip malformed string variable
         }
 
@@ -2223,6 +2360,22 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
               solutions.emplace_back(input, offset + j, bytes[j]);
             }
           }
+        }
+      } else if (name.str().find("int-") == 0) {
+        // Int variable from BV-to-Int sort coercion (int-input-offset-bits)
+        // Maps back to input byte(s)
+        uint32_t input, offset, bits;
+        if (sscanf(name.str().c_str(), int_name_format,
+                   &input, &offset, &bits) != 3) {
+          continue;
+        }
+        uint64_t value = e.get_numeral_uint64();
+        uint32_t bytes = bits / 8;
+        if (bytes == 0) bytes = 1;
+        // Emit byte-level solutions (little-endian)
+        for (uint32_t i = 0; i < bytes; i++) {
+          solutions.emplace_back(input, offset + i, (uint8_t)(value & 0xff));
+          value >>= 8;
         }
       } else if (name.str().find("strrchr_idx_") == 0 ||
                  name.str().find("strchr_idx_") == 0) {
@@ -2280,6 +2433,9 @@ int Z3ParserSolver::export_task_smt2(uint64_t task_id, int fd) {
   try {
     // Create solver and add all constraints
     z3::solver solver(context_);
+    for (const auto &ac : aux_constraints_) {
+      solver.add(ac);
+    }
     for (const auto &expr : *task) {
       solver.add(expr);
     }
@@ -2319,7 +2475,7 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
 
     // Create a single symbolic string variable: str-input-offset-len
     char name[256];
-    snprintf(name, sizeof(name), "str-%u-%u-%u", input, offset, len);
+    snprintf(name, sizeof(name), str_name_format, input, offset, len);
     z3::symbol symbol = context_.str_symbol(name);
     z3::expr str_var = context_.constant(symbol, context_.string_sort());
 
@@ -2491,7 +2647,7 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
 
       // Create single symbolic string variable
       char name[256];
-      snprintf(name, sizeof(name), "str-%u-%u-%u", input_id, start_offset, len);
+      snprintf(name, sizeof(name), str_name_format, input_id, start_offset, len);
       z3::symbol symbol = context_.str_symbol(name);
       z3::expr str_var = context_.constant(symbol, context_.string_sort());
 
@@ -2555,7 +2711,7 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
 
     // Create a single-char symbolic string
     char name[256];
-    snprintf(name, sizeof(name), "str-%u-%u-%u", input, offset, 1);
+    snprintf(name, sizeof(name), str_name_format, input, offset, 1);
     z3::symbol symbol = context_.str_symbol(name);
     z3::expr str_var = context_.constant(symbol, context_.string_sort());
 

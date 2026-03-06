@@ -36,6 +36,11 @@ protected:
   const char* input_name_format;
   const char* atoi_name_format;
   const char* strlen_name_format;
+  const char* str_name_format;
+  const char* int_name_format;
+
+  // Auxiliary constraints generated during serialization (e.g., Int variable bounds)
+  std::vector<z3::expr> aux_constraints_;
 
   // String range entry with cached str- expr for linking constraints
   struct string_range_t {
