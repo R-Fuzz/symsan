@@ -517,6 +517,35 @@ static PyObject* SolveTask(PyObject *self, PyObject *args) {
   return ret;
 }
 
+static PyObject* ExportTaskSMT2(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  uint64_t id = 0;
+  const char *filename = NULL;
+  if (!PyArg_ParseTuple(args, "Ks", &id, &filename)) {
+    return NULL;
+  }
+
+  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+    return NULL;
+  }
+
+  int ret = __z3_parser->export_task_smt2(id, fd);
+  close(fd);
+
+  if (ret != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to export task as SMT2");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyMethodDef SymSanMethods[] = {
   {"init", (PyCFunction)SymSanInit, METH_VARARGS | METH_KEYWORDS, "initialize symsan target"},
   {"config", (PyCFunction)SymSanConfig, METH_VARARGS | METH_KEYWORDS, "config symsan"},
@@ -531,6 +560,7 @@ static PyMethodDef SymSanMethods[] = {
   {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},
   {"record_memcmp", RecordMemcmp, METH_VARARGS, "record a memcmp event"},
   {"solve_task", SolveTask, METH_VARARGS, "solve a task"},
+  {"export_task_smt2", ExportTaskSMT2, METH_VARARGS, "export a task as SMT-LIB v2 to a file"},
   {NULL, NULL, 0, NULL}  /* Sentinel */
 };
 
