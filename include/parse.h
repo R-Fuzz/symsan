@@ -74,6 +74,11 @@ public:
   /// @return 0 on success, -1 on failure
   virtual int add_constraints(dfsan_label label, uint64_t result) = 0;
 
+  /// @brief Record a label to minimize during solving (e.g., malloc size)
+  /// @param label symbolic label to minimize
+  /// @return 0 on success, -1 on failure
+  virtual int record_minimize(dfsan_label label) { (void)label; return 0; }
+
   virtual int record_memcmp(dfsan_label label, uint8_t* buf, size_t size) {
     auto content = std::make_unique<uint8_t[]>(size);
     memcpy(content.get(), buf, size);

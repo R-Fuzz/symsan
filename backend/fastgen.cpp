@@ -308,6 +308,31 @@ __taint_add_constraint(dfsan_label label, uint8_t result) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_minimize_label(dfsan_label label) {
+  if (label == 0)
+    return;
+
+  AOUT("minimize label: %d\n", label);
+
+  if (__pipe_fd < 0)
+    return;
+
+  pipe_msg msg = {
+    .msg_type = minimize_type,
+    .flags = 0,
+    .instance_id = __instance_id,
+    .addr = 0,
+    .context = __taint_trace_callstack,
+    .label = label,
+    .result = 0
+  };
+
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_memcmp(dfsan_label label) {
   if (label == 0)
     return;

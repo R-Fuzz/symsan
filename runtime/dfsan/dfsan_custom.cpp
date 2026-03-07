@@ -207,6 +207,9 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_add_constraint(dfsan_label label, uint8_t result);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_minimize_label(dfsan_label label);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_memcmp(dfsan_label label);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -2929,11 +2932,15 @@ char *__dfsw_fgets_unlocked(char *s, int size, FILE *stream, dfsan_label s_label
 }
 
 static inline void __taint_check_malloc_size(size_t size, dfsan_label size_label) {
-  if (size_label && flags().solve_ub) {
+  if (size_label) {
     AOUT("*alloc size: %lu = %d\n", size, size_label);
-    // -fsanitize=unsigned-integer-overflow
-    dfsan_label os = dfsan_union(0, size_label, (bveq << 8) | ICmp, 64, 0, size);
-    __taint_trace_cond(os, 0, UndefinedCheck, ub_integer_overflow);
+    // hint solver to minimize allocation size
+    __taint_minimize_label(size_label);
+    if (flags().solve_ub) {
+      // -fsanitize=unsigned-integer-overflow
+      dfsan_label os = dfsan_union(0, size_label, (bveq << 8) | ICmp, 64, 0, size);
+      __taint_trace_cond(os, 0, UndefinedCheck, ub_integer_overflow);
+    }
   }
 }
 

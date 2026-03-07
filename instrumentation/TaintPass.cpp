@@ -413,6 +413,7 @@ class Taint {
   FunctionType *TaintSolveSizeFnTy;
   FunctionType *TaintTraceGlobalFnTy;
   FunctionType *TaintDebugFnTy;
+  FunctionType *TaintMinimizeLabelFnTy;
   FunctionCallee TaintUnionFn;
   FunctionCallee TaintUnionLoadFn;
   FunctionCallee TaintUnionStoreFn;
@@ -436,6 +437,7 @@ class Taint {
   FunctionCallee TaintSolveSizeFn;
   FunctionCallee TaintTraceGlobalFn;
   FunctionCallee TaintDebugFn;
+  FunctionCallee TaintMinimizeLabelFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
   Constant *CallStack;
   MDNode *ColdCallWeights;
@@ -1026,6 +1028,9 @@ bool Taint::initializeModule(Module &M) {
       {PrimitiveShadowTy, PrimitiveShadowTy, PrimitiveShadowTy,
        PrimitiveShadowTy, PrimitiveShadowTy}, false);
 
+  TaintMinimizeLabelFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), { PrimitiveShadowTy }, false);
+
   ColdCallWeights = MDBuilder(*Ctx).createBranchWeights(1, 1000);
   return true;
 }
@@ -1225,6 +1230,13 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     TaintDebugFn =
         Mod->getOrInsertFunction("__taint_debug", TaintDebugFnTy);
   }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    TaintMinimizeLabelFn =
+        Mod->getOrInsertFunction("__taint_minimize_label", TaintMinimizeLabelFnTy, AL);
+  }
 
   TaintRuntimeFunctions.insert(
       TaintUnionFn.getCallee()->stripPointerCasts());
@@ -1244,6 +1256,8 @@ void Taint::initializeRuntimeFunctions(Module &M) {
       TaintVarargWrapperFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintDebugFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintMinimizeLabelFn.getCallee()->stripPointerCasts());
 }
 
 // Initializes event callback functions and declare them in the module
@@ -1632,6 +1646,51 @@ bool Taint::runImpl(Module &M) {
         // TaintVisitor may delete Inst, so keep track of whether it was a
         // terminator.
         bool IsTerminator = Inst->isTerminator();
+        // Emit minimize hints for nosanitize alloc calls (from UCSanPass)
+        if (ClWithUCSan && Inst->getMetadata("nosanitize")) {
+          if (auto *CI = dyn_cast<CallInst>(Inst)) {
+            if (Function *Callee = CI->getCalledFunction()) {
+              StringRef FName = Callee->getName();
+              if (FName.startswith("__dfsw_")) {
+                StringRef BaseName = FName.drop_front(7); // skip "__dfsw_"
+                // Map: function name -> list of arg indices that are allocation sizes
+                // malloc(size)=0, calloc(nmemb,size)=0,1, realloc(ptr,size)=1,
+                // reallocarray(ptr,nmemb,size)=1,2, aligned_alloc(align,size)=1,
+                // memalign(align,size)=1, valloc(size)=0, pvalloc(size)=0,
+                // posix_memalign(memptr,align,size)=2
+                SmallVector<unsigned, 2> SizeArgIndices;
+                if (BaseName == "malloc" || BaseName == "__libc_malloc" ||
+                    BaseName == "valloc" || BaseName == "__libc_valloc" ||
+                    BaseName == "pvalloc" || BaseName == "__libc_pvalloc" ||
+                    BaseName == "kmalloc_large") {
+                  SizeArgIndices.push_back(0);
+                } else if (BaseName == "calloc" || BaseName == "__libc_calloc") {
+                  SizeArgIndices.push_back(0);
+                  SizeArgIndices.push_back(1);
+                } else if (BaseName == "realloc" || BaseName == "__libc_realloc" ||
+                           BaseName == "aligned_alloc" ||
+                           BaseName == "memalign" || BaseName == "__libc_memalign" ||
+                           BaseName == "kmalloc" || BaseName == "__kmalloc") {
+                  SizeArgIndices.push_back(1);
+                } else if (BaseName == "reallocarray" || BaseName == "__libc_reallocarray") {
+                  SizeArgIndices.push_back(1);
+                  SizeArgIndices.push_back(2);
+                } else if (BaseName == "posix_memalign") {
+                  SizeArgIndices.push_back(2);
+                }
+                if (!SizeArgIndices.empty()) {
+                  IRBuilder<> IRB(CI);
+                  for (unsigned Idx : SizeArgIndices) {
+                    Value *Shadow = TF.getShadow(CI->getArgOperand(Idx));
+                    if (!TF.TT.isZeroShadow(Shadow)) {
+                      IRB.CreateCall(TF.TT.TaintMinimizeLabelFn, {Shadow});
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
         if (!TF.SkipInsts.count(Inst) && !Inst->getMetadata("nosanitize"))
           TaintVisitor(TF).visit(Inst);
         if (IsTerminator)

@@ -347,6 +347,9 @@ int main(int argc, char* const argv[]) {
                   msg.label, msg.result, (void*)msg.addr);
         }
         break;
+      case minimize_type:
+        __z3_parser->record_minimize(msg.label);
+        break;
       default:
         break;
     }

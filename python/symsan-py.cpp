@@ -467,6 +467,26 @@ static PyObject* RecordMemcmp(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject* RecordMinimize(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  dfsan_label label = 0;
+
+  if (!PyArg_ParseTuple(args, "I", &label)) {
+    return NULL;
+  }
+
+  if (__z3_parser->record_minimize(label) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to record minimize hint");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyObject* SolveTask(PyObject *self, PyObject *args) {
   if (__z3_parser == nullptr) {
     PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
@@ -559,6 +579,7 @@ static PyMethodDef SymSanMethods[] = {
   {"parse_gep", ParseGEP, METH_VARARGS, "parse trace_gep event into solving tasks"},
   {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},
   {"record_memcmp", RecordMemcmp, METH_VARARGS, "record a memcmp event"},
+  {"record_minimize", RecordMinimize, METH_VARARGS, "record a label to minimize during solving (e.g., malloc size)"},
   {"solve_task", SolveTask, METH_VARARGS, "solve a task"},
   {"export_task_smt2", ExportTaskSMT2, METH_VARARGS, "export a task as SMT-LIB v2 to a file"},
   {NULL, NULL, 0, NULL}  /* Sentinel */

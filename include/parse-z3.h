@@ -30,6 +30,7 @@ public:
                 std::vector<uint64_t> &tasks) override;
 
   int add_constraints(dfsan_label label, uint64_t result) override;
+  int record_minimize(dfsan_label label) override;
 
 protected:
   z3::context &context_;
@@ -41,6 +42,11 @@ protected:
 
   // Auxiliary constraints generated during serialization (e.g., Int variable bounds)
   std::vector<z3::expr> aux_constraints_;
+
+  // Expressions to minimize during solving (e.g., malloc sizes)
+  // Each entry: (expr to minimize, set of input offsets it depends on)
+  using minimize_hint_t = std::pair<z3::expr, std::unordered_set<offset_t, offset_hash>>;
+  std::vector<minimize_hint_t> minimize_hints_;
 
   // String range entry with cached str- expr for linking constraints
   struct string_range_t {

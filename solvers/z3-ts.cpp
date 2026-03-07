@@ -175,6 +175,7 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
   is_label_seq_.resize(1); // reserve for CONST_OFFSET
 
   aux_constraints_.clear();
+  minimize_hints_.clear();
   string_info_cache_.clear();
   branch_deps_.clear();
   branch_deps_.resize(inputs.size());
@@ -1931,6 +1932,27 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
   return 0;
 }
 
+int Z3AstParser::record_minimize(dfsan_label label) {
+  if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
+    return -1;
+  }
+
+  try {
+    input_dep_set_t inputs;
+    z3::expr expr = serialize(label, inputs);
+    if (expr.is_bv() && !inputs.empty()) {
+      minimize_hints_.emplace_back(expr, inputs);
+    }
+  } catch (z3::exception e) {
+    fprintf(stderr, "WARNING: z3 exception in record_minimize: %s\n", e.msg());
+    return -1;
+  } catch (...) {
+    return -1;
+  }
+
+  return 0;
+}
+
 void Z3AstParser::mark_expr_type(dfsan_label label, input_dep_set_t &inputs) {
   bool is_bv = is_label_bv_.at(label);
   bool is_seq = is_label_seq_.at(label);
@@ -2106,6 +2128,9 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
       std::vector<z3::expr> str_len_minimize; // str.len(str_var) to minimize
       const uint64_t MAX_STRLEN_EXTEND = 4096; // Reasonable max extension
 
+      // Collect input offsets from the model for minimize hint matching
+      std::unordered_set<offset_t, offset_hash> model_inputs;
+
       for (unsigned i = 0; i < m.num_consts(); ++i) {
         z3::func_decl decl = m.get_const_decl(i);
         if (decl.name().kind() == Z3_STRING_SYMBOL) {
@@ -2123,13 +2148,28 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
             z3::expr str_var = context_.constant(decl.name(), decl.range());
             z3::expr len_expr(context_, Z3_mk_seq_length(context_, str_var));
             str_len_minimize.push_back(len_expr);
+          } else if (decl.name().str().find("input") == 0) {
+            uint32_t input, offset;
+            if (sscanf(decl.name().str().c_str(), input_name_format, &input, &offset) == 2) {
+              model_inputs.emplace(input, offset);
+            }
           }
         }
       }
 
-      if (!strlen_vars.empty() || !str_len_minimize.empty()) {
-        // fprintf(stderr, "DEBUG solve_task[%lu]: found %zu strlen variables, optimizing...\n", task_id, strlen_vars.size());
-        // Step 1: Try optimizer to minimize strlen values (no hard bounds)
+      // Find matching minimize hints based on input dep overlap
+      std::vector<z3::expr> alloc_minimize;
+      for (const auto &hint : minimize_hints_) {
+        for (const auto &dep : hint.second) {
+          if (model_inputs.count(dep)) {
+            alloc_minimize.push_back(hint.first);
+            break;
+          }
+        }
+      }
+
+      if (!strlen_vars.empty() || !str_len_minimize.empty() || !alloc_minimize.empty()) {
+        // Try optimizer to minimize values (no hard bounds)
         z3::optimize opt(context_);
         z3::params p(context_);
         p.set("timeout", timeout);
@@ -2142,17 +2182,18 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           opt.add(expr);
         }
         for (const auto &sv : strlen_vars) {
-          // fprintf(stderr, "DEBUG solve_task[%lu]: minimizing %s (max=%lu)\n", task_id, sv.first.to_string().c_str(), sv.second);
           opt.minimize(sv.first);
         }
         for (const auto &sl : str_len_minimize) {
           opt.minimize(sl);
         }
+        for (const auto &am : alloc_minimize) {
+          opt.minimize(am);
+        }
 
         bool use_optimized = false;
         if (opt.check() == z3::sat) {
           z3::model opt_model = opt.get_model();
-          // fprintf(stderr, "DEBUG solve_task[%lu]: optimized SAT model:\n%s\n", task_id, opt_model.to_string().c_str());
           // Check if all strlen values are within bounds
           bool all_within_bounds = true;
           for (const auto &sv : strlen_vars) {
@@ -2166,23 +2207,20 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           if (all_within_bounds) {
             m = opt_model;
             use_optimized = true;
-            // fprintf(stderr, "DEBUG solve_task[%lu]: using optimized model (all within bounds)\n", task_id);
           }
           // else: optimized model exceeds bounds, fall back to bounded solver
         }
 
         // Step 2: If optimization failed or exceeded bounds, try solver with bound constraints
         if (!use_optimized) {
-          // fprintf(stderr, "DEBUG solve_task[%lu]: adding bound constraints and re-checking\n", task_id);
           solver.push();
           for (const auto &sv : strlen_vars) {
             solver.add(z3::ule(sv.first, context_.bv_val(sv.second, sv.first.get_sort().bv_size())));
           }
           if (solver.check() == z3::sat) {
             m = solver.get_model();
-            // fprintf(stderr, "DEBUG solve_task[%lu]: bounded SAT model:\n%s\n", task_id, m.to_string().c_str());
           } else {
-            // Step 3: Unsolvable within bounds, skip
+            // Unsolvable within bounds, skip
             solver.pop();
             return ret;
           }

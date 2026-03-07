@@ -281,6 +281,7 @@ enum pipe_msg_type {
   bb_type,
   event_type,
   gv_type,
+  minimize_type,
 };
 
 static const uint8_t TrueBranchLoopLatch = 0x8;
