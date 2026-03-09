@@ -177,6 +177,7 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
   aux_constraints_.clear();
   minimize_hints_.clear();
   string_info_cache_.clear();
+  int_var_cache_.clear();
   branch_deps_.clear();
   branch_deps_.resize(inputs.size());
   for (size_t i = 0; i < inputs.size(); i++) {
@@ -461,6 +462,15 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // Downstream Add/Sub/ICmp will detect Int operands and stay in Int domain,
           // converting BV operands to fresh Int variables (intbyte-...) as needed.
           z3::expr idx = get_cached_expr(info->l1, input_deps);
+          // String index ops (indexof, last_indexof) return position relative
+          // to the string variable. But PtrToInt should give the absolute
+          // position from the start of the input buffer. Add the string's
+          // starting offset to convert relative -> absolute.
+          dfsan_label content_label = src_info->l1; // haystack content label
+          auto si_it = string_info_cache_.find(content_label);
+          if (si_it != string_info_cache_.end() && si_it->second.offset > 0) {
+            idx = idx + context_.int_val(si_it->second.offset);
+          }
           tsize_cache_.emplace_back(tsize_cache_[info->l1]);
           cache_expr(l, idx);  // keep Int sort
           TRACK_LABEL_SEQ_ONLY();
@@ -983,6 +993,28 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         if (info->l2 >= CONST_OFFSET) {
           // l2 is the string op label - its cached value is the index/length
           len_expr = get_cached_expr(info->l2, input_deps);
+          // seq_extract needs Int sort; convert BV when n comes from input bytes
+          if (len_expr.get_sort().is_bv()) {
+            // For direct input labels, reuse the named Int variable (int-id-off-bits)
+            // which sort coercion may have already constrained. Using the same name
+            // avoids expanding bv2int into an expensive polynomial in str.substr.
+            dfsan_label_info *l2_info = get_label_info(info->l2);
+            if (l2_info->op == 0) {
+              char intname[256];
+              snprintf(intname, sizeof(intname), int_name_format,
+                       l2_info->op2.i, l2_info->op1.i, l2_info->size);
+              z3::symbol sym = context_.str_symbol(intname);
+              len_expr = context_.constant(sym, context_.int_sort());
+              // Ensure bounds and BV linkage exist (idempotent if sort coercion already added them)
+              aux_constraints_.push_back(len_expr >= 0);
+              aux_constraints_.push_back(len_expr == z3::expr(context_,
+                  Z3_mk_bv2int(context_, get_cached_expr(info->l2, input_deps), false)));
+              // Cache int-* variable for Int mirroring of BV comparisons
+              int_var_cache_.emplace(info->l2, len_expr);
+            } else {
+              len_expr = z3::expr(context_, Z3_mk_bv2int(context_, len_expr, false));
+            }
+          }
         }
         substr_expr = z3::expr(context_, Z3_mk_seq_extract(context_,
                                                            full_str,
@@ -1292,10 +1324,6 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           }
           // else already Int (from sort coercion), use as-is
         }
-        // If flength is on the right side, swap the comparison direction
-        if (l2_is_flength && !l1_is_flength) {
-          std::swap(len_expr, other);
-        }
         z3::expr cmp_expr(context_);
         switch (predicate) {
           case __dfsan::bvuge: cmp_expr = len_expr >= other; break;
@@ -1313,7 +1341,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         tsize_cache_.emplace_back(tsize_cache_[info->l1] + tsize_cache_[info->l2]);
         cache_expr(l, cmp_expr);
         TRACK_LABEL_SEQ_ONLY();
-        RECORD_VALUE(info->op2.i);
+        {
+          uint64_t cmp_result = eval_icmp(predicate,
+              (uint64_t)info->op1.i, (uint64_t)info->op2.i, 64) ? 1 : 0;
+          RECORD_VALUE(cmp_result);
+        }
         continue;
       }
 
@@ -1444,6 +1476,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             if (lbl_info->size < 64) {
               aux_constraints_.push_back(bv_op < context_.int_val((uint64_t)(1ULL << lbl_info->size)));
             }
+            // Cache int-* variable for Int mirroring of BV comparisons
+            int_var_cache_.emplace(lbl, bv_op);
           } else {
             // Complex BV expression — use bv2int (unsigned)
             bv_op = z3::expr(context_, Z3_mk_bv2int(context_, bv_op, false));
@@ -1907,6 +1941,7 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
     z3::expr r = context_.bv_val(result, size);
     // add constraint
     if (expr.is_bool()) r = context_.bool_val(result);
+    else if (expr.is_int()) r = context_.int_val(result);
 
 #if FILTER_WRONG_AST
     // double check if label is valid
@@ -1919,6 +1954,22 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
 #endif
 
     save_constraint(expr == r, inputs);
+
+    // Track ICmp comparisons for Int mirroring of BV nested constraints.
+    // When both operands later get int-* variables (from sort coercion or fsubstr),
+    // add_nested_constraints will add the equivalent Int comparison to prevent
+    // the optimizer from minimizing int-* variables in ways that violate BV ordering.
+    dfsan_label_info *cmp_info = get_label_info(label);
+    if ((cmp_info->op & 0xff) == __dfsan::ICmp) {
+      cmp_info_t cmp{cmp_info->l1, cmp_info->l2,
+                     (uint16_t)(cmp_info->op >> 8), (bool)result};
+      for (auto &off : inputs) {
+        auto c = get_branch_dep(off);
+        if (c != nullptr) {
+          c->cmp_deps.push_back(cmp);
+        }
+      }
+    }
   } catch (z3::exception e) {
     return -1;
   } catch (std::exception& e) {
@@ -2028,6 +2079,31 @@ size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, z3_task_t *t
     add_string_bitvec_link(off, task);
   }
 
+  // Add Int mirrors of BV comparisons when both operands have int-* variables.
+  // This prevents the optimizer from minimizing int-* variables in ways that
+  // violate BV ordering constraints (e.g., bvsle alloc n → int_alloc <= int_n).
+  if (!int_var_cache_.empty()) {
+    std::set<std::pair<dfsan_label, dfsan_label>> processed_cmps;
+    for (auto &off : inputs) {
+      auto deps = get_branch_dep(off);
+      if (deps == nullptr) continue;
+      for (auto &cmp : deps->cmp_deps) {
+        auto key = std::make_pair(cmp.l1, cmp.l2);
+        if (!processed_cmps.insert(key).second) continue;
+        auto it1 = int_var_cache_.find(cmp.l1);
+        auto it2 = int_var_cache_.find(cmp.l2);
+        if (it1 != int_var_cache_.end() && it2 != int_var_cache_.end()) {
+          // Both operands have int-* variables — add Int comparison
+          z3::expr int_cmp = get_cmd(it1->second, it2->second, cmp.predicate);
+          z3::expr int_constraint = cmp.result ? int_cmp : !int_cmp;
+          task->push_back(int_constraint);
+          // fprintf(stderr, "DEBUG: adding Int mirror: %s\n",
+          //         int_constraint.to_string().c_str());
+        }
+      }
+    }
+  }
+
   return added.size();
 }
 
@@ -2094,6 +2170,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
     // fprintf(stderr, "DEBUG solve_task[%lu]: result = %d (sat=1, unsat=0, unknown=2)\n", task_id, (int)res);
     if (res == z3::sat) {
       ret = opt_sat;
+      bool str_abstract = false; // true if model from string_solver=none
       // optimistic sat, save a model
       z3::model m = solver.get_model();
       // fprintf(stderr, "DEBUG solve_task[%lu]: optimistic SAT model:\n%s\n", task_id, m.to_string().c_str());
@@ -2117,13 +2194,38 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
               task_id, solver.to_smt2().c_str());
           ret = opt_sat_nested_unsat;
         } else {
-          ret = opt_sat_nested_timeout;
+          // Nested check timed out with seq solver. Retry with
+          // string_solver=none which treats string ops (e.g., last_indexof)
+          // abstractly, avoiding expensive seq axiom instantiation while
+          // still solving BV/Int arithmetic correctly.
+          z3::set_param("smt.string_solver", "none");
+          z3::solver fallback(context_);
+          fallback.set("timeout", timeout);
+          for (const auto &ac : aux_constraints_) {
+            fallback.add(ac);
+          }
+          for (const auto &expr : *task) {
+            fallback.add(expr);
+          }
+          z3::check_result fb_res = fallback.check();
+          z3::set_param("smt.string_solver", "seq");
+          if (fb_res == z3::sat) {
+            ret = nested_sat;
+            m = fallback.get_model();
+            str_abstract = true;
+          } else {
+            ret = opt_sat_nested_timeout;
+          }
         }
+        // pop nested constraints so solver is clean for optimization below
+        solver.pop();
       } else {
         ret = nested_sat; // XXX: upgrade to nested_sat?
       }
 
       // Check if model contains strlen/str symbols and optimize if needed
+      // Skip string optimization when model came from string_solver=none
+      // (string variables are abstract and can't be meaningfully minimized)
       std::vector<std::pair<z3::expr, uint64_t>> strlen_vars; // (var, max_len)
       std::vector<z3::expr> str_len_minimize; // str.len(str_var) to minimize
       const uint64_t MAX_STRLEN_EXTEND = 4096; // Reasonable max extension
@@ -2143,11 +2245,16 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
               uint64_t max_len = orig_len + MAX_STRLEN_EXTEND;
               strlen_vars.emplace_back(strlen_var, max_len);
             }
-          } else if (decl.name().str().find("str-") == 0) {
+          } else if (!str_abstract && decl.name().str().find("str-") == 0) {
             // Minimize string variable lengths to avoid unnecessarily large strings
             z3::expr str_var = context_.constant(decl.name(), decl.range());
             z3::expr len_expr(context_, Z3_mk_seq_length(context_, str_var));
             str_len_minimize.push_back(len_expr);
+          } else if (decl.name().str().find("int-") == 0) {
+            // Int variables from sort coercion (e.g., int-0-0-64) — minimize
+            // to keep close to original value and avoid changing allocation sizes
+            z3::expr int_var = context_.constant(decl.name(), decl.range());
+            str_len_minimize.push_back(int_var);
           } else if (decl.name().str().find("input") == 0) {
             uint32_t input, offset;
             if (sscanf(decl.name().str().c_str(), input_name_format, &input, &offset) == 2) {
@@ -2212,18 +2319,16 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
         }
 
         // Step 2: If optimization failed or exceeded bounds, try solver with bound constraints
-        if (!use_optimized) {
+        if (!use_optimized && !strlen_vars.empty()) {
+          // Only try bounded solver if there are strlen vars to bound
           solver.push();
           for (const auto &sv : strlen_vars) {
             solver.add(z3::ule(sv.first, context_.bv_val(sv.second, sv.first.get_sort().bv_size())));
           }
           if (solver.check() == z3::sat) {
             m = solver.get_model();
-          } else {
-            // Unsolvable within bounds, skip
-            solver.pop();
-            return ret;
           }
+          // else: bounded check failed, fall through with original model m
           solver.pop();
         }
       }
@@ -2341,6 +2446,9 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         if (target_len > orig_len) {
           // Extending: insert bytes to make the string longer
           uint64_t extend_by = target_len - orig_len;
+          if (extend_by > std::vector<uint8_t>().max_size()) {
+            continue; // skip unreasonable extension
+          }
           std::vector<uint8_t> fill_bytes(extend_by, 'A');
           solutions.emplace_back(input, offset + (uint32_t)orig_len, std::move(fill_bytes));
           // For plain strings (null_from_input=1), add null terminator at new end

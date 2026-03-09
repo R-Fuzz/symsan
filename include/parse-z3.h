@@ -121,16 +121,29 @@ private:
     }
   };
   using expr_set_t = std::unordered_set<z3::expr, expr_hash, expr_equal>;
+  // Comparison info stored for Int mirroring of BV nested constraints
+  struct cmp_info_t {
+    dfsan_label l1;      // left operand label
+    dfsan_label l2;      // right operand label
+    uint16_t predicate;  // comparison predicate (e.g., bvsle)
+    bool result;         // concrete result (true/false)
+  };
+
   struct branch_dependency_t {
     expr_set_t expr_deps;
     input_dep_set_t input_deps;
     bool used_in_bv = false;   // any saved constraint involves bitvec
     bool used_in_seq = false;  // any saved constraint involves string/seq
     z3::expr input_expr;  // cached input-X-Y expr (z3::expr handles refcount)
+    std::vector<cmp_info_t> cmp_deps;  // ICmp constraints for Int mirroring
 
     // Only constructor: must have input_expr (linear scan guarantees this)
     branch_dependency_t(z3::expr e) : input_expr(e) {}
   };
+
+  // Cache of int-* variables: label -> Int z3 expr
+  // Populated when int-* variables are created in convert_bv_to_int or fsubstr handler
+  std::unordered_map<dfsan_label, z3::expr> int_var_cache_;
   using branch_dep_t = std::unique_ptr<struct branch_dependency_t>;
   using offset_dep_t = std::vector<branch_dep_t>;
   std::vector<offset_dep_t> branch_deps_;
