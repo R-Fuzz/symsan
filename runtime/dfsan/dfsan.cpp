@@ -1955,6 +1955,11 @@ void __taint_copy_shadow(void *dst, void *src, uint64_t size) {
   dfsan_label *dst_shadow = shadow_for(dst);
   dfsan_label *src_shadow = shadow_for(src);
   internal_memcpy(dst_shadow, src_shadow, size * sizeof(dfsan_label));
+  // Propagate string content label from src to dst
+  dfsan_label str_label = taint_get_str_content_label(src);
+  if (str_label != 0) {
+    taint_set_str_content_label(dst, str_label);
+  }
 }
 
 // Move SymSan shadow memory from src to dst (handles overlapping regions)
@@ -1964,6 +1969,11 @@ void __taint_move_shadow(void *dst, void *src, uint64_t size) {
   dfsan_label *dst_shadow = shadow_for(dst);
   dfsan_label *src_shadow = shadow_for(src);
   internal_memmove(dst_shadow, src_shadow, size * sizeof(dfsan_label));
+  // Propagate string content label from src to dst
+  dfsan_label str_label = taint_get_str_content_label(src);
+  if (str_label != 0) {
+    taint_set_str_content_label(dst, str_label);
+  }
 }
 
 }  // extern "C"

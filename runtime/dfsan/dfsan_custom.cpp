@@ -63,6 +63,26 @@ SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE void f(__VA_ARGS__);
 
 static off_t current_stdin_offset = 0;
 
+// Get the concrete string length represented by a taint label.
+// Returns 0 if the length cannot be determined.
+static size_t get_label_string_length(dfsan_label label) {
+  if (label < CONST_OFFSET) return 0;
+  dfsan_label_info *info = dfsan_get_label_info(label);
+  if (!info) return 0;
+
+  if (info->op == __dfsan::Load) {
+    return info->l2; // number of bytes loaded
+  } else if (info->op == __dfsan::fsubstr) {
+    return (size_t)info->op1.i; // concrete substring length
+  } else if (info->op == __dfsan::fstrcat) {
+    size_t left = get_label_string_length(info->l1);
+    size_t right = get_label_string_length(info->l2);
+    if (left > 0 && right > 0) return left + right;
+    return 0;
+  }
+  return 0;
+}
+
 // Unified method to get string label with explicit length
 // Checks (in order):
 // 1. Runtime content map (for strncpy/strcat destinations)
@@ -805,6 +825,11 @@ void *__dfsw_memcpy(void *dest, const void *src, size_t n,
     __taint_solve_bounds(src_label, (uint64_t)src, n_label, n, 0, 1, 0, 0);
     __taint_solve_bounds(dest_label, (uint64_t)dest, n_label, n, 0, 1, 0, 0);
   }
+  // Propagate string content label from src to dest
+  dfsan_label str_label = taint_get_str_content_label(src);
+  if (str_label != 0) {
+    taint_set_str_content_label(dest, str_label);
+  }
   *ret_label = dest_label;
   return dfsan_memcpy(dest, src, n);
 }
@@ -818,6 +843,11 @@ void *__dfsw_memmove(void *dest, const void *src, size_t n,
   if (n_label) {
     __taint_solve_bounds(src_label, (uint64_t)src, n_label, n, 0, 1, 0, 0);
     __taint_solve_bounds(dest_label, (uint64_t)dest, n_label, n, 0, 1, 0, 0);
+  }
+  // Propagate string content label from src to dest
+  dfsan_label str_label = taint_get_str_content_label(src);
+  if (str_label != 0) {
+    taint_set_str_content_label(dest, str_label);
   }
   dfsan_label tmp[n];
   dfsan_label *sdest = shadow_for(dest);
@@ -1787,15 +1817,27 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
   dfsan_label src_label = get_str_label_n(s, s_label, n, n_label);
 
   if (src_label != 0 || c_label != 0) {
+    // When n is symbolic, bound the haystack to first n bytes so the solver
+    // produces indexof(substr(s, 0, n), char) instead of indexof(s, char).
+    // Skip if get_str_label_n already returned an fsubstr (avoids nesting).
+    dfsan_label bounded_src = src_label;
+    if (src_label != 0 && n_label != 0) {
+      dfsan_label_info *src_info = dfsan_get_label_info(src_label);
+      if (src_info && !is_content_string_op(src_info->op)) {
+        bounded_src = dfsan_union(src_label, n_label, __dfsan::fsubstr,
+                                  sizeof(void*) * 8, (uint64_t)n, 0);
+      }
+    }
+
     // Determine which operand is concrete and set size accordingly
     uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
 
-    // l1 = src_label (haystack content)
+    // l1 = bounded_src (haystack content, bounded by n when symbolic)
     // l2 = c_label (character to find)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = character value
     // size = haystack length if haystack concrete, else 0
-    *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
+    *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrchr,
                              content_len,
                              (uint64_t)s, (uint64_t)(uint8_t)c);
 
@@ -1807,21 +1849,6 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     // Store the result pointer to recover symbolic length
     if (ret) {
       taint_set_str_indexof_label(ret, *ret_label);
-    }
-
-    // Emit length constraint: length(src) >= n, only when n is symbolic.
-    // When n is concrete, the buffer size is fixed and cannot diverge.
-    // When n is symbolic (from input), we must tie string length to n
-    // so Z3 does not shrink the string while leaving n large.
-    if (src_label != 0 && n_label != 0) {
-      dfsan_label len_label = dfsan_union(src_label, 0, __dfsan::flength,
-                                          sizeof(size_t) * 8, 0, (uint64_t)n);
-      if (len_label) {
-        dfsan_label ge_label = dfsan_union(len_label, n_label,
-                          (__dfsan::bvuge << 8) | __dfsan::ICmp, 1, n, n);
-        if (ge_label)
-          __taint_add_constraint(ge_label, 1);
-      }
     }
   } else {
     *ret_label = 0;
@@ -1880,15 +1907,29 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
   dfsan_label src_label = get_str_label_n(s, s_label, n, n_label);
 
   if (src_label != 0 || c_label != 0) {
+    // When n is symbolic, bound the haystack to first n bytes so the solver
+    // produces last_indexof(substr(s, 0, n), char) instead of
+    // last_indexof(s, char). Without this, the solver can grow the string
+    // variable beyond the actual symbolized region when it increases n.
+    // Skip if get_str_label_n already returned an fsubstr (avoids nesting).
+    dfsan_label bounded_src = src_label;
+    if (src_label != 0 && n_label != 0) {
+      dfsan_label_info *src_info = dfsan_get_label_info(src_label);
+      if (src_info && !is_content_string_op(src_info->op)) {
+        bounded_src = dfsan_union(src_label, n_label, __dfsan::fsubstr,
+                                  sizeof(void*) * 8, (uint64_t)n, 0);
+      }
+    }
+
     // Determine which operand is concrete and set size accordingly
     uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
 
-    // l1 = src_label (haystack content)
+    // l1 = bounded_src (haystack content, bounded by n when symbolic)
     // l2 = c_label (character to find)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = character value
     // size = haystack length if haystack concrete, else 0
-    *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
+    *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrrchr,
                              content_len,
                              (uint64_t)s, (uint64_t)(uint8_t)c);
 
@@ -1900,21 +1941,6 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
     // Store the result pointer to recover symbolic length
     if (ret) {
       taint_set_str_indexof_label(ret, *ret_label);
-    }
-
-    // Emit length constraint: length(src) >= n, only when n is symbolic.
-    // When n is concrete, the buffer size is fixed and cannot diverge.
-    // When n is symbolic (from input), we must tie string length to n
-    // so Z3 does not shrink the string while leaving n large.
-    if (src_label != 0 && n_label != 0) {
-      dfsan_label len_label = dfsan_union(src_label, 0, __dfsan::flength,
-                                          sizeof(size_t) * 8, 0, (uint64_t)n);
-      if (len_label) {
-        dfsan_label ge_label = dfsan_union(len_label, n_label,
-                          (__dfsan::bvuge << 8) | __dfsan::ICmp, 1, n, n);
-        if (ge_label)
-          __taint_add_constraint(ge_label, 1);
-      }
     }
   } else {
     *ret_label = 0;
@@ -2051,6 +2077,19 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
   // Pass haystacklen_label to handle fsubstr creation when haystacklen derives from a string op
   dfsan_label src_label =
       get_str_label_n(haystack, haystack_label, haystacklen, haystacklen_label);
+
+  // When haystacklen is symbolic, bound the haystack to first haystacklen bytes
+  // so the solver produces indexof(substr(haystack, 0, n), needle) instead of
+  // indexof(haystack, needle). Without this, the solver can grow the string
+  // variable beyond the actual symbolized region when it increases haystacklen.
+  // Skip if get_str_label_n already returned an fsubstr (avoids nesting).
+  if (src_label != 0 && haystacklen_label != 0) {
+    dfsan_label_info *src_info = dfsan_get_label_info(src_label);
+    if (src_info && !is_content_string_op(src_info->op)) {
+      src_label = dfsan_union(src_label, haystacklen_label, __dfsan::fsubstr,
+                              sizeof(void*) * 8, (uint64_t)haystacklen, 0);
+    }
+  }
 
   // Use unified get_str_label_n for needle
   dfsan_label real_needle_label =
