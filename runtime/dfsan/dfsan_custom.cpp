@@ -180,6 +180,37 @@ static inline dfsan_label get_str_label_n(const void *s, dfsan_label s_label,
   }
 
   // 5. Fall back to reading buffer content labels
+  // When length is symbolic and pointer has Alloca bounds, read the full object
+  // to create a complete string variable, then substr to the requested length.
+  // This ensures string theory operations (strchr, memrchr, etc.) see the full
+  // buffer even when the symbolic length is smaller than the actual object.
+  if (n_label != 0 && s_label != 0) {
+    dfsan_label_info *info = dfsan_get_label_info(s_label);
+    if (info && info->op == __dfsan::Alloca) {
+      uint64_t lower = info->op1.i;
+      uint64_t upper = info->op2.i;
+      uint64_t ptr_offset = (uint64_t)s - lower;
+      uint64_t remaining = upper - lower - ptr_offset;
+      AOUT("get_str_label_n: step 5 Alloca bounds lower=%p, upper=%p, "
+           "remaining=%lu, n=%zu\n",
+           (void*)lower, (void*)upper, remaining, n);
+      // Trim trailing untainted bytes (e.g., null terminators)
+      const dfsan_label *shadow = shadow_for(s);
+      while (remaining > n && shadow[remaining - 1] == 0) {
+        remaining--;
+      }
+      if (remaining > n) {
+        dfsan_label full_label = dfsan_read_label(s, remaining);
+        if (full_label != 0) {
+          return dfsan_union(full_label, n_label, __dfsan::fsubstr,
+                             sizeof(void*) * 8, (uint64_t)n, 0);
+        }
+      } else if (remaining < n) {
+        AOUT("ERROR: OOB read in get_str_label_n: n=%zu exceeds "
+             "remaining=%lu bytes in object\n", n, remaining);
+      }
+    }
+  }
   return dfsan_read_label(s, n);
 }
 
