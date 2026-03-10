@@ -569,6 +569,11 @@ struct TaintFunction {
   Value *getShadow(Value *V);
   void setShadow(Instruction *I, Value *Shadow);
 
+  /// Handle nosanitize __dfsw_* calls from UCSan:
+  /// emit minimize hints for alloc size args and load retval TLS for non-void.
+  /// Returns true if handled.
+  bool handleUCSanCall(CallInst *CI, Instruction *Next);
+
   /// Returns the shadow value of a global variable GV.
   Value *getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB);
 
@@ -1646,49 +1651,10 @@ bool Taint::runImpl(Module &M) {
         // TaintVisitor may delete Inst, so keep track of whether it was a
         // terminator.
         bool IsTerminator = Inst->isTerminator();
-        // Emit minimize hints for nosanitize alloc calls (from UCSanPass)
+        // Handle nosanitize __dfsw_* calls from UCSan
         if (ClWithUCSan && Inst->getMetadata("nosanitize")) {
           if (auto *CI = dyn_cast<CallInst>(Inst)) {
-            if (Function *Callee = CI->getCalledFunction()) {
-              StringRef FName = Callee->getName();
-              if (FName.startswith("__dfsw_")) {
-                StringRef BaseName = FName.drop_front(7); // skip "__dfsw_"
-                // Map: function name -> list of arg indices that are allocation sizes
-                // malloc(size)=0, calloc(nmemb,size)=0,1, realloc(ptr,size)=1,
-                // reallocarray(ptr,nmemb,size)=1,2, aligned_alloc(align,size)=1,
-                // memalign(align,size)=1, valloc(size)=0, pvalloc(size)=0,
-                // posix_memalign(memptr,align,size)=2
-                SmallVector<unsigned, 2> SizeArgIndices;
-                if (BaseName == "malloc" || BaseName == "__libc_malloc" ||
-                    BaseName == "valloc" || BaseName == "__libc_valloc" ||
-                    BaseName == "pvalloc" || BaseName == "__libc_pvalloc" ||
-                    BaseName == "kmalloc_large") {
-                  SizeArgIndices.push_back(0);
-                } else if (BaseName == "calloc" || BaseName == "__libc_calloc") {
-                  SizeArgIndices.push_back(0);
-                  SizeArgIndices.push_back(1);
-                } else if (BaseName == "realloc" || BaseName == "__libc_realloc" ||
-                           BaseName == "aligned_alloc" ||
-                           BaseName == "memalign" || BaseName == "__libc_memalign" ||
-                           BaseName == "kmalloc" || BaseName == "__kmalloc") {
-                  SizeArgIndices.push_back(1);
-                } else if (BaseName == "reallocarray" || BaseName == "__libc_reallocarray") {
-                  SizeArgIndices.push_back(1);
-                  SizeArgIndices.push_back(2);
-                } else if (BaseName == "posix_memalign") {
-                  SizeArgIndices.push_back(2);
-                }
-                if (!SizeArgIndices.empty()) {
-                  IRBuilder<> IRB(CI);
-                  for (unsigned Idx : SizeArgIndices) {
-                    Value *Shadow = TF.getShadow(CI->getArgOperand(Idx));
-                    if (!TF.TT.isZeroShadow(Shadow)) {
-                      IRB.CreateCall(TF.TT.TaintMinimizeLabelFn, {Shadow});
-                    }
-                  }
-                }
-              }
-            }
+            TF.handleUCSanCall(CI, Next);
           }
         }
         if (!TF.SkipInsts.count(Inst) && !Inst->getMetadata("nosanitize"))
@@ -1798,6 +1764,60 @@ Value *TaintFunction::getShadow(Value *V) {
 void TaintFunction::setShadow(Instruction *I, Value *Shadow) {
   assert(!ValShadowMap.count(I));
   ValShadowMap[I] = Shadow;
+}
+
+bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee)
+    return false;
+  StringRef FName = Callee->getName();
+  if (!FName.startswith("__dfsw_"))
+    return false;
+
+  StringRef BaseName = FName.drop_front(7); // skip "__dfsw_"
+
+  // Emit minimize hints for allocation size arguments
+  SmallVector<unsigned, 2> SizeArgIndices;
+  if (BaseName == "malloc" || BaseName == "__libc_malloc" ||
+      BaseName == "valloc" || BaseName == "__libc_valloc" ||
+      BaseName == "pvalloc" || BaseName == "__libc_pvalloc" ||
+      BaseName == "kmalloc_large") {
+    SizeArgIndices.push_back(0);
+  } else if (BaseName == "calloc" || BaseName == "__libc_calloc") {
+    SizeArgIndices.push_back(0);
+    SizeArgIndices.push_back(1);
+  } else if (BaseName == "realloc" || BaseName == "__libc_realloc" ||
+             BaseName == "aligned_alloc" ||
+             BaseName == "memalign" || BaseName == "__libc_memalign" ||
+             BaseName == "kmalloc" || BaseName == "__kmalloc") {
+    SizeArgIndices.push_back(1);
+  } else if (BaseName == "reallocarray" || BaseName == "__libc_reallocarray") {
+    SizeArgIndices.push_back(1);
+    SizeArgIndices.push_back(2);
+  } else if (BaseName == "posix_memalign") {
+    SizeArgIndices.push_back(2);
+  }
+  if (!SizeArgIndices.empty()) {
+    IRBuilder<> IRB(CI);
+    for (unsigned Idx : SizeArgIndices) {
+      Value *Shadow = getShadow(CI->getArgOperand(Idx));
+      if (!TT.isZeroShadow(Shadow)) {
+        IRB.CreateCall(TT.TaintMinimizeLabelFn, {Shadow});
+      }
+    }
+  }
+
+  // Load return shadow from retval TLS for non-void __dfsw_* calls
+  if (!CI->getType()->isVoidTy()) {
+    IRBuilder<> NextIRB(Next);
+    LoadInst *LI = NextIRB.CreateAlignedLoad(
+        TT.getShadowTy(CI), getRetvalTLS(CI->getType(), NextIRB),
+        ShadowTLSAlignment, "_dfsret");
+    SkipInsts.insert(LI);
+    setShadow(CI, LI);
+  }
+
+  return true;
 }
 
 /// Compute the integer shadow offset that corresponds to a given
