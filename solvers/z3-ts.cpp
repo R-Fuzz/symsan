@@ -2145,6 +2145,38 @@ void Z3AstParser::add_string_bitvec_link(offset_t off, z3_task_t *task) {
   }
 }
 
+void Z3AstParser::register_string_range(uint32_t input, uint32_t start,
+                                        uint32_t end, z3::expr str_var) {
+  if (input >= string_ranges_.size()) return;
+  auto &ranges = string_ranges_[input];
+
+  auto result = ranges.emplace(start, end, str_var);
+  if (!result.second) return; // already exists (same start and end)
+
+  // Check all existing ranges for containment relationships and add
+  // linking constraints so that overlapping string variables stay consistent.
+  for (auto &existing : ranges) {
+    if (existing.start == start && existing.end == end) continue; // skip self
+
+    // New range is a subset of existing range
+    if (start >= existing.start && end <= existing.end) {
+      uint32_t offset = start - existing.start;
+      uint32_t len = end - start;
+      aux_constraints_.push_back(str_var == z3::expr(context_,
+          Z3_mk_seq_extract(context_, existing.str_expr,
+                            context_.int_val(offset), context_.int_val(len))));
+    }
+    // Existing range is a subset of new range
+    else if (existing.start >= start && existing.end <= end) {
+      uint32_t offset = existing.start - start;
+      uint32_t len = existing.end - existing.start;
+      aux_constraints_.push_back(existing.str_expr == z3::expr(context_,
+          Z3_mk_seq_extract(context_, str_var,
+                            context_.int_val(offset), context_.int_val(len))));
+    }
+  }
+}
+
 Z3ParserSolver::solving_status
 Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solutions) {
   solving_status ret = unknown_error;
@@ -2625,10 +2657,8 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
     z3::symbol symbol = context_.str_symbol(name);
     z3::expr str_var = context_.constant(symbol, context_.string_sort());
 
-    // Track string range for null-byte post-processing and linking constraints
-    if (input < string_ranges_.size()) {
-      string_ranges_[input].emplace(offset, offset + len, str_var);
-    }
+    // Track string range and add linking constraints for overlapping ranges
+    register_string_range(input, offset, offset + len, str_var);
 
     // Cache string info for this label
     string_info_cache_[label] = {input, offset, len};
@@ -2797,10 +2827,8 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
       z3::symbol symbol = context_.str_symbol(name);
       z3::expr str_var = context_.constant(symbol, context_.string_sort());
 
-      // Track string range for null-byte post-processing and linking constraints
-      if (input_id < string_ranges_.size()) {
-        string_ranges_[input_id].emplace(start_offset, start_offset + len, str_var);
-      }
+      // Track string range and add linking constraints for overlapping ranges
+      register_string_range(input_id, start_offset, start_offset + len, str_var);
 
       // Cache string info for this label
       string_info_cache_[label] = {input_id, start_offset, len};
@@ -2861,10 +2889,8 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
     z3::symbol symbol = context_.str_symbol(name);
     z3::expr str_var = context_.constant(symbol, context_.string_sort());
 
-    // Track string range for null-byte post-processing and linking constraints
-    if (input < string_ranges_.size()) {
-      string_ranges_[input].emplace(offset, offset + 1, str_var);
-    }
+    // Track string range and add linking constraints for overlapping ranges
+    register_string_range(input, offset, offset + 1, str_var);
 
     // Cache string info for this label
     string_info_cache_[label] = {input, offset, 1};

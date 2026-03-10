@@ -58,12 +58,15 @@ protected:
         : start(s), end(e), str_expr(expr) {}
   };
 
-  // Transparent comparator for O(log n) lookup with just uint32_t
+  // Transparent comparator: order by (start, end) so ranges with the same
+  // start but different lengths coexist.  Heterogeneous lookup by uint32_t
+  // still works for upper_bound (compares against start only).
   struct string_range_cmp {
     using is_transparent = void;  // Enable heterogeneous lookup
 
     bool operator()(const string_range_t &a, const string_range_t &b) const {
-      return a.start < b.start;
+      if (a.start != b.start) return a.start < b.start;
+      return a.end < b.end;
     }
     bool operator()(const string_range_t &a, uint32_t offset) const {
       return a.start < offset;
@@ -205,6 +208,10 @@ private:
 
   // Helper for linking bitvec and string constraints on shared offsets
   void add_string_bitvec_link(offset_t off, z3_task_t *task);
+
+  // Register a string range and add linking constraints for overlapping ranges
+  void register_string_range(uint32_t input, uint32_t start, uint32_t end,
+                             z3::expr str_var);
 };
 
 class Z3ParserSolver : public Z3AstParser {
