@@ -24,6 +24,8 @@ extern "C" {
   void __taint_copy_shadow(void *dst, void *src, u64 size);
   void __taint_move_shadow(void *dst, void *src, u64 size);
   void __taint_set_label(u32 label, void *addr, u64 size);
+  dfsan_label __taint_get_ptr_bounds_label(void *ptr, u64 lower, u64 upper);
+  void __taint_set_retval_tls(u32 index, dfsan_label label, u32 size_in_bits);
 }
 
 // Simple passthrough wrappers for malloc family
@@ -52,6 +54,10 @@ static ucsan_label create_alloca_label(void *ptr, size_t size) {
   for (size_t i = 0; i < size; i++) {
     shadow[i] = kUninitializedLabel;
   }
+
+  // Bridge to SymSan: create Alloca bounds label and set via retval TLS
+  dfsan_label bounds = __taint_get_ptr_bounds_label(nullptr, (u64)ptr, (u64)ptr + size);
+  __taint_set_retval_tls(0, bounds, sizeof(void*) * 8);
 
   return label;
 }

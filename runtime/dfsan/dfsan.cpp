@@ -1976,4 +1976,32 @@ void __taint_move_shadow(void *dst, void *src, uint64_t size) {
   }
 }
 
+// Get or create an Alloca bounds label for a pointer
+// If ptr != NULL, checks shadow_for(&ptr) for existing Alloca to update
+// If ptr == NULL or no existing Alloca, creates a new one
+// Returns the Alloca label; caller stores it (e.g., via __taint_set_retval_tls)
+// Overrides weak stub in ucsan.cpp
+SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_get_ptr_bounds_label(void *ptr, uint64_t lower, uint64_t upper) {
+  if (!flags().trace_bounds) return 0;
+  if (ptr != nullptr) {
+    dfsan_label label = *shadow_for(&ptr);
+    if (label != 0) {
+      dfsan_label_info *info = get_label_info(label);
+      if (info->op == __dfsan::Alloca) {
+        info->op1.i = lower;
+        info->op2.i = upper;
+        AOUT("update ptr bounds %p = %d, lower = %p, upper = %p\n",
+             ptr, label, (void*)lower, (void*)upper);
+        return label;
+      }
+    }
+  }
+  // Allocate new Alloca label
+  dfsan_label bound = dfsan_union(0, 0, Alloca, sizeof(void*) * 8, lower, upper);
+  AOUT("new ptr bounds label %d, lower = %p, upper = %p\n",
+       bound, (void*)lower, (void*)upper);
+  return bound;
+}
+
 }  // extern "C"

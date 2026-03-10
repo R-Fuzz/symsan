@@ -63,6 +63,9 @@ void __taint_set_label(dfsan_label label, void *addr, uint64_t size);
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_copy_shadow(void *dst, void *src, uint64_t size);
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_get_ptr_bounds_label(void *ptr, uint64_t lower, uint64_t upper);
+
 //===----------------------------------------------------------------------===//
 // Global State
 //===----------------------------------------------------------------------===//
@@ -1416,5 +1419,14 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_copy_shadow, void*, void*, uint64_t) 
 // @param src: source address
 // @param size: size in bytes
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_move_shadow, void*, void*, uint64_t) {}
+
+// Get or create an Alloca bounds label for a pointer
+// @param ptr: pointer (NULL to always create new)
+// @param lower: lower bound address
+// @param upper: upper bound address
+// @return: Alloca label (0 when standalone)
+SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_get_ptr_bounds_label, void*, uint64_t, uint64_t) {
+  return 0;
+}
 
 }  // extern "C"
