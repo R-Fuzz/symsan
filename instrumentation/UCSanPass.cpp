@@ -1870,7 +1870,7 @@ void UCSanVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
     Value *Size = ConstantInt::get(UF.UC.Int64Ty,
         DL.getTypeAllocSize(GEPI.getSourceElementType()));
     Value *Addr = IRB.CreateBitCast(Ptr, UF.UC.VoidPtrTy);
-    UF.UC.markNosanitize(Addr);
+    if (Addr != Ptr) UF.UC.markNosanitize(Addr);
     Value *Checked = IRB.CreateCall(UF.UC.UCCheckPointerFn,
       { Addr, UF.getShadow(Ptr), Size, ConstantInt::get(UF.UC.Int1Ty, false) });
     UF.UC.markNosanitize(Checked);
