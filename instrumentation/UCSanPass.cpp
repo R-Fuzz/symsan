@@ -319,7 +319,8 @@ class UCSan {
     WK_None,
     WK_Custom,
     WK_TaintCustom, // custom in dfsan abilist, defer to TaintPass if available
-    WK_AutoCustom
+    WK_AutoCustom,
+    WK_Uninstrumented,
   };
 
   Module *Mod;
@@ -1522,6 +1523,10 @@ UCSan::WrapperKind UCSan::getWrapperKind(Function *F) {
   if (ABIList.isIn(*F, "custom"))
     return WK_Custom;
 
+  // Check ABIList for uninstrumented functions
+  if (ABIList.isIn(*F, "uninstrumented"))
+    return WK_Uninstrumented;
+
   // Check if function is in the custom map from YAML metadata
   if (Scope.custom.find(F->getName().str()) != Scope.custom.end()) {
     return WK_AutoCustom;
@@ -2297,6 +2302,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     return true;
 
   case UCSan::WK_TaintCustom:
+  case UCSan::WK_Uninstrumented:
   {
     // TaintPass will handle the __dfsw_ wrapping with proper taint labels.
     // Just check pointer arguments here, skip ucsan arg/retval TLS.
@@ -2856,6 +2862,11 @@ bool UCSan::runImpl(Module &M) {
       if (WK == WK_TaintCustom && ClWithTaintPass) {
         // TaintPass will call the custom wrapper and pass taint labels.
         // UCSan will only do check_pointer on pointer args at call sites.
+        UnwrappedFnMap[&F] = &F;
+        // Remove the body of there is one
+        if (!F.isDeclaration()) F.deleteBody();
+      } else if (WK == WK_Uninstrumented) {
+        // Leave the function as is, but add to UnwrappedFnMap
         UnwrappedFnMap[&F] = &F;
       } else if (WK == WK_Custom || WK == WK_AutoCustom) {
         if (!F.isDeclaration()) F.deleteBody();
