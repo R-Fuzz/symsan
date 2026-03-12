@@ -25,7 +25,13 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/ADT/iterator.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
@@ -172,6 +178,12 @@ static cl::opt<bool> ClTraceLoop(
 static cl::opt<bool> ClTraceBound(
     "taint-trace-bound",
     cl::desc("Trace buffer bound info."),
+    cl::Hidden, cl::init(true));
+
+// SYMSAN specific flags, hoist bounds checks out of loops using SCEV
+static cl::opt<bool> ClHoistBoundsChecks(
+    "taint-hoist-bounds-checks",
+    cl::desc("Hoist bounds checks out of loops using SCEV analysis."),
     cl::Hidden, cl::init(true));
 
 // SYMSAN specific flags, enable generating solving tasks for undefined behaviour
@@ -591,6 +603,7 @@ struct TaintFunction {
   Value *visitAllocaInst(AllocaInst *I, Value *ArraySize, Type *ElTy);
   void checkBounds(Value *Ptr, Value *Size, Instruction *Pos);
   void solveBounds(Value *Ptr, Value *Size, Instruction *Pos);
+  void hoistBoundsChecks();
 
   /// XXX: because we never collapse taint labels for aggregate types,
   ///      we also do not expand taint labels from an aggreated primitive
@@ -1676,6 +1689,10 @@ bool Taint::runImpl(Module &M) {
             Val, TF.getShadow(P.Phi->getIncomingValue(Val)));
       }
     }
+
+    // Hoist bounds checks out of loops
+    if (ClTraceBound && ClHoistBoundsChecks)
+      TF.hoistBoundsChecks();
   }
 
   return Changed || !FnsToInstrument.empty() ||
@@ -1999,6 +2016,224 @@ void TaintFunction::solveBounds(Value *Ptr, Value* Size, Instruction *Pos) {
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(Pos));
   IRB.CreateCall(TT.TaintSolveSizeFn,
       {PtrShadow, Addr, SizeShadow, Size64, CID});
+}
+
+// Collect all SCEVUnknown values from a SCEV expression.
+static void collectSCEVUnknowns(const SCEV *S,
+                                SmallVectorImpl<Value *> &Unknowns) {
+  if (auto *U = dyn_cast<SCEVUnknown>(S)) {
+    Unknowns.push_back(U->getValue());
+  } else if (auto *NAry = dyn_cast<SCEVNAryExpr>(S)) {
+    for (const SCEV *Op : NAry->operands())
+      collectSCEVUnknowns(Op, Unknowns);
+  } else if (auto *Cast = dyn_cast<SCEVCastExpr>(S)) {
+    collectSCEVUnknowns(Cast->getOperand(), Unknowns);
+  } else if (auto *UDiv = dyn_cast<SCEVUDivExpr>(S)) {
+    collectSCEVUnknowns(UDiv->getLHS(), Unknowns);
+    collectSCEVUnknowns(UDiv->getRHS(), Unknowns);
+  }
+  // SCEVConstant has no unknowns
+}
+
+// Hoist __taint_check_bounds calls out of loops using SCEV analysis.
+// For each loop with a computable backedge-taken count, find bounds checks
+// where the pointer shadow (bounds label) is loop-invariant and the address
+// follows an affine recurrence {start, +, stride}. Replace N per-iteration
+// checks with a single summary check in the preheader covering the full
+// access range [start, start + BTC * stride + elem_size).
+// When the trip count is symbolic, also emit a __taint_solve_size call
+// so the solver can find loop bounds that cause OOB.
+void TaintFunction::hoistBoundsChecks() {
+  // Recalculate analyses after TaintVisitor may have split blocks
+  DT.recalculate(*F);
+  delete LI;
+  LI = new LoopInfo(DT);
+
+  if (LI->empty()) return;
+
+  Module *M = F->getParent();
+  TargetLibraryInfoImpl TLII(Triple(M->getTargetTriple()));
+  TargetLibraryInfo TLI(TLII, F);
+  AssumptionCache AC(*F);
+  ScalarEvolution SE(*F, TLI, AC, DT, *LI);
+
+  // Process innermost loops first so hoisted checks can be further
+  // hoisted when processing outer loops
+  SmallVector<Loop *, 8> Loops(LI->getLoopsInPreorder());
+
+  for (Loop *L : reverse(Loops)) {
+    BasicBlock *Preheader = L->getLoopPreheader();
+    if (!Preheader) {
+      // No canonical preheader (predecessor has multiple successors).
+      // Split the edge to create one.
+      BasicBlock *Pred = L->getLoopPredecessor();
+      if (!Pred) continue;
+      Preheader = SplitEdge(Pred, L->getHeader(), &DT, LI);
+      if (!Preheader) continue;
+    }
+
+    const SCEV *BTC = SE.getBackedgeTakenCount(L);
+    if (isa<SCEVCouldNotCompute>(BTC)) continue;
+
+    // Collect __taint_check_bounds calls at this loop level (skip subloops)
+    SmallVector<CallInst *, 8> BoundsChecks;
+    for (BasicBlock *BB : L->blocks()) {
+      if (LI->getLoopFor(BB) != L) continue;
+      for (Instruction &I : *BB) {
+        auto *CI = dyn_cast<CallInst>(&I);
+        if (!CI) continue;
+        Function *Callee = CI->getCalledFunction();
+        if (Callee && Callee->getName() == "__taint_check_bounds")
+          BoundsChecks.push_back(CI);
+      }
+    }
+    if (BoundsChecks.empty()) continue;
+
+    // Group hoistable checks by AddrLabel (ptr bounds shadow).
+    // For each group, compute the merged range covering all accesses,
+    // emit one summary check + one solve_size call.
+    struct HoistCandidate {
+      const SCEVAddRecExpr *AR;
+      uint64_t ElemSize;
+      CallInst *CI;
+    };
+    DenseMap<Value *, SmallVector<HoistCandidate, 4>> Groups;
+    for (CallInst *CI : BoundsChecks) {
+      Value *AddrLabel = CI->getArgOperand(0);  // ptr bounds shadow
+      Value *Addr = CI->getArgOperand(1);       // concrete address
+      Value *Size = CI->getArgOperand(3);       // access size
+
+      // AddrLabel may be loop-variant due to:
+      // 1. __taint_gep_offset(base_shadow, gep, base) called per-iteration
+      // 2. PHI nodes for pointer-incrementing loops (buf++)
+      // Walk through these to find the loop-invariant base allocation shadow.
+      if (!L->isLoopInvariant(AddrLabel)) {
+        Value *Resolved = AddrLabel;
+        bool Found = false;
+        // Walk through PHIs and __taint_gep_offset calls
+        for (int Depth = 0; Depth < 4 && !Found; ++Depth) {
+          if (L->isLoopInvariant(Resolved)) {
+            Found = true;
+          } else if (auto *PN = dyn_cast<PHINode>(Resolved)) {
+            // Pick the incoming value from outside the loop
+            for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
+              if (!L->contains(PN->getIncomingBlock(i))) {
+                Resolved = PN->getIncomingValue(i);
+                break;
+              }
+            }
+          } else if (auto *GepCall = dyn_cast<CallInst>(Resolved)) {
+            Function *GepFn = GepCall->getCalledFunction();
+            if (GepFn && GepFn->getName() == "__taint_gep_offset")
+              Resolved = GepCall->getArgOperand(0);
+            else
+              break;
+          } else {
+            break;
+          }
+        }
+        if (!Found && L->isLoopInvariant(Resolved))
+          Found = true;
+        if (!Found) continue;
+        AddrLabel = Resolved;
+      }
+
+      auto *SizeC = dyn_cast<ConstantInt>(Size);
+      if (!SizeC) continue;
+
+      // With UCSan, Addr is ptrtoint(ucsan_check_pointer(orig_ptr, ...)).
+      // ucsan_check_pointer is opaque to SCEV; use the original pointer.
+      Value *AddrForSCEV = Addr;
+      if (ClWithUCSan) {
+        if (auto *PTI = dyn_cast<PtrToIntOperator>(Addr)) {
+          if (auto *ChkCall = dyn_cast<CallInst>(PTI->getPointerOperand())) {
+            Function *ChkFn = ChkCall->getCalledFunction();
+            if (ChkFn && ChkFn->getName() == "ucsan_check_pointer") {
+              IRBuilder<> IRB(CI);
+              AddrForSCEV = IRB.CreatePtrToInt(ChkCall->getArgOperand(0), TT.Int64Ty);
+            }
+          }
+        }
+      }
+
+      const SCEV *AddrSCEV = SE.getSCEV(AddrForSCEV);
+      auto *AR = dyn_cast<SCEVAddRecExpr>(AddrSCEV);
+      if (!AR || AR->getLoop() != L) continue;
+
+      const SCEV *Step = AR->getStepRecurrence(SE);
+      auto *StepC = dyn_cast<SCEVConstant>(Step);
+      if (!StepC) continue;
+      int64_t StepVal = StepC->getAPInt().getSExtValue();
+      if (StepVal <= 0) continue;
+
+      Groups[AddrLabel].push_back({AR, SizeC->getZExtValue(), CI});
+    }
+
+    SCEVExpander Expander(SE, M->getDataLayout(), "bounds.hoist");
+    Instruction *InsertPt = Preheader->getTerminator();
+
+    for (auto &KV : Groups) {
+      Value *AddrLabel = KV.first;
+      auto &Candidates = KV.second;
+
+      // Find the minimum start and maximum end across all accesses
+      // to emit a single check covering the entire range.
+      const SCEV *MinStart = Candidates[0].AR->getStart();
+      const SCEV *MaxEnd = nullptr; // end = BTC * stride + elem_size
+      CallInst *FirstCI = Candidates[0].CI;
+
+      for (auto &C : Candidates) {
+        const SCEV *Start = C.AR->getStart();
+        const SCEV *Step = C.AR->getStepRecurrence(SE);
+        // end of this access: start + BTC * stride + elem_size
+        const SCEV *End = SE.getAddExpr(
+          Start,
+          SE.getAddExpr(
+            SE.getMulExpr(BTC, Step),
+            SE.getConstant(BTC->getType(), C.ElemSize)
+          )
+        );
+        if (SE.isKnownPredicate(ICmpInst::ICMP_ULT, Start, MinStart))
+          MinStart = Start;
+        if (!MaxEnd || SE.isKnownPredicate(ICmpInst::ICMP_UGT, End, MaxEnd))
+          MaxEnd = End;
+      }
+
+      // total = MaxEnd - MinStart
+      const SCEV *TotalSCEV = SE.getMinusSCEV(MaxEnd, MinStart);
+
+      Value *StartVal = Expander.expandCodeFor(MinStart, TT.Int64Ty, InsertPt);
+      Value *TotalVal = Expander.expandCodeFor(TotalSCEV, TT.Int64Ty, InsertPt);
+
+      // Emit one summary bounds check for the group
+      IRBuilder<> IRB(InsertPt);
+      IRB.CreateCall(TT.TaintCheckBoundsFn,
+                     {AddrLabel, StartVal, TT.ZeroPrimitiveShadow, TotalVal});
+
+      // If the trip count is symbolic, also emit a __taint_solve_size
+      // call so the solver can find loop bounds that cause OOB.
+      if (!isa<SCEVConstant>(BTC)) {
+        SmallVector<Value *, 4> Unknowns;
+        collectSCEVUnknowns(BTC, Unknowns);
+        Value *SizeShadow = TT.ZeroPrimitiveShadow;
+        for (Value *V : Unknowns) {
+          Value *S = getShadow(V);
+          if (!TT.isZeroShadow(S))
+            SizeShadow = S;
+        }
+        if (!TT.isZeroShadow(SizeShadow)) {
+          ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
+              TT.getInstructionId(FirstCI));
+          IRB.CreateCall(TT.TaintSolveSizeFn,
+                         {AddrLabel, StartVal, SizeShadow, TotalVal, CID});
+        }
+      }
+
+      // Remove all original per-iteration checks in this group
+      for (auto &C : Candidates)
+        C.CI->eraseFromParent();
+    }
+  }
 }
 
 // Generates IR to load shadow corresponding to bytes [Addr, Addr+Size), where
