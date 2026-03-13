@@ -2308,7 +2308,8 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     // Just check pointer arguments here, skip ucsan arg/retval TLS.
     auto *I = CB.arg_begin();
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
-      if ((*I)->getType()->isPointerTy()) {
+      // skip nullptr
+      if ((*I)->getType()->isPointerTy() && !isa<ConstantPointerNull>(*I)) {
         Value *sizeArg = ConstantInt::get(UF.UC.Int64Ty,
             DL.getTypeAllocSize((*I)->getType()->getPointerElementType()));
         Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB);
