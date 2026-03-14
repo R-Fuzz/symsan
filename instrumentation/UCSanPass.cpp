@@ -105,6 +105,10 @@ static cl::opt<bool> ClTraceBB("ucsan-trace-bb",
                                 cl::desc("Enable basic block tracing"),
                                 cl::Hidden, cl::init(false));
 
+static cl::opt<std::string> ClDumpCfg("ucsan-dump-cfg",
+    cl::desc("Dump control flow info to file"),
+    cl::Hidden);
+
 static cl::opt<bool> ClWithTaintPass(
     "ucsan-with-taint",
     cl::desc("TaintPass will run after UCSanPass, defer taint custom functions"),
@@ -2890,6 +2894,17 @@ bool UCSan::runImpl(Module &M) {
     }
   }
 
+  // check if we need to dump cov information
+  std::unique_ptr<llvm::raw_fd_ostream> COVF;
+  if (!ClDumpCfg.empty()) {
+    std::error_code EC;
+    COVF = std::make_unique<raw_fd_ostream>(ClDumpCfg, EC, llvm::sys::fs::OF_Append | llvm::sys::fs::OF_Text);
+    if (EC) {
+      errs() << "Failed to open control flow file: " << ClDumpCfg << "\n";
+      COVF.reset();
+    }
+  }
+
   // Instrument in-scope functions
   for (Function *F : FnsToInstrument) {
     if (!F || F->isDeclaration()) continue;
@@ -2940,6 +2955,54 @@ bool UCSan::runImpl(Module &M) {
     // Build a copy of the list before iterating over it.
     SmallVector<BasicBlock *, 4> BBList(depth_first(&F->getEntryBlock()));
     for (BasicBlock *BB : BBList) {
+
+      // Dump cov info
+      if (COVF) {
+        auto getBBID = [&](BasicBlock *B) -> int64_t {
+          auto *MD = B->getTerminator()->getMetadata(BBIDName);
+          if (!MD) return -1;
+          auto *C = dyn_cast<ConstantAsMetadata>(MD->getOperand(0));
+          return dyn_cast<ConstantInt>(C->getValue())->getZExtValue();
+        };
+
+        int64_t CurID = getBBID(BB);
+        if (CurID >= 0) {
+          Instruction *Term = BB->getTerminator();
+          // COV := FN:current_bbid:termination_types
+          // types := C (conditional branch)
+          //       := D (unconditional branch)
+          //       := S (switch cases)
+          //       := R (return)
+          //       := U (unreachable)
+          *COVF << F->getName() << ":" << CurID << ":";
+          if (auto *BR = dyn_cast<BranchInst>(Term)) {
+            if (BR->isConditional()) {
+              // condition branch: C:T:true_target_id:F:false_target_id
+              *COVF << "C:T:" << getBBID(BR->getSuccessor(0))
+                    << ":F:" << getBBID(BR->getSuccessor(1)) << "\n";
+            } else {
+              // unconditional branch: D:next_bbid
+              *COVF << "D:" << getBBID(BR->getSuccessor(0)) << "\n";
+            }
+          } else if (auto *SI = dyn_cast<SwitchInst>(Term)) {
+            // switch cases: S:default_bbid:case1_bbid:case2_bbid:...
+            *COVF << "S";
+            for (unsigned i = 0, n = SI->getNumSuccessors(); i < n; ++i) {
+              *COVF << ":" << getBBID(SI->getSuccessor(i));
+            }
+            *COVF << "\n";
+          } else if (isa<ReturnInst>(Term)) {
+            // return: "R"
+            *COVF << "R\n";
+          } else if (isa<UnreachableInst>(Term)) {
+            // unreachable: "U"
+            *COVF << "U\n";
+          } else {
+            errs() << "Warning: unhandled termination type: " << *Term << "\n";
+          }
+        }
+      }
+
       Instruction *Inst = &BB->front();
       while (true) {
         // UCSanVisitor may split the current basic block, changing the current
