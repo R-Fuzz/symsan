@@ -490,7 +490,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
 
       // Unsigned overflow: result < op1 (for any non-zero op2)
       // When adding two unsigned numbers, overflow means result wrapped around
-      if (result >= orig_op1 && orig_op2 != 0) {
+      if (result >= orig_op1 && (orig_op2 != 0 || l2 != 0)) {
         dfsan_label cond = do_taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
                                           size, result, orig_op1);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
@@ -514,7 +514,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       // This is an approximation - full check would need wider multiplication
       bool has_signed_overflow = (overflow_check & sign_bit) != 0;
 
-      if (!has_signed_overflow && orig_op1 != 0 && orig_op2 != 0) {
+      if (!has_signed_overflow && (orig_op1 != 0 || l1 != 0) && (orig_op2 != 0 || l2 != 0)) {
         dfsan_label xor_l1 = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
         dfsan_label xor_l2 = do_taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
         dfsan_label and_xors = do_taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
@@ -524,14 +524,12 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       }
 
       // Unsigned overflow: for multiplication, check if result / op1 != op2 (when op1 != 0)
-      if (orig_op1 != 0 && result / orig_op1 == orig_op2) {
-        // No overflow currently, check if overflow can happen
-        // Approximate: result < op1 || result < op2 when both > 1
-        if (orig_op1 > 1 && orig_op2 > 1) {
+      // When orig_op1 == 0, no overflow possible concretely (0 * x = 0), but if symbolic, still check
+      bool no_unsigned_overflow = (orig_op1 == 0 || result / orig_op1 == orig_op2);
+      if (no_unsigned_overflow && (orig_op1 > 1 || l1 != 0) && (orig_op2 > 1 || l2 != 0)) {
           dfsan_label cond = do_taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
                                             size, result, orig_op1);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
-        }
       }
     } else if (op == __dfsan::Sub) {
       // check for integer overflow (underflow for subtraction)
