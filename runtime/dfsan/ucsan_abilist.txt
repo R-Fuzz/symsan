@@ -51,6 +51,16 @@ fun:strstr=taint
 fun:strnstr=taint
 fun:memmem=taint
 
+# custom assertions
+fun:assert_cond=taint
+fun:assume_cond=taint
+fun:assert_init=custom
+fun:assert_allocated=custom
+fun:assert_freed=custom
+fun:assume_init=custom
+fun:assume_allocated=custom
+fun:assume_freed=custom
+
 # kernel
 fun:kmalloc_large=custom
 fun:__kmalloc=custom

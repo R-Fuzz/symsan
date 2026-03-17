@@ -601,6 +601,12 @@ fun:__dfsw_*=discard
 fun:__taint_*=uninstrumented
 fun:__taint_*=discard
 
+# custom assertions
+fun:assert_cond=custom
+fun:assert_cond=uninstrumented
+fun:assume_cond=custom
+fun:assume_cond=uninstrumented
+
 # Don't add extra parameters to the Fuzzer callback.
 fun:LLVMFuzzerTestOneInput=uninstrumented
 fun:__afl_manual_init=uninstrumented

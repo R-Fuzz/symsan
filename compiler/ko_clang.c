@@ -290,6 +290,12 @@ static void add_ucsan_pass() {
     cc_params[cc_par_cnt++] = "-ucsan-trace-bb=true";
   }
 
+  const char *uscan_cfg = getenv("KO_DUMP_CFG");
+  if (uscan_cfg) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = alloc_printf("-ucsan-dump-cfg=%s", uscan_cfg);
+  }
+
   if (!use_ucsan_only) {
     // TaintPass will run after UCSanPass
     cc_params[cc_par_cnt++] = "-mllvm";

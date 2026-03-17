@@ -307,6 +307,7 @@ enum undefined_check_ids {
   ub_unsigned_integer_truncation,
   ub_signed_integer_truncation,
   ub_integer_sign_change,
+  ub_assertion_failure,
 };
 
 #define F_ADD_CONS   0x1

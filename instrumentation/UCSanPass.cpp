@@ -98,12 +98,12 @@ static const char *BBIDName = "dfsan.bb";
 
 // Command line options
 static cl::opt<bool> ClTraceBound("ucsan-trace-bound",
-                                   cl::desc("Enable bounds checking"),
-                                   cl::Hidden, cl::init(true));
+    cl::desc("Enable bounds checking"),
+    cl::Hidden, cl::init(true));
 
 static cl::opt<bool> ClTraceBB("ucsan-trace-bb",
-                                cl::desc("Enable basic block tracing"),
-                                cl::Hidden, cl::init(false));
+    cl::desc("Enable basic block tracing"),
+    cl::Hidden, cl::init(false));
 
 static cl::opt<std::string> ClDumpCfg("ucsan-dump-cfg",
     cl::desc("Dump control flow info to file"),
@@ -245,6 +245,8 @@ struct UCSanScopeCustom {
 struct UCSanScope {
   std::string entry;
   std::vector<std::string> scope;
+  std::vector<std::string> shims_yaml;          // parsed from YAML
+  std::map<std::string, bool> shims;            // expanded: orig->true, __shim_orig->false
   std::map<std::string, UCSanScopeCustom> custom;
 };
 
@@ -287,6 +289,7 @@ struct MappingTraits<UCSanScope> {
   static void mapping(yaml::IO &io, UCSanScope &sc) {
     io.mapRequired("entry", sc.entry);
     io.mapOptional("scope", sc.scope);
+    io.mapOptional("shims", sc.shims_yaml);
     io.mapOptional("custom", sc.custom);
   }
 };
@@ -324,6 +327,8 @@ class UCSan {
     WK_Custom,
     WK_TaintCustom, // custom in dfsan abilist, defer to TaintPass if available
     WK_AutoCustom,
+    WK_ShimOrig,    // original function to be replaced by __shim_ version
+    WK_ShimTarget,  // LLM-generated __shim_ function, instrumented like in-scope
     WK_Uninstrumented,
   };
 
@@ -795,6 +800,13 @@ bool UCSan::loadMetadata() {
   }
 
   sys::fs::closeFile(fd);
+
+  // Expand shims_yaml list into shims map
+  for (const auto &name : Scope.shims_yaml) {
+    Scope.shims[name] = true;                    // original function
+    Scope.shims["__shim_" + name] = false;       // shim replacement
+  }
+
   return true;
 }
 
@@ -1530,6 +1542,12 @@ UCSan::WrapperKind UCSan::getWrapperKind(Function *F) {
   // Check ABIList for uninstrumented functions
   if (ABIList.isIn(*F, "uninstrumented"))
     return WK_Uninstrumented;
+
+  // Check if function is in the shims map from YAML metadata
+  auto shimIt = Scope.shims.find(F->getName().str());
+  if (shimIt != Scope.shims.end()) {
+    return shimIt->second ? WK_ShimOrig : WK_ShimTarget;
+  }
 
   // Check if function is in the custom map from YAML metadata
   if (Scope.custom.find(F->getName().str()) != Scope.custom.end()) {
@@ -2269,6 +2287,17 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     // No wrapper needed, fall through to default behavior
     llvm_unreachable("WK_None should not be handled here");
     return false;
+  case UCSan::WK_ShimTarget:
+    llvm_unreachable("WK_ShimTarget should not be in UnwrappedFnMap");
+    return false;
+  case UCSan::WK_ShimOrig:
+  {
+    // Redirect call to __shim_ function, let normal TLS path handle shadows
+    std::string ShimName = "__shim_" + F->getName().str();
+    FunctionCallee ShimF = UF.UC.Mod->getOrInsertFunction(ShimName, F->getFunctionType());
+    CB.setCalledFunction(ShimF);
+    return false;  // let caller handle arg/retval TLS
+  }
   case UCSan::WK_AutoCustom:
     // invoke the custom function
     {
@@ -2876,6 +2905,13 @@ bool UCSan::runImpl(Module &M) {
       } else if (WK == WK_Custom || WK == WK_AutoCustom) {
         if (!F.isDeclaration()) F.deleteBody();
         UnwrappedFnMap[&F] = &F;
+      } else if (WK == WK_ShimOrig) {
+        // Original function: delete body, redirect calls via visitWrappedCallBase
+        if (!F.isDeclaration()) F.deleteBody();
+        UnwrappedFnMap[&F] = &F;
+      } else if (WK == WK_ShimTarget) {
+        // LLM-generated __shim_ function, instrument like in-scope
+        FnsToInstrument.push_back(&F);
       } else {
         FnsOutOfScope.push_back(&F);
       }
@@ -2908,6 +2944,9 @@ bool UCSan::runImpl(Module &M) {
   // Instrument in-scope functions
   for (Function *F : FnsToInstrument) {
     if (!F || F->isDeclaration()) continue;
+
+    // Make in-scope functions externally visible for debugging/linking
+    F->setLinkage(GlobalValue::ExternalLinkage);
 
     // Kernel-style inputs may use 8-byte stack alignment; force realignment so
     // inserted UCSan runtime calls follow userspace ABI requirements.
@@ -2968,13 +3007,19 @@ bool UCSan::runImpl(Module &M) {
         int64_t CurID = getBBID(BB);
         if (CurID >= 0) {
           Instruction *Term = BB->getTerminator();
-          // COV := FN:current_bbid:termination_types
+          // COV := debug_info:current_bbid:termination_types
+          // debug_info := file,line,column
           // types := C (conditional branch)
           //       := D (unconditional branch)
           //       := S (switch cases)
           //       := R (return)
           //       := U (unreachable)
-          *COVF << F->getName() << ":" << CurID << ":";
+          if (const auto &DL = Term->getDebugLoc()) {
+            *COVF << DL->getFilename() << "," << DL.getLine() << "," << DL.getCol();
+          } else {
+            *COVF << F->getName() << ",0,0";
+          }
+          *COVF << ":" << CurID << ":";
           if (auto *BR = dyn_cast<BranchInst>(Term)) {
             if (BR->isConditional()) {
               // condition branch: C:T:true_target_id:F:false_target_id
