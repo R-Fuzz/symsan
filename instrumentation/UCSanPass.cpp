@@ -1341,6 +1341,11 @@ Function *UCSan::buildDangleFunction(Function *F) {
     SmallVector<unsigned, 4> Indices;
     Value *RetVal = wrapRetvalRecursive(RT, retvaltls, Indices);
     IRB.CreateRet(RetVal);
+  } else if (F->doesNotReturn()) {
+    NewF->addFnAttr(Attribute::NoReturn);
+    auto *ExitCall = IRB.CreateCall(ExitFn, {ConstantInt::get(Int32Ty, 0)});
+    markNosanitize(ExitCall);
+    IRB.CreateUnreachable();
   } else {
     IRB.CreateRetVoid();
   }
