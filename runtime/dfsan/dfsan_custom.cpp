@@ -3669,7 +3669,7 @@ __dfsw_fseeko64(FILE *stream, off64_t offset, int whence, dfsan_label stream_lab
 /// for assertion and assumption
 
 SANITIZER_INTERFACE_ATTRIBUTE void
-__dfsw_assert_cond(uint8_t result, dfsan_label result_label, uint64_t id) {
+__dfsw_assert_cond(uint8_t result,  uint64_t id, dfsan_label result_label, dfsan_label id_label) {
   if (!result) {
     AOUT("ERROR: assertion %lu failure: result %d, label %d\n", id, result, result_label);
   }
@@ -3677,7 +3677,7 @@ __dfsw_assert_cond(uint8_t result, dfsan_label result_label, uint64_t id) {
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE void
-__dfsw_assume_cond(uint8_t result, dfsan_label result_label, uint64_t id) {
+__dfsw_assume_cond(uint8_t result, uint64_t id, dfsan_label result_label, dfsan_label id_label) {
   if (result_label) {
     AOUT("WARNING: assumption label is concrete for id %lu\n", id);
   }
