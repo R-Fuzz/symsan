@@ -521,12 +521,22 @@ __dfsw_assume_allocated(void *ptr, size_t size, uint64_t id, ucsan_label ptr_lab
     *ret_label = ptr_label;
   } else {
     // external ptr
-    void *new_ptr = __dfsw_malloc(size, size_label, ret_label);
-    if (new_ptr) {
-      void *old_ptr = ucsan_check_pointer(ptr, ptr_label, size, true);
-      ucsan_label dummy;
-      __dfsw_memcpy(new_ptr, old_ptr, size, *ret_label, ptr_label, size_label, &dummy);
-      return new_ptr;
+    ucsan_label_info *info = get_label_info(ptr_label);
+    ucsan_ptr_info *ptr_info = to_ptr_info(info);
+    // for external ptr, we need to convert it back to pseudo ptr
+    ptr = ptr_info->pseudo_base;
+    if (size_label == 0) {
+      // size is concrete, we set a concrete bound by malloc
+      void *new_ptr = __dfsw_malloc(size, size_label, ret_label);
+      if (new_ptr) {
+        void *old_ptr = ucsan_check_pointer(ptr, ptr_label, size, true);
+        ucsan_label dummy;
+        __dfsw_memcpy(new_ptr, old_ptr, size, *ret_label, ptr_label, size_label, &dummy);
+        return new_ptr;
+      }
+    } else {
+      // symbolic size, keep it unbounded?
+      *ret_label = ptr_label;
     }
   }
 

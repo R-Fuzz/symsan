@@ -841,10 +841,18 @@ ucsan_label ucsan_combine_label(ucsan_label l1, ucsan_label l2) {
   if (l1 != 0) {
     ucsan_label_info *info = get_label_info(l1);
     l1_is_ptr = info && (info->common.op == OP_EXTERNAL || info->common.op == OP_ALLOCA);
+    if (info->common.op == OP_NONE && !l2) {
+      // l1 is under-constrained and l2 is concrete, allow it
+      return l1;
+    }
   }
   if (l2 != 0) {
     ucsan_label_info *info = get_label_info(l2);
     l2_is_ptr = info && (info->common.op == OP_EXTERNAL || info->common.op == OP_ALLOCA);
+    if (info->common.op == OP_NONE && !l1) {
+      // l2 is under-constrained and l1 is concrete, allow it
+      return l2;
+    }
   }
   // Warn only if pointer is combined with non-zero non-pointer
   if (l1_is_ptr && l2 != 0 && !l2_is_ptr) {
