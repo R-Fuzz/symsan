@@ -584,6 +584,7 @@ public:
   void visitGetElementPtrInst(GetElementPtrInst &GEPI);
   void visitSelectInst(SelectInst &I);
   void visitPHINode(PHINode &PN);
+  void visitUnreachableInst(UnreachableInst &I);
   // void visitIntrinsicInst(IntrinsicInst &I);
 
 private:
@@ -2776,6 +2777,13 @@ void UCSanVisitor::visitPHINode(PHINode &PN) {
 
   UF.PHIFixups.push_back({&PN, ShadowPN});
   UF.setShadow(&PN, ShadowPN);
+}
+
+void UCSanVisitor::visitUnreachableInst(UnreachableInst &I) {
+  IRBuilder<> IRB(&I);
+  Value *ExitCall = IRB.CreateCall(UF.UC.ExitFn,
+                                   {ConstantInt::get(UF.UC.Int32Ty, 0)});
+  UF.UC.markNosanitize(ExitCall);
 }
 
 bool UCSan::initializeModule(Module &M) {
