@@ -208,6 +208,21 @@ enum ucsan_event_type {
   EVENT_LAZY_INIT = 100,
   EVENT_USAGE_CITE = 101,
   EVENT_EXTENSION = 102,
+  EVENT_ASSERTION = 103,
+  EVENT_TYPE_BIND = 104,
+};
+
+enum ucsan_assertion_type {
+  ASSERTION_NONE = 0,
+  ASSERTION_NONE_SYMBOLIC = 1,
+  ASSERTION_ALLOCATED_FAILED = 2,
+  ASSERTION_ALLOCATED_SUCCESS = 3,
+  ASSERTION_FREED_FAILED = 4,
+  ASSERTION_FREED_SUCCESS = 5,
+  ASSERTION_INIT_FAILED = 6,
+  ASSERTION_INIT_SUCCESS = 7,
+  ASSERTION_COND_FAILED = 8,
+  ASSERTION_COND_SUCCESS = 9,
 };
 
 //===----------------------------------------------------------------------===//
