@@ -79,10 +79,16 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <set>
 #include <vector>
 #include <string>
+#include <fstream>
 
 using namespace llvm;
 
@@ -113,6 +119,10 @@ static cl::opt<bool> ClWithTaintPass(
     "ucsan-with-taint",
     cl::desc("TaintPass will run after UCSanPass, defer taint custom functions"),
     cl::Hidden, cl::init(false));
+
+static cl::opt<std::string> ClTypeTable("ucsan-type-table",
+    cl::desc("Emit type table JSON to file (loaded/appended across modules)"),
+    cl::Hidden);
 
 // The ABI list files control how shadow parameters are passed.
 static cl::list<std::string> ClABIListFiles(
@@ -408,6 +418,30 @@ class UCSan {
   UCSanABIList ABIList;
   AttributeMask ReadOnlyNoneAttrs;
 
+  // Type ID assignment for sidecar type table
+  std::map<std::string, uint32_t> TypeIDMap; // type key -> type_id
+  std::map<uint32_t, Type*> TypeIDToType;    // type_id -> LLVM Type*
+  std::map<uint32_t, json::Object> LoadedTypes; // type_id -> JSON from previous modules
+  // Builtin type IDs (fixed across modules):
+  // 1=i1, 2=i8, 3=i16, 4=i32, 5=i64, 6=float, 7=double
+  static const uint32_t kFirstDynamicTypeID = 16; // IDs 1-15 reserved for builtins
+  uint32_t NextTypeID = kFirstDynamicTypeID;
+
+  void initBuiltinTypeIDs();
+
+  // Entry function arg info for type table
+  struct ArgInfo {
+    std::string name;
+    uint32_t type_id;
+  };
+  std::string EntryFunctionName;
+  std::vector<ArgInfo> EntryArgs;
+
+  uint32_t getOrCreateTypeID(Type *T);
+  std::string getTypeKey(Type *T);
+  void emitTypeTable();
+  void loadTypeTable();
+
   void initializeRuntimeFunctions(Module &M);
   void initializeCustomFunctionTypes();
   bool loadMetadata();
@@ -535,7 +569,8 @@ struct UCSanFunction {
   /// SS(Addr, PS) = SS(Addr, PS)
   void storeShadow(Value *Addr, uint64_t Size, Align Align, Value *Shadow, Type *Ty, Instruction *Pos);
 
-  Value *checkPointer(Value *Ptr, Value *Size, bool dereference, IRBuilder<> &IRB);
+  Value *checkPointer(Value *Ptr, Value *Size, bool dereference, IRBuilder<> &IRB,
+                      uint32_t TypeID = 0);
 
   UCSanFunction(UCSan &UC, Function *F)
       : UC(UC), F(F) {
@@ -598,10 +633,10 @@ private:
 void UCSan::initializeRuntimeFunctions(Module &M) {
   Function *F = nullptr;
 
-  // Pointer checking: void* ucsan_check_pointer(void*, i16, i64, i1)
+  // Pointer checking: void* ucsan_check_pointer(void*, i16, i64, i1, i32)
   UCCheckPointerFnTy = FunctionType::get(
     VoidPtrTy,
-    {VoidPtrTy, PrimitiveShadowTy, Int64Ty, Int1Ty},
+    {VoidPtrTy, PrimitiveShadowTy, Int64Ty, Int1Ty, Int32Ty},
     false);
   UCCheckPointerFn = M.getOrInsertFunction("ucsan_check_pointer", UCCheckPointerFnTy);
   F = dyn_cast<Function>(UCCheckPointerFn.getCallee()->stripPointerCasts());
@@ -809,6 +844,239 @@ bool UCSan::loadMetadata() {
   }
 
   return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Type ID assignment for sidecar type table
+//===----------------------------------------------------------------------===//
+
+void UCSan::initBuiltinTypeIDs() {
+  // Reserve fixed IDs for primitive types so they're stable across modules
+  auto assign = [&](uint32_t ID, Type *T) {
+    std::string Key = getTypeKey(T);
+    TypeIDMap[Key] = ID;
+    TypeIDToType[ID] = T;
+  };
+  assign(1, Int1Ty);
+  assign(2, Int8Ty);
+  assign(3, Int16Ty);
+  assign(4, Int32Ty);
+  assign(5, Int64Ty);
+  assign(6, Type::getFloatTy(*Ctx));
+  assign(7, Type::getDoubleTy(*Ctx));
+  assign(8, VoidPtrTy);
+}
+
+std::string UCSan::getTypeKey(Type *T) {
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    if (ST->hasName())
+      return ST->getName().str();
+  }
+  // For non-named types, use the LLVM type string
+  std::string Key;
+  raw_string_ostream OS(Key);
+  T->print(OS);
+  return Key;
+}
+
+uint32_t UCSan::getOrCreateTypeID(Type *T) {
+  std::string Key = getTypeKey(T);
+  auto It = TypeIDMap.find(Key);
+  if (It != TypeIDMap.end())
+    return It->second;
+  uint32_t ID = NextTypeID++;
+  TypeIDMap[Key] = ID;
+  TypeIDToType[ID] = T;
+  // Recursively assign IDs to embedded sub-types (struct fields, array elements)
+  // Don't chase through pointers — those get their own checkPointer at runtime
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    for (unsigned I = 0, N = ST->getNumElements(); I < N; ++I)
+      getOrCreateTypeID(ST->getElementType(I));
+  } else if (auto *AT = dyn_cast<ArrayType>(T)) {
+    getOrCreateTypeID(AT->getElementType());
+  }
+  return ID;
+}
+
+void UCSan::loadTypeTable() {
+  if (ClTypeTable.empty()) return;
+
+  auto BufOrErr = llvm::MemoryBuffer::getFile(ClTypeTable);
+  if (!BufOrErr) return; // file doesn't exist yet, that's ok
+
+  auto Parsed = json::parse(BufOrErr.get()->getBuffer());
+  if (!Parsed) {
+    errs() << "Warning: failed to parse type table: " << ClTypeTable << "\n";
+    return;
+  }
+
+  auto *Root = Parsed->getAsObject();
+  if (!Root) return;
+
+  // Load next_type_id
+  if (auto NID = Root->getInteger("next_type_id"))
+    NextTypeID = *NID;
+
+  // Load existing type name->id mappings
+  if (auto *Types = Root->getObject("types")) {
+    for (auto &KV : *Types) {
+      auto *TypeObj = KV.second.getAsObject();
+      if (!TypeObj) continue;
+      auto ID = TypeObj->getInteger("type_id");
+      auto Name = TypeObj->getString("key");
+      if (ID && Name) {
+        TypeIDMap[Name->str()] = *ID;
+        // Preserve the full JSON object for types we can't resolve to LLVM Type*
+        LoadedTypes[*ID] = json::Object(*TypeObj);
+      }
+    }
+  }
+}
+
+void UCSan::emitTypeTable() {
+  if (ClTypeTable.empty()) return;
+
+  const DataLayout &DL = Mod->getDataLayout();
+
+  // Build debug info map: LLVM struct name -> DICompositeType
+  // StructType::getName() returns e.g. "struct.node"
+  // DICompositeType::getName() returns e.g. "node"
+  std::map<std::string, DICompositeType*> DebugStructMap;
+  DebugInfoFinder DIF;
+  DIF.processModule(*Mod);
+  for (auto *Ty : DIF.types()) {
+    if (auto *CT = dyn_cast<DICompositeType>(Ty)) {
+      if (CT->getTag() == dwarf::DW_TAG_structure_type && !CT->getName().empty()) {
+        // Map both "struct.<name>" and just "<name>" for flexible matching
+        DebugStructMap["struct." + CT->getName().str()] = CT;
+      }
+    }
+  }
+
+  json::Object Root;
+  Root["next_type_id"] = NextTypeID;
+  Root["entry_function"] = EntryFunctionName;
+
+  // Entry args - also try to get arg names from debug info
+  json::Array ArgsArr;
+  // Find entry function's debug info for arg names
+  std::vector<std::string> EntryArgNames;
+  if (Function *EntryF = Mod->getFunction(EntryFunctionName)) {
+    if (auto *SP = EntryF->getSubprogram()) {
+      for (auto *N : SP->getRetainedNodes()) {
+        if (auto *DV = dyn_cast<DILocalVariable>(N)) {
+          if (DV->isParameter()) {
+            unsigned Idx = DV->getArg() - 1; // DILocalVariable arg is 1-based
+            if (Idx >= EntryArgNames.size())
+              EntryArgNames.resize(Idx + 1);
+            EntryArgNames[Idx] = DV->getName().str();
+          }
+        }
+      }
+    }
+  }
+  for (unsigned I = 0; I < EntryArgs.size(); ++I) {
+    json::Object ArgObj;
+    std::string Name = EntryArgs[I].name;
+    if (Name.empty() && I < EntryArgNames.size())
+      Name = EntryArgNames[I];
+    ArgObj["name"] = Name;
+    ArgObj["type_id"] = EntryArgs[I].type_id;
+    ArgsArr.push_back(std::move(ArgObj));
+  }
+  Root["args"] = std::move(ArgsArr);
+
+  // Types
+  json::Object TypesObj;
+  for (auto &KV : TypeIDToType) {
+    uint32_t ID = KV.first;
+    Type *T = KV.second;
+    json::Object TypeObj;
+    TypeObj["type_id"] = ID;
+    TypeObj["key"] = getTypeKey(T);
+
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      TypeObj["kind"] = "struct";
+      TypeObj["name"] = ST->hasName() ? ST->getName().str() : "(anonymous)";
+      if (ST->isSized()) {
+        const StructLayout *SL = DL.getStructLayout(ST);
+        TypeObj["size"] = (int64_t)DL.getTypeAllocSize(ST);
+
+        // Look up field names from debug info
+        DICompositeType *DCT = nullptr;
+        if (ST->hasName()) {
+          auto It = DebugStructMap.find(ST->getName().str());
+          if (It != DebugStructMap.end())
+            DCT = It->second;
+        }
+
+        json::Array Fields;
+        for (unsigned I = 0, N = ST->getNumElements(); I < N; ++I) {
+          json::Object Field;
+          Field["index"] = I;
+          Field["offset"] = (int64_t)SL->getElementOffset(I);
+          Field["size"] = (int64_t)DL.getTypeAllocSize(ST->getElementType(I));
+          Field["type_id"] = getOrCreateTypeID(ST->getElementType(I));
+
+          // Extract field name from debug info
+          if (DCT) {
+            auto Elements = DCT->getElements();
+            if (I < Elements.size()) {
+              if (auto *DT = dyn_cast<DIDerivedType>(Elements[I])) {
+                Field["name"] = DT->getName().str();
+              }
+            }
+          }
+
+          Fields.push_back(std::move(Field));
+        }
+        TypeObj["fields"] = std::move(Fields);
+      }
+    } else if (auto *AT = dyn_cast<ArrayType>(T)) {
+      TypeObj["kind"] = "array";
+      TypeObj["num_elements"] = (int64_t)AT->getNumElements();
+      TypeObj["element_type_id"] = getOrCreateTypeID(AT->getElementType());
+      if (T->isSized())
+        TypeObj["size"] = (int64_t)DL.getTypeAllocSize(T);
+    } else if (auto *PT = dyn_cast<PointerType>(T)) {
+      TypeObj["kind"] = "pointer";
+      TypeObj["size"] = (int64_t)DL.getTypeAllocSize(T);
+      Type *PointeeTy = PT->getPointerElementType();
+      if (PointeeTy->isSized())
+        TypeObj["pointee_type_id"] = getOrCreateTypeID(PointeeTy);
+      else
+        TypeObj["pointee_type_id"] = 0;
+    } else {
+      // Primitive types (integers, floats, etc.)
+      TypeObj["kind"] = "primitive";
+      std::string Name;
+      raw_string_ostream OS(Name);
+      T->print(OS);
+      TypeObj["name"] = Name;
+      if (T->isSized())
+        TypeObj["size"] = (int64_t)DL.getTypeAllocSize(T);
+    }
+
+    TypesObj[std::to_string(ID)] = std::move(TypeObj);
+  }
+
+  // Merge in loaded types from previous modules that weren't re-encountered
+  for (auto &KV : LoadedTypes) {
+    std::string Key = std::to_string(KV.first);
+    if (!TypesObj.get(Key))
+      TypesObj[Key] = json::Value(json::Object(KV.second));
+  }
+
+  Root["types"] = std::move(TypesObj);
+
+  // Write to file
+  std::error_code EC;
+  raw_fd_ostream OS(ClTypeTable, EC, sys::fs::OF_Text);
+  if (EC) {
+    errs() << "Warning: failed to write type table: " << ClTypeTable << "\n";
+    return;
+  }
+  OS << json::Value(std::move(Root));
 }
 
 // Helper: Get shadow type for a given type (simplified for standalone UCSan)
@@ -1390,6 +1658,10 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
   FunctionType *EntryFT = F->getFunctionType();
   const DataLayout &DL = Mod->getDataLayout();
 
+  // Record entry function info for type table
+  EntryFunctionName = F->getName().str();
+  EntryArgs.clear();
+
   // Initialize arguments for the entry point
   std::vector<Value *> Args;
   for (Function::arg_iterator ai = F->arg_begin(), ae = F->arg_end(); ai != ae; ++ai) {
@@ -1397,6 +1669,10 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
     ConstantInt *ArgSize = ConstantInt::get(Int32Ty, DL.getTypeSizeInBits(ai->getType()));
     ConstantInt *IsPtr = ConstantInt::get(Int8Ty, ai->getType()->isPointerTy());
     ConstantInt *InitVal = ConstantInt::get(Int64Ty, 0);
+
+    // Record arg type info
+    uint32_t TypeID = getOrCreateTypeID(ai->getType());
+    EntryArgs.push_back({ai->getName().str(), TypeID});
 
     // Call runtime to create symbolic argument
     // Returns a pointer that we cast to the appropriate type
@@ -1588,7 +1864,7 @@ TransformedFunction UCSan::getCustomFunctionType(FunctionType *T) {
 }
 
 Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
-                                    IRBuilder<> &IRB) {
+                                    IRBuilder<> &IRB, uint32_t TypeID) {
   Type *Ty = Ptr->getType();
   Value *SPtr = Ptr->stripPointerCasts();
   bool cacheable = isa<Constant>(Size);
@@ -1679,9 +1955,10 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
       UC.markNosanitize(ExtSize);
     }
     ConstantInt *Deref = ConstantInt::get(UC.Int1Ty, dereference);
+    ConstantInt *TypeIDVal = ConstantInt::get(UC.Int32Ty, TypeID);
 
     CallInst *NewAddr = IRB.CreateCall(
-      UC.UCCheckPointerFn, {Addr, Shadow, ExtSize, Deref});
+      UC.UCCheckPointerFn, {Addr, Shadow, ExtSize, Deref, TypeIDVal});
     // UC.markNosanitize(NewAddr); // don't mark as nonsanitize
 
     Value *Checked = NewAddr;
@@ -1761,10 +2038,11 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
     }
   }
   ConstantInt *Size = ConstantInt::get(UF.UC.Int64Ty, StoreSize);
+  uint32_t TypeID = UF.UC.getOrCreateTypeID(Ty);
 
   // Check and replace pointer
   IRBuilder<> IRB(&LI);
-  Ptr = UF.checkPointer(Ptr, Size, true, IRB);
+  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID);
   LI.setOperand(0, Ptr);
 
   Value *Shadow = UF.loadShadow(Ptr, StoreSize, LI.getAlign(), Ty, &LI);
@@ -1788,13 +2066,14 @@ void UCSanVisitor::visitStoreInst(StoreInst &SI) {
   Value *Ptr = SI.getPointerOperand();
   ConstantInt *Size = ConstantInt::get(UF.UC.Int64Ty, StoreSize);
 
-  // Check and replace pointer
-  IRBuilder<> IRB(&SI);
-  Ptr = UF.checkPointer(Ptr, Size, true, IRB);
-  SI.setOperand(SI.getPointerOperandIndex(), Ptr);
-
   Value *Val = SI.getValueOperand();
   Type *Ty = Val->getType();
+  uint32_t TypeID = UF.UC.getOrCreateTypeID(Ty);
+
+  // Check and replace pointer
+  IRBuilder<> IRB(&SI);
+  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID);
+  SI.setOperand(SI.getPointerOperandIndex(), Ptr);
   Value *Shadow = UF.getShadow(Val);
   UF.storeShadow(Ptr, StoreSize, SI.getAlign(), Shadow, Ty, &SI);
 
@@ -1900,12 +2179,15 @@ void UCSanVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
       !isa<AllocaInst>(Ptr->stripPointerCasts())) {
     IRBuilder<> IRB(&GEPI);
     const DataLayout &DL = getDataLayout();
+    Type *SrcElemTy = GEPI.getSourceElementType();
     Value *Size = ConstantInt::get(UF.UC.Int64Ty,
-        DL.getTypeAllocSize(GEPI.getSourceElementType()));
+        DL.getTypeAllocSize(SrcElemTy));
+    uint32_t TypeID = UF.UC.getOrCreateTypeID(SrcElemTy);
     Value *Addr = IRB.CreateBitCast(Ptr, UF.UC.VoidPtrTy);
     if (Addr != Ptr) UF.UC.markNosanitize(Addr);
     Value *Checked = IRB.CreateCall(UF.UC.UCCheckPointerFn,
-      { Addr, UF.getShadow(Ptr), Size, ConstantInt::get(UF.UC.Int1Ty, false) });
+      { Addr, UF.getShadow(Ptr), Size, ConstantInt::get(UF.UC.Int1Ty, false),
+        ConstantInt::get(UF.UC.Int32Ty, TypeID) });
     UF.UC.markNosanitize(Checked);
     UF.CheckedPtrSet.insert(Ptr);
   }
@@ -1940,11 +2222,14 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
       if (!isa<Constant>(Arg) &&
           !isa<AllocaInst>(Arg->stripPointerCasts())) {
         unsigned ObjSize = 0;
-        if (Arg->getType()->getPointerElementType()->isSized()) {
-          ObjSize = DL.getTypeAllocSize(Arg->getType()->getPointerElementType());
+        Type *PointeeTy = Arg->getType()->getPointerElementType();
+        uint32_t TypeID = 0;
+        if (PointeeTy->isSized()) {
+          ObjSize = DL.getTypeAllocSize(PointeeTy);
+          TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
         }
         Value *Size = ConstantInt::get(UF.UC.Int64Ty, ObjSize);
-        Value *Ptr = UF.checkPointer(Arg, Size, true, IRB); // dereference pointer
+        Value *Ptr = UF.checkPointer(Arg, Size, true, IRB, TypeID); // dereference pointer
         CB.setArgOperand(ArgIdx, Ptr);
       }
     }
@@ -2349,9 +2634,11 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
       // skip nullptr
       if ((*I)->getType()->isPointerTy() && !isa<ConstantPointerNull>(*I)) {
+        Type *PointeeTy = (*I)->getType()->getPointerElementType();
         Value *sizeArg = ConstantInt::get(UF.UC.Int64Ty,
-            DL.getTypeAllocSize((*I)->getType()->getPointerElementType()));
-        Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB);
+            DL.getTypeAllocSize(PointeeTy));
+        uint32_t TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
+        Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
         CB.setArgOperand(FT->getNumParams() - N, rptr);
       }
     }
@@ -2393,10 +2680,12 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       if (isa<PointerType>(T)) {
         // Check pointer arguments before passing to custom function
         auto DL = getDataLayout();
+        Type *PointeeTy = T->getPointerElementType();
         Value *sizeArg =
             ConstantInt::get(UF.UC.Int64Ty,
-                             DL.getTypeAllocSize(T->getPointerElementType()));
-        Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB);
+                             DL.getTypeAllocSize(PointeeTy));
+        uint32_t TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
+        Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
         Args.push_back(rptr);
       } else {
         Args.push_back(*I);
@@ -2603,9 +2892,10 @@ void UCSanVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
   Type *Ty = I.getType();
   unsigned StoreSize = DL.getTypeStoreSize(Ty);
   ConstantInt *Size = ConstantInt::get(UF.UC.Int64Ty, StoreSize);
+  uint32_t TypeID = UF.UC.getOrCreateTypeID(Ty);
 
   IRBuilder<> IRB(&I);
-  Ptr = UF.checkPointer(Ptr, Size, true, IRB);
+  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID);
   I.setOperand(0, Ptr);
 
   // FIXME: AtomicRMWInst should not operate on ptrs
@@ -2837,6 +3127,12 @@ bool UCSan::initializeModule(Module &M) {
     report_fatal_error("Failed to load metadata");
   }
   initializeCustomFunctionTypes();
+
+  // Initialize builtin type IDs (fixed across modules)
+  initBuiltinTypeIDs();
+
+  // Load existing type table (for multi-file compilation)
+  loadTypeTable();
 
   // Initialize ABIList from command-line abilist files
   if (!ClABIListFiles.empty()) {
@@ -3112,6 +3408,9 @@ bool UCSan::runImpl(Module &M) {
       F.setDSOLocal(false);
     }
   }
+
+  // Emit type table JSON
+  emitTypeTable();
 
   return true;
 }

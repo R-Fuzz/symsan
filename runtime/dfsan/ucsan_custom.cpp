@@ -553,7 +553,7 @@ __dfsw_assume_allocated(void *ptr, size_t size, uint64_t id, ucsan_label ptr_lab
       // size is concrete, we set a concrete bound by malloc
       void *new_ptr = __dfsw_malloc(size, size_label, ret_label);
       if (new_ptr) {
-        void *old_ptr = ucsan_check_pointer(ptr, ptr_label, size, true);
+        void *old_ptr = ucsan_check_pointer(ptr, ptr_label, size, true, 0);
         ucsan_label dummy;
         __dfsw_memcpy(new_ptr, old_ptr, size, *ret_label, ptr_label, size_label, &dummy);
         return new_ptr;

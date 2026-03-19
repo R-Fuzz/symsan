@@ -336,7 +336,7 @@ static inline bool is_writeable(void *p) {
 // Object Lookup
 //===----------------------------------------------------------------------===//
 
-UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr, uint32_t *ret_object_id) {
+UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr, uint32_t *ret_object_id, uint32_t type_id) {
   if (label) {
     ucsan_label_info *label_info = get_label_info(label);
     uint32_t object_id = 0;
@@ -410,6 +410,10 @@ UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr
       uint64_t info = ((uint64_t)parent_obj_id << 32) | object_id;
       __taint_trace_event_addr(label, EVENT_LAZY_INIT, info, return_addr,
                                (uint32_t)offset_in_parent);
+      // Send type binding: type_id for the newly created object
+      if (type_id != 0) {
+        __taint_trace_event_addr(label, EVENT_TYPE_BIND, object_id, return_addr, type_id);
+      }
     }
 
     if (ret_object_id) *ret_object_id = object_id;
@@ -462,8 +466,8 @@ object_info create_label_from_super_object(size_t size, bool is_pointer) {
 using namespace __ucsan;
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool dereferencing) {
-  UCSAN_OUT("%p: label: %d, size: %zu, dereferencing: %d\n", p, label, size, dereferencing);
+void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool dereferencing, uint32_t type_id) {
+  UCSAN_OUT("%p: label: %d, size: %zu, dereferencing: %d, type_id: %u\n", p, label, size, dereferencing, type_id);
   __ucsan_null_deref_flag = nullptr;
 
   // Handle unlabeled or special labels
@@ -499,10 +503,10 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
           ucsan_label_info *info = get_label_info(first_label);
           // globals are from super object, so object_id is always 0
           int64_t offset = to_byte_info(info)->offset;
-          if (offset > INT32_MAX || offset < INT32_MIN || size > UINT32_MAX) {
-            UCSAN_OUT("WARNING: global variable offset (%ld) or size (%lu) too large\n", offset, size);
+          if (offset > INT32_MAX || offset < INT32_MIN) {
+            UCSAN_OUT("WARNING: global variable offset (%ld) too large\n", offset);
           } else {
-            __taint_trace_event_addr(*(ucsan_shadow_for(p)), EVENT_USAGE_CITE, size,
+            __taint_trace_event_addr(*(ucsan_shadow_for(p)), EVENT_USAGE_CITE, type_id,
                                      __builtin_return_address(0), (uint32_t)offset);
           }
         }
@@ -622,7 +626,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
     uint32_t object_id;
     void *return_addr = __builtin_return_address(0);
-    auto& obj = lookup_object(label, 0, return_addr, &object_id);
+    auto& obj = lookup_object(label, 0, return_addr, &object_id, type_id);
     size_t object_size = obj.data.size();
 
     UCSAN_OUT("Find object_id: %u (size = %zu) for label %u, addr %p\n",
@@ -725,10 +729,14 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       new_lower_bound = -desired_offset;
       UCSAN_OUT("Extended lower bound: %lu, new lower bound: %lu\n",
                 extended_lower, new_lower_bound);
-      if (ucsan_flags().trace_object)
+      if (ucsan_flags().trace_object) {
         __taint_trace_event_addr(label, EVENT_EXTENSION, object_id,
                                  __builtin_return_address(0),
                                  (uint32_t)new_lower_bound);
+        if (type_id != 0)
+          __taint_trace_event_addr(label, EVENT_TYPE_BIND, object_id,
+                                   __builtin_return_address(0), type_id);
+      }
     }
 
     uint64_t new_size = new_lower_bound + Max(desired_offset + (int64_t)size,

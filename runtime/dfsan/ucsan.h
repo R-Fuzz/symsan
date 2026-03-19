@@ -293,7 +293,8 @@ struct object_info {
 };
 
 // Look up or create an object for a given pointer label
-UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr, uint32_t *ret_object_id = nullptr);
+UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr,
+                           uint32_t *ret_object_id = nullptr, uint32_t type_id = 0);
 
 // Create a label from the super object (object 0)
 object_info create_label_from_super_object(size_t size, bool is_pointer = false);
@@ -335,9 +336,10 @@ extern void* __ucsan_null_deref_flag;
 // @param label: the ucsan label for the pointer
 // @param size: access size in bytes
 // @param dereferencing: true if this is a dereference (load/store)
+// @param type_id: compile-time type ID from type table (0 = unknown)
 // @return: resolved real pointer (may differ from p for pseudo-pointers)
 SANITIZER_INTERFACE_ATTRIBUTE
-void* ucsan_check_pointer(void* p, __ucsan::ucsan_label label, size_t size, bool dereferencing);
+void* ucsan_check_pointer(void* p, __ucsan::ucsan_label label, size_t size, bool dereferencing, uint32_t type_id);
 
 // Check pointer argument for use-before-initialization
 SANITIZER_INTERFACE_ATTRIBUTE

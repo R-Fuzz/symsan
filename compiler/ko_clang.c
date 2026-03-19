@@ -296,6 +296,12 @@ static void add_ucsan_pass() {
     cc_params[cc_par_cnt++] = alloc_printf("-ucsan-dump-cfg=%s", uscan_cfg);
   }
 
+  const char *type_table = getenv("KO_TYPE_TABLE");
+  if (type_table) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = alloc_printf("-ucsan-type-table=%s", type_table);
+  }
+
   if (!use_ucsan_only) {
     // TaintPass will run after UCSanPass
     cc_params[cc_par_cnt++] = "-mllvm";
