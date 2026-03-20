@@ -193,15 +193,15 @@ static void add_runtime() {
   cc_params[cc_par_cnt++] = alloc_printf("-Wl,-T%s/taint.ld", obj_path);
 
   if (is_cxx && !use_native_cxx) {
-    // cc_params[cc_par_cnt++] = "-Wl,--whole-archive";
+    // Instrumented static libc++ for C++ builds
     cc_params[cc_par_cnt++] = alloc_printf("%s/libc++.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/libc++abi.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/libunwind.a", obj_path);
-    // cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
   } else {
-    cc_params[cc_par_cnt++] = "-lc++";
-    cc_params[cc_par_cnt++] = "-lc++abi";
-    cc_params[cc_par_cnt++] = "-l:libunwind.so";
+    // System static libc++ for C builds (avoids shared lib dependency)
+    cc_params[cc_par_cnt++] = "-l:libc++.a";
+    cc_params[cc_par_cnt++] = "-l:libc++abi.a";
+    cc_params[cc_par_cnt++] = "-l:libunwind.a";
   }
   cc_params[cc_par_cnt++] = "-lrt";
 

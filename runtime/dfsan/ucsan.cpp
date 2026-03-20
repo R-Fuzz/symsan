@@ -44,6 +44,10 @@ void __taint_trace_global_var(__ucsan::ucsan_label label, uint64_t size,
 // Forward declaration for UCSan solver initialization (thoroupy backend)
 extern "C" void InitializeUCSanSolver();
 
+// Ensure dfsan is initialized before ucsan (weak, no-op when standalone)
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
+void __dfsan_ensure_init(int argc, char **argv, char **envp);
+
 // Forward declarations for SymSan bridge functions
 // (weak stubs, overridden when linked with SymSan)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -137,6 +141,175 @@ void* __ucsan_null_deref_flag = nullptr;
 }  // extern "C"
 
 //===----------------------------------------------------------------------===//
+// Container Implementations (replaces STL)
+//===----------------------------------------------------------------------===//
+
+using namespace __ucsan;
+using __sanitizer::MmapOrDie;
+using __sanitizer::UnmapOrDie;
+using __sanitizer::RoundUpTo;
+using __sanitizer::GetPageSizeCached;
+using __sanitizer::internal_memcpy;
+using __sanitizer::internal_memset;
+
+void ByteBuffer::destroy() {
+  if (buf) {
+    UnmapOrDie(buf, RoundUpTo(cap, GetPageSizeCached()));
+    buf = nullptr;
+  }
+  len = cap = 0;
+}
+
+void ByteBuffer::resize(uint32_t new_size) {
+  if (new_size > cap) {
+    uint32_t new_cap = cap ? cap : 16;
+    while (new_cap < new_size) new_cap *= 2;
+    uptr old_alloc = RoundUpTo(cap, GetPageSizeCached());
+    uptr new_alloc = RoundUpTo(new_cap, GetPageSizeCached());
+    if (buf) {
+      uptr r = internal_mremap(buf, old_alloc, new_alloc, MREMAP_MAYMOVE, nullptr);
+      if (!internal_iserror(r)) {
+        buf = (unsigned char *)r;
+      } else {
+        unsigned char *new_buf = (unsigned char *)MmapOrDie(new_alloc, "ByteBuffer");
+        __builtin_memcpy(new_buf, buf, len);
+        UnmapOrDie(buf, old_alloc);
+        buf = new_buf;
+      }
+    } else {
+      buf = (unsigned char *)MmapOrDie(new_alloc, "ByteBuffer");
+    }
+    cap = new_cap;
+  }
+  len = new_size;
+}
+
+void ByteBuffer::assign(const unsigned char *src, uint32_t n) {
+  resize(n);
+  __builtin_memcpy(buf, src, n);
+}
+
+void ObjectStorage::destroy() {
+  if (items) {
+    for (uint32_t i = 0; i < len; i++)
+      items[i].data.destroy();
+    UnmapOrDie(items, RoundUpTo(cap * sizeof(UCSanObject), GetPageSizeCached()));
+    items = nullptr;
+  }
+  len = cap = 0;
+}
+
+void ObjectStorage::resize(uint32_t new_size) {
+  if (new_size > cap) {
+    uint32_t new_cap = cap ? cap : 4;
+    while (new_cap < new_size) new_cap *= 2;
+    uptr alloc_size = RoundUpTo(new_cap * sizeof(UCSanObject), GetPageSizeCached());
+    UCSanObject *new_items = (UCSanObject *)MmapOrDie(alloc_size, "ObjectStorage");
+    if (items) {
+      internal_memcpy(new_items, items, len * sizeof(UCSanObject));
+      UnmapOrDie(items, RoundUpTo(cap * sizeof(UCSanObject), GetPageSizeCached()));
+    }
+    items = new_items;
+    cap = new_cap;
+  }
+  // Initialize new entries (MmapOrDie zero-fills, but init ByteBuffer explicitly)
+  for (uint32_t i = len; i < new_size; i++) {
+    items[i].offset = 0;
+    items[i].data.init();
+    items[i].origin = {0, 0};
+  }
+  len = new_size;
+}
+
+void ObjectStorage::clear() {
+  for (uint32_t i = 0; i < len; i++)
+    items[i].data.destroy();
+  len = 0;
+}
+
+void ObjectStorage::push_back(const UCSanObject &obj) {
+  if (len >= cap) {
+    resize(len + 1);
+    items[len - 1] = obj;
+  } else {
+    items[len++] = obj;
+  }
+}
+
+UCSanObject& ObjectStorage::emplace_back(const UCSanObject &obj) {
+  push_back(obj);
+  return items[len - 1];
+}
+
+void ObjectMap::init(uint32_t initial_cap) {
+  cap = initial_cap;
+  count = 0;
+  uptr alloc_size = RoundUpTo(cap * sizeof(ObjectMapEntry), GetPageSizeCached());
+  entries = (ObjectMapEntry *)MmapOrDie(alloc_size, "ObjectMap");
+  // MmapOrDie returns zero-filled, so occupied=0 for all entries
+}
+
+void ObjectMap::destroy() {
+  if (entries) {
+    UnmapOrDie(entries, RoundUpTo(cap * sizeof(ObjectMapEntry), GetPageSizeCached()));
+    entries = nullptr;
+  }
+  cap = count = 0;
+}
+
+uint32_t ObjectMap::hash(uint32_t parent_id, int32_t offset) const {
+  uint64_t key = ((uint64_t)parent_id << 32) | (uint32_t)offset;
+  key *= 2654435769ULL;
+  return (uint32_t)(key & (cap - 1));
+}
+
+uint32_t *ObjectMap::find_val(uint32_t parent_id, int32_t offset) {
+  if (!entries) return nullptr;
+  uint32_t h = hash(parent_id, offset);
+  for (uint32_t i = 0; i < cap; i++) {
+    uint32_t idx = (h + i) & (cap - 1);
+    if (!entries[idx].occupied) return nullptr;
+    if (entries[idx].key.first == parent_id && entries[idx].key.second == offset)
+      return &entries[idx].value;
+  }
+  return nullptr;
+}
+
+void ObjectMap::insert(uint32_t parent_id, int32_t offset, uint32_t value) {
+  if (count * 10 > cap * 7) grow();
+  uint32_t h = hash(parent_id, offset);
+  for (;;) {
+    uint32_t idx = h & (cap - 1);
+    if (!entries[idx].occupied) {
+      entries[idx].key = {parent_id, offset};
+      entries[idx].value = value;
+      entries[idx].occupied = 1;
+      count++;
+      return;
+    }
+    if (entries[idx].key.first == parent_id && entries[idx].key.second == offset) {
+      entries[idx].value = value;
+      return;
+    }
+    h++;
+  }
+}
+
+void ObjectMap::grow() {
+  uint32_t old_cap = cap;
+  ObjectMapEntry *old = entries;
+  cap *= 2;
+  uptr alloc_size = RoundUpTo(cap * sizeof(ObjectMapEntry), GetPageSizeCached());
+  entries = (ObjectMapEntry *)MmapOrDie(alloc_size, "ObjectMap");
+  count = 0;
+  for (uint32_t i = 0; i < old_cap; i++) {
+    if (old[i].occupied)
+      insert(old[i].key.first, old[i].key.second, old[i].value);
+  }
+  UnmapOrDie(old, RoundUpTo(old_cap * sizeof(ObjectMapEntry), GetPageSizeCached()));
+}
+
+//===----------------------------------------------------------------------===//
 // UCSan Input Implementation
 //===----------------------------------------------------------------------===//
 
@@ -162,22 +335,28 @@ static void ucsan_init_input_struct() {
   }
   if (!ucsan_tainted.obj_map) {
     ucsan_tainted.obj_map = new ObjectMap();
+    ucsan_tainted.obj_map->init();
   }
   ucsan_tainted.arg_used.val_dont_use = 0;
 }
 
 static void ucsan_fini_input_struct() {
   if (ucsan_tainted.objects) {
+    ucsan_tainted.objects->destroy();
     delete ucsan_tainted.objects;
     ucsan_tainted.objects = nullptr;
   }
-  // obj_map is an object, not a pointer - no need to delete
+  if (ucsan_tainted.obj_map) {
+    ucsan_tainted.obj_map->destroy();
+    delete ucsan_tainted.obj_map;
+    ucsan_tainted.obj_map = nullptr;
+  }
 }
 
 char* ucsan_input::dump() {
   uint64_t length = sizeof(uint64_t);
-  for (auto& object : *objects) {
-    length += object.data.size() + sizeof(uint64_t) + sizeof(uint32_t);
+  for (uint32_t i = 0; i < objects->size(); i++) {
+    length += objects->at(i).data.size() + sizeof(uint64_t) + sizeof(uint32_t);
   }
 
   char *ret = static_cast<char*>(malloc(length));
@@ -189,23 +368,23 @@ char* ucsan_input::dump() {
   pos += sizeof(uint64_t);
 
   // Write offsets
-  for (auto& object : *objects) {
-    uint32_t tmp32 = object.offset;
+  for (uint32_t i = 0; i < objects->size(); i++) {
+    uint32_t tmp32 = objects->at(i).offset;
     internal_memcpy(pos, &tmp32, sizeof(uint32_t));
     pos += sizeof(uint32_t);
   }
 
   // Write sizes
-  for (auto& object : *objects) {
-    tmp = object.data.size();
+  for (uint32_t i = 0; i < objects->size(); i++) {
+    tmp = objects->at(i).data.size();
     internal_memcpy(pos, &tmp, sizeof(uint64_t));
     pos += sizeof(uint64_t);
   }
 
   // Write data
-  for (auto& object : *objects) {
-    tmp = object.data.size();
-    internal_memcpy(pos, object.data.data(), tmp);
+  for (uint32_t i = 0; i < objects->size(); i++) {
+    tmp = objects->at(i).data.size();
+    internal_memcpy(pos, objects->at(i).data.data(), tmp);
     pos += tmp;
   }
 
@@ -239,11 +418,12 @@ uint64_t ucsan_input::load(const char *buf, size_t file_size) {
   ucsan_tainted.objects->clear();
 
   for (uint64_t i = 0; i < object_cnt; ++i) {
-    ucsan_tainted.objects->emplace_back(UCSanObject{
-      .offset = offsets[i],
-      .data = std::vector<unsigned char>(cursor, cursor + sizes[i]),
-      .origin = {0, 0}
-    });
+    UCSanObject obj;
+    obj.offset = offsets[i];
+    obj.data.init();
+    obj.data.assign((const unsigned char *)cursor, (uint32_t)sizes[i]);
+    obj.origin = {0, 0};
+    ucsan_tainted.objects->push_back(obj);
     cursor += sizes[i];
   }
 
@@ -273,10 +453,10 @@ void ucsan_input::build_obj_map() {
   UCSAN_OUT("build_obj_map: objects->size()=%lu\n", (uint64_t)objects->size());
 
   for (; object_id < objects->size(); ++object_id) {
-    auto& object_meta = objects->at(object_id).origin;
+    ObjectOrigin& object_meta = objects->at(object_id).origin;
     UCSAN_OUT("  obj[%u]: from.obj_id=%u, from.offset=%d\n",
               object_id, object_meta.obj_id, object_meta.offset);
-    (*obj_map)[{object_meta.obj_id, object_meta.offset}] = object_id;
+    obj_map->insert(object_meta.obj_id, object_meta.offset, object_id);
   }
 
   atomic_store(&__ucsan_inited_objects, object_id, memory_order_relaxed);
@@ -285,8 +465,10 @@ void ucsan_input::build_obj_map() {
 
   // Debug: dump obj_map contents
   UCSAN_OUT("obj_map contents:\n");
-  for (auto &entry : *obj_map) {
-    UCSAN_OUT("  {%u, %d} -> %u\n", entry.first.first, entry.first.second, entry.second);
+  for (uint32_t i = 0; i < obj_map->cap; i++) {
+    if (obj_map->entries[i].occupied)
+      UCSAN_OUT("  {%u, %d} -> %u\n", obj_map->entries[i].key.first,
+                obj_map->entries[i].key.second, obj_map->entries[i].value);
   }
 }
 
@@ -379,9 +561,9 @@ UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr
     uint32_t parent_obj_id = (uint32_t)parent_obj_id_64;
     int32_t offset_in_parent = (int32_t)offset_in_parent_64;
 
-    auto find_result = ucsan_tainted.obj_map->find({parent_obj_id, offset_in_parent});
-    if (find_result != ucsan_tainted.obj_map->end()) {
-      object_id = find_result->second;
+    uint32_t *found_val = ucsan_tainted.obj_map->find_val(parent_obj_id, offset_in_parent);
+    if (found_val) {
+      object_id = *found_val;
       UCSAN_OUT("  found object_id=%u\n", object_id);
     } else {
       UCSAN_OUT("  NOT found in obj_map\n");
@@ -397,11 +579,11 @@ UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr
     }
 
     if (object_id >= ucsan_tainted.objects->size()) {
-      ucsan_tainted.objects->emplace_back(UCSanObject{
-        .offset = 0,
-        .data = std::vector<unsigned char>(0),
-        .origin = {0, 0}
-      });
+      UCSanObject new_obj;
+      new_obj.offset = 0;
+      new_obj.data.init();
+      new_obj.origin = {0, 0};
+      ucsan_tainted.objects->push_back(new_obj);
     }
 
     // Trace lazy init event if enabled
@@ -1354,9 +1536,9 @@ void ucsan_init_input(const char *filename) {
 
 // Internal init function with standard signature for preinit_array
 static void ucsan_init_internal(int argc, char **argv, char **envp) {
-  (void)argc;
-  (void)argv;
-  (void)envp;
+  // When linked with dfsan, ensure it is initialized before ucsan
+  // (ucsan's fork server must not fork before dfsan_init completes)
+  __dfsan_ensure_init(argc, argv, envp);
   ucsan_init();
 }
 
@@ -1390,6 +1572,9 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_basic_block,
 
 // Weak definition for UCSan solver initialization
 SANITIZER_INTERFACE_WEAK_DEF(void, InitializeUCSanSolver, void) {}
+
+// Weak definition for dfsan init ordering (overridden by dfsan.cpp when linked)
+SANITIZER_INTERFACE_WEAK_DEF(void, __dfsan_ensure_init, int, char**, char**) {}
 
 //===----------------------------------------------------------------------===//
 // SymSan Bridge - Weak Stubs

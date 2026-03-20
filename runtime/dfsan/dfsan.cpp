@@ -1509,9 +1509,9 @@ static inline uptr hash_addr(uptr addr, uptr capacity) {
 // Grow content map when load factor exceeds 0.7
 static void grow_content_map() {
   uptr new_capacity = content_map_capacity * 2;
-  typeof(__taint_content_map) new_map = (typeof(__taint_content_map))InternalAlloc(
-      new_capacity * sizeof(*__taint_content_map));
-  internal_memset(new_map, 0, new_capacity * sizeof(*__taint_content_map));
+  uptr new_size = RoundUpTo(new_capacity * sizeof(*__taint_content_map), GetPageSizeCached());
+  typeof(__taint_content_map) new_map = (typeof(__taint_content_map))MmapOrDie(
+      new_size, "taint_content_map");
 
   // Rehash existing entries
   for (uptr i = 0; i < content_map_capacity; i++) {
@@ -1524,7 +1524,8 @@ static void grow_content_map() {
     }
   }
 
-  InternalFree(__taint_content_map);
+  uptr old_size = RoundUpTo(content_map_capacity * sizeof(*__taint_content_map), GetPageSizeCached());
+  UnmapOrDie(__taint_content_map, old_size);
   __taint_content_map = new_map;
   content_map_capacity = new_capacity;
 }
@@ -1532,9 +1533,9 @@ static void grow_content_map() {
 // Grow indexOf map
 static void grow_indexof_map() {
   uptr new_capacity = indexof_map_capacity * 2;
-  typeof(__taint_indexof_map) new_map = (typeof(__taint_indexof_map))InternalAlloc(
-      new_capacity * sizeof(*__taint_indexof_map));
-  internal_memset(new_map, 0, new_capacity * sizeof(*__taint_indexof_map));
+  uptr new_size = RoundUpTo(new_capacity * sizeof(*__taint_indexof_map), GetPageSizeCached());
+  typeof(__taint_indexof_map) new_map = (typeof(__taint_indexof_map))MmapOrDie(
+      new_size, "taint_indexof_map");
 
   for (uptr i = 0; i < indexof_map_capacity; i++) {
     if (__taint_indexof_map[i].addr != 0) {
@@ -1546,7 +1547,8 @@ static void grow_indexof_map() {
     }
   }
 
-  InternalFree(__taint_indexof_map);
+  uptr old_size = RoundUpTo(indexof_map_capacity * sizeof(*__taint_indexof_map), GetPageSizeCached());
+  UnmapOrDie(__taint_indexof_map, old_size);
   __taint_indexof_map = new_map;
   indexof_map_capacity = new_capacity;
 }
@@ -1567,18 +1569,16 @@ static void InitializeStringMaps() {
 
   // Content map
   content_map_capacity = capacity;
-  __taint_content_map = (typeof(__taint_content_map))InternalAlloc(
-      content_map_capacity * sizeof(*__taint_content_map));
-  internal_memset(__taint_content_map, 0,
-      content_map_capacity * sizeof(*__taint_content_map));
+  __taint_content_map = (typeof(__taint_content_map))MmapOrDie(
+      RoundUpTo(content_map_capacity * sizeof(*__taint_content_map), GetPageSizeCached()),
+      "taint_content_map");
   content_map_count = 0;
 
   // IndexOf map
   indexof_map_capacity = capacity;
-  __taint_indexof_map = (typeof(__taint_indexof_map))InternalAlloc(
-      indexof_map_capacity * sizeof(*__taint_indexof_map));
-  internal_memset(__taint_indexof_map, 0,
-      indexof_map_capacity * sizeof(*__taint_indexof_map));
+  __taint_indexof_map = (typeof(__taint_indexof_map))MmapOrDie(
+      RoundUpTo(indexof_map_capacity * sizeof(*__taint_indexof_map), GetPageSizeCached()),
+      "taint_indexof_map");
   indexof_map_count = 0;
 }
 
@@ -1779,7 +1779,13 @@ static void dfsan_fini() {
   }
 }
 
+static bool dfsan_initialized;
+
 static void dfsan_init(int argc, char **argv, char **envp) {
+  if (dfsan_initialized)
+    return;
+  dfsan_initialized = true;
+
   InitializeFlags();
   print_debug = flags().debug;
 
@@ -1865,6 +1871,13 @@ static void (*dfsan_init_ptr)(int, char **, char **) = dfsan_init;
 #endif
 
 extern "C" {
+
+// Called by ucsan_init_internal to ensure dfsan is initialized before the fork server
+SANITIZER_INTERFACE_ATTRIBUTE
+void __dfsan_ensure_init(int argc, char **argv, char **envp) {
+  dfsan_init(argc, argv, envp);
+}
+
 SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanSolver, void) {}
 
 // Default empty implementations (weak) for hooks

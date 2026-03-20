@@ -23,8 +23,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
-#include <map>
 
 using __sanitizer::uptr;
 using __sanitizer::atomic_uint16_t;
@@ -144,21 +142,89 @@ struct ObjectOrigin {
   int32_t offset;    // offset within parent object
 };
 
+//===----------------------------------------------------------------------===//
+// Simple dynamic buffer (replaces std::vector<unsigned char>)
+//===----------------------------------------------------------------------===//
+struct ByteBuffer {
+  unsigned char *buf;
+  uint32_t len;
+  uint32_t cap;
+
+  void init() { buf = nullptr; len = 0; cap = 0; }
+  void destroy();
+  uint32_t size() const { return len; }
+  unsigned char *data() { return buf; }
+  const unsigned char *data() const { return buf; }
+  unsigned char& operator[](uint32_t i) { return buf[i]; }
+  const unsigned char& operator[](uint32_t i) const { return buf[i]; }
+  unsigned char& at(uint32_t i) { return buf[i]; }
+  const unsigned char& at(uint32_t i) const { return buf[i]; }
+  void resize(uint32_t new_size);
+  void clear() { len = 0; }
+  void assign(const unsigned char *src, uint32_t n);
+};
+
 // An object tracked by UCSan
 struct UCSanObject {
-  uint32_t offset;                         // offset within object (for sub-objects)
-  std::vector<unsigned char> data;    // concrete data
+  uint32_t offset;                    // offset within object (for sub-objects)
+  ByteBuffer data;                    // concrete data
   ObjectOrigin origin;                // where this object came from
 };
 
-// Object storage type
-typedef std::vector<UCSanObject> ObjectStorage;
+//===----------------------------------------------------------------------===//
+// Simple dynamic array for objects (replaces std::vector<UCSanObject>)
+//===----------------------------------------------------------------------===//
+struct ObjectStorage {
+  UCSanObject *items;
+  uint32_t len;
+  uint32_t cap;
 
-// Object map key type: (parent_obj_id, offset)
-typedef std::pair<uint32_t, int32_t> ObjectMapKey;
+  void init() { items = nullptr; len = 0; cap = 0; }
+  void destroy();
+  uint32_t size() const { return len; }
+  UCSanObject& operator[](uint32_t i) { return items[i]; }
+  const UCSanObject& operator[](uint32_t i) const { return items[i]; }
+  UCSanObject& at(uint32_t i) { return items[i]; }
+  const UCSanObject& at(uint32_t i) const { return items[i]; }
+  void resize(uint32_t new_size);
+  void clear();
+  void push_back(const UCSanObject &obj);
+  UCSanObject& emplace_back(const UCSanObject &obj);
+};
 
-// Object map: maps (parent_obj_id, offset) -> object_id
-typedef std::map<ObjectMapKey, uint32_t> ObjectMap;
+//===----------------------------------------------------------------------===//
+// Simple open-addressing hash map (replaces std::map<pair, uint32_t>)
+//===----------------------------------------------------------------------===//
+struct ObjectMapKey {
+  uint32_t first;   // parent_obj_id
+  int32_t second;   // offset
+};
+
+struct ObjectMapEntry {
+  ObjectMapKey key;
+  uint32_t value;
+  uint8_t occupied;
+};
+
+struct ObjectMap {
+  ObjectMapEntry *entries;
+  uint32_t cap;
+  uint32_t count;
+
+  void init(uint32_t initial_cap = 64);
+  void destroy();
+  uint32_t size() const { return count; }
+
+  // Returns pointer to value if found, nullptr if not
+  uint32_t *find_val(uint32_t parent_id, int32_t offset);
+
+  // Insert or update
+  void insert(uint32_t parent_id, int32_t offset, uint32_t value);
+
+private:
+  uint32_t hash(uint32_t parent_id, int32_t offset) const;
+  void grow();
+};
 
 //===----------------------------------------------------------------------===//
 // UCSan Taint Source (Input Tracking)
