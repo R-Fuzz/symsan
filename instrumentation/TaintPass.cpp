@@ -3432,8 +3432,57 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
   if (!NeedsInstrumentation)
     return;
 
-  // FIXME: track intrinsic
-  return;
+  Intrinsic::ID IId = F->getIntrinsicID();
+
+  // bswap: decompose into Extract-per-byte then Concat in reverse order.
+  // __taint_union(l1=low, l2=high, Concat) → z3::concat(high, low) (little-endian)
+  if (IId == Intrinsic::bswap) {
+    Value *Shadow = TF.getShadow(CB.getArgOperand(0));
+    unsigned TotalBits = CB.getArgOperand(0)->getType()->getIntegerBitWidth();
+    unsigned NumBytes = TotalBits / 8;
+
+    // Extract = last_llvm_op + 4 = 71, Concat = last_llvm_op + 5 = 72 (for LLVM 14)
+    const uint16_t OpExtract = 71;
+    const uint16_t OpConcat  = 72;
+
+    IRBuilder<> IRB(&CB);
+    Value *ZeroShadow = TF.TT.ZeroPrimitiveShadow;
+    Value *ExtractOp = ConstantInt::get(TF.TT.Int16Ty, OpExtract);
+    Value *ConcatOp  = ConstantInt::get(TF.TT.Int16Ty, OpConcat);
+    Value *ByteSize  = ConstantInt::get(TF.TT.Int16Ty, 8);
+    Value *Zero64    = ConstantInt::get(TF.TT.Int64Ty, 0);
+
+    auto MakeUnionCall = [&](Value *L1, Value *L2, Value *Op, Value *Size,
+                             Value *Op1, Value *Op2) -> Value * {
+      CallInst *C = IRB.CreateCall(TF.TT.TaintUnionFn, {L1, L2, Op, Size, Op1, Op2});
+      C->addRetAttr(Attribute::ZExt);
+      C->addParamAttr(0, Attribute::ZExt);
+      C->addParamAttr(1, Attribute::ZExt);
+      return C;
+    };
+
+    // Extract byte i → input bits [i*8+7 : i*8]
+    SmallVector<Value *, 8> ByteLabels(NumBytes);
+    for (unsigned I = 0; I < NumBytes; ++I)
+      ByteLabels[I] = MakeUnionCall(Shadow, ZeroShadow, ExtractOp, ByteSize,
+                                    Zero64, ConstantInt::get(TF.TT.Int64Ty, I * 8));
+
+    // Concat reversed: result LSB = input byte[NumBytes-1], MSB = input byte[0]
+    // Build: z3::concat(byte[0], concat(byte[1], ... concat(byte[N-2], byte[N-1])...))
+    // Using __taint_union(l1=low, l2=high) → z3::concat(l2, l1)
+    Value *Result = ByteLabels[NumBytes - 1];
+    unsigned AccumBits = 8;
+    for (int I = (int)NumBytes - 2; I >= 0; --I) {
+      AccumBits += 8;
+      Value *CSize = ConstantInt::get(TF.TT.Int16Ty, AccumBits);
+      Result = MakeUnionCall(Result, ByteLabels[I], ConcatOp, CSize, Zero64, Zero64);
+    }
+
+    TF.setShadow(&CB, Result);
+    return;
+  }
+
+  // Other intrinsics: symbolic propagation not yet implemented — skip.
 }
 
 void TaintVisitor::visitCallBase(CallBase &CB) {
