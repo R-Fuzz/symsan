@@ -140,6 +140,7 @@ inline ucsan_byte_info* to_byte_info(ucsan_label_info *info) {
 struct ObjectOrigin {
   uint32_t obj_id;   // parent object ID (0 = super object)
   int32_t offset;    // offset within parent object
+  uint32_t target_offset; // offset within this object the pointer points to
 };
 
 //===----------------------------------------------------------------------===//

@@ -422,18 +422,31 @@ uint64_t ucsan_input::load(const char *buf, size_t file_size) {
     obj.offset = offsets[i];
     obj.data.init();
     obj.data.assign((const unsigned char *)cursor, (uint32_t)sizes[i]);
-    obj.origin = {0, 0};
+    obj.origin = {0, 0, 0};
     ucsan_tainted.objects->push_back(obj);
     cursor += sizes[i];
   }
 
   // Load metadata if present
   if (cursor < buf + file_size) {
-    for (uint64_t i = 0; i < object_cnt && cursor + sizeof(uint64_t) * 2 <= buf + file_size; ++i) {
+    // Determine metadata entry size: 3 uint64_t (with target_offset) or 2 (legacy)
+    size_t remaining = (buf + file_size) - cursor;
+    size_t meta_entry_size = (remaining >= object_cnt * sizeof(uint64_t) * 3)
+                             ? sizeof(uint64_t) * 3 : sizeof(uint64_t) * 2;
+    for (uint64_t i = 0; i < object_cnt && cursor + meta_entry_size <= buf + file_size; ++i) {
       ucsan_tainted.objects->at(i).origin.obj_id = *(uint64_t *)cursor;
       cursor += sizeof(uint64_t);
       ucsan_tainted.objects->at(i).origin.offset = *(uint64_t *)cursor;
       cursor += sizeof(uint64_t);
+      if (meta_entry_size == sizeof(uint64_t) * 3) {
+        uint64_t target_offset = *(uint64_t *)cursor;
+        cursor += sizeof(uint64_t);
+        ucsan_tainted.objects->at(i).origin.target_offset = (uint32_t)target_offset;
+        // Override obj.offset with target_offset from metadata if non-zero
+        if (target_offset > 0) {
+          ucsan_tainted.objects->at(i).offset = (uint32_t)target_offset;
+        }
+      }
     }
   }
 
@@ -858,8 +871,9 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       ucsan_label *shadow = ucsan_shadow_for(nptr);
       *shadow = byte_label;
 
-      // Bridge to SymSan: create symbolic label for this byte and set shadow
-      dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
+      // Bridge to SymSan: use 0-based offset so offsets stay consistent
+      // across seed re-executions regardless of obj.offset growth
+      dfsan_label symsan_label = __taint_create_label(object_id, offset, 1);
       __taint_set_label(symsan_label, nptr, 1);
     }
 
@@ -958,7 +972,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       void *nptr = (void*)((uint64_t)np + offset);
       *ucsan_shadow_for(nptr) = byte_label;
 
-      // Bridge to SymSan: create symbolic label for this byte and set shadow
+      // Bridge to SymSan: use signed offset (negative for backward extension)
       dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
       __taint_set_label(symsan_label, nptr, 1);
     }
@@ -988,7 +1002,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       void *nptr = (void*)((uint64_t)np + offset);
       *ucsan_shadow_for(nptr) = byte_label;
 
-      // Bridge to SymSan: create symbolic label for this byte and set shadow
+      // Bridge to SymSan: offset relative to original pointer base
       dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
       __taint_set_label(symsan_label, nptr, 1);
     }
