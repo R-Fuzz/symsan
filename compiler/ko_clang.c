@@ -229,6 +229,8 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = "-Wl,--no-whole-archive";
     cc_params[cc_par_cnt++] = "-L/usr/local/lib"; // prefer local
     cc_params[cc_par_cnt++] = "-lz3";
+    cc_params[cc_par_cnt++] = "-lc++";
+    cc_params[cc_par_cnt++] = "-lc++abi";
     cc_params[cc_par_cnt++] = "-Wl,-rpath,/usr/local/lib";
   }
 }
