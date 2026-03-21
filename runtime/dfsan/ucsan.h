@@ -360,7 +360,8 @@ struct object_info {
 
 // Look up or create an object for a given pointer label
 UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr,
-                           uint32_t *ret_object_id = nullptr, uint32_t type_id = 0);
+                           uint32_t *ret_object_id = nullptr, uint32_t type_id = 0,
+                           uint32_t size = 0);
 
 // Create a label from the super object (object 0)
 object_info create_label_from_super_object(size_t size, bool is_pointer = false);

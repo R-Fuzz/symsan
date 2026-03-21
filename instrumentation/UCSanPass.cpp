@@ -2630,16 +2630,64 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
   {
     // TaintPass will handle the __dfsw_ wrapping with proper taint labels.
     // Just check pointer arguments here, skip ucsan arg/retval TLS.
+    //
+    // For memory/string functions, use type_id=0 (typeless bytes) and pass
+    // the actual byte count to checkPointer so lazy init allocates enough.
+    StringRef FName = F->getName();
+    // Determine the length argument index for known mem/string functions.
+    // -1 means no explicit length (string functions: use size=0).
+    int LenArgIdx = -1;
+    if (FName == "memcmp" || FName == "bcmp" || FName == "memchr" ||
+        FName == "memrchr" || FName == "strncmp" || FName == "strncasecmp" ||
+        FName == "strncpy" || FName == "strncat" || FName == "strnstr") {
+      LenArgIdx = 2;  // 3rd argument is the length
+    } else if (FName == "strndup") {
+      LenArgIdx = 1;  // 2nd argument is the length
+    } else if (FName == "memmem") {
+      LenArgIdx = -2;  // special: arg1 is len for arg0, arg3 is len for arg2
+    }
+    bool IsMemOrStrFn = (LenArgIdx != -1) ||
+        FName == "strcmp" || FName == "strcasecmp" || FName == "strchr" ||
+        FName == "strrchr" || FName == "strpbrk" || FName == "strstr" ||
+        FName == "strlen" || FName == "strcpy" || FName == "stpcpy" ||
+        FName == "strcat" || FName == "strdup";
+
+    Value *LenVal = nullptr;
+    if (LenArgIdx >= 0 && (unsigned)LenArgIdx < CB.arg_size()) {
+      LenVal = IRB.CreateZExtOrTrunc(CB.getArgOperand(LenArgIdx), UF.UC.Int64Ty);
+      UF.UC.markNosanitize(LenVal);
+    }
+
     auto *I = CB.arg_begin();
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
+      unsigned ArgIdx = FT->getNumParams() - N;
       // skip nullptr
       if ((*I)->getType()->isPointerTy() && !isa<ConstantPointerNull>(*I)) {
-        Type *PointeeTy = (*I)->getType()->getPointerElementType();
-        Value *sizeArg = ConstantInt::get(UF.UC.Int64Ty,
-            DL.getTypeAllocSize(PointeeTy));
-        uint32_t TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
+        Value *sizeArg;
+        uint32_t TypeID;
+        if (IsMemOrStrFn) {
+          TypeID = 0;  // typeless bytes
+          if (LenArgIdx == -2) {
+            // memmem: arg0 uses arg1 as len, arg2 uses arg3 as len
+            unsigned MyLenIdx = (ArgIdx == 0) ? 1 : 3;
+            if (MyLenIdx < CB.arg_size()) {
+              sizeArg = IRB.CreateZExtOrTrunc(CB.getArgOperand(MyLenIdx), UF.UC.Int64Ty);
+              UF.UC.markNosanitize(sizeArg);
+            } else {
+              sizeArg = ConstantInt::get(UF.UC.Int64Ty, 0);
+            }
+          } else if (LenVal) {
+            sizeArg = LenVal;
+          } else {
+            sizeArg = ConstantInt::get(UF.UC.Int64Ty, 0);  // string fn, unknown length
+          }
+        } else {
+          Type *PointeeTy = (*I)->getType()->getPointerElementType();
+          sizeArg = ConstantInt::get(UF.UC.Int64Ty, DL.getTypeAllocSize(PointeeTy));
+          TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
+        }
         Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
-        CB.setArgOperand(FT->getNumParams() - N, rptr);
+        CB.setArgOperand(ArgIdx, rptr);
       }
     }
     // Set zero ucsan shadow for the return value; TaintPass will set the taint label.

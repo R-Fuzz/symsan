@@ -518,7 +518,7 @@ static inline bool is_writeable(void *p) {
 // Object Lookup
 //===----------------------------------------------------------------------===//
 
-UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr, uint32_t *ret_object_id, uint32_t type_id) {
+UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr, uint32_t *ret_object_id, uint32_t type_id, uint32_t size) {
   if (label) {
     ucsan_label_info *label_info = get_label_info(label);
     uint32_t object_id = 0;
@@ -592,10 +592,10 @@ UCSanObject& lookup_object(ucsan_label label, uint64_t offset, void* return_addr
       uint64_t info = ((uint64_t)parent_obj_id << 32) | object_id;
       __taint_trace_event_addr(label, EVENT_LAZY_INIT, info, return_addr,
                                (uint32_t)offset_in_parent);
-      // Send type binding: type_id for the newly created object
-      if (type_id != 0) {
-        __taint_trace_event_addr(label, EVENT_TYPE_BIND, object_id, return_addr, type_id);
-      }
+      // Send type/size binding for the newly created object
+      // result = object_id (lower 32) | size (upper 32), id = type_id
+      uint64_t bind_info = ((uint64_t)size << 32) | object_id;
+      __taint_trace_event_addr(label, EVENT_TYPE_BIND, bind_info, return_addr, type_id);
     }
 
     if (ret_object_id) *ret_object_id = object_id;
@@ -808,13 +808,22 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
     uint32_t object_id;
     void *return_addr = __builtin_return_address(0);
-    auto& obj = lookup_object(label, 0, return_addr, &object_id, type_id);
+    auto& obj = lookup_object(label, 0, return_addr, &object_id, type_id, (uint32_t)size);
     size_t object_size = obj.data.size();
 
     UCSAN_OUT("Find object_id: %u (size = %zu) for label %u, addr %p\n",
               object_id, object_size, label, return_addr);
 
-    if (obj.data.size() < size) obj.data.resize(size);
+    if (type_id == 0 && size == 0) {
+      // Typeless with unknown length (e.g. strcmp): ensure at least 1 byte '\0'
+      // If seed data populated the object, use that size instead
+      if (obj.data.size() == 0) {
+        obj.data.resize(1);
+        obj.data[0] = '\0';
+      }
+    } else if (obj.data.size() < size) {
+      obj.data.resize(size);
+    }
     object_size = obj.data.size();
 
     // Create object label
@@ -915,9 +924,11 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
         __taint_trace_event_addr(label, EVENT_EXTENSION, object_id,
                                  __builtin_return_address(0),
                                  (uint32_t)new_lower_bound);
-        if (type_id != 0)
-          __taint_trace_event_addr(label, EVENT_TYPE_BIND, object_id,
+        {
+          uint64_t bind_info = ((uint64_t)size << 32) | object_id;
+          __taint_trace_event_addr(label, EVENT_TYPE_BIND, bind_info,
                                    __builtin_return_address(0), type_id);
+        }
       }
     }
 
