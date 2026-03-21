@@ -150,13 +150,38 @@ private:
   using branch_dep_t = std::unique_ptr<struct branch_dependency_t>;
   using offset_dep_t = std::vector<branch_dep_t>;
   std::vector<offset_dep_t> branch_deps_;
+  // Separate storage for negative offsets (container_of pattern).
+  // Negative offset -N (encoded as uint32_t > INT32_MAX) maps to index N-1.
+  std::vector<offset_dep_t> neg_branch_deps_;
+
+  static inline bool is_negative_offset(uint32_t off) {
+    return (int32_t)off < 0;
+  }
+
+  static inline uint32_t neg_index(uint32_t off) {
+    return (uint32_t)(-(int32_t)off) - 1;
+  }
 
   inline struct branch_dependency_t* get_branch_dep(offset_t off) {
+    if (is_negative_offset(off.second)) {
+      auto &deps = neg_branch_deps_.at(off.first);
+      return deps.at(neg_index(off.second)).get();
+    }
     auto &offset_deps = branch_deps_.at(off.first);
     return offset_deps.at(off.second).get();
   }
 
   inline void set_branch_dep(offset_t off, branch_dep_t dep) {
+    if (is_negative_offset(off.second)) {
+      if (off.first >= neg_branch_deps_.size())
+        neg_branch_deps_.resize(off.first + 1);
+      auto &deps = neg_branch_deps_[off.first];
+      uint32_t idx = neg_index(off.second);
+      if (idx >= deps.size())
+        deps.resize(idx + 1);
+      deps[idx] = std::move(dep);
+      return;
+    }
     auto &offset_deps = branch_deps_.at(off.first);
     if (off.second >= offset_deps.size()) {
       offset_deps.resize(off.second + 1);
@@ -231,7 +256,7 @@ public:
   struct solution_val {
     solution_op_t op;
     uint32_t id;       // input id
-    uint32_t offset;   // position in file
+    int32_t offset;    // position in file (signed for container_of negative offsets)
     union {
       uint8_t val;     // for SET: the byte value
       uint32_t len;    // for DELETE: number of bytes to delete
@@ -240,15 +265,15 @@ public:
 
     // Constructors for convenience
     // SET: set single byte at offset
-    solution_val(uint32_t id, uint32_t offset, uint8_t val)
+    solution_val(uint32_t id, int32_t offset, uint8_t val)
         : op(solution_op_t::SET), id(id), offset(offset), val(val) {}
 
     // INSERT: insert bytes at offset
-    solution_val(uint32_t id, uint32_t offset, std::vector<uint8_t> data)
+    solution_val(uint32_t id, int32_t offset, std::vector<uint8_t> data)
         : op(solution_op_t::INSERT), id(id), offset(offset), data(std::move(data)) {}
 
     // DELETE: delete len bytes at offset
-    solution_val(solution_op_t op, uint32_t id, uint32_t offset, uint32_t len)
+    solution_val(solution_op_t op, uint32_t id, int32_t offset, uint32_t len)
         : op(op), id(id), offset(offset), len(len) {}
   };
 

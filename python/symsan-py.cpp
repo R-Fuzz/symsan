@@ -510,7 +510,7 @@ static PyObject* SolveTask(PyObject *self, PyObject *args) {
     // Common fields for all operations
     PyDict_SetItemString(sol, "op", PyLong_FromLong((int)val.op));
     PyDict_SetItemString(sol, "id", PyLong_FromUnsignedLong(val.id));
-    PyDict_SetItemString(sol, "offset", PyLong_FromUnsignedLong(val.offset));
+    PyDict_SetItemString(sol, "offset", PyLong_FromLong(val.offset));
 
     // Operation-specific fields
     using op_t = symsan::Z3ParserSolver::solution_op_t;

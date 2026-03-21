@@ -179,6 +179,7 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
   string_info_cache_.clear();
   int_var_cache_.clear();
   branch_deps_.clear();
+  neg_branch_deps_.clear();
   branch_deps_.resize(inputs.size());
   for (size_t i = 0; i < inputs.size(); i++) {
     auto &input = inputs[i];
@@ -308,14 +309,16 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
   z3::expr out = first_byte;
   { // for ucsan, due to lazy init, the input may be empty
     if (input >= branch_deps_.size()) branch_deps_.resize(input + 1);
-    if (offset >= branch_deps_[input].size())
-      branch_deps_[input].resize(offset + bytes);
+    if (!is_negative_offset(offset)) {
+      if (offset >= branch_deps_[input].size())
+        branch_deps_[input].resize(offset + bytes);
+    }
   }
   // Cache first byte in branch_dependency for linking (linear scan: always new)
   set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(first_byte));
   uint64_t val = 0;
 #if FILTER_WRONG_AST
-  if (inputs_cache_.size() > input &&
+  if (!is_negative_offset(offset) && inputs_cache_.size() > input &&
       inputs_cache_[input].second > offset) {
     val = (uint64_t)inputs_cache_[input].first[offset];
   }
@@ -329,7 +332,7 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
     // Cache each byte expr in branch_dependency (linear scan: always new)
     set_branch_dep({input, offset + i}, std::make_unique<branch_dependency_t>(byte_expr));
 #if FILTER_WRONG_AST
-    if (inputs_cache_.size() > input &&
+    if (!is_negative_offset(offset + i) && inputs_cache_.size() > input &&
         inputs_cache_[input].second > offset + i) {
       val |= (uint64_t)inputs_cache_[input].first[offset + i] << (i * 8);
     }
@@ -1471,11 +1474,15 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             snprintf(intname, sizeof(intname), int_name_format,
                      lbl_info->op2.i, lbl_info->op1.i, lbl_info->size);
             z3::symbol sym = context_.str_symbol(intname);
-            bv_op = context_.constant(sym, context_.int_sort());
-            aux_constraints_.push_back(bv_op >= 0);
+            z3::expr int_var = context_.constant(sym, context_.int_sort());
+            aux_constraints_.push_back(int_var >= 0);
             if (lbl_info->size < 64) {
-              aux_constraints_.push_back(bv_op < context_.int_val((uint64_t)(1ULL << lbl_info->size)));
+              aux_constraints_.push_back(int_var < context_.int_val((uint64_t)(1ULL << lbl_info->size)));
             }
+            // Link Int variable to BV so generate_solution produces consistent values
+            aux_constraints_.push_back(int_var == z3::expr(context_,
+                Z3_mk_bv2int(context_, bv_op, false)));
+            bv_op = int_var;
             // Cache int-* variable for Int mirroring of BV comparisons
             int_var_cache_.emplace(lbl, bv_op);
           } else {
@@ -1945,7 +1952,10 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
 
 #if FILTER_WRONG_AST
     // double check if label is valid
-    if (value_cache_[label] != result) {
+    // Skip validation for indexOf operations (op1 repurposed for haystack pointer,
+    // RECORD_VALUE uses placeholder 0 which propagates wrong concrete values to
+    // downstream ICmp labels, causing spurious mismatches)
+    if (!label_contains_indexof(label) && value_cache_[label] != result) {
       // recalculated value must match the recorded value
       fprintf(stderr, "WARNING: value mismatch for label %u: expected %ld, got %ld\n",
               label, value_cache_[label], result);
@@ -2241,9 +2251,11 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           }
           z3::check_result fb_res = fallback.check();
           z3::set_param("smt.string_solver", "seq");
+          // fprintf(stderr, "DEBUG solve_task[%lu]: string_solver=none fallback result = %d\n", task_id, (int)fb_res);
           if (fb_res == z3::sat) {
             ret = nested_sat;
             m = fallback.get_model();
+            // fprintf(stderr, "DEBUG solve_task[%lu]: fallback model:\n%s\n", task_id, m.to_string().c_str());
             str_abstract = true;
           } else {
             ret = opt_sat_nested_timeout;
@@ -2331,8 +2343,11 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
         }
 
         bool use_optimized = false;
-        if (opt.check() == z3::sat) {
+        auto opt_result = opt.check();
+        // fprintf(stderr, "DEBUG solve_task[%lu]: optimizer result = %d\n", task_id, (int)opt_result);
+        if (opt_result == z3::sat) {
           z3::model opt_model = opt.get_model();
+          // fprintf(stderr, "DEBUG solve_task[%lu]: optimized model:\n%s\n", task_id, opt_model.to_string().c_str());
           // Check if all strlen values are within bounds
           bool all_within_bounds = true;
           for (const auto &sv : strlen_vars) {
@@ -2365,6 +2380,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
         }
       }
 
+      // fprintf(stderr, "DEBUG solve_task[%lu]: final model:\n%s\n", task_id, m.to_string().c_str());
       generate_solution(m, solutions);
       // fprintf(stderr, "DEBUG solve_task[%lu]: after generate_solution, solutions.size() = %zu\n", task_id, solutions.size());
     } else if (res == z3::unsat) {
@@ -2400,9 +2416,9 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         uint32_t offset;
         sscanf(name.str().c_str(), input_name_format, &input, &offset);
         uint8_t value = (uint8_t)e.get_numeral_int();
-        // fprintf(stderr, "DEBUG input-%u-%u: SET offset %u = 0x%02x (individual byte)\n",
-        //         input, offset, offset, value);
-        solutions.emplace_back(input, offset, value);
+        // fprintf(stderr, "DEBUG input-%u-%u: SET offset %d = 0x%02x (individual byte)\n",
+        //         input, offset, (int32_t)offset, value);
+        solutions.emplace_back(input, (int32_t)offset, value);
       } else if (!name.str().compare("fsize")) {
         // FIXME:
         // off_t size = (off_t)e.get_numeral_int64();
