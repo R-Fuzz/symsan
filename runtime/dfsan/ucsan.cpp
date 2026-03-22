@@ -38,8 +38,7 @@ void __taint_trace_event_addr(__ucsan::ucsan_label label, uint32_t event_id,
                               uint64_t info, void* addr, uint32_t info2);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_trace_global_var(__ucsan::ucsan_label label, uint64_t size,
-                              void *gv);
+void __taint_trace_global_var(uint64_t offset, uint64_t size, void *gv);
 
 // Forward declaration for UCSan solver initialization (thoroupy backend)
 extern "C" void InitializeUCSanSolver();
@@ -672,11 +671,13 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       ucsan_label *shadow = ucsan_shadow_for(p);
       if (*shadow == 0) {
         bool sent_data = false;
+        uint64_t first_byte_offset = 0;
         for (uint64_t i = 0; i < size; ++i) {
           void *byte_addr = (void*)((uint64_t)p + i);
           shadow = ucsan_shadow_for(byte_addr);
           auto ret = create_label_from_super_object(1, false);
           *shadow = ret.label;
+          if (i == 0) first_byte_offset = ret.offset;
           UCSAN_OUT("Symbolize global variable byte @%p with %u from offset %lu\n",
                     ((char*)p+i), ret.label, ret.offset);
 
@@ -709,7 +710,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
         // Send initial data if needed
         if (sent_data) {
           UCSAN_OUT("Sent init data for global variable @%p\n", p);
-          __taint_trace_global_var(*(ucsan_shadow_for(p)), size, p);
+          __taint_trace_global_var(first_byte_offset, size, p);
         }
       }
     }
@@ -1589,7 +1590,7 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_event_addr,
 
 // Weak definition for global variable tracing
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_global_var,
-                             __ucsan::ucsan_label, uint64_t, void*) {}
+                             uint64_t, uint64_t, void*) {}
 
 // Weak definition for basic block tracing
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_basic_block,

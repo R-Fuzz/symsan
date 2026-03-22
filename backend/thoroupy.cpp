@@ -228,17 +228,11 @@ __taint_trace_bb(uint32_t function_index, uint32_t bb_index) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_global_var(dfsan_label label, uint64_t size, void *gv) {
-  if (label == 0)
-    return;
-
-  AOUT("global var: %d, size: %lu @%p\n", label, size, gv);
+__taint_trace_global_var(uint64_t offset, uint64_t size, void *gv) {
+  AOUT("global var: offset=%lu, size: %lu @%p\n", offset, size, gv);
 
   if (__pipe_fd < 0)
     return;
-
-  dfsan_label_info *info = get_label_info(label);
-  uptr offset = (uptr)info->op1.i; // offset is recorded in op1
 
   pipe_msg msg = {
     .msg_type = gv_type,
@@ -246,7 +240,7 @@ __taint_trace_global_var(dfsan_label label, uint64_t size, void *gv) {
     .instance_id = __instance_id,
     .addr = offset,
     .context = __taint_trace_callstack,
-    .label = label, // just in case
+    .label = 0,
     .result = size
   };
 
