@@ -3,6 +3,7 @@
 #include "parse-z3.h"
 
 #include <algorithm>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -708,6 +709,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           c_expr = c_expr.extract(7, 0);
         }
         code = z3::bv2int(c_expr, false);
+        // Prefer non-zero needle: avoids trivial solutions where the solver
+        // picks '\0' which already exists in unmodified buffer regions
+        aux_constraints_.push_back(code != context_.int_val(0));
       }
       // Use Z3_mk_string_from_code to convert int to single-char String
       z3::expr target_str(context_, Z3_mk_string_from_code(context_, code));
@@ -764,6 +768,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           c_expr = c_expr.extract(7, 0);
         }
         code = z3::bv2int(c_expr, false);
+        // Prefer non-zero needle: avoids trivial solutions where the solver
+        // picks '\0' which already exists in unmodified buffer regions
+        aux_constraints_.push_back(code != context_.int_val(0));
       }
       // Use Z3_mk_string_from_code to convert int to single-char String
       z3::expr target_str(context_, Z3_mk_string_from_code(context_, code));
@@ -993,6 +1000,17 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       } else {
         // Prefix mode: substr(str, 0, len)
         z3::expr len_expr = context_.int_val((int64_t)info->op1.i);
+        if (info->l2 < CONST_OFFSET && info->l1 >= CONST_OFFSET) {
+          // Concrete length substr: pin parent string length so Z3 cannot
+          // shrink it to empty (which trivially satisfies extract/indexof).
+          // The parent represents a fixed-size input region.
+          auto si_it = string_info_cache_.find(info->l1);
+          if (si_it != string_info_cache_.end()) {
+            aux_constraints_.push_back(z3::expr(context_,
+                Z3_mk_seq_length(context_, full_str)) ==
+                context_.int_val(si_it->second.length));
+          }
+        }
         if (info->l2 >= CONST_OFFSET) {
           // l2 is the string op label - its cached value is the index/length
           len_expr = get_cached_expr(info->l2, input_deps);
@@ -2202,6 +2220,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
     solver.set("timeout", timeout);
     // add auxiliary constraints (e.g., Int variable bounds from sort coercion)
     for (const auto &ac : aux_constraints_) {
+      // fprintf(stderr, "DEBUG solve_task[%lu]: adding aux constraint: %s\n", task_id, ac.to_string().c_str());
       solver.add(ac);
     }
     // solve the first constraint (optimistic)
@@ -2403,6 +2422,36 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
   // from qsym
   unsigned num_constants = m.num_consts();
   // fprintf(stderr, "DEBUG generate_solution: model has %u constants\n", num_constants);
+
+  // Pre-scan str- variables: collect per-input info to detect sibling
+  // variables (adjacent/overlapping ranges from loop iterations).
+  // When a sibling has content (non-empty), empty ones must not be deleted
+  // as that would shift offsets and corrupt the buffer layout.
+  struct str_info { uint32_t offset; uint32_t orig_len; uint32_t new_len; };
+  std::map<uint32_t, std::vector<str_info>> str_vars_by_input;
+  for (unsigned i = 0; i < num_constants; i++) {
+    z3::func_decl decl = m.get_const_decl(i);
+    z3::symbol name = decl.name();
+    if (name.kind() == Z3_STRING_SYMBOL && name.str().find("str-") == 0) {
+      uint32_t input, offset, orig_len;
+      if (sscanf(name.str().c_str(), str_name_format, &input, &offset, &orig_len) == 3) {
+        z3::expr e = m.get_const_interp(decl);
+        uint32_t new_len = 0;
+        if (e.is_string_value()) {
+          new_len = decode_z3_string(e.get_string()).size();
+        }
+        str_vars_by_input[input].push_back({offset, orig_len, new_len});
+      }
+    }
+  }
+  // Sort each input's str- variables by offset so adjacency is easy to check
+  for (auto &entry : str_vars_by_input) {
+    std::sort(entry.second.begin(), entry.second.end(),
+              [](const str_info &a, const str_info &b) {
+                return a.offset < b.offset;
+              });
+  }
+
   for (unsigned i = 0; i < num_constants; i++) {
     z3::func_decl decl = m.get_const_decl(i);
     z3::expr e = m.get_const_interp(decl);
@@ -2530,6 +2579,60 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
           uint32_t new_len = bytes.size();
           fprintf(stderr, "DEBUG generate_solution: str-%u-%u-%u: orig=%u, new=%u, raw='%s'\n",
                   input, offset, orig_len, orig_len, new_len, raw_str.c_str());
+
+          // Skip empty str- variables that are connected (via adjacent or
+          // overlapping ranges) to a non-empty sibling in the same input.
+          // The sorted vector lets us walk outward from our position to find
+          // the contiguous group and check if any member has content.
+          // Deleting would shift offsets and corrupt siblings' content.
+          if (new_len == 0 && orig_len > 0) {
+            auto it = str_vars_by_input.find(input);
+            if (it != str_vars_by_input.end()) {
+              const auto &siblings = it->second;
+              // Find our position in the sorted vector
+              size_t self_idx = 0;
+              for (size_t si = 0; si < siblings.size(); si++) {
+                if (siblings[si].offset == offset &&
+                    siblings[si].orig_len == orig_len) {
+                  self_idx = si;
+                  break;
+                }
+              }
+              // Walk left: check adjacent/overlapping ranges
+              bool has_nonempty_sibling = false;
+              uint32_t group_start = offset;
+              for (size_t si = self_idx; si > 0; si--) {
+                const auto &prev = siblings[si - 1];
+                uint32_t prev_end = prev.offset + prev.orig_len;
+                if (prev_end >= group_start) { // adjacent or overlapping
+                  group_start = prev.offset;
+                  if (prev.new_len > 0) { has_nonempty_sibling = true; break; }
+                } else {
+                  break;
+                }
+              }
+              // Walk right: check adjacent/overlapping ranges
+              if (!has_nonempty_sibling) {
+                uint32_t group_end = offset + orig_len;
+                for (size_t si = self_idx + 1; si < siblings.size(); si++) {
+                  const auto &next = siblings[si];
+                  if (next.offset <= group_end) { // adjacent or overlapping
+                    uint32_t next_end = next.offset + next.orig_len;
+                    if (next_end > group_end) group_end = next_end;
+                    if (next.new_len > 0) { has_nonempty_sibling = true; break; }
+                  } else {
+                    break;
+                  }
+                }
+              }
+              if (has_nonempty_sibling) {
+                fprintf(stderr, "DEBUG generate_solution: str-%u-%u-%u: "
+                        "skipping empty (has non-empty adjacent sibling)\n",
+                        input, offset, orig_len);
+                continue;
+              }
+            }
+          }
 
           if (new_len > orig_len) {
             // Extending: set common prefix, then insert extra bytes
