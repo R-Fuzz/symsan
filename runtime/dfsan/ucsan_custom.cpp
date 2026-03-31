@@ -389,8 +389,13 @@ SANITIZER_INTERFACE_ATTRIBUTE void
 __dfsw_assert_allocated(void *ptr, size_t size, uint64_t id, ucsan_label ptr_label,
                         ucsan_label size_label, ucsan_label id_label) {
   if (ptr_label == 0) {
-    UCSAN_OUT("ERROR: assertion %lu failure non-symbolic label: ptr %p\n", id, ptr);
-    __taint_trace_event_addr(0, EVENT_ASSERTION, id, ptr, ASSERTION_NONE_SYMBOLIC);
+    if (ptr == nullptr) {
+      UCSAN_OUT("ERROR: assertion %lu failure null pointer\n", id);
+      __taint_trace_event_addr(0, EVENT_ASSERTION, id, ptr, ASSERTION_ALLOCATED_FAILED);
+    } else {
+      UCSAN_OUT("WARNING: assertion %lu non-symbolic label: ptr %p, label %d\n", id, ptr, ptr_label);
+      __taint_trace_event_addr(0, EVENT_ASSERTION, id, ptr, ASSERTION_ALLOCATED_SUCCESS);
+    }
     return;
   }
   ucsan_label_info *info = get_label_info(ptr_label);
@@ -416,8 +421,12 @@ __dfsw_assert_allocated(void *ptr, size_t size, uint64_t id, ucsan_label ptr_lab
 SANITIZER_INTERFACE_ATTRIBUTE void
 __dfsw_assert_freed(void *ptr, uint64_t id, ucsan_label ptr_label, ucsan_label id_label) {
   if (ptr_label == 0) {
-    UCSAN_OUT("ERROR: assertion %lu failure non-symbolic label: ptr %p, label %d\n", id, ptr, ptr_label);
-    __taint_trace_event_addr(0, EVENT_ASSERTION, id, ptr, ASSERTION_NONE_SYMBOLIC);
+    if (ptr != nullptr) {
+      UCSAN_OUT("ERROR: assertion %lu failure non-symbolic label: ptr %p, label %d\n", id, ptr, ptr_label);
+      __taint_trace_event_addr(0, EVENT_ASSERTION, id, ptr, ASSERTION_NONE_SYMBOLIC);
+    } else {
+      __taint_trace_event_addr(0, EVENT_ASSERTION, id, ptr, ASSERTION_FREED_SUCCESS);
+    }
     return;
   }
   ucsan_label_info *info = get_label_info(ptr_label);
@@ -435,23 +444,29 @@ __dfsw_assert_init(void *ptr, size_t size, uint64_t id, ucsan_label ptr_label,
                    ucsan_label size_label, ucsan_label id_label) {
   // check ptr is allocated and the size is in bound
   if (ptr_label == 0) {
-    UCSAN_OUT("ERROR: assertion %lu failure non-symbolic label: ptr %p, label %d\n", id, ptr, ptr_label);
-    __taint_trace_event_addr(0, EVENT_ASSERTION, id, ptr, ASSERTION_NONE_SYMBOLIC);
-    return;
+    if (ptr == nullptr) {
+      UCSAN_OUT("ERROR: assertion %lu failure null pointer\n", id);
+      __taint_trace_event_addr(0, EVENT_ASSERTION, id, ptr, ASSERTION_INIT_FAILED);
+      return;
+    } else {
+      UCSAN_OUT("WARNING: assertion %lu non-symbolic label: ptr %p, label %d\n", id, ptr, ptr_label);
+    }
+  } else {
+    ucsan_label_info *info = get_label_info(ptr_label);
+    ucsan_obj_info *obj = to_obj_info(info);
+    if (obj->op != OP_ALLOCA) {
+      UCSAN_OUT("ERROR: assertion %lu failure: ptr %p, label %d, op %d\n", id, ptr, ptr_label, obj->op);
+      __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSERTION_INIT_FAILED);
+      return;
+    }
+    if (size > obj->upper_bound) {
+      UCSAN_OUT("ERROR: assertion %lu failure: ptr %p, label %d, size %lu exceeds upper bound %u\n",
+                id, ptr, ptr_label, size, obj->upper_bound);
+      __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSERTION_INIT_FAILED);
+      return;
+    }
   }
-  ucsan_label_info *info = get_label_info(ptr_label);
-  ucsan_obj_info *obj = to_obj_info(info);
-  if (obj->op != OP_ALLOCA) {
-    UCSAN_OUT("ERROR: assertion %lu failure: ptr %p, label %d, op %d\n", id, ptr, ptr_label, obj->op);
-    __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSERTION_INIT_FAILED);
-    return;
-  }
-  if (size > obj->upper_bound) {
-    UCSAN_OUT("ERROR: assertion %lu failure: ptr %p, label %d, size %lu exceeds upper bound %u\n",
-              id, ptr, ptr_label, size, obj->upper_bound);
-    __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSERTION_INIT_FAILED);
-    return;
-  }
+  // fall through to scan shadow
   bool success = true;
   ucsan_label *shadow = ucsan_shadow_for(ptr);
   for (size_t i = 0; i < size; i++) {
