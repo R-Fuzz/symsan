@@ -350,6 +350,47 @@ static PyObject* ResetParser(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+// Update input cache without clearing deps (for late-arriving GV data)
+static PyObject* UpdateInput(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  std::vector<symsan::input_t> inputs;
+  PyObject *iargs = NULL;
+
+  if (!PyArg_ParseTuple(args, "O!", &PyList_Type, &iargs)) {
+    return NULL;
+  }
+
+  Py_ssize_t argc = PyList_Size(iargs);
+  for (Py_ssize_t i = 0; i < argc; i++) {
+    PyObject *item = PyList_GetItem(iargs, i);
+    if (item == NULL) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to retrieve args list");
+      return NULL;
+    }
+    if (!PyBytes_Check(item)) {
+      PyErr_SetString(PyExc_TypeError, "args must be a list of bytes");
+      return NULL;
+    }
+    Py_ssize_t size;
+    char *data;
+    if (PyBytes_AsStringAndSize(item, &data, &size) != 0) {
+      return NULL;
+    }
+    inputs.push_back({(uint8_t*)data, size});
+  }
+
+  if (__z3_parser->update_input(inputs, true) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to update input");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyObject* ParseCond(PyObject *self, PyObject *args) {
   if (__z3_parser == nullptr) {
     PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
@@ -575,6 +616,7 @@ static PyMethodDef SymSanMethods[] = {
   {"destroy", (PyCFunction)SymSanDestroy, METH_NOARGS, "destroy symsan target"},
   {"init_parser", InitParser, METH_VARARGS, "initialize parser from shared memory (name or address)"},
   {"reset_input", ResetParser, METH_VARARGS, "reset the symbolic expression parser with a new input"},
+  {"update_input", UpdateInput, METH_VARARGS, "update input cache without clearing deps"},
   {"parse_cond", ParseCond, METH_VARARGS, "parse trace_cond event into solving tasks"},
   {"parse_gep", ParseGEP, METH_VARARGS, "parse trace_gep event into solving tasks"},
   {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},

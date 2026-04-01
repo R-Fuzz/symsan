@@ -212,6 +212,28 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
   return 0;
 }
 
+int Z3AstParser::update_input(std::vector<input_t> &inputs, bool copy_input) {
+#if FILTER_WRONG_AST
+  inputs_cache_.clear();
+  inputs_copy_.clear();
+
+  if (copy_input) {
+    inputs_copy_.resize(inputs.size());
+    for (size_t i = 0; i < inputs.size(); i++) {
+      auto &input = inputs[i];
+      inputs_copy_[i].assign(input.first, input.first + input.second);
+      inputs_cache_.emplace_back(inputs_copy_[i].data(), inputs_copy_[i].size());
+    }
+  } else {
+    for (size_t i = 0; i < inputs.size(); i++) {
+      auto &input = inputs[i];
+      inputs_cache_.emplace_back(input.first, input.second);
+    }
+  }
+#endif
+  return 0;
+}
+
 z3::expr Z3AstParser::read_concrete(dfsan_label label, uint16_t size) {
   auto itr = memcmp_cache_.find(label);
   if (itr == memcmp_cache_.end()) {

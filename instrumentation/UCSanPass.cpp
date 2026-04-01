@@ -704,10 +704,11 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
-  // Load pointer shadow: i16 ucsan_load_pointer_shadow(i16*, i64, i1)
+  // Load pointer shadow: i16 ucsan_load_pointer_shadow(i16*, i64, i1, void*)
+  // 4th arg: concrete source address (for make_input addr range lookup)
   UCLoadPointerShadowFnTy = FunctionType::get(
     PrimitiveShadowTy,
-    {PrimitiveShadowPtrTy, Int64Ty, Int1Ty},
+    {PrimitiveShadowPtrTy, Int64Ty, Int1Ty, VoidPtrTy},
     false);
   UCLoadPointerShadowFn = M.getOrInsertFunction("ucsan_load_pointer_shadow", UCLoadPointerShadowFnTy);
   F = dyn_cast<Function>(UCLoadPointerShadowFn.getCallee()->stripPointerCasts());
@@ -785,6 +786,14 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   F = dyn_cast<Function>(UCPopStackFrameFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
+
+  // __ucsan_symbolize_input: declared in user source code, not emitted by pass.
+  // Register as runtime function to prevent dangle wrapping.
+  // Arg shadow is stored to __ucsan_arg_tls automatically by visitCallBase.
+  if (Function *MakeInputFn = M.getFunction("__ucsan_symbolize_input")) {
+    markFunctionNosanitize(MakeInputFn);
+    UCRuntimeFunctions.insert(MakeInputFn);
+  }
 }
 
 void UCSan::initializeCustomFunctionTypes() {
@@ -1268,10 +1277,12 @@ Value *UCSanFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size, Align Alig
 
   Value *ShadowAddr = UC.getShadowAddress(Addr, IRB);
   // TOOD: Optimize for non-pointer types
+  Value *ConcreteAddr = IRB.CreateBitCast(Addr, UC.VoidPtrTy);
+  UC.markNosanitize(ConcreteAddr);
   CallInst *FallbackCall = IRB.CreateCall(
       UC.UCLoadPointerShadowFn,
       {ShadowAddr, ConstantInt::get(UC.Int64Ty, Size),
-       ConstantInt::get(UC.Int1Ty, Ty->isPointerTy())});
+       ConstantInt::get(UC.Int1Ty, Ty->isPointerTy()), ConcreteAddr});
   FallbackCall->addRetAttr(Attribute::ZExt);
   UC.markNosanitize(FallbackCall);
   return FallbackCall;

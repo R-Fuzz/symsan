@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ucsan.h"
+#include "ucsan_containers.h"
 #include "sanitizer_common/sanitizer_atomic.h"
 #include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_file.h"
@@ -38,7 +39,7 @@ void __taint_trace_event_addr(__ucsan::ucsan_label label, uint32_t event_id,
                               uint64_t info, void* addr, uint32_t info2);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_trace_global_var(uint64_t offset, uint64_t size, void *gv);
+void __taint_trace_global_var(uint32_t obj_id, uint64_t offset, uint64_t size, void *gv);
 
 // Forward declaration for UCSan solver initialization (thoroupy backend)
 extern "C" void InitializeUCSanSolver();
@@ -90,6 +91,10 @@ static ucsan_label_info *__ucsan_label_info = nullptr;
 
 // Object counter
 static atomic_uint32_t __ucsan_inited_objects;
+
+// Address range map for __ucsan_symbolize_input pointer relationship discovery
+static AddrRangeMap __symbolize_addr_map;
+static bool __symbolize_addr_map_inited = false;
 
 // Stack management for bounds tracking
 static ucsan_label __alloca_stack_bottom;
@@ -357,6 +362,8 @@ char* ucsan_input::dump() {
   for (uint32_t i = 0; i < objects->size(); i++) {
     length += objects->at(i).data.size() + sizeof(uint64_t) + sizeof(uint32_t);
   }
+  // Include metadata: origin info per object (obj_id, offset, target_offset)
+  length += objects->size() * 3 * sizeof(uint64_t);
 
   char *ret = static_cast<char*>(malloc(length));
   char *pos = ret;
@@ -385,6 +392,19 @@ char* ucsan_input::dump() {
     tmp = objects->at(i).data.size();
     internal_memcpy(pos, objects->at(i).data.data(), tmp);
     pos += tmp;
+  }
+
+  // Write metadata: origin info (obj_id, offset, target_offset) per object
+  for (uint32_t i = 0; i < objects->size(); i++) {
+    tmp = objects->at(i).origin.obj_id;
+    internal_memcpy(pos, &tmp, sizeof(uint64_t));
+    pos += sizeof(uint64_t);
+    tmp = (uint64_t)(int64_t)objects->at(i).origin.offset;
+    internal_memcpy(pos, &tmp, sizeof(uint64_t));
+    pos += sizeof(uint64_t);
+    tmp = objects->at(i).origin.target_offset;
+    internal_memcpy(pos, &tmp, sizeof(uint64_t));
+    pos += sizeof(uint64_t);
   }
 
   buf_size = length;
@@ -710,7 +730,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
         // Send initial data if needed
         if (sent_data) {
           UCSAN_OUT("Sent init data for global variable @%p\n", p);
-          __taint_trace_global_var(first_byte_offset, size, p);
+          __taint_trace_global_var(0, first_byte_offset, size, p);
         }
       }
     }
@@ -1083,7 +1103,8 @@ ucsan_label ucsan_combine_label(ucsan_label l1, ucsan_label l2) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_pointer) {
+ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_pointer,
+                                      void *concrete_addr) {
   if (ls == nullptr) return 0;
 
   ucsan_label label0 = ls[0];
@@ -1100,7 +1121,40 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
 
   if (is_pointer) {
     if (label0 >= UCSAN_CONST_OFFSET && label_info->common.op == OP_NONE) {
-      // Convert byte label to pointer label
+      // Check if the concrete pointer value points to a symbolize_input object
+      if (__symbolize_addr_map_inited && concrete_addr && n == sizeof(void*)) {
+        void *concrete_val = *(void **)concrete_addr;
+        if (concrete_val) {
+          uint32_t target_id, target_offset;
+          ucsan_label target_ptr_label;
+          if (__symbolize_addr_map.find(concrete_val, &target_id, &target_offset,
+                                         &target_ptr_label)) {
+            UCSAN_OUT("load_pointer_shadow: symbolize_input hit: target_id=%u, "
+                      "target_offset=%u, ptr_label=%u\n",
+                      target_id, target_offset, target_ptr_label);
+
+            // Populate obj_map for lookup_object to find later
+            ucsan_byte_info *byte = to_byte_info(label_info);
+            uint32_t parent_id = byte->object_id;
+            int32_t parent_offset = (int32_t)byte->offset;
+            ucsan_tainted.obj_map->insert(parent_id, parent_offset, target_id);
+
+            // Set target's origin
+            if (target_id < ucsan_tainted.objects->size()) {
+              ucsan_tainted.objects->at(target_id).origin = {
+                parent_id, parent_offset, target_offset
+              };
+            }
+
+            // Return the saved ptr_label instead of converting to OP_EXTERNAL
+            if (target_ptr_label) {
+              return target_ptr_label;
+            }
+          }
+        }
+      }
+
+      // Default: convert byte label to pointer label
       ucsan_ptr_info *ptr = to_ptr_info(label_info);
       ptr->op = OP_EXTERNAL;
       ptr->status = PTR_UNINITIALIZED;
@@ -1193,6 +1247,102 @@ void* ucsan_set_label_for_args(uint32_t index, uint32_t size_in_bits, uint8_t is
   ucsan_tainted.objects->at(0).data.resize(last_offset + size_in_bytes);
 
   return (void*)given;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_symbolize_input(void *ptr, size_t size, int id) {
+  UCSAN_OUT("symbolize_input: ptr=%p, size=%zu, id=%d\n", ptr, size, id);
+
+  if (!ptr || size == 0) return;
+
+  uint32_t object_id = (uint32_t)id;  // direct 1-based mapping
+
+  // Read the pointer's label from arg_tls (stored by UCSanPass at call site)
+  ucsan_label ptr_label = __ucsan_arg_tls[0];
+  UCSAN_OUT("symbolize_input: ptr_label=%u\n", ptr_label);
+
+  // Ensure objects storage is allocated and large enough
+  if (!ucsan_tainted.objects) {
+    ucsan_tainted.objects = new ObjectStorage();
+  }
+  while (ucsan_tainted.objects->size() <= object_id) {
+    UCSanObject empty;
+    empty.offset = 0;
+    empty.data.init();
+    empty.origin = {0, 0, 0};
+    ucsan_tainted.objects->push_back(empty);
+  }
+
+  // Bump __ucsan_inited_objects to avoid collision with lazy alloc
+  uint32_t current = atomic_load(&__ucsan_inited_objects, memory_order_relaxed);
+  while (current <= object_id) {
+    if (atomic_compare_exchange_weak(&__ucsan_inited_objects,
+          &current, object_id + 1, memory_order_relaxed))
+      break;
+  }
+
+  // Ensure obj_map is initialized
+  if (!ucsan_tainted.obj_map) {
+    ucsan_tainted.obj_map = new ObjectMap();
+    ucsan_tainted.obj_map->init();
+  }
+
+  // Seed data handling
+  UCSanObject &obj = ucsan_tainted.objects->at(object_id);
+  bool first_run = (obj.data.size() == 0);
+  if (!first_run && obj.data.size() >= (uint32_t)size) {
+    // Re-run: solver provided data, overwrite ptr
+    internal_memcpy(ptr, obj.data.data(), size);
+    UCSAN_OUT("symbolize_input: re-run, overwrote ptr with solver data\n");
+  } else {
+    // First run: snapshot concrete bytes as initial seed
+    obj.data.assign((const unsigned char *)ptr, (uint32_t)size);
+    UCSAN_OUT("symbolize_input: first run, snapshotted %zu bytes\n", size);
+  }
+
+  // Initialize addr range map if needed
+  if (!__symbolize_addr_map_inited) {
+    __symbolize_addr_map.init();
+    __symbolize_addr_map_inited = true;
+  }
+
+  // Register in addr range map for lazy pointer relationship discovery
+  __symbolize_addr_map.insert(ptr, size, object_id, ptr_label);
+
+  // Label every byte OP_NONE — same pattern as ucsan_check_pointer:861-879
+  ucsan_label *shadow = ucsan_shadow_for(ptr);
+  for (size_t offset = 0; offset < size; ++offset) {
+    ucsan_label byte_label = allocate_label();
+    check_label(byte_label);
+
+    ucsan_label_info *byte_info = get_label_info(byte_label);
+    ucsan_byte_info *byte = to_byte_info(byte_info);
+    byte->op = OP_NONE;
+    byte->object_id = object_id;
+    byte->offset = offset;
+
+    shadow[offset] = byte_label;
+
+    // Bridge to SymSan
+    void *byte_addr = (void *)((uintptr_t)ptr + offset);
+    dfsan_label symsan_label = __taint_create_label(object_id, offset, 1);
+    __taint_set_label(symsan_label, byte_addr, 1);
+  }
+
+  // Trace object usage event so thoroupy knows about this object
+  if (ucsan_flags().trace_object) {
+    ucsan_label first_label = *(ucsan_shadow_for(ptr));
+    uint64_t cite_info = ((uint64_t)size << 32) | object_id;
+    __taint_trace_event_addr(first_label, EVENT_USAGE_CITE, cite_info,
+                             __builtin_return_address(0), 0);
+  }
+
+  // Send initial concrete data to solver (first run only)
+  if (first_run) {
+    __taint_trace_global_var(object_id, 0, size, ptr);
+  }
+
+  UCSAN_OUT("symbolize_input: done, labeled %zu bytes for object %u\n", size, object_id);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1590,7 +1740,7 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_event_addr,
 
 // Weak definition for global variable tracing
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_global_var,
-                             uint64_t, uint64_t, void*) {}
+                             uint32_t, uint64_t, uint64_t, void*) {}
 
 // Weak definition for basic block tracing
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_basic_block,

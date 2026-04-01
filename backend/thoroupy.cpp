@@ -228,8 +228,8 @@ __taint_trace_bb(uint32_t function_index, uint32_t bb_index) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_global_var(uint64_t offset, uint64_t size, void *gv) {
-  AOUT("global var: offset=%lu, size: %lu @%p\n", offset, size, gv);
+__taint_trace_global_var(uint32_t obj_id, uint64_t offset, uint64_t size, void *gv) {
+  AOUT("global var: obj_id=%u, offset=%lu, size: %lu @%p\n", obj_id, offset, size, gv);
 
   if (__pipe_fd < 0)
     return;
@@ -240,6 +240,7 @@ __taint_trace_global_var(uint64_t offset, uint64_t size, void *gv) {
     .instance_id = __instance_id,
     .addr = offset,
     .context = __taint_trace_callstack,
+    .id = obj_id,
     .label = 0,
     .result = size
   };

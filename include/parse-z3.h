@@ -21,6 +21,8 @@ public:
   }
 
   int restart(std::vector<input_t> &inputs, bool copy_input = false) override;
+  /// @brief Update input cache without clearing deps
+  int update_input(std::vector<input_t> &inputs, bool copy_input = false);
   int parse_cond(dfsan_label label, bool result, bool add_nested,
                  std::vector<uint64_t> &tasks) override;
   int parse_gep(dfsan_label ptr_label, uptr ptr,
