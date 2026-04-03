@@ -2160,12 +2160,8 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
   I.setSource(src);
 
   // memmove shadow
-  Value *DestShadowAddr = IRB.CreateBitCast(
-      UF.UC.getShadowAddress(dest, IRB), UF.UC.VoidPtrTy);
-  UF.UC.markNosanitize(DestShadowAddr);
-  Value *SrcShadowAddr = IRB.CreateBitCast(
-      UF.UC.getShadowAddress(src, IRB), UF.UC.VoidPtrTy);
-  UF.UC.markNosanitize(SrcShadowAddr);
+  Value *DestShadowAddr = UF.UC.getShadowAddress(dest, IRB);
+  Value *SrcShadowAddr = UF.UC.getShadowAddress(src, IRB);
   Value *ShadowLength = IRB.CreateMul(
       Length,
       ConstantInt::get(UF.UC.Int64Ty, UCSan::ShadowWidthBytes));
