@@ -3455,7 +3455,36 @@ bool UCSan::runImpl(Module &M) {
   // (needed for code compiled without -fPIC, e.g. kernel)
   for (GlobalVariable &GV : M.globals()) {
     if (GV.isDSOLocal()) {
-      GV.setDSOLocal(false);
+      // Keep dso_local on globals used in inline asm with immediate ("i")
+      // constraint, as their address must be a compile-time constant
+      bool usedAsImmInAsm = false;
+      for (User *U : GV.users()) {
+        auto *CB = dyn_cast<CallBase>(U);
+        if (!CB || !CB->isInlineAsm())
+          continue;
+        auto *IA = cast<InlineAsm>(CB->getCalledOperand());
+        // Check if the GV operand has an immediate constraint
+        auto Constraints = IA->ParseConstraints();
+        unsigned argIdx = 0;
+        for (auto &CI : Constraints) {
+          if (CI.Type != InlineAsm::isInput)
+            continue;
+          if (argIdx < CB->arg_size() &&
+              CB->getArgOperand(argIdx)->stripPointerCasts() == &GV) {
+            for (auto &Code : CI.Codes) {
+              if (Code == "i") {
+                usedAsImmInAsm = true;
+                break;
+              }
+            }
+          }
+          if (usedAsImmInAsm) break;
+          argIdx++;
+        }
+        if (usedAsImmInAsm) break;
+      }
+      if (!usedAsImmInAsm)
+        GV.setDSOLocal(false);
     }
     if (GV.isDeclaration() && GV.hasExternalLinkage()) {
       GV.setLinkage(GlobalValue::WeakAnyLinkage);
