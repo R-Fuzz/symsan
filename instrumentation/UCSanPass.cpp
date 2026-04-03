@@ -1918,7 +1918,7 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
 
       // not dominating, move the checks to a dominating basic block
       Instruction *Pos = nullptr;
-      if (isa<GlobalVariable>(Ptr) || isa<Argument>(Ptr)) {
+      if (isa<GlobalVariable>(Ptr) || isa<Argument>(Ptr) || isa<ConstantExpr>(Ptr)) {
         Pos = F->getEntryBlock().getTerminator();
       } else if (Instruction *I = dyn_cast<Instruction>(Ptr)) {
         // move to after the source of Ptr
