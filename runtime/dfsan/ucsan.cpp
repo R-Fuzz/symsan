@@ -1538,11 +1538,6 @@ ucsan_label ucsan_trace_alloca(uint64_t size, uint64_t elem_size, uint64_t addr)
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_trace_bb(uint32_t function_index, uint32_t bb_index) {
-  // stub for basic block tracing, actual implementation in thoroupy backend
-}
-
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_push_stack_frame() {
   // Save current stack top when entering a function
   // This allows automatic cleanup of stack allocation labels on function exit
@@ -1748,7 +1743,7 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_global_var,
                              uint32_t, uint64_t, uint64_t, void*) {}
 
 // Weak definition for basic block tracing
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_basic_block,
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_bb,
                              uint32_t, uint32_t) {}
 
 // Weak definition for UCSan solver initialization

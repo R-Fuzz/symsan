@@ -7,6 +7,7 @@
 #include "ucsan.h"
 
 #include <malloc.h>
+#include <unistd.h>
 
 using namespace __sanitizer;
 using namespace __ucsan;
@@ -580,6 +581,12 @@ __dfsw_assume_allocated(void *ptr, size_t size, uint64_t id, ucsan_label ptr_lab
   }
 
   return ptr;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE void
+__dfsw_panic(char *reason, ucsan_label reason_label) {
+  UCSAN_OUT("PANIC: %s\n", reason);
+  _exit(EVENT_PANIC);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE void*
