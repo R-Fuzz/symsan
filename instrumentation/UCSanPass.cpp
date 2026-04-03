@@ -3452,14 +3452,24 @@ bool UCSan::runImpl(Module &M) {
   for (GlobalVariable &GV : M.globals()) {
     if (GV.isDSOLocal()) {
       // Keep dso_local on globals used in inline asm with immediate ("i")
-      // constraint, as their address must be a compile-time constant
+      // constraint, as their address must be a compile-time constant.
+      // Walk through ConstantExpr users (e.g. GEP, bitcast) to find
+      // indirect uses in inline asm.
       bool usedAsImmInAsm = false;
-      for (User *U : GV.users()) {
+      SmallVector<User *, 8> Worklist(GV.users().begin(), GV.users().end());
+      SmallPtrSet<User *, 8> Visited;
+      while (!Worklist.empty() && !usedAsImmInAsm) {
+        User *U = Worklist.pop_back_val();
+        if (!Visited.insert(U).second)
+          continue;
+        if (isa<ConstantExpr>(U)) {
+          Worklist.append(U->user_begin(), U->user_end());
+          continue;
+        }
         auto *CB = dyn_cast<CallBase>(U);
         if (!CB || !CB->isInlineAsm())
           continue;
         auto *IA = cast<InlineAsm>(CB->getCalledOperand());
-        // Check if the GV operand has an immediate constraint
         auto Constraints = IA->ParseConstraints();
         unsigned argIdx = 0;
         for (auto &CI : Constraints) {
@@ -3477,7 +3487,6 @@ bool UCSan::runImpl(Module &M) {
           if (usedAsImmInAsm) break;
           argIdx++;
         }
-        if (usedAsImmInAsm) break;
       }
       if (!usedAsImmInAsm)
         GV.setDSOLocal(false);
