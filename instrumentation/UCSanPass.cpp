@@ -3309,8 +3309,11 @@ bool UCSan::runImpl(Module &M) {
   for (Function *F : FnsToInstrument) {
     if (!F || F->isDeclaration()) continue;
 
-    // Make in-scope functions externally visible for debugging/linking
-    F->setLinkage(GlobalValue::ExternalLinkage);
+    // Make in-scope functions externally visible for debugging/linking,
+    // but preserve internal/private linkage to avoid multiple definitions
+    // when linking (e.g. static inline functions like percpu_counter_add)
+    if (!F->hasLocalLinkage())
+      F->setLinkage(GlobalValue::ExternalLinkage);
 
     // Kernel-style inputs may use 8-byte stack alignment; force realignment so
     // inserted UCSan runtime calls follow userspace ABI requirements.
