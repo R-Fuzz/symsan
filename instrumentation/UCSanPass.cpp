@@ -1914,17 +1914,24 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
     // cache is only possible if size is a constant
     auto itr = CheckedPtrMap.find(Ptr);
     if (itr != CheckedPtrMap.end()) {
-      // finding related instructions
-      // worst case, cast(ptr) -> check_ptr -> cast(ptr)
+      // finding related instructions created by checkPointer
+      // worst case, cast(ptr) -> check_ptr -> cast(result)
       Instruction *I1 = itr->second, *I2 = nullptr, *I3 = nullptr;
       CallBase *CB = nullptr;
       if (isa<CastInst>(I1)) {
+        // I1 = bitcast(result), I2 = call, I3 = bitcast(Ptr) if exists
         I2 = dyn_cast<Instruction>(I1->getOperand(0));
         CB = dyn_cast<CallBase>(I2);
-        I3 = dyn_cast<Instruction>(I2->getOperand(0));
+        auto *AddrOp = dyn_cast<Instruction>(CB->getArgOperand(0));
+        // Only track the input cast if it was created by us, not Ptr itself
+        if (AddrOp && isa<CastInst>(AddrOp) && AddrOp != Ptr)
+          I3 = AddrOp;
       } else {
         CB = dyn_cast<CallBase>(I1);
-        I2 = dyn_cast<Instruction>(I1->getOperand(0));
+        // No output cast; check if there's an input cast we created
+        auto *AddrOp = dyn_cast<Instruction>(CB->getArgOperand(0));
+        if (AddrOp && isa<CastInst>(AddrOp) && AddrOp != Ptr)
+          I2 = AddrOp;
       }
 
       // update size if needed
@@ -1950,14 +1957,21 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
       if (isa<GlobalVariable>(Ptr) || isa<Argument>(Ptr) || isa<ConstantExpr>(Ptr)) {
         Pos = F->getEntryBlock().getTerminator();
       } else if (Instruction *I = dyn_cast<Instruction>(Ptr)) {
-        // move to after the source of Ptr
-        Pos = I->getNextNode();
-        while (isa<PHINode>(Pos) || isa<AllocaInst>(Pos)) {
-          Pos = Pos->getNextNode();
-        }
-        // handle load shadow - skip the shadow if it exists
-        if (CB->getArgOperand(1) == Pos) {
-          Pos = Pos->getNextNode();
+        // Find a block that dominates both the cached check and the new use
+        auto *NCD = DT.findNearestCommonDominator(SBB, TBB);
+        if (I->getParent() == NCD) {
+          // Ptr is in the common dominator, place after Ptr
+          Pos = I->getNextNode();
+          while (isa<PHINode>(Pos) || isa<AllocaInst>(Pos)) {
+            Pos = Pos->getNextNode();
+          }
+          // handle load shadow - skip the shadow if it exists
+          if (CB->getArgOperand(1) == Pos) {
+            Pos = Pos->getNextNode();
+          }
+        } else {
+          // Ptr's block dominates NCD, place at start of NCD
+          Pos = &*NCD->getFirstInsertionPt();
         }
       } else {
         errs() << "Unexpected pointer type for checkPointer: " << *Ptr << "\n"
