@@ -340,6 +340,7 @@ class UCSan {
     WK_ShimOrig,    // original function to be replaced by __shim_ version
     WK_ShimTarget,  // LLM-generated __shim_ function, instrumented like in-scope
     WK_Uninstrumented,
+    WK_Discard,
   };
 
   Module *Mod;
@@ -448,6 +449,7 @@ class UCSan {
   bool initializeModule(Module &M);
 
   Function *buildDangleFunction(Function *F);
+  Function *buildDiscardFunction(Function *F);
   Function *buildDriverWrapperFunction(Function *F);
   Function *getCustomFunction(const Function *F);
 
@@ -1632,6 +1634,29 @@ Function *UCSan::buildDangleFunction(Function *F) {
   return NewF;
 }
 
+Function *UCSan::buildDiscardFunction(Function *F) {
+  // Creates a trivial stub for discarded functions (e.g., kernel helpers
+  // like _copy_to_user/printk that have no implementation in UC mode).
+  // The stub simply returns zero/void and is marked so TaintPass skips it.
+
+  FunctionType *FT = F->getFunctionType();
+  std::string FN = "__discard$" + F->getName().str();
+  Function *NewF = Function::Create(FT, GlobalValue::LinkageTypes::PrivateLinkage,
+                                    F->getAddressSpace(), FN, Mod);
+  markFunctionNosanitize(NewF);
+
+  BasicBlock *BB = BasicBlock::Create(*Ctx, "entry", NewF);
+  IRBuilder<> IRB(BB);
+
+  Type *RT = FT->getReturnType();
+  if (RT->isVoidTy())
+    IRB.CreateRetVoid();
+  else
+    IRB.CreateRet(Constant::getNullValue(RT));
+
+  return NewF;
+}
+
 Function *UCSan::buildDriverWrapperFunction(Function *F) {
   // Creates main() wrapper that calls the entry point function
   // This replaces the standard main() and initializes arguments symbolically
@@ -1831,6 +1856,10 @@ UCSan::WrapperKind UCSan::getWrapperKind(Function *F) {
   // Check ABIList for custom functions (priority)
   if (ABIList.isIn(*F, "custom"))
     return WK_Custom;
+
+  // Check ABIList for discard functions (completely ignored, no wrapper)
+  if (ABIList.isIn(*F, "discard"))
+    return WK_Discard;
 
   // Check ABIList for uninstrumented functions
   if (ABIList.isIn(*F, "uninstrumented"))
@@ -2632,6 +2661,10 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     }
     return true;
 
+  case UCSan::WK_Discard:
+    // Completely discarded, nothing to do
+    return true;
+
   case UCSan::WK_TaintCustom:
   case UCSan::WK_Uninstrumented:
   {
@@ -3263,6 +3296,11 @@ bool UCSan::runImpl(Module &M) {
         UnwrappedFnMap[&F] = &F;
         // Remove the body of there is one
         if (!F.isDeclaration()) F.deleteBody();
+      } else if (WK == WK_Discard) {
+        // Replace with a trivial stub so both UCSan and TaintPass skip it
+        Function *Stub = buildDiscardFunction(&F);
+        F.replaceAllUsesWith(Stub);
+        F.deleteBody();
       } else if (WK == WK_Uninstrumented) {
         // Leave the function as is, but add to UnwrappedFnMap
         UnwrappedFnMap[&F] = &F;
