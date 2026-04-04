@@ -2510,6 +2510,8 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
   UF.UC.markNosanitize(And);
   // if not null and not symbolic, we can call it directly
   SplitBlockAndInsertIfThenElse(And, &CB, &TB, &EB);
+  // Update dominator tree after block split
+  UF.DT.recalculate(*UF.F);
   // get the correct merge bb
   curBB = TB->getParent()->getSingleSuccessor();
   assert(curBB != nullptr && "Expected single successor after if-then-else");
