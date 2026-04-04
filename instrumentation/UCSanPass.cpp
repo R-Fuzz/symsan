@@ -3344,7 +3344,7 @@ bool UCSan::runImpl(Module &M) {
   for (Function *F : FnsOutOfScope) {
     if (Function *dangle = buildDangleFunction(F)) {
       F->replaceAllUsesWith(dangle);
-      F->deleteBody();
+      F->eraseFromParent();
     }
   }
 
@@ -3507,7 +3507,7 @@ bool UCSan::runImpl(Module &M) {
   // Also strip dso_local so llc generates PIC-compatible relocations
   // (needed for code compiled without -fPIC, e.g. kernel)
   for (GlobalVariable &GV : M.globals()) {
-    if (GV.isDSOLocal()) {
+    if (GV.isDSOLocal() && !GV.hasLocalLinkage() && GV.hasDefaultVisibility()) {
       // Keep dso_local on globals used in inline asm with immediate ("i")
       // constraint, as their address must be a compile-time constant.
       // Walk through ConstantExpr users (e.g. GEP, bitcast) to find
@@ -3554,7 +3554,7 @@ bool UCSan::runImpl(Module &M) {
     }
   }
   for (Function &F : M) {
-    if (F.isDSOLocal()) {
+    if (F.isDSOLocal() && !F.hasLocalLinkage() && F.hasDefaultVisibility()) {
       F.setDSOLocal(false);
     }
   }
