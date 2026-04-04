@@ -1993,7 +1993,7 @@ void TaintFunction::checkBounds(Value *Ptr, Value* Size, Instruction *Pos) {
   if (!TT.isZeroShadow(PtrShadow)) {
     Value *Addr = IRB.CreatePtrToInt(Ptr, TT.Int64Ty);
     Value *Size64 = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
-    IRB.CreateCall(TT.TaintCheckBoundsFn, {PtrShadow, Addr, SizeShadow, Size});
+    IRB.CreateCall(TT.TaintCheckBoundsFn, {PtrShadow, Addr, SizeShadow, Size64});
   }
 }
 
