@@ -1892,12 +1892,12 @@ TransformedFunction UCSan::getCustomFunctionType(FunctionType *T) {
     ArgTypes.push_back(param_type);
   }
   for (unsigned i = 0, e = T->getNumParams(); i != e; ++i)
-    ArgTypes.push_back(PrimitiveShadowTy);
+    ArgTypes.push_back(getShadowTy(T->getParamType(i)));
   if (T->isVarArg())
     ArgTypes.push_back(PrimitiveShadowPtrTy);
   Type *RetType = T->getReturnType();
   if (!RetType->isVoidTy())
-    ArgTypes.push_back(PrimitiveShadowPtrTy);
+    ArgTypes.push_back(PointerType::getUnqual(getShadowTy(RetType)));
   return TransformedFunction(
       T, FunctionType::get(T->getReturnType(), ArgTypes, T->isVarArg()),
       ArgumentIndexMapping);
@@ -3164,11 +3164,12 @@ void UCSanVisitor::visitSelectInst(SelectInst &I) {
 }
 
 void UCSanVisitor::visitPHINode(PHINode &PN) {
+  Type *ShadowTy = UF.UC.getShadowTy(PN.getType());
   PHINode *ShadowPN =
-      PHINode::Create(UF.UC.PrimitiveShadowTy, PN.getNumIncomingValues(), "", &PN);
+      PHINode::Create(ShadowTy, PN.getNumIncomingValues(), "", &PN);
 
   // Give the shadow phi node valid predecessors to fool SplitEdge into working.
-  Value *UndefShadow = UndefValue::get(UF.UC.PrimitiveShadowTy);
+  Value *UndefShadow = UndefValue::get(ShadowTy);
   for (PHINode::block_iterator i = PN.block_begin(), e = PN.block_end(); i != e;
        ++i) {
     ShadowPN->addIncoming(UndefShadow, *i);
