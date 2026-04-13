@@ -633,8 +633,8 @@ struct TaintFunction {
 
 private:
   /// Loads a primitive shadow label
-  Value *loadPrimitiveShadow(Value *Addr, uint64_t Size, uint64_t Align,
-                             IRBuilder<> &IRB);
+  Value *loadPrimitiveShadow(Value *Addr, uint64_t Size, uint64_t SizeInBits,
+                             uint64_t Align, IRBuilder<> &IRB);
   /// Loads shadow recursively for aggregate types
   Value *loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                              Type *SubTy, Value *Addr, uint64_t Size,
@@ -981,9 +981,10 @@ bool Taint::initializeModule(Module &M) {
       Int16Ty, Int16Ty, Int64Ty, Int64Ty};
   TaintUnionFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintUnionArgs, /*isVarArg=*/ false);
-  Type *TaintUnionLoadArgs[3] = { PrimitiveShadowPtrTy, IntptrTy, Int64Ty };
+  Type *TaintUnionLoadArgs[4] = { PrimitiveShadowPtrTy, IntptrTy, Int64Ty, Int64Ty };
   TaintUnionLoadFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintUnionLoadArgs, /*isVarArg=*/ false);
+  // args: shadow_ptr, n (bytes), size_in_bits, align
   Type *TaintUnionStoreArgs[4] = { PrimitiveShadowTy, PrimitiveShadowPtrTy,
       IntptrTy, Int64Ty };
   TaintUnionStoreFnTy = FunctionType::get(
@@ -2239,13 +2240,15 @@ void TaintFunction::hoistBoundsChecks() {
 // Generates IR to load shadow corresponding to bytes [Addr, Addr+Size), where
 // Addr has alignment Align, and take the union of each of those shadows.
 Value *TaintFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size,
-                                          uint64_t Align, IRBuilder<> &IRB) {
+                                          uint64_t SizeInBits, uint64_t Align,
+                                          IRBuilder<> &IRB) {
   if (Size == 0)
     return TT.ZeroPrimitiveShadow;
 
   Value *ShadowAddr = TT.getShadowAddress(Addr, IRB);
   CallInst *FallbackCall = IRB.CreateCall(
       TT.TaintUnionLoadFn, {ShadowAddr, ConstantInt::get(TT.IntptrTy, Size),
+                            ConstantInt::get(TT.Int64Ty, SizeInBits),
                             ConstantInt::get(TT.IntptrTy, Align)});
   FallbackCall->addRetAttr(Attribute::ZExt);
   return FallbackCall;
@@ -2259,9 +2262,10 @@ Value *TaintFunction::loadShadowRecursive(
   if (!isa<ArrayType>(SubTy) && !isa<StructType>(SubTy)) {
     uint64_t SubSize = DL.getTypeStoreSize(SubTy);
     assert(Size >= SubSize);
+    uint64_t SubSizeInBits = DL.getTypeSizeInBits(SubTy);
     Align = std::min(Align, (uint64_t)DL.getABITypeAlignment(SubTy));
     // load a primitive shadow from address
-    Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, Align, IRB);
+    Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, SubSizeInBits, Align, IRB);
     // then insert the primitive shadow into the sub-field
     return IRB.CreateInsertValue(Shadow, PrimitiveShadow, Indices);
   }
@@ -2333,10 +2337,13 @@ Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size,
     return TT.ZeroPrimitiveShadow;
 
   const uint64_t ShadowAlign = getShadowAlign(Alignment).value();
+  auto &DL = F->getParent()->getDataLayout();
 
   // now check if we're loading an aggragate object
-  if (!isa<ArrayType>(T) && !isa<StructType>(T))
-    return loadPrimitiveShadow(Addr, Size, ShadowAlign, IRB);
+  if (!isa<ArrayType>(T) && !isa<StructType>(T)) {
+    uint64_t SizeInBits = DL.getTypeSizeInBits(T);
+    return loadPrimitiveShadow(Addr, Size, SizeInBits, ShadowAlign, IRB);
+  }
 
   // if loading an aggregate object, load its shadow recursively
   SmallVector<unsigned, 4> Indices;

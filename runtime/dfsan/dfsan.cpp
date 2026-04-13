@@ -620,7 +620,7 @@ dfsan_label __taint_gep_offset(dfsan_label label, char* result, char* base) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
+dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_bits, uint64_t align) {
   if ((uptr)ls < 4096) {
     AOUT("WARNING: nullptr deref\n");
     return 0;
@@ -666,10 +666,16 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
     }
   }
   if (shape) {
-    if (n == 1) return label0;
-
-    AOUT("shape: label0: %d %lu\n", label0, n);
-    return do_taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0);
+    dfsan_label result;
+    if (n == 1)
+      result = label0;
+    else {
+      AOUT("shape: label0: %d %lu\n", label0, n);
+      result = do_taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0);
+    }
+    if (size_in_bits < n * 8)
+      result = do_taint_union(result, CONST_LABEL, Trunc, size_in_bits, 0, 0);
+    return result;
   }
 
   // fast path 2: all labels are extracted from a n-size label,
@@ -688,6 +694,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
     }
     if (get_label_info(parent)->size == offset && offset == n * 8) {
       AOUT("Fast path (2): all labels are extracts: %u\n", parent);
+      if (size_in_bits < n * 8)
+        return do_taint_union(parent, CONST_LABEL, Trunc, size_in_bits, 0, 0);
       return parent;
     }
   }
@@ -708,7 +716,10 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
         Report("WARNING: partial loading expected=%lu has=%d\n", n-i, next_size);
         uptr size = n - i;
         dfsan_label trunc = do_taint_union(next_label, CONST_LABEL, Trunc, size * 8, 0, 0);
-        return do_taint_union(label, trunc, Concat, n * 8, 0, 0);
+        dfsan_label result = do_taint_union(label, trunc, Concat, n * 8, 0, 0);
+        if (size_in_bits < n * 8)
+          result = do_taint_union(result, CONST_LABEL, Trunc, size_in_bits, 0, 0);
+        return result;
       }
     } else {
       Report("WARNING: taint mixed with concrete %lu\n", i);
@@ -718,6 +729,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t align) {
     }
   }
   AOUT("\n");
+  if (size_in_bits < n * 8)
+    label = do_taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
   return label;
 }
 
@@ -1176,7 +1189,7 @@ SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
 dfsan_read_label(const void *addr, uptr size) {
   if (size == 0)
     return 0;
-  return __taint_union_load(shadow_for(addr), size, sizeof(dfsan_label));
+  return __taint_union_load(shadow_for(addr), size, size * 8, sizeof(dfsan_label));
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
