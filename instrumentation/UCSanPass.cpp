@@ -1712,8 +1712,15 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
 
     // Call runtime to create symbolic argument
     // Returns a pointer that we cast to the appropriate type
-    Value *casted_arg = IRB.CreateCall(UCSetLabelForArgsFn, {ArgNo, ArgSize, IsPtr, InitVal});
-    Args.push_back(IRB.CreateBitOrPointerCast(casted_arg, ai->getType()));
+    Value *ret_val = IRB.CreateCall(UCSetLabelForArgsFn, {ArgNo, ArgSize, IsPtr, InitVal});
+    if (ai->getType()->isFloatingPointTy()) {
+      // Can't bitcast pointer directly to float; go through integer
+      Type *IntTy = IntegerType::get(*Ctx, DL.getTypeSizeInBits(ai->getType()));
+      Value *int_val = IRB.CreatePtrToInt(ret_val, IntTy);
+      Args.push_back(IRB.CreateBitCast(int_val, ai->getType()));
+    } else {
+      Args.push_back(IRB.CreateBitOrPointerCast(ret_val, ai->getType()));
+    }
   }
 
   // Call the actual entry point function
