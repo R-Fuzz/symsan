@@ -267,6 +267,22 @@ static void segfault_handler(int sig, siginfo_t *si, void *unused)
   Die();
 }
 
+static void fpe_handler(int sig, siginfo_t *si, void *unused)
+{
+  void *addr = si->si_addr;
+  if (si->si_code == FPE_INTDIV) {
+    AOUT("Integer division by zero at address: %p\n", addr);
+    __taint_trace_event_addr(0, EVENT_DIV_BY_ZERO, 0, addr, 0);
+    internal__exit(EVENT_DIV_BY_ZERO);
+  } else if (si->si_code == FPE_INTOVF) {
+    AOUT("Integer overflow at address: %p\n", addr);
+    __taint_trace_event_addr(0, EVENT_INT_OVERFLOW, 0, addr, 0);
+    internal__exit(EVENT_INT_OVERFLOW);
+  }
+  AOUT("Floating point exception at address: %p, code: %d\n", addr, si->si_code);
+  Die();
+}
+
 void RegisterSegFault () {
 #ifdef __handle_segfualt__
   struct sigaction sa;
@@ -275,6 +291,9 @@ void RegisterSegFault () {
   sigemptyset(&sa.sa_mask);
   sa.sa_sigaction = segfault_handler;
   if (sigaction(SIGSEGV, &sa, NULL) == -1)
+    Die();
+  sa.sa_sigaction = fpe_handler;
+  if (sigaction(SIGFPE, &sa, NULL) == -1)
     Die();
 #endif
 }
