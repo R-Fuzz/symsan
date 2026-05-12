@@ -589,6 +589,21 @@ __dfsw_panic(char *reason, ucsan_label reason_label) {
   _exit(EVENT_PANIC);
 }
 
+SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
+__dfsw_abort(void) {
+  UCSAN_OUT("ABORT\n");
+  _exit(EVENT_PANIC);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
+__dfsw___assert_fail(const char *assertion, const char *file,
+                     unsigned int line, const char *function,
+                     ucsan_label assertion_label, ucsan_label file_label,
+                     ucsan_label line_label, ucsan_label function_label) {
+  UCSAN_OUT("ASSERT FAILED: %s at %s:%u (%s)\n", assertion, file, line, function);
+  _exit(EVENT_PANIC);
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE void*
 __dfsw_assume_freed(void *ptr, uint64_t id, ucsan_label ptr_label,
                     ucsan_label id_label, ucsan_label *ret_label) {
