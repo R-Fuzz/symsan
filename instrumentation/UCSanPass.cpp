@@ -382,6 +382,7 @@ class UCSan {
   FunctionType *UCTraceAllocaFnTy;
   FunctionType *UCPushStackFrameFnTy;
   FunctionType *UCPopStackFrameFnTy;
+  FunctionType *UCCheckCopyBoundsFnTy;
 
   // Runtime functions
   FunctionCallee UCCheckPointerFn;
@@ -398,6 +399,7 @@ class UCSan {
   FunctionCallee UCTraceAllocaFn;
   FunctionCallee UCPushStackFrameFn;
   FunctionCallee UCPopStackFrameFn;
+  FunctionCallee UCCheckCopyBoundsFn;
   // FunctionCallee PopulateDataSegmentFn;
 
   FunctionCallee LLVMReturnAddrFn;
@@ -786,6 +788,17 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   UCPopStackFrameFnTy = FunctionType::get(Type::getVoidTy(*Ctx), {}, false);
   UCPopStackFrameFn = M.getOrInsertFunction("ucsan_pop_stack_frame", UCPopStackFrameFnTy);
   F = dyn_cast<Function>(UCPopStackFrameFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // void ucsan_check_copy_bounds(void *dst, i16 dst_label, void *src, i16 src_label, i64 size)
+  // Check if a copy operation can overflow the destination buffer
+  UCCheckCopyBoundsFnTy = FunctionType::get(
+    Type::getVoidTy(*Ctx),
+    {VoidPtrTy, PrimitiveShadowTy, VoidPtrTy, PrimitiveShadowTy, Int64Ty},
+    false);
+  UCCheckCopyBoundsFn = M.getOrInsertFunction("ucsan_check_copy_bounds", UCCheckCopyBoundsFnTy);
+  F = dyn_cast<Function>(UCCheckCopyBoundsFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -2721,6 +2734,13 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       UF.UC.markNosanitize(LenVal);
     }
 
+    // Check copy semantics from abilist: copystr (unbounded) or copyn (bounded)
+    bool IsCopyStr = UF.UC.ABIList.isIn(*F, "copystr");
+    bool IsCopyN = UF.UC.ABIList.isIn(*F, "copyn");
+
+    Value *ResolvedDst = nullptr, *ResolvedSrc = nullptr;
+    Value *DstShadow = nullptr, *SrcShadow = nullptr;
+
     auto *I = CB.arg_begin();
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
       unsigned ArgIdx = FT->getNumParams() - N;
@@ -2749,10 +2769,39 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
           sizeArg = ConstantInt::get(UF.UC.Int64Ty, DL.getTypeAllocSize(PointeeTy));
           TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
         }
+
+        // Capture shadow before checkPointer resolves the pointer
+        if ((IsCopyStr || IsCopyN) && ArgIdx <= 1) {
+          Value *Shadow = UF.getShadow(*I);
+          if (ArgIdx == 0) DstShadow = Shadow;
+          else if (ArgIdx == 1) SrcShadow = Shadow;
+        }
+
         Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
         CB.setArgOperand(ArgIdx, rptr);
+
+        // Capture resolved pointers for copy bounds check
+        if ((IsCopyStr || IsCopyN) && ArgIdx <= 1) {
+          if (ArgIdx == 0) ResolvedDst = rptr;
+          else if (ArgIdx == 1) ResolvedSrc = rptr;
+        }
       }
     }
+
+    // Emit copy bounds check: dst=arg0, src=arg1
+    if ((IsCopyStr || IsCopyN) && ResolvedDst && ResolvedSrc &&
+        DstShadow && SrcShadow) {
+      Value *DstAddr = IRB.CreateBitCast(ResolvedDst, UF.UC.VoidPtrTy);
+      Value *SrcAddr = IRB.CreateBitCast(ResolvedSrc, UF.UC.VoidPtrTy);
+      UF.UC.markNosanitize(DstAddr);
+      UF.UC.markNosanitize(SrcAddr);
+      // For copyn, pass the explicit size; for copystr, pass 0 (strlen-determined)
+      Value *CopySize = IsCopyN && LenVal ? LenVal
+                                          : ConstantInt::get(UF.UC.Int64Ty, 0);
+      IRB.CreateCall(UF.UC.UCCheckCopyBoundsFn,
+                     {DstAddr, DstShadow, SrcAddr, SrcShadow, CopySize});
+    }
+
     // Set zero ucsan shadow for the return value; TaintPass will set the taint label.
     if (!FT->getReturnType()->isVoidTy()) {
       UF.setShadow(&CB, UF.UC.getZeroShadow(&CB));

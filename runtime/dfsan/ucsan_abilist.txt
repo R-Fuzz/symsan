@@ -72,5 +72,17 @@ fun:_copy_from_user=custom
 fun:printk=discard
 fun:_copy_to_user=discard
 
+# copy semantics: unbounded (size=strlen(src))
+fun:strcpy=copystr
+fun:stpcpy=copystr
+fun:strcat=copystr
+fun:strdup=copystr
+
+# copy semantics: bounded (size=arg2)
+fun:memcpy=copyn
+fun:memmove=copyn
+fun:strncpy=copyn
+fun:strncat=copyn
+
 # buffer size
 fun:_copy_from_user=size3

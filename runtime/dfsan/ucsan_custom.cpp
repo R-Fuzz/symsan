@@ -52,7 +52,7 @@ static ucsan_label create_alloca_label(void *ptr, size_t size, bool set_uninitia
   ucsan_obj_info *obj = to_obj_info(info);
 
   obj->op = OP_ALLOCA;
-  obj->_reserved = 0;
+  obj->type_id = 0;
   obj->object_id = 0;  // Not tracked in objects array
   obj->real_ptr = ptr;
   obj->lower_bound = 0;           // No bytes before base

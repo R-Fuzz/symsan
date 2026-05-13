@@ -872,6 +872,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     obj_label_info->upper_bound = (uint32_t)object_size - obj.offset;
     obj_label_info->real_ptr = (char*)np + obj.offset;
     obj_label_info->op = OP_RESERVED_OBJ;
+    obj_label_info->type_id = (uint16_t)type_id;
     obj_label_info->object_id = object_id;
 
     ptr_info->obj_label = obj_label;
@@ -1057,6 +1058,61 @@ void ucsan_check_ubi(ucsan_label label) {
     // Trace use-before-initialization event
     __taint_trace_event_addr(label, EVENT_UBI, 0, __builtin_return_address(0), 0);
     exit(exit_reason::EVENT_UBI);
+  }
+}
+
+// Check if a copy operation can overflow the destination buffer.
+// Phase 1: if src object already exceeds dst bound, exit with OOB.
+// Phase 2: if src type is variable-size (type_id==0), ask thoroupy to
+//          enlarge the src object past dst bound for the next run.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_check_copy_bounds(void *dst, ucsan_label dst_label,
+                             void *src, ucsan_label src_label,
+                             uint64_t size) {
+  UCSAN_OUT("ucsan_check_copy_bounds: dst=%p (label=%u), src=%p (label=%u), size=%lu\n",
+            dst, dst_label, src, src_label, size);
+
+  // dst must have known alloca bounds
+  if (dst_label < UCSAN_CONST_OFFSET) return;
+  ucsan_label_info *dst_info = get_label_info(dst_label);
+  if (dst_info->common.op != OP_ALLOCA) return;
+
+  ucsan_obj_info *dst_obj = to_obj_info(dst_info);
+  uint64_t dst_bound = dst_obj->upper_bound;
+
+  // src must be under-constrained (OP_EXTERNAL)
+  if (src_label < UCSAN_CONST_OFFSET) return;
+  ucsan_label_info *src_info = get_label_info(src_label);
+  if (src_info->common.op != OP_EXTERNAL) return;
+
+  ucsan_ptr_info *src_ptr = to_ptr_info(src_info);
+  if (src_ptr->status != PTR_INITIALIZED) return;
+
+  // Get src object info
+  ucsan_label src_obj_label = src_ptr->obj_label;
+  if (src_obj_label < UCSAN_CONST_OFFSET) return;
+  ucsan_label_info *src_obj_info = get_label_info(src_obj_label);
+  if (src_obj_info->common.op != OP_RESERVED_OBJ) return;
+
+  ucsan_obj_info *src_obj = to_obj_info(src_obj_info);
+  uint32_t src_object_id = src_obj->object_id;
+  uint64_t src_size = src_obj->lower_bound + src_obj->upper_bound;
+
+  UCSAN_OUT("  dst_bound=%lu, src_object_id=%u, src_size=%lu, src_type_id=%u\n",
+            dst_bound, src_object_id, src_size, src_obj->type_id);
+
+  // Phase 1: src already exceeds dst bound → OOB witness
+  if (src_size > dst_bound) {
+    UCSAN_OUT("  COPY OVERFLOW: src_size=%lu > dst_bound=%lu\n", src_size, dst_bound);
+    __taint_trace_event_addr(src_label, EVENT_OOB, 0,
+                             __builtin_return_address(0), 0);
+    exit(exit_reason::EVENT_OOB);
+  }
+
+  // Phase 2: src type is variable-size → request enlargement
+  if (src_obj->type_id == 0) {
+    __taint_trace_event_addr(src_label, EVENT_COPY_OVERFLOW, src_object_id,
+                             __builtin_return_address(0), (uint32_t)dst_bound);
   }
 }
 
@@ -1516,7 +1572,7 @@ ucsan_label ucsan_trace_alloca(uint64_t size, uint64_t elem_size, uint64_t addr)
 
     // Set up bounds tracking for stack allocation
     obj->op = OP_ALLOCA;
-    obj->_reserved = 0;
+    obj->type_id = 0;
     obj->object_id = 0;  // Not tracked in objects array (stack allocation)
     obj->real_ptr = ptr;
     obj->lower_bound = 0;           // No bytes before base

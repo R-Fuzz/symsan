@@ -90,8 +90,8 @@ struct ucsan_ptr_info {
 
 // Object info - tracks lazy-initialized objects (op == OP_RESERVED_OBJ)
 struct ucsan_obj_info {
-  uint16_t op;                 // OP_RESERVED_OBJ
-  uint16_t _reserved;
+  uint16_t op;                 // OP_RESERVED_OBJ or OP_ALLOCA
+  uint16_t type_id;            // compile-time type ID from type table (0 = unknown)
   uint32_t object_id;          // unique object ID (index into objects array)
   void* real_ptr;         // actual memory (points to base within allocated region)
   uint32_t lower_bound;        // bytes before base (for container_of)
@@ -277,6 +277,7 @@ enum ucsan_event_type {
   EVENT_EXTENSION = 102,
   EVENT_ASSERTION = 103,
   EVENT_TYPE_BIND = 104,
+  EVENT_COPY_OVERFLOW = 105,
 };
 
 enum ucsan_assertion_type {
