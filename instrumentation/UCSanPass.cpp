@@ -791,11 +791,11 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
-  // void ucsan_check_copy_bounds(void *dst, i16 dst_label, void *src, i16 src_label, i64 size)
+  // void ucsan_check_copy_bounds(void *dst, i16 dst_label, void *src, i16 src_label, i64 size, i64 dst_bound)
   // Check if a copy operation can overflow the destination buffer
   UCCheckCopyBoundsFnTy = FunctionType::get(
     Type::getVoidTy(*Ctx),
-    {VoidPtrTy, PrimitiveShadowTy, VoidPtrTy, PrimitiveShadowTy, Int64Ty},
+    {VoidPtrTy, PrimitiveShadowTy, VoidPtrTy, PrimitiveShadowTy, Int64Ty, Int64Ty},
     false);
   UCCheckCopyBoundsFn = M.getOrInsertFunction("ucsan_check_copy_bounds", UCCheckCopyBoundsFnTy);
   F = dyn_cast<Function>(UCCheckCopyBoundsFn.getCallee()->stripPointerCasts());
@@ -2740,6 +2740,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
 
     Value *ResolvedDst = nullptr, *ResolvedSrc = nullptr;
     Value *DstShadow = nullptr, *SrcShadow = nullptr;
+    Value *DstBound = ConstantInt::get(UF.UC.Int64Ty, 0);
 
     auto *I = CB.arg_begin();
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
@@ -2773,8 +2774,18 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
         // Capture shadow before checkPointer resolves the pointer
         if ((IsCopyStr || IsCopyN) && ArgIdx <= 1) {
           Value *Shadow = UF.getShadow(*I);
-          if (ArgIdx == 0) DstShadow = Shadow;
-          else if (ArgIdx == 1) SrcShadow = Shadow;
+          if (ArgIdx == 0) {
+            DstShadow = Shadow;
+            // For GV destinations, shadow is zero but we know the size at compile time
+            if (auto *GV = dyn_cast<GlobalVariable>((*I)->stripPointerCasts())) {
+              Type *T = GV->getValueType();
+              if (T && (T->isArrayTy() || T->isStructTy()) && T->isSized()) {
+                DstBound = ConstantInt::get(UF.UC.Int64Ty, DL.getTypeAllocSize(T));
+              }
+            }
+          } else if (ArgIdx == 1) {
+            SrcShadow = Shadow;
+          }
         }
 
         Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
@@ -2799,7 +2810,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       Value *CopySize = IsCopyN && LenVal ? LenVal
                                           : ConstantInt::get(UF.UC.Int64Ty, 0);
       IRB.CreateCall(UF.UC.UCCheckCopyBoundsFn,
-                     {DstAddr, DstShadow, SrcAddr, SrcShadow, CopySize});
+                     {DstAddr, DstShadow, SrcAddr, SrcShadow, CopySize, DstBound});
     }
 
     // Set zero ucsan shadow for the return value; TaintPass will set the taint label.

@@ -1068,17 +1068,20 @@ void ucsan_check_ubi(ucsan_label label) {
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_check_copy_bounds(void *dst, ucsan_label dst_label,
                              void *src, ucsan_label src_label,
-                             uint64_t size) {
-  UCSAN_OUT("ucsan_check_copy_bounds: dst=%p (label=%u), src=%p (label=%u), size=%lu\n",
-            dst, dst_label, src, src_label, size);
+                             uint64_t size, uint64_t gv_dst_bound) {
+  UCSAN_OUT("ucsan_check_copy_bounds: dst=%p (label=%u), src=%p (label=%u), size=%lu, gv_dst_bound=%lu\n",
+            dst, dst_label, src, src_label, size, gv_dst_bound);
 
-  // dst must have known alloca bounds
-  if (dst_label < UCSAN_CONST_OFFSET) return;
-  ucsan_label_info *dst_info = get_label_info(dst_label);
-  if (dst_info->common.op != OP_ALLOCA) return;
-
-  ucsan_obj_info *dst_obj = to_obj_info(dst_info);
-  uint64_t dst_bound = dst_obj->upper_bound;
+  // Get dst bound: from alloca label or from compile-time GV size
+  uint64_t dst_bound = 0;
+  if (dst_label >= UCSAN_CONST_OFFSET) {
+    ucsan_label_info *dst_info = get_label_info(dst_label);
+    if (dst_info->common.op == OP_ALLOCA) {
+      ucsan_obj_info *dst_obj = to_obj_info(dst_info);
+      dst_bound = dst_obj->upper_bound;
+    }
+  } else dst_bound = gv_dst_bound;
+  if (dst_bound == 0) return;
 
   // src must be under-constrained (OP_EXTERNAL)
   if (src_label < UCSAN_CONST_OFFSET) return;
