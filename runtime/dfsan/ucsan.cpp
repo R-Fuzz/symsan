@@ -1112,8 +1112,8 @@ void ucsan_check_copy_bounds(void *dst, ucsan_label dst_label,
     exit(exit_reason::EVENT_OOB);
   }
 
-  // Phase 2: src type is variable-size → request enlargement
-  if (src_obj->type_id == 0) {
+  // Phase 2: request enlargement for variable-size or char-typed objects
+  if (src_obj->type_id == 0 || src_obj->type_id == 2) {
     __taint_trace_event_addr(src_label, EVENT_COPY_OVERFLOW, src_object_id,
                              __builtin_return_address(0), (uint32_t)dst_bound);
   }
