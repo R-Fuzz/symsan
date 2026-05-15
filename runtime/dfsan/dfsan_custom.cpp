@@ -1172,6 +1172,7 @@ __dfsw_strncpy(char *s1, const char *s2, size_t n, dfsan_label s1_label,
   return s1;
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t
 __dfsw_pread(int fd, void *buf, size_t count, off_t offset,
              dfsan_label fd_label, dfsan_label buf_label,
@@ -1244,6 +1245,7 @@ __dfsw_read(int fd, void *buf, size_t count,
   }
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_clock_gettime(clockid_t clk_id,
                                                        struct timespec *tp,
@@ -2717,6 +2719,7 @@ __dfsw_fclose(FILE *fp, dfsan_label fp_label, dfsan_label *ret_label) {
   return ret;
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE size_t
 __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
              dfsan_label ptr_label, dfsan_label size_label,
@@ -2815,6 +2818,7 @@ __dfsw_fread_unlocked(
   }
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t
 __dfsw_getline(char **lineptr, size_t *n, FILE *stream,
