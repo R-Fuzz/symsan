@@ -84,5 +84,12 @@ fun:memmove=copyn
 fun:strncpy=copyn
 fun:strncat=copyn
 
+# I/O read functions
+fun:read=custom
+fun:pread=custom
+fun:pread64=custom
+fun:fread=custom
+fun:fread_unlocked=custom
+
 # buffer size
 fun:_copy_from_user=size3
