@@ -619,7 +619,8 @@ __dfsw_assume_freed(void *ptr, uint64_t id, ucsan_label ptr_label,
   return ptr;
 }
 
-// I/O read wrappers: skip real read, symbolize buffer via resign_shadow
+// I/O read wrappers: skip real read, symbolize entire buffer via
+// resign_shadow with label=0 to force the concrete-pointer path
 
 __attribute__((visibility("default")))
 ssize_t __dfsw_read(int fd, void *buf, size_t count,
@@ -627,7 +628,8 @@ ssize_t __dfsw_read(int fd, void *buf, size_t count,
                     ucsan_label count_label, ucsan_label *ret_label) {
   UCSAN_OUT("__dfsw_read(fd=%d, buf=%p, count=%zu)\n", fd, buf, count);
   if (buf && count > 0) {
-    ucsan_resign_shadow(buf, &buf_label, count, __builtin_return_address(0));
+    ucsan_label zero = 0;
+    ucsan_resign_shadow(buf, &zero, count, __builtin_return_address(0));
   }
   *ret_label = 0;
   return (ssize_t)count;
@@ -640,7 +642,8 @@ ssize_t __dfsw_pread(int fd, void *buf, size_t count, off_t offset,
                      ucsan_label *ret_label) {
   UCSAN_OUT("__dfsw_pread(fd=%d, buf=%p, count=%zu, offset=%ld)\n", fd, buf, count, offset);
   if (buf && count > 0) {
-    ucsan_resign_shadow(buf, &buf_label, count, __builtin_return_address(0));
+    ucsan_label zero = 0;
+    ucsan_resign_shadow(buf, &zero, count, __builtin_return_address(0));
   }
   *ret_label = 0;
   return (ssize_t)count;
@@ -653,7 +656,8 @@ ssize_t __dfsw_pread64(int fd, void *buf, size_t count, off_t offset,
                        ucsan_label *ret_label) {
   UCSAN_OUT("__dfsw_pread64(fd=%d, buf=%p, count=%zu, offset=%ld)\n", fd, buf, count, offset);
   if (buf && count > 0) {
-    ucsan_resign_shadow(buf, &buf_label, count, __builtin_return_address(0));
+    ucsan_label zero = 0;
+    ucsan_resign_shadow(buf, &zero, count, __builtin_return_address(0));
   }
   *ret_label = 0;
   return (ssize_t)count;
@@ -667,7 +671,8 @@ size_t __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
   size_t total = size * nmemb;
   UCSAN_OUT("__dfsw_fread(ptr=%p, size=%zu, nmemb=%zu)\n", ptr, size, nmemb);
   if (ptr && total > 0) {
-    ucsan_resign_shadow(ptr, &ptr_label, total, __builtin_return_address(0));
+    ucsan_label zero = 0;
+    ucsan_resign_shadow(ptr, &zero, total, __builtin_return_address(0));
   }
   *ret_label = 0;
   return nmemb;
@@ -681,7 +686,8 @@ size_t __dfsw_fread_unlocked(void *ptr, size_t size, size_t nmemb, FILE *stream,
   size_t total = size * nmemb;
   UCSAN_OUT("__dfsw_fread_unlocked(ptr=%p, size=%zu, nmemb=%zu)\n", ptr, size, nmemb);
   if (ptr && total > 0) {
-    ucsan_resign_shadow(ptr, &ptr_label, total, __builtin_return_address(0));
+    ucsan_label zero = 0;
+    ucsan_resign_shadow(ptr, &zero, total, __builtin_return_address(0));
   }
   *ret_label = 0;
   return nmemb;
