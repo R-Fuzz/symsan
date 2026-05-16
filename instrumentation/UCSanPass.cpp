@@ -819,7 +819,36 @@ void UCSan::initializeCustomFunctionTypes() {
   CustomFuncTypes["realloc"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, Int64Ty}, false);
   CustomFuncTypes["calloc"] = FunctionType::get(VoidPtrTy, {Int64Ty, Int64Ty}, false);
   CustomFuncTypes["strdup"] = FunctionType::get(VoidPtrTy, {VoidPtrTy}, false);
+  CustomFuncTypes["strndup"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, Int64Ty}, false);
   CustomFuncTypes["exit"] = FunctionType::get(Type::getVoidTy(*Ctx), {Int32Ty}, false);
+
+  // String copy functions
+  CustomFuncTypes["strcpy"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, VoidPtrTy}, false);
+  CustomFuncTypes["stpcpy"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, VoidPtrTy}, false);
+  CustomFuncTypes["strncpy"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, VoidPtrTy, Int64Ty}, false);
+  CustomFuncTypes["strcat"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, VoidPtrTy}, false);
+  CustomFuncTypes["strncat"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, VoidPtrTy, Int64Ty}, false);
+
+  // Comparison functions
+  CustomFuncTypes["memcmp"] = FunctionType::get(Int32Ty, {VoidPtrTy, VoidPtrTy, Int64Ty}, false);
+  CustomFuncTypes["bcmp"] = FunctionType::get(Int32Ty, {VoidPtrTy, VoidPtrTy, Int64Ty}, false);
+  CustomFuncTypes["strcmp"] = FunctionType::get(Int32Ty, {VoidPtrTy, VoidPtrTy}, false);
+  CustomFuncTypes["strncmp"] = FunctionType::get(Int32Ty, {VoidPtrTy, VoidPtrTy, Int64Ty}, false);
+  CustomFuncTypes["strcasecmp"] = FunctionType::get(Int32Ty, {VoidPtrTy, VoidPtrTy}, false);
+  CustomFuncTypes["strncasecmp"] = FunctionType::get(Int32Ty, {VoidPtrTy, VoidPtrTy, Int64Ty}, false);
+
+  // Search functions
+  CustomFuncTypes["memchr"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, Int32Ty, Int64Ty}, false);
+  CustomFuncTypes["memrchr"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, Int32Ty, Int64Ty}, false);
+  CustomFuncTypes["strchr"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, Int32Ty}, false);
+  CustomFuncTypes["strrchr"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, Int32Ty}, false);
+  CustomFuncTypes["strstr"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, VoidPtrTy}, false);
+  CustomFuncTypes["strnstr"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, VoidPtrTy, Int64Ty}, false);
+  CustomFuncTypes["strpbrk"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, VoidPtrTy}, false);
+  CustomFuncTypes["memmem"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, Int64Ty, VoidPtrTy, Int64Ty}, false);
+
+  // Length function
+  CustomFuncTypes["strlen"] = FunctionType::get(Int64Ty, {VoidPtrTy}, false);
 }
 
 bool UCSan::loadMetadata() {
