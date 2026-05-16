@@ -2633,7 +2633,23 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
   }
 
   if (RetPhiNode) {
-    UF.ValShadowMap[RetPhiNode] = UF.getShadow(&CB);
+    // Load return shadow from RetvalTLS at the merge point.
+    // Both branches write their return shadow to RetvalTLS:
+    //   then-block: callee writes it normally
+    //   else-block: ucsan_wrap_retval writes it
+    IRB.SetInsertPoint(RetPhiNode->getNextNonDebugInstruction());
+    unsigned Size = DL.getTypeAllocSize(UF.UC.getShadowTy(RT));
+    if (Size > kRetvalTLSSize) {
+      UF.ValShadowMap[RetPhiNode] = UF.UC.getZeroShadow(RT);
+    } else {
+      LoadInst *LI = IRB.CreateAlignedLoad(
+          UF.UC.getShadowTy(RT), UF.getRetvalTLS(RT, IRB),
+          ShadowTLSAlignment, "_dfsret");
+      UF.UC.markNosanitize(LI);
+      UF.SkipInsts.insert(LI);
+      UF.ValShadowMap[RetPhiNode] = LI;
+      UF.NonZeroChecks.push_back(LI);
+    }
     CB.replaceAllUsesWith(RetPhiNode);
   }
   CB.eraseFromParent();
