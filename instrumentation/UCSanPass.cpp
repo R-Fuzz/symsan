@@ -153,6 +153,12 @@ class UCSanABIList {
     if (!SCL) return false;
     return SCL->inSection("taint", "src", M.getModuleIdentifier(), Category);
   }
+
+  /// Returns whether the given function name is listed in the given category.
+  bool isIn(StringRef Name, StringRef Category) const {
+    if (!SCL) return false;
+    return SCL->inSection("taint", "fun", Name, Category);
+  }
 };
 
 namespace {
@@ -1816,10 +1822,17 @@ Function *UCSan::getCustomFunction(const Function *F) {
     return nullptr;
   }
 
+  // Check if ref function is a taint type (handled by TaintPass).
+  // For taint refs, generate a simple forwarding wrapper that calls the ref
+  // function directly with remapped args. TaintPass will instrument the
+  // wrapper body and convert the inner call to __dfsw_<ref>.
+  bool IsTaintRef = ABIList.isIn(CustomEntry.ref_name, "taint");
+
   // Create wrapper function
   auto Linkage = Function::InternalLinkage;
   auto WrappedName = "__auto_dfsw_" + Name;
-  auto RefedName = "__dfsw_" + CustomEntry.ref_name;
+  auto RefedName = IsTaintRef ? CustomEntry.ref_name
+                              : ("__dfsw_" + CustomEntry.ref_name);
 
   FunctionType *RefedFuncType = CustomFuncTypes[CustomEntry.ref_name];
   FunctionType *WrapperType = FunctionType::get(F->getReturnType(),
@@ -1830,16 +1843,16 @@ Function *UCSan::getCustomFunction(const Function *F) {
   // Keep wrapper/runtime call ABI robust even when module stack alignment is 8.
   WrapperFunc->addFnAttr(Attribute::getWithStackAlignment(*Ctx, Align(16)));
   WrapperFunc->addFnAttr("stackrealign");
-  markFunctionNosanitize(WrapperFunc);  // Mark custom wrapper so TaintPass skips it
+  // For ucsan custom refs, mark wrapper nosanitize so TaintPass skips its body.
+  // For taint refs, leave the wrapper instrumentable so TaintPass wraps the
+  // inner ref call with its proper taint-label handling.
+  if (!IsTaintRef)
+    markFunctionNosanitize(WrapperFunc);
   BasicBlock *BB = BasicBlock::Create(*Ctx, "entry", WrapperFunc);
   IRBuilder<> IRB(BB);
 
   // Create UCSanFunction context for shadow memory access
   UCSanFunction UF(*this, WrapperFunc);
-
-  // Get or insert the referenced function with transformed type (includes shadow args)
-  TransformedFunction TransformedFn = getCustomFunctionType(RefedFuncType);
-  FunctionCallee RefedFunc = Mod->getOrInsertFunction(RefedName, TransformedFn.TransformedType);
 
   // Build argument mapping
   std::map<unsigned int, unsigned int> ArgMap;
@@ -1850,6 +1863,49 @@ Function *UCSan::getCustomFunction(const Function *F) {
   }
 
   const DataLayout &DL = Mod->getDataLayout();
+
+  if (IsTaintRef) {
+    // Simple forwarding wrapper: call the ref function directly with remapped
+    // args. TaintPass will instrument this body and wrap the call with the
+    // proper __dfsw_<ref> taint-label handling.
+    FunctionCallee RefedFunc = Mod->getOrInsertFunction(RefedName, RefedFuncType);
+
+    std::vector<Value *> Args;
+    for (unsigned i = 0, e = RefedFuncType->getNumParams(); i != e; ++i) {
+      if (ArgMap.find(i) == ArgMap.end()) {
+        errs() << "Error: Argument " << i << " not in arg_maps\n";
+        return nullptr;
+      }
+      unsigned idx = ArgMap[i];
+      Value *Arg = WrapperFunc->getArg(idx);
+      // Cast wrapper arg to ref function's expected param type if they differ
+      // (e.g. uint8_t* -> void*).
+      Type *RefParamTy = RefedFuncType->getParamType(i);
+      if (Arg->getType() != RefParamTy)
+        Arg = IRB.CreateBitOrPointerCast(Arg, RefParamTy);
+      Args.push_back(Arg);
+    }
+
+    if (!F->getReturnType()->isVoidTy()) {
+      Value *RetVal = IRB.CreateCall(RefedFunc, Args);
+      Value *CastedRetVal = IRB.CreateBitOrPointerCast(RetVal, F->getReturnType());
+      IRB.CreateRet(CastedRetVal);
+    } else {
+      IRB.CreateCall(RefedFunc, Args);
+      IRB.CreateRetVoid();
+    }
+
+    CustomFuncs[Name] = WrapperFunc;
+    return WrapperFunc;
+  }
+
+  // ucsan custom ref: use the existing __dfsw_<ref> wrapper that takes
+  // extra ucsan_label shadow arguments via __ucsan_arg_tls / __ucsan_retval_tls.
+
+  // Get or insert the referenced function with transformed type (includes shadow args)
+  TransformedFunction TransformedFn = getCustomFunctionType(RefedFuncType);
+  FunctionCallee RefedFunc = Mod->getOrInsertFunction(RefedName, TransformedFn.TransformedType);
+
   unsigned ArgOffset = 0;
 
   // Calculate shadow offsets for each argument
@@ -2709,35 +2765,50 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
   case UCSan::WK_AutoCustom:
     // invoke the custom function
     {
-      // Only store shadows for fixed parameters, varargs are not tracked in TLS
-      // FIXME: add vararg shadow tracking support
-      unsigned NumFixedParams = FT->getNumParams();
-      unsigned ArgOffset = 0;
+      // For taint ref_names, the wrapper just forwards to the ref function
+      // and TaintPass will handle the __dfsw_ wrapping via its own dfsan TLS.
+      // Skip writing the ucsan arg/retval TLS in that case; let the call
+      // through to the wrapper be treated as a regular function call.
+      auto It = UF.UC.Scope.custom.find(F->getName().str());
+      bool IsTaintRef = (It != UF.UC.Scope.custom.end()) &&
+                        UF.UC.ABIList.isIn(It->second.ref_name, "taint");
 
-      for (unsigned I = 0; I < NumFixedParams; ++I) {
-        unsigned Size =
-            DL.getTypeAllocSize(UF.UC.getShadowTy(FT->getParamType(I)));
-        // Stop storing if arguments' size overflows. Inside a function,
-        // arguments after overflow have zero shadow values.
-        if (ArgOffset + Size > ArgTLSSize)
-          report_fatal_error("Argument size overflow in custom function");
-        StoreInst *SI = IRB.CreateAlignedStore(
-            UF.getShadow(CB.getArgOperand(I)),
-            UF.getArgTLS(FT->getParamType(I), ArgOffset, IRB),
-            ShadowTLSAlignment);
-        UF.UC.markNosanitize(SI);
-        ArgOffset += alignTo(Size, ShadowTLSAlignment);
+      if (!IsTaintRef) {
+        // Only store shadows for fixed parameters, varargs are not tracked in TLS
+        // FIXME: add vararg shadow tracking support
+        unsigned NumFixedParams = FT->getNumParams();
+        unsigned ArgOffset = 0;
+
+        for (unsigned I = 0; I < NumFixedParams; ++I) {
+          unsigned Size =
+              DL.getTypeAllocSize(UF.UC.getShadowTy(FT->getParamType(I)));
+          // Stop storing if arguments' size overflows. Inside a function,
+          // arguments after overflow have zero shadow values.
+          if (ArgOffset + Size > ArgTLSSize)
+            report_fatal_error("Argument size overflow in custom function");
+          StoreInst *SI = IRB.CreateAlignedStore(
+              UF.getShadow(CB.getArgOperand(I)),
+              UF.getArgTLS(FT->getParamType(I), ArgOffset, IRB),
+              ShadowTLSAlignment);
+          UF.UC.markNosanitize(SI);
+          ArgOffset += alignTo(Size, ShadowTLSAlignment);
+        }
       }
 
       CB.setCalledFunction(UF.UC.getCustomFunction(F));
       if (!FT->getReturnType()->isVoidTy()) {
-        IRB.SetInsertPoint(CB.getNextNode());
-        LoadInst *LI = IRB.CreateAlignedLoad(UF.UC.getShadowTy(&CB),
-            UF.getRetvalTLS(CB.getType(), IRB),
-            ShadowTLSAlignment, "_autoret");
-        UF.UC.markNosanitize(LI);
-        Shadow = LI;
-        UF.setShadow(&CB, Shadow);
+        if (IsTaintRef) {
+          // No ucsan return shadow from the wrapper; set zero.
+          UF.setShadow(&CB, UF.UC.getZeroShadow(&CB));
+        } else {
+          IRB.SetInsertPoint(CB.getNextNode());
+          LoadInst *LI = IRB.CreateAlignedLoad(UF.UC.getShadowTy(&CB),
+              UF.getRetvalTLS(CB.getType(), IRB),
+              ShadowTLSAlignment, "_autoret");
+          UF.UC.markNosanitize(LI);
+          Shadow = LI;
+          UF.setShadow(&CB, Shadow);
+        }
       }
     }
     return true;
