@@ -146,6 +146,11 @@ __taint_trace_loop(uint32_t bid, int depth) {
     // exit a loop
     if (bid == __loop_bid[get_nested_loop_depth()]) {
       // exiting the current loop
+      // reset bid
+      for (int i = 0; i > depth; --i) {
+        __loop_bid[get_nested_loop_depth() + i] = 0;
+        __loop_counter[get_nested_loop_depth() + i] = 0;
+      }
       __current_loop_depth += depth;
       __previous_loop_depth += depth;
       AOUT("exit to outer loop: %u depth: %u\n", bid, __current_loop_depth);
