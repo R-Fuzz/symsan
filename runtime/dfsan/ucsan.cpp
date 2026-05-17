@@ -1068,9 +1068,9 @@ void ucsan_check_ubi(ucsan_label label) {
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_check_copy_bounds(void *dst, ucsan_label dst_label,
                              void *src, ucsan_label src_label,
-                             uint64_t size, uint64_t gv_dst_bound) {
-  UCSAN_OUT("ucsan_check_copy_bounds: dst=%p (label=%u), src=%p (label=%u), size=%lu, gv_dst_bound=%lu\n",
-            dst, dst_label, src, src_label, size, gv_dst_bound);
+                             uint64_t gv_dst_bound) {
+  UCSAN_OUT("ucsan_check_copy_bounds: dst=%p (label=%u), src=%p (label=%u), gv_dst_bound=%lu\n",
+            dst, dst_label, src, src_label, gv_dst_bound);
 
   // Get dst bound: from alloca label or from compile-time GV size
   uint64_t dst_bound = 0;

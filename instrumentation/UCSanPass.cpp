@@ -159,6 +159,18 @@ class UCSanABIList {
     if (!SCL) return false;
     return SCL->inSection("taint", "fun", Name, Category);
   }
+
+  /// Returns the 0-indexed argument that holds the byte count for the named
+  /// function, or -1 if none is listed.  Probes categories size0..size7.
+  int getSizeArgIdx(StringRef Name) const {
+    if (!SCL) return -1;
+    for (int i = 0; i < 8; ++i) {
+      std::string Cat = "size" + std::to_string(i);
+      if (SCL->inSection("taint", "fun", Name, Cat))
+        return i;
+    }
+    return -1;
+  }
 };
 
 namespace {
@@ -797,11 +809,11 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
-  // void ucsan_check_copy_bounds(void *dst, i16 dst_label, void *src, i16 src_label, i64 size, i64 dst_bound)
+  // void ucsan_check_copy_bounds(void *dst, i16 dst_label, void *src, i16 src_label, i64 dst_bound)
   // Check if a copy operation can overflow the destination buffer
   UCCheckCopyBoundsFnTy = FunctionType::get(
     Type::getVoidTy(*Ctx),
-    {VoidPtrTy, PrimitiveShadowTy, VoidPtrTy, PrimitiveShadowTy, Int64Ty, Int64Ty},
+    {VoidPtrTy, PrimitiveShadowTy, VoidPtrTy, PrimitiveShadowTy, Int64Ty},
     false);
   UCCheckCopyBoundsFn = M.getOrInsertFunction("ucsan_check_copy_bounds", UCCheckCopyBoundsFnTy);
   F = dyn_cast<Function>(UCCheckCopyBoundsFn.getCallee()->stripPointerCasts());
@@ -1886,6 +1898,24 @@ Function *UCSan::getCustomFunction(const Function *F) {
       Args.push_back(Arg);
     }
 
+    // Lazy-init / enlarge the symbolic object behind each pointer arg with
+    // the right byte count.  The size is taken from the abilist sizeN entry
+    // on the ref function (e.g. memcmp=size2 → 3rd arg holds the count);
+    // for ref functions with no entry (e.g. strcmp) pass 0 (strlen-determined).
+    int SizeArgIdx = ABIList.getSizeArgIdx(CustomEntry.ref_name);
+    Value *SizeVal;
+    if (SizeArgIdx >= 0 && (unsigned)SizeArgIdx < Args.size()) {
+      SizeVal = IRB.CreateZExtOrTrunc(Args[SizeArgIdx], Int64Ty);
+      markNosanitize(SizeVal);
+    } else {
+      SizeVal = ConstantInt::get(Int64Ty, 0);
+    }
+    for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+      if (!Args[i]->getType()->isPointerTy()) continue;
+      // typeID 0 = typeless bytes (matches WK_TaintCustom convention)
+      Args[i] = UF.checkPointer(Args[i], SizeVal, true, IRB, 0);
+    }
+
     if (!F->getReturnType()->isVoidTy()) {
       Value *RetVal = IRB.CreateCall(RefedFunc, Args);
       Value *CastedRetVal = IRB.CreateBitOrPointerCast(RetVal, F->getReturnType());
@@ -2826,23 +2856,16 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     // For memory/string functions, use type_id=0 (typeless bytes) and pass
     // the actual byte count to checkPointer so lazy init allocates enough.
     StringRef FName = F->getName();
-    // Determine the length argument index for known mem/string functions.
+    // Determine the length argument index from the abilist (sizeN category).
     // -1 means no explicit length (string functions: use size=0).
-    int LenArgIdx = -1;
-    if (FName == "memcmp" || FName == "bcmp" || FName == "memchr" ||
-        FName == "memrchr" || FName == "strncmp" || FName == "strncasecmp" ||
-        FName == "strncpy" || FName == "strncat" || FName == "strnstr") {
-      LenArgIdx = 2;  // 3rd argument is the length
-    } else if (FName == "strndup") {
-      LenArgIdx = 1;  // 2nd argument is the length
-    } else if (FName == "memmem") {
+    int LenArgIdx = UF.UC.ABIList.getSizeArgIdx(FName);
+    if (LenArgIdx == -1 && FName == "memmem") {
       LenArgIdx = -2;  // special: arg1 is len for arg0, arg3 is len for arg2
     }
-    bool IsMemOrStrFn = (LenArgIdx != -1) ||
-        FName == "strcmp" || FName == "strcasecmp" || FName == "strchr" ||
-        FName == "strrchr" || FName == "strpbrk" || FName == "strstr" ||
-        FName == "strlen" || FName == "strcpy" || FName == "stpcpy" ||
-        FName == "strcat" || FName == "strdup";
+    // All taint-listed functions are byte-typed mem/str fns; non-mem taint
+    // fns like assert_cond/assume_cond have no pointer args so the predicate
+    // is only consulted on pointer-arg paths anyway.
+    bool IsMemOrStrFn = UF.UC.ABIList.isIn(*F, "taint");
 
     Value *LenVal = nullptr;
     if (LenArgIdx >= 0 && (unsigned)LenArgIdx < CB.arg_size()) {
@@ -2850,9 +2873,11 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       UF.UC.markNosanitize(LenVal);
     }
 
-    // Check copy semantics from abilist: copystr (unbounded) or copyn (bounded)
+    // Check copy semantics from abilist: copystr is unbounded (size determined
+    // by strlen at runtime), so we need check_copy_bounds to enlarge the dst
+    // symbolic obj. Bounded copies (memcpy/memmove/strncpy/strncat) have their
+    // size in a sizeN entry; check_pointer handles enlargement directly.
     bool IsCopyStr = UF.UC.ABIList.isIn(*F, "copystr");
-    bool IsCopyN = UF.UC.ABIList.isIn(*F, "copyn");
 
     Value *ResolvedDst = nullptr, *ResolvedSrc = nullptr;
     Value *DstShadow = nullptr, *SrcShadow = nullptr;
@@ -2888,7 +2913,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
         }
 
         // Capture shadow before checkPointer resolves the pointer
-        if ((IsCopyStr || IsCopyN) && ArgIdx <= 1) {
+        if (IsCopyStr && ArgIdx <= 1) {
           Value *Shadow = UF.getShadow(*I);
           if (ArgIdx == 0) {
             DstShadow = Shadow;
@@ -2908,25 +2933,22 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
         CB.setArgOperand(ArgIdx, rptr);
 
         // Capture resolved pointers for copy bounds check
-        if ((IsCopyStr || IsCopyN) && ArgIdx <= 1) {
+        if (IsCopyStr && ArgIdx <= 1) {
           if (ArgIdx == 0) ResolvedDst = rptr;
           else if (ArgIdx == 1) ResolvedSrc = rptr;
         }
       }
     }
 
-    // Emit copy bounds check: dst=arg0, src=arg1
-    if ((IsCopyStr || IsCopyN) && ResolvedDst && ResolvedSrc &&
+    // Emit copy bounds check for unbounded copies (size=strlen(src)).
+    if (IsCopyStr && ResolvedDst && ResolvedSrc &&
         DstShadow && SrcShadow) {
       Value *DstAddr = IRB.CreateBitCast(ResolvedDst, UF.UC.VoidPtrTy);
       Value *SrcAddr = IRB.CreateBitCast(ResolvedSrc, UF.UC.VoidPtrTy);
       UF.UC.markNosanitize(DstAddr);
       UF.UC.markNosanitize(SrcAddr);
-      // For copyn, pass the explicit size; for copystr, pass 0 (strlen-determined)
-      Value *CopySize = IsCopyN && LenVal ? LenVal
-                                          : ConstantInt::get(UF.UC.Int64Ty, 0);
       IRB.CreateCall(UF.UC.UCCheckCopyBoundsFn,
-                     {DstAddr, DstShadow, SrcAddr, SrcShadow, CopySize, DstBound});
+                     {DstAddr, DstShadow, SrcAddr, SrcShadow, DstBound});
     }
 
     // Set zero ucsan shadow for the return value; TaintPass will set the taint label.

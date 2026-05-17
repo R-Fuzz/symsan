@@ -72,17 +72,13 @@ fun:_copy_from_user=custom
 fun:printk=discard
 fun:_copy_to_user=discard
 
-# copy semantics: unbounded (size=strlen(src))
+# copy semantics: unbounded (size=strlen(src)) — needs check_copy_bounds
+# bounded copies (memcpy/memmove/strncpy/strncat) get the size via sizeN
+# below, which check_pointer uses for lazy enlargement.
 fun:strcpy=copystr
 fun:stpcpy=copystr
 fun:strcat=copystr
 fun:strdup=copystr
-
-# copy semantics: bounded (size=arg2)
-fun:memcpy=copyn
-fun:memmove=copyn
-fun:strncpy=copyn
-fun:strncat=copyn
 
 # I/O read functions
 fun:read=custom
@@ -91,5 +87,19 @@ fun:pread64=custom
 fun:fread=custom
 fun:fread_unlocked=custom
 
-# buffer size
-fun:_copy_from_user=size3
+# buffer size (sizeN means arg index N (0-indexed) holds the byte count)
+fun:_copy_from_user=size2
+
+# explicit byte-count args for taint comparison/search/copy functions
+fun:memcpy=size2
+fun:memmove=size2
+fun:memcmp=size2
+fun:bcmp=size2
+fun:strncmp=size2
+fun:strncasecmp=size2
+fun:memchr=size2
+fun:memrchr=size2
+fun:strnstr=size2
+fun:strncpy=size2
+fun:strncat=size2
+fun:strndup=size1
