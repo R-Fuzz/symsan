@@ -2801,35 +2801,32 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
   case UCSan::WK_AutoCustom:
     // invoke the custom function
     {
+      // Only store shadows for fixed parameters, varargs are not tracked in TLS
+      // FIXME: add vararg shadow tracking support
+      unsigned NumFixedParams = FT->getNumParams();
+      unsigned ArgOffset = 0;
+
+      for (unsigned I = 0; I < NumFixedParams; ++I) {
+        unsigned Size =
+            DL.getTypeAllocSize(UF.UC.getShadowTy(FT->getParamType(I)));
+        // Stop storing if arguments' size overflows. Inside a function,
+        // arguments after overflow have zero shadow values.
+        if (ArgOffset + Size > ArgTLSSize)
+          report_fatal_error("Argument size overflow in custom function");
+        StoreInst *SI = IRB.CreateAlignedStore(
+            UF.getShadow(CB.getArgOperand(I)),
+            UF.getArgTLS(FT->getParamType(I), ArgOffset, IRB),
+            ShadowTLSAlignment);
+        UF.UC.markNosanitize(SI);
+        ArgOffset += alignTo(Size, ShadowTLSAlignment);
+      }
+
       // For taint ref_names, the wrapper just forwards to the ref function
       // and TaintPass will handle the __dfsw_ wrapping via its own dfsan TLS.
-      // Skip writing the ucsan arg/retval TLS in that case; let the call
-      // through to the wrapper be treated as a regular function call.
+      // Skip reading retval TLS in that case
       auto It = UF.UC.Scope.custom.find(F->getName().str());
       bool IsTaintRef = (It != UF.UC.Scope.custom.end()) &&
                         UF.UC.ABIList.isIn(It->second.ref_name, "taint");
-
-      if (!IsTaintRef) {
-        // Only store shadows for fixed parameters, varargs are not tracked in TLS
-        // FIXME: add vararg shadow tracking support
-        unsigned NumFixedParams = FT->getNumParams();
-        unsigned ArgOffset = 0;
-
-        for (unsigned I = 0; I < NumFixedParams; ++I) {
-          unsigned Size =
-              DL.getTypeAllocSize(UF.UC.getShadowTy(FT->getParamType(I)));
-          // Stop storing if arguments' size overflows. Inside a function,
-          // arguments after overflow have zero shadow values.
-          if (ArgOffset + Size > ArgTLSSize)
-            report_fatal_error("Argument size overflow in custom function");
-          StoreInst *SI = IRB.CreateAlignedStore(
-              UF.getShadow(CB.getArgOperand(I)),
-              UF.getArgTLS(FT->getParamType(I), ArgOffset, IRB),
-              ShadowTLSAlignment);
-          UF.UC.markNosanitize(SI);
-          ArgOffset += alignTo(Size, ShadowTLSAlignment);
-        }
-      }
 
       CB.setCalledFunction(UF.UC.getCustomFunction(F));
       if (!FT->getReturnType()->isVoidTy()) {
