@@ -1318,8 +1318,14 @@ Value *UCSanFunction::getShadowForTLSArgument(Argument *A) {
     if (ArgOffset + Size > ArgTLSSize)
       break; // ArgTLS overflows, uses a zero shadow.
 
-    Instruction *ArgTLSPos = &*F->getEntryBlock().begin();
-    IRBuilder<> IRB(ArgTLSPos);
+    // Insert ArgTLS load at the start of the entry block. Use the
+    // (BB, iterator) overload so we handle an empty entry block (e.g. an
+    // auto-custom wrapper whose first checkPointer fires before any IR has
+    // been emitted) — getFirstInsertionPt() returns end() and IRBuilder then
+    // appends to the block.
+    BasicBlock &EntryBB = F->getEntryBlock();
+    IRBuilder<> IRB(*UC.Ctx);
+    IRB.SetInsertPoint(&EntryBB, EntryBB.getFirstInsertionPt());
     Value *ArgShadowPtr = getArgTLS(FArg.getType(), ArgOffset, IRB);
     LoadInst *LI = IRB.CreateAlignedLoad(UC.getShadowTy(&FArg), ArgShadowPtr,
                                          ShadowTLSAlignment);
