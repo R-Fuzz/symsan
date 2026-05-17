@@ -268,6 +268,10 @@ struct ArgMapEntry {
 struct UCSanScopeCustom {
   std::string ref_name;
   std::vector<ArgMapEntry> arg_maps;
+  // If true, the wrapper returns the logical NOT of the ref's return value
+  // (cast to the wrapper's return type).  Useful for adapters whose truth
+  // sense is inverted from the ref's, e.g. bytesEqual→strncmp.
+  bool invert_ret = false;
 };
 
 struct UCSanScope {
@@ -309,6 +313,7 @@ struct MappingTraits<UCSanScopeCustom> {
   static void mapping(yaml::IO &io, UCSanScopeCustom &c) {
     io.mapRequired("ref_name", c.ref_name);
     io.mapRequired("arg_maps", c.arg_maps);
+    io.mapOptional("invert_ret", c.invert_ret, false);
   }
 };
 
@@ -472,6 +477,13 @@ class UCSan {
   Function *buildDiscardFunction(Function *F);
   Function *buildDriverWrapperFunction(Function *F);
   Function *getCustomFunction(const Function *F);
+
+  // Build the final wrapper return value, applying invert_ret if requested.
+  // For invert on integer returns: returns `(ret == 0) ? 1 : 0`.  Targets are
+  // comparators (memcmp/strcmp/...) whose `*ret_label` solver-side wants a
+  // direct `== 0` / `!= 0` constraint anyway, so the extra icmp is desirable.
+  Value *invertIntRet(Value *RetVal, Type *WrapperRetTy, bool Invert,
+                      IRBuilder<> &IRB);
 
   WrapperKind getWrapperKind(Function *F);
   TransformedFunction getCustomFunctionType(FunctionType *T);
@@ -1816,6 +1828,17 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
   return NewF;
 }
 
+Value *UCSan::invertIntRet(Value *RetVal, Type *WrapperRetTy, bool Invert,
+                            IRBuilder<> &IRB) {
+  if (!Invert || !RetVal->getType()->isIntegerTy() ||
+      !WrapperRetTy->isIntegerTy()) {
+    return IRB.CreateBitOrPointerCast(RetVal, WrapperRetTy);
+  }
+  Value *IsZero =
+      IRB.CreateICmpEQ(RetVal, ConstantInt::get(RetVal->getType(), 0));
+  return IRB.CreateZExtOrTrunc(IsZero, WrapperRetTy);
+}
+
 Function *UCSan::getCustomFunction(const Function *F) {
   // Handles auto-custom function wrapping based on YAML configuration
   // Maps arguments from one function signature to another
@@ -1924,8 +1947,9 @@ Function *UCSan::getCustomFunction(const Function *F) {
 
     if (!F->getReturnType()->isVoidTy()) {
       Value *RetVal = IRB.CreateCall(RefedFunc, Args);
-      Value *CastedRetVal = IRB.CreateBitOrPointerCast(RetVal, F->getReturnType());
-      IRB.CreateRet(CastedRetVal);
+      Value *FinalRet = invertIntRet(RetVal, F->getReturnType(),
+                                      CustomEntry.invert_ret, IRB);
+      IRB.CreateRet(FinalRet);
     } else {
       IRB.CreateCall(RefedFunc, Args);
       IRB.CreateRetVoid();
@@ -1978,8 +2002,9 @@ Function *UCSan::getCustomFunction(const Function *F) {
     Args.push_back(retvaltls);
 
     Value *RetVal = IRB.CreateCall(RefedFunc, Args);
-    Value *CastedRetVal = IRB.CreateBitOrPointerCast(RetVal, F->getReturnType());
-    IRB.CreateRet(CastedRetVal);
+    Value *FinalRet = invertIntRet(RetVal, F->getReturnType(),
+                                    CustomEntry.invert_ret, IRB);
+    IRB.CreateRet(FinalRet);
   } else {
     IRB.CreateCall(RefedFunc, Args);
     IRB.CreateRetVoid();
