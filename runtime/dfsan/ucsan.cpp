@@ -1247,7 +1247,7 @@ void ucsan_store_pointer_shadow(ucsan_label l, ucsan_label *ls, uint64_t n) {
       label_info->common.op == OP_ALLOCA ||
       label_info->common.op == OP_FREE) {
     assert(n == sizeof(void*));
-    ls[0] = l;
+    for (uint64_t i = 0; i < n; ++i) ls[i] = l;
     return;
   }
 
