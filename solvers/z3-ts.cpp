@@ -9,11 +9,14 @@
 #include <utility>
 #include <vector>
 
+#include <new>
 #include <unistd.h>
 
 using namespace symsan;
 
 #define FILTER_WRONG_AST 1
+
+static const uint64_t MAX_STRLEN_EXTEND = 4096;
 
 static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::Extract, "Extract"},
@@ -278,42 +281,27 @@ static bool eval_icmp(uint16_t predicate, uint64_t val1, uint64_t val2, uint8_t 
     case __dfsan::bvuge: return val1 >= val2;
     case __dfsan::bvult: return val1 < val2;
     case __dfsan::bvule: return val1 <= val2;
-    case __dfsan::bvsgt:
-      switch(bits) {
-        case 8:  return (int8_t)val1 > (int8_t)val2;
-        case 16: return (int16_t)val1 > (int16_t)val2;
-        case 32: return (int32_t)val1 > (int32_t)val2;
-        case 64: return (int64_t)val1 > (int64_t)val2;
-        default:
-          throw z3::exception("unsupported bits for signed comparison");
-      }
-    case __dfsan::bvsge:
-      switch(bits) {
-        case 8:  return (int8_t)val1 >= (int8_t)val2;
-        case 16: return (int16_t)val1 >= (int16_t)val2;
-        case 32: return (int32_t)val1 >= (int32_t)val2;
-        case 64: return (int64_t)val1 >= (int64_t)val2;
-        default:
-          throw z3::exception("unsupported bits for signed comparison");
-      }
-    case __dfsan::bvslt:
-      switch(bits) {
-        case 8:  return (int8_t)val1 < (int8_t)val2;
-        case 16: return (int16_t)val1 < (int16_t)val2;
-        case 32: return (int32_t)val1 < (int32_t)val2;
-        case 64: return (int64_t)val1 < (int64_t)val2;
-        default:
-          throw z3::exception("unsupported bits for signed comparison");
-      }
-    case __dfsan::bvsle:
-      switch(bits) {
-        case 8:  return (int8_t)val1 <= (int8_t)val2;
-        case 16: return (int16_t)val1 <= (int16_t)val2;
-        case 32: return (int32_t)val1 <= (int32_t)val2;
-        case 64: return (int64_t)val1 <= (int64_t)val2;
-        default:
-          throw z3::exception("unsupported bits for signed comparison");
-      }
+    case __dfsan::bvsgt: {
+      // sign-extend to 64-bit for arbitrary widths
+      int64_t s1 = (int64_t)(val1 << (64 - bits)) >> (64 - bits);
+      int64_t s2 = (int64_t)(val2 << (64 - bits)) >> (64 - bits);
+      return s1 > s2;
+    }
+    case __dfsan::bvsge: {
+      int64_t s1 = (int64_t)(val1 << (64 - bits)) >> (64 - bits);
+      int64_t s2 = (int64_t)(val2 << (64 - bits)) >> (64 - bits);
+      return s1 >= s2;
+    }
+    case __dfsan::bvslt: {
+      int64_t s1 = (int64_t)(val1 << (64 - bits)) >> (64 - bits);
+      int64_t s2 = (int64_t)(val2 << (64 - bits)) >> (64 - bits);
+      return s1 < s2;
+    }
+    case __dfsan::bvsle: {
+      int64_t s1 = (int64_t)(val1 << (64 - bits)) >> (64 - bits);
+      int64_t s2 = (int64_t)(val2 << (64 - bits)) >> (64 - bits);
+      return s1 <= s2;
+    }
     default:
       throw z3::exception("unsupported predicate");
       return false; // unsupported predicate
@@ -1556,8 +1544,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         break;
       }
       case __dfsan::Xor: {
-        cache_expr(l, op1 ^ op2);
-        TRACK_LABEL_BV_ONLY();
+        cache_expr(l, info->size != 1 ? (op1 ^ op2) : (op1 != op2));
+        TRACK_LABEL_PROPAGATE_BOTH();
         RECORD_VALUE(val1 ^ val2);
         break;
       }
@@ -2313,7 +2301,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
       // (string variables are abstract and can't be meaningfully minimized)
       std::vector<std::pair<z3::expr, uint64_t>> strlen_vars; // (var, max_len)
       std::vector<z3::expr> str_len_minimize; // str.len(str_var) to minimize
-      const uint64_t MAX_STRLEN_EXTEND = 4096; // Reasonable max extension
+      // MAX_STRLEN_EXTEND is defined at file scope
 
       // Collect input offsets from the model for minimize hint matching
       std::unordered_set<offset_t, offset_hash> model_inputs;
@@ -2432,7 +2420,13 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
       ret = opt_timeout;
     }
   } catch (z3::exception ze) {
-    fprintf(stderr, "WARNING: solve_task[%lu]: EXCEPTION: %s\n", task_id, ze.msg());
+    fprintf(stderr, "WARNING: solve_task[%lu]: z3 exception: %s\n", task_id, ze.msg());
+    ret = unknown_error;
+  } catch (std::bad_alloc &) {
+    fprintf(stderr, "WARNING: solve_task[%lu]: out of memory\n", task_id);
+    ret = unknown_error;
+  } catch (std::exception &e) {
+    fprintf(stderr, "WARNING: solve_task[%lu]: exception: %s\n", task_id, e.what());
     ret = unknown_error;
   }
 
@@ -2565,8 +2559,9 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         if (target_len > orig_len) {
           // Extending: insert bytes to make the string longer
           uint64_t extend_by = target_len - orig_len;
-          if (extend_by > std::vector<uint8_t>().max_size()) {
-            continue; // skip unreasonable extension
+          if (extend_by > MAX_STRLEN_EXTEND) {
+            extend_by = MAX_STRLEN_EXTEND;
+            target_len = orig_len + extend_by;
           }
           std::vector<uint8_t> fill_bytes(extend_by, 'A');
           solutions.emplace_back(input, offset + (uint32_t)orig_len, std::move(fill_bytes));
@@ -2768,6 +2763,12 @@ int Z3ParserSolver::export_task_smt2(uint64_t task_id, int fd) {
     return 0;
   } catch (z3::exception &e) {
     fprintf(stderr, "WARNING: export_task_smt2[%lu]: %s\n", task_id, e.msg());
+    return -1;
+  } catch (std::bad_alloc &) {
+    fprintf(stderr, "WARNING: export_task_smt2[%lu]: out of memory\n", task_id);
+    return -1;
+  } catch (std::exception &e) {
+    fprintf(stderr, "WARNING: export_task_smt2[%lu]: %s\n", task_id, e.what());
     return -1;
   }
 }
