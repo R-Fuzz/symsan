@@ -3115,14 +3115,19 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
     return;
   }
 
-  if (!F) {
-    // indirect call
-    visitIndirectCallBase(CB.getCalledOperand(), CB);
+  // intrinsics are handled elsewhere
+  if (F && F->isIntrinsic()) {
     return;
   }
 
-  // intrinsics are handled elsewhere
-  if (F->isIntrinsic()) {
+  // Callee may call ucsan_resign_shadow which changes pointer state;
+  // invalidate all cached check_pointer results so subsequent accesses
+  // go through ucsan_check_pointer again for lazy re-initialization.
+  UF.CheckedPtrMap.clear();
+
+  if (!F) {
+    // indirect call
+    visitIndirectCallBase(CB.getCalledOperand(), CB);
     return;
   }
 
