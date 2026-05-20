@@ -2120,24 +2120,62 @@ void TaintFunction::hoistBoundsChecks() {
       if (auto *TR = dyn_cast<TruncInst>(LoadedVal))
         LoadedVal = TR->getOperand(0);
 
-      LoadInst *LI_load = dyn_cast<LoadInst>(LoadedVal);
-      if (!LI_load || !LI_load->getType()->isIntegerTy(8))
-        continue;
+      // Find the base string pointer from the loop header.
+      Value *StrBase = nullptr;
 
-      // Find the base pointer: gep i8* base, iv
-      GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(LI_load->getPointerOperand());
-      // Also check through ucsan_check_pointer
-      if (!GEP) {
-        if (auto *ChkCall = dyn_cast<CallInst>(LI_load->getPointerOperand())) {
-          Function *ChkFn = ChkCall->getCalledFunction();
-          if (ChkFn && ChkFn->getName() == "ucsan_check_pointer")
-            GEP = dyn_cast<GetElementPtrInst>(ChkCall->getArgOperand(0));
+      CallInst *StrUCChk = nullptr;
+      if (ClWithUCSan) {
+        // TaintPass runs after UCSanPass, so the load goes through
+        // ucsan_check_pointer. Scan the header
+        // for a GEP matching: gep i8, base, iv
+        for (Instruction &I : *Header) {
+          auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+          if (!GEP || GEP->getNumIndices() != 1) continue;
+          if (!GEP->getSourceElementType()->isIntegerTy(8)) continue;
+          if (!L->isLoopInvariant(GEP->getPointerOperand())) continue;
+          Value *Idx = GEP->getOperand(1);
+          if (auto *PN = dyn_cast<PHINode>(Idx)) {
+            if (L->contains(PN->getParent())) {
+              StrBase = GEP->getPointerOperand();
+              break;
+            }
+          }
         }
+        // Find the ucsan_check_pointer call on StrBase's GEP in the loop
+        if (StrBase) {
+          for (BasicBlock *BB : L->blocks()) {
+            if (StrUCChk) break;
+            for (Instruction &I : *BB) {
+              auto *CI = dyn_cast<CallInst>(&I);
+              if (!CI) continue;
+              Function *Fn = CI->getCalledFunction();
+              if (Fn && Fn->getName() == "ucsan_check_pointer") {
+                Value *Ptr = CI->getArgOperand(0);
+                if (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+                  if (GEP->getPointerOperand() == StrBase) {
+                    StrUCChk = CI;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        // Without UCSan, the load directly uses the GEP
+        if (auto *ZE = dyn_cast<ZExtInst>(LoadedVal))
+          LoadedVal = ZE->getOperand(0);
+        if (auto *TR = dyn_cast<TruncInst>(LoadedVal))
+          LoadedVal = TR->getOperand(0);
+        auto *LI_load = dyn_cast<LoadInst>(LoadedVal);
+        if (!LI_load || !LI_load->getType()->isIntegerTy(8))
+          continue;
+        auto *GEP = dyn_cast<GetElementPtrInst>(LI_load->getPointerOperand());
+        if (!GEP || GEP->getNumIndices() != 1) continue;
+        if (!L->isLoopInvariant(GEP->getPointerOperand())) continue;
+        StrBase = GEP->getPointerOperand();
       }
-      if (!GEP || GEP->getNumIndices() != 1) continue;
-
-      Value *StrBase = GEP->getPointerOperand();
-      if (!L->isLoopInvariant(StrBase)) continue;
+      if (!StrBase) continue;
 
       // Collect __taint_check_bounds calls in this loop
       SmallVector<CallInst *, 8> BoundsChecks;
@@ -2158,6 +2196,16 @@ void TaintFunction::hoistBoundsChecks() {
       Instruction *InsertPt = Preheader->getTerminator();
       IRBuilder<> IRB(InsertPt);
       Value *StrPtr = IRB.CreateBitCast(StrBase, Type::getInt8PtrTy(*TT.Ctx));
+      if (StrUCChk) {
+        // Hoist ucsan_check_pointer with deref=1 so the string object
+        // is materialized before __taint_solve_str_bounds dereferences it
+        Value *UCLabel = StrUCChk->getArgOperand(1);
+        if (!L->isLoopInvariant(UCLabel))
+          UCLabel = ConstantInt::get(UCLabel->getType(), 0);
+        StrPtr = IRB.CreateCall(StrUCChk->getCalledFunction(),
+            {StrPtr, UCLabel, StrUCChk->getArgOperand(2),
+             ConstantInt::getTrue(*TT.Ctx), StrUCChk->getArgOperand(4)});
+      }
 
       DenseSet<Value *> EmittedBufs;
       for (CallInst *CI : BoundsChecks) {

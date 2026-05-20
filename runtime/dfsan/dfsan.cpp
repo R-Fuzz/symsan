@@ -1098,15 +1098,28 @@ void __taint_solve_str_bounds(const char *str_ptr,
     return;
 
   size_t len = strlen(str_ptr);
-  if (len == 0)
-    return;
+  AOUT("solve_str_bounds: str_ptr=%p, strlen=%zu, buf_label=%u, buf_ptr=%p, step=%lu\n",
+       str_ptr, len, buf_label, (void*)buf_ptr, step);
+  bool tainted_zero = false;
+  if (len == 0) {
+    const dfsan_label *sp = shadow_for(str_ptr);
+    AOUT("solve_str_bounds: strlen==0, shadow[0]=%u\n", sp[0]);
+    if (sp[0] == 0)
+      return;
+    len = 1;
+    while (sp[len] != 0)
+      len++;
+    tainted_zero = true;
+    AOUT("solve_str_bounds: tainted extent=%zu\n", len);
+  }
 
   dfsan_label str_label = dfsan_read_label(str_ptr, len + 1);
+  AOUT("solve_str_bounds: str_label=%u\n", str_label);
   if (str_label == 0)
     return;
 
   dfsan_label null_label = dfsan_read_label(str_ptr + len, 1);
-  bool null_from_input = (null_label != 0);
+  bool null_from_input = (null_label != 0 || tainted_zero);
 
   dfsan_label strlen_label = do_taint_union(0, str_label, fstrlen,
                                             64, null_from_input ? 1 : 0, len);
