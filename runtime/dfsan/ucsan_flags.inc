@@ -35,3 +35,6 @@ UCSAN_FLAG(int, max_obj_size, 1 << 20,
 
 UCSAN_FLAG(const char *, input_file, "",
            "Input file containing seed objects.")
+
+UCSAN_FLAG(bool, disable_loop_bounds, false,
+           "Disable loop unrolling bounds.")

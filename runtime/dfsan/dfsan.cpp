@@ -1091,6 +1091,43 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_solve_str_bounds(const char *str_ptr,
+                              dfsan_label buf_label, uint64_t buf_ptr,
+                              uint64_t step) {
+  if (!flags().solve_ub)
+    return;
+
+  size_t len = strlen(str_ptr);
+  if (len == 0)
+    return;
+
+  dfsan_label str_label = dfsan_read_label(str_ptr, len + 1);
+  if (str_label == 0)
+    return;
+
+  dfsan_label null_label = dfsan_read_label(str_ptr + len, 1);
+  bool null_from_input = (null_label != 0);
+
+  dfsan_label strlen_label = do_taint_union(0, str_label, fstrlen,
+                                            64, null_from_input ? 1 : 0, len);
+
+  uint64_t total = len;
+  if (step > 1) {
+    strlen_label = do_taint_union(strlen_label, 0, Mul, 64, len, step);
+    total = len * step;
+  }
+
+  AOUT("solve str bounds: strlen=%zu, step=%lu, total=%lu, buf=%p, buf_label=%u\n",
+       len, step, total, (void*)buf_ptr, buf_label);
+
+  // Concrete OOB detection (same as __taint_check_bounds)
+  __taint_check_bounds(buf_label, buf_ptr, 0, total);
+
+  // Symbolic solving
+  __taint_solve_size(buf_label, buf_ptr, strlen_label, total, 0);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void dfsan_store_label(dfsan_label l, void *addr, uptr size) {
   if (l == 0) return;
   __taint_union_store(l, shadow_for(addr), size, sizeof(dfsan_label));

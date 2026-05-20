@@ -423,6 +423,7 @@ class Taint {
   FunctionType *TaintCheckBoundsFnTy;
   FunctionType *TaintSolveBoundsFnTy;
   FunctionType *TaintSolveSizeFnTy;
+  FunctionType *TaintSolveStrBoundsFnTy;
   FunctionType *TaintTraceGlobalFnTy;
   FunctionType *TaintDebugFnTy;
   FunctionType *TaintMinimizeLabelFnTy;
@@ -447,6 +448,7 @@ class Taint {
   FunctionCallee TaintCheckBoundsFn;
   FunctionCallee TaintSolveBoundsFn;
   FunctionCallee TaintSolveSizeFn;
+  FunctionCallee TaintSolveStrBoundsFn;
   FunctionCallee TaintTraceGlobalFn;
   FunctionCallee TaintDebugFn;
   FunctionCallee TaintMinimizeLabelFn;
@@ -1040,6 +1042,10 @@ bool Taint::initializeModule(Module &M) {
   TaintSolveSizeFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx),
       { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy, Int64Ty, Int32Ty }, false);
+  // __taint_solve_str_bounds(str_ptr, buf_label, buf_ptr, step)
+  TaintSolveStrBoundsFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx),
+      { Type::getInt8PtrTy(*Ctx), PrimitiveShadowTy, Int64Ty, Int64Ty }, false);
   TaintTraceGlobalFnTy = FunctionType::get(
       PrimitiveShadowTy, { Int64Ty, Int64Ty }, false);
 
@@ -1394,6 +1400,14 @@ void Taint::initializeCallbackFunctions(Module &M) {
     TaintSolveSizeFn =
         Mod->getOrInsertFunction("__taint_solve_size", TaintSolveSizeFnTy, AL);
   }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
+    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
+    TaintSolveStrBoundsFn =
+        Mod->getOrInsertFunction("__taint_solve_str_bounds", TaintSolveStrBoundsFnTy, AL);
+  }
 
   TaintRuntimeFunctions.insert(
       TaintTraceCmpFn.getCallee()->stripPointerCasts());
@@ -1423,6 +1437,8 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintSolveBoundsFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintSolveSizeFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintSolveStrBoundsFn.getCallee()->stripPointerCasts());
 }
 
 bool Taint::runImpl(Module &M) {
@@ -2074,7 +2090,148 @@ void TaintFunction::hoistBoundsChecks() {
     }
 
     const SCEV *BTC = SE.getBackedgeTakenCount(L);
-    if (isa<SCEVCouldNotCompute>(BTC)) continue;
+    if (isa<SCEVCouldNotCompute>(BTC)) {
+      // SCEV can't compute trip count — check for strlen-bounded loop:
+      //   while (ptr[i] != 0) { ... __taint_check_bounds(...) ... }
+      // Detect: loop exit is (icmp ne (load i8 (gep i8* base, iv)), 0)
+      BasicBlock *Header = L->getHeader();
+      BranchInst *HeaderBr = dyn_cast<BranchInst>(Header->getTerminator());
+      if (!HeaderBr || !HeaderBr->isConditional()) continue;
+
+      ICmpInst *Cmp = dyn_cast<ICmpInst>(HeaderBr->getCondition());
+      if (!Cmp) continue;
+
+      // Match: icmp ne i8 %val, 0  or  icmp eq i8 %val, 0
+      Value *LoadedVal = nullptr;
+      if (Cmp->getPredicate() == ICmpInst::ICMP_NE &&
+          isa<ConstantInt>(Cmp->getOperand(1)) &&
+          cast<ConstantInt>(Cmp->getOperand(1))->isZero())
+        LoadedVal = Cmp->getOperand(0);
+      else if (Cmp->getPredicate() == ICmpInst::ICMP_EQ &&
+               isa<ConstantInt>(Cmp->getOperand(1)) &&
+               cast<ConstantInt>(Cmp->getOperand(1))->isZero())
+        LoadedVal = Cmp->getOperand(0);
+      else
+        continue;
+
+      // Strip zext/trunc to find the load
+      if (auto *ZE = dyn_cast<ZExtInst>(LoadedVal))
+        LoadedVal = ZE->getOperand(0);
+      if (auto *TR = dyn_cast<TruncInst>(LoadedVal))
+        LoadedVal = TR->getOperand(0);
+
+      LoadInst *LI_load = dyn_cast<LoadInst>(LoadedVal);
+      if (!LI_load || !LI_load->getType()->isIntegerTy(8))
+        continue;
+
+      // Find the base pointer: gep i8* base, iv
+      GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(LI_load->getPointerOperand());
+      // Also check through ucsan_check_pointer
+      if (!GEP) {
+        if (auto *ChkCall = dyn_cast<CallInst>(LI_load->getPointerOperand())) {
+          Function *ChkFn = ChkCall->getCalledFunction();
+          if (ChkFn && ChkFn->getName() == "ucsan_check_pointer")
+            GEP = dyn_cast<GetElementPtrInst>(ChkCall->getArgOperand(0));
+        }
+      }
+      if (!GEP || GEP->getNumIndices() != 1) continue;
+
+      Value *StrBase = GEP->getPointerOperand();
+      if (!L->isLoopInvariant(StrBase)) continue;
+
+      // Collect __taint_check_bounds calls in this loop
+      SmallVector<CallInst *, 8> BoundsChecks;
+      for (BasicBlock *BB : L->blocks()) {
+        if (LI->getLoopFor(BB) != L) continue;
+        for (Instruction &I : *BB) {
+          auto *CI = dyn_cast<CallInst>(&I);
+          if (!CI) continue;
+          Function *Callee = CI->getCalledFunction();
+          if (Callee && Callee->getName() == "__taint_check_bounds")
+            BoundsChecks.push_back(CI);
+        }
+      }
+      if (BoundsChecks.empty()) continue;
+
+      // For each bounds check, extract the buffer pointer and emit
+      // __taint_solve_str_bounds(str_ptr, buf_label, buf_ptr, step)
+      Instruction *InsertPt = Preheader->getTerminator();
+      IRBuilder<> IRB(InsertPt);
+      Value *StrPtr = IRB.CreateBitCast(StrBase, Type::getInt8PtrTy(*TT.Ctx));
+
+      DenseSet<Value *> EmittedBufs;
+      for (CallInst *CI : BoundsChecks) {
+        Value *AddrLabel = CI->getArgOperand(0);  // buf shadow (bounds info)
+        Value *Addr = CI->getArgOperand(1);       // buf concrete address
+        Value *Size = CI->getArgOperand(3);       // access size (step)
+
+        // Resolve loop-variant AddrLabel to loop-invariant base
+        if (!L->isLoopInvariant(AddrLabel)) {
+          Value *Resolved = AddrLabel;
+          bool Found = false;
+          for (int Depth = 0; Depth < 4 && !Found; ++Depth) {
+            if (L->isLoopInvariant(Resolved)) {
+              Found = true;
+            } else if (auto *PN = dyn_cast<PHINode>(Resolved)) {
+              for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
+                if (!L->contains(PN->getIncomingBlock(i))) {
+                  Resolved = PN->getIncomingValue(i);
+                  break;
+                }
+              }
+            } else if (auto *GepCall = dyn_cast<CallInst>(Resolved)) {
+              Function *GepFn = GepCall->getCalledFunction();
+              if (GepFn && GepFn->getName() == "__taint_gep_offset")
+                Resolved = GepCall->getArgOperand(0);
+              else
+                break;
+            } else {
+              break;
+            }
+          }
+          if (!Found && L->isLoopInvariant(Resolved))
+            Found = true;
+          if (!Found) continue;
+          AddrLabel = Resolved;
+        }
+
+        // One call per unique buffer
+        if (!EmittedBufs.insert(AddrLabel).second) continue;
+
+        // Resolve buf_ptr to loop-invariant start address
+        Value *BufPtr = Addr;
+        if (!L->isLoopInvariant(BufPtr)) {
+          // Try to find the base address from SCEV or PHI
+          if (auto *PTI = dyn_cast<PtrToIntOperator>(BufPtr)) {
+            Value *PtrOp = PTI->getOperand(0);
+            if (ClWithUCSan) {
+              if (auto *ChkCall = dyn_cast<CallInst>(PtrOp)) {
+                Function *ChkFn = ChkCall->getCalledFunction();
+                if (ChkFn && ChkFn->getName() == "ucsan_check_pointer")
+                  PtrOp = ChkCall->getArgOperand(0);
+              }
+            }
+            if (auto *BufGEP = dyn_cast<GetElementPtrInst>(PtrOp)) {
+              BufPtr = IRB.CreatePtrToInt(BufGEP->getPointerOperand(), TT.Int64Ty);
+            }
+          }
+          if (!L->isLoopInvariant(BufPtr)) continue;
+        }
+
+        auto *SizeC = dyn_cast<ConstantInt>(Size);
+        uint64_t Step = SizeC ? SizeC->getZExtValue() : 1;
+
+        IRB.CreateCall(TT.TaintSolveStrBoundsFn,
+                       {StrPtr, AddrLabel,
+                        BufPtr, ConstantInt::get(TT.Int64Ty, Step)});
+      }
+
+      // Remove per-iteration bounds checks
+      for (CallInst *CI : BoundsChecks)
+        CI->eraseFromParent();
+
+      continue;
+    }
 
     // Collect __taint_check_bounds calls at this loop level (skip subloops)
     SmallVector<CallInst *, 8> BoundsChecks;

@@ -110,6 +110,10 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_loop(uint32_t bid, int depth) {
   void *addr = __builtin_return_address(0);
 
+  if (ucsan_flags().disable_loop_bounds) {
+    return;
+  }
+
   AOUT("loop header: %u depth: %d current: %d base: %d previous: %d, top bid = %u, @%p\n",
        bid, depth, __current_loop_depth, __base_loop_depth, __previous_loop_depth,
        __loop_bid[get_nested_loop_depth()], addr);
