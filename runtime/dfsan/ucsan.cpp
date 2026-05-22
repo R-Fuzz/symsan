@@ -1424,6 +1424,11 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       // Calculate bounds: real_ptr is the base, lower_bound is bytes before, upper_bound is bytes after
       char *lower = (char*)obj_info->real_ptr - obj_info->lower_bound;
       char *upper = (char*)obj_info->real_ptr + obj_info->upper_bound;
+      size_t alloca_size = upper - lower;
+      if (alloca_size > UCSAN_OBJECT_SIZE_LIMIT) {
+        UCSAN_OUT("WARNING: alloca resign size %zu exceeds limit %u, capping\n", alloca_size, UCSAN_OBJECT_SIZE_LIMIT);
+        upper = lower + UCSAN_OBJECT_SIZE_LIMIT;
+      }
       ucsan_label *lp = ucsan_shadow_for(lower);
       ucsan_label *le = ucsan_shadow_for(upper);
       char *obj_ptr = lower;
@@ -1862,6 +1867,15 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_move_shadow, void*, void*, uint64_t) 
 // @param upper: upper bound address
 // @return: Alloca label (0 when standalone)
 SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_get_ptr_bounds_label, void*, uint64_t, uint64_t) {
+  return 0;
+}
+
+// Extend a SymSan label to a wider bit width via ZExt or SExt.
+// @param label: input label (typically narrow, e.g. 8-bit byte label)
+// @param sign_extend: true for SExt, false for ZExt
+// @param new_size_in_bits: target bit width (must be > current size)
+// @return: extended label (0 when standalone, or unchanged label if input is 0)
+SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_extend_label, dfsan_label, bool, uint16_t) {
   return 0;
 }
 

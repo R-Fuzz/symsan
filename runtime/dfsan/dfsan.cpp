@@ -2050,6 +2050,15 @@ void __taint_move_shadow(void *dst, void *src, uint64_t size) {
   }
 }
 
+// Extend a SymSan label to a wider bit width via ZExt or SExt.
+// Overrides weak stub in ucsan.cpp
+SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_extend_label(dfsan_label label, bool sign_extend, uint16_t new_size_in_bits) {
+  if (label == 0) return 0;
+  uint16_t op = sign_extend ? __dfsan::SExt : __dfsan::ZExt;
+  return do_taint_union(label, CONST_LABEL, op, new_size_in_bits, 0, 0);
+}
+
 // Get or create an Alloca bounds label for a pointer
 // If ptr != NULL, checks shadow_for(&ptr) for existing Alloca to update
 // If ptr == NULL or no existing Alloca, creates a new one

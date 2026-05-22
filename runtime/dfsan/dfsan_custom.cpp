@@ -2635,6 +2635,7 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __dfsw___sanitizer_cov_trace_const_cmp8,
                              void) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __dfsw___sanitizer_cov_trace_switch, void) {}
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_open(const char *path, int oflags, dfsan_label path_label,
             dfsan_label flag_label, dfsan_label *va_labels,
@@ -2718,6 +2719,7 @@ __dfsw_fclose(FILE *fp, dfsan_label fp_label, dfsan_label *ret_label) {
   *ret_label = 0;
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 #ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE size_t
@@ -3482,6 +3484,7 @@ static dfsan_label taint_getc(int fd, off_t offset, int ret) {
   return 0;
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_fgetc(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
   int fd = fileno(stream);
@@ -3535,6 +3538,7 @@ __dfsw_getchar(dfsan_label *ret_label) {
   *ret_label = taint_getc(0, offset, ret);
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE size_t
 __dfsw_mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps,
@@ -3588,6 +3592,7 @@ __dfsw_munmap(void *addr, size_t length, dfsan_label addr_label,
   return ret;
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE off_t
 __dfsw_lseek(int fd, off_t offset, int whence, dfsan_label fd_label,
              dfsan_label offset_label, dfsan_label whence_label,
@@ -3604,6 +3609,7 @@ __dfsw_lseek(int fd, off_t offset, int whence, dfsan_label fd_label,
   } else *ret_label = 0;
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE off64_t
 __dfsw_lseek64(int fd, off64_t offset, int whence, dfsan_label fd_label,
@@ -3622,6 +3628,7 @@ __dfsw_lseek64(int fd, off64_t offset, int whence, dfsan_label fd_label,
   return ret;
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_fseek(FILE *stream, long offset, int whence, dfsan_label stream_label,
              dfsan_label offset_label, dfsan_label whence_label,
@@ -3653,6 +3660,7 @@ __dfsw_fseeko(FILE *stream, off_t offset, int whence, dfsan_label stream_label,
   }
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_fseeko64(FILE *stream, off64_t offset, int whence, dfsan_label stream_label,

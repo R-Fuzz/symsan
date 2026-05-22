@@ -80,12 +80,36 @@ fun:stpcpy=copystr
 fun:strcat=copystr
 fun:strdup=copystr
 
+# I/O open/close (fake handles, no real libc I/O)
+fun:open=custom
+fun:openat=custom
+fun:close=custom
+fun:fopen=custom
+fun:fopen64=custom
+fun:freopen=custom
+fun:fclose=custom
+
+# I/O seek/tell
+fun:fseek=custom
+fun:fseeko=custom
+fun:lseek=custom
+fun:rewind=custom
+fun:ftell=custom
+
 # I/O read functions
 fun:read=custom
 fun:pread=custom
 fun:pread64=custom
 fun:fread=custom
 fun:fread_unlocked=custom
+
+# I/O single-byte read functions
+fun:fgetc=custom
+fun:fgetc_unlocked=custom
+fun:getc=custom
+fun:getc_unlocked=custom
+fun:_IO_getc=custom
+fun:getchar=custom
 
 # buffer size (sizeN means arg index N (0-indexed) holds the byte count)
 fun:_copy_from_user=size2
