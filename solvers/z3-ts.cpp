@@ -127,18 +127,20 @@ static std::vector<uint8_t> decode_z3_string(const std::string &str) {
 }
 
 void Z3AstParser::dump_value_cache(dfsan_label label) {
-  if (label >= value_cache_.size()) {
-    throw z3::exception("invalid label for value cache");
+  if (label < CONST_OFFSET || label >= size_) {
+    fprintf(stderr, "  label %u: out of range\n", label);
+    return;
   }
   dfsan_label_info *info = get_label_info(label);
-  fprintf(stderr, "label %u = l1: %u, l2: %u, op: %s, size: %u, op1: %lu, op2: %lu\n",
-          label, info->l1, info->l2, get_op_name(info->op).c_str(), info->size,
-          info->op1.i, info->op2.i);
-  fprintf(stderr, "recalcuated value: %lu = op1: %lu, op2: %lu\n",
-          value_cache_[label], value_cache_[info->l1], value_cache_[info->l2]);
-  if (info->l1 != 0)
+  fprintf(stderr, "  label %u = (l1:%u, l2:%u, op:%s(0x%x), size:%u, op1:%lu, op2:%lu)",
+          label, info->l1, info->l2, get_op_name(info->op).c_str(), info->op,
+          info->size, info->op1.i, info->op2.i);
+  if (label < value_cache_.size())
+    fprintf(stderr, " val:%lu", value_cache_[label]);
+  fprintf(stderr, "\n");
+  if (info->l1 >= CONST_OFFSET)
     dump_value_cache(info->l1);
-  if (info->l2 != 0)
+  if (info->l2 >= CONST_OFFSET)
     dump_value_cache(info->l2);
 }
 
@@ -325,8 +327,10 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
         branch_deps_[input].resize(offset + bytes);
     }
   }
-  // Cache first byte in branch_dependency for linking (linear scan: always new)
-  set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(first_byte));
+  // Load operation can load overlapping bytes, so we need to check
+  if (get_branch_dep({input, offset}) == nullptr) {
+    set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(first_byte));
+  }
   uint64_t val = 0;
 #if FILTER_WRONG_AST
   if (!is_negative_offset(offset) && inputs_cache_.size() > input &&
@@ -339,6 +343,9 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
     symbol = context_.str_symbol(name);
     z3::expr byte_expr = context_.constant(symbol, sort);
     out = z3::concat(byte_expr, out);
+    if (get_branch_dep({input, offset + i}) == nullptr) {
+      set_branch_dep({input, offset + i}, std::make_unique<branch_dependency_t>(byte_expr));
+    }
     input_deps.insert(std::make_pair(input, offset + i));
     // Cache each byte expr in branch_dependency (linear scan: always new)
     set_branch_dep({input, offset + i}, std::make_unique<branch_dependency_t>(byte_expr));
@@ -454,6 +461,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     } else if (info->op == __dfsan::Trunc) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      if (!base.is_bv()) {
+        fprintf(stderr, "WARNING: Trunc on non-BV (label=%u, l1=%u, sort=%s)\n",
+                l, info->l1, base.get_sort().to_string().c_str());
+        dump_value_cache(l);
+      }
       cache_expr(l, base.extract(info->size - 1, 0));
       TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(value_cache_[info->l1] & ((1UL << info->size) - 1));
@@ -504,6 +516,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     else if (info->op == __dfsan::Extract) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      if (!base.is_bv()) {
+        fprintf(stderr, "WARNING: Extract on non-BV (label=%u, l1=%u, sort=%s)\n",
+                l, info->l1, base.get_sort().to_string().c_str());
+        dump_value_cache(l);
+      }
       cache_expr(l, base.extract((info->op2.i + info->size) - 1, info->op2.i));
       TRACK_LABEL_BV_ONLY();
       RECORD_VALUE((value_cache_[info->l1] >> info->op2.i) &
@@ -547,7 +564,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
                                        context_.bv_val(1, 32));
       cache_expr(l, e);
       TRACK_LABEL_BV_ONLY();
-      RECORD_VALUE(0); // memcmp result is always 0 or 1
+      RECORD_VALUE(1); // memcmp result is always 0 or 1
       continue;
     } else if (info->op == __dfsan::fsize) {
       // file size
@@ -1818,7 +1835,8 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
     return 0; // success
   } catch (z3::exception e) {
-    fprintf(stderr, "WARNING: parsing error: %s\n", e.msg());
+    fprintf(stderr, "WARNING: parsing error: %s (label=%u)\n", e.msg(), label);
+    try { dump_value_cache(label); } catch (...) {}
   } catch (std::exception& e) {
     fprintf(stderr, "WARNING: std::exception in parse_cond: %s\n", e.what());
   } catch (...) {

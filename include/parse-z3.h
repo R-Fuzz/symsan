@@ -167,9 +167,15 @@ private:
   inline struct branch_dependency_t* get_branch_dep(offset_t off) {
     if (is_negative_offset(off.second)) {
       auto &deps = neg_branch_deps_.at(off.first);
+      if (neg_index(off.second) >= deps.size()) {
+        return nullptr;
+      }
       return deps.at(neg_index(off.second)).get();
     }
     auto &offset_deps = branch_deps_.at(off.first);
+    if (off.second >= offset_deps.size()) {
+      return nullptr;
+    }
     return offset_deps.at(off.second).get();
   }
 
