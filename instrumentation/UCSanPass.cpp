@@ -403,6 +403,7 @@ class UCSan {
   FunctionType *UCSetLabelFnTy;
   FunctionType *UCTraceBBFnTy;
   FunctionType *UCTraceAllocaFnTy;
+  FunctionType *UCTraceGlobalFnTy;
   FunctionType *UCPushStackFrameFnTy;
   FunctionType *UCPopStackFrameFnTy;
   FunctionType *UCCheckCopyBoundsFnTy;
@@ -420,6 +421,7 @@ class UCSan {
   FunctionCallee UCSetLabelFn;
   FunctionCallee UCTraceBBFn;
   FunctionCallee UCTraceAllocaFn;
+  FunctionCallee UCTraceGlobalFn;
   FunctionCallee UCPushStackFrameFn;
   FunctionCallee UCPopStackFrameFn;
   FunctionCallee UCCheckCopyBoundsFn;
@@ -802,6 +804,17 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCTraceAllocaFn = M.getOrInsertFunction("ucsan_trace_alloca", UCTraceAllocaFnTy);
   F = dyn_cast<Function>(UCTraceAllocaFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // i16 ucsan_trace_global(i64 Address, i64 Size)
+  // Returns a shadow label representing bounds for a fixed-size global object.
+  UCTraceGlobalFnTy = FunctionType::get(
+    PrimitiveShadowTy,
+    {Int64Ty, Int64Ty},
+    false);
+  UCTraceGlobalFn = M.getOrInsertFunction("ucsan_trace_global", UCTraceGlobalFnTy);
+  F = dyn_cast<Function>(UCTraceGlobalFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -2160,6 +2173,39 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
     SPtr = GEP->getPointerOperand();
   }
 
+  GlobalVariable *GV =
+      dyn_cast<GlobalVariable>(getUnderlyingObject(Ptr->stripPointerCasts()));
+  Value *GlobalBoundsShadow = nullptr;
+  if (GV) {
+    // underlying obj is a global variable, do two things:
+    // 1) if size is a constant and smaller than the global obj size, and
+    // 2) we're not dereferencing the pointe, then we can skip the check
+    auto &DL = F->getParent()->getDataLayout();
+    Type *GTy = GV->getValueType();
+    if (GV->hasInitializer()) {
+      GTy = GV->getInitializer()->getType();
+    }
+    uint64_t TypeSize = DL.getTypeStoreSize(GTy);
+    bool HasFixedBounds =
+        GTy->isSized() && (GTy->isArrayTy() || GTy->isStructTy());
+
+    // trace globals with fixed bounds to allow bounds checks
+    if (HasFixedBounds) {
+      Value *GlobalAddr = IRB.CreatePtrToInt(GV, UC.Int64Ty);
+      UC.markNosanitize(GlobalAddr);
+      Value *GlobalSize = ConstantInt::get(UC.Int64Ty, TypeSize);
+      GlobalBoundsShadow =
+          IRB.CreateCall(UC.UCTraceGlobalFn, {GlobalAddr, GlobalSize});
+      UC.markNosanitize(GlobalBoundsShadow);
+    }
+
+    if (ConstantInt *CI = dyn_cast<ConstantInt>(Size)) {
+      if (CI->getZExtValue() < TypeSize && !dereference) {
+        return Ptr; // size is smaller than the pointed type, no check needed
+      }
+    }
+  }
+
   if (!isa<AllocaInst>(SPtr)) {
     Value *Addr = Ptr;
     if (Ty != UC.VoidPtrTy) {
@@ -2168,7 +2214,7 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
     }
 
     // Get shadow for the pointer from TLS (for arguments) or shadow memory
-    Value* Shadow = getShadow(Ptr);
+    Value* Shadow = GlobalBoundsShadow ? GlobalBoundsShadow : getShadow(Ptr);
 
     Value *ExtSize = IRB.CreateZExtOrTrunc(Size, UC.Int64Ty);
     if (ExtSize != Size) {
@@ -2311,7 +2357,12 @@ void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
 
   // Check source and destination pointers
   Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB);
-  Value *dest = UF.checkPointer(I.getRawDest(), Length, true, IRB);
+  // check the destination pointer, if it's a global variable,
+  // no need to call check pointer to symbolize, as it's the dest.
+  Value *dest = I.getRawDest();
+  if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
+    dest = UF.checkPointer(dest, Length, true, IRB);
+  }
 
   I.setSource(src);
   I.setDest(dest);
@@ -2341,10 +2392,15 @@ void UCSanVisitor::visitMemSetInst(MemSetInst &I) {
     UF.UC.markNosanitize(Length);
   }
 
-  // Check destination pointer
-  Value *dest = UF.checkPointer(I.getRawDest(), Length, true, IRB);
-
-  I.setDest(dest);
+  // check the destination pointer, if it's a global variable,
+  // no need to call check pointer. stack still needs to be checked,
+  // not for symbolizing, but for bounds check.
+  Value *dest = I.getRawDest();
+  if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
+    // Check destination pointer
+    dest = UF.checkPointer(dest, Length, true, IRB);
+    I.setDest(dest);
+  }
 
   // update shadow
   Value *ValShadow = UF.getShadow(I.getValue());
@@ -2363,7 +2419,12 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
 
   // Check source and destination pointers
   Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB);
-  Value *dest = UF.checkPointer(I.getRawDest(), Length, true, IRB);
+  // check the destination pointer, if it's a global variable,
+  // no need to call check pointer to symbolize, as it's the dest.
+  Value *dest = I.getRawDest();
+  if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
+    dest = UF.checkPointer(dest, Length, true, IRB);
+  }
 
   I.setDest(dest);
   I.setSource(src);
@@ -2941,7 +3002,8 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
         }
 
         // Capture shadow before checkPointer resolves the pointer
-        if (IsCopyStr && ArgIdx <= 1) {
+        bool skipCheckPointer = false;
+        if ((IsCopyStr || LenVal) && ArgIdx <= 1) {
           Value *Shadow = UF.getShadow(*I);
           if (ArgIdx == 0) {
             DstShadow = Shadow;
@@ -2952,12 +3014,19 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
                 DstBound = ConstantInt::get(UF.UC.Int64Ty, DL.getTypeAllocSize(T));
               }
             }
+            if (isa<GlobalVariable>(getUnderlyingObject((*I)->stripPointerCasts()))) {
+              // destination is part of aglobal variable, skip
+              skipCheckPointer = true;
+            }
           } else if (ArgIdx == 1) {
             SrcShadow = Shadow;
           }
         }
 
-        Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
+        Value *rptr = *I;
+        if (!skipCheckPointer) {
+          rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
+        }
         CB.setArgOperand(ArgIdx, rptr);
 
         // Capture resolved pointers for copy bounds check

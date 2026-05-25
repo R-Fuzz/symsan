@@ -2000,7 +2000,10 @@ void TaintFunction::checkBounds(Value *Ptr, Value* Size, Instruction *Pos) {
   IRBuilder<> IRB(Pos);
   // another place to check for global variable as the ptr
   Value *PtrShadow = nullptr;
+  Value *PtrBase = getUnderlyingObject(Ptr);
   if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts())) {
+    PtrShadow = getShadowForGlobal(GV, IRB);
+  } else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(PtrBase)) {
     PtrShadow = getShadowForGlobal(GV, IRB);
   } else {
     PtrShadow = getShadow(Ptr);
@@ -2023,7 +2026,10 @@ void TaintFunction::solveBounds(Value *Ptr, Value* Size, Instruction *Pos) {
   IRBuilder<> IRB(Pos);
   // another place to check for global variable as the ptr
   Value *PtrShadow = nullptr;
+  Value *PtrBase = getUnderlyingObject(Ptr);
   if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts())) {
+    PtrShadow = getShadowForGlobal(GV, IRB);
+  } else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(PtrBase)) {
     PtrShadow = getShadowForGlobal(GV, IRB);
   } else {
     PtrShadow = getShadow(Ptr);

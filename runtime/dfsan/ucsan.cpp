@@ -96,6 +96,10 @@ static atomic_uint32_t __ucsan_inited_objects;
 static AddrRangeMap __symbolize_addr_map;
 static bool __symbolize_addr_map_inited = false;
 
+// Address range map for fixed-size global object bounds.
+static AddrRangeMap __global_bounds_map;
+static bool __global_bounds_map_inited = false;
+
 // Stack management for bounds tracking
 static ucsan_label __alloca_stack_bottom;
 static ucsan_label __alloca_stack_top;
@@ -512,15 +516,17 @@ ucsan_label_info* get_label_info(ucsan_label label) {
   return &__ucsan_label_info[label];
 }
 
-ucsan_label allocate_label() {
-  return atomic_fetch_add(&__ucsan_last_label, 1, memory_order_relaxed) + 1;
-}
-
 void check_label(ucsan_label label) {
   if (label >= __alloca_stack_top) {
     Report("FATAL: UCSan: exhausted labels\n");
     Die();
   }
+}
+
+ucsan_label allocate_label() {
+  ucsan_label label = atomic_fetch_add(&__ucsan_last_label, 1, memory_order_relaxed) + 1;
+  check_label(label);
+  return label;
 }
 
 //===----------------------------------------------------------------------===//
@@ -684,57 +690,89 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
   UCSAN_OUT("%p: label: %d, size: %zu, dereferencing: %d, type_id: %u\n", p, label, size, dereferencing, type_id);
   __ucsan_null_deref_flag = nullptr;
 
-  // Handle unlabeled or special labels
-  if (label < UCSAN_CONST_OFFSET) {
-    // Global variable handling - symbolize on first access
-    if (in_data_section(p)) {
-      ucsan_label *shadow = ucsan_shadow_for(p);
-      if (*shadow == 0) {
-        bool sent_data = false;
-        uint64_t first_byte_offset = 0;
-        for (uint64_t i = 0; i < size; ++i) {
-          void *byte_addr = (void*)((uint64_t)p + i);
-          shadow = ucsan_shadow_for(byte_addr);
-          auto ret = create_label_from_super_object(1, false);
-          *shadow = ret.label;
-          if (i == 0) first_byte_offset = ret.offset;
-          UCSAN_OUT("Symbolize global variable byte @%p with %u from offset %lu\n",
-                    ((char*)p+i), ret.label, ret.offset);
-
-          // Bridge to SymSan: create symbolic label for this byte and set shadow
-          dfsan_label symsan_label = __taint_create_label(0, ret.offset, 1);
-          __taint_set_label(symsan_label, byte_addr, 1);
-
-          // Initialize from seed data if available
-          if (ucsan_tainted.objects->size() && ret.offset < ucsan_tainted.objects->at(0).data.size()) {
-            *((char*)p + i) = ucsan_tainted.objects->at(0).data.at(ret.offset);
-          } else if (!in_bss_section(p) && *((char*)p + i) != 0) {
-            sent_data = true;
+  // Global variable handling
+  if (in_data_section(p)) {
+    // if label is not zero, perform bounds check
+    if (label >= UCSAN_CONST_OFFSET) {
+      ucsan_label_info *label_info = get_label_info(label);
+      if (label_info->common.op != OP_ALLOCA) {
+        UCSAN_OUT("WARNING: global variable with non-alloca label %u\n", label);
+      } else {
+        // Check for out-of-bounds access to global variable
+        ucsan_obj_info *obj = to_obj_info(label_info);
+        void *base = obj->real_ptr;
+        uint64_t base_addr = (uint64_t)base;
+        uint64_t ptr_addr = (uint64_t)p;
+        uint64_t upper_bound = (uint64_t)obj->upper_bound;
+        uint64_t offset = ptr_addr - base_addr;
+        if (ucsan_flags().trace_bounds &&
+            (ptr_addr < base_addr ||
+             offset > upper_bound ||
+             size > upper_bound - offset)) {
+          UCSAN_OUT("ERROR: Out-of-bounds access to global variable @%p, label=%u, access size=%lu, object size=%u\n",
+                    p, label, size, obj->upper_bound);
+          if (dereferencing) {
+            __taint_trace_event_addr(label, EVENT_OOB, 0, __builtin_return_address(0), (uint32_t)obj->upper_bound);
+            exit(exit_reason::EVENT_OOB);
           }
-        }
-
-        // Trace global variable usage
-        if (ucsan_flags().trace_object) {
-          ucsan_label first_label = *(ucsan_shadow_for(p));
-          ucsan_label_info *info = get_label_info(first_label);
-          // globals are from super object, so object_id is always 0
-          int64_t offset = to_byte_info(info)->offset;
-          if (offset > INT32_MAX || offset < INT32_MIN) {
-            UCSAN_OUT("WARNING: global variable offset (%ld) too large\n", offset);
-          } else {
-            __taint_trace_event_addr(*(ucsan_shadow_for(p)), EVENT_USAGE_CITE, type_id,
-                                     __builtin_return_address(0), (uint32_t)offset);
-          }
-        }
-
-        // Send initial data if needed
-        if (sent_data) {
-          UCSAN_OUT("Sent init data for global variable @%p\n", p);
-          __taint_trace_global_var(0, first_byte_offset, size, p);
         }
       }
+    } else if (size > UCSAN_OBJECT_SIZE_LIMIT) {
+      UCSAN_OUT("WARNING: global variable size too large: %lu\n", size);
+      size = UCSAN_OBJECT_SIZE_LIMIT;
     }
+    // Symbolize global variable on first access (label == 0)
+    ucsan_label *shadow = ucsan_shadow_for(p);
+    if (*shadow == 0 && dereferencing) {
+      // only symbolize on deref
+      bool sent_data = false;
+      uint64_t first_byte_offset = 0;
+      for (uint64_t i = 0; i < size; ++i) {
+        void *byte_addr = (void*)((uint64_t)p + i);
+        shadow = ucsan_shadow_for(byte_addr);
+        auto ret = create_label_from_super_object(1, false);
+        *shadow = ret.label;
+        if (i == 0) first_byte_offset = ret.offset;
+        UCSAN_OUT("Symbolize global variable byte @%p with %u from offset %lu\n",
+                  ((char*)p+i), ret.label, ret.offset);
 
+        // Bridge to SymSan: create symbolic label for this byte and set shadow
+        dfsan_label symsan_label = __taint_create_label(0, ret.offset, 1);
+        __taint_set_label(symsan_label, byte_addr, 1);
+
+        // Initialize from seed data if available
+        if (ucsan_tainted.objects->size() && ret.offset < ucsan_tainted.objects->at(0).data.size()) {
+          *((char*)p + i) = ucsan_tainted.objects->at(0).data.at(ret.offset);
+        } else if (!in_bss_section(p) && *((char*)p + i) != 0) {
+          sent_data = true;
+        }
+      }
+
+      // Trace global variable usage
+      if (ucsan_flags().trace_object) {
+        ucsan_label first_label = *(ucsan_shadow_for(p));
+        ucsan_label_info *info = get_label_info(first_label);
+        // globals are from super object, so object_id is always 0
+        int64_t offset = to_byte_info(info)->offset;
+        if (offset > INT32_MAX || offset < INT32_MIN) {
+          UCSAN_OUT("WARNING: global variable offset (%ld) too large\n", offset);
+        } else {
+          __taint_trace_event_addr(*(ucsan_shadow_for(p)), EVENT_USAGE_CITE, type_id,
+                                    __builtin_return_address(0), (uint32_t)offset);
+        }
+      }
+
+      // Send initial data if needed
+      if (sent_data) {
+        UCSAN_OUT("Sent init data for global variable @%p\n", p);
+        __taint_trace_global_var(0, first_byte_offset, size, p);
+      }
+    }
+    return p;
+  }
+
+  // if non-global yet without label, can't do much
+  if (label < UCSAN_CONST_OFFSET) {
     // Null dereference checking
     if (dereferencing && ucsan_flags().checker_nullderef) {
       if ((uint64_t)p < size || (uint64_t)p < UCSAN_OBJECT_SIZE_LIMIT) {
@@ -803,8 +841,11 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       UCSAN_OUT("OOB check: ptr=%p, base=%p, lower=%p, upper=%p, size=%zu\n",
                 p, base, (void*)lower, (void*)upper, size);
 
-      if ((uint64_t)p < lower || (uint64_t)p >= upper ||
-          (uint64_t)p + size > upper) {
+      uint64_t ptr_addr = (uint64_t)p;
+      uint64_t offset = ptr_addr - lower;
+      uint64_t object_size = upper - lower;
+      if (ptr_addr < lower || offset >= object_size ||
+          size > object_size - offset) {
         UCSAN_OUT("ERROR: OOB access ptr %p, lower = %p, upper = %p, size = %zu, label = %u, deref=%d\n",
                   p, (void*)lower, (void*)upper, size, label, dereferencing);
         if (dereferencing) {
@@ -821,7 +862,6 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
   // Mark as external if needed - create a new pointer label for non-pointer types
   if (ptr_info->op != OP_EXTERNAL && ptr_info->op != OP_NONE) {
     ucsan_label new_label = allocate_label();
-    check_label(new_label);
     ucsan_label_info *new_info = get_label_info(new_label);
     ucsan_ptr_info *new_ptr = to_ptr_info(new_info);
     new_ptr->op = OP_BITCAST;
@@ -862,7 +902,6 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
     // Create object label
     ucsan_label obj_label = allocate_label();
-    check_label(obj_label);
 
     void* np = customized_malloc(object_size);
     internal_memcpy(np, obj.data.data(), object_size);
@@ -881,7 +920,6 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     // Create labels for each byte in the object and set up shadow memory
     for (uint64_t offset = 0; offset < object_size; ++offset) {
       ucsan_label byte_label = allocate_label();
-      check_label(byte_label);
 
       ucsan_label_info *byte_info = get_label_info(byte_label);
       ucsan_byte_info *byte = to_byte_info(byte_info);
@@ -913,16 +951,29 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     int64_t pseudo_base = (int64_t)ptr_info->pseudo_base;  // Read from ptr_info
     int64_t desired_offset = (int64_t)p - pseudo_base;
 
+    if (size > UCSAN_OBJECT_SIZE_LIMIT) {
+      UCSAN_OUT("Object access size too large: %zu\n", size);
+      exit(exit_reason::REASON_OBJ_OOB);
+    }
+
+    int64_t access_size = (int64_t)size;
+    if (desired_offset > INT64_MAX - access_size) {
+      UCSAN_OUT("Object access offset overflow: offset=%ld, size=%zu\n",
+                desired_offset, size);
+      exit(exit_reason::REASON_OBJ_OOB);
+    }
+    int64_t desired_end = desired_offset + access_size;
+
     if (ucsan_flags().no_upcast && desired_offset < 0) {
       UCSAN_OUT("Upcast disallowed by no_upcast flag\n");
       exit(exit_reason::EVENT_OOB_UPCAST);
     }
 
     // Fast path: within current bounds
-    int64_t lower_bound = pseudo_base - obj_label_info->lower_bound;
-    int64_t upper_bound = pseudo_base + obj_label_info->upper_bound;
+    int64_t lower_bound = -(int64_t)obj_label_info->lower_bound;
+    int64_t upper_bound = (int64_t)obj_label_info->upper_bound;
 
-    if (lower_bound <= (int64_t)p && (int64_t)p + (int64_t)size <= upper_bound) {
+    if (lower_bound <= desired_offset && desired_end <= upper_bound) {
       void* target = (void*)((int64_t)obj_base + desired_offset);
       UCSAN_OUT("Fast path: returning %p\n", target);
       return target;
@@ -968,7 +1019,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       }
     }
 
-    uint64_t new_size = new_lower_bound + Max(desired_offset + (int64_t)size,
+    uint64_t new_size = new_lower_bound + Max(desired_end,
                                          (int64_t)obj_label_info->upper_bound);
 
     if (new_size > UCSAN_OBJECT_SIZE_LIMIT) {
@@ -983,7 +1034,6 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     // Padding the left lower bounds with new labels
     for (uint64_t offset = 0; offset < extended_lower; ++offset) {
       ucsan_label byte_label = allocate_label();
-      check_label(byte_label);
 
       ucsan_label_info *byte_info = get_label_info(byte_label);
       ucsan_byte_info *byte = to_byte_info(byte_info);
@@ -1013,7 +1063,6 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     // Padding the right upper bounds with new labels
     for (uint64_t offset = extended_lower + original_size; offset < new_size; ++offset) {
       ucsan_label byte_label = allocate_label();
-      check_label(byte_label);
 
       ucsan_label_info *byte_info = get_label_info(byte_label);
       ucsan_byte_info *byte = to_byte_info(byte_info);
@@ -1372,7 +1421,6 @@ void __ucsan_symbolize_input(void *ptr, size_t size, int id) {
   ucsan_label *shadow = ucsan_shadow_for(ptr);
   for (size_t offset = 0; offset < size; ++offset) {
     ucsan_label byte_label = allocate_label();
-    check_label(byte_label);
 
     ucsan_label_info *byte_info = get_label_info(byte_label);
     ucsan_byte_info *byte = to_byte_info(byte_info);
@@ -1485,7 +1533,6 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
     ucsan_label *shadow = ucsan_shadow_for(ptr);
     for (uptr i = 0; i < n; ++i) {
       ucsan_label next_label = allocate_label();
-      check_label(next_label);
 
       shadow[i] = next_label;
       ucsan_label_info *new_label_info = get_label_info(next_label);
@@ -1602,6 +1649,49 @@ ucsan_label ucsan_trace_alloca(uint64_t size, uint64_t elem_size, uint64_t addr)
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+ucsan_label ucsan_trace_global(uint64_t addr, uint64_t size) {
+  if (!ucsan_flags().trace_bounds || addr == 0 || size == 0)
+    return 0;
+
+  if (size > UINT32_MAX) {
+    UCSAN_OUT("WARNING: global bounds size %lu exceeds limit %u, capping\n",
+              size, UINT32_MAX);
+    size = UINT32_MAX;
+  }
+
+  void *ptr = (void *)addr;
+  if (!__global_bounds_map_inited) {
+    __global_bounds_map.init();
+    __global_bounds_map_inited = true;
+  }
+
+  uint32_t object_id = 0;
+  uint32_t offset = 0;
+  ucsan_label label = 0;
+  if (__global_bounds_map.find(ptr, &object_id, &offset, &label)) {
+    UCSAN_OUT("ucsan_trace_global: reuse label=%u, base=%p, size=%lu\n",
+              label, ptr, size);
+    return label;
+  }
+
+  label = allocate_label();
+  UCSAN_OUT("ucsan_trace_global: label=%u, base=%p, size=%lu\n",
+            label, ptr, size);
+
+  ucsan_label_info *info = get_label_info(label);
+  ucsan_obj_info *obj = to_obj_info(info);
+  obj->op = OP_ALLOCA;
+  obj->type_id = 0;
+  obj->object_id = 0;
+  obj->real_ptr = ptr;
+  obj->lower_bound = 0;
+  obj->upper_bound = (uint32_t)size;
+
+  __global_bounds_map.insert(ptr, (size_t)size, 0, label);
+  return label;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_push_stack_frame() {
   // Save current stack top when entering a function
   // This allows automatic cleanup of stack allocation labels on function exit
@@ -1710,6 +1800,15 @@ static void ucsan_init_shadow_memory() {
 
 static void ucsan_fini_internal() {
   UCSAN_OUT("UCSan runtime finalized\n");
+
+  if (__global_bounds_map_inited) {
+    __global_bounds_map.destroy();
+    __global_bounds_map_inited = false;
+  }
+  if (__symbolize_addr_map_inited) {
+    __symbolize_addr_map.destroy();
+    __symbolize_addr_map_inited = false;
+  }
 
   // Clean up input struct
   ucsan_fini_input_struct();
