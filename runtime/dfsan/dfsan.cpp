@@ -1016,7 +1016,7 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
                         dfsan_label size_label, uint64_t size,
                         uint32_t cid) {
-  if (size_label == 0 || !flags().solve_ub)
+  if (!flags().solve_ub)
     return;
 
   void *addr = __builtin_return_address(0);
@@ -1040,7 +1040,10 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
       size, size_label, (void*)ptr, ptr_label);
 
   // construct size solving tasks here
-  uint16_t size_bits = get_label_info(size_label)->size;
+  uint16_t size_bits = 64; // Default to 64 bits
+  if (size_label != 0) {
+    size_bits = get_label_info(size_label)->size;
+  }
 
   // check overflow with buffer bounds if ptr has bounds info
   if (ptr_label != 0) {
@@ -1052,6 +1055,10 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
 
       if (bounds_info->l2 == 0) {
         // concrete allocation size
+        if (size_label == 0) {
+          // concrete size, concrete allocation size, nothing to solve
+          return;
+        }
         // check underflow: ptr + size < lower_bound (wrap around)
         // => size < lower_bound - ptr (when lower_bound > ptr, but this shouldn't happen in valid code)
         // or equivalently, check that ptr < lower_bound (shouldn't happen)
@@ -1071,7 +1078,7 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
         // check: size > alloc_size
         uint64_t offset = ptr - bounds_info->op1.i;
         uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
-        dfsan_label adjusted_size = offset == 0 ? size_label :
+        dfsan_label adjusted_size = (offset == 0 || size_label == 0) ? size_label :
             do_taint_union(size_label, 0, Add, 64, size, offset);
         uint64_t actual_size = size + offset;
         dfsan_label overflow = do_taint_union(adjusted_size, bounds_info->l2,

@@ -522,6 +522,8 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
                                               dfsan_label *ret_label) {
   __taint_check_bounds(s1_label, (uptr)s1, n_label, n);
   __taint_check_bounds(s2_label, (uptr)s2, n_label, n);
+  __taint_solve_size(s1_label, (uint64_t)s1, n_label, n, 0);
+  __taint_solve_size(s2_label, (uint64_t)s2, n_label, n, 0);
   int ret = bcmp(s1, s2, n);
 
   // Check for fsubstr labels (from strncpy with symbolic length)

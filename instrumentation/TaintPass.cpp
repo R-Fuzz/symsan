@@ -1053,8 +1053,8 @@ bool Taint::initializeModule(Module &M) {
       {PrimitiveShadowTy, PrimitiveShadowTy, PrimitiveShadowTy,
        PrimitiveShadowTy, PrimitiveShadowTy}, false);
 
-  TaintMinimizeLabelFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), { PrimitiveShadowTy }, false);
+  TaintMinimizeLabelFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
+      { PrimitiveShadowTy, PrimitiveShadowTy }, false);
 
   ColdCallWeights = MDBuilder(*Ctx).createBranchWeights(1, 1000);
   return true;
@@ -1810,6 +1810,22 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
 
   StringRef BaseName = FName.drop_front(7); // skip "__dfsw_"
 
+  auto GetFakeIORetShadow = [&]() -> Value * {
+    // ucsan_custom.cpp simulates reads without forwarding to libc. For these
+    // fake full-read paths the return value is derived from the requested
+    // count, so keep the return label tied to that argument instead of the
+    // wrapper's concrete retval TLS.
+    if (BaseName == "read" || BaseName == "pread" ||
+        BaseName == "pread64") {
+      if (CI->arg_size() > 2)
+        return getShadow(CI->getArgOperand(2));
+    } else if (BaseName == "fread" || BaseName == "fread_unlocked") {
+      if (CI->arg_size() > 2)
+        return getShadow(CI->getArgOperand(2));
+    }
+    return nullptr;
+  };
+
   // Emit minimize hints for allocation size arguments
   SmallVector<unsigned, 2> SizeArgIndices;
   if (BaseName == "malloc" || BaseName == "__libc_malloc" ||
@@ -1831,24 +1847,32 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
   } else if (BaseName == "posix_memalign") {
     SizeArgIndices.push_back(2);
   }
-  if (!SizeArgIndices.empty()) {
-    IRBuilder<> IRB(CI);
-    for (unsigned Idx : SizeArgIndices) {
-      Value *Shadow = getShadow(CI->getArgOperand(Idx));
-      if (!TT.isZeroShadow(Shadow)) {
-        IRB.CreateCall(TT.TaintMinimizeLabelFn, {Shadow});
-      }
+
+  // Load return shadow from retval TLS for non-void __dfsw_* calls
+  LoadInst *LI = nullptr;
+  if (!CI->getType()->isVoidTy()) {
+    IRBuilder<> NextIRB(Next);
+    if (Value *RetShadow = GetFakeIORetShadow()) {
+      setShadow(CI, RetShadow);
+    } else {
+      LI = NextIRB.CreateAlignedLoad(
+          TT.getShadowTy(CI), getRetvalTLS(CI->getType(), NextIRB),
+          ShadowTLSAlignment, "_dfsret");
+      SkipInsts.insert(LI);
+      setShadow(CI, LI);
     }
   }
 
-  // Load return shadow from retval TLS for non-void __dfsw_* calls
-  if (!CI->getType()->isVoidTy()) {
-    IRBuilder<> NextIRB(Next);
-    LoadInst *LI = NextIRB.CreateAlignedLoad(
-        TT.getShadowTy(CI), getRetvalTLS(CI->getType(), NextIRB),
-        ShadowTLSAlignment, "_dfsret");
-    SkipInsts.insert(LI);
-    setShadow(CI, LI);
+  if (!SizeArgIndices.empty()) {
+    IRBuilder<> IRB(LI ? LI->getNextNode() : Next);
+    for (unsigned Idx : SizeArgIndices) {
+      Value *Shadow = getShadow(CI->getArgOperand(Idx));
+      Value *Bounds = LI;
+      if (!Bounds) Bounds = ConstantInt::get(TT.getShadowTy(CI), 0);
+      if (!TT.isZeroShadow(Shadow)) {
+        IRB.CreateCall(TT.TaintMinimizeLabelFn, {Shadow, Bounds});
+      }
+    }
   }
 
   return true;

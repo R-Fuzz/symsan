@@ -308,11 +308,19 @@ __taint_add_constraint(dfsan_label label, uint8_t result) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_minimize_label(dfsan_label label) {
+__taint_minimize_label(dfsan_label label, dfsan_label bounds) {
   if (label == 0)
     return;
 
-  AOUT("minimize label: %d\n", label);
+  AOUT("minimize label: %d, bounds: %d\n", label, bounds);
+
+  if (bounds != 0) {
+    dfsan_label_info *bounds_info = get_label_info(bounds);
+    if (bounds_info->op == __dfsan::Alloca) {
+      AOUT("update size label from %d to %d\n", bounds_info->l2, label);
+      bounds_info->l2 = label;
+    }
+  }
 
   if (__pipe_fd < 0)
     return;
