@@ -111,6 +111,34 @@ fun:getc_unlocked=custom
 fun:_IO_getc=custom
 fun:getchar=custom
 
+# ignore I/O writes
+fun:write=ignore
+fun:writev=ignore
+fun:pwrite=ignore
+fun:pwrite64=ignore
+fun:pwritev=ignore
+fun:pwritev64=ignore
+fun:fprintf=ignore
+fun:vfprintf=ignore
+fun:printf=ignore
+fun:vprintf=ignore
+fun:snprintf=ignore
+fun:vsnprintf=ignore
+fun:sprintf=ignore
+fun:vsprintf=ignore
+fun:fwrite=ignore
+fun:fwrite_unlocked=ignore
+fun:fflush=ignore
+fun:fflush_unlocked=ignore
+fun:fputc=ignore
+fun:fputc_unlocked=ignore
+fun:putc=ignore
+fun:putc_unlocked=ignore
+fun:putchar=ignore
+fun:putchar_unlocked=ignore
+fun:fputs=ignore
+fun:puts=ignore
+
 # buffer size (sizeN means arg index N (0-indexed) holds the byte count)
 fun:_copy_from_user=size2
 

@@ -101,6 +101,7 @@ static const unsigned ArgTLSSize = 800;
 static const unsigned kRetvalTLSSize = 800;
 
 static const char *BBIDName = "dfsan.bb";
+static const unsigned BBID_STEP = 100000; // Max 100k BBs per function
 
 // Command line options
 static cl::opt<bool> ClTraceBound("ucsan-trace-bound",
@@ -364,6 +365,7 @@ class UCSan {
     WK_ShimTarget,  // LLM-generated __shim_ function, instrumented like in-scope
     WK_Uninstrumented,
     WK_Discard,
+    WK_Ignore,
   };
 
   Module *Mod;
@@ -1609,7 +1611,8 @@ Function *UCSan::buildDangleFunction(Function *F) {
   UCSanFunction UF(*this, NewF);
 
   const DataLayout &DL = Mod->getDataLayout();
-  bool resign_ptrargs = getenv("KO_RESIGN_PTRARGS") != nullptr;
+  bool ignore_resign = getWrapperKind(F) == WK_Ignore;
+  bool resign_ptrargs = getenv("KO_RESIGN_PTRARGS") != nullptr && !ignore_resign;
   bool checker_ubi = getenv("KO_CHECKER_UBI") != nullptr;
 
   // Get return address for tracking
@@ -1822,7 +1825,7 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
 
   // Add basic block tracing to entry point if enabled
   if (ClTraceBB) {
-    unsigned int BBCount = 0;
+    unsigned int BBCount = BBID_STEP;
     for (Function::iterator BI = F->begin(), BE = F->end(); BI != BE; ++BI, ++BBCount) {
       ConstantInt *BBID = ConstantInt::get(Int32Ty, BBCount);
 
@@ -2039,6 +2042,11 @@ UCSan::WrapperKind UCSan::getWrapperKind(Function *F) {
   // Check ABIList for discard functions (completely ignored, no wrapper)
   if (ABIList.isIn(*F, "discard"))
     return WK_Discard;
+
+  // Check ABIList for ignored external functions. These still get an external
+  // wrapper, but the wrapper must not resign pointer arguments.
+  if (ABIList.isIn(*F, "ignore"))
+    return WK_Ignore;
 
   // Check ABIList for uninstrumented functions
   if (ABIList.isIn(*F, "uninstrumented"))
@@ -2936,6 +2944,10 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     // Completely discarded, nothing to do
     return true;
 
+  case UCSan::WK_Ignore:
+    llvm_unreachable("WK_Ignore should be handled by external wrapper");
+    return false;
+
   case UCSan::WK_TaintCustom:
   case UCSan::WK_Uninstrumented:
   {
@@ -3692,10 +3704,10 @@ bool UCSan::runImpl(Module &M) {
 
     // Annotate BBs for all functions (excluding entry)
     if (!isEntry) {
-      unsigned int Idx = find(Scope.scope, F->getName()) - Scope.scope.begin() + 1;
+      unsigned int Idx = find(Scope.scope, F->getName()) - Scope.scope.begin() + 2;
       unsigned int BBCount = 0;
       for (Function::iterator BB = F->begin(); BB != F->end(); BB++, BBCount++) {
-        auto *BBID = ConstantInt::get(Int32Ty, Idx * 100000 + BBCount);
+        auto *BBID = ConstantInt::get(Int32Ty, Idx * BBID_STEP + BBCount);
         if (ClTraceBB) {
           CallInst::Create(UCTraceBBFn, {ConstantInt::get(Int32Ty, Idx), BBID},
                           "", &*BB->getFirstNonPHI());
