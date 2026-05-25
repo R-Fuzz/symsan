@@ -322,15 +322,15 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
   z3::expr out = first_byte;
   { // for ucsan, due to lazy init, the input may be empty
     if (input >= branch_deps_.size()) branch_deps_.resize(input + 1);
-    if (!is_negative_offset(offset)) {
-      if (offset >= branch_deps_[input].size())
-        branch_deps_[input].resize(offset + bytes);
+    if (is_negative_offset(offset) && input >= neg_branch_deps_.size()) {
+      neg_branch_deps_.resize(input + 1);
     }
   }
   // Load operation can load overlapping bytes, so we need to check
   if (get_branch_dep({input, offset}) == nullptr) {
     set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(first_byte));
   }
+  input_deps.insert(std::make_pair(input, offset));
   uint64_t val = 0;
 #if FILTER_WRONG_AST
   if (!is_negative_offset(offset) && inputs_cache_.size() > input &&
@@ -347,8 +347,6 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
       set_branch_dep({input, offset + i}, std::make_unique<branch_dependency_t>(byte_expr));
     }
     input_deps.insert(std::make_pair(input, offset + i));
-    // Cache each byte expr in branch_dependency (linear scan: always new)
-    set_branch_dep({input, offset + i}, std::make_unique<branch_dependency_t>(byte_expr));
 #if FILTER_WRONG_AST
     if (!is_negative_offset(offset + i) && inputs_cache_.size() > input &&
         inputs_cache_[input].second > offset + i) {
@@ -432,7 +430,6 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     } else if (info->op == __dfsan::Load) {
       uint32_t offset = get_label_info(info->l1)->op1.i; // legacy: offset in op1
       uint32_t input = get_label_info(info->l1)->op2.i;
-      input_deps.insert(std::make_pair(input, offset));
       uint64_t val = serialize_input(l, input, offset, info->l2, input_deps);
       TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(val);
@@ -466,7 +463,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
                 l, info->l1, base.get_sort().to_string().c_str());
         dump_value_cache(l);
       }
-      cache_expr(l, base.extract(info->size - 1, 0));
+      z3::expr trunc_expr = base.extract(info->size - 1, 0);
+      if (info->size == 1)
+        trunc_expr = (trunc_expr == context_.bv_val(1, 1));
+      cache_expr(l, trunc_expr);
       TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(value_cache_[info->l1] & ((1UL << info->size) - 1));
       continue;
@@ -1790,11 +1790,18 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
     // parse last branch cond
     input_dep_set_t inputs;
-    z3::expr cond = serialize(label, inputs);
+    z3::expr cond = serialize(label, inputs).simplify();
 
     // fix cond if it's bv1
     if (cond.is_bv() && cond.get_sort().bv_size() == 1) {
-      cond = (cond != context_.bv_val(0, 1));
+      cond = (cond != context_.bv_val(0, 1)).simplify();
+    }
+
+    if (Z3_get_bool_value(context_, cond) != Z3_L_UNDEF) {
+      // constant condition, no need to add constraint
+      // fprintf(stderr, "DEBUG parse_cond: label %u = %s is constant %d,\n",
+      //         label, cond.to_string().c_str(), result);
+      return 0;
     }
 
     // add negated last branch condition
@@ -1983,6 +1990,12 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
   try {
     input_dep_set_t inputs;
     z3::expr expr = serialize(label, inputs);
+
+    // fprintf(stderr, "DEBUG add_constraints for label %u: expr=(%s == %lu)\n",
+    //         label, expr.to_string().c_str(), result);
+    // for (auto off : inputs) {
+    //   fprintf(stderr, "DEBUG:  input dep: (%u, %u)\n", off.first, off.second);
+    // }
 
     // mark expression type for linking detection
     mark_expr_type(label, inputs);
@@ -2182,7 +2195,11 @@ void Z3AstParser::add_string_bitvec_link(offset_t off, z3_task_t *task) {
       z3::expr str_var = it->str_expr;  // cached str- expr
 
       // Get cached input- expr from branch_dependency
-      z3::expr input_var = get_branch_dep(off)->input_expr;
+      auto branch_dep = get_branch_dep(off);
+      if (branch_dep == nullptr) {
+        throw z3::exception("branch_dep not found for linking");
+      }
+      z3::expr input_var = branch_dep->input_expr;
 
       // str_var[pos] as integer == input_var as integer
       // Extract single-char substring, then convert to code point
@@ -2806,16 +2823,28 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
     uint32_t input = get_label_info(info->l1)->op2.i;
     uint32_t len = info->l2;  // number of bytes loaded
 
-    // Add dependencies for all bytes in the range
-    for (uint32_t i = 0; i < len; i++) {
-      deps.insert(std::make_pair(input, offset + i));
-    }
-
     // Create a single symbolic string variable: str-input-offset-len
     char name[256];
     snprintf(name, sizeof(name), str_name_format, input, offset, len);
     z3::symbol symbol = context_.str_symbol(name);
     z3::expr str_var = context_.constant(symbol, context_.string_sort());
+
+    { // handle ucsan's lazy input allocation
+      if (input >= branch_deps_.size())
+        branch_deps_.resize(input + 1);
+      if (is_negative_offset(offset) && input >= neg_branch_deps_.size()) {
+        neg_branch_deps_.resize(input + 1);
+      }
+    };
+
+    // Add dependencies for all bytes in the range
+    for (uint32_t i = 0; i < len; i++) {
+      if (get_branch_dep({input, offset + i}) == nullptr) {
+        set_branch_dep({input, offset + i},
+                       std::make_unique<branch_dependency_t>(str_var));
+      }
+      deps.insert(std::make_pair(input, offset + i));
+    }
 
     // Track string range and add linking constraints for overlapping ranges
     register_string_range(input, offset, offset + len, str_var);
@@ -2976,16 +3005,28 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
       uint32_t len = offsets.size();
       uint32_t start_offset = offsets[0];
 
-      // Add dependencies for all bytes
-      for (uint32_t off : offsets) {
-        deps.insert(std::make_pair(input_id, off));
-      }
-
       // Create single symbolic string variable
       char name[256];
       snprintf(name, sizeof(name), str_name_format, input_id, start_offset, len);
       z3::symbol symbol = context_.str_symbol(name);
       z3::expr str_var = context_.constant(symbol, context_.string_sort());
+
+      { // handle ucsan's lazy input allocation
+        if (input_id >= branch_deps_.size())
+          branch_deps_.resize(input_id + 1);
+        if (input_id >= neg_branch_deps_.size()) {
+          neg_branch_deps_.resize(input_id + 1);
+        }
+      };
+
+      // Add dependencies for all bytes
+      for (uint32_t off : offsets) {
+        if (get_branch_dep({input_id, off}) == nullptr) {
+          set_branch_dep({input_id, off},
+                         std::make_unique<branch_dependency_t>(str_var));
+        }
+        deps.insert(std::make_pair(input_id, off));
+      }
 
       // Track string range and add linking constraints for overlapping ranges
       register_string_range(input_id, start_offset, start_offset + len, str_var);
@@ -3048,6 +3089,21 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
     snprintf(name, sizeof(name), str_name_format, input, offset, 1);
     z3::symbol symbol = context_.str_symbol(name);
     z3::expr str_var = context_.constant(symbol, context_.string_sort());
+
+    { // handle ucsan's lazy input allocation
+      if (input >= branch_deps_.size())
+        branch_deps_.resize(input + 1);
+      if (is_negative_offset(offset) && input >= neg_branch_deps_.size()) {
+        neg_branch_deps_.resize(input + 1);
+      }
+    };
+
+    // Add dependency
+    if (get_branch_dep({input, offset}) == nullptr) {
+      set_branch_dep({input, offset},
+                     std::make_unique<branch_dependency_t>(str_var));
+    }
+    deps.insert(std::make_pair(input, offset));
 
     // Track string range and add linking constraints for overlapping ranges
     register_string_range(input, offset, offset + 1, str_var);
