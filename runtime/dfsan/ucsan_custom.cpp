@@ -677,14 +677,34 @@ static ucsan_file_state __ucsan_file = {0, 0, 0};
 static int __ucsan_fake_fd_counter = 1000;
 static uintptr_t __ucsan_fake_file_counter = 0xFAFE0000;
 
-// Return the singleton file state, lazily allocating a super-object label
-// on first call. The label is what ties the file's UC object to the super
-// via lookup_object's point-by relationship.
+static void materialize_file_object(ucsan_file_state *state) {
+  if (!state || state->object_id != 0) return;
+
+  uint32_t obj_id = 0;
+  lookup_object(state->label, 0, __builtin_return_address(0), &obj_id, 0, 0);
+  state->object_id = obj_id;
+  UCSAN_OUT("file simulator: resolved file_obj_id=%u (label=%u)\n",
+            obj_id, state->label);
+}
+
+// Each open/fopen creates an anchor pointer in the super object. The file
+// content object is then discovered through lookup_object({obj0, anchor_off})
+// so replay can rebuild obj_map from the seed metadata.
+static ucsan_file_state *open_file_state() {
+  auto lbl = create_label_from_super_object(sizeof(void*), true);
+  __ucsan_file.label = lbl.label;
+  __ucsan_file.object_id = 0;
+  __ucsan_file.offset = 0;
+  UCSAN_OUT("file simulator: opened anchor label=%u offset=%lu\n",
+            __ucsan_file.label, lbl.offset);
+  materialize_file_object(&__ucsan_file);
+  return &__ucsan_file;
+}
+
+// Fallback for read/getchar-style use without a prior open wrapper.
 static ucsan_file_state *get_file_state() {
   if (__ucsan_file.label == 0) {
-    auto lbl = create_label_from_super_object(sizeof(void*), true);
-    __ucsan_file.label = lbl.label;
-    UCSAN_OUT("file simulator: allocated singleton label=%u\n", __ucsan_file.label);
+    return open_file_state();
   }
   return &__ucsan_file;
 }
@@ -695,17 +715,8 @@ static ucsan_file_state *get_file_state() {
 static size_t simulate_file_read(ucsan_file_state *state, void *ptr, size_t n, off_t pos) {
   if (!state || !ptr || n == 0) return 0;
 
-  // Resolve the file UC object on first read via the handle's label.
-  // lookup_object reads (parent_obj_id, offset_in_parent) from the label
-  // and either finds an existing object_id in obj_map or allocates a new
-  // one — same mechanism used for external/lazy pointers.
-  if (state->object_id == 0) {
-    uint32_t obj_id = 0;
-    lookup_object(state->label, 0, __builtin_return_address(0), &obj_id, 0, 0);
-    state->object_id = obj_id;
-    UCSAN_OUT("file simulator: resolved file_obj_id=%u (label=%u)\n",
-              obj_id, state->label);
-  }
+  materialize_file_object(state);
+  if (state->object_id == 0) return 0;
 
   // Clamp at the per-object size limit. Anything past the cap returns
   // short (caller treats as EOF) rather than silently wrapping.
@@ -769,10 +780,10 @@ int __dfsw_open(const char *path, int oflags, ucsan_label path_label,
   int fake_fd = __ucsan_fake_fd_counter++;
   UCSAN_OUT("__dfsw_open(path=%s, oflags=%d) = fake fd %d\n",
             path ? path : "(null)", oflags, fake_fd);
-  // Lazily allocate the singleton so its label is available now and stays
-  // stable across re-runs; subsequent reads route through get_file_state().
-  ucsan_file_state *s = get_file_state();
-  *ret_label = s->label;
+  // The returned fd is just an opaque concrete handle; symbolic content comes
+  // from the file object anchored in obj0 at this open call.
+  open_file_state();
+  *ret_label = 0;
   __taint_set_retval_tls(0, 0, sizeof(int) * 8);
   return fake_fd;
 }
@@ -785,8 +796,8 @@ int __dfsw_openat(int dirfd, const char *path, int oflags,
   int fake_fd = __ucsan_fake_fd_counter++;
   UCSAN_OUT("__dfsw_openat(dirfd=%d, path=%s, oflags=%d) = fake fd %d\n",
             dirfd, path ? path : "(null)", oflags, fake_fd);
-  ucsan_file_state *s = get_file_state();
-  *ret_label = s->label;
+  open_file_state();
+  *ret_label = 0;
   __taint_set_retval_tls(0, 0, sizeof(int) * 8);
   return fake_fd;
 }
@@ -798,8 +809,8 @@ FILE *__dfsw_fopen(const char *filename, const char *mode,
   FILE *fake = (FILE *)(__ucsan_fake_file_counter++);
   UCSAN_OUT("__dfsw_fopen(filename=%s, mode=%s) = fake FILE* %p\n",
             filename ? filename : "(null)", mode ? mode : "(null)", fake);
-  ucsan_file_state *s = get_file_state();
-  *ret_label = s->label;
+  open_file_state();
+  *ret_label = 0;
   __taint_set_retval_tls(0, 0, sizeof(FILE*) * 8);
   return fake;
 }
