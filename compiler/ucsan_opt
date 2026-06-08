@@ -98,7 +98,8 @@ if args.taint:
     cc += f" -load {taint_pass_path}" \
           f" -load-pass-plugin={taint_pass_path}" \
           f" -taint-abilist={path_to_install}/lib/symsan/dfsan_abilist.txt" \
-          f" -taint-with-ucsan=true"
+          f" -taint-with-ucsan=true" \
+          f" -taint-solve-ub=true"
     # Pipeline: ucsan then taint
     cc += " -passes=ucsan,taint"
 else:
