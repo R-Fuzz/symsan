@@ -337,6 +337,12 @@ inline UCSanFlags& ucsan_flags() {
   return ucsan_flags_data;
 }
 
+inline uint64_t ucsan_object_size_limit() {
+  return ucsan_flags().max_obj_size > 0
+             ? static_cast<uint64_t>(ucsan_flags().max_obj_size)
+             : static_cast<uint64_t>(UCSAN_OBJECT_SIZE_LIMIT);
+}
+
 //===----------------------------------------------------------------------===//
 // UCSan Label Management
 //===----------------------------------------------------------------------===//

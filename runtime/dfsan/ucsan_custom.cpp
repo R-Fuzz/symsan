@@ -521,9 +521,10 @@ __dfsw_assume_init(void *ptr, size_t size, uint64_t id, ucsan_label ptr_label,
               id, ptr, ptr_label, size, obj->upper_bound);
     return;
   }
-  if (size > UCSAN_OBJECT_SIZE_LIMIT) {
-    UCSAN_OUT("WARNING: alloca resign size %lu exceeds limit %u, capping\n", size, UCSAN_OBJECT_SIZE_LIMIT);
-    size = UCSAN_OBJECT_SIZE_LIMIT;
+  if (size > ucsan_object_size_limit()) {
+    UCSAN_OUT("WARNING: alloca resign size %lu exceeds limit %lu, capping\n",
+              size, ucsan_object_size_limit());
+    size = ucsan_object_size_limit();
   }
   ucsan_label *shadow = ucsan_shadow_for(ptr);
   char *obj_ptr = (char *)ptr;
@@ -721,10 +722,10 @@ static size_t simulate_file_read(ucsan_file_state *state, void *ptr, size_t n, o
   // Clamp at the per-object size limit. Anything past the cap returns
   // short (caller treats as EOF) rather than silently wrapping.
   off_t end = pos + (off_t)n;
-  if (end > (off_t)UCSAN_OBJECT_SIZE_LIMIT) {
-    UCSAN_OUT("WARNING: file read end %ld exceeds object limit %u, capping\n",
-              (long)end, UCSAN_OBJECT_SIZE_LIMIT);
-    end = UCSAN_OBJECT_SIZE_LIMIT;
+  if (end > (off_t)ucsan_object_size_limit()) {
+    UCSAN_OUT("WARNING: file read end %ld exceeds object limit %lu, capping\n",
+              (long)end, ucsan_object_size_limit());
+    end = ucsan_object_size_limit();
     if (pos >= end) return 0;
     n = (size_t)(end - pos);
   }

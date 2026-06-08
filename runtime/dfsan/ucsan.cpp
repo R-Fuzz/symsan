@@ -534,7 +534,7 @@ ucsan_label allocate_label() {
 //===----------------------------------------------------------------------===//
 
 void* customized_malloc(uint64_t size) {
-  if (size > UCSAN_OBJECT_SIZE_LIMIT) {
+  if (size > ucsan_object_size_limit()) {
     UCSAN_OUT("Object size too large: %lu\n", size);
     exit(exit_reason::REASON_OBJ_OOB);
   }
@@ -717,9 +717,9 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
           }
         }
       }
-    } else if (size > UCSAN_OBJECT_SIZE_LIMIT) {
+    } else if (size > ucsan_object_size_limit()) {
       UCSAN_OUT("WARNING: global variable size too large: %lu\n", size);
-      size = UCSAN_OBJECT_SIZE_LIMIT;
+      size = ucsan_object_size_limit();
     }
     // Symbolize global variable on first access (label == 0)
     ucsan_label *shadow = ucsan_shadow_for(p);
@@ -775,7 +775,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
   if (label < UCSAN_CONST_OFFSET) {
     // Null dereference checking
     if (dereferencing && ucsan_flags().checker_nullderef) {
-      if ((uint64_t)p < size || (uint64_t)p < UCSAN_OBJECT_SIZE_LIMIT) {
+      if ((uint64_t)p < size || (uint64_t)p < ucsan_object_size_limit()) {
         // Trace null dereference event
         __taint_trace_event_addr(label, EVENT_NULL_DEREF, 0, __builtin_return_address(0), 0);
         exit(exit_reason::EVENT_NULL_DEREF);
@@ -951,7 +951,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     int64_t pseudo_base = (int64_t)ptr_info->pseudo_base;  // Read from ptr_info
     int64_t desired_offset = (int64_t)p - pseudo_base;
 
-    if (size > UCSAN_OBJECT_SIZE_LIMIT) {
+    if (size > ucsan_object_size_limit()) {
       UCSAN_OUT("Object access size too large: %zu\n", size);
       exit(exit_reason::REASON_OBJ_OOB);
     }
@@ -1022,7 +1022,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     uint64_t new_size = new_lower_bound + Max(desired_end,
                                          (int64_t)obj_label_info->upper_bound);
 
-    if (new_size > UCSAN_OBJECT_SIZE_LIMIT) {
+    if (new_size > ucsan_object_size_limit()) {
       UCSAN_OUT("Object size too large: %lu\n", new_size);
       exit(exit_reason::REASON_OBJ_OOB);
     }
@@ -1473,9 +1473,10 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       char *lower = (char*)obj_info->real_ptr - obj_info->lower_bound;
       char *upper = (char*)obj_info->real_ptr + obj_info->upper_bound;
       size_t alloca_size = upper - lower;
-      if (alloca_size > UCSAN_OBJECT_SIZE_LIMIT) {
-        UCSAN_OUT("WARNING: alloca resign size %zu exceeds limit %u, capping\n", alloca_size, UCSAN_OBJECT_SIZE_LIMIT);
-        upper = lower + UCSAN_OBJECT_SIZE_LIMIT;
+      if (alloca_size > ucsan_object_size_limit()) {
+        UCSAN_OUT("WARNING: alloca resign size %zu exceeds limit %lu, capping\n",
+                  alloca_size, ucsan_object_size_limit());
+        upper = lower + ucsan_object_size_limit();
       }
       ucsan_label *lp = ucsan_shadow_for(lower);
       ucsan_label *le = ucsan_shadow_for(upper);

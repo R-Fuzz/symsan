@@ -30,8 +30,9 @@ UCSAN_FLAG(bool, trace_bounds, false,
 UCSAN_FLAG(bool, no_enlarge, false,
            "Disallow object enlargement beyond initial size.")
 
-UCSAN_FLAG(int, max_obj_size, 1 << 20,
-           "Maximum object size for lazy initialization.")
+UCSAN_FLAG(int, max_obj_size, 0,
+           "Maximum object size for lazy initialization "
+           "(0 = use UCSAN_OBJECT_SIZE_LIMIT).")
 
 UCSAN_FLAG(const char *, input_file, "",
            "Input file containing seed objects.")
