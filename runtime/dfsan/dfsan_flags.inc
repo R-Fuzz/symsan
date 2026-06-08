@@ -45,6 +45,8 @@ DFSAN_FLAG(bool, trace_bounds, false, "trace bounds info.")
 DFSAN_FLAG(bool, trace_fsize, false, "trace file size.")
 DFSAN_FLAG(bool, exit_on_memerror, true, "terminate on memory error.")
 DFSAN_FLAG(bool, solve_ub, false, "solve undefined behavior.")
+DFSAN_FLAG(bool, allow_zero_size_alloc, false,
+           "Allow malloc-size minimization to solve allocation sizes to zero.")
 DFSAN_FLAG(bool, debug, false, "Print debug output.")
 DFSAN_FLAG(const char *, output_dir, ".", "The path for output file.")
 DFSAN_FLAG(int, instance_id, 0, "instance id for multi-instance fuzzing.")

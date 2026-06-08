@@ -308,11 +308,13 @@ __taint_add_constraint(dfsan_label label, uint8_t result) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_minimize_label(dfsan_label label, dfsan_label bounds) {
-  if (label == 0)
+__taint_minimize_label(dfsan_label label, u64 size, dfsan_label bounds) {
+  if (label == 0 || label == kInitializingLabel)
     return;
 
-  AOUT("minimize label: %d, bounds: %d\n", label, bounds);
+  void *addr = __builtin_return_address(0);
+
+  AOUT("minimize label: %d, bounds: %d, size: %lu\n", label, bounds, size);
 
   if (bounds != 0) {
     dfsan_label_info *bounds_info = get_label_info(bounds);
@@ -337,6 +339,16 @@ __taint_minimize_label(dfsan_label label, dfsan_label bounds) {
 
   if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
     Die();
+  }
+
+  if (!flags().allow_zero_size_alloc && size == 0) {
+    // Emit this after the minimize message so the manager records the hint
+    // before solving the synthetic nonzero condition.
+    static constexpr uint32_t kMinimizeNonzeroCid = 12;
+    dfsan_label_info *size_info = get_label_info(label);
+    dfsan_label nonzero_label =
+        dfsan_union(label, 0, (__dfsan::bvneq << 8) | ICmp, size_info->size, 0, 0);
+    __taint_send_cond(nonzero_label, 0, 1, 0, kMinimizeNonzeroCid, addr);
   }
 }
 

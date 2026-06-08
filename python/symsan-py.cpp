@@ -515,12 +515,13 @@ static PyObject* RecordMinimize(PyObject *self, PyObject *args) {
   }
 
   dfsan_label label = 0;
+  bool allow_zero = true;
 
-  if (!PyArg_ParseTuple(args, "I", &label)) {
+  if (!PyArg_ParseTuple(args, "I|b", &label, &allow_zero)) {
     return NULL;
   }
 
-  if (__z3_parser->record_minimize(label) != 0) {
+  if (__z3_parser->record_minimize(label, allow_zero) != 0) {
     PyErr_SetString(PyExc_RuntimeError, "failed to record minimize hint");
     return NULL;
   }

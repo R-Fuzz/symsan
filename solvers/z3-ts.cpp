@@ -2052,7 +2052,7 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
   return 0;
 }
 
-int Z3AstParser::record_minimize(dfsan_label label) {
+int Z3AstParser::record_minimize(dfsan_label label, bool allow_zero) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
     return -1;
   }
@@ -2061,7 +2061,7 @@ int Z3AstParser::record_minimize(dfsan_label label) {
     input_dep_set_t inputs;
     z3::expr expr = serialize(label, inputs);
     if (expr.is_bv() && !inputs.empty()) {
-      minimize_hints_.emplace_back(expr, inputs);
+      minimize_hints_.push_back({expr, allow_zero, inputs});
     }
   } catch (z3::exception e) {
     fprintf(stderr, "WARNING: z3 exception in record_minimize: %s\n", e.msg());
@@ -2373,11 +2373,11 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
       }
 
       // Find matching minimize hints based on input dep overlap
-      std::vector<z3::expr> alloc_minimize;
+      std::vector<std::pair<z3::expr, bool>> alloc_minimize;
       for (const auto &hint : minimize_hints_) {
-        for (const auto &dep : hint.second) {
+        for (const auto &dep : hint.deps) {
           if (model_inputs.count(dep)) {
-            alloc_minimize.push_back(hint.first);
+            alloc_minimize.push_back({hint.expr, hint.allow_zero});
             break;
           }
         }
@@ -2403,7 +2403,10 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           opt.minimize(sl);
         }
         for (const auto &am : alloc_minimize) {
-          opt.minimize(am);
+          opt.minimize(am.first);
+          if (!am.second) {
+            opt.add(am.first != 0);
+          }
         }
 
         bool use_optimized = false;

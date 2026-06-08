@@ -1054,7 +1054,7 @@ bool Taint::initializeModule(Module &M) {
        PrimitiveShadowTy, PrimitiveShadowTy}, false);
 
   TaintMinimizeLabelFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
-      { PrimitiveShadowTy, PrimitiveShadowTy }, false);
+      { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy }, false);
 
   ColdCallWeights = MDBuilder(*Ctx).createBranchWeights(1, 1000);
   return true;
@@ -1866,11 +1866,12 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
   if (!SizeArgIndices.empty()) {
     IRBuilder<> IRB(LI ? LI->getNextNode() : Next);
     for (unsigned Idx : SizeArgIndices) {
-      Value *Shadow = getShadow(CI->getArgOperand(Idx));
+      Value *Size = CI->getArgOperand(Idx);
+      Value *Shadow = getShadow(Size);
       Value *Bounds = LI;
       if (!Bounds) Bounds = ConstantInt::get(TT.getShadowTy(CI), 0);
       if (!TT.isZeroShadow(Shadow)) {
-        IRB.CreateCall(TT.TaintMinimizeLabelFn, {Shadow, Bounds});
+        IRB.CreateCall(TT.TaintMinimizeLabelFn, {Shadow, Size, Bounds});
       }
     }
   }
