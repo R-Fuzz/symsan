@@ -297,6 +297,20 @@ fun:strtoull=custom
 fun:atoi=custom
 fun:atol=custom
 fun:atoll=custom
+fun:htonl=custom
+fun:htons=custom
+fun:ntohl=custom
+fun:ntohs=custom
+fun:__bswap_16=custom
+fun:__bswap_32=custom
+fun:__bswap_64=custom
+fun:__bswapsi2=custom
+fun:__bswapdi2=custom
+# __bswap_16/32/64 have no libc abilist entry; mark uninstrumented (like other
+# custom libc funcs) so TaintPass wraps them instead of renaming to .taint.
+fun:__bswap_16=uninstrumented
+fun:__bswap_32=uninstrumented
+fun:__bswap_64=uninstrumented
 fun:tolower=custom
 fun:toupper=custom
 

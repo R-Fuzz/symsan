@@ -251,6 +251,43 @@ static void dfsan_memset(void *s, int c, dfsan_label c_label, size_t n) {
   dfsan_set_label(c_label, s, n);
 }
 
+static inline dfsan_label bswap_label(dfsan_label label, uint16_t bits) {
+  if (!label || bits <= 8)
+    return label;
+
+  const uint16_t num_bytes = bits / 8;
+  dfsan_label bytes[8] = {};
+  for (uint16_t i = 0; i < num_bytes; ++i) {
+    bytes[i] = dfsan_union(label, 0, __dfsan::Extract, 8, 0, i * 8);
+  }
+
+  dfsan_label result = bytes[num_bytes - 1];
+  uint16_t accum_bits = 8;
+  for (int i = (int)num_bytes - 2; i >= 0; --i) {
+    accum_bits += 8;
+    result = dfsan_union(result, bytes[i], __dfsan::Concat, accum_bits, 0, 0);
+  }
+  return result;
+}
+
+static inline dfsan_label net16_label(dfsan_label label) {
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return bswap_label(label, 16);
+#else
+  return label;
+#endif
+}
+
+static inline dfsan_label net32_label(dfsan_label label) {
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return bswap_label(label, 32);
+#else
+  return label;
+#endif
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, int64_t offset, unsigned size);
 
@@ -916,6 +953,78 @@ SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_toupper(int c, dfsan_label c_label, dfsan_label *ret_label) {
   int ret = toupper(c);
   *ret_label = dfsan_union(0, c_label, __dfsan::And, 8, 0x5f, 0);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint16_t __dfsw_htons(uint16_t hostshort, dfsan_label hostshort_label,
+                      dfsan_label *ret_label) {
+  uint16_t ret = htons(hostshort);
+  *ret_label = net16_label(hostshort_label);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint16_t __dfsw_ntohs(uint16_t netshort, dfsan_label netshort_label,
+                      dfsan_label *ret_label) {
+  uint16_t ret = ntohs(netshort);
+  *ret_label = net16_label(netshort_label);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint32_t __dfsw_htonl(uint32_t hostlong, dfsan_label hostlong_label,
+                      dfsan_label *ret_label) {
+  uint32_t ret = htonl(hostlong);
+  *ret_label = net32_label(hostlong_label);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint32_t __dfsw_ntohl(uint32_t netlong, dfsan_label netlong_label,
+                      dfsan_label *ret_label) {
+  uint32_t ret = ntohl(netlong);
+  *ret_label = net32_label(netlong_label);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint16_t __dfsw___bswap_16(uint16_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint16_t ret = __builtin_bswap16(x);
+  *ret_label = bswap_label(x_label, 16);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint32_t __dfsw___bswap_32(uint32_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint32_t ret = __builtin_bswap32(x);
+  *ret_label = bswap_label(x_label, 32);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint64_t __dfsw___bswap_64(uint64_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint64_t ret = __builtin_bswap64(x);
+  *ret_label = bswap_label(x_label, 64);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint32_t __dfsw___bswapsi2(uint32_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint32_t ret = __builtin_bswap32(x);
+  *ret_label = bswap_label(x_label, 32);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint64_t __dfsw___bswapdi2(uint64_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint64_t ret = __builtin_bswap64(x);
+  *ret_label = bswap_label(x_label, 64);
   return ret;
 }
 

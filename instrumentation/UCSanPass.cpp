@@ -1598,6 +1598,28 @@ Function *UCSan::buildDangleFunction(Function *F) {
   std::string FN = "__external$" + F->getName().str();
   Function *NewF = Function::Create(FT, GlobalValue::LinkageTypes::PrivateLinkage,
                                     F->getAddressSpace(), FN, Mod);
+
+  // libc/header byte-swap helpers are often emitted as out-of-scope static
+  // functions. Returning an arbitrary symbolic value here breaks protocol
+  // dispatch constraints like htons(ETHERTYPE_IP6). Keep these wrappers
+  // semantic and let the later TaintPass model llvm.bswap normally.
+  StringRef OrigName = F->getName();
+  if (OrigName == "__bswap_16" || OrigName == "__bswap_32" ||
+      OrigName == "__bswap_64") {
+    BasicBlock *BB = BasicBlock::Create(*Ctx, "entry", NewF);
+    IRBuilder<> IRB(BB);
+    Argument *Arg = &*NewF->arg_begin();
+    Type *ArgTy = Arg->getType();
+    if (ArgTy->isIntegerTy() && FT->getReturnType() == ArgTy) {
+      Function *Bswap = Intrinsic::getDeclaration(Mod, Intrinsic::bswap, ArgTy);
+      Value *Ret = IRB.CreateCall(Bswap, {Arg});
+      IRB.CreateRet(Ret);
+      return NewF;
+    }
+    IRB.CreateRet(Constant::getNullValue(FT->getReturnType()));
+    return NewF;
+  }
+
   // Some inputs are compiled with non-standard stack alignment; force realignment
   // so calls into UCSan runtime vararg logging are always safe.
   NewF->addFnAttr(Attribute::getWithStackAlignment(*Ctx, Align(16)));

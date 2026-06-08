@@ -51,6 +51,16 @@ fun:strstr=taint
 fun:strnstr=taint
 fun:memmem=taint
 
+fun:htonl=taint
+fun:htons=taint
+fun:ntohl=taint
+fun:ntohs=taint
+fun:__bswap_16=taint
+fun:__bswap_32=taint
+fun:__bswap_64=taint
+fun:__bswapsi2=taint
+fun:__bswapdi2=taint
+
 # custom assertions
 fun:assert_cond=taint
 fun:assume_cond=taint
