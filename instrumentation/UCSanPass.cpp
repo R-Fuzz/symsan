@@ -47,6 +47,8 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#include "UCSanSummary.h"
+
 #include "llvm/ADT/None.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
@@ -57,6 +59,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Attributes.h"
@@ -574,6 +577,15 @@ struct UCSanFunction {
   DenseSet<Value *> CheckedPtrSet;
   SmallVector<Value *, 16> NonZeroChecks;
 
+  struct LoadedPointerSummary {
+    unsigned ArgNo;
+    int64_t FieldOffset;
+  };
+
+  using MemoryAccessSummary = symsan::ucsan::MemoryAccessSummary;
+  DenseMap<Value *, LoadedPointerSummary> LoadedPointerSummaries;
+  SmallVector<MemoryAccessSummary, 8> MemoryAccessSummaries;
+
   /// Computes the shadow address for a given function argument.
   ///
   /// Shadow = ArgTLS+ArgOffset.
@@ -609,6 +621,10 @@ struct UCSanFunction {
 
   Value *checkPointer(Value *Ptr, Value *Size, bool dereference, IRBuilder<> &IRB,
                       uint32_t TypeID = 0);
+  void recordPointerLoadSummary(LoadInst &LI);
+  void recordMemoryAccessSummary(Value *Ptr, uint64_t AccessSize, bool IsWrite,
+                                 uint32_t TypeID, Instruction *I);
+  void emitMemoryAccessSummaries();
 
   UCSanFunction(UCSan &UC, Function *F)
       : UC(UC), F(F) {
@@ -2275,6 +2291,136 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
   }
 }
 
+static Value *stripPointerCastsForSummary(Value *V) {
+  while (true) {
+    if (auto *BC = dyn_cast<BitCastOperator>(V)) {
+      V = BC->getOperand(0);
+      continue;
+    }
+    if (auto *ASC = dyn_cast<AddrSpaceCastOperator>(V)) {
+      V = ASC->getOperand(0);
+      continue;
+    }
+    if (auto *CI = dyn_cast<CastInst>(V)) {
+      V = CI->getOperand(0);
+      continue;
+    }
+    return V;
+  }
+}
+
+static bool getArgumentBaseAndConstantOffset(Value *Ptr, const DataLayout &DL,
+                                             Argument *&Arg,
+                                             int64_t &Offset) {
+  Ptr = stripPointerCastsForSummary(Ptr);
+  APInt APOffset(DL.getIndexSizeInBits(Ptr->getType()->getPointerAddressSpace()), 0);
+
+  if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+    if (!GEP->accumulateConstantOffset(DL, APOffset))
+      return false;
+    Ptr = stripPointerCastsForSummary(GEP->getPointerOperand());
+  }
+
+  Arg = dyn_cast<Argument>(Ptr);
+  if (!Arg)
+    return false;
+
+  Offset = APOffset.getSExtValue();
+  return true;
+}
+
+static Value *getLoadedPointerBase(Value *Ptr, const DataLayout &DL,
+                                   int64_t &AccessOffset) {
+  Ptr = stripPointerCastsForSummary(Ptr);
+  AccessOffset = 0;
+
+  if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+    APInt APOffset(DL.getIndexSizeInBits(Ptr->getType()->getPointerAddressSpace()), 0);
+    if (!GEP->accumulateConstantOffset(DL, APOffset))
+      return nullptr;
+    AccessOffset = APOffset.getSExtValue();
+    Ptr = stripPointerCastsForSummary(GEP->getPointerOperand());
+  }
+
+  return Ptr;
+}
+
+void UCSanFunction::recordPointerLoadSummary(LoadInst &LI) {
+  if (!LI.getType()->isPointerTy())
+    return;
+
+  Argument *Arg = nullptr;
+  int64_t FieldOffset = 0;
+  if (!getArgumentBaseAndConstantOffset(LI.getPointerOperand(),
+                                        F->getParent()->getDataLayout(), Arg,
+                                        FieldOffset))
+    return;
+
+  LoadedPointerSummaries[&LI] = {Arg->getArgNo(), FieldOffset};
+}
+
+void UCSanFunction::recordMemoryAccessSummary(Value *Ptr, uint64_t AccessSize,
+                                              bool IsWrite, uint32_t TypeID,
+                                              Instruction *I) {
+  int64_t AccessOffset = 0;
+  Value *Base = getLoadedPointerBase(Ptr, F->getParent()->getDataLayout(),
+                                     AccessOffset);
+  if (!Base)
+    return;
+
+  auto It = LoadedPointerSummaries.find(Base);
+  if (It == LoadedPointerSummaries.end())
+    return;
+
+  unsigned Line = 0;
+  unsigned Col = 0;
+  if (const DebugLoc &DL = I->getDebugLoc()) {
+    Line = DL.getLine();
+    Col = DL.getCol();
+  }
+
+  MemoryAccessSummary Summary{
+      It->second.ArgNo,
+      It->second.FieldOffset + AccessOffset,
+      AccessSize,
+      IsWrite,
+      TypeID,
+      Line,
+      Col,
+  };
+
+  for (const MemoryAccessSummary &Existing : MemoryAccessSummaries) {
+    if (Existing.ArgNo == Summary.ArgNo &&
+        Existing.FieldOffset == Summary.FieldOffset &&
+        Existing.AccessSize == Summary.AccessSize &&
+        Existing.IsWrite == Summary.IsWrite &&
+        Existing.TypeID == Summary.TypeID &&
+        Existing.Line == Summary.Line &&
+        Existing.Col == Summary.Col)
+      return;
+  }
+
+  MemoryAccessSummaries.push_back(Summary);
+}
+
+void UCSanFunction::emitMemoryAccessSummaries() {
+  if (MemoryAccessSummaries.empty())
+    return;
+
+  LLVMContext &C = F->getContext();
+  SmallVector<Metadata *, 8> Summaries;
+  if (MDNode *Existing = symsan::ucsan::getMemoryAccessSummaries(*F)) {
+    for (const MDOperand &Op : Existing->operands())
+      Summaries.push_back(Op.get());
+  }
+
+  for (const MemoryAccessSummary &Summary : MemoryAccessSummaries) {
+    Summaries.push_back(symsan::ucsan::createMemoryAccessSummaryMD(C, Summary));
+  }
+
+  symsan::ucsan::setMemoryAccessSummaries(*F, MDNode::get(C, Summaries));
+}
+
 void UCSanVisitor::visitLoadInst(LoadInst &LI) {
   auto &DL = LI.getModule()->getDataLayout();
   Type *Ty = LI.getType();
@@ -2282,6 +2428,9 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
   if (StoreSize == 0) return;
 
   Value *Ptr = LI.getPointerOperand();
+  UF.recordPointerLoadSummary(LI);
+  UF.recordMemoryAccessSummary(Ptr, StoreSize, false,
+                               UF.UC.getOrCreateTypeID(Ty), &LI);
   Value *Base = Ptr->stripPointerCasts();
 
   // Check if loading from a constant global variable
@@ -3839,6 +3988,8 @@ bool UCSan::runImpl(Module &M) {
             Val, UF.getShadow(P.Phi->getIncomingValue(Val)));
       }
     }
+
+    UF.emitMemoryAccessSummaries();
 
     // Removal instructions
     for (auto *RI : UF.RemovalInsts)

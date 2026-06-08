@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 //#include "defs.h"
+#include "UCSanSummary.h"
 #include "version.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -35,6 +36,7 @@
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -2123,6 +2125,111 @@ void TaintFunction::hoistBoundsChecks() {
 
     const SCEV *BTC = SE.getBackedgeTakenCount(L);
     if (isa<SCEVCouldNotCompute>(BTC)) {
+      struct UCSanCallSummary {
+        CallInst *CI;
+        symsan::ucsan::MemoryAccessSummary Summary;
+      };
+      SmallVector<UCSanCallSummary, 8> UCSanCallSummaries;
+      if (ClWithUCSan) {
+        for (BasicBlock *BB : L->blocks()) {
+          if (LI->getLoopFor(BB) != L) continue;
+          for (Instruction &I : *BB) {
+            auto *CI = dyn_cast<CallInst>(&I);
+            if (!CI) continue;
+            Function *Callee = CI->getCalledFunction();
+            if (!Callee) continue;
+            MDNode *Summaries = symsan::ucsan::getMemoryAccessSummaries(*Callee);
+            if (!Summaries) continue;
+            for (const MDOperand &Op : Summaries->operands()) {
+              auto *SummaryNode = dyn_cast_or_null<MDNode>(Op.get());
+              symsan::ucsan::MemoryAccessSummary Summary;
+              if (!symsan::ucsan::parseMemoryAccessSummary(SummaryNode,
+                                                           Summary))
+                continue;
+              if (!Summary.IsWrite || Summary.AccessSize == 0 ||
+                  Summary.ArgNo >= CI->arg_size())
+                continue;
+              UCSanCallSummaries.push_back({CI, Summary});
+            }
+          }
+        }
+      }
+
+      auto GetSinglePredGuardCount = [&](CallInst *CI) -> Value * {
+        BasicBlock *BB = CI->getParent();
+        if (std::distance(pred_begin(BB), pred_end(BB)) != 1)
+          return nullptr;
+        BasicBlock *Pred = *pred_begin(BB);
+        auto *BI = dyn_cast<BranchInst>(Pred->getTerminator());
+        if (!BI || !BI->isConditional())
+          return nullptr;
+        if (BI->getSuccessor(0) != BB && BI->getSuccessor(1) != BB)
+          return nullptr;
+        auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+        if (!Cmp)
+          return nullptr;
+
+        Value *LHS = Cmp->getOperand(0);
+        Value *RHS = Cmp->getOperand(1);
+        if (auto *C = dyn_cast<ConstantInt>(RHS)) {
+          if (C->isZero())
+            return LHS;
+        }
+        if (auto *C = dyn_cast<ConstantInt>(LHS)) {
+          if (C->isZero())
+            return RHS;
+        }
+        return nullptr;
+      };
+
+      bool EmittedUnknownTripSummary = false;
+      for (const UCSanCallSummary &CallSummary : UCSanCallSummaries) {
+        CallInst *CI = CallSummary.CI;
+        const auto &Summary = CallSummary.Summary;
+        Value *Arg = CI->getArgOperand(Summary.ArgNo)->stripPointerCasts();
+        if (!L->isLoopInvariant(Arg) || !isa<AllocaInst>(Arg))
+          continue;
+
+        Value *Count = GetSinglePredGuardCount(CI);
+        if (!Count)
+          continue;
+
+        IRBuilder<> IRB(CI);
+        Type *I8PtrTy = Type::getInt8PtrTy(F->getContext());
+        Type *I8PtrPtrTy = PointerType::getUnqual(I8PtrTy);
+        Value *ArgI8 = IRB.CreateBitCast(Arg, I8PtrTy);
+        Value *FieldAddr = ArgI8;
+        if (Summary.FieldOffset != 0) {
+          FieldAddr = IRB.CreateGEP(
+              IRB.getInt8Ty(), ArgI8,
+              ConstantInt::get(TT.Int64Ty, Summary.FieldOffset, true));
+        }
+        Value *FieldAddrPtr = IRB.CreateBitCast(FieldAddr, I8PtrPtrTy);
+        Value *AddrLabel = loadShadow(I8PtrTy, FieldAddrPtr,
+                                      M->getDataLayout().getTypeStoreSize(I8PtrTy),
+                                      Align(1), CI);
+        Value *LoadedPtr = IRB.CreateLoad(I8PtrTy, FieldAddrPtr);
+        Value *StartVal = IRB.CreatePtrToInt(LoadedPtr, TT.Int64Ty);
+        Value *Count64 = IRB.CreateZExtOrTrunc(Count, TT.Int64Ty);
+        Value *TotalVal = Count64;
+        if (Summary.AccessSize != 1)
+          TotalVal = IRB.CreateMul(
+              Count64, ConstantInt::get(TT.Int64Ty, Summary.AccessSize));
+        Value *SizeShadow = getShadow(Count);
+
+        // Soft solve_size hint only: the guard value is a heuristic for the
+        // write count, not a proven bound, so a hard check_bounds here would
+        // risk spurious OOB aborts.
+        ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
+            TT.getInstructionId(CI));
+        IRB.CreateCall(TT.TaintSolveSizeFn,
+                       {AddrLabel, StartVal, SizeShadow, TotalVal, CID});
+        EmittedUnknownTripSummary = true;
+      }
+
+      if (EmittedUnknownTripSummary)
+        continue;
+
       // SCEV can't compute trip count — check for strlen-bounded loop:
       //   while (ptr[i] != 0) { ... __taint_check_bounds(...) ... }
       // Detect: loop exit is (icmp ne (load i8 (gep i8* base, iv)), 0)
@@ -2316,6 +2423,12 @@ void TaintFunction::hoistBoundsChecks() {
     // Collect bounds calls at this loop level (skip subloops).
     SmallVector<CallInst *, 8> BoundsChecks;
     SmallVector<CallInst *, 8> SolveBoundsCalls;
+    SmallVector<CallInst *, 8> UCSanPointerChecks;
+    struct UCSanCallSummary {
+      CallInst *CI;
+      symsan::ucsan::MemoryAccessSummary Summary;
+    };
+    SmallVector<UCSanCallSummary, 8> UCSanCallSummaries;
     for (BasicBlock *BB : L->blocks()) {
       if (LI->getLoopFor(BB) != L) continue;
       for (Instruction &I : *BB) {
@@ -2327,9 +2440,29 @@ void TaintFunction::hoistBoundsChecks() {
           BoundsChecks.push_back(CI);
         else if (Callee->getName() == "__taint_solve_bounds")
           SolveBoundsCalls.push_back(CI);
+        else if (ClWithUCSan && Callee->getName() == "ucsan_check_pointer")
+          UCSanPointerChecks.push_back(CI);
+        if (ClWithUCSan) {
+          if (MDNode *Summaries =
+                  symsan::ucsan::getMemoryAccessSummaries(*Callee)) {
+            for (const MDOperand &Op : Summaries->operands()) {
+              auto *SummaryNode = dyn_cast_or_null<MDNode>(Op.get());
+              symsan::ucsan::MemoryAccessSummary Summary;
+              if (!symsan::ucsan::parseMemoryAccessSummary(SummaryNode,
+                                                           Summary))
+                continue;
+              if (!Summary.IsWrite || Summary.AccessSize == 0 ||
+                  Summary.ArgNo >= CI->arg_size())
+                continue;
+              UCSanCallSummaries.push_back({CI, Summary});
+            }
+          }
+        }
       }
     }
-    if (BoundsChecks.empty()) continue;
+    if (BoundsChecks.empty() && SolveBoundsCalls.empty() &&
+        UCSanPointerChecks.empty() && UCSanCallSummaries.empty())
+      continue;
 
     auto ResolveLoopInvariantLabel = [&](Value *Label) -> Value * {
       if (L->isLoopInvariant(Label))
@@ -2370,6 +2503,10 @@ void TaintFunction::hoistBoundsChecks() {
       uint64_t ElemSize;
       CallInst *CI;
     };
+    // ptrtoint instructions materialized only to query SCEV; erased at the end
+    // of this loop if they end up unused.
+    SmallVector<Instruction *, 8> SCEVTemps;
+
     DenseMap<Value *, SmallVector<HoistCandidate, 4>> Groups;
     for (CallInst *CI : BoundsChecks) {
       Value *AddrLabel = CI->getArgOperand(0);  // ptr bounds shadow
@@ -2399,6 +2536,7 @@ void TaintFunction::hoistBoundsChecks() {
             if (ChkFn && ChkFn->getName() == "ucsan_check_pointer") {
               IRBuilder<> IRB(CI);
               AddrForSCEV = IRB.CreatePtrToInt(ChkCall->getArgOperand(0), TT.Int64Ty);
+              SCEVTemps.push_back(cast<Instruction>(AddrForSCEV));
             }
           }
         }
@@ -2413,6 +2551,46 @@ void TaintFunction::hoistBoundsChecks() {
       if (!StepC) continue;
       int64_t StepVal = StepC->getAPInt().getSExtValue();
       if (StepVal <= 0) continue;
+
+      Groups[AddrLabel].push_back({AR, SizeC->getZExtValue(), CI});
+    }
+
+    // UCSan may guard the concrete access directly with ucsan_check_pointer
+    // without a matching __taint_check_bounds on the checked pointer. Treat
+    // affine checked pointers as solve-hint candidates, but keep the original
+    // runtime checks in place.
+    for (CallInst *CI : UCSanPointerChecks) {
+      if (CI->arg_size() < 5)
+        continue;
+
+      auto *SizeC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+      auto *DerefC = dyn_cast<ConstantInt>(CI->getArgOperand(3));
+      if (!SizeC || !DerefC || !DerefC->isOne())
+        continue;
+
+      Value *AddrLabel = getShadow(CI);
+      if (TT.isZeroShadow(AddrLabel))
+        AddrLabel = getShadow(CI->getArgOperand(0));
+      if (TT.isZeroShadow(AddrLabel))
+        continue;
+
+      AddrLabel = ResolveLoopInvariantLabel(AddrLabel);
+      if (!AddrLabel)
+        continue;
+
+      IRBuilder<> LocalIRB(CI);
+      Value *PtrAsInt =
+          LocalIRB.CreatePtrToInt(CI->getArgOperand(0), TT.Int64Ty);
+      SCEVTemps.push_back(cast<Instruction>(PtrAsInt));
+      const SCEV *AddrSCEV = SE.getSCEV(PtrAsInt);
+      auto *AR = dyn_cast<SCEVAddRecExpr>(AddrSCEV);
+      if (!AR || AR->getLoop() != L)
+        continue;
+
+      const SCEV *Step = AR->getStepRecurrence(SE);
+      auto *StepC = dyn_cast<SCEVConstant>(Step);
+      if (!StepC || StepC->getAPInt().getSExtValue() <= 0)
+        continue;
 
       Groups[AddrLabel].push_back({AR, SizeC->getZExtValue(), CI});
     }
@@ -2477,9 +2655,69 @@ void TaintFunction::hoistBoundsChecks() {
                        {AddrLabel, StartVal, SizeShadow, TotalVal, CID});
       }
 
-      // Remove all original per-iteration checks in this group
-      for (auto &C : Candidates)
-        C.CI->eraseFromParent();
+      // Remove original __taint_check_bounds checks, but do not remove
+      // ucsan_check_pointer calls because they perform the runtime access
+      // validation and may materialize under-constrained objects.
+      for (auto &C : Candidates) {
+        Function *Callee = C.CI->getCalledFunction();
+        if (Callee && Callee->getName() == "__taint_check_bounds")
+          C.CI->eraseFromParent();
+      }
+    }
+
+    // UCSan callee summaries let us see stores hidden behind a call inside the
+    // loop. For a summary "callee loads a pointer from arg+field_offset and
+    // writes access_size bytes through it", emit a caller-side upper-bound
+    // check from the loop preheader. This is intentionally conservative: it
+    // only uses loop-invariant alloca-backed arguments so the inserted field
+    // load is safe without adding new UCSan instrumentation.
+    for (const UCSanCallSummary &CallSummary : UCSanCallSummaries) {
+      CallInst *CI = CallSummary.CI;
+      const auto &Summary = CallSummary.Summary;
+      Value *Arg = CI->getArgOperand(Summary.ArgNo)->stripPointerCasts();
+      if (!L->isLoopInvariant(Arg))
+        continue;
+      if (!isa<AllocaInst>(Arg))
+        continue;
+
+      const SCEV *TripCount =
+          SE.getAddExpr(BTC, SE.getConstant(BTC->getType(), 1));
+      const SCEV *TotalSCEV = SE.getMulExpr(
+          TripCount, SE.getConstant(TripCount->getType(), Summary.AccessSize));
+
+      IRBuilder<> IRB(InsertPt);
+      Type *I8PtrTy = Type::getInt8PtrTy(F->getContext());
+      Type *I8PtrPtrTy = PointerType::getUnqual(I8PtrTy);
+      Value *ArgI8 = IRB.CreateBitCast(Arg, I8PtrTy);
+      Value *FieldAddr = ArgI8;
+      if (Summary.FieldOffset != 0) {
+        FieldAddr = IRB.CreateGEP(
+            IRB.getInt8Ty(), ArgI8,
+            ConstantInt::get(TT.Int64Ty, Summary.FieldOffset, true));
+      }
+      Value *FieldAddrPtr = IRB.CreateBitCast(FieldAddr, I8PtrPtrTy);
+      Value *AddrLabel = loadShadow(I8PtrTy, FieldAddrPtr,
+                                    M->getDataLayout().getTypeStoreSize(I8PtrTy),
+                                    Align(1), InsertPt);
+      Value *LoadedPtr = IRB.CreateLoad(I8PtrTy, FieldAddrPtr);
+      Value *StartVal = IRB.CreatePtrToInt(LoadedPtr, TT.Int64Ty);
+      Value *TotalVal = Expander.expandCodeFor(TotalSCEV, TT.Int64Ty, InsertPt);
+
+      // Soft solve_size hint only. The summary records a fixed field offset and
+      // access size with no per-iteration stride, so trip_count * access_size is
+      // not a proven extent; a hard check_bounds here could abort spuriously.
+      SmallVector<Value *, 4> Unknowns;
+      collectSCEVUnknowns(TotalSCEV, Unknowns);
+      Value *SizeShadow = TT.ZeroPrimitiveShadow;
+      for (Value *V : Unknowns) {
+        Value *S = getShadow(V);
+        if (!TT.isZeroShadow(S))
+          SizeShadow = S;
+      }
+      ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
+          TT.getInstructionId(CI));
+      IRB.CreateCall(TT.TaintSolveSizeFn,
+                     {AddrLabel, StartVal, SizeShadow, TotalVal, CID});
     }
 
     // Some accesses do not have a matching check_bounds call with an affine
@@ -2731,8 +2969,8 @@ void TaintFunction::hoistBoundsChecks() {
         Value *TotalVal = IRB.CreateSelect(HeaderBr->getCondition(),
                                            TrueSize, FalseSize);
 
-        IRB.CreateCall(TT.TaintCheckBoundsFn,
-                       {KV.first, StartVal, TT.ZeroPrimitiveShadow, TotalVal});
+        // Soft solve_size hint only: ConstantIterations and the per-path counts
+        // are heuristics, not a proven extent, so no hard check_bounds here.
         ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
             TT.getInstructionId(Candidates[0].CI));
         IRB.CreateCall(TT.TaintSolveSizeFn,
@@ -2746,6 +2984,11 @@ void TaintFunction::hoistBoundsChecks() {
 
     for (CallInst *CI : HoistedSolveBounds)
       CI->eraseFromParent();
+
+    // Drop ptrtoint temporaries that were only needed for SCEV queries.
+    for (Instruction *T : SCEVTemps)
+      if (T->use_empty())
+        T->eraseFromParent();
   }
 }
 
