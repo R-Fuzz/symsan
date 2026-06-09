@@ -98,6 +98,8 @@ fun:fopen=custom
 fun:fopen64=custom
 fun:freopen=custom
 fun:fclose=custom
+fun:fileno=custom
+fun:fileno_unlocked=custom
 
 # I/O seek/tell
 fun:fseek=custom

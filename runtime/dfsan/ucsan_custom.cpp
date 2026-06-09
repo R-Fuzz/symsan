@@ -7,7 +7,9 @@
 #include "ucsan.h"
 
 #include <malloc.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace __sanitizer;
@@ -669,14 +671,25 @@ struct ucsan_file_state {
   ucsan_label label;      // label rooting the file object in the super obj
   uint32_t object_id;     // cached file UC object id (0 = not yet resolved)
   off_t offset;           // current sequential read position
+  off_t size;             // concrete backing-file size, or -1 if unknown
+  int fd;                 // current fake fd
+  FILE *stream;           // current fake FILE*
 };
-static ucsan_file_state __ucsan_file = {0, 0, 0};
+static ucsan_file_state __ucsan_file = {0, 0, 0, -1, -1, nullptr};
 
 // Counter for synthetic fd/FILE* values returned by our open/fopen wrappers.
 // Start above the usual stdio fds and at a recognizable bit pattern for
 // FILE* so accidental dereferences fault loudly instead of returning data.
 static int __ucsan_fake_fd_counter = 1000;
 static uintptr_t __ucsan_fake_file_counter = 0xFAFE0000;
+
+static off_t concrete_file_size(const char *path) {
+  if (!path) return -1;
+  struct stat st;
+  if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
+    return st.st_size;
+  return -1;
+}
 
 static void materialize_file_object(ucsan_file_state *state) {
   if (!state || state->object_id != 0) return;
@@ -691,11 +704,12 @@ static void materialize_file_object(ucsan_file_state *state) {
 // Each open/fopen creates an anchor pointer in the super object. The file
 // content object is then discovered through lookup_object({obj0, anchor_off})
 // so replay can rebuild obj_map from the seed metadata.
-static ucsan_file_state *open_file_state() {
+static ucsan_file_state *open_file_state(off_t size = -1) {
   auto lbl = create_label_from_super_object(sizeof(void*), true);
   __ucsan_file.label = lbl.label;
   __ucsan_file.object_id = 0;
   __ucsan_file.offset = 0;
+  __ucsan_file.size = size;
   UCSAN_OUT("file simulator: opened anchor label=%u offset=%lu\n",
             __ucsan_file.label, lbl.offset);
   materialize_file_object(&__ucsan_file);
@@ -708,6 +722,15 @@ static ucsan_file_state *get_file_state() {
     return open_file_state();
   }
   return &__ucsan_file;
+}
+
+static off_t simulated_file_size(ucsan_file_state *s) {
+  if (!s) return 0;
+  if (s->size >= 0) return s->size;
+  materialize_file_object(s);
+  if (s->object_id != 0 && s->object_id < ucsan_tainted.objects->size())
+    return (off_t)ucsan_tainted.objects->at(s->object_id).data.size();
+  return s->offset;
 }
 
 // Symbolize n bytes into ptr from the file UC object at position pos.
@@ -783,7 +806,9 @@ int __dfsw_open(const char *path, int oflags, ucsan_label path_label,
             path ? path : "(null)", oflags, fake_fd);
   // The returned fd is just an opaque concrete handle; symbolic content comes
   // from the file object anchored in obj0 at this open call.
-  open_file_state();
+  ucsan_file_state *s = open_file_state(concrete_file_size(path));
+  s->fd = fake_fd;
+  s->stream = nullptr;
   *ret_label = 0;
   __taint_set_retval_tls(0, 0, sizeof(int) * 8);
   return fake_fd;
@@ -797,7 +822,9 @@ int __dfsw_openat(int dirfd, const char *path, int oflags,
   int fake_fd = __ucsan_fake_fd_counter++;
   UCSAN_OUT("__dfsw_openat(dirfd=%d, path=%s, oflags=%d) = fake fd %d\n",
             dirfd, path ? path : "(null)", oflags, fake_fd);
-  open_file_state();
+  ucsan_file_state *s = open_file_state(concrete_file_size(path));
+  s->fd = fake_fd;
+  s->stream = nullptr;
   *ret_label = 0;
   __taint_set_retval_tls(0, 0, sizeof(int) * 8);
   return fake_fd;
@@ -810,7 +837,9 @@ FILE *__dfsw_fopen(const char *filename, const char *mode,
   FILE *fake = (FILE *)(__ucsan_fake_file_counter++);
   UCSAN_OUT("__dfsw_fopen(filename=%s, mode=%s) = fake FILE* %p\n",
             filename ? filename : "(null)", mode ? mode : "(null)", fake);
-  open_file_state();
+  ucsan_file_state *s = open_file_state(concrete_file_size(filename));
+  s->fd = __ucsan_fake_fd_counter++;
+  s->stream = fake;
   *ret_label = 0;
   __taint_set_retval_tls(0, 0, sizeof(FILE*) * 8);
   return fake;
@@ -837,6 +866,7 @@ int __dfsw_close(int fd, ucsan_label fd_label, ucsan_label *ret_label) {
   // Single-file simulator: no per-handle state to tear down. Reset offset
   // so a later open()+read() starts at byte 0 like a fresh handle would.
   __ucsan_file.offset = 0;
+  __ucsan_file.fd = -1;
   *ret_label = 0;
   __taint_set_retval_tls(0, 0, sizeof(int) * 8);
   return 0;
@@ -845,9 +875,70 @@ int __dfsw_close(int fd, ucsan_label fd_label, ucsan_label *ret_label) {
 __attribute__((visibility("default")))
 int __dfsw_fclose(FILE *stream, ucsan_label stream_label, ucsan_label *ret_label) {
   __ucsan_file.offset = 0;
+  __ucsan_file.fd = -1;
+  __ucsan_file.stream = nullptr;
   *ret_label = 0;
   __taint_set_retval_tls(0, 0, sizeof(int) * 8);
   return 0;
+}
+
+__attribute__((visibility("default")))
+int __dfsw_fileno(FILE *stream, ucsan_label stream_label,
+                  ucsan_label *ret_label) {
+  ucsan_file_state *s = get_file_state();
+  *ret_label = 0;
+  __taint_set_retval_tls(0, 0, sizeof(int) * 8);
+  if (stream == s->stream)
+    return s->fd;
+  return s->fd >= 0 ? s->fd : 0;
+}
+
+__attribute__((visibility("default")))
+int __dfsw_fileno_unlocked(FILE *stream, ucsan_label stream_label,
+                           ucsan_label *ret_label) {
+  return __dfsw_fileno(stream, stream_label, ret_label);
+}
+
+static int simulate_fstat(int fd, struct stat *buf, ucsan_label *ret_label) {
+  *ret_label = 0;
+  __taint_set_retval_tls(0, 0, sizeof(int) * 8);
+  ucsan_file_state *s = get_file_state();
+  if (!buf)
+    return -1;
+  internal_memset(buf, 0, sizeof(struct stat));
+  __taint_set_label(0, buf, sizeof(struct stat));
+  buf->st_mode = S_IFREG | 0600;
+  buf->st_nlink = 1;
+  buf->st_size = simulated_file_size(s);
+  UCSAN_OUT("__dfsw_fstat(fd=%d) simulated st_size=%ld\n",
+            fd, (long)buf->st_size);
+  return 0;
+}
+
+__attribute__((visibility("default")))
+int __dfsw_ucsan_fstat(int fd, struct stat *buf, ucsan_label fd_label,
+                       ucsan_label buf_label, ucsan_label *ret_label) {
+  return simulate_fstat(fd, buf, ret_label);
+}
+
+__attribute__((visibility("default")))
+int __dfsw_ucsan_fstat64(int fd, struct stat *buf, ucsan_label fd_label,
+                         ucsan_label buf_label, ucsan_label *ret_label) {
+  return simulate_fstat(fd, buf, ret_label);
+}
+
+__attribute__((visibility("default")))
+int __dfsw_ucsan_fxstat(int vers, int fd, struct stat *buf,
+                        ucsan_label vers_label, ucsan_label fd_label,
+                        ucsan_label buf_label, ucsan_label *ret_label) {
+  return simulate_fstat(fd, buf, ret_label);
+}
+
+__attribute__((visibility("default")))
+int __dfsw_ucsan_fxstat64(int vers, int fd, struct stat *buf,
+                          ucsan_label vers_label, ucsan_label fd_label,
+                          ucsan_label buf_label, ucsan_label *ret_label) {
+  return simulate_fstat(fd, buf, ret_label);
 }
 
 // ===== seek wrappers — just update the simulator offset =====
