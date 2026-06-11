@@ -192,8 +192,19 @@ static void add_runtime() {
 
   cc_params[cc_par_cnt++] = alloc_printf("-Wl,-T%s/taint.ld", obj_path);
 
-  if (is_cxx && !use_native_cxx) {
-    // Instrumented static libc++ for C++ builds
+  if (is_cxx && use_ucsan_only) {
+    // UCSan-only: link the plain (uninstrumented) EH runtime so C++ exception
+    // handling resolves to the real __cxa_*/personality/unwinder symbols that
+    // the UCSanPass EH passthrough calls.  The taint-instrumented libc++abi
+    // would only export ".taint"-mangled versions, so it cannot satisfy them.
+    // All of libc++ (the STL) is out-of-scope and dangled, so it is not linked.
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libc++abi-native.a", obj_path);
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libunwind-native.a", obj_path);
+  } else if (is_cxx && !use_native_cxx) {
+    // Instrumented static libc++ for C++ builds.  The EH subsystem inside
+    // libc++abi/libunwind is kept concrete via the abilist (the unwinder and
+    // __cxa_*/personality functions are marked uninstrumented) so exceptions
+    // unwind correctly while the STL stays instrumented for taint tracking.
     cc_params[cc_par_cnt++] = alloc_printf("%s/libc++.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/libc++abi.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/libunwind.a", obj_path);

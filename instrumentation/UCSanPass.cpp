@@ -92,8 +92,23 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <cxxabi.h>
 
 using namespace llvm;
+
+// Demangle a C++ mangled name. If demangling fails (e.g. plain C name),
+// return the original name unchanged.
+static std::string demangleName(StringRef MangledName) {
+  int Status = -1;
+  char *Demangled = abi::__cxa_demangle(
+      MangledName.str().c_str(), nullptr, nullptr, &Status);
+  if (Status == 0 && Demangled) {
+    std::string Result(Demangled);
+    free(Demangled);
+    return Result;
+  }
+  return MangledName.str();
+}
 
 namespace {
 
@@ -1867,10 +1882,13 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
     for (Function::iterator BI = F->begin(), BE = F->end(); BI != BE; ++BI, ++BBCount) {
       ConstantInt *BBID = ConstantInt::get(Int32Ty, BBCount);
 
-      // Add trace call at beginning of basic block
+      // Add trace call at beginning of basic block.
+      // Use getFirstInsertionPt() (not getFirstNonPHI): in C++ EH landing pads
+      // the landingpad must remain the first non-PHI instruction, and
+      // getFirstInsertionPt() advances past EH pads so we don't break the block.
       CallInst *CI = CallInst::Create(UCTraceBBFn,
                       {ConstantInt::get(Int32Ty, 0), BBID},
-                      "", &*BI->getFirstNonPHI());
+                      "", &*BI->getFirstInsertionPt());
 
       // Add metadata for BB tracking
       MDNode *MD = MDNode::get(Mod->getContext(),
@@ -3778,7 +3796,10 @@ bool UCSan::runImpl(Module &M) {
       continue;
     }
 
-    std::string FName = F.getName().str();
+    // Demangle the LLVM mangled name before matching against the YAML scope,
+    // which lists demangled (human) names. For plain C names demangleName()
+    // returns the name unchanged.
+    std::string FName = demangleName(F.getName());
 
     // Check if function is in scope
     bool inScope = false;
@@ -3867,7 +3888,7 @@ bool UCSan::runImpl(Module &M) {
 
     // Add driver wrapper for entry point
     bool isEntry = false;
-    if (F->getName() == Scope.entry ||
+    if (demangleName(F->getName()) == Scope.entry ||
         (Scope.entry == "main" && F->getName() == "__original$main")) {
       buildDriverWrapperFunction(F);
       isEntry = true;
@@ -3875,13 +3896,15 @@ bool UCSan::runImpl(Module &M) {
 
     // Annotate BBs for all functions (excluding entry)
     if (!isEntry) {
-      unsigned int Idx = find(Scope.scope, F->getName()) - Scope.scope.begin() + 2;
+      unsigned int Idx = find(Scope.scope, demangleName(F->getName())) - Scope.scope.begin() + 2;
       unsigned int BBCount = 0;
       for (Function::iterator BB = F->begin(); BB != F->end(); BB++, BBCount++) {
         auto *BBID = ConstantInt::get(Int32Ty, Idx * BBID_STEP + BBCount);
         if (ClTraceBB) {
+          // getFirstInsertionPt() (not getFirstNonPHI) so the trace call lands
+          // after any landingpad in C++ EH blocks, keeping the module valid.
           CallInst::Create(UCTraceBBFn, {ConstantInt::get(Int32Ty, Idx), BBID},
-                          "", &*BB->getFirstNonPHI());
+                          "", &*BB->getFirstInsertionPt());
         }
         MDNode *MD = MDNode::get(Mod->getContext(),
                                 {ConstantAsMetadata::get(BBID)});
@@ -4049,6 +4072,71 @@ bool UCSan::runImpl(Module &M) {
   for (Function &F : M) {
     if (F.isDSOLocal() && !F.hasLocalLinkage() && F.hasDefaultVisibility()) {
       F.setDSOLocal(false);
+    }
+  }
+
+  // === C++ exception-handling passthrough ===
+  // The dangle loop replaced C++ EH runtime functions with __external$ stubs
+  // that return normally, and erased the originals (F->eraseFromParent()).
+  // __cxa_throw is noreturn, so when its stub returns the caller hits
+  // `unreachable` (UB -> segfault / wrong exit code). Fix: rebuild the stubs as
+  // passthroughs to the real libc++ implementations so throw/catch works inside
+  // instrumented code. Because the originals were erased, we re-declare them via
+  // getOrInsertFunction using the stub's (preserved) signature.
+  {
+    static const char *CxxEHNames[] = {
+        "__cxa_throw",              "__cxa_rethrow",
+        "__cxa_allocate_exception", "__cxa_free_exception",
+        "__cxa_begin_catch",        "__cxa_end_catch",
+        nullptr};
+    for (int idx = 0; CxxEHNames[idx]; ++idx) {
+      const char *Name = CxxEHNames[idx];
+      std::string ExtName = std::string("__external$") + Name;
+      Function *ExtF = M.getFunction(ExtName);
+      if (!ExtF) continue;  // EH function not used in this module
+
+      // Re-declare the real libc++ implementation with the stub's signature.
+      FunctionCallee RealCallee =
+          M.getOrInsertFunction(Name, ExtF->getFunctionType());
+      Function *OrigF = dyn_cast<Function>(RealCallee.getCallee());
+      if (!OrigF) continue;
+
+      // Rebuild the stub body as a passthrough to the real function.
+      ExtF->deleteBody();
+      BasicBlock *BB = BasicBlock::Create(*Ctx, "entry", ExtF);
+      IRBuilder<> IRB(BB);
+      std::vector<Value *> Args;
+      for (auto &Arg : ExtF->args()) Args.push_back(&Arg);
+
+      bool IsNoReturn = StringRef(Name) == "__cxa_throw" ||
+                        StringRef(Name) == "__cxa_rethrow";
+      CallInst *CI = IRB.CreateCall(OrigF, Args);
+      if (IsNoReturn) {
+        CI->addFnAttr(Attribute::NoReturn);
+        IRB.CreateUnreachable();
+      } else if (ExtF->getReturnType()->isVoidTy()) {
+        IRB.CreateRetVoid();
+      } else {
+        IRB.CreateRet(CI);
+      }
+    }
+
+    // Restore the real __gxx_personality_v0 on all instrumented functions.
+    // The dangle loop's replaceAllUsesWith rewired the personality references to
+    // the stub; revert them so libunwind can correctly walk instrumented frames
+    // during EH unwinding.
+    Function *StubPersonality = M.getFunction("__external$__gxx_personality_v0");
+    if (StubPersonality) {
+      FunctionCallee RealCallee = M.getOrInsertFunction(
+          "__gxx_personality_v0", StubPersonality->getFunctionType());
+      if (Function *RealPersonality = dyn_cast<Function>(RealCallee.getCallee())) {
+        for (Function &F : M) {
+          if (F.hasPersonalityFn() &&
+              F.getPersonalityFn()->stripPointerCasts() == StubPersonality) {
+            F.setPersonalityFn(RealPersonality);
+          }
+        }
+      }
     }
   }
 
