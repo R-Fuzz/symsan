@@ -149,6 +149,69 @@ fun:sqrtf=functional
 fun:wctob=functional
 fun:wctob=functional
 
+# C++ exception-handling subsystem.  EH must run CONCRETELY: the unwinder, the
+# personality routine, and the Itanium __cxa_* / type-matching internals cannot
+# be meaningfully instrumented — instrumenting any of it breaks the unwind, so a
+# throw never reaches its catch.  EH is also tightly coupled (the entry points
+# call internal helpers and the DWARF unwinder), so the whole connected set must
+# be uninstrumented together; a plain caller of an instrumented callee is an
+# undefined-symbol link error.  Instrumented code reaches these via dfsw$
+# wrappers, and the thrown value's symbolic label still propagates through them
+# via address-keyed shadow memory.  Functions NOT listed (operator new/delete
+# = _Znwm/_ZdlPv, __cxa_guard_*) stay instrumented so the STL keeps taint
+# tracking.  (The _Unwind_* entry points are in the per-OS libc abilist.)
+#
+# IMPORTANT: only the functions on the *unwind* path are uninstrumented.  The
+# allocation and deallocation of the exception object run in normal context and
+# stay INSTRUMENTED so malloc/free remain captured (they are custom wrappers
+# recorded only at instrumented call sites) — symsan/ucsan needs this to track
+# allocation sizes for heap bug detection.  Specifically these stay instrumented
+# (NOT listed here): __cxa_allocate_exception(+dependent), __cxa_end_catch,
+# __cxa_free_exception(+dependent), __cxa_decrement_exception_refcount, and the
+# __aligned_malloc/__calloc/__free/__aligned_free_with_fallback wrappers.
+# __cxa_end_catch and friends are only called from the landing pad (instrumented
+# user code), never from the unwinder, so instrumenting them is safe.
+#
+# Unwind-path entry points (Itanium ABI, extern "C").  __cxa_begin_catch is here
+# because the unwinder's failed_throw (no-handler path) calls it directly, so it
+# must be concrete; __cxa_increment_exception_refcount follows because
+# begin_catch calls it.
+fun:__cxa_throw=uninstrumented
+fun:__cxa_rethrow=uninstrumented
+fun:__cxa_begin_catch=uninstrumented
+fun:__cxa_get_exception_ptr=uninstrumented
+fun:__cxa_call_unexpected=uninstrumented
+fun:__cxa_increment_exception_refcount=uninstrumented
+fun:__cxa_get_globals=uninstrumented
+fun:__cxa_get_globals_fast=uninstrumented
+fun:__gxx_personality_v0=uninstrumented
+fun:__dynamic_cast=uninstrumented
+# libc++abi C++ internals on the unwind path: personality statics (scan_eh_tab,
+# exception_spec_can_catch, failed_throw = _ZN10__cxxabiv1L*) and the can_catch /
+# dynamic-cast type-matching machinery (_ZNK10__cxxabiv1*).  The *_with_fallback
+# malloc/free wrappers are NOT matched by these patterns (they are
+# _ZN10__cxxabiv1<len>..., not L/K) so they stay instrumented and captured.
+fun:_ZN10__cxxabiv1L*=uninstrumented
+fun:_ZNK10__cxxabiv1*=uninstrumented
+# std::terminate / std::unexpected and their get/set handlers.
+fun:_ZSt9terminatev=uninstrumented
+fun:_ZSt10unexpectedv=uninstrumented
+fun:_ZSt11__terminatePFvvE=uninstrumented
+fun:_ZSt12__unexpectedPFvvE=uninstrumented
+fun:_ZSt13get_terminatev=uninstrumented
+fun:_ZSt13set_terminatePFvvE=uninstrumented
+fun:_ZSt14get_unexpectedv=uninstrumented
+fun:_ZSt14set_unexpectedPFvvE=uninstrumented
+# libunwind: the DWARF unwinder (entry API + statics).  The heavy lifting is
+# inlined into the __unw_* functions.
+fun:__unw_*=uninstrumented
+fun:unwind_phase2=uninstrumented
+fun:unwind_phase2_forced=uninstrumented
+fun:logAPIs=uninstrumented
+fun:logDWARF=uninstrumented
+fun:logUnwinding=uninstrumented
+fun:_ZN9libunwind*=uninstrumented
+
 # Functions that produce an output that does not depend on the input (shadow is
 # zeroed automatically).
 fun:__assert_fail=discard
