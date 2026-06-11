@@ -25,6 +25,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3795,23 +3796,23 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_event_addr,
                              uint16_t, uint32_t, uint64_t, void*, uint32_t) {}
 
 SANITIZER_INTERFACE_ATTRIBUTE void
-__dfsw_assert_cond(uint8_t result,  uint64_t id, dfsan_label result_label, dfsan_label id_label) {
+__dfsw_assert_cond(bool result,  uint64_t id, dfsan_label result_label, dfsan_label id_label) {
   if (!result) {
     AOUT("ERROR: assertion %lu failure: result %d, label %d\n", id, result, result_label);
     __taint_trace_event_addr(0, 103, id, (void *)__builtin_return_address(0), 8);
   } else {
     __taint_trace_event_addr(0, 103, id, (void *)__builtin_return_address(0), 9);
-    __taint_trace_cond(result_label, 1, UndefinedCheck, ub_assertion_failure);
+    __taint_trace_cond(result_label, result, UndefinedCheck, ub_assertion_failure);
   }
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE void
-__dfsw_assume_cond(uint8_t result, uint64_t id, dfsan_label result_label, dfsan_label id_label) {
+__dfsw_assume_cond(bool result, uint64_t id, dfsan_label result_label, dfsan_label id_label) {
   if (result_label) {
     AOUT("WARNING: assumption label is concrete for id %lu\n", id);
   }
   if (!result) {
-    __taint_trace_cond(result_label, 1, 0, id);
+    __taint_trace_cond(result_label, result, 0, id);
     AOUT("WARNING: assumption %lu is false, exiting\n", id);
     exit(0);
   }
