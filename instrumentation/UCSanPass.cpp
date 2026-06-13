@@ -190,6 +190,19 @@ class UCSanABIList {
     }
     return -1;
   }
+
+  // Returns the argument index whose pointer the function's return value
+  // aliases (e.g. strchr/memchr return haystack+index → retptr0), or -1.
+  // Used to translate the materialized return pointer back into UC space.
+  int getRetPtrArgIdx(StringRef Name) const {
+    if (!SCL) return -1;
+    for (int i = 0; i < 8; ++i) {
+      std::string Cat = "retptr" + std::to_string(i);
+      if (SCL->inSection("taint", "fun", Name, Cat))
+        return i;
+    }
+    return -1;
+  }
 };
 
 namespace {
@@ -412,6 +425,7 @@ class UCSan {
 
   // Runtime function types
   FunctionType *UCCheckPointerFnTy;
+  FunctionType *UCUncheckPointerFnTy;
   FunctionType *UCCheckPointerArgFnTy;
   FunctionType *UCCheckUBIFnTy;
   FunctionType *UCCombineLabelFnTy;
@@ -430,6 +444,7 @@ class UCSan {
 
   // Runtime functions
   FunctionCallee UCCheckPointerFn;
+  FunctionCallee UCUncheckPointerFn;
   FunctionCallee UCCheckPointerArgFn;
   FunctionCallee UCCheckUBIFn;
   FunctionCallee UCCombineLabelFn;
@@ -709,6 +724,19 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCCheckPointerFn = M.getOrInsertFunction("ucsan_check_pointer", UCCheckPointerFnTy);
   F = dyn_cast<Function>(UCCheckPointerFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // Inverse pointer translation: void* ucsan_uncheck_pointer(void*, i16)
+  // Converts a real pointer returned by a libc call (e.g. strchr -> haystack +
+  // index in the materialized buffer) back into the caller's UC pseudo space,
+  // using the haystack pointer's shadow label to find the backing object.
+  UCUncheckPointerFnTy = FunctionType::get(
+    VoidPtrTy,
+    {VoidPtrTy, PrimitiveShadowTy},
+    false);
+  UCUncheckPointerFn = M.getOrInsertFunction("ucsan_uncheck_pointer", UCUncheckPointerFnTy);
+  F = dyn_cast<Function>(UCUncheckPointerFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -3157,6 +3185,13 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     // is only consulted on pointer-arg paths anyway.
     bool IsMemOrStrFn = UF.UC.ABIList.isIn(*F, "taint");
 
+    // Functions whose return value is a pointer into a pointer argument
+    // (e.g. strchr/memchr return base+index). Capture the base arg's UC shadow
+    // so we can translate the materialized result pointer back into UC pseudo
+    // space after the call (see below).
+    int RetPtrIdx = UF.UC.ABIList.getRetPtrArgIdx(FName);
+    Value *RetPtrBaseShadow = nullptr;
+
     Value *LenVal = nullptr;
     if (LenArgIdx >= 0 && (unsigned)LenArgIdx < CB.arg_size()) {
       LenVal = IRB.CreateZExtOrTrunc(CB.getArgOperand(LenArgIdx), UF.UC.Int64Ty);
@@ -3224,6 +3259,11 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
           }
         }
 
+        // Capture the UC shadow of the base arg (before checkPointer resolves
+        // the pointer) for return-pointer translation.
+        if ((int)ArgIdx == RetPtrIdx)
+          RetPtrBaseShadow = UF.getShadow(*I);
+
         Value *rptr = *I;
         if (!skipCheckPointer) {
           rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
@@ -3249,9 +3289,49 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
                      {DstAddr, DstShadow, SrcAddr, SrcShadow, DstBound});
     }
 
-    // Set zero ucsan shadow for the return value; TaintPass will set the taint label.
     if (!FT->getReturnType()->isVoidTy()) {
-      UF.setShadow(&CB, UF.UC.getZeroShadow(&CB));
+      if (RetPtrIdx >= 0 && FT->getReturnType()->isPointerTy() &&
+          RetPtrBaseShadow) {
+        // The result points into the materialized buffer (base+index in np).
+        // Translate it back into the caller's UC pseudo space using the base
+        // arg's UC shadow, so pointer arithmetic against the original arg
+        // (e.g. p - c == index) is preserved. The symsan taint label is
+        // carried separately through the __dfsw_ retval TLS (different shadow
+        // memory), so rewriting the pointer value here does not affect it.
+        IRBuilder<> AfterIRB(CB.getNextNode());
+        // Only emit (and mark nosanitize) a cast when one is actually needed.
+        // CreateBitCast returns &CB unchanged when the types already match, and
+        // marking that nosanitize would suppress TaintPass on the real call.
+        Value *RetArg = &CB;
+        if (CB.getType() != UF.UC.VoidPtrTy) {
+          RetArg = AfterIRB.CreateBitCast(&CB, UF.UC.VoidPtrTy);
+          UF.UC.markNosanitize(RetArg);
+        }
+        CallInst *Unchecked = AfterIRB.CreateCall(
+            UF.UC.UCUncheckPointerFn, {RetArg, RetPtrBaseShadow});
+        // Do NOT mark the uncheck call nosanitize: TaintPass must visit it to
+        // propagate the symsan taint label from arg 0 (mirrors how it treats
+        // ucsan_check_pointer). nosanitize would suppress that propagation.
+        Value *RetFixed = Unchecked;
+        if (CB.getType() != Unchecked->getType()) {
+          RetFixed = AfterIRB.CreateBitCast(Unchecked, CB.getType());
+          UF.UC.markNosanitize(RetFixed);
+        }
+        // Redirect downstream uses to the UC pointer, but not the
+        // bitcast/uncheck chain we just created.
+        CB.replaceUsesWithIf(RetFixed, [&](Use &U) {
+          User *user = U.getUser();
+          return user != RetArg && user != Unchecked && user != RetFixed;
+        });
+        // The returned pointer aliases the base object and carries its UC shadow.
+        if (Instruction *RetFixedI = dyn_cast<Instruction>(RetFixed))
+          if (RetFixedI != &CB)
+            UF.setShadow(RetFixedI, RetPtrBaseShadow);
+        UF.setShadow(&CB, RetPtrBaseShadow);
+      } else {
+        // Set zero ucsan shadow for the return value; TaintPass sets the taint label.
+        UF.setShadow(&CB, UF.UC.getZeroShadow(&CB));
+      }
     }
     return true; // fully handled, skip normal arg/retval TLS stores
   }

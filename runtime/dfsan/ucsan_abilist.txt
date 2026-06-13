@@ -167,3 +167,18 @@ fun:strnstr=size2
 fun:strncpy=size2
 fun:strncat=size2
 fun:strndup=size1
+
+# functions whose return value is a pointer into a pointer argument
+# (retptrN means the result aliases arg N). Under UC the result must be
+# translated from the materialized buffer back into the caller's pseudo
+# pointer space (ucsan_uncheck_pointer) so that p - arg == index holds.
+# Their __dfsw_ wrappers also stash the haystack pointer label in op2's high
+# bits (low 8 bits = needle char) so the solver can constrain the base pointer
+# non-null and simplify (ptr - base) to the index. This is limited to the
+# single-char search ops, whose op2 is free; strstr/strpbrk/memmem keep a
+# needle/accept pointer in op2 (used for concrete content), so they have no
+# room to carry the pointer label and are not listed here.
+fun:strchr=retptr0
+fun:strrchr=retptr0
+fun:memchr=retptr0
+fun:memrchr=retptr0

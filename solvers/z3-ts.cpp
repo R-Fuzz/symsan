@@ -745,6 +745,14 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       z3::expr idx = z3::indexof(haystack_str, target_str, start_offset);
 
+      // Under UC the haystack pointer is symbolic; its label is stashed in the
+      // high 32 bits of op2 (the low 8 bits hold the needle char). The search
+      // result is base+index, so a match at index 0 collapses to a NULL pointer
+      // when the pseudo base is 0. Constrain the base pointer non-null so the
+      // solver picks a non-zero pseudo base; serialize() also pulls the pointer
+      // bytes into this op's deps so the constraint reaches the search branch.
+      add_haystack_ptr_nonnull((dfsan_label)(info->op2.i >> 32), input_deps);
+
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx);  // cache the index expression (Int sort)
       TRACK_LABEL_SEQ_ONLY();
@@ -804,6 +812,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
       // For reverse search, find the last occurrence
       z3::expr idx = z3::last_indexof(haystack_str, target_str);
+
+      // UC: constrain the (symbolic) haystack base pointer non-null; see fstrchr.
+      // The pointer label is stashed in op2's high bits (low 8 bits = char).
+      add_haystack_ptr_nonnull((dfsan_label)(info->op2.i >> 32), input_deps);
 
       tsize_cache_.emplace_back(1);
       cache_expr(l, idx);
@@ -1616,6 +1628,28 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             }
           }
         }
+        // UC variant: (PtrToInt(string_op) - PtrToInt(base)) = index, when the
+        // base pointer is the search's own (symbolic) haystack pointer. The
+        // haystack pointer label is stashed in the search op's op2 high bits.
+        // Without this the solver sees Sub(index, base_value) and can satisfy
+        // ==k by adjusting the (free) base value, picking the wrong index.
+        if (info->l1 >= CONST_OFFSET && info->l2 >= CONST_OFFSET) {
+          dfsan_label_info *l1_info = get_label_info(info->l1);
+          dfsan_label_info *l2_info = get_label_info(info->l2);
+          if (l1_info->op == __dfsan::PtrToInt && l1_info->l1 >= CONST_OFFSET &&
+              l2_info->op == __dfsan::PtrToInt && l2_info->l1 >= CONST_OFFSET) {
+            dfsan_label_info *src_info = get_label_info(l1_info->l1);
+            if (src_info->op >= __dfsan::fstr_op_start &&
+                src_info->op < __dfsan::fstr_op_end &&
+                (dfsan_label)(src_info->op2.i >> 32) == l2_info->l1) {
+              // base matches the haystack pointer: ptr - base = index
+              cache_expr(l, op1);
+              TRACK_LABEL_SEQ_ONLY();
+              RECORD_VALUE(val1);
+              break;
+            }
+          }
+        }
         cache_expr(l, op1 - op2);
         if (op1_is_int || op2_is_int) {
           TRACK_LABEL_SEQ_ONLY();
@@ -2218,6 +2252,24 @@ void Z3AstParser::add_string_bitvec_link(offset_t off, z3_task_t *task) {
   }
 }
 
+void Z3AstParser::add_haystack_ptr_nonnull(dfsan_label ptr_label,
+                                           input_dep_set_t &deps) {
+  if (ptr_label < CONST_OFFSET || ptr_label >= size_) return;
+  uint16_t op = get_label_info(ptr_label)->op;
+  // Alloca/Free labels track concrete stack/heap/global bounds, not a symbolic
+  // pointer value — skip them (this also keeps file-mode pointers untouched).
+  if (op == __dfsan::Alloca || op == __dfsan::Free) return;
+  try {
+    z3::expr cptr = serialize(ptr_label, deps);
+    if (cptr.is_bv()) {
+      aux_constraints_.push_back(
+          cptr != context_.bv_val(0, cptr.get_sort().bv_size()));
+    }
+  } catch (z3::exception &) {
+    // best-effort: if the pointer can't be serialized, skip the constraint
+  }
+}
+
 void Z3AstParser::register_string_range(uint32_t input, uint32_t start,
                                         uint32_t end, z3::expr str_var) {
   if (input >= string_ranges_.size()) return;
@@ -2447,7 +2499,6 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
         }
       }
 
-      // fprintf(stderr, "DEBUG solve_task[%lu]: final model:\n%s\n", task_id, m.to_string().c_str());
       generate_solution(m, solutions);
       // fprintf(stderr, "DEBUG solve_task[%lu]: after generate_solution, solutions.size() = %zu\n", task_id, solutions.size());
     } else if (res == z3::unsat) {

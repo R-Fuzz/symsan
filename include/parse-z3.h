@@ -255,6 +255,11 @@ private:
   // Register a string range and add linking constraints for overlapping ranges
   void register_string_range(uint32_t input, uint32_t start, uint32_t end,
                              z3::expr str_var);
+
+  // Constrain a (UC) string-search haystack base pointer to be non-null. The
+  // pointer label is carried in the high bits of a string op's op2. No-op for
+  // concrete/bounds (Alloca/Free) pointers. Pulls the pointer bytes into deps.
+  void add_haystack_ptr_nonnull(dfsan_label ptr_label, input_dep_set_t &deps);
 };
 
 class Z3ParserSolver : public Z3AstParser {

@@ -1091,6 +1091,41 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void* ucsan_uncheck_pointer(void* real_ptr, ucsan_label label) {
+  // Inverse of ucsan_check_pointer for an already-initialized UC pointer.
+  // ucsan_check_pointer maps pseudo -> real as:
+  //   real = obj_base + (pseudo - pseudo_base)
+  // so the inverse maps real -> pseudo as:
+  //   pseudo = pseudo_base + (real - obj_base)
+  // This is pure pointer arithmetic (like phys_to_virt): no object is
+  // allocated, provisioned, or grown here.
+  if (real_ptr == nullptr || label < UCSAN_CONST_OFFSET)
+    return real_ptr;
+
+  ucsan_label_info *info = get_label_info(label);
+  // Only translate genuine UC (external/pseudo) pointers. File-mode pointers
+  // (no ptr_info) pass through unchanged.
+  if (info->common.op != OP_EXTERNAL)
+    return real_ptr;
+
+  ucsan_ptr_info *ptr_info = to_ptr_info(info);
+  // We only uncheck a pointer that was previously resolved by
+  // ucsan_check_pointer, so it must already have a backing object.
+  if (ptr_info->status != PTR_INITIALIZED) {
+    Report("BUG: ucsan_uncheck_pointer on uninitialized UC pointer "
+           "(label=%u, status=%d)\n", label, ptr_info->status);
+    return real_ptr;
+  }
+
+  ucsan_obj_info *obj_label_info = to_obj_info(get_label_info(ptr_info->obj_label));
+  int64_t offset = (int64_t)real_ptr - (int64_t)obj_label_info->real_ptr;
+  void *pseudo = (void*)((int64_t)ptr_info->pseudo_base + offset);
+  UCSAN_OUT("uncheck_pointer: real=%p label=%u -> pseudo=%p (obj_base=%p, pseudo_base=%p, off=%ld)\n",
+            real_ptr, label, pseudo, obj_label_info->real_ptr, ptr_info->pseudo_base, offset);
+  return pseudo;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_check_ptr_arg(ucsan_label *label, uint32_t arg_index, void* ret_addr) {
   if (label[0] == kUninitializedLabel) {
     // Trace use-before-initialization event

@@ -416,6 +416,17 @@ extern void* __ucsan_null_deref_flag;
 SANITIZER_INTERFACE_ATTRIBUTE
 void* ucsan_check_pointer(void* p, __ucsan::ucsan_label label, size_t size, bool dereferencing, uint32_t type_id);
 
+// Inverse of ucsan_check_pointer: translate a real (materialized) pointer back
+// into the UC pseudo-pointer space, using the pointer's label to find the
+// backing object. Like phys_to_virt: no allocation, just offset arithmetic.
+// Functions whose result aliases an input UC pointer (e.g. strchr/memchr return
+// haystack+index in the materialized buffer) must convert the result back so
+// that pointer arithmetic against the original UC pointer (e.g. p - c) is
+// preserved. Returns real_ptr unchanged if label is not an initialized UC
+// pointer (e.g. file-mode pointers), or if real_ptr is null.
+SANITIZER_INTERFACE_ATTRIBUTE
+void* ucsan_uncheck_pointer(void* real_ptr, __ucsan::ucsan_label label);
+
 // Check pointer argument for use-before-initialization
 SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_check_ptr_arg(__ucsan::ucsan_label *label, uint32_t arg_index, void* ret_addr);

@@ -4260,8 +4260,12 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
     return;
   }
 
-  // handle ucsan_check_pointer
-  if (F && ClWithUCSan && F->getName().equals("ucsan_check_pointer")) {
+  // handle ucsan_check_pointer / ucsan_uncheck_pointer: both return a pointer
+  // that aliases their first argument (real<->pseudo translation), so the
+  // symsan taint label flows straight through from arg 0.
+  if (F && ClWithUCSan &&
+      (F->getName().equals("ucsan_check_pointer") ||
+       F->getName().equals("ucsan_uncheck_pointer"))) {
     // just propagate the label
     Value *Shadow = TF.getShadow(CB.getArgOperand(0));
     if (!TF.TT.isZeroShadow(Shadow)) {

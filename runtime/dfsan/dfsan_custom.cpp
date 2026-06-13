@@ -305,6 +305,20 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_check_bounds(dfsan_label addr_label, uptr addr,
                           dfsan_label size_label, uint64_t size);
 
+// Encode the haystack base-pointer label into the high 32 bits of a string
+// search op's op2 (whose low 8 bits hold the needle char). Under UC the search
+// result is base+index; the solver needs the base pointer's label so it can
+// pull its dependency / constrain it non-null. Returns op2 with both fields.
+// Without UCSan the pointer label is concrete (0) so this is a no-op.
+static inline uint64_t encode_strchr_op2(uint8_t needle, dfsan_label s_label) {
+#ifdef USE_UCSAN_CUSTOM
+  return (uint64_t)needle | ((uint64_t)s_label << 32);
+#else
+  (void)s_label;
+  return (uint64_t)needle;
+#endif
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid);
 
@@ -450,7 +464,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
                              content_len,
                              (uint64_t)s,
-                             (uint64_t)(uint8_t)c);
+                             encode_strchr_op2((uint8_t)c, s_label));
 
     // Send concrete haystack content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -1984,7 +1998,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     // size = haystack length if haystack concrete, else 0
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrchr,
                              content_len,
-                             (uint64_t)s, (uint64_t)(uint8_t)c);
+                             (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
 
     // Send concrete content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -2023,7 +2037,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
                              content_len,
                              (uint64_t)s,
-                             (uint64_t)(uint8_t)c);
+                             encode_strchr_op2((uint8_t)c, s_label));
 
     // Send concrete haystack content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -2076,7 +2090,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
     // size = haystack length if haystack concrete, else 0
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrrchr,
                              content_len,
-                             (uint64_t)s, (uint64_t)(uint8_t)c);
+                             (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
 
     // Send concrete content if haystack is concrete
     if (content_len > 0 && *ret_label) {
