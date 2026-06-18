@@ -3342,9 +3342,11 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     if (!CI)
       return false;
 
+    auto FName = F->getName();
+    bool IsContractPrim = FName.startswith("assume_") || FName.startswith("assert_");
+
     TransformedFunction CustomFn = UF.UC.getCustomFunctionType(FT);
-    std::string CustomFName = "__dfsw_";
-    CustomFName += F->getName();
+    std::string CustomFName = "__dfsw_" + FName.str();
     FunctionCallee CustomF =
         UF.UC.Mod->getOrInsertFunction(CustomFName, CustomFn.TransformedType);
     if (Function *CustomFnPtr = dyn_cast<Function>(CustomF.getCallee())) {
@@ -3364,7 +3366,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     auto *I = CB.arg_begin();
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
       Type *T = (*I)->getType();
-      if (isa<PointerType>(T)) {
+      if (isa<PointerType>(T) && !IsContractPrim) {
         // Check pointer arguments before passing to custom function
         auto DL = getDataLayout();
         Type *PointeeTy = T->getPointerElementType();

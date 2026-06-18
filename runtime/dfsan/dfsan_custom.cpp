@@ -3828,7 +3828,8 @@ __dfsw_assume_cond(bool result, uint64_t id, dfsan_label result_label, dfsan_lab
   if (!result) {
     __taint_trace_cond(result_label, result, 0, id);
     AOUT("WARNING: assumption %lu is false, exiting\n", id);
-    exit(0);
+    __taint_trace_event_addr(result_label, 103, id, (void*)result, 10);
+    exit(201);
   }
   __taint_add_constraint(result_label, 1);
 }

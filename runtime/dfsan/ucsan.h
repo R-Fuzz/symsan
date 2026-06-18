@@ -291,6 +291,7 @@ enum ucsan_assertion_type {
   ASSERTION_INIT_SUCCESS = 7,
   ASSERTION_COND_FAILED = 8,
   ASSERTION_COND_SUCCESS = 9,
+  ASSUMPTION_CONTRACTION = 10,
 };
 
 //===----------------------------------------------------------------------===//

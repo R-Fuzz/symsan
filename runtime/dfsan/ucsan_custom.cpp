@@ -207,6 +207,7 @@ void __dfsw_free(void *ptr, ucsan_label ptr_label) {
       info->common.op = OP_FREE;
     } else if (info->common.op == OP_FREE) {
       UCSAN_OUT("WARNING: double free detected for ptr %p, label %d\n", ptr, ptr_label);
+      __taint_trace_event_addr(ptr_label, EVENT_DOUBLE_FREE, 0, __builtin_return_address(0), 0);
       exit(exit_reason::EVENT_DOUBLE_FREE);
     } else {
       UCSAN_OUT("WARNING: free ptr_label %d with unknown op %d\n", ptr_label, info->common.op);
@@ -521,12 +522,14 @@ __dfsw_assume_init(void *ptr, size_t size, uint64_t id, ucsan_label ptr_label,
   ucsan_obj_info *obj = to_obj_info(info);
   if (obj->op != OP_ALLOCA) {
     UCSAN_OUT("WARNING: assumption %lu failure: ptr %p, label %d, op %d\n", id, ptr, ptr_label, obj->op);
-    return;
+    __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSUMPTION_CONTRACTION);
+    exit(exit_reason::EVENT_CONTRACTION);
   }
   if (size > obj->upper_bound) {
     UCSAN_OUT("WARNING: assumption %lu failure: ptr %p, label %d, size %lu exceeds upper bound %u\n",
               id, ptr, ptr_label, size, obj->upper_bound);
-    return;
+    __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSUMPTION_CONTRACTION);
+    exit(exit_reason::EVENT_CONTRACTION);
   }
   if (size > ucsan_object_size_limit()) {
     UCSAN_OUT("WARNING: alloca resign size %lu exceeds limit %lu, capping\n",
@@ -596,7 +599,8 @@ __dfsw_assume_allocated(void *ptr, size_t size, uint64_t id, ucsan_label ptr_lab
     // should not happen, contradiction
     UCSAN_OUT("WARNING: assume_allocated id=%lu, ptr=%p, label=%d is already freed\n",
               id, ptr, ptr_label);
-    exit(0);
+    __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSUMPTION_CONTRACTION);
+    exit(exit_reason::EVENT_CONTRACTION);
   } else {
     // external ptr
     ucsan_label_info *info = get_label_info(ptr_label);
@@ -633,7 +637,8 @@ __dfsw_assume_freed(void *ptr, uint64_t id, ucsan_label ptr_label,
   if (info->common.op == OP_ALLOCA) {
     UCSAN_OUT("WARNING: assume_freed id=%lu, ptr=%p, label=%d is still allocated\n",
               id, ptr, ptr_label);
-    exit(0);
+    __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSUMPTION_CONTRACTION);
+    exit(exit_reason::EVENT_CONTRACTION);
   }
   // otherwise we just mark it as freed
   // internal_memset(info, 0, sizeof(*info));

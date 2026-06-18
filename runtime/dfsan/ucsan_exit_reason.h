@@ -16,4 +16,7 @@ enum exit_reason {
   EVENT_OOB_UPCAST = 161,
 
   EVENT_PANIC = 171,
+
+  /* assumption assertion errors */
+  EVENT_CONTRACTION = 201,
 };
