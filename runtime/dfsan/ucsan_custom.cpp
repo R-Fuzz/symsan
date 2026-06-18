@@ -203,8 +203,13 @@ void __dfsw_free(void *ptr, ucsan_label ptr_label) {
   // Mark buffer as freed for UAF detection
   if (ptr && ptr_label > UCSAN_CONST_LABEL) {
     ucsan_label_info *info = get_label_info(ptr_label);
-    if (info->common.op == OP_ALLOCA) {
+    if (info->common.op == OP_ALLOCA || info->common.op == OP_EXTERNAL) {
       info->common.op = OP_FREE;
+    } else if (info->common.op == OP_FREE) {
+      UCSAN_OUT("WARNING: double free detected for ptr %p, label %d\n", ptr, ptr_label);
+      exit(exit_reason::EVENT_DOUBLE_FREE);
+    } else {
+      UCSAN_OUT("WARNING: free ptr_label %d with unknown op %d\n", ptr_label, info->common.op);
     }
   }
   // don't actually free the buffer, to capture UAFs
@@ -580,13 +585,18 @@ __dfsw_assume_allocated(void *ptr, size_t size, uint64_t id, ucsan_label ptr_lab
   }
   // ptr has a label, just make sure size is right
   ucsan_label_info *info = get_label_info(ptr_label);
-  if (info->common.op == OP_ALLOCA || info->common.op == OP_FREE) {
+  if (info->common.op == OP_ALLOCA) {
     ucsan_obj_info *obj = to_obj_info(info);
     if (size > obj->upper_bound) {
       void *new_ptr = __dfsw_realloc(ptr, size, ptr_label, size_label, ret_label);
       return new_ptr;
     }
     *ret_label = ptr_label;
+  } else if (info->common.op == OP_FREE) {
+    // should not happen, contradiction
+    UCSAN_OUT("WARNING: assume_allocated id=%lu, ptr=%p, label=%d is already freed\n",
+              id, ptr, ptr_label);
+    exit(0);
   } else {
     // external ptr
     ucsan_label_info *info = get_label_info(ptr_label);
@@ -611,6 +621,27 @@ __dfsw_assume_allocated(void *ptr, size_t size, uint64_t id, ucsan_label ptr_lab
   return ptr;
 }
 
+SANITIZER_INTERFACE_ATTRIBUTE void*
+__dfsw_assume_freed(void *ptr, uint64_t id, ucsan_label ptr_label,
+                    ucsan_label id_label, ucsan_label *ret_label) {
+  if (ptr_label == 0) {
+    ptr_label = allocate_label();
+    check_label(ptr_label);
+  }
+  ucsan_label_info *info = get_label_info(ptr_label);
+  // check for contradictions
+  if (info->common.op == OP_ALLOCA) {
+    UCSAN_OUT("WARNING: assume_freed id=%lu, ptr=%p, label=%d is still allocated\n",
+              id, ptr, ptr_label);
+    exit(0);
+  }
+  // otherwise we just mark it as freed
+  // internal_memset(info, 0, sizeof(*info));
+  info->common.op = OP_FREE;
+  *ret_label = ptr_label;
+  return ptr;
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE void
 __dfsw_panic(char *reason, ucsan_label reason_label) {
   UCSAN_OUT("PANIC: %s\n", reason);
@@ -630,20 +661,6 @@ __dfsw___assert_fail(const char *assertion, const char *file,
                      ucsan_label line_label, ucsan_label function_label) {
   UCSAN_OUT("ASSERT FAILED: %s at %s:%u (%s)\n", assertion, file, line, function);
   _exit(EVENT_PANIC);
-}
-
-SANITIZER_INTERFACE_ATTRIBUTE void*
-__dfsw_assume_freed(void *ptr, uint64_t id, ucsan_label ptr_label,
-                    ucsan_label id_label, ucsan_label *ret_label) {
-  if (ptr_label == 0) {
-    ptr_label = allocate_label();
-    check_label(ptr_label);
-  }
-  ucsan_label_info *info = get_label_info(ptr_label);
-  internal_memset(info, 0, sizeof(*info));
-  info->common.op = OP_FREE;
-  *ret_label = ptr_label;
-  return ptr;
 }
 
 //===----------------------------------------------------------------------===//
