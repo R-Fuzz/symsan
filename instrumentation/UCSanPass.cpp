@@ -3571,6 +3571,16 @@ void UCSanVisitor::visitReturnInst(ReturnInst &RI) {
       StoreInst *SI = IRB.CreateAlignedStore(S, UF.getRetvalTLS(RT, IRB), ShadowTLSAlignment);
       UF.UC.markNosanitize(SI);
     }
+  } else {
+    // for void return, clean the tls return value shadow to zero
+    // store void* enough?
+    Type *RT = UF.UC.VoidPtrTy;
+    unsigned Size = getDataLayout().getTypeAllocSize(UF.UC.getShadowTy(RT));
+    if (Size <= kRetvalTLSSize) {
+      StoreInst *SI = IRB.CreateAlignedStore(UF.UC.getZeroShadow(RT),
+          UF.getRetvalTLS(RT, IRB), ShadowTLSAlignment);
+      UF.UC.markNosanitize(SI);
+    }
   }
 
   if (ClTraceBB) {

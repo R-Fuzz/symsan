@@ -113,6 +113,19 @@ struct AddrRangeMap {
     return false;
   }
 
+  // Iteration over all entries in sorted (start address) order.
+  // Entries are stored contiguously, so plain pointers serve as iterators.
+  typedef AddrRangeEntry *iterator;
+  typedef const AddrRangeEntry *const_iterator;
+
+  iterator begin() { return entries; }
+  iterator end() { return entries + len; }
+  const_iterator begin() const { return entries; }
+  const_iterator end() const { return entries + len; }
+
+  uint32_t size() const { return len; }
+  bool empty() const { return len == 0; }
+
 private:
   void grow() {
     uint32_t old_cap = cap;

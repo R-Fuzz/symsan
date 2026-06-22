@@ -39,3 +39,6 @@ UCSAN_FLAG(const char *, input_file, "",
 
 UCSAN_FLAG(bool, disable_loop_bounds, false,
            "Disable loop unrolling bounds.")
+
+UCSAN_FLAG(bool, check_memleak, false,
+           "Check for memory leaks.")

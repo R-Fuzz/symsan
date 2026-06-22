@@ -1757,6 +1757,136 @@ void ucsan_pop_stack_frame() {
   }
 }
 
+/// scan shadow for ptr labels and recursively mark
+void ucsan_scan_mark_reachable(void *base, uint64_t size) {
+
+  UCSAN_OUT("ucsan_scan_mark_reachable: base=%p, size=%lu\n", base, size);
+
+  ucsan_label *shadow = ucsan_shadow_for(base);
+  for (uptr i = 0; i < size; ++i) {
+    // ptr labels can occupy multiple bytes, but once marked reachable,
+    // the duplicated ones will be skipped
+    ucsan_label label = shadow[i];
+    if (label >= UCSAN_CONST_OFFSET) {
+      ucsan_label_info *info = get_label_info(label);
+      if (info->common.op == OP_EXTERNAL) {
+        // external pointer, find the real object and continue scanning
+        // Mark this object as reachable by setting op to OP_FREE
+        info->common.op = OP_FREE;
+        ucsan_ptr_info *ptr_info = to_ptr_info(info);
+        if (ptr_info->status == PTR_INITIALIZED) {
+          ucsan_label obj_label = ptr_info->obj_label;
+          if (obj_label >= UCSAN_CONST_OFFSET) {
+            ucsan_label_info *obj_info = get_label_info(obj_label);
+            if (obj_info->common.op == OP_RESERVED_OBJ) {
+              ucsan_obj_info *obj = to_obj_info(obj_info);
+              // object spans [real_ptr - lower_bound, real_ptr + upper_bound)
+              ucsan_scan_mark_reachable((char*)obj->real_ptr - obj->lower_bound,
+                                        obj->lower_bound + obj->upper_bound);
+            } else {
+              UCSAN_OUT("WARNING: expected obj label %u, got op %d\n",
+                        obj_label, obj_info->common.op);
+            }
+          } else {
+            UCSAN_OUT("WARNING: expected obj label %u, got non-pointer label\n", obj_label);
+          }
+        } // else uninitialized pointer, skip
+      } else if (info->common.op == OP_ALLOCA) {
+        // explicitly allocated object, mark as reachable and continue scanning
+        info->common.op = OP_FREE;
+        ucsan_obj_info *obj = to_obj_info(info);
+        // object spans [real_ptr - lower_bound, real_ptr + upper_bound)
+        ucsan_scan_mark_reachable((char*)obj->real_ptr - obj->lower_bound,
+                                  obj->lower_bound + obj->upper_bound);
+      }
+    }
+  }
+}
+
+/// mark and sweep style detector for unreachable memory regions
+void ucsan_scan_shadow_for_leaks() {
+  // This function can be called at program exit to detect memory leaks
+  // by scanning the shadow memory for objects that are still live (not freed)
+  // yet unreachable.
+
+  UCSAN_OUT("ucsan_scan_shadow_for_leaks: scanning shadow memory for leaks\n");
+  uint32_t last_label = atomic_load(&__ucsan_last_label, memory_order_relaxed);
+
+  // step 1: mark reachable objects as freed
+  // first set of roots: global variables
+  if (__global_bounds_map_inited) {
+    for (auto &entry : __global_bounds_map) {
+      ucsan_label label = entry.ptr_label;
+      void *base = (void*)entry.start;
+      ucsan_label_info *info = get_label_info(label);
+      UCSAN_OUT("global var: label=%u, base=%p, size=%lu, op=%d\n",
+                label, base, entry.size, info->common.op);
+      if (info->common.op != OP_ALLOCA) {
+        UCSAN_OUT("WARNING: unexpected global var label op %d\n", info->common.op);
+        continue;
+      }
+      info->common.op = OP_FREE; // mark as freed to indicate reachable
+      ucsan_scan_mark_reachable(base, entry.size);
+    }
+  }
+
+  // second set of roots: pseudo pointers in the union table
+  for (unsigned i = 0; i <= last_label; ++i) {
+    ucsan_label_info *info = get_label_info(i);
+    if (info->common.op == OP_EXTERNAL) {
+      // external pointer, find the real object and continue scanning
+      info->common.op = OP_FREE; // mark as freed to indicate reachable
+      ucsan_ptr_info *ptr_info = to_ptr_info(info);
+      if (ptr_info->status == PTR_INITIALIZED) {
+        ucsan_label obj_label = ptr_info->obj_label;
+        if (obj_label >= UCSAN_CONST_OFFSET) {
+          ucsan_label_info *obj_info = get_label_info(obj_label);
+          if (obj_info->common.op == OP_RESERVED_OBJ) {
+            ucsan_obj_info *obj = to_obj_info(obj_info);
+            // object spans [real_ptr - lower_bound, real_ptr + upper_bound)
+            ucsan_scan_mark_reachable((char*)obj->real_ptr - obj->lower_bound,
+                                      obj->lower_bound + obj->upper_bound);
+          } else {
+            UCSAN_OUT("WARNING: expected obj label %u, got op %d\n",
+                      obj_label, obj_info->common.op);
+          }
+        } else {
+          UCSAN_OUT("WARNING: expected obj label %u, got non-pointer label\n", obj_label);
+        }
+      }
+    }
+  }
+
+  // third set of root: return value labels in TLS
+  {
+    // FIXME: assume scalar return value for now
+    ucsan_label retval_label = __ucsan_retval_tls[0];
+    if (retval_label >= UCSAN_CONST_OFFSET) {
+      ucsan_label_info *info = get_label_info(retval_label);
+      if (info->common.op == OP_ALLOCA) {
+        // external pointer, find the real object and continue scanning
+        info->common.op = OP_FREE; // mark as freed to indicate reachable
+        ucsan_obj_info *obj = to_obj_info(info);
+        // object spans [real_ptr - lower_bound, real_ptr + upper_bound)
+        ucsan_scan_mark_reachable((char*)obj->real_ptr - obj->lower_bound,
+                                  obj->lower_bound + obj->upper_bound);
+      }
+    }
+  }
+
+  // step 2: report any remaining non-freed objects as leaks
+  for (unsigned i = 0; i <= last_label; ++i) {
+    ucsan_label_info *info = get_label_info(i);
+    if (info->common.op == OP_ALLOCA) {
+      ucsan_obj_info *obj = to_obj_info(info);
+      UCSAN_OUT("ERROR: MEMLEAK detected: label=%u, ptr=%p, size=%u\n",
+                i, obj->real_ptr, obj->lower_bound + obj->upper_bound);
+      __taint_trace_event_addr(i, EVENT_MEMLEAK, 0, obj->real_ptr, 0);
+    }
+  }
+}
+
+
 //===----------------------------------------------------------------------===//
 // Initialization
 //===----------------------------------------------------------------------===//
@@ -1836,6 +1966,10 @@ static void ucsan_init_shadow_memory() {
 
 static void ucsan_fini_internal() {
   UCSAN_OUT("UCSan runtime finalized\n");
+
+  if (ucsan_flags().check_memleak) {
+    ucsan_scan_shadow_for_leaks();
+  }
 
   if (__global_bounds_map_inited) {
     __global_bounds_map.destroy();
