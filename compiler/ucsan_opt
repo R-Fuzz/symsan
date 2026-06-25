@@ -36,6 +36,7 @@ argparser.add_argument('-t', '--taint', action="store_true", help="Enable TaintP
 argparser.add_argument('-i', '--indirect-call', action="store_true", help="Enable indirect call wrapping",default=False)
 argparser.add_argument('-c', '--clean', action="store_false", help="Clean up the temporary files",default=True)
 argparser.add_argument('-r', '--resign-ptrargs', action="store_true", help="Resign pointer arguments",default=False)
+argparser.add_argument('--type-table', type=str, default=None, help="Path to emit the typeid->type table (UCSanPass -ucsan-type-table)")
 argparser.add_argument('-v', '--verbose', action="count", help="Verbose level",default=0)
 argparser.add_argument('-s', '--cov', type=str, help="Path to the coverage file", default=None)
 argparser.add_argument('files', action="extend", help="Path to llvm bitcode files to analyse. Note that you may add 'files' in the metadata to specify target" ,type=str, nargs='*')
@@ -73,6 +74,9 @@ if not args.optimization:
 if args.tracebb:
     KO_FLAGS.append("KO_TRACE_BB=1")
     cc += " -ucsan-trace-bb=true"
+
+if args.type_table:
+    cc += f" -ucsan-type-table={args.type_table}"
 
 if args.indirect_call:
     KO_FLAGS.append("KO_WRAP_INDIRECT_CALL=1")
