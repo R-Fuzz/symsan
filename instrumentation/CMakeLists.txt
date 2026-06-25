@@ -13,9 +13,11 @@ include(AddLLVM)
 set(LLVM_OPTIONAL_SOURCES
   TaintPass.cpp
   UCSanPass.cpp
+  LoopOutlinePass.cpp
 )
 
 add_llvm_pass_plugin(TaintPass TaintPass.cpp)
 add_llvm_pass_plugin(UCSanPass UCSanPass.cpp)
+add_llvm_pass_plugin(LoopOutlinePass LoopOutlinePass.cpp)
 
-install (TARGETS TaintPass UCSanPass DESTINATION ${SYMSAN_LIB_DIR})
+install (TARGETS TaintPass UCSanPass LoopOutlinePass DESTINATION ${SYMSAN_LIB_DIR})
