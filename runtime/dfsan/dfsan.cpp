@@ -32,6 +32,7 @@
 #include "taint_allocator.h"
 #include "union_util.h"
 #include "union_hashtable.h"
+#include "ucsan_exit_reason.h"
 
 #include <assert.h>
 #include <arpa/inet.h>
@@ -228,6 +229,11 @@ static dfsan_label do_taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid);
 
+// Forward declarations for trace callbacks (implemented in solvers)
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_trace_event_addr(uint32_t label, uint32_t event_id,
+                              uint64_t info, void* addr, uint32_t info2);
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2) {
@@ -373,6 +379,9 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           cond = do_taint_union(l2, 0, (bveq << 8) | __dfsan::ICmp, size,
                                 orig_op2, 0);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_division_by_zero);
+        } else {
+          AOUT("WARNING: division by zero\n");
+          __taint_trace_event_addr(l2, EVENT_DIV_BY_ZERO, 0, __builtin_return_address(0), 0);
         }
         break;
       case __dfsan::Shl:
@@ -486,6 +495,9 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
                                           size, overflow_check, 0);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      } else {
+        AOUT("WARNING: signed integer overflow\n");
+        __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
       }
 
       // Unsigned overflow: result < op1 (for any non-zero op2)
@@ -521,6 +533,9 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
                                           size, overflow_check, 0);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      } else {
+        AOUT("WARNING: signed integer overflow\n");
+        __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
       }
 
       // Unsigned overflow: for multiplication, check if result / op1 != op2 (when op1 != 0)
@@ -557,6 +572,9 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
                                           size, overflow_check, 0);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+      } else {
+        AOUT("WARNING: signed integer overflow\n");
+        __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
       }
 
       // Unsigned underflow: result > op1 when op2 > 0
@@ -2093,5 +2111,10 @@ dfsan_label __taint_get_ptr_bounds_label(void *ptr, uint64_t lower, uint64_t upp
        bound, (void*)lower, (void*)upper);
   return bound;
 }
+
+// Weak stub for UCSan's event tracing
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_event_addr,
+                             uint32_t, uint32_t, uint64_t, void*,
+                             uint32_t) {}
 
 }  // extern "C"

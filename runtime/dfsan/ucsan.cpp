@@ -35,7 +35,7 @@ using namespace __sanitizer;
 
 // Forward declarations for trace callbacks (implemented in solvers)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_trace_event_addr(__ucsan::ucsan_label label, uint32_t event_id,
+void __taint_trace_event_addr(uint32_t label, uint32_t event_id,
                               uint64_t info, void* addr, uint32_t info2);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -2068,7 +2068,7 @@ extern "C" {
 
 // Weak definition for event tracing
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_event_addr,
-                             __ucsan::ucsan_label, uint32_t, uint64_t, void*,
+                             uint32_t, uint32_t, uint64_t, void*,
                              uint32_t) {}
 
 // Weak definition for global variable tracing
