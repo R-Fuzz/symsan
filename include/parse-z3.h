@@ -3,6 +3,7 @@
 #include "parse.h"
 
 #include <z3++.h>
+#include <set>
 
 namespace symsan {
 
@@ -19,7 +20,9 @@ public:
     }
   }
 
-  int restart(std::vector<input_t> &inputs) override;
+  int restart(std::vector<input_t> &inputs, bool copy_input = false) override;
+  /// @brief Update input cache without clearing deps
+  int update_input(std::vector<input_t> &inputs, bool copy_input = false);
   int parse_cond(dfsan_label label, bool result, bool add_nested,
                  std::vector<uint64_t> &tasks) override;
   int parse_gep(dfsan_label ptr_label, uptr ptr,
@@ -29,15 +32,59 @@ public:
                 std::vector<uint64_t> &tasks) override;
 
   int add_constraints(dfsan_label label, uint64_t result) override;
+  int record_minimize(dfsan_label label, bool allow_zero = true) override;
 
 protected:
   z3::context &context_;
   const char* input_name_format;
   const char* atoi_name_format;
   const char* strlen_name_format;
+  const char* str_name_format;
+  const char* int_name_format;
 
-  // String ranges for null-byte post-processing (input_id -> list of (start, end))
-  std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> string_ranges_;
+  // Auxiliary constraints generated during serialization (e.g., Int variable bounds)
+  std::vector<z3::expr> aux_constraints_;
+
+  // Expressions to minimize during solving (e.g., malloc sizes)
+  // Each entry: (expr to minimize, set of input offsets it depends on)
+  struct minimize_hint_t {
+    z3::expr expr;
+    bool allow_zero;  // whether to allow zero as a valid solution
+    std::unordered_set<offset_t, offset_hash> deps;
+  };
+  std::vector<minimize_hint_t> minimize_hints_;
+
+  // String range entry with cached str- expr for linking constraints
+  struct string_range_t {
+    uint32_t start;
+    uint32_t end;
+    z3::expr str_expr;  // cached str-X-Y-Z expr (z3::expr handles refcount)
+
+    string_range_t(uint32_t s, uint32_t e, z3::expr expr)
+        : start(s), end(e), str_expr(expr) {}
+  };
+
+  // Transparent comparator: order by (start, end) so ranges with the same
+  // start but different lengths coexist.  Heterogeneous lookup by uint32_t
+  // still works for upper_bound (compares against start only).
+  struct string_range_cmp {
+    using is_transparent = void;  // Enable heterogeneous lookup
+
+    bool operator()(const string_range_t &a, const string_range_t &b) const {
+      if (a.start != b.start) return a.start < b.start;
+      return a.end < b.end;
+    }
+    bool operator()(const string_range_t &a, uint32_t offset) const {
+      return a.start < offset;
+    }
+    bool operator()(uint32_t offset, const string_range_t &b) const {
+      return offset < b.start;
+    }
+  };
+
+  // String ranges for null-byte post-processing and linking constraints
+  // vector indexed by input_id, each contains a sorted set of ranges
+  std::vector<std::set<string_range_t, string_range_cmp>> string_ranges_;
 
   // String info cache: label -> (input_id, offset, length)
   struct string_info_t {
@@ -48,8 +95,11 @@ protected:
   std::unordered_map<dfsan_label, string_info_t> string_info_cache_;
 
 private:
-  // Original input cache
+  // Original input cache (stores pointers to input data)
   std::vector<input_t> inputs_cache_;
+
+  // Copied input data (when copy_input=true, owns the data)
+  std::vector<std::vector<uint8_t>> inputs_copy_;
 
   // fsize flag
   bool has_fsize;
@@ -64,6 +114,10 @@ private:
   std::vector<uint64_t> value_cache_;
   static const size_t SIZE_INCREMENT = 2048;
 
+  // Label-level tracking: what type of variables does each expression involve?
+  std::vector<bool> is_label_bv_;   // involves bitvec variables (input-X-Y)
+  std::vector<bool> is_label_seq_;  // involves string/seq variables (str-X-Y-Z)
+
   // dependencies
   struct expr_hash {
     std::size_t operator()(const z3::expr &expr) const {
@@ -76,20 +130,76 @@ private:
     }
   };
   using expr_set_t = std::unordered_set<z3::expr, expr_hash, expr_equal>;
-  struct branch_dependency {
+  // Comparison info stored for Int mirroring of BV nested constraints
+  struct cmp_info_t {
+    dfsan_label l1;      // left operand label
+    dfsan_label l2;      // right operand label
+    uint16_t predicate;  // comparison predicate (e.g., bvsle)
+    bool result;         // concrete result (true/false)
+  };
+
+  struct branch_dependency_t {
     expr_set_t expr_deps;
     input_dep_set_t input_deps;
+    bool used_in_bv = false;   // any saved constraint involves bitvec
+    bool used_in_seq = false;  // any saved constraint involves string/seq
+    z3::expr input_expr;  // cached input-X-Y expr (z3::expr handles refcount)
+    std::vector<cmp_info_t> cmp_deps;  // ICmp constraints for Int mirroring
+
+    // Only constructor: must have input_expr (linear scan guarantees this)
+    branch_dependency_t(z3::expr e) : input_expr(e) {}
   };
-  using branch_dep_t = std::unique_ptr<struct branch_dependency>;
+
+  // Cache of int-* variables: label -> Int z3 expr
+  // Populated when int-* variables are created in convert_bv_to_int or fsubstr handler
+  std::unordered_map<dfsan_label, z3::expr> int_var_cache_;
+  using branch_dep_t = std::unique_ptr<struct branch_dependency_t>;
   using offset_dep_t = std::vector<branch_dep_t>;
   std::vector<offset_dep_t> branch_deps_;
+  // Separate storage for negative offsets (container_of pattern).
+  // Negative offset -N (encoded as uint32_t > INT32_MAX) maps to index N-1.
+  std::vector<offset_dep_t> neg_branch_deps_;
 
-  inline struct branch_dependency* get_branch_dep(offset_t off) {
+  static inline bool is_negative_offset(uint32_t off) {
+    return (int32_t)off < 0;
+  }
+
+  static inline uint32_t neg_index(uint32_t off) {
+    return (uint32_t)(-(int32_t)off) - 1;
+  }
+
+  inline struct branch_dependency_t* get_branch_dep(offset_t off) {
+    if (is_negative_offset(off.second)) {
+      if (off.first >= neg_branch_deps_.size()) {
+        return nullptr;
+      }
+      auto &deps = neg_branch_deps_.at(off.first);
+      if (neg_index(off.second) >= deps.size()) {
+        return nullptr;
+      }
+      return deps.at(neg_index(off.second)).get();
+    }
+    if (off.first >= branch_deps_.size()) {
+      return nullptr;
+    }
     auto &offset_deps = branch_deps_.at(off.first);
+    if (off.second >= offset_deps.size()) {
+      return nullptr;
+    }
     return offset_deps.at(off.second).get();
   }
 
   inline void set_branch_dep(offset_t off, branch_dep_t dep) {
+    if (is_negative_offset(off.second)) {
+      if (off.first >= neg_branch_deps_.size())
+        neg_branch_deps_.resize(off.first + 1);
+      auto &deps = neg_branch_deps_[off.first];
+      uint32_t idx = neg_index(off.second);
+      if (idx >= deps.size())
+        deps.resize(idx + 1);
+      deps[idx] = std::move(dep);
+      return;
+    }
     auto &offset_deps = branch_deps_.at(off.first);
     if (off.second >= offset_deps.size()) {
       offset_deps.resize(off.second + 1);
@@ -124,7 +234,10 @@ private:
 
   z3::expr read_concrete(dfsan_label label, uint16_t size);
   z3::expr serialize(dfsan_label label, input_dep_set_t &deps);
+  uint64_t serialize_input(dfsan_label label, uint32_t input, uint32_t offset,
+                           uint32_t bytes, input_dep_set_t &input_deps);
   inline void collect_more_deps(input_dep_set_t &deps);
+  inline void mark_expr_type(dfsan_label label, input_dep_set_t &inputs);
   inline size_t add_nested_constraints(input_dep_set_t &deps, z3_task_t *task);
   inline void save_constraint(z3::expr expr, input_dep_set_t &inputs);
   void construct_index_tasks(z3::expr &index, uint64_t curr,
@@ -135,6 +248,18 @@ private:
   z3::expr build_string_from_label(dfsan_label content_label, input_dep_set_t &deps);
   z3::expr get_byte_expr(uint32_t input, uint32_t offset, input_dep_set_t &deps);
   bool label_contains_indexof(dfsan_label label);
+
+  // Helper for linking bitvec and string constraints on shared offsets
+  void add_string_bitvec_link(offset_t off, z3_task_t *task);
+
+  // Register a string range and add linking constraints for overlapping ranges
+  void register_string_range(uint32_t input, uint32_t start, uint32_t end,
+                             z3::expr str_var);
+
+  // Constrain a (UC) string-search haystack base pointer to be non-null. The
+  // pointer label is carried in the high bits of a string op's op2. No-op for
+  // concrete/bounds (Alloca/Free) pointers. Pulls the pointer bytes into deps.
+  void add_haystack_ptr_nonnull(dfsan_label ptr_label, input_dep_set_t &deps);
 };
 
 class Z3ParserSolver : public Z3AstParser {
@@ -154,7 +279,7 @@ public:
   struct solution_val {
     solution_op_t op;
     uint32_t id;       // input id
-    uint32_t offset;   // position in file
+    int32_t offset;    // position in file (signed for container_of negative offsets)
     union {
       uint8_t val;     // for SET: the byte value
       uint32_t len;    // for DELETE: number of bytes to delete
@@ -163,15 +288,15 @@ public:
 
     // Constructors for convenience
     // SET: set single byte at offset
-    solution_val(uint32_t id, uint32_t offset, uint8_t val)
+    solution_val(uint32_t id, int32_t offset, uint8_t val)
         : op(solution_op_t::SET), id(id), offset(offset), val(val) {}
 
     // INSERT: insert bytes at offset
-    solution_val(uint32_t id, uint32_t offset, std::vector<uint8_t> data)
+    solution_val(uint32_t id, int32_t offset, std::vector<uint8_t> data)
         : op(solution_op_t::INSERT), id(id), offset(offset), data(std::move(data)) {}
 
     // DELETE: delete len bytes at offset
-    solution_val(solution_op_t op, uint32_t id, uint32_t offset, uint32_t len)
+    solution_val(solution_op_t op, uint32_t id, int32_t offset, uint32_t len)
         : op(op), id(id), offset(offset), len(len) {}
   };
 
@@ -188,6 +313,12 @@ public:
 
   using solution_t = std::vector<struct solution_val>;
   solving_status solve_task(uint64_t task_id, unsigned timeout, solution_t &solutions);
+
+  /// @brief Export task constraints to SMT2 format
+  /// @param task_id the task to export
+  /// @param fd file descriptor to write to
+  /// @return 0 on success, -1 on failure
+  int export_task_smt2(uint64_t task_id, int fd);
 
 private:
   void generate_solution(z3::model &m, solution_t &solutions);

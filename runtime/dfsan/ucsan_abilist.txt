@@ -1,0 +1,184 @@
+# UCSan ABI list - custom functions for under-constrained execution
+
+# Memory allocation functions (need to track shadow)
+fun:aligned_alloc=custom
+fun:calloc=custom
+fun:free=custom
+fun:malloc=custom
+fun:memalign=custom
+fun:posix_memalign=custom
+fun:pvalloc=custom
+fun:realloc=custom
+fun:reallocarray=custom
+fun:valloc=custom
+
+# libc internal versions
+fun:__libc_calloc=custom
+fun:__libc_free=custom
+fun:__libc_malloc=custom
+fun:__libc_memalign=custom
+fun:__libc_pvalloc=custom
+fun:__libc_realloc=custom
+fun:__libc_reallocarray=custom
+fun:__libc_valloc=custom
+
+# String and memory functions
+fun:memcpy=custom
+fun:memmove=custom
+fun:memset=custom
+
+fun:stpcpy=taint
+fun:strcat=taint
+fun:strcpy=taint
+fun:strdup=taint
+fun:strncat=taint
+fun:strncpy=taint
+fun:strndup=taint
+
+fun:bcmp=taint
+fun:memchr=taint
+fun:memcmp=taint
+fun:memrchr=taint
+fun:strcasecmp=taint
+fun:strchr=taint
+fun:strcmp=taint
+fun:strlen=taint
+fun:strncasecmp=taint
+fun:strncmp=taint
+fun:strpbrk=taint
+fun:strrchr=taint
+fun:strstr=taint
+fun:strnstr=taint
+fun:memmem=taint
+
+fun:htonl=taint
+fun:htons=taint
+fun:ntohl=taint
+fun:ntohs=taint
+fun:__bswap_16=taint
+fun:__bswap_32=taint
+fun:__bswap_64=taint
+fun:__bswapsi2=taint
+fun:__bswapdi2=taint
+
+# custom assertions
+fun:assert_cond=taint
+fun:assume_cond=taint
+fun:assert_init=custom
+fun:assert_allocated=custom
+fun:assert_freed=custom
+fun:assume_init=custom
+fun:assume_allocated=custom
+fun:assume_freed=custom
+
+# kernel
+fun:kmalloc_large=custom
+fun:__kmalloc=custom
+fun:kmalloc=custom
+fun:panic=custom
+fun:abort=custom
+fun:__assert_fail=custom
+fun:_copy_from_user=custom
+fun:printk=discard
+fun:_copy_to_user=discard
+
+# copy semantics: unbounded (size=strlen(src)) — needs check_copy_bounds
+# bounded copies (memcpy/memmove/strncpy/strncat) get the size via sizeN
+# below, which check_pointer uses for lazy enlargement.
+fun:strcpy=copystr
+fun:stpcpy=copystr
+fun:strcat=copystr
+fun:strdup=copystr
+
+# I/O open/close (fake handles, no real libc I/O)
+fun:open=custom
+fun:openat=custom
+fun:close=custom
+fun:fopen=custom
+fun:fopen64=custom
+fun:freopen=custom
+fun:fclose=custom
+fun:fileno=custom
+fun:fileno_unlocked=custom
+
+# I/O seek/tell
+fun:fseek=custom
+fun:fseeko=custom
+fun:lseek=custom
+fun:rewind=custom
+fun:ftell=custom
+
+# I/O read functions
+fun:read=custom
+fun:pread=custom
+fun:pread64=custom
+fun:fread=custom
+fun:fread_unlocked=custom
+
+# I/O single-byte read functions
+fun:fgetc=custom
+fun:fgetc_unlocked=custom
+fun:getc=custom
+fun:getc_unlocked=custom
+fun:_IO_getc=custom
+fun:getchar=custom
+
+# ignore I/O writes
+fun:write=ignore
+fun:writev=ignore
+fun:pwrite=ignore
+fun:pwrite64=ignore
+fun:pwritev=ignore
+fun:pwritev64=ignore
+fun:fprintf=ignore
+fun:vfprintf=ignore
+fun:printf=ignore
+fun:vprintf=ignore
+fun:snprintf=ignore
+fun:vsnprintf=ignore
+fun:sprintf=ignore
+fun:vsprintf=ignore
+fun:fwrite=ignore
+fun:fwrite_unlocked=ignore
+fun:fflush=ignore
+fun:fflush_unlocked=ignore
+fun:fputc=ignore
+fun:fputc_unlocked=ignore
+fun:putc=ignore
+fun:putc_unlocked=ignore
+fun:putchar=ignore
+fun:putchar_unlocked=ignore
+fun:fputs=ignore
+fun:puts=ignore
+
+# buffer size (sizeN means arg index N (0-indexed) holds the byte count)
+fun:_copy_from_user=size2
+
+# explicit byte-count args for taint comparison/search/copy functions
+fun:memcpy=size2
+fun:memmove=size2
+fun:memcmp=size2
+fun:bcmp=size2
+fun:strncmp=size2
+fun:strncasecmp=size2
+fun:memchr=size2
+fun:memrchr=size2
+fun:strnstr=size2
+fun:strncpy=size2
+fun:strncat=size2
+fun:strndup=size1
+
+# functions whose return value is a pointer into a pointer argument
+# (retptrN means the result aliases arg N). Under UC the result must be
+# translated from the materialized buffer back into the caller's pseudo
+# pointer space (ucsan_uncheck_pointer) so that p - arg == index holds.
+# Their __dfsw_ wrappers also stash the haystack pointer label in op2's high
+# bits (low 8 bits = needle char) so the solver can constrain the base pointer
+# non-null and simplify (ptr - base) to the index. This is limited to the
+# single-char search ops, whose op2 is free; strstr/strpbrk/memmem keep a
+# needle/accept pointer in op2 (used for concrete content), so they have no
+# room to carry the pointer label and are not listed here.
+fun:strchr=retptr0
+fun:strrchr=retptr0
+fun:memchr=retptr0
+fun:memrchr=retptr0

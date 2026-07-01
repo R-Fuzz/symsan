@@ -1,7 +1,7 @@
 # include_directories(..)
 
-# Runtime library sources and build flags.
-set(DFSAN_RTL_SOURCES
+# SymSan sources (symbolic execution, taint tracking)
+set(SYMSAN_RTL_SOURCES
   dfsan.cpp
   dfsan_custom.cpp
   dfsan_interceptors.cpp
@@ -9,7 +9,17 @@ set(DFSAN_RTL_SOURCES
   union_util.cpp
   union_hashtable.cpp)
 
-set(DFSAN_RTL_HEADERS
+# UCSan sources (under-constrained execution, pointer/object tracking)
+set(UCSAN_RTL_SOURCES
+  ucsan.cpp
+  ucsan_custom.cpp)
+
+# Combined sources (both SymSan and UCSan)
+set(DFSAN_RTL_SOURCES
+  ${SYMSAN_RTL_SOURCES}
+  ${UCSAN_RTL_SOURCES})
+
+set(SYMSAN_RTL_HEADERS
   dfsan.h
   dfsan_flags.inc
   dfsan_platform.h
@@ -17,6 +27,19 @@ set(DFSAN_RTL_HEADERS
   union_util.h
   union_hashtable.h)
 
+# UCSan headers
+set(UCSAN_RTL_HEADERS
+  ucsan.h
+  ucsan_platform.h
+  ucsan_exit_reason.h
+  ucsan_flags.inc)
+
+# Combined headers
+set(DFSAN_RTL_HEADERS
+  ${SYMSAN_RTL_HEADERS}
+  ${UCSAN_RTL_HEADERS})
+
+list(APPEND ${SANITIZER_COMMON_CFLAGS} "-O3 -Wno-format")
 set(DFSAN_COMMON_CFLAGS ${SANITIZER_COMMON_CFLAGS})
 
 if(OS_NAME MATCHES "Linux" AND
@@ -31,12 +54,46 @@ append_rtti_flag(OFF DFSAN_COMMON_CFLAGS)
 # Prevent clang from generating libc calls.
 append_list_if(COMPILER_RT_HAS_FFREESTANDING_FLAG -ffreestanding DFSAN_COMMON_CFLAGS)
 
-# Static runtime library.
+# Static runtime libraries.
+# We build three variants:
+#   1. symsan_rt  - standalone SymSan (symbolic execution)
+#   2. ucsan_rt   - standalone UCSan (under-constrained execution)
+#   3. dfsan_rt   - combined library (both SymSan and UCSan)
+
+add_compiler_rt_component(symsan)
+add_compiler_rt_component(ucsan)
 add_compiler_rt_component(dfsan)
 
 foreach(arch ${DFSAN_SUPPORTED_ARCH})
   set(DFSAN_CFLAGS ${DFSAN_COMMON_CFLAGS})
   append_list_if(COMPILER_RT_HAS_FPIE_FLAG -fPIE DFSAN_CFLAGS)
+
+  # Standalone SymSan library
+  add_compiler_rt_runtime(symsan_rt
+    STATIC
+    ARCHS ${arch}
+    SOURCES ${SYMSAN_RTL_SOURCES}
+            $<TARGET_OBJECTS:RTInterception.${arch}>
+            $<TARGET_OBJECTS:RTSanitizerCommon.${arch}>
+            $<TARGET_OBJECTS:RTSanitizerCommonLibc.${arch}>
+    CFLAGS ${DFSAN_CFLAGS}
+    PARENT_TARGET symsan)
+
+  # Standalone UCSan library
+  add_compiler_rt_runtime(ucsan_rt
+    STATIC
+    ARCHS ${arch}
+    SOURCES ${UCSAN_RTL_SOURCES}
+            $<TARGET_OBJECTS:RTInterception.${arch}>
+            $<TARGET_OBJECTS:RTSanitizerCommon.${arch}>
+            $<TARGET_OBJECTS:RTSanitizerCommonLibc.${arch}>
+    CFLAGS ${DFSAN_CFLAGS}
+    PARENT_TARGET ucsan)
+
+  # Combined library (SymSan + UCSan)
+  # USE_UCSAN_CUSTOM tells dfsan_custom.cpp to skip definitions
+  # that are provided by ucsan_custom.cpp (e.g., __dfsw_memcpy)
+  set(DFSAN_COMBINED_CFLAGS ${DFSAN_CFLAGS} -DUSE_UCSAN_CUSTOM)
   add_compiler_rt_runtime(dfsan_rt
     STATIC
     ARCHS ${arch}
@@ -46,8 +103,9 @@ foreach(arch ${DFSAN_SUPPORTED_ARCH})
             $<TARGET_OBJECTS:RTSanitizerCommonLibc.${arch}>
             $<TARGET_OBJECTS:RTSanitizerCommonSymbolizer.${arch}>
     ADDITIONAL_HEADERS ${DFSAN_RTL_HEADERS}
-    CFLAGS ${DFSAN_CFLAGS}
+    CFLAGS ${DFSAN_COMBINED_CFLAGS}
     PARENT_TARGET dfsan)
+
   add_sanitizer_rt_symbols(dfsan_rt
     ARCHS ${arch}
     EXTRA dfsan.syms.extra)
@@ -106,6 +164,21 @@ add_dependencies(dfsan dfsan_abilist)
 install(FILES ${dfsan_abilist_filename}
   DESTINATION ${COMPILER_RT_LIBRARY_INSTALL_DIR})
 install(FILES "libc++_abilist.txt"
+  DESTINATION ${COMPILER_RT_LIBRARY_INSTALL_DIR})
+
+set(ucsan_abilist_filename ${dfsan_abilist_dir}/ucsan_abilist.txt)
+add_custom_target(ucsan_abilist ALL
+  DEPENDS ${ucsan_abilist_filename})
+add_custom_command(OUTPUT ${ucsan_abilist_filename}
+                   VERBATIM
+                   COMMAND
+                     ${CMAKE_COMMAND} -E make_directory ${dfsan_abilist_dir}
+                   COMMAND
+                     cat ${CMAKE_CURRENT_SOURCE_DIR}/ucsan_abilist.txt
+                         > ${ucsan_abilist_filename}
+                   DEPENDS ucsan_abilist.txt)
+add_dependencies(dfsan ucsan_abilist)
+install(FILES ${ucsan_abilist_filename}
   DESTINATION ${COMPILER_RT_LIBRARY_INSTALL_DIR})
 
 set(taint_linker_script_filename ${COMPILER_RT_OUTPUT_DIR}/taint.ld)

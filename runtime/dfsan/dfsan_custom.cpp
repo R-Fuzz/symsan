@@ -25,6 +25,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,79 +64,23 @@ SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE void f(__VA_ARGS__);
 
 static off_t current_stdin_offset = 0;
 
-// Check if an op is a string operation (fstr_op_start to fstr_op_end)
-static inline bool is_string_op(uint16_t op) {
-  return op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end;
-}
-
-// Check if an op is an indexOf-type operation (returns position, not content)
-// These are: fstrchr, fstrrchr, fstrstr, fstrpbrk, fstr_off
-static inline bool is_indexof_op(uint16_t op) {
-  return op >= __dfsan::fstrchr && op <= __dfsan::fstr_off;
-}
-
-// Check if an op is a content-type string operation (fsubstr, fstrcat)
-static inline bool is_content_string_op(uint16_t op) {
-  return op == __dfsan::fsubstr || op == __dfsan::fstrcat;
-}
-
-// Helper: Find the first (base) input byte label from a content label.
-// Walks through Concat chains and Load operations to find the starting input.
-// Returns the base label, or 0 if not found.
-static dfsan_label get_base_input_label(dfsan_label label) {
+// Get the concrete string length represented by a taint label.
+// Returns 0 if the length cannot be determined.
+static size_t get_label_string_length(dfsan_label label) {
   if (label < CONST_OFFSET) return 0;
-
   dfsan_label_info *info = dfsan_get_label_info(label);
+  if (!info) return 0;
 
-  // Base input label has op == 0
-  if (info->op == 0) return label;
-
-  // For Concat (op 72), walk left (l1) to find the base
-  if (info->op == __dfsan::Concat) {
-    return get_base_input_label(info->l1);
-  }
-
-  // For Load (op 32), l1 is the starting label
   if (info->op == __dfsan::Load) {
-    return info->l1;
+    return info->l2; // number of bytes loaded
+  } else if (info->op == __dfsan::fsubstr) {
+    return (size_t)info->op1.i; // concrete substring length
+  } else if (info->op == __dfsan::fstrcat) {
+    size_t left = get_label_string_length(info->l1);
+    size_t right = get_label_string_length(info->l2);
+    if (left > 0 && right > 0) return left + right;
+    return 0;
   }
-
-  // For other ops, try l1
-  if (info->l1 >= CONST_OFFSET) {
-    return get_base_input_label(info->l1);
-  }
-
-  return 0;
-}
-
-// Helper: Find if a label derives from a string op (fstrchr, fstrrchr, fstrstr)
-// by walking through PtrToInt, Sub, Add operations.
-// Returns the string op label if found, 0 otherwise.
-static dfsan_label find_string_op_source(dfsan_label label) {
-  if (label < CONST_OFFSET) return 0;
-
-  dfsan_label_info *info = dfsan_get_label_info(label);
-  uint16_t op = info->op;
-
-  // Check if this is directly a string op
-  if (is_string_op(op)) {
-    return label;
-  }
-
-  // Follow through PtrToInt, Sub, Add to find the source string op
-  if (op == __dfsan::PtrToInt || op == __dfsan::Sub || op == __dfsan::Add) {
-    // Recursively check l1 (the primary operand)
-    if (info->l1 >= CONST_OFFSET) {
-      dfsan_label result = find_string_op_source(info->l1);
-      if (result != 0) return result;
-    }
-    // For Sub/Add, also check l2
-    if ((op == __dfsan::Sub || op == __dfsan::Add) && info->l2 >= CONST_OFFSET) {
-      dfsan_label result = find_string_op_source(info->l2);
-      if (result != 0) return result;
-    }
-  }
-
   return 0;
 }
 
@@ -207,7 +152,7 @@ static inline dfsan_label get_str_label_n(const void *s, dfsan_label s_label,
   // 4. Check if n_label derives from a string op (e.g., ptr arithmetic on memchr result)
   // If so, create fsubstr to represent substr(content, 0, idx) where idx is the string op result
   // IMPORTANT: Do this even when n=0 to preserve the symbolic constraint!
-  dfsan_label str_op_label = find_string_op_source(n_label);
+  dfsan_label str_op_label = taint_find_string_op_source(n_label);
   if (str_op_label != 0) {
     dfsan_label_info *str_op_info = dfsan_get_label_info(str_op_label);
     dfsan_label str_op_content = str_op_info->l1;
@@ -219,8 +164,8 @@ static inline dfsan_label get_str_label_n(const void *s, dfsan_label s_label,
       // Verify same underlying buffer only if content is available
       bool same_buffer = true;
       if (content_label != 0) {
-        dfsan_label src_base = get_base_input_label(content_label);
-        dfsan_label str_op_base = get_base_input_label(str_op_content);
+        dfsan_label src_base = taint_get_base_input_label(content_label);
+        dfsan_label str_op_base = taint_get_base_input_label(str_op_content);
         same_buffer = (src_base != 0 && src_base == str_op_base);
       }
       // When n=0, trust that n_label derives from same buffer
@@ -236,6 +181,37 @@ static inline dfsan_label get_str_label_n(const void *s, dfsan_label s_label,
   }
 
   // 5. Fall back to reading buffer content labels
+  // When length is symbolic and pointer has Alloca bounds, read the full object
+  // to create a complete string variable, then substr to the requested length.
+  // This ensures string theory operations (strchr, memrchr, etc.) see the full
+  // buffer even when the symbolic length is smaller than the actual object.
+  if (n_label != 0 && s_label != 0) {
+    dfsan_label_info *info = dfsan_get_label_info(s_label);
+    if (info && info->op == __dfsan::Alloca) {
+      uint64_t lower = info->op1.i;
+      uint64_t upper = info->op2.i;
+      uint64_t ptr_offset = (uint64_t)s - lower;
+      uint64_t remaining = upper - lower - ptr_offset;
+      AOUT("get_str_label_n: step 5 Alloca bounds lower=%p, upper=%p, "
+           "remaining=%lu, n=%zu\n",
+           (void*)lower, (void*)upper, remaining, n);
+      // Trim trailing untainted bytes (e.g., null terminators)
+      const dfsan_label *shadow = shadow_for(s);
+      while (remaining > n && shadow[remaining - 1] == 0) {
+        remaining--;
+      }
+      if (remaining > n) {
+        dfsan_label full_label = dfsan_read_label(s, remaining);
+        if (full_label != 0) {
+          return dfsan_union(full_label, n_label, __dfsan::fsubstr,
+                             sizeof(void*) * 8, (uint64_t)n, 0);
+        }
+      } else if (remaining < n) {
+        AOUT("ERROR: OOB read in get_str_label_n: n=%zu exceeds "
+             "remaining=%lu bytes in object\n", n, remaining);
+      }
+    }
+  }
   return dfsan_read_label(s, n);
 }
 
@@ -256,7 +232,7 @@ static inline dfsan_label get_str_label(const char *s, dfsan_label s_label) {
 static inline dfsan_label get_label_for(int fd, off_t offset) {
   // check if fd is stdin, if so, the label hasn't been pre-allocated
   if (is_stdin_taint() || (fd ==0 && flags().force_stdin))
-    return dfsan_create_label(current_stdin_offset++);
+    return dfsan_create_label((uint64_t)fd, (uint64_t)(current_stdin_offset++), 1);
   // if fd is a tainted file, the label should have been pre-allocated
   else return (offset + CONST_OFFSET);
 }
@@ -276,8 +252,51 @@ static void dfsan_memset(void *s, int c, dfsan_label c_label, size_t n) {
   dfsan_set_label(c_label, s, n);
 }
 
+static inline dfsan_label bswap_label(dfsan_label label, uint16_t bits) {
+  if (!label || bits <= 8)
+    return label;
+
+  const uint16_t num_bytes = bits / 8;
+  dfsan_label bytes[8] = {};
+  for (uint16_t i = 0; i < num_bytes; ++i) {
+    bytes[i] = dfsan_union(label, 0, __dfsan::Extract, 8, 0, i * 8);
+  }
+
+  dfsan_label result = bytes[num_bytes - 1];
+  uint16_t accum_bits = 8;
+  for (int i = (int)num_bytes - 2; i >= 0; --i) {
+    accum_bits += 8;
+    result = dfsan_union(result, bytes[i], __dfsan::Concat, accum_bits, 0, 0);
+  }
+  return result;
+}
+
+static inline dfsan_label net16_label(dfsan_label label) {
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return bswap_label(label, 16);
+#else
+  return label;
+#endif
+}
+
+static inline dfsan_label net32_label(dfsan_label label) {
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return bswap_label(label, 32);
+#else
+  return label;
+#endif
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, int64_t offset, unsigned size);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_add_constraint(dfsan_label label, uint8_t result);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_minimize_label(dfsan_label label, uint64_t size, dfsan_label bounds);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_memcmp(dfsan_label label);
@@ -285,6 +304,20 @@ __taint_trace_memcmp(dfsan_label label);
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_check_bounds(dfsan_label addr_label, uptr addr,
                           dfsan_label size_label, uint64_t size);
+
+// Encode the haystack base-pointer label into the high 32 bits of a string
+// search op's op2 (whose low 8 bits hold the needle char). Under UC the search
+// result is base+index; the solver needs the base pointer's label so it can
+// pull its dependency / constrain it non-null. Returns op2 with both fields.
+// Without UCSan the pointer label is concrete (0) so this is a no-op.
+static inline uint64_t encode_strchr_op2(uint8_t needle, dfsan_label s_label) {
+#ifdef USE_UCSAN_CUSTOM
+  return (uint64_t)needle | ((uint64_t)s_label << 32);
+#else
+  (void)s_label;
+  return (uint64_t)needle;
+#endif
+}
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid);
@@ -306,6 +339,11 @@ void __taint_trace_memerr(dfsan_label ptr_label, uptr ptr,
                           uint16_t flag, void *addr);
 
 extern "C" {
+SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
+__dfsw_exit(int status, dfsan_label status_label) {
+  exit(status);
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_stat(const char *path, struct stat *buf, dfsan_label path_label,
             dfsan_label buf_label, dfsan_label *ret_label) {
@@ -402,32 +440,6 @@ __dfsw_lstat(const char *path, struct stat *buf, dfsan_label path_label,
   return ret;
 }
 
-// Create a label for string op + constant offset (for pointer arithmetic like sep + 1)
-// If base_label is a string op, returns a new fstr_off label; otherwise returns base_label
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_trace_gep_ptr(dfsan_label base_label, char *result, char *base) {
-  if (base_label < CONST_OFFSET) return;
-
-  // Check if base_label is or derives from a string op
-  dfsan_label str_op_label = find_string_op_source(base_label);
-  if (str_op_label == 0) {
-    // Not a string op - return base label unchanged
-    return;
-  }
-
-  // Create fstr_off label: l1=str_op_label, op1=offset
-  // This represents the content at (string_op_position + offset)
-  uint64_t offset = (uint64_t)(result - base);
-  dfsan_label off_label = dfsan_union(str_op_label, 0, __dfsan::fstr_off,
-                                       sizeof(void*) * 8,
-                                       0, (uint64_t)offset);
-  AOUT("gep_ptr: base=%u, str_op=%u, offset=%ld, result=%u\n",
-       base_label, str_op_label, offset, off_label);
-
-  // record the label (fstr_off is an indexOf-type op)
-  taint_set_str_indexof_label(result, off_label);
-}
-
 SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
                                                   dfsan_label s_label,
                                                   dfsan_label c_label,
@@ -452,7 +464,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
                              content_len,
                              (uint64_t)s,
-                             (uint64_t)(uint8_t)c);
+                             encode_strchr_op2((uint8_t)c, s_label));
 
     // Send concrete haystack content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -562,6 +574,8 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
                                               dfsan_label *ret_label) {
   __taint_check_bounds(s1_label, (uptr)s1, n_label, n);
   __taint_check_bounds(s2_label, (uptr)s2, n_label, n);
+  __taint_solve_size(s1_label, (uint64_t)s1, n_label, n, 0);
+  __taint_solve_size(s2_label, (uint64_t)s2, n_label, n, 0);
   int ret = bcmp(s1, s2, n);
 
   // Check for fsubstr labels (from strncpy with symbolic length)
@@ -883,6 +897,9 @@ __dfsw_strlen(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
   return ret;
 }
 
+// When USE_UCSAN_CUSTOM is defined, ucsan_custom.cpp provides these functions
+// which handle both UCSan and SymSan shadow memory via the bridge.
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_memcpy(void *dest, const void *src, size_t n,
                     dfsan_label dest_label, dfsan_label src_label,
@@ -892,6 +909,11 @@ void *__dfsw_memcpy(void *dest, const void *src, size_t n,
   if (n_label) {
     __taint_solve_bounds(src_label, (uint64_t)src, n_label, n, 0, 1, 0, 0);
     __taint_solve_bounds(dest_label, (uint64_t)dest, n_label, n, 0, 1, 0, 0);
+  }
+  // Propagate string content label from src to dest
+  dfsan_label str_label = taint_get_str_content_label(src);
+  if (str_label != 0) {
+    taint_set_str_content_label(dest, str_label);
   }
   *ret_label = dest_label;
   return dfsan_memcpy(dest, src, n);
@@ -906,6 +928,11 @@ void *__dfsw_memmove(void *dest, const void *src, size_t n,
   if (n_label) {
     __taint_solve_bounds(src_label, (uint64_t)src, n_label, n, 0, 1, 0, 0);
     __taint_solve_bounds(dest_label, (uint64_t)dest, n_label, n, 0, 1, 0, 0);
+  }
+  // Propagate string content label from src to dest
+  dfsan_label str_label = taint_get_str_content_label(src);
+  if (str_label != 0) {
+    taint_set_str_content_label(dest, str_label);
   }
   dfsan_label tmp[n];
   dfsan_label *sdest = shadow_for(dest);
@@ -928,6 +955,7 @@ void *__dfsw_memset(void *s, int c, size_t n,
   *ret_label = s_label;
   return s;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_tolower(int c, dfsan_label c_label, dfsan_label *ret_label) {
@@ -940,6 +968,78 @@ SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_toupper(int c, dfsan_label c_label, dfsan_label *ret_label) {
   int ret = toupper(c);
   *ret_label = dfsan_union(0, c_label, __dfsan::And, 8, 0x5f, 0);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint16_t __dfsw_htons(uint16_t hostshort, dfsan_label hostshort_label,
+                      dfsan_label *ret_label) {
+  uint16_t ret = htons(hostshort);
+  *ret_label = net16_label(hostshort_label);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint16_t __dfsw_ntohs(uint16_t netshort, dfsan_label netshort_label,
+                      dfsan_label *ret_label) {
+  uint16_t ret = ntohs(netshort);
+  *ret_label = net16_label(netshort_label);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint32_t __dfsw_htonl(uint32_t hostlong, dfsan_label hostlong_label,
+                      dfsan_label *ret_label) {
+  uint32_t ret = htonl(hostlong);
+  *ret_label = net32_label(hostlong_label);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint32_t __dfsw_ntohl(uint32_t netlong, dfsan_label netlong_label,
+                      dfsan_label *ret_label) {
+  uint32_t ret = ntohl(netlong);
+  *ret_label = net32_label(netlong_label);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint16_t __dfsw___bswap_16(uint16_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint16_t ret = __builtin_bswap16(x);
+  *ret_label = bswap_label(x_label, 16);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint32_t __dfsw___bswap_32(uint32_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint32_t ret = __builtin_bswap32(x);
+  *ret_label = bswap_label(x_label, 32);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint64_t __dfsw___bswap_64(uint64_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint64_t ret = __builtin_bswap64(x);
+  *ret_label = bswap_label(x_label, 64);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint32_t __dfsw___bswapsi2(uint32_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint32_t ret = __builtin_bswap32(x);
+  *ret_label = bswap_label(x_label, 32);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+uint64_t __dfsw___bswapdi2(uint64_t x, dfsan_label x_label,
+                           dfsan_label *ret_label) {
+  uint64_t ret = __builtin_bswap64(x);
+  *ret_label = bswap_label(x_label, 64);
   return ret;
 }
 
@@ -1141,7 +1241,7 @@ __dfsw_strncpy(char *s1, const char *s2, size_t n, dfsan_label s1_label,
     __taint_solve_bounds(s1_label, (uint64_t)s1, n_label, n, 0, 1, 0, 0);
 
   // Check if n_label derives from a string op (e.g., strchr index)
-  dfsan_label str_op_label = n_label ? find_string_op_source(n_label) : 0;
+  dfsan_label str_op_label = n_label ? taint_find_string_op_source(n_label) : 0;
   bool created_fsubstr = false;
 
   if (str_op_label != 0) {
@@ -1156,8 +1256,8 @@ __dfsw_strncpy(char *s1, const char *s2, size_t n, dfsan_label s1_label,
       if (copy_len > 0) {
         dfsan_label src_content = dfsan_read_label(s2, copy_len);
         if (src_content >= CONST_OFFSET) {
-          dfsan_label src_base = get_base_input_label(src_content);
-          dfsan_label str_op_base = get_base_input_label(str_op_content);
+          dfsan_label src_base = taint_get_base_input_label(src_content);
+          dfsan_label str_op_base = taint_get_base_input_label(str_op_content);
           buffers_match = (src_base != 0 && src_base == str_op_base);
         }
       } else {
@@ -1198,6 +1298,7 @@ __dfsw_strncpy(char *s1, const char *s2, size_t n, dfsan_label s1_label,
   return s1;
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t
 __dfsw_pread(int fd, void *buf, size_t count, off_t offset,
              dfsan_label fd_label, dfsan_label buf_label,
@@ -1270,6 +1371,7 @@ __dfsw_read(int fd, void *buf, size_t count,
   }
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_clock_gettime(clockid_t clk_id,
                                                        struct timespec *tp,
@@ -1874,17 +1976,29 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
   dfsan_label src_label = get_str_label_n(s, s_label, n, n_label);
 
   if (src_label != 0 || c_label != 0) {
+    // When n is symbolic, bound the haystack to first n bytes so the solver
+    // produces indexof(substr(s, 0, n), char) instead of indexof(s, char).
+    // Skip if get_str_label_n already returned an fsubstr (avoids nesting).
+    dfsan_label bounded_src = src_label;
+    if (src_label != 0 && n_label != 0) {
+      dfsan_label_info *src_info = dfsan_get_label_info(src_label);
+      if (src_info && !is_content_string_op(src_info->op)) {
+        bounded_src = dfsan_union(src_label, n_label, __dfsan::fsubstr,
+                                  sizeof(void*) * 8, (uint64_t)n, 0);
+      }
+    }
+
     // Determine which operand is concrete and set size accordingly
     uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
 
-    // l1 = src_label (haystack content)
+    // l1 = bounded_src (haystack content, bounded by n when symbolic)
     // l2 = c_label (character to find)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = character value
     // size = haystack length if haystack concrete, else 0
-    *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
+    *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrchr,
                              content_len,
-                             (uint64_t)s, (uint64_t)(uint8_t)c);
+                             (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
 
     // Send concrete content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -1923,7 +2037,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
                              content_len,
                              (uint64_t)s,
-                             (uint64_t)(uint8_t)c);
+                             encode_strchr_op2((uint8_t)c, s_label));
 
     // Send concrete haystack content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -1952,17 +2066,31 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
   dfsan_label src_label = get_str_label_n(s, s_label, n, n_label);
 
   if (src_label != 0 || c_label != 0) {
+    // When n is symbolic, bound the haystack to first n bytes so the solver
+    // produces last_indexof(substr(s, 0, n), char) instead of
+    // last_indexof(s, char). Without this, the solver can grow the string
+    // variable beyond the actual symbolized region when it increases n.
+    // Skip if get_str_label_n already returned an fsubstr (avoids nesting).
+    dfsan_label bounded_src = src_label;
+    if (src_label != 0 && n_label != 0) {
+      dfsan_label_info *src_info = dfsan_get_label_info(src_label);
+      if (src_info && !is_content_string_op(src_info->op)) {
+        bounded_src = dfsan_union(src_label, n_label, __dfsan::fsubstr,
+                                  sizeof(void*) * 8, (uint64_t)n, 0);
+      }
+    }
+
     // Determine which operand is concrete and set size accordingly
     uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
 
-    // l1 = src_label (haystack content)
+    // l1 = bounded_src (haystack content, bounded by n when symbolic)
     // l2 = c_label (character to find)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = character value
     // size = haystack length if haystack concrete, else 0
-    *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
+    *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrrchr,
                              content_len,
-                             (uint64_t)s, (uint64_t)(uint8_t)c);
+                             (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
 
     // Send concrete content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -2109,6 +2237,19 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
   dfsan_label src_label =
       get_str_label_n(haystack, haystack_label, haystacklen, haystacklen_label);
 
+  // When haystacklen is symbolic, bound the haystack to first haystacklen bytes
+  // so the solver produces indexof(substr(haystack, 0, n), needle) instead of
+  // indexof(haystack, needle). Without this, the solver can grow the string
+  // variable beyond the actual symbolized region when it increases haystacklen.
+  // Skip if get_str_label_n already returned an fsubstr (avoids nesting).
+  if (src_label != 0 && haystacklen_label != 0) {
+    dfsan_label_info *src_info = dfsan_get_label_info(src_label);
+    if (src_info && !is_content_string_op(src_info->op)) {
+      src_label = dfsan_union(src_label, haystacklen_label, __dfsan::fsubstr,
+                              sizeof(void*) * 8, (uint64_t)haystacklen, 0);
+    }
+  }
+
   // Use unified get_str_label_n for needle
   dfsan_label real_needle_label =
       get_str_label_n(needle, needle_label, needlelen, needlelen_label);
@@ -2177,7 +2318,8 @@ SANITIZER_INTERFACE_ATTRIBUTE ssize_t __dfsw_recv(
     if (offset >= 0) {
       AOUT("recv: fd = %d, offset = %ld, ret = %ld\n", sockfd, offset, ret);
       for (ssize_t i = 0; i < ret; i++) {
-        dfsan_set_label(dfsan_create_label(offset + i), (char *)buf + i, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)sockfd, (uint64_t)(offset + i), 1);
+        dfsan_set_label(lbl, (char *)buf + i, 1);
       }
       taint_update_socket_offset(sockfd, ret);
     } else {
@@ -2209,7 +2351,8 @@ SANITIZER_INTERFACE_ATTRIBUTE ssize_t __dfsw_recvfrom(
     off_t offset = taint_get_socket(sockfd);
     if (offset >= 0) {
       for (ssize_t i = 0; i < ret; i++) {
-        dfsan_set_label(dfsan_create_label(offset + i), (char *)buf + i, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)sockfd, (uint64_t)(offset + i), 1);
+        dfsan_set_label(lbl, (char *)buf + i, 1);
       }
       taint_update_socket_offset(sockfd, ret);
     } else {
@@ -2239,7 +2382,8 @@ static void taint_handle_msg(int sockfd, struct msghdr *msg, size_t msg_len) {
         bytes_written < iov->iov_len ? bytes_written : iov->iov_len;
     if (offset >= 0) {
       for (size_t j = 0; j < iov_written; ++j) {
-        dfsan_set_label(dfsan_create_label(offset + j), (char *)iov->iov_base + j, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)sockfd, (uint64_t)(offset + j), 1);
+        dfsan_set_label(lbl, (char *)iov->iov_base + j, 1);
       }
       taint_update_socket_offset(sockfd, iov_written);
       offset += iov_written;
@@ -2617,6 +2761,7 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __dfsw___sanitizer_cov_trace_const_cmp8,
                              void) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __dfsw___sanitizer_cov_trace_switch, void) {}
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_open(const char *path, int oflags, dfsan_label path_label,
             dfsan_label flag_label, dfsan_label *va_labels,
@@ -2700,7 +2845,9 @@ __dfsw_fclose(FILE *fp, dfsan_label fp_label, dfsan_label *ret_label) {
   *ret_label = 0;
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE size_t
 __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
              dfsan_label ptr_label, dfsan_label size_label,
@@ -2722,7 +2869,8 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
       fwrite(ptr, size, nmemb, stream);
       // update taint
       for (size_t i = 0; i < size * nmemb; i++) {
-        dfsan_set_label(dfsan_create_label(offset + i), (char *)ptr + i, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)fd, (uint64_t)(offset + i), 1);
+        dfsan_set_label(lbl, (char *)ptr + i, 1);
       }
       return nmemb; // directly return
     }
@@ -2771,7 +2919,8 @@ __dfsw_fread_unlocked(
       fwrite(ptr, size, nmemb, stream);
       // update taint
       for (size_t i = 0; i < size * nmemb; i++) {
-        dfsan_set_label(dfsan_create_label(offset + i), (char *)ptr + i, 1);
+        dfsan_label lbl = dfsan_create_label((uint64_t)fd, (uint64_t)(offset + i), 1);
+        dfsan_set_label(lbl, (char *)ptr + i, 1);
       }
       return nmemb; // directly return
     }
@@ -2797,6 +2946,7 @@ __dfsw_fread_unlocked(
   }
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t
 __dfsw_getline(char **lineptr, size_t *n, FILE *stream,
@@ -2984,14 +3134,19 @@ char *__dfsw_fgets_unlocked(char *s, int size, FILE *stream, dfsan_label s_label
 }
 
 static inline void __taint_check_malloc_size(size_t size, dfsan_label size_label) {
-  if (size_label && flags().solve_ub) {
+  if (size_label) {
     AOUT("*alloc size: %lu = %d\n", size, size_label);
-    // -fsanitize=unsigned-integer-overflow
-    dfsan_label os = dfsan_union(0, size_label, (bveq << 8) | ICmp, 64, 0, size);
-    __taint_trace_cond(os, 0, UndefinedCheck, ub_integer_overflow);
+    // hint solver to minimize allocation size
+    __taint_minimize_label(size_label, (uint64_t)size, 0);
+    if (flags().solve_ub) {
+      // -fsanitize=unsigned-integer-overflow
+      dfsan_label os = dfsan_union(0, size_label, (bveq << 8) | ICmp, 64, 0, size);
+      __taint_trace_cond(os, 0, UndefinedCheck, ub_integer_overflow);
+    }
   }
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE void *
 __dfsw_realloc(void *ptr, size_t new_size,
                dfsan_label ptr_label, dfsan_label new_size_label,
@@ -3445,6 +3600,7 @@ void __dfsw___libc_free(void *ptr, dfsan_label ptr_label) {
     free(ptr);
   }
 }
+#endif // USE_UCSAN_CUSTOM
 
 static dfsan_label taint_getc(int fd, off_t offset, int ret) {
   if (ret != EOF && taint_get_file(fd)) {
@@ -3454,6 +3610,7 @@ static dfsan_label taint_getc(int fd, off_t offset, int ret) {
   return 0;
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_fgetc(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
   int fd = fileno(stream);
@@ -3507,6 +3664,7 @@ __dfsw_getchar(dfsan_label *ret_label) {
   *ret_label = taint_getc(0, offset, ret);
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE size_t
 __dfsw_mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps,
@@ -3560,6 +3718,7 @@ __dfsw_munmap(void *addr, size_t length, dfsan_label addr_label,
   return ret;
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE off_t
 __dfsw_lseek(int fd, off_t offset, int whence, dfsan_label fd_label,
              dfsan_label offset_label, dfsan_label whence_label,
@@ -3576,6 +3735,7 @@ __dfsw_lseek(int fd, off_t offset, int whence, dfsan_label fd_label,
   } else *ret_label = 0;
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE off64_t
 __dfsw_lseek64(int fd, off64_t offset, int whence, dfsan_label fd_label,
@@ -3594,6 +3754,7 @@ __dfsw_lseek64(int fd, off64_t offset, int whence, dfsan_label fd_label,
   return ret;
 }
 
+#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_fseek(FILE *stream, long offset, int whence, dfsan_label stream_label,
              dfsan_label offset_label, dfsan_label whence_label,
@@ -3625,6 +3786,7 @@ __dfsw_fseeko(FILE *stream, off_t offset, int whence, dfsan_label stream_label,
   }
   return ret;
 }
+#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_fseeko64(FILE *stream, off64_t offset, int whence, dfsan_label stream_label,
@@ -3640,6 +3802,36 @@ __dfsw_fseeko64(FILE *stream, off64_t offset, int whence, dfsan_label stream_lab
     }
   }
   return ret;
+}
+
+/// for assertion and assumption
+
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_event_addr,
+                             uint16_t, uint32_t, uint64_t, void*, uint32_t) {}
+
+SANITIZER_INTERFACE_ATTRIBUTE void
+__dfsw_assert_cond(bool result,  uint64_t id, dfsan_label result_label, dfsan_label id_label) {
+  if (!result) {
+    AOUT("ERROR: assertion %lu failure: result %d, label %d\n", id, result, result_label);
+    __taint_trace_event_addr(0, 103, id, (void *)__builtin_return_address(0), 8);
+  } else {
+    __taint_trace_event_addr(0, 103, id, (void *)__builtin_return_address(0), 9);
+    __taint_trace_cond(result_label, result, UndefinedCheck, ub_assertion_failure);
+  }
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE void
+__dfsw_assume_cond(bool result, uint64_t id, dfsan_label result_label, dfsan_label id_label) {
+  if (result_label) {
+    AOUT("WARNING: assumption label is concrete for id %lu\n", id);
+  }
+  if (!result) {
+    __taint_trace_cond(result_label, result, 0, id);
+    AOUT("WARNING: assumption %lu is false, exiting\n", id);
+    __taint_trace_event_addr(result_label, 103, id, (void*)result, 10);
+    exit(201);
+  }
+  __taint_add_constraint(result_label, 1);
 }
 
 }  // extern "C"

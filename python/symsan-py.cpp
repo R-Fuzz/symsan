@@ -22,20 +22,29 @@ extern "C" {
 #include <unistd.h>
 
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <errno.h>
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+
+// For attach mode - track mapped shm for cleanup
+static void *__attached_shm = nullptr;
+static size_t __attached_shm_size = 0;
 
 // z3parser
 static z3::context __z3_context;
 symsan::Z3ParserSolver *__z3_parser = nullptr;
 
 
-static PyObject* SymSanInit(PyObject *self, PyObject *args) {
+static PyObject* SymSanInit(PyObject *self, PyObject *args, PyObject *keywds) {
+  static const char *kwlist[] = {"program", "shm_size", "init_solver", NULL};
   const char *program;
   unsigned long long ut_size = uniontable_size;
+  int init_solver = 1;  // default True
 
-  if (!PyArg_ParseTuple(args, "s|K", &program, &ut_size)) {
+  if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|Kp",
+      const_cast<char**>(kwlist), &program, &ut_size, &init_solver)) {
     return NULL;
   }
 
@@ -46,11 +55,13 @@ static PyObject* SymSanInit(PyObject *self, PyObject *args) {
     return PyErr_SetFromErrno(PyExc_OSError);
   }
 
-  // setup parser
-  __z3_parser = new symsan::Z3ParserSolver(shm_base, ut_size, __z3_context);
-  if (__z3_parser == nullptr) {
-    fprintf(stderr, "Failed to initialize parser\n");
-    return PyErr_NoMemory();
+  // setup parser (optional)
+  if (init_solver) {
+    __z3_parser = new symsan::Z3ParserSolver(shm_base, ut_size, __z3_context);
+    if (__z3_parser == nullptr) {
+      fprintf(stderr, "Failed to initialize parser\n");
+      return PyErr_NoMemory();
+    }
   }
 
   return PyCapsule_New(shm_base, "dfsan_label_info", NULL);
@@ -200,13 +211,104 @@ static PyObject* SymSanTerminate(PyObject *self) {
 static PyObject* SymSanDestroy(PyObject *self) {
   if (__z3_parser != nullptr) {
     delete __z3_parser;
-    symsan_destroy();
     __z3_parser = nullptr;
   }
+
+  // Clean up attached shm (from init_parser with shm name)
+  if (__attached_shm != nullptr) {
+    munmap(__attached_shm, __attached_shm_size);
+    __attached_shm = nullptr;
+    __attached_shm_size = 0;
+  } else {
+    // Only call symsan_destroy if we used init (launcher mode)
+    symsan_destroy();
+  }
+
   Py_RETURN_NONE;
 }
 
+// Initialize parser from shared memory (by name or address)
+// Usage: init_parser(shm_name, size) or init_parser(shm_capsule, size)
 static PyObject* InitParser(PyObject *self, PyObject *args) {
+  PyObject *shm_arg = NULL;
+  unsigned long long shm_size = 0;
+
+  if (!PyArg_ParseTuple(args, "OK", &shm_arg, &shm_size)) {
+    return NULL;
+  }
+
+  // Clean up any previous parser
+  if (__z3_parser != nullptr) {
+    delete __z3_parser;
+    __z3_parser = nullptr;
+  }
+  if (__attached_shm != nullptr) {
+    munmap(__attached_shm, __attached_shm_size);
+    __attached_shm = nullptr;
+    __attached_shm_size = 0;
+  }
+
+  void *shm_base = nullptr;
+
+  if (PyUnicode_Check(shm_arg)) {
+    // shm_arg is a string (shared memory name)
+    const char *shm_name = PyUnicode_AsUTF8(shm_arg);
+    if (shm_name == NULL) {
+      return NULL;
+    }
+
+    int shm_fd = shm_open(shm_name, O_RDWR, S_IRUSR | S_IWUSR);
+    if (shm_fd == -1) {
+      fprintf(stderr, "Failed to open shm '%s': %s\n", shm_name, strerror(errno));
+      return PyErr_SetFromErrno(PyExc_OSError);
+    }
+
+    shm_base = mmap(0, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+
+    if (shm_base == MAP_FAILED) {
+      fprintf(stderr, "Failed to mmap shm: %s\n", strerror(errno));
+      return PyErr_SetFromErrno(PyExc_OSError);
+    }
+
+    __attached_shm = shm_base;
+    __attached_shm_size = shm_size;
+  } else if (PyCapsule_CheckExact(shm_arg)) {
+    // shm_arg is a capsule (already mapped address)
+    shm_base = PyCapsule_GetPointer(shm_arg, "dfsan_label_info");
+    if (shm_base == NULL) {
+      return NULL;
+    }
+    // Don't track for munmap - caller owns this memory
+  } else if (PyLong_Check(shm_arg)) {
+    // shm_arg is an integer address
+    shm_base = (void *)PyLong_AsUnsignedLongLong(shm_arg);
+    if (PyErr_Occurred()) {
+      return NULL;
+    }
+    // Don't track for munmap - caller owns this memory
+  } else {
+    PyErr_SetString(PyExc_TypeError, "first argument must be shm name (str), capsule, or address (int)");
+    return NULL;
+  }
+
+  // Create the parser
+  __z3_parser = new symsan::Z3ParserSolver(shm_base, shm_size, __z3_context);
+  if (__z3_parser == nullptr) {
+    if (__attached_shm != nullptr) {
+      munmap(__attached_shm, __attached_shm_size);
+      __attached_shm = nullptr;
+      __attached_shm_size = 0;
+    }
+    fprintf(stderr, "Failed to initialize parser\n");
+    return PyErr_NoMemory();
+  }
+
+  Py_RETURN_NONE;
+}
+
+// Reset parser with new input data
+static PyObject* ResetParser(PyObject *self, PyObject *args) {
   if (__z3_parser == nullptr) {
     PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
     return NULL;
@@ -239,8 +341,50 @@ static PyObject* InitParser(PyObject *self, PyObject *args) {
     inputs.push_back({(uint8_t*)data, size});
   }
 
-  if (__z3_parser->restart(inputs) != 0) {
+  // Always copy input data in Python to avoid dangling pointers
+  if (__z3_parser->restart(inputs, true) != 0) {
     PyErr_SetString(PyExc_RuntimeError, "failed to restart parser");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
+// Update input cache without clearing deps (for late-arriving GV data)
+static PyObject* UpdateInput(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  std::vector<symsan::input_t> inputs;
+  PyObject *iargs = NULL;
+
+  if (!PyArg_ParseTuple(args, "O!", &PyList_Type, &iargs)) {
+    return NULL;
+  }
+
+  Py_ssize_t argc = PyList_Size(iargs);
+  for (Py_ssize_t i = 0; i < argc; i++) {
+    PyObject *item = PyList_GetItem(iargs, i);
+    if (item == NULL) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to retrieve args list");
+      return NULL;
+    }
+    if (!PyBytes_Check(item)) {
+      PyErr_SetString(PyExc_TypeError, "args must be a list of bytes");
+      return NULL;
+    }
+    Py_ssize_t size;
+    char *data;
+    if (PyBytes_AsStringAndSize(item, &data, &size) != 0) {
+      return NULL;
+    }
+    inputs.push_back({(uint8_t*)data, size});
+  }
+
+  if (__z3_parser->update_input(inputs, true) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to update input");
     return NULL;
   }
 
@@ -291,12 +435,13 @@ static PyObject* ParseGEP(PyObject *self, PyObject *args) {
   uint64_t num_elems = 0;
   uint64_t elem_size = 0;
   int64_t current_offset = 0;
-  bool enum_index = false; // XXX: default to false?
+  int enum_index_i = 0; // PyArg 'p' expects int*
 
   if (!PyArg_ParseTuple(args, "IKILKKLp", &ptr_label, &ptr, &index_label, &index,
-      &num_elems, &elem_size, &current_offset, &enum_index)) {
+      &num_elems, &elem_size, &current_offset, &enum_index_i)) {
     return NULL;
   }
+  bool enum_index = (enum_index_i != 0);
 
   std::vector<uint64_t> tasks;
   if (__z3_parser->parse_gep(ptr_label, ptr, index_label, index, num_elems,
@@ -363,6 +508,27 @@ static PyObject* RecordMemcmp(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject* RecordMinimize(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  dfsan_label label = 0;
+  bool allow_zero = true;
+
+  if (!PyArg_ParseTuple(args, "I|b", &label, &allow_zero)) {
+    return NULL;
+  }
+
+  if (__z3_parser->record_minimize(label, allow_zero) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to record minimize hint");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyObject* SolveTask(PyObject *self, PyObject *args) {
   if (__z3_parser == nullptr) {
     PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
@@ -380,11 +546,29 @@ static PyObject* SolveTask(PyObject *self, PyObject *args) {
 
   PyObject *sols = PyList_New(solutions.size());
   for (size_t i = 0; i < solutions.size(); i++) {
-    PyObject *sol = PyTuple_New(3);
-    auto val = solutions[i];
-    PyTuple_SetItem(sol, 0, PyLong_FromUnsignedLong(val.id));
-    PyTuple_SetItem(sol, 1, PyLong_FromUnsignedLong(val.offset));
-    PyTuple_SetItem(sol, 2, PyLong_FromUnsignedLong(val.val));
+    auto &val = solutions[i];
+    PyObject *sol = PyDict_New();
+
+    // Common fields for all operations
+    PyDict_SetItemString(sol, "op", PyLong_FromLong((int)val.op));
+    PyDict_SetItemString(sol, "id", PyLong_FromUnsignedLong(val.id));
+    PyDict_SetItemString(sol, "offset", PyLong_FromLong(val.offset));
+
+    // Operation-specific fields
+    using op_t = symsan::Z3ParserSolver::solution_op_t;
+    switch (val.op) {
+      case op_t::SET:
+        PyDict_SetItemString(sol, "val", PyLong_FromUnsignedLong(val.val));
+        break;
+      case op_t::INSERT:
+        PyDict_SetItemString(sol, "data",
+            PyBytes_FromStringAndSize((char*)val.data.data(), val.data.size()));
+        break;
+      case op_t::DELETE:
+        PyDict_SetItemString(sol, "len", PyLong_FromUnsignedLong(val.len));
+        break;
+    }
+
     PyList_SetItem(sols, i, sol);
   }
 
@@ -395,19 +579,52 @@ static PyObject* SolveTask(PyObject *self, PyObject *args) {
   return ret;
 }
 
+static PyObject* ExportTaskSMT2(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  uint64_t id = 0;
+  const char *filename = NULL;
+  if (!PyArg_ParseTuple(args, "Ks", &id, &filename)) {
+    return NULL;
+  }
+
+  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+    return NULL;
+  }
+
+  int ret = __z3_parser->export_task_smt2(id, fd);
+  close(fd);
+
+  if (ret != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to export task as SMT2");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyMethodDef SymSanMethods[] = {
-  {"init", SymSanInit, METH_VARARGS, "initialize symsan target"},
+  {"init", (PyCFunction)SymSanInit, METH_VARARGS | METH_KEYWORDS, "initialize symsan target"},
   {"config", (PyCFunction)SymSanConfig, METH_VARARGS | METH_KEYWORDS, "config symsan"},
   {"run", (PyCFunction)SymSanRun, METH_VARARGS | METH_KEYWORDS, "run symsan target, optional stdin=file"},
   {"read_event", SymSanReadEvent, METH_VARARGS, "read a symsan event"},
   {"terminate", (PyCFunction)SymSanTerminate, METH_NOARGS, "terminate current symsan instance"},
   {"destroy", (PyCFunction)SymSanDestroy, METH_NOARGS, "destroy symsan target"},
-  {"reset_input", InitParser, METH_VARARGS, "reset the symbolic expression parser with a new input"},
+  {"init_parser", InitParser, METH_VARARGS, "initialize parser from shared memory (name or address)"},
+  {"reset_input", ResetParser, METH_VARARGS, "reset the symbolic expression parser with a new input"},
+  {"update_input", UpdateInput, METH_VARARGS, "update input cache without clearing deps"},
   {"parse_cond", ParseCond, METH_VARARGS, "parse trace_cond event into solving tasks"},
   {"parse_gep", ParseGEP, METH_VARARGS, "parse trace_gep event into solving tasks"},
   {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},
   {"record_memcmp", RecordMemcmp, METH_VARARGS, "record a memcmp event"},
+  {"record_minimize", RecordMinimize, METH_VARARGS, "record a label to minimize during solving (e.g., malloc size)"},
   {"solve_task", SolveTask, METH_VARARGS, "solve a task"},
+  {"export_task_smt2", ExportTaskSMT2, METH_VARARGS, "export a task as SMT-LIB v2 to a file"},
   {NULL, NULL, 0, NULL}  /* Sentinel */
 };
 
@@ -429,5 +646,46 @@ PyInit_symsan(void) {
     delete __z3_parser;
     symsan_destroy();
   }
-  return PyModule_Create(&SymSanModule);
+
+  PyObject *module = PyModule_Create(&SymSanModule);
+  if (module == NULL) {
+    return NULL;
+  }
+
+  // Create OpType enum class
+  PyObject *enum_module = PyImport_ImportModule("enum");
+  if (enum_module == NULL) {
+    Py_DECREF(module);
+    return NULL;
+  }
+
+  PyObject *int_enum = PyObject_GetAttrString(enum_module, "IntEnum");
+  Py_DECREF(enum_module);
+  if (int_enum == NULL) {
+    Py_DECREF(module);
+    return NULL;
+  }
+
+  // Create OpType enum with SET=0, INSERT=1, DELETE=2
+  PyObject *enum_dict = PyDict_New();
+  PyDict_SetItemString(enum_dict, "SET", PyLong_FromLong(0));
+  PyDict_SetItemString(enum_dict, "INSERT", PyLong_FromLong(1));
+  PyDict_SetItemString(enum_dict, "DELETE", PyLong_FromLong(2));
+
+  PyObject *enum_args = PyTuple_Pack(2, PyUnicode_FromString("OpType"), enum_dict);
+  Py_DECREF(enum_dict);
+
+  PyObject *op_type_enum = PyObject_CallObject(int_enum, enum_args);
+  Py_DECREF(int_enum);
+  Py_DECREF(enum_args);
+
+  if (op_type_enum == NULL) {
+    Py_DECREF(module);
+    return NULL;
+  }
+
+  // Add OpType to module
+  PyModule_AddObject(module, "OpType", op_type_enum);
+
+  return module;
 }

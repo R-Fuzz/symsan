@@ -20,7 +20,7 @@ target_include_directories(pysymsan PRIVATE
 target_link_libraries(pysymsan PRIVATE
   launcher
   z3parser
-  z3
+  ${Z3_LIBRARY}
   ${Python3_LIBRARIES}
   rt
 )

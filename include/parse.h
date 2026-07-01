@@ -37,8 +37,9 @@ public:
       prev_task_id_(0) {}
   virtual ~ASTParser() {}
 
-  virtual int restart(std::vector<input_t> &inputs) {
+  virtual int restart(std::vector<input_t> &inputs, bool copy_input = false) {
     (void)inputs;
+    (void)copy_input;
     memcmp_cache_.clear();
     return 0;
   }
@@ -72,6 +73,15 @@ public:
   /// @param result concrete value of the constraint
   /// @return 0 on success, -1 on failure
   virtual int add_constraints(dfsan_label label, uint64_t result) = 0;
+
+  /// @brief Record a label to minimize during solving (e.g., malloc size)
+  /// @param label symbolic label to minimize
+  /// @param allow_zero whether to allow zero as a valid solution
+  /// @return 0 on success, -1 on failure
+  virtual int record_minimize(dfsan_label label, bool allow_zero) {
+    (void)label; (void)allow_zero;
+    return 0;
+  }
 
   virtual int record_memcmp(dfsan_label label, uint8_t* buf, size_t size) {
     auto content = std::make_unique<uint8_t[]>(size);

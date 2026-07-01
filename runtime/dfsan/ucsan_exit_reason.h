@@ -1,0 +1,23 @@
+enum exit_reason {
+  /* internal */
+  REASON_LOOP_OOB = 123,
+  REASON_OBJ_OOB = 124,
+  REASON_STACK_OOB = 125,
+
+  /* checker */
+  EVENT_UBI = 150,
+  EVENT_UAF = 151,
+  EVENT_OOB = 152,
+  EVENT_NULL_DEREF = 153,
+  EVENT_DIV_BY_ZERO = 154,
+  EVENT_INT_OVERFLOW = 155,
+  EVENT_DOUBLE_FREE = 156,
+  EVENT_MEMLEAK = 157,
+
+  EVENT_OOB_UPCAST = 161,
+
+  EVENT_PANIC = 171,
+
+  /* assumption assertion errors */
+  EVENT_CONTRACTION = 201,
+};

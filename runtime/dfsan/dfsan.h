@@ -57,7 +57,8 @@ struct dfsan_label_info {
 #define CONST_OFFSET 1
 #define CONST_LABEL 0
 
-static const size_t uniontable_size = 0xc00000000; // FIXME
+static const size_t minimum_uniontable_size = 0x10000 * sizeof(dfsan_label_info); // 64K entries
+static size_t uniontable_size = 0xc00000000; // FIXME
 
 struct taint_file {
   char filename[PATH_MAX];
@@ -87,7 +88,7 @@ dfsan_label dfsan_read_label(const void *addr, uptr size);
 void dfsan_store_label(dfsan_label l1, void *addr, uptr size);
 dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
                         uint64_t op1, uint64_t op2);
-dfsan_label dfsan_create_label(off_t offset);
+dfsan_label dfsan_create_label(uint64_t input_id, uint64_t offset, uint32_t size_in_bytes);
 dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
 
@@ -105,6 +106,8 @@ void taint_set_str_content_label(void *addr, dfsan_label label);
 dfsan_label taint_get_str_content_label(const void *addr);
 void taint_set_str_indexof_label(void *addr, dfsan_label label);
 dfsan_label taint_get_str_indexof_label(const void *addr);
+dfsan_label taint_find_string_op_source(dfsan_label label);
+dfsan_label taint_get_base_input_label(dfsan_label label);
 
 // taint source utmp
 off_t get_utmp_offset(void);
@@ -198,7 +201,8 @@ enum operators {
   fstrcmp   = last_llvm_op + 18, // 85 strcmp using Z3 string theory
   fprefixof = last_llvm_op + 19, // 86 prefixof(str, prefix) using Z3 string theory
   fsuffixof = last_llvm_op + 20, // 87 suffixof(str, suffix) using Z3 string theory
-  LastOp    = last_llvm_op + 21, // 88
+  flength   = last_llvm_op + 21, // 88 z3::length(str_var), Int sort
+  LastOp    = last_llvm_op + 22, // 89
 };
 
 enum predicate {
@@ -231,7 +235,7 @@ static inline uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predic
   return 0;
 }
 
-static inline bool is_commutative(unsigned char op) {
+static inline bool is_commutative(uint16_t op) {
   switch(op) {
     case Not:
     case And:
@@ -247,14 +251,37 @@ static inline bool is_commutative(unsigned char op) {
   }
 }
 
+// Check if an op is a string operation (fstr_op_start to fstr_op_end)
+static inline bool is_string_op(uint16_t op) {
+  return op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end;
+}
+
+// Check if an op is an indexOf-type operation (returns position, not content)
+// These are: fstrchr, fstrrchr, fstrstr, fstrpbrk, fstr_off
+static inline bool is_indexof_op(uint16_t op) {
+  return op >= __dfsan::fstrchr && op <= __dfsan::fstr_off;
+}
+
+// Check if an op is a content-type string operation (fsubstr, fstrcat)
+static inline bool is_content_string_op(uint16_t op) {
+  return op == __dfsan::fsubstr || op == __dfsan::fstrcat;
+}
+
 // for out-of-process solving
 
 enum pipe_msg_type {
   cond_type = 0,
   gep_type = 1,
   memcmp_type = 2,
-  fsize_type = 3,
+  add_constraint_type = 3,
   memerr_type = 4,
+  // from thoroupy
+  exit_type,
+  loop_type,
+  bb_type,
+  event_type,
+  gv_type,
+  minimize_type,
 };
 
 static const uint8_t TrueBranchLoopLatch = 0x8;
@@ -280,6 +307,7 @@ enum undefined_check_ids {
   ub_unsigned_integer_truncation,
   ub_signed_integer_truncation,
   ub_integer_sign_change,
+  ub_assertion_failure,
 };
 
 #define F_ADD_CONS   0x1

@@ -16,65 +16,7 @@
 
  */
 
-#include "sanitizer_common/sanitizer_common.h"
-#include "sanitizer_common/sanitizer_file.h"
-#include "sanitizer_common/sanitizer_posix.h"
-#include "dfsan/dfsan.h"
-
-using namespace __dfsan;
-
-static uint32_t __instance_id;
-static uint32_t __session_id;
-static int __pipe_fd;
-
-// filter?
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
-
-static inline void __solve_cond(dfsan_label label, uint8_t result,
-                                uint8_t add_nested, uint8_t loop_flag,
-                                uint32_t cid, void *addr) {
-
-  if (__pipe_fd < 0)
-    return;
-
-  uint16_t flags = 0;
-  if (add_nested) flags |= F_ADD_CONS;
-
-  // set the loop flags according to branching results
-  switch (loop_flag) {
-    case TrueBranchLoopExit:
-      flags |= result ? F_LOOP_EXIT : F_LOOP_LATCH;
-      break;
-    case TrueBranchLoopLatch:
-      flags |= result ? F_LOOP_LATCH : F_LOOP_EXIT;
-      break;
-    case FalseBranchLoopExit:
-      flags |= result ? F_LOOP_LATCH : F_LOOP_EXIT;
-      break;
-    case FalseBranchLoopLatch:
-      flags |= result ? F_LOOP_EXIT : F_LOOP_LATCH;
-      break;
-    default:
-      // No loop flag or unrecognized flag, do nothing
-      break;
-  }
-
-  // send info
-  pipe_msg msg = {
-    .msg_type = cond_type,
-    .flags = flags,
-    .instance_id = __instance_id,
-    .addr = (uptr)addr,
-    .context = __taint_trace_callstack,
-    .id = cid,
-    .label = label,
-    .result = result
-  };
-
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
-}
+#include "solver_common.h"
 
 static inline void __send_ubi(dfsan_label label, uint64_t result,
                               uint32_t cid, void *addr) {
@@ -140,7 +82,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
     __switch_true_case.cid = cid;
   } else {
     // solve without add_nested
-    __solve_cond(temp, r, 0, 0, cid, addr);
+    __taint_send_cond(temp, r, 0, 0, cid, addr);
   }
 }
 
@@ -160,7 +102,7 @@ __taint_trace_switch_end(uint32_t cid) {
        __switch_true_case.label, cid, addr);
 
   // solve the true case
-  __solve_cond(__switch_true_case.label, 1, 1, 0, cid, addr);
+  __taint_send_cond(__switch_true_case.label, 1, 1, 0, cid, addr);
   __switch_true_case.label = 0;
 }
 
@@ -190,7 +132,7 @@ __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
   uint8_t loop_flag = flag & LoopFlagMask;
 
   // always add nested
-  __solve_cond(label, r, add_nested, loop_flag, cid, addr);
+  __taint_send_cond(label, r, add_nested, loop_flag, cid, addr);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
@@ -217,18 +159,18 @@ __taint_trace_select(dfsan_label cond_label, dfsan_label true_label,
   if (true_label != 0 && false_op == 0) {
     dfsan_label land = dfsan_union(cond_label, true_label, And, 1, r, true_op);
     uint8_t lr = (r && true_op) ? 1 : 0;
-    __solve_cond(land, lr, 1, 0, cid, addr);
+    __taint_send_cond(land, lr, 1, 0, cid, addr);
     return land;
   } else if (false_label != 0 && true_op == 1) {
     // logical OR: select cond, true, label
     dfsan_label lor = dfsan_union(cond_label, false_label, Or, 1, r, false_op);
     uint8_t lr = (r || false_op) ? 1 : 0;
-    __solve_cond(lor, lr, 1, 0, cid, addr);
+    __taint_send_cond(lor, lr, 1, 0, cid, addr);
     return lor;
   } else {
     // normal select?
     AOUT("normal select?!\n");
-    __solve_cond(cond_label, r, 1, 0, cid, addr);
+    __taint_send_cond(cond_label, r, 1, 0, cid, addr);
     return r ? true_label : false_label;
   }
 }
@@ -307,7 +249,107 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, s64 offset, unsigned size) {
+  // use add_constraint_type to send offset constraints
+  if (offset_label == 0)
+    return;
+
+  void *addr = __builtin_return_address(0);
+
+  AOUT("tainted offset: %ld = %d, size: %u @%p\n",
+       offset, offset_label, size, addr);
+
+  if (__pipe_fd < 0)
+    return;
+
+  pipe_msg msg = {
+    .msg_type = add_constraint_type,
+    .flags = 0,
+    .instance_id = __instance_id,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack,
+    .label = offset_label, // just in case
+    .result = (uint64_t)offset
+  };
+
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
+
   return;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_add_constraint(dfsan_label label, uint8_t result) {
+  if (label == 0)
+    return;
+
+  void *addr = __builtin_return_address(0);
+
+  AOUT("tainted add_constraint: %d, result: %u @%p\n", label, result, addr);
+
+  if (__pipe_fd < 0)
+    return;
+
+  pipe_msg msg = {
+    .msg_type = add_constraint_type,
+    .flags = 0,
+    .instance_id = __instance_id,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack,
+    .label = label,
+    .result = (uint64_t)result
+  };
+
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
+
+  return;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_minimize_label(dfsan_label label, u64 size, dfsan_label bounds) {
+  if (label == 0 || label == kInitializingLabel)
+    return;
+
+  void *addr = __builtin_return_address(0);
+
+  AOUT("minimize label: %d, bounds: %d, size: %lu\n", label, bounds, size);
+
+  if (bounds != 0) {
+    dfsan_label_info *bounds_info = get_label_info(bounds);
+    if (bounds_info->op == __dfsan::Alloca) {
+      AOUT("update size label from %d to %d\n", bounds_info->l2, label);
+      bounds_info->l2 = label;
+    }
+  }
+
+  if (__pipe_fd < 0)
+    return;
+
+  pipe_msg msg = {
+    .msg_type = minimize_type,
+    .flags = 0,
+    .instance_id = __instance_id,
+    .addr = 0,
+    .context = __taint_trace_callstack,
+    .label = label,
+    .result = 0
+  };
+
+  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+    Die();
+  }
+
+  if (!flags().allow_zero_size_alloc && size == 0) {
+    // Emit this after the minimize message so the manager records the hint
+    // before solving the synthetic nonzero condition.
+    static constexpr uint32_t kMinimizeNonzeroCid = 12;
+    dfsan_label_info *size_info = get_label_info(label);
+    dfsan_label nonzero_label =
+        dfsan_union(label, 0, (__dfsan::bvneq << 8) | ICmp, size_info->size, 0, 0);
+    __taint_send_cond(nonzero_label, 0, 1, 0, kMinimizeNonzeroCid, addr);
+  }
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -403,8 +445,9 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
   }
 }
 
-extern "C" void InitializeSolver() {
+extern "C" void InitializeSymSanSolver() {
   __instance_id = flags().instance_id;
   __session_id = flags().session_id;
   __pipe_fd = flags().pipe_fd;
+  __control_pipe_fd = flags().control_pipe_fd;
 }
