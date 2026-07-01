@@ -505,7 +505,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
         data->parser->record_memcmp(msg.label, mmsg->content, msg.result);
         free(mmsg);
         break;
-      case fsize_type:
+      case add_constraint_type:
         break;
       case memerr_type:
         WARNF("Memory error detected @%p, type = %d\n", (void*)msg.addr, msg.flags);
