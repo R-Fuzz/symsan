@@ -19,12 +19,10 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DepthFirstIterator.h"
-#include "llvm/ADT/None.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -48,6 +46,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
@@ -74,7 +73,9 @@
 #include "llvm/Support/SpecialCaseList.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/Instrumentation.h"
+#if LLVM_VERSION_CODE < LLVM_VERSION(17, 0)
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#endif
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <algorithm>
@@ -205,6 +206,17 @@ static cl::opt<bool> ClWithUCSan(
     "taint-with-ucsan",
     cl::desc("Performs under-constrained symbolic execution."),
     cl::Hidden, cl::init(false));
+
+// SYMSAN specific flag. Upstream DFSan conservatively stores a zero shadow on
+// atomic stores (and CAS/RMW) to avoid shadow data races. That loses the
+// symbolic expression of the stored value. Concolic targets are typically
+// single-threaded, so by default we preserve the real shadow instead. Set to
+// false to restore DFSan's race-free zeroing behaviour.
+static cl::opt<bool> ClPreserveAtomicShadow(
+    "taint-preserve-atomic-shadow",
+    cl::desc("Propagate the real shadow through atomic stores/CAS instead of "
+             "zeroing it (loses symex but is race-free when disabled)."),
+    cl::Hidden, cl::init(true));
 
 static StringRef getGlobalTypeString(const GlobalValue &G) {
   // Types of GlobalVariables are always pointer types.
@@ -409,6 +421,7 @@ class Taint {
   FunctionType *TaintUnionStoreFnTy;
   FunctionType *TaintGEPOffsetFnTy;
   FunctionType *TaintUnimplementedFnTy;
+  FunctionType *TaintWrapperExternWeakNullFnTy;
   FunctionType *TaintSetLabelFnTy;
   FunctionType *TaintNonzeroLabelFnTy;
   FunctionType *TaintVarargWrapperFnTy;
@@ -434,6 +447,7 @@ class Taint {
   FunctionCallee TaintUnionStoreFn;
   FunctionCallee TaintGEPOffsetFn;
   FunctionCallee TaintUnimplementedFn;
+  FunctionCallee TaintWrapperExternWeakNullFn;
   FunctionCallee TaintSetLabelFn;
   FunctionCallee TaintNonzeroLabelFn;
   FunctionCallee TaintVarargWrapperFn;
@@ -471,14 +485,19 @@ class Taint {
   bool isInstrumented(const GlobalAlias *GA);
   FunctionType *getArgsFunctionType(FunctionType *T);
   bool isForceZeroLabels(const Function *F);
+#if LLVM_VERSION_CODE < LLVM_VERSION(15, 0)
   FunctionType *getTrampolineFunctionType(FunctionType *T);
+#endif
   TransformedFunction getCustomFunctionType(FunctionType *T);
   WrapperKind getWrapperKind(Function *F);
   void addGlobalNameSuffix(GlobalValue *GV);
+  void buildExternWeakCheckIfNeeded(IRBuilder<> &IRB, Function *F);
   Function *buildWrapperFunction(Function *F, StringRef NewFName,
                                  GlobalValue::LinkageTypes NewFLink,
                                  FunctionType *NewFT);
+#if LLVM_VERSION_CODE < LLVM_VERSION(15, 0)
   Constant *getOrBuildTrampolineFunction(FunctionType *FT, StringRef FName);
+#endif
 
   void addContextRecording(Function &F);
   void addFrameTracing(Function &F);
@@ -676,7 +695,7 @@ public:
   void visitLoadInst(LoadInst &LI);
   void visitStoreInst(StoreInst &SI);
   void visitAtomicRMWInst(AtomicRMWInst &I);
-  //void visitAtomicCmpXchgInst(AtomicCmpXchgInst &I);
+  void visitAtomicCmpXchgInst(AtomicCmpXchgInst &I);
   void visitReturnInst(ReturnInst &RI);
   void visitCallBase(CallBase &CB);
   void visitPHINode(PHINode &PN);
@@ -732,6 +751,7 @@ FunctionType *Taint::getArgsFunctionType(FunctionType *T) {
   return FunctionType::get(RetType, ArgTypes, T->isVarArg());
 }
 
+#if LLVM_VERSION_CODE < LLVM_VERSION(15, 0)
 FunctionType *Taint::getTrampolineFunctionType(FunctionType *T) {
   assert(!T->isVarArg());
   SmallVector<Type *, 4> ArgTypes;
@@ -750,6 +770,7 @@ FunctionType *Taint::getTrampolineFunctionType(FunctionType *T) {
     ArgTypes.push_back(PointerType::getUnqual(getShadowTy(RetType)));
   return FunctionType::get(T->getReturnType(), ArgTypes, false);
 }
+#endif
 
 TransformedFunction Taint::getCustomFunctionType(FunctionType *T) {
   SmallVector<Type *, 4> ArgTypes;
@@ -761,16 +782,24 @@ TransformedFunction Taint::getCustomFunctionType(FunctionType *T) {
   std::vector<unsigned> ArgumentIndexMapping;
   for (unsigned I = 0, E = T->getNumParams(); I != E; ++I) {
     Type* ParamType = T->getParamType(I);
-    FunctionType *FT;
+#if LLVM_VERSION_CODE < LLVM_VERSION(15, 0)
+    FunctionType *FT = nullptr;
     if (isa<PointerType>(ParamType) &&
         (FT = dyn_cast<FunctionType>(ParamType->getPointerElementType()))) {
       ArgumentIndexMapping.push_back(ArgTypes.size());
       ArgTypes.push_back(getTrampolineFunctionType(FT)->getPointerTo());
-      ArgTypes.push_back(Type::getInt8PtrTy(*Ctx));
+      ArgTypes.push_back(KO_INT8PTRTY(*Ctx));
     } else {
       ArgumentIndexMapping.push_back(ArgTypes.size());
       ArgTypes.push_back(ParamType);
     }
+#else
+    // Opaque pointers (LLVM 15+) hide the pointee type, so custom-wrapper
+    // trampolines for function-pointer arguments can no longer be detected;
+    // pass the parameter through unchanged.
+    ArgumentIndexMapping.push_back(ArgTypes.size());
+    ArgTypes.push_back(ParamType);
+#endif
   }
   for (unsigned i = 0, e = T->getNumParams(); i != e; ++i) {
     // we keep the shadow type consistent with the arg type so we don't
@@ -898,7 +927,7 @@ void Taint::addContextRecording(Function &F) {
 
   // Strip dfs$ prefix
   auto FName = F.getName();
-  if (FName.startswith("dfs")) {
+  if (KO_STARTSWITH(FName, "dfs")) {
     size_t pos = FName.find_first_of('$');
     FName = FName.drop_front(pos + 1);
   }
@@ -910,10 +939,10 @@ void Taint::addContextRecording(Function &F) {
 
   ConstantInt *CID = ConstantInt::get(Int32Ty, hash);
   LoadInst *LCS = IRB.CreateLoad(Int32Ty, CallStack);
-  LCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+  LCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, LLVM_NONE));
   Value *NCS = IRB.CreateXor(LCS, CID);
   StoreInst *SCS = IRB.CreateStore(NCS, CallStack);
-  SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+  SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, LLVM_NONE));
 
   // Recover ctx at the end of a function
   for (auto FI = F.begin(), FE = F.end(); FI != FE; FI++) {
@@ -922,7 +951,7 @@ void Taint::addContextRecording(Function &F) {
     if (isa<ReturnInst>(Inst) || isa<ResumeInst>(Inst)) {
       IRB.SetInsertPoint(Inst);
       SCS = IRB.CreateStore(LCS, CallStack);
-      SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, None));
+      SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, LLVM_NONE));
     }
   }
 }
@@ -997,15 +1026,19 @@ bool Taint::initializeModule(Module &M) {
       PrimitiveShadowTy,
       { PrimitiveShadowTy, VoidPtrTy, VoidPtrTy }, /*isVarArg=*/ false);
   TaintUnimplementedFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), Type::getInt8PtrTy(*Ctx), /*isVarArg=*/false);
-  Type *TaintSetLabelArgs[3] = { PrimitiveShadowTy, Type::getInt8PtrTy(*Ctx),
+      Type::getVoidTy(*Ctx), KO_INT8PTRTY(*Ctx), /*isVarArg=*/false);
+  Type *TaintWrapperExternWeakNullArgs[2] = { KO_INT8PTRTY(*Ctx),
+      KO_INT8PTRTY(*Ctx) };
+  TaintWrapperExternWeakNullFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), TaintWrapperExternWeakNullArgs, /*isVarArg=*/false);
+  Type *TaintSetLabelArgs[3] = { PrimitiveShadowTy, KO_INT8PTRTY(*Ctx),
       IntptrTy };
   TaintSetLabelFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
                                         TaintSetLabelArgs, /*isVarArg=*/false);
   TaintNonzeroLabelFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), None, /*isVarArg=*/false);
+      Type::getVoidTy(*Ctx), LLVM_NONE, /*isVarArg=*/false);
   TaintVarargWrapperFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), Type::getInt8PtrTy(*Ctx), /*isVarArg=*/false);
+      Type::getVoidTy(*Ctx), KO_INT8PTRTY(*Ctx), /*isVarArg=*/false);
   Type *TaintTraceCmpArgs[7] = { PrimitiveShadowTy, PrimitiveShadowTy,
       Int32Ty, Int32Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceCmpFnTy = FunctionType::get(
@@ -1047,7 +1080,7 @@ bool Taint::initializeModule(Module &M) {
   // __taint_solve_str_bounds(str_ptr, buf_label, buf_ptr, step)
   TaintSolveStrBoundsFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx),
-      { Type::getInt8PtrTy(*Ctx), PrimitiveShadowTy, Int64Ty, Int64Ty }, false);
+      { KO_INT8PTRTY(*Ctx), PrimitiveShadowTy, Int64Ty, Int64Ty }, false);
   TaintTraceGlobalFnTy = FunctionType::get(
       PrimitiveShadowTy, { Int64Ty, Int64Ty }, false);
 
@@ -1130,6 +1163,22 @@ void Taint::addGlobalNameSuffix(GlobalValue *GV) {
   }
 }
 
+void Taint::buildExternWeakCheckIfNeeded(IRBuilder<> &IRB, Function *F) {
+  // If the function we are wrapping was ExternWeak, it may be null.
+  // The original code before calling this wrapper may have checked for null,
+  // but replacing with a known-to-not-be-null wrapper can break this check.
+  // When replacing uses of the extern weak function with the wrapper we try
+  // to avoid replacing uses in conditionals, but this is not perfect.
+  // In the case where we fail, and accidentially optimize out a null check
+  // for a extern weak function, add a check here to help identify the issue.
+  if (GlobalValue::isExternalWeakLinkage(F->getLinkage())) {
+    std::vector<Value *> Args;
+    Args.push_back(IRB.CreatePointerCast(F, KO_INT8PTRTY(*Ctx)));
+    Args.push_back(IRB.CreateGlobalStringPtr(F->getName()));
+    IRB.CreateCall(TaintWrapperExternWeakNullFn, Args);
+  }
+}
+
 Function *
 Taint::buildWrapperFunction(Function *F, StringRef NewFName,
                             GlobalValue::LinkageTypes NewFLink,
@@ -1163,6 +1212,7 @@ Taint::buildWrapperFunction(Function *F, StringRef NewFName,
   return NewF;
 }
 
+#if LLVM_VERSION_CODE < LLVM_VERSION(15, 0)
 Constant *Taint::getOrBuildTrampolineFunction(FunctionType *FT,
                                               StringRef FName) {
   FunctionType *FTT = getTrampolineFunctionType(FT);
@@ -1201,6 +1251,7 @@ Constant *Taint::getOrBuildTrampolineFunction(FunctionType *FT,
 
   return cast<Constant>(C.getCallee());
 }
+#endif
 
 // Initialize DataFlowSanitizer runtime functions and declare them in the module
 void Taint::initializeRuntimeFunctions(Module &M) {
@@ -1240,6 +1291,10 @@ void Taint::initializeRuntimeFunctions(Module &M) {
         Mod->getOrInsertFunction("__dfsan_unimplemented", TaintUnimplementedFnTy);
   }
   {
+    TaintWrapperExternWeakNullFn = Mod->getOrInsertFunction(
+        "__dfsan_wrapper_extern_weak_null", TaintWrapperExternWeakNullFnTy);
+  }
+  {
     AttributeList AL;
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     TaintSetLabelFn =
@@ -1275,6 +1330,8 @@ void Taint::initializeRuntimeFunctions(Module &M) {
       TaintGEPOffsetFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintUnimplementedFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintWrapperExternWeakNullFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintSetLabelFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -1594,7 +1651,40 @@ bool Taint::runImpl(Module &M) {
 
       Value *WrappedFnCst =
           ConstantExpr::getBitCast(NewF, PointerType::getUnqual(FT));
-      F.replaceAllUsesWith(WrappedFnCst);
+
+      // Extern weak functions can sometimes be null at execution time.
+      // Code will sometimes check if an extern weak function is null.
+      // This could look something like:
+      //   declare extern_weak i8 @my_func(i8)
+      //   br i1 icmp ne (i8 (i8)* @my_func, i8 (i8)* null), label %use_my_func,
+      //   label %avoid_my_func
+      // The @"dfsw$my_func" wrapper is never null, so if we replace this use
+      // in the comparision, the icmp will simplify to false and we have
+      // accidentially optimized away a null check that is necessary.
+      // This can lead to a crash when the null extern_weak my_func is called.
+      //
+      // To prevent (the most common pattern of) this problem,
+      // do not replace uses in comparisons with the wrapper.
+      // We definitely want to replace uses in call instructions.
+      // Other uses (e.g. store the function address somewhere) might be
+      // called or compared or both - this case may not be handled correctly.
+      // We will default to replacing with wrapper in cases we are unsure.
+      auto IsNotCmpUse = [](Use &U) -> bool {
+        User *Usr = U.getUser();
+        if (ConstantExpr *CE = dyn_cast<ConstantExpr>(Usr)) {
+          // This is the most common case for icmp ne null
+          if (CE->getOpcode() == Instruction::ICmp) {
+            return false;
+          }
+        }
+        if (Instruction *I = dyn_cast<Instruction>(Usr)) {
+          if (I->getOpcode() == Instruction::ICmp) {
+            return false;
+          }
+        }
+        return true;
+      };
+      F.replaceUsesWithIf(WrappedFnCst, IsNotCmpUse);
 
       UnwrappedFnMap[WrappedFnCst] = &F;
       *FI = NewF;
@@ -1628,7 +1718,7 @@ bool Taint::runImpl(Module &M) {
       continue;
 
     addContextRecording(*F);
-    if (!F->getName().startswith("dfsw$"))
+    if (!KO_STARTSWITH(F->getName(), "dfsw$"))
       addFrameTracing(*F);
     removeUnreachableBlocks(*F);
 
@@ -1807,7 +1897,7 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
   if (!Callee)
     return false;
   StringRef FName = Callee->getName();
-  if (!FName.startswith("__dfsw_"))
+  if (!KO_STARTSWITH(FName, "__dfsw_"))
     return false;
 
   StringRef BaseName = FName.drop_front(7); // skip "__dfsw_"
@@ -2195,7 +2285,7 @@ void TaintFunction::hoistBoundsChecks() {
           continue;
 
         IRBuilder<> IRB(CI);
-        Type *I8PtrTy = Type::getInt8PtrTy(F->getContext());
+        Type *I8PtrTy = KO_INT8PTRTY(F->getContext());
         Type *I8PtrPtrTy = PointerType::getUnqual(I8PtrTy);
         Value *ArgI8 = IRB.CreateBitCast(Arg, I8PtrTy);
         Value *FieldAddr = ArgI8;
@@ -2334,7 +2424,7 @@ void TaintFunction::hoistBoundsChecks() {
       // __taint_solve_str_bounds(str_ptr, buf_label, buf_ptr, step)
       Instruction *InsertPt = Preheader->getTerminator();
       IRBuilder<> IRB(InsertPt);
-      Value *StrPtr = IRB.CreateBitCast(StrBase, Type::getInt8PtrTy(*TT.Ctx));
+      Value *StrPtr = IRB.CreateBitCast(StrBase, KO_INT8PTRTY(*TT.Ctx));
       if (StrUCChk) {
         // Hoist ucsan_check_pointer with deref=1 so the string object
         // is materialized before __taint_solve_str_bounds dereferences it
@@ -2686,7 +2776,7 @@ void TaintFunction::hoistBoundsChecks() {
           TripCount, SE.getConstant(TripCount->getType(), Summary.AccessSize));
 
       IRBuilder<> IRB(InsertPt);
-      Type *I8PtrTy = Type::getInt8PtrTy(F->getContext());
+      Type *I8PtrTy = KO_INT8PTRTY(F->getContext());
       Type *I8PtrPtrTy = PointerType::getUnqual(I8PtrTy);
       Value *ArgI8 = IRB.CreateBitCast(Arg, I8PtrTy);
       Value *FieldAddr = ArgI8;
@@ -3018,7 +3108,7 @@ Value *TaintFunction::loadShadowRecursive(
     uint64_t SubSize = DL.getTypeStoreSize(SubTy);
     assert(Size >= SubSize);
     uint64_t SubSizeInBits = DL.getTypeSizeInBits(SubTy);
-    Align = std::min(Align, (uint64_t)DL.getABITypeAlignment(SubTy));
+    Align = std::min(Align, (uint64_t)KO_GETABITYPEALIGN(DL, SubTy));
     // load a primitive shadow from address
     Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, SubSizeInBits, Align, IRB);
     // then insert the primitive shadow into the sub-field
@@ -3212,6 +3302,59 @@ void TaintVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
   I.setOrdering(addReleaseOrdering(I.getOrdering()));
 }
 
+void TaintVisitor::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
+  auto &DL = I.getModule()->getDataLayout();
+  Value *Ptr = I.getPointerOperand();
+  Value *NewVal = I.getNewValOperand();
+  Type *ValTy = NewVal->getType();
+  uint64_t Size = DL.getTypeStoreSize(ValTy);
+
+  // The result is { ValTy old_value, i1 success }. Field 0 carries the value
+  // read from memory; the success flag is a concrete comparison result and is
+  // treated as clean.
+  Type *ResShadowTy = TF.TT.getShadowTy(I.getType());
+
+  if (Size == 0) {
+    TF.setShadow(&I, TF.TT.getZeroShadow(&I));
+    // Upstream DFSan follows MSan's ordering change; do the same.
+    I.setSuccessOrdering(addReleaseOrdering(I.getSuccessOrdering()));
+    return;
+  }
+
+  if (!ClPreserveAtomicShadow) {
+    // Conservative, race-free behaviour matching upstream DFSan: zero the
+    // shadow at the stored address and return a zero result shadow.
+    Value *Zero = TF.TT.getZeroShadow(ValTy);
+    TF.storeShadow(Ptr, ValTy, Size, I.getAlign(), Zero, &I);
+    TF.setShadow(&I, TF.TT.getZeroShadow(&I));
+    I.setSuccessOrdering(addReleaseOrdering(I.getSuccessOrdering()));
+    return;
+  }
+
+  // Shadow of the value currently in memory (returned in field 0).
+  Value *OldShadow = TF.loadShadow(ValTy, Ptr, Size, I.getAlign(), &I);
+  Value *NewShadow = TF.getShadow(NewVal);
+
+  // The exchange only writes NewVal on success, so the shadow in memory
+  // becomes NewShadow when the comparison succeeded and stays OldShadow
+  // otherwise. The success flag is only available after the instruction.
+  Instruction *Pos = I.getNextNode();
+  IRBuilder<> IRB(Pos);
+  Value *Success = IRB.CreateExtractValue(&I, 1);
+  Value *StoredShadow = IRB.CreateSelect(Success, NewShadow, OldShadow);
+  TF.storeShadow(Ptr, ValTy, Size, I.getAlign(), StoredShadow, Pos);
+
+  Value *ResShadow = UndefValue::get(ResShadowTy);
+  ResShadow = IRB.CreateInsertValue(ResShadow, OldShadow, 0);
+  ResShadow = IRB.CreateInsertValue(
+      ResShadow, TF.TT.getZeroShadow(I.getType()->getStructElementType(1)), 1);
+  TF.setShadow(&I, ResShadow);
+
+  // TODO: The ordering change follows MSan. It is possible not to change
+  // ordering because we always set and use 0 shadows.
+  I.setSuccessOrdering(addReleaseOrdering(I.getSuccessOrdering()));
+}
+
 void TaintVisitor::visitLoadInst(LoadInst &LI) {
   auto &DL = LI.getModule()->getDataLayout();
   uint64_t Size = DL.getTypeStoreSize(LI.getType());
@@ -3259,7 +3402,7 @@ void TaintFunction::storeShadowRecursive(
   if (!isa<ArrayType>(SubShadowTy) && !isa<StructType>(SubShadowTy)) {
     uint64_t SubSize = DL.getTypeStoreSize(SubShadowTy);
     assert(Size >= SubSize);
-    Align = std::min(Align, (uint64_t)DL.getABITypeAlignment(SubShadowTy));
+    Align = std::min(Align, (uint64_t)KO_GETABITYPEALIGN(DL, SubShadowTy));
     // load a primitive shadow from the sub-field
     Value *PrimitiveShadow = IRB.CreateExtractValue(Shadow, Indices);
     // then store the primitive shadow into the shadow address
@@ -3366,7 +3509,9 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
   if (SI.isAtomic())
     SI.setOrdering(addReleaseOrdering(SI.getOrdering()));
 
-  Value* Shadow = SI.isAtomic() ? TF.TT.getZeroShadow(VT) : TF.getShadow(Val);
+  Value* Shadow = (SI.isAtomic() && !ClPreserveAtomicShadow)
+                      ? TF.TT.getZeroShadow(VT)
+                      : TF.getShadow(Val);
 
   // check bounds first
   if (ClTraceBound)
@@ -3688,12 +3833,12 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
       IRBuilder<> IRB(I.getNextNode());
       auto DL = I.getModule()->getDataLayout();
       auto size = I.getAllocationSizeInBits(DL);
-      assert(size != None);
+      assert(size != LLVM_NONE);
       Value *Size =
           ConstantInt::get(TF.TT.IntptrTy, (size->getFixedValue() + 7) >> 3);
       IRB.CreateCall(TF.TT.TaintSetLabelFn,
                      {Init,
-                      IRB.CreateBitCast(&I, Type::getInt8PtrTy(*TF.TT.Ctx)),
+                      IRB.CreateBitCast(&I, KO_INT8PTRTY(*TF.TT.Ctx)),
                       Size});
     }
   }
@@ -3750,7 +3895,7 @@ void TaintVisitor::visitMemSetInst(MemSetInst &I) {
   IRB.CreateCall(
       TF.TT.TaintSetLabelFn,
       {ValShadow,
-       IRB.CreateBitCast(I.getDest(), Type::getInt8PtrTy(*TF.TT.Ctx)),
+       IRB.CreateBitCast(I.getDest(), KO_INT8PTRTY(*TF.TT.Ctx)),
        IRB.CreateZExtOrTrunc(I.getLength(), TF.TT.IntptrTy)});
 }
 
@@ -3770,15 +3915,15 @@ void TaintVisitor::visitMemTransferInst(MemTransferInst &I) {
   Value *LenShadow = IRB.CreateMul(
       I.getLength(),
       ConstantInt::get(I.getLength()->getType(), TF.TT.ShadowWidthBytes));
-  Type *Int8Ptr = Type::getInt8PtrTy(*TF.TT.Ctx);
+  Type *Int8Ptr = KO_INT8PTRTY(*TF.TT.Ctx);
   DestShadow = IRB.CreateBitCast(DestShadow, Int8Ptr);
   SrcShadow = IRB.CreateBitCast(SrcShadow, Int8Ptr);
   auto *MTI = cast<MemTransferInst>(
       IRB.CreateCall(I.getFunctionType(), I.getCalledOperand(),
                      {DestShadow, SrcShadow, LenShadow, I.getVolatileCst()}));
   if (ClPreserveAlignment) {
-    MTI->setDestAlignment(I.getDestAlign() * TF.TT.ShadowWidthBytes);
-    MTI->setSourceAlignment(I.getSourceAlign() * TF.TT.ShadowWidthBytes);
+    MTI->setDestAlignment(KO_MULMAYBEALIGN(I.getDestAlign(), TF.TT.ShadowWidthBytes));
+    MTI->setSourceAlignment(KO_MULMAYBEALIGN(I.getSourceAlign(), TF.TT.ShadowWidthBytes));
   } else {
     MTI->setDestAlignment(Align(TF.TT.ShadowWidthBytes));
     MTI->setSourceAlignment(Align(TF.TT.ShadowWidthBytes));
@@ -3872,14 +4017,17 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     CB.setCalledFunction(F);
     IRB.CreateCall(TF.TT.TaintUnimplementedFn,
                    IRB.CreateGlobalStringPtr(F->getName()));
+    TF.TT.buildExternWeakCheckIfNeeded(IRB, F);
     TF.setShadow(&CB, TF.TT.getZeroShadow(&CB));
     return true;
   case Taint::WK_Discard:
     CB.setCalledFunction(F);
+    TF.TT.buildExternWeakCheckIfNeeded(IRB, F);
     TF.setShadow(&CB, TF.TT.getZeroShadow(&CB));
     return true;
   case Taint::WK_Functional:
     CB.setCalledFunction(F);
+    TF.TT.buildExternWeakCheckIfNeeded(IRB, F);
     //FIXME:
     // visitOperandShadowInst(CS);
     return true;
@@ -4114,8 +4262,9 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     // Adds non-variable arguments.
     auto *I = CB.arg_begin();
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
+#if LLVM_VERSION_CODE < LLVM_VERSION(15, 0)
       Type *T = (*I)->getType();
-      FunctionType *ParamFT;
+      FunctionType *ParamFT = nullptr;
       if (isa<PointerType>(T) &&
           (ParamFT = dyn_cast<FunctionType>(T->getPointerElementType()))) {
         std::string TName = "dfst";
@@ -4126,10 +4275,15 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
             TF.TT.getOrBuildTrampolineFunction(ParamFT, TName);
         Args.push_back(Trampoline);
         Args.push_back(
-            IRB.CreateBitCast(*I, Type::getInt8PtrTy(*TF.TT.Ctx)));
+            IRB.CreateBitCast(*I, KO_INT8PTRTY(*TF.TT.Ctx)));
       } else {
         Args.push_back(*I);
       }
+#else
+      // Opaque pointers (LLVM 15+): cannot recover a function pointee type,
+      // so pass the argument through unchanged.
+      Args.push_back(*I);
+#endif
     }
 
     // Adds shadow arguments.
@@ -4175,10 +4329,10 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
 void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
   // filter some obvious ones
   StringRef FN = F->getName();
-  if (FN.startswith("llvm.va_") || // varabile length
-      FN.startswith("llvm.gc")  || // garbaage collection
-      FN.startswith("llvm.experimental") ||
-      FN.startswith("llvm.lifetime")
+  if (KO_STARTSWITH(FN, "llvm.va_") || // varabile length
+      KO_STARTSWITH(FN, "llvm.gc")  || // garbaage collection
+      KO_STARTSWITH(FN, "llvm.experimental") ||
+      KO_STARTSWITH(FN, "llvm.lifetime")
      ) {
     return;
   }
