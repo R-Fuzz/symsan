@@ -1404,29 +1404,28 @@ __dfsw_dlopen(const char *filename, int flag, dfsan_label filename_label,
 }
 
 struct pthread_create_info {
-  void *(*start_routine_trampoline)(void *, void *, dfsan_label, dfsan_label *);
-  void *start_routine;
+  void *(*start_routine)(void *);
   void *arg;
 };
 
 static void *pthread_create_cb(void *p) {
   pthread_create_info pci(*(pthread_create_info *)p);
   free(p);
-  dfsan_label ret_label;
-  return pci.start_routine_trampoline(pci.start_routine, pci.arg, 0,
-                                      &ret_label);
+  // Trampolines were removed with opaque pointers (LLVM 15+); the instrumented
+  // start routine reads its argument label from the args TLS, so clear it to
+  // give a zero-labelled argument before calling it directly.
+  dfsan_clear_thread_local_state();
+  return pci.start_routine(pci.arg);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_pthread_create(
     pthread_t *thread, const pthread_attr_t *attr,
-    void *(*start_routine_trampoline)(void *, void *, dfsan_label,
-                                      dfsan_label *),
-    void *start_routine, void *arg, dfsan_label thread_label,
+    void *(*start_routine)(void *),
+    void *arg, dfsan_label thread_label,
     dfsan_label attr_label, dfsan_label start_routine_label,
     dfsan_label arg_label, dfsan_label *ret_label) {
   pthread_create_info *pci =
       (pthread_create_info *)malloc(sizeof(pthread_create_info));
-  pci->start_routine_trampoline = start_routine_trampoline;
   pci->start_routine = start_routine;
   pci->arg = arg;
   int rv = pthread_create(thread, attr, pthread_create_cb, (void *)pci);
@@ -1449,11 +1448,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_pthread_join(pthread_t thread,
 }
 
 struct dl_iterate_phdr_info {
-  int (*callback_trampoline)(void *callback, struct dl_phdr_info *info,
-                             size_t size, void *data, dfsan_label info_label,
-                             dfsan_label size_label, dfsan_label data_label,
-                             dfsan_label *ret_label);
-  void *callback;
+  int (*callback)(struct dl_phdr_info *info, size_t size, void *data);
   void *data;
 };
 
@@ -1465,19 +1460,18 @@ int dl_iterate_phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
   dfsan_set_label(
       0, const_cast<char *>(reinterpret_cast<const char *>(info->dlpi_phdr)),
       sizeof(*info->dlpi_phdr) * info->dlpi_phnum);
-  dfsan_label ret_label;
-  return dipi->callback_trampoline(dipi->callback, info, size, dipi->data, 0, 0,
-                                   0, &ret_label);
+  // The trampoline mechanism was removed with opaque pointers (LLVM 15+); the
+  // instrumented callback now reads its argument labels from the args TLS, so
+  // clear it to give the callback zero-labelled arguments before calling it.
+  dfsan_clear_thread_local_state();
+  return dipi->callback(info, size, dipi->data);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_dl_iterate_phdr(
-    int (*callback_trampoline)(void *callback, struct dl_phdr_info *info,
-                               size_t size, void *data, dfsan_label info_label,
-                               dfsan_label size_label, dfsan_label data_label,
-                               dfsan_label *ret_label),
-    void *callback, void *data, dfsan_label callback_label,
-    dfsan_label data_label, dfsan_label *ret_label) {
-  dl_iterate_phdr_info dipi = { callback_trampoline, callback, data };
+    int (*callback)(struct dl_phdr_info *info, size_t size, void *data),
+    void *data, dfsan_label callback_label, dfsan_label data_label,
+    dfsan_label *ret_label) {
+  dl_iterate_phdr_info dipi = { callback, data };
   *ret_label = 0;
   return dl_iterate_phdr(dl_iterate_phdr_cb, &dipi);
 }
@@ -2432,27 +2426,20 @@ __dfsw_socketpair(int domain, int type, int protocol, int sv[2],
   return ret;
 }
 
-// Type of the trampoline function passed to the custom version of
-// dfsan_set_write_callback.
-typedef void (*write_trampoline_t)(
-    void *callback,
-    int fd, const void *buf, ssize_t count,
-    dfsan_label fd_label, dfsan_label buf_label, dfsan_label count_label);
+// Type of the write callback registered via dfsan_set_write_callback.
+typedef void (*write_callback_t)(int fd, const void *buf, ssize_t count);
 
-// Calls to dfsan_set_write_callback() set the values in this struct.
-// Calls to the custom version of write() read (and invoke) them.
+// Calls to dfsan_set_write_callback() set the value in this struct.
+// Calls to the custom version of write() read (and invoke) it.
 static struct {
-  write_trampoline_t write_callback_trampoline = nullptr;
-  void *write_callback = nullptr;
+  write_callback_t write_callback = nullptr;
 } write_callback_info;
 
 SANITIZER_INTERFACE_ATTRIBUTE void
 __dfsw_dfsan_set_write_callback(
-    write_trampoline_t write_callback_trampoline,
-    void *write_callback,
+    write_callback_t write_callback,
     dfsan_label write_callback_label,
     dfsan_label *ret_label) {
-  write_callback_info.write_callback_trampoline = write_callback_trampoline;
   write_callback_info.write_callback = write_callback;
   *ret_label = 0;
 }
@@ -2462,10 +2449,11 @@ __dfsw_write(int fd, const void *buf, size_t count,
              dfsan_label fd_label, dfsan_label buf_label,
              dfsan_label count_label, dfsan_label *ret_label) {
   if (write_callback_info.write_callback) {
-    write_callback_info.write_callback_trampoline(
-        write_callback_info.write_callback,
-        fd, buf, count,
-        fd_label, buf_label, count_label);
+    // Trampolines were removed with opaque pointers (LLVM 15+).  The callback
+    // is now invoked directly; clear the args TLS so it sees zero-labelled
+    // arguments (label forwarding to this callback is not currently modelled).
+    dfsan_clear_thread_local_state();
+    write_callback_info.write_callback(fd, buf, count);
   }
 
   *ret_label = 0;

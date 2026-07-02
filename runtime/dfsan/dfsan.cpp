@@ -2051,6 +2051,16 @@ void __taint_set_retval_tls(uint32_t index, dfsan_label label, uint32_t size_in_
   __dfsan_retval_tls[index] = label;
 }
 
+// Zero the argument/return-value TLS.  Custom function wrappers that invoke an
+// instrumented callback directly (e.g. dl_iterate_phdr, pthread_create) use
+// this to give the callback zero-labelled arguments now that the trampoline
+// mechanism has been removed (opaque pointers, LLVM 15+).
+SANITIZER_INTERFACE_ATTRIBUTE
+void dfsan_clear_thread_local_state() {
+  internal_memset(__dfsan_arg_tls, 0, sizeof(__dfsan_arg_tls));
+  internal_memset(__dfsan_retval_tls, 0, sizeof(__dfsan_retval_tls));
+}
+
 // Set SymSan shadow memory for a region
 // Overrides weak stub in ucsan.cpp
 SANITIZER_INTERFACE_ATTRIBUTE
