@@ -357,6 +357,11 @@ fun:strtol=custom
 fun:strtoll=custom
 fun:strtoul=custom
 fun:strtoull=custom
+# glibc 2.38 (C23) redirects the strto* family to these at compile time
+fun:__isoc23_strtol=custom
+fun:__isoc23_strtoll=custom
+fun:__isoc23_strtoul=custom
+fun:__isoc23_strtoull=custom
 fun:atoi=custom
 fun:atol=custom
 fun:atoll=custom

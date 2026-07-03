@@ -1397,7 +1397,9 @@ __dfsw_dlopen(const char *filename, int flag, dfsan_label filename_label,
               dfsan_label flag_label, dfsan_label *ret_label) {
   void *handle = dlopen(filename, flag);
   link_map *map = GET_LINK_MAP_BY_DLOPEN_HANDLE(handle);
-  if (map && map->l_addr)
+  // dlopen(NULL, ...) returns the main executable's map; don't clear the shadow
+  // of its already-live globals.  (l_addr==0 additionally guards non-PIE mains.)
+  if (filename && map && map->l_addr)
     ForEachMappedRegion(map, dfsan_set_zero_label);
   *ret_label = 0;
   return handle;
@@ -1776,9 +1778,9 @@ unsigned long __dfsw_strtoul(const char *nptr, char **endptr, int base,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
-unsigned long long __dfsw_strtoull(const char *nptr, char **endptr,
+unsigned long long __dfsw_strtoull(const char *nptr, char **endptr, int base,
                                    dfsan_label nptr_label,
-                                   int base, dfsan_label endptr_label,
+                                   dfsan_label endptr_label,
                                    dfsan_label base_label,
                                    dfsan_label *ret_label) {
   char *tmp_endptr;
@@ -1789,6 +1791,48 @@ unsigned long long __dfsw_strtoull(const char *nptr, char **endptr,
   uptr len = (uptr)tmp_endptr - (uptr)nptr;
   *ret_label = taint_strtol(nptr, len, sizeof(ret), base);
   return ret;
+}
+
+// glibc 2.38 (C23) redirects strtol/strtoll/strtoul/strtoull in <stdlib.h> to
+// these __isoc23_* variants at compile time, so on modern glibc (Ubuntu 24.04)
+// user calls to strtol&co land here.  Forward to the symbolic base wrappers so
+// the parsed integer's taint is preserved.
+SANITIZER_INTERFACE_ATTRIBUTE
+long __dfsw___isoc23_strtol(const char *nptr, char **endptr, int base,
+                            dfsan_label nptr_label, dfsan_label endptr_label,
+                            dfsan_label base_label, dfsan_label *ret_label) {
+  return __dfsw_strtol(nptr, endptr, base, nptr_label, endptr_label, base_label,
+                       ret_label);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+long long __dfsw___isoc23_strtoll(const char *nptr, char **endptr, int base,
+                                  dfsan_label nptr_label,
+                                  dfsan_label endptr_label,
+                                  dfsan_label base_label,
+                                  dfsan_label *ret_label) {
+  return __dfsw_strtoll(nptr, endptr, base, nptr_label, endptr_label,
+                        base_label, ret_label);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+unsigned long __dfsw___isoc23_strtoul(const char *nptr, char **endptr, int base,
+                                      dfsan_label nptr_label,
+                                      dfsan_label endptr_label,
+                                      dfsan_label base_label,
+                                      dfsan_label *ret_label) {
+  return __dfsw_strtoul(nptr, endptr, base, nptr_label, endptr_label,
+                        base_label, ret_label);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+unsigned long long __dfsw___isoc23_strtoull(const char *nptr, char **endptr,
+                                            int base, dfsan_label nptr_label,
+                                            dfsan_label endptr_label,
+                                            dfsan_label base_label,
+                                            dfsan_label *ret_label) {
+  return __dfsw_strtoull(nptr, endptr, base, nptr_label, endptr_label,
+                         base_label, ret_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
@@ -2707,7 +2751,9 @@ int __dfsw_sprintf(char *str, const char *format, dfsan_label str_label,
                    dfsan_label *ret_label, ...) {
   va_list ap;
   va_start(ap, ret_label);
-  int ret = format_buffer(str, ~0ul, format, va_labels, ret_label, ap);
+  // Do not use a ~0 size: on glibc >= 2.37 / musl, snprintf computes `str + n`
+  // which wraps for an unbounded size and drops the last char (glibc PR30441).
+  int ret = format_buffer(str, INT32_MAX, format, va_labels, ret_label, ap);
   va_end(ap);
   *ret_label = 0;
   return ret;
