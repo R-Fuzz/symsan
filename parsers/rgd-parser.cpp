@@ -306,13 +306,21 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       return false;
     }
     dfsan_label_info *src = get_label_info(info->l2);
-    if (unlikely(src->op != __dfsan::Load)) {
+    // The consumed digits are represented either as a Load label (len > 1) or,
+    // when a single digit was consumed, as the raw input-byte label directly
+    // (op == 0).
+    dfsan_label_info *byte;
+    if (src->op == __dfsan::Load) {
+      byte = get_label_info(src->l1);
+    } else if (src->op == 0) {
+      byte = src;
+    } else {
       WARNF("invalid atoi source label %u, op = %u\n", info->l2, src->op);
       return false;
     }
     visited.insert(info->l2);
-    uint32_t input_id = get_label_info(src->l1)->op2.i;
-    uint32_t offset = get_label_info(src->l1)->op1.i;
+    uint32_t input_id = byte->op2.i;
+    uint32_t offset = byte->op1.i;
     // this check should have been done during label scanning
     // if (unlikely(offset >= buf_size)) {
     //   WARNF("invalid offset: %lu >= %lu\n", offset, buf_size);

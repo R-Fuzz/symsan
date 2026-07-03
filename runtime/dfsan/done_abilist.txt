@@ -476,6 +476,11 @@ fun:gettimeofday=custom
 fun:sprintf=custom
 fun:snprintf=custom
 
+# scanf-like (glibc redirects sscanf -> __isoc99_sscanf / __isoc23_sscanf)
+fun:sscanf=custom
+fun:__isoc99_sscanf=custom
+fun:__isoc23_sscanf=custom
+
 # TODO: custom
 fun:asprintf=discard
 fun:qsort=discard

@@ -1680,7 +1680,12 @@ char *__dfsw_strcpy(char *dest, const char *src, dfsan_label dst_label,
   return ret;
 }
 
-static dfsan_label taint_strtol(const char *nptr, uptr len, size_t ret_size, int base) {
+// add_null: whether the parsed number is a standalone null-terminated string
+// (atoi/strtol) so the solver may append a NUL after the rendered digits.  For
+// numbers embedded in a larger input (e.g. an sscanf field) pass false so the
+// separator/following bytes are preserved.
+static dfsan_label taint_strtol(const char *nptr, uptr len, size_t ret_size,
+                                int base, bool add_null = true) {
   dfsan_label load = 0;
   if (len > 0) {
     load = dfsan_read_label(nptr, len);
@@ -1691,7 +1696,8 @@ static dfsan_label taint_strtol(const char *nptr, uptr len, size_t ret_size, int
       return 0;
     load = dfsan_union(l, 0, Load, 0, 0, 0);
   }
-  return dfsan_union(0, load, fatoi, sizeof(ret_size) * 8, base, len);
+  int op1 = base | (add_null ? 0 : FATOI_NO_NULL);
+  return dfsan_union(0, load, fatoi, sizeof(ret_size) * 8, op1, len);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
@@ -2521,7 +2527,7 @@ typedef int dfsan_label_va;
 struct Formatter {
   Formatter(char *str_, const char *fmt_, size_t size_)
       : str(str_), str_off(0), size(size_), fmt_start(fmt_), fmt_cur(fmt_),
-        width(-1) {}
+        width(-1), num_scanned(0), skip(false) {}
 
   int format() {
     char *tmp_fmt = build_format_string();
@@ -2546,13 +2552,44 @@ struct Formatter {
     return retval;
   }
 
-  char *build_format_string() {
+  // When with_n is true, append "%n" to the single-directive format so a real
+  // sscanf reports how many input characters this directive consumed.
+  char *build_format_string(bool with_n = false) {
     size_t fmt_size = fmt_cur - fmt_start + 1;
-    char *new_fmt = (char *)malloc(fmt_size + 1);
+    size_t n_size = with_n ? 2 : 0; // "%n"
+    char *new_fmt = (char *)malloc(fmt_size + n_size + 1);
     assert(new_fmt);
     internal_memcpy(new_fmt, fmt_start, fmt_size);
-    new_fmt[fmt_size] = '\0';
+    if (with_n) {
+      new_fmt[fmt_size] = '%';
+      new_fmt[fmt_size + 1] = 'n';
+    }
+    new_fmt[fmt_size + n_size] = '\0';
     return new_fmt;
+  }
+
+  // Scan a suppressed/literal directive; returns the number of input characters
+  // consumed (via the appended %n).
+  int scan() {
+    char *tmp_fmt = build_format_string(true);
+    int read_count = 0;
+    int retval = sscanf(str + str_off, tmp_fmt, &read_count);
+    if (retval > 0)
+      num_scanned += retval;
+    free(tmp_fmt);
+    return read_count;
+  }
+
+  // Scan one directive into 'arg'; returns the number of input characters
+  // consumed (via the appended %n).
+  template <typename T> int scan(T arg) {
+    char *tmp_fmt = build_format_string(true);
+    int read_count = 0;
+    int retval = sscanf(str + str_off, tmp_fmt, arg, &read_count);
+    if (retval > 0)
+      num_scanned += retval;
+    free(tmp_fmt);
+    return read_count;
   }
 
   char *str_cur() { return str + str_off; }
@@ -2583,6 +2620,8 @@ struct Formatter {
   const char *fmt_start;
   const char *fmt_cur;
   int width;
+  int num_scanned; // number of items assigned so far (sscanf return value)
+  bool skip;       // current directive has assignment-suppression (%*)
 };
 
 // Formats the input and propagates the input labels to the output. The output
@@ -2744,6 +2783,229 @@ static int format_buffer(char *str, size_t size, const char *fmt,
   return formatter.str_off;
 }
 
+// Scans 'str' according to 'format', propagating input taint to the scanned
+// output arguments.  Mirrors format_buffer / upstream DFSan's scan_buffer, but
+// applies SymSan symbolic ops at the two label points: numeric conversions
+// attach a string-to-int (fatoi) label so the solver can drive the raw input
+// digits, and %s/%c copy the matched input bytes' labels to the destination.
+// Per-directive consumed length is measured by an appended %n (Formatter::scan).
+static int scan_buffer(char *str, size_t size, const char *fmt,
+                       dfsan_label *va_labels, dfsan_label *ret_label,
+                       va_list ap) {
+  Formatter formatter(str, fmt, size);
+
+  while (*formatter.fmt_cur) {
+    formatter.fmt_start = formatter.fmt_cur;
+    formatter.width = -1;
+    formatter.skip = false;
+    int read_count = 0;
+    void *dst_ptr = 0;
+    size_t write_size = 0;
+    int base = 10;
+
+    if (*formatter.fmt_cur != '%') {
+      // Ordinary characters up to the next '%'.
+      for (; *(formatter.fmt_cur + 1) && *(formatter.fmt_cur + 1) != '%';
+           ++formatter.fmt_cur) {}
+      read_count = formatter.scan();
+      dfsan_set_label(0, formatter.str_cur(),
+                      formatter.num_written_bytes(read_count));
+    } else {
+      bool end_fmt = false;
+      for (; *formatter.fmt_cur && !end_fmt; ) {
+        switch (*++formatter.fmt_cur) {
+        case 'd':
+        case 'i':
+        case 'u':
+        case 'o':
+        case 'x':
+        case 'X':
+          // base for the fatoi op; the solver supports only 2/8/10/16, and %i
+          // must NOT use C's auto base 0.
+          switch (*formatter.fmt_cur) {
+          case 'x':
+          case 'X': base = 16; break;
+          case 'o': base = 8; break;
+          default: base = 10; break; // d, i, u
+          }
+          if (formatter.skip) {
+            read_count = formatter.scan();
+          } else {
+            switch (*(formatter.fmt_cur - 1)) {
+            case 'h':
+              // Also covers 'hh' (arg is promoted to int).
+              dst_ptr = va_arg(ap, int *);
+              read_count = formatter.scan((int *)dst_ptr);
+              write_size = sizeof(int);
+              break;
+            case 'l':
+              if (formatter.fmt_cur - formatter.fmt_start >= 2 &&
+                  *(formatter.fmt_cur - 2) == 'l') {
+                dst_ptr = va_arg(ap, long long int *);
+                read_count = formatter.scan((long long int *)dst_ptr);
+                write_size = sizeof(long long int);
+              } else {
+                dst_ptr = va_arg(ap, long int *);
+                read_count = formatter.scan((long int *)dst_ptr);
+                write_size = sizeof(long int);
+              }
+              break;
+            case 'q':
+              dst_ptr = va_arg(ap, long long int *);
+              read_count = formatter.scan((long long int *)dst_ptr);
+              write_size = sizeof(long long int);
+              break;
+            case 'j':
+              dst_ptr = va_arg(ap, intmax_t *);
+              read_count = formatter.scan((intmax_t *)dst_ptr);
+              write_size = sizeof(intmax_t);
+              break;
+            case 'z':
+            case 't':
+              dst_ptr = va_arg(ap, size_t *);
+              read_count = formatter.scan((size_t *)dst_ptr);
+              write_size = sizeof(size_t);
+              break;
+            default:
+              dst_ptr = va_arg(ap, int *);
+              read_count = formatter.scan((int *)dst_ptr);
+              write_size = sizeof(int);
+            }
+            // Attach a string-to-int (fatoi) label linking the parsed integer
+            // to the consumed input digits, so a constraint on the value is
+            // solved back into input bytes (same op as atoi/strtol).  Pass
+            // add_null=false: this is a field inside a larger input, so the
+            // solver must not write a NUL after the digits (it would clobber
+            // the following separator/field).
+            dfsan_label l = taint_strtol(
+                formatter.str_cur(), formatter.num_written_bytes(read_count),
+                write_size, base, /*add_null=*/false);
+            dfsan_set_label(l, dst_ptr, write_size);
+          }
+          end_fmt = true;
+          break;
+
+        case 'a':
+        case 'A':
+        case 'e':
+        case 'E':
+        case 'f':
+        case 'F':
+        case 'g':
+        case 'G':
+          if (formatter.skip) {
+            read_count = formatter.scan();
+          } else {
+            if (*(formatter.fmt_cur - 1) == 'L') {
+              dst_ptr = va_arg(ap, long double *);
+              read_count = formatter.scan((long double *)dst_ptr);
+              write_size = sizeof(long double);
+            } else if (*(formatter.fmt_cur - 1) == 'l') {
+              dst_ptr = va_arg(ap, double *);
+              read_count = formatter.scan((double *)dst_ptr);
+              write_size = sizeof(double);
+            } else {
+              dst_ptr = va_arg(ap, float *);
+              read_count = formatter.scan((float *)dst_ptr);
+              write_size = sizeof(float);
+            }
+            // No symbolic float model yet (strtod is a stub); clear shadow.
+            dfsan_set_label(0, dst_ptr, write_size);
+          }
+          end_fmt = true;
+          break;
+
+        case 'c':
+          if (formatter.skip) {
+            read_count = formatter.scan();
+          } else {
+            dst_ptr = va_arg(ap, char *);
+            read_count = formatter.scan((char *)dst_ptr);
+            write_size = sizeof(char);
+            // Copy the matched input byte's label to the output char.
+            dfsan_label l = dfsan_read_label(
+                formatter.str_cur(), formatter.num_written_bytes(read_count));
+            dfsan_set_label(l, dst_ptr, write_size);
+          }
+          end_fmt = true;
+          break;
+
+        case 's': {
+          if (formatter.skip) {
+            read_count = formatter.scan();
+          } else {
+            dst_ptr = va_arg(ap, char *);
+            read_count = formatter.scan((char *)dst_ptr);
+            if (1 == read_count) {
+              // one string matched: use its actual length
+              read_count = internal_strlen((char *)dst_ptr);
+            }
+            va_labels++;
+            // Copy the matched input bytes' labels to the output buffer (the
+            // printf-%s idiom, in reverse): downstream strcmp/etc. is solvable.
+            internal_memcpy(shadow_for(dst_ptr),
+                            shadow_for(formatter.str_cur()),
+                            sizeof(dfsan_label) *
+                                formatter.num_written_bytes(read_count));
+          }
+          end_fmt = true;
+          break;
+        }
+
+        case 'p':
+          if (formatter.skip) {
+            read_count = formatter.scan();
+          } else {
+            dst_ptr = va_arg(ap, void *);
+            read_count = formatter.scan((int *)dst_ptr);
+            write_size = sizeof(int);
+            dfsan_set_label(0, dst_ptr, write_size);
+          }
+          end_fmt = true;
+          break;
+
+        case 'n': {
+          if (!formatter.skip) {
+            int *ptr = va_arg(ap, int *);
+            *ptr = (int)formatter.str_off;
+            va_labels++;
+            dfsan_set_label(0, ptr, sizeof(*ptr));
+          }
+          end_fmt = true;
+          break;
+        }
+
+        case '%':
+          read_count = formatter.scan();
+          end_fmt = true;
+          break;
+
+        case '*':
+          formatter.skip = true;
+          break;
+
+        default:
+          break;
+        }
+      }
+    }
+
+    if (read_count < 0) {
+      // Matching failure / EOF.
+      return read_count;
+    }
+
+    formatter.fmt_cur++;
+    formatter.str_off += read_count;
+  }
+
+  (void)va_labels;
+  *ret_label = 0;
+
+  // Number of items scanned in total.
+  return formatter.num_scanned;
+}
+
 extern "C" {
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_sprintf(char *str, const char *format, dfsan_label str_label,
@@ -2767,6 +3029,44 @@ int __dfsw_snprintf(char *str, size_t size, const char *format,
   va_list ap;
   va_start(ap, ret_label);
   int ret = format_buffer(str, size, format, va_labels, ret_label, ap);
+  va_end(ap);
+  *ret_label = 0;
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw_sscanf(char *str, const char *format, dfsan_label str_label,
+                  dfsan_label format_label, dfsan_label *va_labels,
+                  dfsan_label *ret_label, ...) {
+  va_list ap;
+  va_start(ap, ret_label);
+  int ret = scan_buffer(str, INT32_MAX, format, va_labels, ret_label, ap);
+  va_end(ap);
+  *ret_label = 0;
+  return ret;
+}
+
+// glibc redirects sscanf -> __isoc99_sscanf (C99), and -> __isoc23_sscanf on
+// glibc 2.38+, so these aliases are what real code actually calls.
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw___isoc99_sscanf(char *str, const char *format, dfsan_label str_label,
+                           dfsan_label format_label, dfsan_label *va_labels,
+                           dfsan_label *ret_label, ...) {
+  va_list ap;
+  va_start(ap, ret_label);
+  int ret = scan_buffer(str, INT32_MAX, format, va_labels, ret_label, ap);
+  va_end(ap);
+  *ret_label = 0;
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw___isoc23_sscanf(char *str, const char *format, dfsan_label str_label,
+                           dfsan_label format_label, dfsan_label *va_labels,
+                           dfsan_label *ret_label, ...) {
+  va_list ap;
+  va_start(ap, ret_label);
+  int ret = scan_buffer(str, INT32_MAX, format, va_labels, ret_label, ap);
   va_end(ap);
   *ret_label = 0;
   return ret;

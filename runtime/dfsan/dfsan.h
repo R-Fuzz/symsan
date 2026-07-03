@@ -206,6 +206,15 @@ enum operators {
   LastOp    = last_llvm_op + 22, // 89
 };
 
+// Flag packed into the high bits of a fatoi label's op1 (which otherwise holds
+// the numeric base).  When set, the solver must NOT append a NUL terminator
+// after the rendered digits: the parsed number is embedded in a larger input
+// (e.g. an sscanf field) rather than a standalone null-terminated string, so a
+// NUL would clobber the following separator/bytes.  Kept clear for
+// atoi/strtol so their labels stay bit-identical.
+#define FATOI_NO_NULL (1u << 16)
+#define FATOI_BASE_MASK 0xffffu
+
 enum predicate {
   bveq = 32,
   bvneq = 33,

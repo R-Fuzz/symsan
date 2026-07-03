@@ -3,6 +3,7 @@
 
 #include "solver.h"
 #include "ast.h"
+#include "dfsan/dfsan.h" // FATOI_NO_NULL / FATOI_BASE_MASK
 #include "jigsaw/rgdJit.h"
 #include "jigsaw/jit.h"
 #include "wheels/lockfreehash/lprobe/hash_table.h"
@@ -145,7 +146,9 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
           assert(itr != task->solution.end());
           val |= itr->second << (8 * (i - 1));
         }
-        uint32_t base = std::get<1>(info);
+        uint32_t raw_base = std::get<1>(info);
+        bool skip_null = (raw_base & FATOI_NO_NULL) != 0;
+        uint32_t base = raw_base & FATOI_BASE_MASK;
         uint32_t orig_len = std::get<2>(info);
         DEBUGF("generate_input atoi offset:%d => %lu, base = %d, original len = %d\n",
             offset, val, base, orig_len);
@@ -158,7 +161,20 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
           default: WARNF("unsupported base %d\n", base);
         }
         if (format) {
-          snprintf((char*)out_buf + offset, in_size - offset, format, val);
+          if (skip_null) {
+            // Number embedded in a larger input (e.g. an sscanf field): write
+            // just the digits so snprintf's NUL doesn't clobber the following
+            // separator/field.
+            char tmp[64];
+            int m = snprintf(tmp, sizeof(tmp), format, val);
+            if (m > 0) {
+              if ((size_t)offset + (size_t)m > in_size)
+                m = (int)(in_size - offset);
+              memcpy(out_buf + offset, tmp, m);
+            }
+          } else {
+            snprintf((char*)out_buf + offset, in_size - offset, format, val);
+          }
         }
       }
     }
