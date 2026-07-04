@@ -48,8 +48,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "UCSanSummary.h"
-#include "version.h"
 
+#include <optional>
+#include "llvm/IR/AttributeMask.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
@@ -568,7 +570,7 @@ class UCSan {
   /// Marks an instruction as "nosanitize" so TaintPass will skip it
   inline void markNosanitize(Value *V) {
     Instruction *I = dyn_cast<Instruction>(V);
-    if (I) I->setMetadata("nosanitize", MDNode::get(*Ctx, LLVM_NONE));
+    if (I) I->setMetadata("nosanitize", MDNode::get(*Ctx, std::nullopt));
   }
 
   /// Marks a function as "nosanitize" so TaintPass will skip instrumenting it
@@ -1522,7 +1524,7 @@ Value *UCSanFunction::loadShadowRecursive(
   if (!isa<ArrayType>(SubTy) && !isa<StructType>(SubTy)) {
     uint64_t SubSize = DL.getTypeStoreSize(SubTy);
     assert(Size >= SubSize);
-    InstAlign = Align(std::min(InstAlign.value(), (uint64_t)KO_GETABITYPEALIGN(DL, SubTy)));
+    InstAlign = Align(std::min(InstAlign.value(), (uint64_t)(DL).getABITypeAlign(SubTy).value()));
     // load a primitive shadow from address
     Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, InstAlign, SubTy, IRB);
     // then insert the primitive shadow into the sub-field
@@ -1621,7 +1623,7 @@ void UCSanFunction::storeShadowRecursive(
     uint64_t SubSize = DL.getTypeStoreSize(SubTy);
     assert(Size >= SubSize);
     InstAlign = Align(std::min(InstAlign.value(),
-                           (uint64_t)KO_GETABITYPEALIGN(DL, SubTy)));
+                           (uint64_t)(DL).getABITypeAlign(SubTy).value()));
     // load a primitive shadow from the sub-field
     Value *PrimitiveShadow = IRB.CreateExtractValue(Shadow, Indices);
     UC.markNosanitize(PrimitiveShadow);
@@ -2626,7 +2628,7 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
 
   // Mark as checked for TaintPass
   LI.setMetadata("ucsan.checked",
-                 MDNode::get(*UF.UC.Ctx, LLVM_NONE));
+                 MDNode::get(*UF.UC.Ctx, std::nullopt));
 }
 
 void UCSanVisitor::visitStoreInst(StoreInst &SI) {
@@ -2652,7 +2654,7 @@ void UCSanVisitor::visitStoreInst(StoreInst &SI) {
 
   // Mark as checked
   SI.setMetadata("ucsan.checked",
-                 MDNode::get(*UF.UC.Ctx, LLVM_NONE));
+                 MDNode::get(*UF.UC.Ctx, std::nullopt));
 }
 
 void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
@@ -2689,7 +2691,7 @@ void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
        I.getVolatileCst()});
   UF.UC.markNosanitize(CI);
 
-  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, std::nullopt));
 }
 
 void UCSanVisitor::visitMemSetInst(MemSetInst &I) {
@@ -2714,7 +2716,7 @@ void UCSanVisitor::visitMemSetInst(MemSetInst &I) {
   Value *CI = IRB.CreateCall(UF.UC.UCSetLabelFn, {ValShadow, dest, Length});
   UF.UC.markNosanitize(CI);
 
-  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, std::nullopt));
 }
 
 void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
@@ -2753,7 +2755,7 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
   MTI->setSourceAlignment(Align(UF.UC.ShadowWidthBytes));
   UF.UC.markNosanitize(MTI);
 
-  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, std::nullopt));
 }
 
 void UCSanVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
@@ -3432,7 +3434,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       return false;
 
     auto FName = F->getName();
-    bool IsContractPrim = KO_STARTSWITH(FName, "assume_") || KO_STARTSWITH(FName, "assert_");
+    bool IsContractPrim = (FName).starts_with("assume_") || (FName).starts_with("assert_");
 
     TransformedFunction CustomFn = UF.UC.getCustomFunctionType(FT);
     std::string CustomFName = "__dfsw_" + FName.str();
@@ -3589,8 +3591,8 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
   const DataLayout &DL = getDataLayout();
 
   // Stores argument shadows.
-  if (F && F->hasName() && !KO_STARTSWITH(F->getName(), "__dfsan") &&
-      !KO_STARTSWITH(F->getName(), "__taint")) {
+  if (F && F->hasName() && !(F->getName()).starts_with("__dfsan") &&
+      !(F->getName()).starts_with("__taint")) {
     unsigned ArgOffset = 0;
     for (unsigned I = 0, N = FT->getNumParams(); I != N; ++I) {
       unsigned Size =
@@ -3699,7 +3701,7 @@ void UCSanVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
   // FIXME: AtomicRMWInst should not operate on ptrs
   UF.setShadow(&I, UF.UC.ZeroPrimitiveShadow);
 
-  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, std::nullopt));
 }
 
 void UCSanVisitor::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
@@ -3718,7 +3720,7 @@ void UCSanVisitor::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   // bounds-check the pointer here and do not propagate a symbolic result.
   UF.setShadow(&I, UF.UC.getZeroShadow(&I));
 
-  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, std::nullopt));
 }
 
 void UCSanVisitor::visitAllocaInst(AllocaInst &I) {
