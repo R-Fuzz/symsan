@@ -431,6 +431,12 @@ int rgd::addFunction(const AstNode* node,
 test_fn_type rgd::performJit(uint64_t id) {
   std::string funcName = "rgdjit_f" + std::to_string(id);
   auto ExprSymbol = JIT->lookup(funcName).get();
+  // LLVM 17 changed getAddress() to return an ExecutorAddr wrapper instead of
+  // a raw uint64_t JITTargetAddress.
+#if LLVM_VERSION_MAJOR >= 17
+  auto func = (test_fn_type)ExprSymbol.getAddress().getValue();
+#else
   auto func = (test_fn_type)ExprSymbol.getAddress();
+#endif
   return func;
 }

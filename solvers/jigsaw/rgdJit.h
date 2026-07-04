@@ -95,7 +95,10 @@ public:
         llvm::orc::ThreadSafeModule(std::move(M), std::move(ctx))));
   }
 
-  llvm::Expected<llvm::JITEvaluatedSymbol> lookup(llvm::StringRef Name) {
+  // LLVM 17 changed ExecutionSession::lookup to return
+  // Expected<ExecutorSymbolDef> instead of Expected<JITEvaluatedSymbol>; let
+  // the return type be deduced so this compiles across versions.
+  auto lookup(llvm::StringRef Name) {
     return ES->lookup({&MainJD}, Mangle(Name.str()));
   }
 
