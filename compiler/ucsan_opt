@@ -13,15 +13,13 @@ else:
     print(f"Cannot find {ucsan_pass_path}, please make sure you have run this script in the right directory(the directory ko-clang installed)")
     os._exit(1)
 
-KO_FLAGS = ["KO_CC=clang-14"]
+KO_FLAGS = ["KO_CC=clang-18"]
 ko_flags = ' '.join(KO_FLAGS)
 
-# Base opt-14 command: load UCSan pass
-# Load library twice for LLVM-14:
-# -load: registers cl::opt definitions (command-line options)
-# -load-pass-plugin: registers the new pass manager plugin
-cc = f"opt-14 -load {path_to_install}/lib/symsan/UCSanPass.so" \
-     f" -load-pass-plugin={path_to_install}/lib/symsan/UCSanPass.so" \
+# Base opt command: load the UCSan pass plugin. On LLVM 18 -load-pass-plugin
+# alone registers both the new-PM pipeline and the pass's cl::opt options (the
+# separate -load needed on LLVM 14 is no longer required).
+cc = f"opt-18 -load-pass-plugin={path_to_install}/lib/symsan/UCSanPass.so" \
      f" -ucsan-abilist={path_to_install}/lib/symsan/ucsan_abilist.txt"
 
 ko_cc = f"{path_to_install}/bin/ko-clang"
@@ -66,8 +64,8 @@ if not files:
     argparser.print_usage()
     os._exit(1)
 
-# Note: With LLVM-14 new pass manager, we don't add -O# flags to opt
-# Optimization is controlled via KO_DONT_OPTIMIZE and handled by ko-clang
+# Note: with the new pass manager we don't add -O# flags to opt;
+# optimization is controlled via KO_DONT_OPTIMIZE and handled by ko-clang
 if not args.optimization:
     KO_FLAGS.append("KO_DONT_OPTIMIZE=1")
 
@@ -98,9 +96,8 @@ if args.taint:
         os._exit(1)
     # Tell UCSanPass that TaintPass will run after it
     cc += f" -ucsan-with-taint=true"
-    # Load TaintPass library for cl::opt and pass registration
-    cc += f" -load {taint_pass_path}" \
-          f" -load-pass-plugin={taint_pass_path}" \
+    # Load TaintPass plugin (registers its pipeline and cl::opt options)
+    cc += f" -load-pass-plugin={taint_pass_path}" \
           f" -taint-abilist={path_to_install}/lib/symsan/dfsan_abilist.txt" \
           f" -taint-with-ucsan=true" \
           f" -taint-solve-ub=true"
@@ -138,7 +135,7 @@ for file in files:
         cleanup()
         os._exit(1)
     tmp_files.append(bc_file)
-    ret = command(f"llc-14 -filetype=obj --relocation-model=pic -o {obj_file} {bc_file}")
+    ret = command(f"llc-18 -filetype=obj --relocation-model=pic -o {obj_file} {bc_file}")
     if ret != 0:
         print(f"Failed to compile {file}, check the error message above")
         cleanup()
