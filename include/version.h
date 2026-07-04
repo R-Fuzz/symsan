@@ -107,19 +107,6 @@
 #define KO_ENDSWITH(s, p) (s).endswith(p)
 #endif
 
-// LLVM 15 made pointers opaque by default and LLVM 18 removed
-// getPointerElementType entirely.  There is no way to recover the pointee type
-// from an opaque pointer, so callers must treat a null result as "unknown".
-#include "llvm/IR/Type.h"
-static inline llvm::Type *koGetPointeeType(llvm::Type *Ty) {
-#if LLVM_VERSION_CODE < LLVM_VERSION(15, 0)
-  return Ty->getPointerElementType();
-#else
-  (void)Ty;
-  return nullptr;
-#endif
-}
-
 #endif // LLVM_VERSION_MAJOR
 
 #endif

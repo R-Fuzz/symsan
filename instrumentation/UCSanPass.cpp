@@ -48,8 +48,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "UCSanSummary.h"
+#include "version.h"
 
-#include "llvm/ADT/None.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
@@ -87,27 +87,25 @@
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Demangle/Demangle.h"
+
 #include <map>
 #include <set>
 #include <vector>
 #include <string>
 #include <fstream>
-#include <cxxabi.h>
 
 using namespace llvm;
 
 // Demangle a C++ mangled name. If demangling fails (e.g. plain C name),
 // return the original name unchanged.
+//
+// Use LLVM's own demangler rather than <cxxabi.h>/abi::__cxa_demangle: when
+// building against the LLVM tree, -I<llvm>/include makes <cxxabi.h> resolve to
+// libc++abi's copy, which clashes with the host libstdc++ headers.
 static std::string demangleName(StringRef MangledName) {
-  int Status = -1;
-  char *Demangled = abi::__cxa_demangle(
-      MangledName.str().c_str(), nullptr, nullptr, &Status);
-  if (Status == 0 && Demangled) {
-    std::string Result(Demangled);
-    free(Demangled);
-    return Result;
-  }
-  return MangledName.str();
+  // llvm::demangle returns a copy of the input if no demangling occurred.
+  return llvm::demangle(MangledName.str());
 }
 
 namespace {
@@ -288,7 +286,7 @@ TransformFunctionAttributes(const TransformedFunction& TransformedFunction,
 
   return AttributeList::get(Ctx, CallSiteAttrs.getFnAttrs(),
                             CallSiteAttrs.getRetAttrs(),
-                            llvm::makeArrayRef(ArgumentAttributes));
+                            ArrayRef(ArgumentAttributes));
 }
 
 // YAML structures for metadata parsing
@@ -485,6 +483,10 @@ class UCSan {
   std::map<std::string, uint32_t> TypeIDMap; // type key -> type_id
   std::map<uint32_t, Type*> TypeIDToType;    // type_id -> LLVM Type*
   std::map<uint32_t, json::Object> LoadedTypes; // type_id -> JSON from previous modules
+  // type_id -> real pointee type, for synthetic pointer entries minted by
+  // getOrCreatePointerTypeID(). Opaque pointers make TypeIDToType[ID] just
+  // "ptr" for these, so the pointee has to be tracked on the side.
+  std::map<uint32_t, Type*> TypeIDPointee;
   // Builtin type IDs (fixed across modules):
   // 1=i1, 2=i8, 3=i16, 4=i32, 5=i64, 6=float, 7=double
   static const uint32_t kFirstDynamicTypeID = 16; // IDs 1-15 reserved for builtins
@@ -501,6 +503,11 @@ class UCSan {
   std::vector<ArgInfo> EntryArgs;
 
   uint32_t getOrCreateTypeID(Type *T);
+  // Mints (or reuses) a type_id for "pointer to PointeeTy". Opaque pointers
+  // collapse every PointerType to the same Type object, so this can't key
+  // off Type* like getOrCreateTypeID() does — it keys off the pointee's own
+  // key instead, keeping distinct pointees distinguishable.
+  uint32_t getOrCreatePointerTypeID(Type *PointeeTy);
   std::string getTypeKey(Type *T);
   void emitTypeTable();
   void loadTypeTable();
@@ -561,7 +568,7 @@ class UCSan {
   /// Marks an instruction as "nosanitize" so TaintPass will skip it
   inline void markNosanitize(Value *V) {
     Instruction *I = dyn_cast<Instruction>(V);
-    if (I) I->setMetadata("nosanitize", MDNode::get(*Ctx, None));
+    if (I) I->setMetadata("nosanitize", MDNode::get(*Ctx, LLVM_NONE));
   }
 
   /// Marks a function as "nosanitize" so TaintPass will skip instrumenting it
@@ -695,6 +702,7 @@ public:
   void visitBinaryOperator(BinaryOperator &BO);
   void visitCmpInst(CmpInst &CI);
   void visitAtomicRMWInst(AtomicRMWInst &I);
+  void visitAtomicCmpXchgInst(AtomicCmpXchgInst &I);
   void visitLoadInst(LoadInst &LI);
   void visitStoreInst(StoreInst &SI);
   void visitMemCpyInst(MemCpyInst &I);
@@ -1055,6 +1063,65 @@ uint32_t UCSan::getOrCreateTypeID(Type *T) {
   return ID;
 }
 
+// Opaque pointers erase pointee type from a pointer Value's Type, but GEP
+// instructions still carry an explicit SourceElementType (they need it to
+// compute the byte offset). So find the pointee type by walking forward
+// through V's uses: a GEP that takes V as its base pointer operand reveals
+// what V conceptually points to. Chases through PHI nodes (e.g. the loop
+// variable in `for (n = head; n; n = n->next)`) since a GEP consuming a
+// loaded/argument pointer is often one hop removed via a PHI rather than a
+// direct use. Purely a compile-time analysis, so an exhaustive walk (bounded
+// by the Visited set against PHI cycles) is affordable.
+static Type *findPointeeTypeFromUses(Value *V, SmallPtrSetImpl<Value *> &Visited) {
+  if (!Visited.insert(V).second)
+    return nullptr;
+  for (User *U : V->users()) {
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      if (GEP->getPointerOperand() == V)
+        return GEP->getSourceElementType();
+    } else if (auto *PN = dyn_cast<PHINode>(U)) {
+      if (Type *Found = findPointeeTypeFromUses(PN, Visited))
+        return Found;
+    }
+  }
+  return nullptr;
+}
+
+static Type *findPointeeTypeFromUses(Value *V) {
+  SmallPtrSet<Value *, 16> Visited;
+  return findPointeeTypeFromUses(V, Visited);
+}
+
+// Opaque pointers erase pointee type going forward too: a pointer Value's own
+// Type carries nothing. For call sites that need *some* size/type for a
+// pointer whose uses don't reveal it (it's about to be handed to opaque code
+// - an indirect call, inline asm, a custom/wrapped function), fall back to
+// tracing backward to the concrete allocation it originates from. alloca and
+// global declarations always carry their real allocated type regardless of
+// pointer opacity. Returns nullptr (unknown) for anything else, e.g. a heap
+// pointer or a plain incoming argument with no local origin.
+static Type *getUnderlyingObjectType(Value *Ptr) {
+  Value *Obj = getUnderlyingObject(Ptr);
+  if (auto *AI = dyn_cast<AllocaInst>(Obj))
+    return AI->getAllocatedType();
+  if (auto *GV = dyn_cast<GlobalVariable>(Obj))
+    return GV->getValueType();
+  return nullptr;
+}
+
+uint32_t UCSan::getOrCreatePointerTypeID(Type *PointeeTy) {
+  std::string Key = "ptr->" + getTypeKey(PointeeTy);
+  auto It = TypeIDMap.find(Key);
+  if (It != TypeIDMap.end())
+    return It->second;
+  uint32_t ID = NextTypeID++;
+  TypeIDMap[Key] = ID;
+  TypeIDToType[ID] = VoidPtrTy;
+  TypeIDPointee[ID] = PointeeTy;
+  getOrCreateTypeID(PointeeTy); // ensure the pointee itself has an entry too
+  return ID;
+}
+
 void UCSan::loadTypeTable() {
   if (ClTypeTable.empty()) return;
 
@@ -1195,11 +1262,15 @@ void UCSan::emitTypeTable() {
       TypeObj["element_type_id"] = getOrCreateTypeID(AT->getElementType());
       if (T->isSized())
         TypeObj["size"] = (int64_t)DL.getTypeAllocSize(T);
-    } else if (auto *PT = dyn_cast<PointerType>(T)) {
+    } else if (isa<PointerType>(T)) {
       TypeObj["kind"] = "pointer";
       TypeObj["size"] = (int64_t)DL.getTypeAllocSize(T);
-      Type *PointeeTy = PT->getPointerElementType();
-      if (PointeeTy->isSized())
+      // Opaque pointers carry no pointee info in T itself. Entries minted by
+      // getOrCreatePointerTypeID() record the real pointee on the side;
+      // anything else is a generic/unknown pointer (pointee_type_id 0).
+      auto PointeeIt = TypeIDPointee.find(ID);
+      Type *PointeeTy = PointeeIt != TypeIDPointee.end() ? PointeeIt->second : nullptr;
+      if (PointeeTy && PointeeTy->isSized())
         TypeObj["pointee_type_id"] = getOrCreateTypeID(PointeeTy);
       else
         TypeObj["pointee_type_id"] = 0;
@@ -1451,7 +1522,7 @@ Value *UCSanFunction::loadShadowRecursive(
   if (!isa<ArrayType>(SubTy) && !isa<StructType>(SubTy)) {
     uint64_t SubSize = DL.getTypeStoreSize(SubTy);
     assert(Size >= SubSize);
-    InstAlign = Align(std::min(InstAlign.value(), (uint64_t)DL.getABITypeAlignment(SubTy)));
+    InstAlign = Align(std::min(InstAlign.value(), (uint64_t)KO_GETABITYPEALIGN(DL, SubTy)));
     // load a primitive shadow from address
     Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, InstAlign, SubTy, IRB);
     // then insert the primitive shadow into the sub-field
@@ -1550,7 +1621,7 @@ void UCSanFunction::storeShadowRecursive(
     uint64_t SubSize = DL.getTypeStoreSize(SubTy);
     assert(Size >= SubSize);
     InstAlign = Align(std::min(InstAlign.value(),
-                           (uint64_t)DL.getABITypeAlignment(SubTy)));
+                           (uint64_t)KO_GETABITYPEALIGN(DL, SubTy)));
     // load a primitive shadow from the sub-field
     Value *PrimitiveShadow = IRB.CreateExtractValue(Shadow, Indices);
     UC.markNosanitize(PrimitiveShadow);
@@ -1706,13 +1777,11 @@ Function *UCSan::buildDangleFunction(Function *F) {
 
     for (auto arg = NewF->arg_begin(); n != 0; ++arg, --n) {
       if (arg->getType()->isPointerTy()) {
-        // Get size of pointed-to type
-        ConstantInt *CI;
-        if (arg->getType()->getPointerElementType()->isSized()) {
-          CI = ConstantInt::get(Int64Ty, DL.getTypeSizeInBits(arg->getType()->getPointerElementType()) / 8);
-        } else {
-          CI = ConstantInt::get(Int64Ty, 0);
-        }
+        // F is an out-of-scope declaration (that's the point of a dangle
+        // wrapper) with no body, and arg is a fresh stub argument with no
+        // uses of its own - there's no pointee type to recover here under
+        // opaque pointers, so treat the pointed-to size as unknown.
+        ConstantInt *CI = ConstantInt::get(Int64Ty, 0);
 
         // Get shadow address for this argument from TLS
         // UCSan uses shadow memory to track pointer aliasing
@@ -1881,8 +1950,13 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
     ConstantInt *IsPtr = ConstantInt::get(Int8Ty, ai->getType()->isPointerTy());
     ConstantInt *InitVal = ConstantInt::get(Int64Ty, 0);
 
-    // Record arg type info
-    uint32_t TypeID = getOrCreateTypeID(ai->getType());
+    // Record arg type info. Entry args are what unittest-style seed gen
+    // needs real types for, so recover pointer args' pointee type the same
+    // way as pointer-typed loads: from how the argument gets used (e.g. a
+    // GEP indexing into it) rather than from its now-opaque Type.
+    Type *PointeeTy = ai->getType()->isPointerTy() ? findPointeeTypeFromUses(&*ai) : nullptr;
+    uint32_t TypeID = PointeeTy ? getOrCreatePointerTypeID(PointeeTy)
+                                : getOrCreateTypeID(ai->getType());
     EntryArgs.push_back({ai->getName().str(), TypeID});
 
     // Call runtime to create symbolic argument
@@ -2529,7 +2603,15 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
     }
   }
   ConstantInt *Size = ConstantInt::get(UF.UC.Int64Ty, StoreSize);
-  uint32_t TypeID = UF.UC.getOrCreateTypeID(Ty);
+  // Opaque pointers make Ty uninformative when the loaded value is itself a
+  // pointer (e.g. a linked-list `next` field) - every such load would
+  // otherwise collapse onto the same generic "ptr" type_id. Recover the real
+  // pointee by looking at how the loaded pointer gets used afterward (e.g. a
+  // GEP indexing into it), so the lazily-created target object can be sized
+  // correctly up front instead of growing it one field access at a time.
+  Type *PointeeTy = Ty->isPointerTy() ? findPointeeTypeFromUses(&LI) : nullptr;
+  uint32_t TypeID = PointeeTy ? UF.UC.getOrCreatePointerTypeID(PointeeTy)
+                              : UF.UC.getOrCreateTypeID(Ty);
 
   // Check and replace pointer
   IRBuilder<> IRB(&LI);
@@ -2544,7 +2626,7 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
 
   // Mark as checked for TaintPass
   LI.setMetadata("ucsan.checked",
-                 MDNode::get(*UF.UC.Ctx, None));
+                 MDNode::get(*UF.UC.Ctx, LLVM_NONE));
 }
 
 void UCSanVisitor::visitStoreInst(StoreInst &SI) {
@@ -2570,7 +2652,7 @@ void UCSanVisitor::visitStoreInst(StoreInst &SI) {
 
   // Mark as checked
   SI.setMetadata("ucsan.checked",
-                 MDNode::get(*UF.UC.Ctx, None));
+                 MDNode::get(*UF.UC.Ctx, LLVM_NONE));
 }
 
 void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
@@ -2607,7 +2689,7 @@ void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
        I.getVolatileCst()});
   UF.UC.markNosanitize(CI);
 
-  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, None));
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
 }
 
 void UCSanVisitor::visitMemSetInst(MemSetInst &I) {
@@ -2632,7 +2714,7 @@ void UCSanVisitor::visitMemSetInst(MemSetInst &I) {
   Value *CI = IRB.CreateCall(UF.UC.UCSetLabelFn, {ValShadow, dest, Length});
   UF.UC.markNosanitize(CI);
 
-  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, None));
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
 }
 
 void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
@@ -2671,7 +2753,7 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
   MTI->setSourceAlignment(Align(UF.UC.ShadowWidthBytes));
   UF.UC.markNosanitize(MTI);
 
-  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, None));
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
 }
 
 void UCSanVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
@@ -2724,9 +2806,11 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
       if (!isa<Constant>(Arg) &&
           !isa<AllocaInst>(Arg->stripPointerCasts())) {
         unsigned ObjSize = 0;
-        Type *PointeeTy = Arg->getType()->getPointerElementType();
+        // AllocaInst is excluded above, so this traces heap/global origins;
+        // opaque pointers carry no pointee type on Arg itself.
+        Type *PointeeTy = getUnderlyingObjectType(Arg);
         uint32_t TypeID = 0;
-        if (PointeeTy->isSized()) {
+        if (PointeeTy && PointeeTy->isSized()) {
           ObjSize = DL.getTypeAllocSize(PointeeTy);
           TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
         }
@@ -3018,13 +3102,12 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
       if (getenv("KO_RESIGN_PTRARGS") && Arg->getType()->isPointerTy()) {
         // only resign ptr args
         std::vector<Value *> Args;
-        ConstantInt *CI;
-        if (Arg->getType()->getPointerElementType()->isSized()) {
-          CI  = ConstantInt::get(UF.UC.Int64Ty,
-              DL.getTypeSizeInBits(Arg->getType()->getPointerElementType()) / 8);
-        } else {
-          CI = ConstantInt::get(UF.UC.Int64Ty, 0);
-        }
+        // Resign the whole underlying object (alloca/global) the pointer
+        // points into, since opaque pointers no longer carry pointee type.
+        Type *PointeeTy = getUnderlyingObjectType(Arg);
+        uint64_t ObjSize = (PointeeTy && PointeeTy->isSized())
+                                ? DL.getTypeAllocSize(PointeeTy) : 0;
+        ConstantInt *CI = ConstantInt::get(UF.UC.Int64Ty, ObjSize);
         auto BCI = IRB_EB.CreateBitCast(Arg, UF.UC.VoidPtrTy); // FIXME: cast to i32* (defined as void *)
         auto ArgTLS = UF.getArgTLS(Arg->getType(), ArgOffset, IRB_EB);
         Args.push_back(BCI);
@@ -3232,9 +3315,15 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
             sizeArg = ConstantInt::get(UF.UC.Int64Ty, 0);  // string fn, unknown length
           }
         } else {
-          Type *PointeeTy = (*I)->getType()->getPointerElementType();
-          sizeArg = ConstantInt::get(UF.UC.Int64Ty, DL.getTypeAllocSize(PointeeTy));
-          TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
+          // Opaque pointers carry no pointee type on (*I) itself; trace back
+          // to its underlying allocation instead.
+          Type *PointeeTy = getUnderlyingObjectType(*I);
+          if (PointeeTy && PointeeTy->isSized()) {
+            sizeArg = ConstantInt::get(UF.UC.Int64Ty, DL.getTypeAllocSize(PointeeTy));
+            TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
+          } else {
+            sizeArg = ConstantInt::get(UF.UC.Int64Ty, 0);
+          }
         }
 
         // Capture shadow before checkPointer resolves the pointer
@@ -3343,7 +3432,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       return false;
 
     auto FName = F->getName();
-    bool IsContractPrim = FName.startswith("assume_") || FName.startswith("assert_");
+    bool IsContractPrim = KO_STARTSWITH(FName, "assume_") || KO_STARTSWITH(FName, "assert_");
 
     TransformedFunction CustomFn = UF.UC.getCustomFunctionType(FT);
     std::string CustomFName = "__dfsw_" + FName.str();
@@ -3367,13 +3456,18 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
       Type *T = (*I)->getType();
       if (isa<PointerType>(T) && !IsContractPrim) {
-        // Check pointer arguments before passing to custom function
+        // Check pointer arguments before passing to custom function.
+        // Opaque pointers carry no pointee type on T itself; trace back
+        // to the underlying allocation instead.
         auto DL = getDataLayout();
-        Type *PointeeTy = T->getPointerElementType();
-        Value *sizeArg =
-            ConstantInt::get(UF.UC.Int64Ty,
-                             DL.getTypeAllocSize(PointeeTy));
-        uint32_t TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
+        Type *PointeeTy = getUnderlyingObjectType(*I);
+        uint32_t TypeID = 0;
+        uint64_t PointeeSize = 0;
+        if (PointeeTy && PointeeTy->isSized()) {
+          PointeeSize = DL.getTypeAllocSize(PointeeTy);
+          TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
+        }
+        Value *sizeArg = ConstantInt::get(UF.UC.Int64Ty, PointeeSize);
         Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
         Args.push_back(rptr);
       } else {
@@ -3495,8 +3589,8 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
   const DataLayout &DL = getDataLayout();
 
   // Stores argument shadows.
-  if (F && F->hasName() && !F->getName().startswith("__dfsan") &&
-      !F->getName().startswith("__taint")) {
+  if (F && F->hasName() && !KO_STARTSWITH(F->getName(), "__dfsan") &&
+      !KO_STARTSWITH(F->getName(), "__taint")) {
     unsigned ArgOffset = 0;
     for (unsigned I = 0, N = FT->getNumParams(); I != N; ++I) {
       unsigned Size =
@@ -3605,7 +3699,26 @@ void UCSanVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
   // FIXME: AtomicRMWInst should not operate on ptrs
   UF.setShadow(&I, UF.UC.ZeroPrimitiveShadow);
 
-  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, None));
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
+}
+
+void UCSanVisitor::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
+  auto &DL = I.getModule()->getDataLayout();
+  Value *Ptr = I.getPointerOperand();
+  Type *Ty = I.getNewValOperand()->getType();
+  unsigned StoreSize = DL.getTypeStoreSize(Ty);
+  ConstantInt *Size = ConstantInt::get(UF.UC.Int64Ty, StoreSize);
+  uint32_t TypeID = UF.UC.getOrCreateTypeID(Ty);
+
+  IRBuilder<> IRB(&I);
+  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID);
+  I.setOperand(0, Ptr);
+
+  // The result is { Ty old_value, i1 success }; like AtomicRMWInst we only
+  // bounds-check the pointer here and do not propagate a symbolic result.
+  UF.setShadow(&I, UF.UC.getZeroShadow(&I));
+
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, LLVM_NONE));
 }
 
 void UCSanVisitor::visitAllocaInst(AllocaInst &I) {
@@ -3642,7 +3755,7 @@ void UCSanVisitor::visitAllocaInst(AllocaInst &I) {
       IRBuilder<> IRB(I.getNextNode());
       auto DL = I.getModule()->getDataLayout();
       auto allocaSizeInBits = I.getAllocationSizeInBits(DL);
-      if (allocaSizeInBits.hasValue()) {
+      if (allocaSizeInBits) {
         int allocaSizeInBytes = (allocaSizeInBits->getFixedValue() + 7) >> 3;
         Value* Size = ConstantInt::get(UF.UC.Int64Ty, allocaSizeInBytes);
         Value* Ptr = IRB.CreateBitOrPointerCast(&I, UF.UC.VoidPtrTy);
@@ -3770,7 +3883,7 @@ void UCSanVisitor::visitPHINode(PHINode &PN) {
 
   // Give the shadow phi node valid predecessors to fool SplitEdge into working.
   Value *UndefShadow = UndefValue::get(ShadowTy);
-  for (PHINode::block_iterator i = PN.block_begin(), e = PN.block_end(); i != e;
+  for (auto i = PN.block_begin(), e = PN.block_end(); i != e;
        ++i) {
     ShadowPN->addIncoming(UndefShadow, *i);
   }

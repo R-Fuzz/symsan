@@ -351,7 +351,7 @@ TransformFunctionAttributes(const TransformedFunction& TransformedFunction,
 
   return AttributeList::get(Ctx, CallSiteAttrs.getFnAttrs(),
                             CallSiteAttrs.getRetAttrs(),
-                            llvm::makeArrayRef(ArgumentAttributes));
+                            ArrayRef(ArgumentAttributes));
 }
 
 class Taint {
