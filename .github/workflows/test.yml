@@ -51,7 +51,7 @@ jobs:
         path: ${{ github.workspace }}/aflpp
 
     - name: configure
-      run: CC=clang-18 CXX=clang++-18 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install -DAFLPP_PATH=${{ github.workspace }}/aflpp
+      run: CC=clang-18 CXX=clang++-18 cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install -DAFLPP_PATH=${{ github.workspace }}/aflpp -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
 
     - name: build
       run: CC=clang-18 CXX=clang++-18 cmake --build ${{ github.workspace }}/build
