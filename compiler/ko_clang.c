@@ -444,7 +444,11 @@ static void edit_params(u32 argc, char **argv) {
   }
 
   if (!skip_instrumentation) {
+    // The new pass manager is the default since clang 13 and the flag that
+    // used to request it was removed in clang 16.
+#if LLVM_VERSION_CODE < LLVM_VERSION(16, 0)
     cc_params[cc_par_cnt++] = "-fexperimental-new-pass-manager";
+#endif
     // add UCSanPass first, if specified
     if (use_ucsan) {
       add_ucsan_pass();

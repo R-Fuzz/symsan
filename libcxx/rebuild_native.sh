@@ -19,12 +19,20 @@
 #   out-of-scope and dangled by UCSan.
 #
 # usage: rebuild_native.sh
-#   Override the compiler with KO_NATIVE_CC / KO_NATIVE_CXX (default clang-14).
+#   Override the compiler with KO_NATIVE_CC / KO_NATIVE_CXX (default clang-18).
 
-LLVM_VERSION=14.0.6
+# We are migrating to LLVM 18, so clang-18 is the default.
+CC=${KO_NATIVE_CC:-clang-18}
+CXX=${KO_NATIVE_CXX:-clang++-18}
 
-CC=${KO_NATIVE_CC:-clang-14}
-CXX=${KO_NATIVE_CXX:-clang++-14}
+# Derive the LLVM version to check out from the compiler itself so the EH
+# runtime sources match the toolchain.
+LLVM_VERSION=$(${CC} --version | sed -n 's/.*clang version \([0-9][0-9.]*\).*/\1/p' | head -1)
+if [ -z "$LLVM_VERSION" ]; then
+    echo "[-] Error: could not determine LLVM version from '${CC}'" 1>&2
+    exit 1
+fi
+LLVM_MAJOR=${LLVM_VERSION%%.*}
 
 NINJA_B=`which ninja 2>/dev/null`
 
@@ -37,10 +45,23 @@ fi
 set -euxo pipefail
 
 CUR_DIR=`pwd`
-LLVM_SRC="llvm_project"
+# Keep a per-major-version source tree so multiple LLVM versions can coexist
+# (shared with rebuild.sh).
+LLVM_SRC="llvm_project-${LLVM_MAJOR}"
 
 if [ ! -d $LLVM_SRC ]; then
   git clone --depth 1 --branch llvmorg-${LLVM_VERSION} https://github.com/llvm/llvm-project.git $LLVM_SRC
+fi
+
+# LLVM 16+ libunwind prefers glibc's _dl_find_object over dl_iterate_phdr to
+# locate EH frames. _dl_find_object bypasses DFSan's dl_iterate_phdr wrapper and
+# cannot resolve unwind info for symsan's fixed-address (taint.ld) binaries,
+# which breaks C++ exception handling. Force the dl_iterate_phdr path.
+# Idempotent: rewrites only the pristine guard line. (Shared source tree with
+# rebuild.sh, so whichever runs first applies it and the other is a no-op.)
+ASPACE="$LLVM_SRC/libunwind/src/AddressSpace.hpp"
+if [ -f "$ASPACE" ]; then
+  sed -i 's|^#if defined(DLFO_STRUCT_HAS_EH_DBASE) & defined(_LIBUNWIND_SUPPORT_DWARF_INDEX)|#if 0 /* symsan: force dl_iterate_phdr; _dl_find_object bypasses DFSan */ \&\& defined(DLFO_STRUCT_HAS_EH_DBASE) \& defined(_LIBUNWIND_SUPPORT_DWARF_INDEX)|' "$ASPACE"
 fi
 
 mkdir -p build_native

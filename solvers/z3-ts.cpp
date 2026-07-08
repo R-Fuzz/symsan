@@ -147,7 +147,7 @@ void Z3AstParser::dump_value_cache(dfsan_label label) {
 Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
   : ASTParser(base, size), context_(context) {
     input_name_format = "input-%u-%u";
-    atoi_name_format = "atoi-%u-%u-%d-%lu";       // input, offset, base, original_len
+    atoi_name_format = "atoi-%u-%u-%d-%lu-%d";     // input, offset, base, original_len, skip_null
     strlen_name_format = "strlen-%u-%u-%lu-%u";   // input, offset, original_len, null_from_input
     str_name_format = "str-%u-%u-%u";             // input, offset, length
     int_name_format = "int-%u-%u-%u";             // input, offset, bits
@@ -588,15 +588,21 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // string to integer conversion
       assert(info->l1 == 0 && info->l2 >= CONST_OFFSET);
       dfsan_label_info *src = get_label_info(info->l2);
-      assert(src->op == __dfsan::Load);
-      uint32_t offset = get_label_info(src->l1)->op1.i; // legacy: offset in op1
-      uint32_t input = get_label_info(src->l1)->op2.i;
-      int base = info->op1.i;
+      // The consumed digits are represented either as a Load label (len > 1;
+      // walk Load.l1 to the first input byte) or, when a single digit was
+      // consumed, as the raw input-byte label directly (op == 0).
+      assert(src->op == __dfsan::Load || src->op == 0);
+      dfsan_label_info *byte =
+          (src->op == __dfsan::Load) ? get_label_info(src->l1) : src;
+      uint32_t offset = byte->op1.i; // legacy: offset in op1
+      uint32_t input = byte->op2.i;
+      int base = info->op1.i & FATOI_BASE_MASK;
+      int skip_null = (info->op1.i & FATOI_NO_NULL) ? 1 : 0;
       uint64_t orig_len = info->op2.i;
       // FIXME: dependencies?
       tsize_cache_.emplace_back(1);
       // XXX: hacky, avoid string theory
-      snprintf(name, sizeof(name), atoi_name_format, input, offset, base, orig_len);
+      snprintf(name, sizeof(name), atoi_name_format, input, offset, base, orig_len, skip_null);
       z3::symbol symbol = context_.str_symbol(name);
       z3::sort sort = context_.bv_sort(info->size);
       cache_expr(l, context_.constant(symbol, sort));
@@ -2590,9 +2596,10 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
         uint32_t offset;
         int base;
         uint64_t orig_len;
+        int skip_null = 0;
         char buf[64];
-        int parsed = sscanf(name.str().c_str(), atoi_name_format, &input, &offset, &base, &orig_len);
-        if (parsed != 4) {
+        int parsed = sscanf(name.str().c_str(), atoi_name_format, &input, &offset, &base, &orig_len, &skip_null);
+        if (parsed != 5) {
           continue;
         }
         const char *format = NULL;
@@ -2629,8 +2636,11 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
             solutions.emplace_back(input, offset + i, (uint8_t)buf[i]);
           }
         }
-        // Set null terminator at the new end
-        solutions.emplace_back(input, offset + new_len, (uint8_t)0);
+        // Set null terminator at the new end, unless this number is embedded in
+        // a larger input (e.g. an sscanf field), where a NUL would clobber the
+        // following separator/field.
+        if (!skip_null)
+          solutions.emplace_back(input, offset + new_len, (uint8_t)0);
       } else if (name.str().find("strlen") == 0) {
         uint32_t input;
         uint32_t offset;

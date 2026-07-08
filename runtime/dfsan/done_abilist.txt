@@ -357,6 +357,11 @@ fun:strtol=custom
 fun:strtoll=custom
 fun:strtoul=custom
 fun:strtoull=custom
+# glibc 2.38 (C23) redirects the strto* family to these at compile time
+fun:__isoc23_strtol=custom
+fun:__isoc23_strtoll=custom
+fun:__isoc23_strtoul=custom
+fun:__isoc23_strtoull=custom
 fun:atoi=custom
 fun:atol=custom
 fun:atoll=custom
@@ -470,6 +475,11 @@ fun:gettimeofday=custom
 # sprintf-like
 fun:sprintf=custom
 fun:snprintf=custom
+
+# scanf-like (glibc redirects sscanf -> __isoc99_sscanf / __isoc23_sscanf)
+fun:sscanf=custom
+fun:__isoc99_sscanf=custom
+fun:__isoc23_sscanf=custom
 
 # TODO: custom
 fun:asprintf=discard

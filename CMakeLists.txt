@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.13)
 
 project(symsan VERSION 1.2.2 LANGUAGES C CXX ASM)
 
-find_package(LLVM 14 REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG)
 
 # Find Z3 (minimum version 4.8.15 required for string theory APIs)
 # Prefer /usr/local over system
@@ -44,6 +44,13 @@ if (LLVM_FOUND)
     message(STATUS "LLVM_VERSION_MAJOR: ${LLVM_VERSION_MAJOR}")
     message(STATUS "LLVM_VERSION_MINOR: ${LLVM_VERSION_MINOR}")
     message(STATUS "LLVM_VERSION_PATCH: ${LLVM_VERSION_PATCH}")
+    # SymSan requires LLVM >= 18 (the default on Ubuntu 24.04). Older versions
+    # predate opaque pointers and the DFSan trampoline removal and are no longer
+    # supported. (find_package(LLVM 18) can't be used: LLVM's version config
+    # requires an exact major.minor match.)
+    if (LLVM_VERSION_MAJOR LESS 18)
+        message(FATAL_ERROR "SymSan requires LLVM >= 18, found ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}")
+    endif()
 else()
     message(FATAL_ERROR "You haven't install LLVM !")
 endif()

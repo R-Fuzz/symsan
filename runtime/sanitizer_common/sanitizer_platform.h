@@ -294,9 +294,12 @@
 // The AArch64 and RISC-V linux ports use the canonical syscall set as
 // mandated by the upstream linux community for all new ports. Other ports
 // may still use legacy syscalls.
+// LLVM 18 (34b676eb60ca) uses the canonical syscalls on all Linux; mirror that
+// here by enabling them for every SANITIZER_LINUX target (incl. x86_64) so we
+// issue openat/newfstatat/dup3/... instead of the legacy open/stat/dup2 (more
+// robust under seccomp filters that only allow the canonical set).
 #ifndef SANITIZER_USES_CANONICAL_LINUX_SYSCALLS
-#  if (defined(__aarch64__) || defined(__riscv) || defined(__hexagon__)) && \
-      SANITIZER_LINUX
+#  if SANITIZER_LINUX
 #    define SANITIZER_USES_CANONICAL_LINUX_SYSCALLS 1
 #  else
 #    define SANITIZER_USES_CANONICAL_LINUX_SYSCALLS 0

@@ -84,6 +84,7 @@ struct taint_socket {
 extern "C" {
 void dfsan_add_label(dfsan_label label, uint8_t op, void *addr, uptr size);
 void dfsan_set_label(dfsan_label label, void *addr, uptr size);
+void dfsan_clear_thread_local_state();
 dfsan_label dfsan_read_label(const void *addr, uptr size);
 void dfsan_store_label(dfsan_label l1, void *addr, uptr size);
 dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
@@ -204,6 +205,15 @@ enum operators {
   flength   = last_llvm_op + 21, // 88 z3::length(str_var), Int sort
   LastOp    = last_llvm_op + 22, // 89
 };
+
+// Flag packed into the high bits of a fatoi label's op1 (which otherwise holds
+// the numeric base).  When set, the solver must NOT append a NUL terminator
+// after the rendered digits: the parsed number is embedded in a larger input
+// (e.g. an sscanf field) rather than a standalone null-terminated string, so a
+// NUL would clobber the following separator/bytes.  Kept clear for
+// atoi/strtol so their labels stay bit-identical.
+#define FATOI_NO_NULL (1u << 16)
+#define FATOI_BASE_MASK 0xffffu
 
 enum predicate {
   bveq = 32,

@@ -26,6 +26,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/SetVector.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/BasicBlock.h"
@@ -207,7 +208,7 @@ collectGlobals(Function *Out) {
     for (Instruction &I : BB)
       for (Value *Op : I.operands())
         if (auto *gv = dyn_cast<GlobalVariable>(Op->stripPointerCasts()))
-          if (!gv->getName().startswith("llvm.") && !gv->getName().empty())
+          if (!(gv->getName()).starts_with("llvm.") && !gv->getName().empty())
             gvs.insert(gv);
   std::vector<std::pair<std::string, std::string>> out;
   for (GlobalVariable *gv : gvs) {
@@ -240,10 +241,12 @@ static Function *extractTarget(const Target &T, unsigned Idx) {
   DT.recalculate(*T.F);
 
   CodeExtractorAnalysisCache CEAC(*T.F);
+  // NOTE: the trailing Suffix argument is intentionally left at its default;
+  // LLVM 18 inserted an AllocationBlock parameter before it, so passing it
+  // positionally is not source-compatible across versions.
   CodeExtractor CE(T.Blocks, &DT, /*AggregateArgs=*/false,
                    /*BFI=*/nullptr, /*BPI=*/nullptr, /*AC=*/nullptr,
-                   /*AllowVarArgs=*/false, /*AllowAlloca=*/false,
-                   /*Suffix=*/"");
+                   /*AllowVarArgs=*/false, /*AllowAlloca=*/false);
   if (!CE.isEligible()) {
     if (ClVerbose)
       errs() << "[loop-outline] skip " << T.F->getName()
@@ -274,7 +277,7 @@ struct LoopOutlinePass : public PassInfoMixin<LoopOutlinePass> {
     // Phase 1 (read-only): gather innermost-loop body regions.
     std::vector<Target> Targets;
     for (Function &F : M) {
-      if (F.isDeclaration() || F.getName().startswith("__ucsan_loopbody_"))
+      if (F.isDeclaration() || (F.getName()).starts_with("__ucsan_loopbody_"))
         continue;
       DominatorTree DT;
       DT.recalculate(F);
