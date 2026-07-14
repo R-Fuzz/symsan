@@ -18,7 +18,7 @@ To learn more, checkout our [paper](https://www.usenix.org/conference/usenixsecu
 ## Building
 
 Because SymSan leverages the shadow memory implementation from LLVM's sanitizers,
-it has more strict dependency on the LLVM version. Right now only LLVM 12 is tested.
+it has more strict dependency on the LLVM version. The latest main branch is tested with LLVM-18.
 
 ### Build Requirements
 
@@ -30,7 +30,11 @@ it has more strict dependency on the LLVM version. Right now only LLVM 12 is tes
 Create a `build` directory and execute the following commands in it:
 
 ```shell
-$ CC=clang-18 CXX=clang++-18 cmake -DCMAKE_INSTALL_PREFIX=/path/to/install -DCMAKE_BUILD_TYPE=Release /path/to/symsan/source
+$ cmake -DCMAKE_C_COMPILER=clang-18 \
+        -DCMAKE_CXX_COMPILER=clang++-18 \
+        -DLLVM_DIR="$(llvm-config-18 --cmakedir)" \
+        -DCMAKE_INSTALL_PREFIX=/path/to/install \
+        -DCMAKE_BUILD_TYPE=Release /path/to/symsan/source
 $ make
 $ make install
 ```
