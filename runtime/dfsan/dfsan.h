@@ -217,7 +217,17 @@ enum operators {
   fp_min      = last_llvm_op + 26, // 93 llvm.minnum
   fp_max      = last_llvm_op + 27, // 94 llvm.maxnum
   fp_copysign = last_llvm_op + 28, // 95 llvm.copysign
-  LastOp    = last_llvm_op + 29, // 96
+  // FP predicates + rounding-to-int libcalls modeled as custom wrappers (see
+  // done_abilist.txt / dfsan_custom.cpp).  SymSan has no working "functional"
+  // ABI (WK_Functional is a no-op that drops taint), so these must build real
+  // op nodes for the solver.  Predicate results are 0/1 integers; fp_lrint is
+  // round-to-nearest (RNE) then convert to a signed integer.
+  fp_is_nan    = last_llvm_op + 29, // 96 isnan/isnanf
+  fp_is_inf    = last_llvm_op + 30, // 97 isinf/isinff and __isinf/__isinff
+  fp_is_finite = last_llvm_op + 31, // 98 finite/finitef
+  fp_signbit   = last_llvm_op + 32, // 99 __signbit/__signbitf
+  fp_lrint     = last_llvm_op + 33, // 100 lrint/lrintf/llrint/llrintf
+  LastOp    = last_llvm_op + 34, // 101
 };
 
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP

@@ -1122,6 +1122,63 @@ DFSW_FP_BINARY(copysign, copysign, __dfsan::fp_copysign)
 
 #undef DFSW_FP_BINARY
 
+// FP predicates (double/float -> int): isnan/isinf/__isinf/finite/__signbit.
+// SymSan has no working "functional" ABI, so these must build a real op node
+// recording the predicate; otherwise a branch like `if (isnan(x))` drops the
+// operand's taint and can never be flipped.  The concrete result is computed
+// with __builtin_* (the libc names are macros that would otherwise recurse).
+// The node is created only when the argument is tainted; the operand's IEEE
+// bits reach the solver via the child label's value cache (like DFSW_FP_UNARY).
+#define DFSW_FP_PRED(name, bfn, op)                                            \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  int __dfsw_##name(double x, dfsan_label x_label,                            \
+                    dfsan_label *ret_label) {                                  \
+    int ret = bfn(x);                                                          \
+    *ret_label = x_label ? dfsan_union(x_label, 0, op, 32, 0, 0) : 0;          \
+    return ret;                                                                \
+  }                                                                            \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  int __dfsw_##name##f(float x, dfsan_label x_label,                          \
+                       dfsan_label *ret_label) {                               \
+    int ret = bfn(x);                                                          \
+    *ret_label = x_label ? dfsan_union(x_label, 0, op, 32, 0, 0) : 0;          \
+    return ret;                                                                \
+  }
+
+DFSW_FP_PRED(isnan, __builtin_isnan, __dfsan::fp_is_nan)
+DFSW_FP_PRED(isinf, __builtin_isinf, __dfsan::fp_is_inf)
+DFSW_FP_PRED(__isinf, __builtin_isinf, __dfsan::fp_is_inf)
+DFSW_FP_PRED(finite, __builtin_isfinite, __dfsan::fp_is_finite)
+DFSW_FP_PRED(__signbit, __builtin_signbit, __dfsan::fp_signbit)
+
+#undef DFSW_FP_PRED
+
+// Round-to-nearest-integer libcalls (lrint/llrint, double/float).  Modeled as
+// fp_lrint: round with the default mode (RNE) then convert to a signed integer.
+// Result width is 64 bits (long / long long on this platform).
+#define DFSW_FP_LRINT(name, cfn, ret_t)                                        \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  ret_t __dfsw_##name(double x, dfsan_label x_label,                          \
+                      dfsan_label *ret_label) {                                \
+    ret_t ret = cfn(x);                                                        \
+    *ret_label = x_label ?                                                     \
+        dfsan_union(x_label, 0, __dfsan::fp_lrint, 64, 0, 0) : 0;              \
+    return ret;                                                                \
+  }                                                                            \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  ret_t __dfsw_##name##f(float x, dfsan_label x_label,                        \
+                         dfsan_label *ret_label) {                             \
+    ret_t ret = cfn##f(x);                                                     \
+    *ret_label = x_label ?                                                     \
+        dfsan_union(x_label, 0, __dfsan::fp_lrint, 64, 0, 0) : 0;              \
+    return ret;                                                                \
+  }
+
+DFSW_FP_LRINT(lrint, lrint, long)
+DFSW_FP_LRINT(llrint, llrint, long long)
+
+#undef DFSW_FP_LRINT
+
 SANITIZER_INTERFACE_ATTRIBUTE
 char *__dfsw_strcat(char *dest, const char *src, dfsan_label d_label,
                     dfsan_label s_label, dfsan_label *ret_label) {

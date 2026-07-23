@@ -82,6 +82,11 @@ static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::fp_min, "fmin"},
   {__dfsan::fp_max, "fmax"},
   {__dfsan::fp_copysign, "copysign"},
+  {__dfsan::fp_is_nan, "isnan"},
+  {__dfsan::fp_is_inf, "isinf"},
+  {__dfsan::fp_is_finite, "isfinite"},
+  {__dfsan::fp_signbit, "signbit"},
+  {__dfsan::fp_lrint, "lrint"},
 #define RELATIONAL_FCMP(cmp) (__dfsan::FCmp | (cmp << 8))
   {RELATIONAL_FCMP(0),  "FcmpFalse"},
   {RELATIONAL_FCMP(1),  "FcmpOeq"},
@@ -702,14 +707,18 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // solution that doesn't match C truncation).  Constrain the operand to the
       // representable range so the conversion is well-defined.  Bounds are closed
       // (slightly conservative at the fractional edges, but never spurious).
+      // NOTE: INT64_MAX (2^63-1) and UINT64_MAX (2^64-1) are not representable as
+      // doubles and round *up* to 2^63 / 2^64 -- both outside the target range,
+      // where to_sbv/to_ubv is undefined.  Use the largest double strictly below
+      // the overflow point instead (2^63-1024 signed, 2^64-2048 unsigned).
       { z3::sort ssort = fpa_sort_for(context_, src_bits);
         double lo, hi;
         if (info->op == __dfsan::FPToSI) {
-          if (info->size >= 64) { lo = -9223372036854775808.0; hi = 9223372036854775807.0; }
+          if (info->size >= 64) { lo = -9223372036854775808.0; hi = 9223372036854774784.0; }
           else { lo = -(double)(1ULL << (info->size - 1)); hi = (double)((1ULL << (info->size - 1)) - 1); }
         } else {
           lo = 0.0;
-          hi = (info->size >= 64) ? 18446744073709551615.0 : (double)((1ULL << info->size) - 1);
+          hi = (info->size >= 64) ? 18446744073709549568.0 : (double)((1ULL << info->size) - 1);
         }
         z3::expr flo(context_, Z3_mk_fpa_numeral_double(context_, lo, ssort));
         z3::expr fhi(context_, Z3_mk_fpa_numeral_double(context_, hi, ssort));
@@ -791,6 +800,80 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       cache_expr(l, fp_to_bv(r));
       TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(fp_encode(rv, bits));
+      continue;
+    }
+    // floating-point predicates (isnan/isinf/finite/signbit; unary, FP operand
+    // in l1, integer result of width info->size = sizeof(int)*8).  These come
+    // from custom libc wrappers; SymSan has no working "functional" ABI, so the
+    // wrapper records the predicate here and the result feeds a normal ICmp.
+    else if (info->op == __dfsan::fp_is_nan || info->op == __dfsan::fp_is_inf ||
+             info->op == __dfsan::fp_is_finite || info->op == __dfsan::fp_signbit) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      unsigned src_bits = get_label_info(info->l1)->size;
+      double a = fp_decode(value_cache_[info->l1], src_bits);
+      z3::expr r(context_);
+      uint64_t rv = 0;
+      if (info->op == __dfsan::fp_signbit) {
+        // signbit is a pure bit read: the IEEE sign bit is the MSB of the BV.
+        // Zero-extend that 1-bit value to the int result width (correct for -0).
+        z3::expr sign = base.extract(src_bits - 1, src_bits - 1);
+        r = z3::zext(sign, info->size - 1);
+        rv = std::signbit(a) ? 1 : 0;
+      } else {
+        z3::expr fp = bv_to_fp(context_, base, src_bits);
+        z3::expr cond(context_);
+        switch (info->op) {
+          case __dfsan::fp_is_nan:
+            cond = z3::expr(context_, Z3_mk_fpa_is_nan(context_, fp));
+            rv = std::isnan(a) ? 1 : 0; break;
+          case __dfsan::fp_is_inf:
+            cond = z3::expr(context_, Z3_mk_fpa_is_infinite(context_, fp));
+            rv = std::isinf(a) ? 1 : 0; break;
+          case __dfsan::fp_is_finite: {
+            z3::expr nan(context_, Z3_mk_fpa_is_nan(context_, fp));
+            z3::expr inf(context_, Z3_mk_fpa_is_infinite(context_, fp));
+            cond = !nan && !inf;
+            rv = std::isfinite(a) ? 1 : 0; break;
+          }
+        }
+        r = z3::ite(cond, context_.bv_val(1, info->size),
+                    context_.bv_val(0, info->size));
+      }
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      cache_expr(l, r);
+      TRACK_LABEL_BV_ONLY();
+      RECORD_VALUE(rv);
+      continue;
+    }
+    // round-to-nearest-integer libcalls (lrint/llrint).  Round with the default
+    // mode (RNE) then convert to a signed integer of width info->size.  Like
+    // FPToSI, z3's fpa.to_sbv is a partial function, so constrain the operand to
+    // the representable range.
+    else if (info->op == __dfsan::fp_lrint) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      unsigned src_bits = get_label_info(info->l1)->size;
+      z3::expr fp = bv_to_fp(context_, base, src_bits);
+      z3::expr r(context_, Z3_mk_fpa_to_sbv(context_,
+                             get_rm(context_, __dfsan::fp_rm_rne), fp, info->size));
+      { z3::sort ssort = fpa_sort_for(context_, src_bits);
+        double lo, hi;
+        // INT64_MAX (2^63-1) is not representable as a double and rounds *up* to
+        // 2^63, which is outside the signed range -- fpa.to_sbv would be
+        // undefined there and the solver could pick that point and assign the
+        // result freely.  Use the largest double strictly below 2^63 (2^63-1024)
+        // as the closed upper bound.  -2^63 is exactly representable.
+        if (info->size >= 64) { lo = -9223372036854775808.0; hi = 9223372036854774784.0; }
+        else { lo = -(double)(1ULL << (info->size - 1)); hi = (double)((1ULL << (info->size - 1)) - 1); }
+        z3::expr flo(context_, Z3_mk_fpa_numeral_double(context_, lo, ssort));
+        z3::expr fhi(context_, Z3_mk_fpa_numeral_double(context_, hi, ssort));
+        aux_constraints_.push_back(z3::expr(context_, Z3_mk_fpa_geq(context_, fp, flo)));
+        aux_constraints_.push_back(z3::expr(context_, Z3_mk_fpa_leq(context_, fp, fhi)));
+      }
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      cache_expr(l, r);
+      TRACK_LABEL_BV_ONLY();
+      { double d = fp_decode(value_cache_[info->l1], src_bits);
+        RECORD_VALUE((uint64_t)std::llrint(d)); }
       continue;
     }
     // floating-point binary intrinsics (minnum/maxnum/copysign).  Either operand
