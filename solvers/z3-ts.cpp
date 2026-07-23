@@ -11,6 +11,8 @@
 
 #include <new>
 #include <unistd.h>
+#include <cstring>
+#include <cmath>
 
 using namespace symsan;
 
@@ -61,6 +63,43 @@ static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::fprefixof, "prefixof"},
   {__dfsan::fsuffixof, "suffixof"},
   {__dfsan::flength, "length"},
+  // floating-point
+  {__dfsan::FAdd, "FAdd"},
+  {__dfsan::FSub, "FSub"},
+  {__dfsan::FMul, "FMul"},
+  {__dfsan::FDiv, "FDiv"},
+  {__dfsan::FRem, "FRem"},
+  {__dfsan::FPToUI, "FPToUI"},
+  {__dfsan::FPToSI, "FPToSI"},
+  {__dfsan::UIToFP, "UIToFP"},
+  {__dfsan::SIToFP, "SIToFP"},
+  {__dfsan::FPTrunc, "FPTrunc"},
+  {__dfsan::FPExt, "FPExt"},
+  {__dfsan::fp_neg, "FNeg"},
+  {__dfsan::fp_fabs, "fabs"},
+  {__dfsan::fp_sqrt, "sqrt"},
+  {__dfsan::fp_round, "fround"},
+  {__dfsan::fp_min, "fmin"},
+  {__dfsan::fp_max, "fmax"},
+  {__dfsan::fp_copysign, "copysign"},
+#define RELATIONAL_FCMP(cmp) (__dfsan::FCmp | (cmp << 8))
+  {RELATIONAL_FCMP(0),  "FcmpFalse"},
+  {RELATIONAL_FCMP(1),  "FcmpOeq"},
+  {RELATIONAL_FCMP(2),  "FcmpOgt"},
+  {RELATIONAL_FCMP(3),  "FcmpOge"},
+  {RELATIONAL_FCMP(4),  "FcmpOlt"},
+  {RELATIONAL_FCMP(5),  "FcmpOle"},
+  {RELATIONAL_FCMP(6),  "FcmpOne"},
+  {RELATIONAL_FCMP(7),  "FcmpOrd"},
+  {RELATIONAL_FCMP(8),  "FcmpUno"},
+  {RELATIONAL_FCMP(9),  "FcmpUeq"},
+  {RELATIONAL_FCMP(10), "FcmpUgt"},
+  {RELATIONAL_FCMP(11), "FcmpUge"},
+  {RELATIONAL_FCMP(12), "FcmpUlt"},
+  {RELATIONAL_FCMP(13), "FcmpUle"},
+  {RELATIONAL_FCMP(14), "FcmpUne"},
+  {RELATIONAL_FCMP(15), "FcmpTrue"},
+#undef RELATIONAL_FCMP
 };
 
 static std::string get_op_name(uint32_t op) {
@@ -312,6 +351,141 @@ static bool eval_icmp(uint16_t predicate, uint64_t val1, uint64_t val2, uint8_t 
   // std::unreachable();
 }
 
+//===----------------------------------------------------------------------===//
+// Floating-point helpers
+//
+// FP-typed labels are represented as bit-vectors holding the IEEE-754 encoding
+// (matching how the runtime stores op1/op2 and how inputs are byte-BVs).  These
+// helpers lift a BV to the fpa theory, lower a fpa result back to a BV, and
+// build/evaluate FCmp.  Rounding follows the z3 context default (RNE), which
+// matches LLVM's default FP environment.
+//===----------------------------------------------------------------------===//
+
+static z3::sort fpa_sort_for(z3::context &ctx, unsigned bits) {
+  switch (bits) {
+    case 16: return ctx.fpa_sort<16>();
+    case 32: return ctx.fpa_sort<32>();
+    case 64: return ctx.fpa_sort<64>();
+    default: throw z3::exception("unsupported floating-point width");
+  }
+}
+
+// Reinterpret an IEEE-754 bit-vector as a floating-point value.
+static z3::expr bv_to_fp(z3::context &ctx, const z3::expr &bv, unsigned bits) {
+  return bv.mk_from_ieee_bv(fpa_sort_for(ctx, bits));
+}
+
+// Lower a floating-point value back to its IEEE-754 bit-vector encoding.
+static z3::expr fp_to_bv(const z3::expr &fp) {
+  return fp.mk_to_ieee_bv();
+}
+
+// Build a z3 rounding-mode expression from an fp_rounding_mode selector.
+static z3::expr get_rm(z3::context &ctx, uint32_t sel) {
+  switch (sel) {
+    case __dfsan::fp_rm_rna: return z3::expr(ctx, Z3_mk_fpa_rna(ctx));
+    case __dfsan::fp_rm_rne: return z3::expr(ctx, Z3_mk_fpa_rne(ctx));
+    case __dfsan::fp_rm_rtp: return z3::expr(ctx, Z3_mk_fpa_rtp(ctx));
+    case __dfsan::fp_rm_rtn: return z3::expr(ctx, Z3_mk_fpa_rtn(ctx));
+    case __dfsan::fp_rm_rtz: return z3::expr(ctx, Z3_mk_fpa_rtz(ctx));
+    default:                 return z3::expr(ctx, Z3_mk_fpa_rne(ctx));
+  }
+}
+
+// Build a boolean expression for an FCmp with the given LLVM predicate (0..15).
+// lhs/rhs must be fpa-sorted.  Ordered (O*) predicates are false when either
+// operand is NaN; unordered (U*) predicates are true when either is NaN.
+static z3::expr get_fcmp(z3::expr const &lhs, z3::expr const &rhs, uint32_t predicate) {
+  z3::context &ctx = lhs.ctx();
+  z3::expr nan_a(ctx, Z3_mk_fpa_is_nan(ctx, lhs));
+  z3::expr nan_b(ctx, Z3_mk_fpa_is_nan(ctx, rhs));
+  z3::expr unordered = (nan_a || nan_b);
+  z3::expr eq(ctx, Z3_mk_fpa_eq(ctx, lhs, rhs));   // ordered equality (false on NaN)
+  z3::expr lt(ctx, Z3_mk_fpa_lt(ctx, lhs, rhs));
+  z3::expr gt(ctx, Z3_mk_fpa_gt(ctx, lhs, rhs));
+  z3::expr le(ctx, Z3_mk_fpa_leq(ctx, lhs, rhs));
+  z3::expr ge(ctx, Z3_mk_fpa_geq(ctx, lhs, rhs));
+  switch (predicate) {
+    case 0:  return ctx.bool_val(false);  // FCMP_FALSE
+    case 1:  return eq;                    // FCMP_OEQ
+    case 2:  return gt;                    // FCMP_OGT
+    case 3:  return ge;                    // FCMP_OGE
+    case 4:  return lt;                    // FCMP_OLT
+    case 5:  return le;                    // FCMP_OLE
+    case 6:  return (lt || gt);            // FCMP_ONE (ordered and not equal)
+    case 7:  return (!unordered);          // FCMP_ORD (no NaN)
+    case 8:  return unordered;             // FCMP_UNO (either NaN)
+    case 9:  return (unordered || eq);     // FCMP_UEQ
+    case 10: return (unordered || gt);     // FCMP_UGT
+    case 11: return (unordered || ge);     // FCMP_UGE
+    case 12: return (unordered || lt);     // FCMP_ULT
+    case 13: return (unordered || le);     // FCMP_ULE
+    case 14: return (!eq);                 // FCMP_UNE (unordered or not equal)
+    case 15: return ctx.bool_val(true);    // FCMP_TRUE
+    default: throw z3::exception("unsupported fcmp predicate");
+  }
+}
+
+// Decode an IEEE-754 bit pattern into a C double (widening 32-bit floats).
+static inline double fp_decode(uint64_t bits_val, uint8_t bits) {
+  if (bits == 64) {
+    double d; memcpy(&d, &bits_val, sizeof(d)); return d;
+  } else if (bits == 32) {
+    uint32_t u = (uint32_t)bits_val; float f; memcpy(&f, &u, sizeof(f)); return (double)f;
+  }
+  // half and other widths: not decoded for concrete evaluation
+  return 0.0;
+}
+
+// Encode a C double back into an IEEE-754 bit pattern of the given width.
+static inline uint64_t fp_encode(double v, uint8_t bits) {
+  if (bits == 64) {
+    uint64_t u; memcpy(&u, &v, sizeof(u)); return u;
+  } else if (bits == 32) {
+    float f = (float)v; uint32_t u; memcpy(&u, &f, sizeof(u)); return (uint64_t)u;
+  }
+  return 0;
+}
+
+// Concrete evaluation of an FCmp for FILTER_WRONG_AST value tracking.
+static bool eval_fcmp(uint16_t predicate, uint64_t val1, uint64_t val2, uint8_t bits) {
+  double a = fp_decode(val1, bits), b = fp_decode(val2, bits);
+  bool ord = !(std::isnan(a) || std::isnan(b));
+  switch (predicate) {
+    case 0:  return false;
+    case 1:  return ord && a == b;
+    case 2:  return ord && a > b;
+    case 3:  return ord && a >= b;
+    case 4:  return ord && a < b;
+    case 5:  return ord && a <= b;
+    case 6:  return ord && a != b;
+    case 7:  return ord;
+    case 8:  return !ord;
+    case 9:  return !ord || a == b;
+    case 10: return !ord || a > b;
+    case 11: return !ord || a >= b;
+    case 12: return !ord || a < b;
+    case 13: return !ord || a <= b;
+    case 14: return !ord || a != b;
+    case 15: return true;
+    default: return false;
+  }
+}
+
+// Concrete evaluation of an FP binary op, returning the IEEE bit pattern.
+static uint64_t eval_fp_binop(uint16_t op, uint64_t v1, uint64_t v2, uint8_t bits) {
+  double a = fp_decode(v1, bits), b = fp_decode(v2, bits), r = 0.0;
+  switch (op) {
+    case __dfsan::FAdd: r = a + b; break;
+    case __dfsan::FSub: r = a - b; break;
+    case __dfsan::FMul: r = a * b; break;
+    case __dfsan::FDiv: r = a / b; break;
+    case __dfsan::FRem: r = std::fmod(a, b); break; // C frem semantics
+    default: return 0;
+  }
+  return fp_encode(r, bits);
+}
+
 uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_t offset,
                                       uint32_t bytes, input_dep_set_t &input_deps) {
   char name[256];
@@ -512,6 +686,154 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       RECORD_VALUE(value_cache_[info->l1]);
       continue;
     } //FIXME: other casting ops (BitCast)?
+    // floating-point casts.  FP-typed labels carry the IEEE-754 encoding as a
+    // bit-vector, so we lift the operand to fpa, convert, then (for FP results)
+    // lower back to a BV.  Int results (FPToSI/FPToUI) stay as BV directly.
+    else if (info->op == __dfsan::FPToSI || info->op == __dfsan::FPToUI) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      unsigned src_bits = get_label_info(info->l1)->size;
+      z3::expr fp = bv_to_fp(context_, base, src_bits);
+      z3::expr r = (info->op == __dfsan::FPToSI) ?
+        z3::expr(context_, Z3_mk_fpa_to_sbv(context_, get_rm(context_, __dfsan::fp_rm_rtz), fp, info->size)) :
+        z3::expr(context_, Z3_mk_fpa_to_ubv(context_, get_rm(context_, __dfsan::fp_rm_rtz), fp, info->size));
+      // z3's fpa.to_sbv/to_ubv is a *partial* function: for NaN/inf and values
+      // outside the target integer range the result is unconstrained, letting the
+      // solver pick an out-of-range operand and assign the result freely (a bogus
+      // solution that doesn't match C truncation).  Constrain the operand to the
+      // representable range so the conversion is well-defined.  Bounds are closed
+      // (slightly conservative at the fractional edges, but never spurious).
+      { z3::sort ssort = fpa_sort_for(context_, src_bits);
+        double lo, hi;
+        if (info->op == __dfsan::FPToSI) {
+          if (info->size >= 64) { lo = -9223372036854775808.0; hi = 9223372036854775807.0; }
+          else { lo = -(double)(1ULL << (info->size - 1)); hi = (double)((1ULL << (info->size - 1)) - 1); }
+        } else {
+          lo = 0.0;
+          hi = (info->size >= 64) ? 18446744073709551615.0 : (double)((1ULL << info->size) - 1);
+        }
+        z3::expr flo(context_, Z3_mk_fpa_numeral_double(context_, lo, ssort));
+        z3::expr fhi(context_, Z3_mk_fpa_numeral_double(context_, hi, ssort));
+        aux_constraints_.push_back(z3::expr(context_, Z3_mk_fpa_geq(context_, fp, flo)));
+        aux_constraints_.push_back(z3::expr(context_, Z3_mk_fpa_leq(context_, fp, fhi)));
+      }
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      cache_expr(l, r);
+      TRACK_LABEL_BV_ONLY();
+      { double d = fp_decode(value_cache_[info->l1], src_bits);
+        RECORD_VALUE((info->op == __dfsan::FPToSI) ?
+                     (uint64_t)(int64_t)d : (uint64_t)d); }
+      continue;
+    } else if (info->op == __dfsan::SIToFP || info->op == __dfsan::UIToFP) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      unsigned src_bits = get_label_info(info->l1)->size;
+      z3::sort fs = fpa_sort_for(context_, info->size);
+      z3::expr fp = (info->op == __dfsan::SIToFP) ?
+        z3::expr(context_, Z3_mk_fpa_to_fp_signed(context_, get_rm(context_, __dfsan::fp_rm_rne), base, fs)) :
+        z3::expr(context_, Z3_mk_fpa_to_fp_unsigned(context_, get_rm(context_, __dfsan::fp_rm_rne), base, fs));
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      cache_expr(l, fp_to_bv(fp));
+      TRACK_LABEL_BV_ONLY();
+      { uint64_t iv = value_cache_[info->l1] & (src_bits >= 64 ? ~0UL : ((1UL << src_bits) - 1));
+        double d;
+        if (info->op == __dfsan::SIToFP) {
+          int64_t s = (int64_t)(iv << (64 - src_bits)) >> (64 - src_bits);
+          d = (double)s;
+        } else {
+          d = (double)iv;
+        }
+        RECORD_VALUE(fp_encode(d, info->size)); }
+      continue;
+    } else if (info->op == __dfsan::FPTrunc || info->op == __dfsan::FPExt) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      unsigned src_bits = get_label_info(info->l1)->size;
+      z3::expr fp = bv_to_fp(context_, base, src_bits);
+      z3::expr fp2(context_, Z3_mk_fpa_to_fp_float(context_, get_rm(context_, __dfsan::fp_rm_rne), fp,
+                                                   fpa_sort_for(context_, info->size)));
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      cache_expr(l, fp_to_bv(fp2));
+      TRACK_LABEL_BV_ONLY();
+      { double d = fp_decode(value_cache_[info->l1], src_bits);
+        RECORD_VALUE(fp_encode(d, info->size)); }
+      continue;
+    }
+    // floating-point negate + intrinsics (unary).  Operand in l1; fp_round
+    // carries the rounding-mode selector (fp_rounding_mode) in op1.
+    else if (info->op == __dfsan::fp_neg || info->op == __dfsan::fp_fabs ||
+             info->op == __dfsan::fp_sqrt || info->op == __dfsan::fp_round) {
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      unsigned bits = info->size;
+      z3::expr fp = bv_to_fp(context_, base, bits);
+      double a = fp_decode(value_cache_[info->l1], bits), rv = 0.0;
+      z3::expr r(context_);
+      switch (info->op) {
+        case __dfsan::fp_neg:
+          r = z3::expr(context_, Z3_mk_fpa_neg(context_, fp)); rv = -a; break;
+        case __dfsan::fp_fabs:
+          r = z3::expr(context_, Z3_mk_fpa_abs(context_, fp)); rv = std::fabs(a); break;
+        case __dfsan::fp_sqrt:
+          r = z3::expr(context_, Z3_mk_fpa_sqrt(context_, get_rm(context_, __dfsan::fp_rm_rne), fp));
+          rv = std::sqrt(a); break;
+        case __dfsan::fp_round: {
+          uint32_t sel = (uint32_t)info->op1.i;
+          r = z3::expr(context_, Z3_mk_fpa_round_to_integral(context_, get_rm(context_, sel), fp));
+          switch (sel) {
+            case __dfsan::fp_rm_rna: rv = std::round(a); break;
+            case __dfsan::fp_rm_rne: rv = std::nearbyint(a); break;
+            case __dfsan::fp_rm_rtp: rv = std::ceil(a); break;
+            case __dfsan::fp_rm_rtn: rv = std::floor(a); break;
+            case __dfsan::fp_rm_rtz: rv = std::trunc(a); break;
+            default: rv = std::nearbyint(a); break;
+          }
+          break;
+        }
+      }
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      cache_expr(l, fp_to_bv(r));
+      TRACK_LABEL_BV_ONLY();
+      RECORD_VALUE(fp_encode(rv, bits));
+      continue;
+    }
+    // floating-point binary intrinsics (minnum/maxnum/copysign).  Either operand
+    // may be a concrete constant (label 0, value in op1/op2).
+    else if (info->op == __dfsan::fp_min || info->op == __dfsan::fp_max ||
+             info->op == __dfsan::fp_copysign) {
+      unsigned bits = info->size;
+      z3::expr b1 = (info->l1 >= CONST_OFFSET) ?
+        get_cached_expr(info->l1, input_deps) :
+        context_.bv_val((uint64_t)info->op1.i, bits);
+      z3::expr b2 = (info->l2 >= CONST_OFFSET) ?
+        get_cached_expr(info->l2, input_deps) :
+        context_.bv_val((uint64_t)info->op2.i, bits);
+      uint64_t v1 = (info->l1 >= CONST_OFFSET) ? value_cache_[info->l1] : info->op1.i;
+      uint64_t v2 = (info->l2 >= CONST_OFFSET) ? value_cache_[info->l2] : info->op2.i;
+      double a = fp_decode(v1, bits), b = fp_decode(v2, bits), rv = 0.0;
+      z3::expr r(context_);
+      if (info->op == __dfsan::fp_copysign) {
+        // copysign is pure bit manipulation: magnitude of x, sign bit of y.
+        z3::expr signmask = context_.bv_val((uint64_t)1 << (bits - 1), bits);
+        r = (b1 & ~signmask) | (b2 & signmask);
+        rv = std::copysign(a, b);
+        tsize_cache_.emplace_back((info->l1 >= CONST_OFFSET) ?
+                                  tsize_cache_[info->l1] : tsize_cache_[info->l2]);
+        cache_expr(l, r);
+        TRACK_LABEL_BV_ONLY();
+        RECORD_VALUE(fp_encode(rv, bits));
+        continue;
+      }
+      z3::expr fp1 = bv_to_fp(context_, b1, bits);
+      z3::expr fp2 = bv_to_fp(context_, b2, bits);
+      if (info->op == __dfsan::fp_min) {
+        r = z3::expr(context_, Z3_mk_fpa_min(context_, fp1, fp2)); rv = std::fmin(a, b);
+      } else {
+        r = z3::expr(context_, Z3_mk_fpa_max(context_, fp1, fp2)); rv = std::fmax(a, b);
+      }
+      tsize_cache_.emplace_back((info->l1 >= CONST_OFFSET) ?
+                                tsize_cache_[info->l1] : tsize_cache_[info->l2]);
+      cache_expr(l, fp_to_bv(r));
+      TRACK_LABEL_BV_ONLY();
+      RECORD_VALUE(fp_encode(rv, bits));
+      continue;
+    }
     // symsan-defined
     else if (info->op == __dfsan::Extract) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
@@ -1709,6 +2031,36 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           RECORD_VALUE(0);
         } else
           RECORD_VALUE((int64_t)val1 % (int64_t)val2);
+        break;
+      }
+      // floating-point arithmetic.  op1/op2 are IEEE-754 bit-vectors of `size`;
+      // lift to fpa, compute (rounding = context default RNE), lower back to BV.
+      case __dfsan::FAdd: case __dfsan::FSub:
+      case __dfsan::FMul: case __dfsan::FDiv: case __dfsan::FRem: {
+        z3::expr f1 = bv_to_fp(context_, op1, size);
+        z3::expr f2 = bv_to_fp(context_, op2, size);
+        z3::expr fr(context_);
+        switch (info->op & 0xff) {
+          case __dfsan::FAdd: fr = f1 + f2; break;
+          case __dfsan::FSub: fr = f1 - f2; break;
+          case __dfsan::FMul: fr = f1 * f2; break;
+          case __dfsan::FDiv: fr = f1 / f2; break;
+          // NOTE: z3 fpa_rem is the IEEE-754 remainder, which differs from
+          // LLVM frem / C fmod for some inputs (sign/magnitude of result).
+          case __dfsan::FRem: fr = z3::rem(f1, f2); break;
+        }
+        cache_expr(l, fp_to_bv(fr));
+        TRACK_LABEL_BV_ONLY();
+        RECORD_VALUE(eval_fp_binop(info->op & 0xff, val1, val2, size));
+        break;
+      }
+      // floating-point comparison: lift operands to fpa, build a bool.
+      case __dfsan::FCmp: {
+        z3::expr f1 = bv_to_fp(context_, op1, size);
+        z3::expr f2 = bv_to_fp(context_, op2, size);
+        cache_expr(l, get_fcmp(f1, f2, info->op >> 8));
+        TRACK_LABEL_PROPAGATE_BOTH();
+        RECORD_VALUE(eval_fcmp(info->op >> 8, val1, val2, size) ? 1 : 0);
         break;
       }
       // relational

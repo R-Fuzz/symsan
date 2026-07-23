@@ -203,7 +203,31 @@ enum operators {
   fprefixof = last_llvm_op + 19, // 86 prefixof(str, prefix) using Z3 string theory
   fsuffixof = last_llvm_op + 20, // 87 suffixof(str, suffix) using Z3 string theory
   flength   = last_llvm_op + 21, // 88 z3::length(str_var), Int sort
-  LastOp    = last_llvm_op + 22, // 89
+  // floating-point ops.  Binary FP arithmetic (FAdd/FSub/FMul/FDiv/FRem),
+  // FP casts (FPToUI/FPToSI/UIToFP/SIToFP/FPTrunc/FPExt) and FCmp reuse the LLVM
+  // opcodes directly (they are already in this enum via Instruction.def).  The
+  // ops below are the ones LLVM does *not* give us a usable opcode for: FNeg is a
+  // unary instruction (Instruction.def UNARY insts are not expanded here) and the
+  // FP intrinsics have no opcode at all.  They are placed in [Add, LastOp) so
+  // is_valid_op() accepts them.
+  fp_neg      = last_llvm_op + 22, // 89 fneg (llvm FNeg is unary, not in enum)
+  fp_fabs     = last_llvm_op + 23, // 90 llvm.fabs
+  fp_sqrt     = last_llvm_op + 24, // 91 llvm.sqrt
+  fp_round    = last_llvm_op + 25, // 92 round-to-integral; rounding mode in op1
+  fp_min      = last_llvm_op + 26, // 93 llvm.minnum
+  fp_max      = last_llvm_op + 27, // 94 llvm.maxnum
+  fp_copysign = last_llvm_op + 28, // 95 llvm.copysign
+  LastOp    = last_llvm_op + 29, // 96
+};
+
+// rounding-mode selector carried in op1 for fp_round, and used when lowering FP
+// arithmetic in the solver.  Values match z3::rounding_mode ordering.
+enum fp_rounding_mode {
+  fp_rm_rna = 0, // round nearest, ties to away (llvm.round)
+  fp_rm_rne = 1, // round nearest, ties to even (llvm.rint/nearbyint, default)
+  fp_rm_rtp = 2, // round toward +inf (llvm.ceil)
+  fp_rm_rtn = 3, // round toward -inf (llvm.floor)
+  fp_rm_rtz = 4, // round toward zero (llvm.trunc)
 };
 
 // Flag packed into the high bits of a fatoi label's op1 (which otherwise holds
@@ -253,6 +277,12 @@ static inline bool is_commutative(uint16_t op) {
     case Xor:
     case Add:
     case Mul:
+    // FP add/mul/min/max are commutative (NaN propagation and signed-zero
+    // results are symmetric), so operands may be swapped for dedup.
+    case FAdd:
+    case FMul:
+    case fp_min:
+    case fp_max:
     case fmemcmp:
     case fstrcmp:
       return true;

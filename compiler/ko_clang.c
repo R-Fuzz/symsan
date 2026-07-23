@@ -259,9 +259,11 @@ static void add_taint_pass() {
         alloc_printf("-taint-abilist=%s/zlib_abilist.txt", obj_path);
   }
 
-  if (getenv("KO_TRACE_FP")) {
+  // Floating-point tracing is on by default (ClTraceFP defaults to true).
+  // KO_NO_TRACE_FP explicitly disables it.
+  if (getenv("KO_NO_TRACE_FP")) {
     cc_params[cc_par_cnt++] = "-mllvm";
-    cc_params[cc_par_cnt++] = "-taint-trace-float-pointer";
+    cc_params[cc_par_cnt++] = "-taint-trace-float-pointer=false";
   }
 
   if (getenv("KO_NO_TRACE_BOUND")) {

@@ -105,11 +105,11 @@ fun:exp=functional
 fun:exp2=functional
 fun:expf=functional
 fun:expl=functional
-fun:fabs=functional
+fun:fabs=custom
 fun:finite=functional
 fun:finitef=functional
 fun:finitel=functional
-fun:floor=functional
+fun:floor=custom
 fun:fmod=functional
 fun:frexp=functional
 fun:frexpf=functional
@@ -143,9 +143,29 @@ fun:nexttowardl=functional
 fun:pow=functional
 fun:powf=functional
 fun:powl=functional
-fun:round=functional
-fun:sqrt=functional
-fun:sqrtf=functional
+fun:round=custom
+fun:sqrt=custom
+fun:sqrtf=custom
+# Floating-point math libcalls modeled as custom wrappers (see dfsan_custom.cpp).
+# These build the self-defined fp_* op nodes so the z3 solver can reconstruct
+# and flip FP-dependent branches even when clang keeps them as libcalls.
+fun:fabsf=custom
+fun:floorf=custom
+fun:ceil=custom
+fun:ceilf=custom
+fun:trunc=custom
+fun:truncf=custom
+fun:roundf=custom
+fun:rint=custom
+fun:rintf=custom
+fun:nearbyint=custom
+fun:nearbyintf=custom
+fun:fmin=custom
+fun:fminf=custom
+fun:fmax=custom
+fun:fmaxf=custom
+fun:copysign=custom
+fun:copysignf=custom
 fun:wctob=functional
 fun:wctob=functional
 
