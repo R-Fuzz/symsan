@@ -1,13 +1,20 @@
-// Floating-point solving, float32 challenge (in-process z3 solver only).
-// Adapted from the AFL "test-float.c" challenge, which requires landing three
-// float32 values (read from tainted bytes) inside very tight ranges that
-// random mutation can't hit.  Each range check `lo <= x && x <= hi` is
-// expressed as a single branch `fabsf(x - mid) < half` so exactly one solver
-// task is produced per check (compound `&&` guards only generate a task for
-// the first short-circuited condition).  The three checks are independent
-// (not nested behind an early bail), so a single concolic run flips all of
-// them and emits one input per check -- see tests/switch.c for the same
-// multi-output pattern.  Exercises float32 FCmp + FSub + the fabs intrinsic.
+// Floating-point solving, float32 challenge.  Adapted from the AFL
+// "test-float.c" challenge, which requires landing three float32 values (read
+// from tainted bytes) inside very tight ranges that random mutation can't hit.
+//
+// These challenges are meant for the *input-to-state* (i2s) solver: each guard
+// is a DIRECT comparison of an input-derived float against a constant (no FP
+// arithmetic in between), so i2s can flip it by copying the constant's IEEE-754
+// bytes into the input.  A two-sided range `lo <= x && x <= hi` short-circuits
+// after its first condition, but flipping that first bound to the boundary
+// (x = lo) already lands inside the range (lo <= hi), so a single concolic run
+// solves each range -- no arithmetic reasoning / z3 required.  The three checks
+// are independent (not nested behind an early bail), so one run emits one input
+// per check (see tests/switch.c for the multi-output pattern).
+//
+// The %afltest lines exercise the out-of-process RGD path with i2s only (no
+// SYMSAN_USE_Z3), demonstrating that i2s alone solves the challenge; the
+// %fgtest / KO_USE_Z3 lines additionally confirm the in-process z3 solver.
 //
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out
@@ -15,6 +22,10 @@
 // RUN: clang -O0 -o %t.uninstrumented %s -lm
 // RUN: %t.uninstrumented %t.bin | FileCheck --check-prefix=CHECK-ORIG %s
 // RUN: env KO_USE_FASTGEN=1 %ko-clang -o %t.fg %s -lm
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %afltest %t.fg %t.bin
+// RUN: %t.uninstrumented %t.out/id-0-0-0 | FileCheck --check-prefix=CHECK-GEN1 %s
+// RUN: %t.uninstrumented %t.out/id-0-0-1 | FileCheck --check-prefix=CHECK-GEN2 %s
+// RUN: %t.uninstrumented %t.out/id-0-0-2 | FileCheck --check-prefix=CHECK-GEN3 %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg %t.bin
 // RUN: %t.uninstrumented %t.out/id-0-0-0 | FileCheck --check-prefix=CHECK-GEN1 %s
 // RUN: %t.uninstrumented %t.out/id-0-0-1 | FileCheck --check-prefix=CHECK-GEN2 %s
@@ -48,17 +59,18 @@ int main(int argc, char **argv) {
   memcpy(&x1, buf + 4, sizeof x1);
   memcpy(&x2, buf + 8, sizeof x2);
 
-  // Seed is all zeros, so every value misses its range; the z3 solver must
-  // reconstruct each float32 expression and land inside the range.
-  if (fabsf(x0 - 1000005.5f) < 5.49f) {   // range [1000000.01, 1000010.99]
+  // Seed is all zeros, so every value misses its range.  Each guard is a direct
+  // float32 comparison against a constant, so i2s copies the boundary into the
+  // input; flipping the first bound to the boundary lands inside the range.
+  if (x0 >= 1000000.01f && x0 <= 1000010.99f) {
     // CHECK-GEN1: Good1
     printf("Good1\n");
   }
-  if (fabsf(x1 - 105.45f) < 3.55f) {      // range [101.9, 109.0]
+  if (x1 >= 101.9f && x1 <= 109.0f) {
     // CHECK-GEN2: Good2
     printf("Good2\n");
   }
-  if (fabsf(x2 - 22222223.5f) < 1.6f) {   // range [22222221.9, 22222225.1]
+  if (x2 >= 22222221.9f && x2 <= 22222225.1f) {
     // CHECK-GEN3: Good3
     printf("Good3\n");
   }
