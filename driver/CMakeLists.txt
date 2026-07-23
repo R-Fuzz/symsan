@@ -18,6 +18,21 @@ target_link_libraries(FGTest PRIVATE
 )
 install (TARGETS FGTest DESTINATION ${SYMSAN_BIN_DIR})
 
+## standalone driver for testing the RGD (out-of-process) solver path
+add_executable(AFLTest afltest.cpp)
+set_target_properties(AFLTest PROPERTIES OUTPUT_NAME "afltest" CXX_STANDARD 17)
+target_include_directories(AFLTest PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+)
+target_link_libraries(AFLTest PRIVATE
+  launcher
+  rgd-parser
+  rgd-solver
+  ${Z3_LIBRARY}
+  rt
+)
+install (TARGETS AFLTest DESTINATION ${SYMSAN_BIN_DIR})
+
 if (DEFINED AFLPP_PATH)
     add_subdirectory(aflpp)
 endif()

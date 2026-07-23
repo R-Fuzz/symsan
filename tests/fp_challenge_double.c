@@ -16,6 +16,12 @@
 // RUN: python -c'import sys; sys.stdout.buffer.write(b"\x00"*32)' > %t.bin
 // RUN: clang -O0 -o %t.uninstrumented %s -lm
 // RUN: %t.uninstrumented %t.bin | FileCheck --check-prefix=CHECK-ORIG %s
+// RUN: env KO_USE_FASTGEN=1 %ko-clang -o %t.fg %s -lm
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg %t.bin
+// RUN: %t.uninstrumented %t.out/id-0-0-0 | FileCheck --check-prefix=CHECK-GEN1 %s
+// RUN: %t.uninstrumented %t.out/id-0-0-1 | FileCheck --check-prefix=CHECK-GEN2 %s
+// RUN: %t.uninstrumented %t.out/id-0-0-2 | FileCheck --check-prefix=CHECK-GEN3 %s
+// RUN: %t.uninstrumented %t.out/id-0-0-3 | FileCheck --check-prefix=CHECK-GEN4 %s
 // RUN: env KO_USE_Z3=1 %ko-clang -o %t.z3 %s -lm
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %t.z3 %t.bin
 // RUN: %t.uninstrumented %t.out/id-0-0-0 | FileCheck --check-prefix=CHECK-GEN1 %s
