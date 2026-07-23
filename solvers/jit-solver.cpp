@@ -103,8 +103,12 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
         uint64_t id = ++uuid;
         start = getTimeStamp();
         if (addFunction(c->get_root(), c->local_map, id) != 0) {
+          // jigsaw is integer-only and rejects unsupported (e.g. floating-point)
+          // roots by returning non-zero here.  Return TIMEOUT rather than ERROR
+          // so the driver advances to the next (FP-aware z3) solver -- ERROR sets
+          // out_buf=NULL and stops the solver chain.
           WARNF("failed to add function\n");
-          return SOLVER_ERROR;
+          return SOLVER_TIMEOUT;
         }
         process_time += (getTimeStamp() - start);
         start = getTimeStamp();

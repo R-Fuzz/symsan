@@ -23,7 +23,13 @@ z3::context g_z3_context;
 const unsigned kSolverTimeout = 10000; // 10 seconds
 
 Z3Solver::Z3Solver()
-    : context_(g_z3_context), solver_(z3::solver(context_, "QF_BV"))
+    // QF_BVFP (bit-vectors + floating point) rather than QF_BV: FP constraints
+    // built for FCmp/FP-arith need the floating-point theory.  Under plain
+    // QF_BV z3 treats the FloatingPoint sort as uninterpreted (finite-universe
+    // model) and returns spurious SAT with a bogus all-zero solution.  BVFP is
+    // still a quantifier-free, bit-blasted logic, so the common BV-only tasks
+    // are unaffected.
+    : context_(g_z3_context), solver_(z3::solver(context_, "QF_BVFP"))
 {
   // Set timeout for solver
   z3::params p(context_);
@@ -32,11 +38,88 @@ Z3Solver::Z3Solver()
 }
 
 static inline z3::expr
-cache_expr(uint32_t label, z3::expr const &e, 
-           std::unordered_map<uint32_t, z3::expr> &expr_cache) {	
+cache_expr(uint32_t label, z3::expr const &e,
+           std::unordered_map<uint32_t, z3::expr> &expr_cache) {
   if (label != 0)
     expr_cache.insert({label, e});
   return e;
+}
+
+//===----------------------------------------------------------------------===//
+// Floating-point helpers (mirror solvers/z3-ts.cpp)
+//
+// FP-typed labels are represented as bit-vectors holding the IEEE-754 encoding
+// (matching how the runtime stores operands and how inputs are byte-BVs).  The
+// RGD AstNode tree keeps FP operands/results as BV children; these helpers lift
+// a BV to the fpa theory, lower a fpa result back to a BV, and build/evaluate
+// FCmp.  Rounding follows the z3 context default (RNE), matching LLVM's default
+// FP environment.  Rounding-mode selectors match __dfsan::fp_rounding_mode
+// (rna=0, rne=1, rtp=2, rtn=3, rtz=4); FpRound carries one in AstNode::index().
+//===----------------------------------------------------------------------===//
+
+static z3::sort fpa_sort_for(z3::context &ctx, unsigned bits) {
+  switch (bits) {
+    case 16: return ctx.fpa_sort<16>();
+    case 32: return ctx.fpa_sort<32>();
+    case 64: return ctx.fpa_sort<64>();
+    default: throw z3::exception("unsupported floating-point width");
+  }
+}
+
+// Reinterpret an IEEE-754 bit-vector as a floating-point value.
+static z3::expr bv_to_fp(z3::context &ctx, const z3::expr &bv, unsigned bits) {
+  return bv.mk_from_ieee_bv(fpa_sort_for(ctx, bits));
+}
+
+// Lower a floating-point value back to its IEEE-754 bit-vector encoding.
+static z3::expr fp_to_bv(const z3::expr &fp) {
+  return fp.mk_to_ieee_bv();
+}
+
+// Build a z3 rounding-mode expression from an fp_rounding_mode selector.
+static z3::expr get_rm(z3::context &ctx, uint32_t sel) {
+  switch (sel) {
+    case 0:  return z3::expr(ctx, Z3_mk_fpa_rna(ctx)); // rna
+    case 1:  return z3::expr(ctx, Z3_mk_fpa_rne(ctx)); // rne
+    case 2:  return z3::expr(ctx, Z3_mk_fpa_rtp(ctx)); // rtp
+    case 3:  return z3::expr(ctx, Z3_mk_fpa_rtn(ctx)); // rtn
+    case 4:  return z3::expr(ctx, Z3_mk_fpa_rtz(ctx)); // rtz
+    default: return z3::expr(ctx, Z3_mk_fpa_rne(ctx));
+  }
+}
+
+// Build a boolean expression for an FCmp with the given LLVM predicate (0..15).
+// lhs/rhs must be fpa-sorted.  Ordered (O*) predicates are false when either
+// operand is NaN; unordered (U*) predicates are true when either is NaN.
+static z3::expr get_fcmp(z3::expr const &lhs, z3::expr const &rhs, uint32_t predicate) {
+  z3::context &ctx = lhs.ctx();
+  z3::expr nan_a(ctx, Z3_mk_fpa_is_nan(ctx, lhs));
+  z3::expr nan_b(ctx, Z3_mk_fpa_is_nan(ctx, rhs));
+  z3::expr unordered = (nan_a || nan_b);
+  z3::expr eq(ctx, Z3_mk_fpa_eq(ctx, lhs, rhs));   // ordered equality (false on NaN)
+  z3::expr lt(ctx, Z3_mk_fpa_lt(ctx, lhs, rhs));
+  z3::expr gt(ctx, Z3_mk_fpa_gt(ctx, lhs, rhs));
+  z3::expr le(ctx, Z3_mk_fpa_leq(ctx, lhs, rhs));
+  z3::expr ge(ctx, Z3_mk_fpa_geq(ctx, lhs, rhs));
+  switch (predicate) {
+    case 0:  return ctx.bool_val(false);  // FCMP_FALSE
+    case 1:  return eq;                    // FCMP_OEQ
+    case 2:  return gt;                    // FCMP_OGT
+    case 3:  return ge;                    // FCMP_OGE
+    case 4:  return lt;                    // FCMP_OLT
+    case 5:  return le;                    // FCMP_OLE
+    case 6:  return (lt || gt);            // FCMP_ONE (ordered and not equal)
+    case 7:  return (!unordered);          // FCMP_ORD (no NaN)
+    case 8:  return unordered;             // FCMP_UNO (either NaN)
+    case 9:  return (unordered || eq);     // FCMP_UEQ
+    case 10: return (unordered || gt);     // FCMP_UGT
+    case 11: return (unordered || ge);     // FCMP_UGE
+    case 12: return (unordered || lt);     // FCMP_ULT
+    case 13: return (unordered || le);     // FCMP_ULE
+    case 14: return (!eq);                 // FCMP_UNE (unordered or not equal)
+    case 15: return ctx.bool_val(true);    // FCMP_TRUE
+    default: throw z3::exception("unsupported fcmp predicate");
+  }
 }
 
 z3::expr Z3Solver::serialize(const AstNode* node,
@@ -195,6 +278,176 @@ z3::expr Z3Solver::serialize(const AstNode* node,
     //   z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
     //   return cache_expr(node->label(), !c1, expr_cache);
     // }
+    // floating-point arithmetic.  FP operands/results are IEEE-754 bit-vectors of
+    // the same width; lift both children to fpa, compute (rounding = context
+    // default RNE), lower back to BV.
+    case rgd::FAdd:
+    case rgd::FSub:
+    case rgd::FMul:
+    case rgd::FDiv:
+    case rgd::FRem: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
+      unsigned bits = node->children(0).bits();
+      z3::expr f1 = bv_to_fp(context_, c1, bits);
+      z3::expr f2 = bv_to_fp(context_, c2, bits);
+      z3::expr fr(context_);
+      switch (node->kind()) {
+        case rgd::FAdd: fr = f1 + f2; break;
+        case rgd::FSub: fr = f1 - f2; break;
+        case rgd::FMul: fr = f1 * f2; break;
+        case rgd::FDiv: fr = f1 / f2; break;
+        // NOTE: z3 fpa_rem is the IEEE-754 remainder, which differs from
+        // LLVM frem / C fmod for some inputs (sign/magnitude of result).
+        case rgd::FRem: fr = z3::rem(f1, f2); break;
+      }
+      return cache_expr(node->label(), fp_to_bv(fr), expr_cache);
+    }
+    case rgd::FNeg: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      z3::expr fp = bv_to_fp(context_, c1, node->children(0).bits());
+      z3::expr r(context_, Z3_mk_fpa_neg(context_, fp));
+      return cache_expr(node->label(), fp_to_bv(r), expr_cache);
+    }
+    // floating-point casts.  FP-typed operands carry the IEEE-754 encoding as a
+    // bit-vector, so we lift the source to fpa, convert, then (for FP results)
+    // lower back to a BV.  Int results (FpToSi/FpToUi/FpLrint) stay as BV.
+    case rgd::FpToSi:
+    case rgd::FpToUi: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      unsigned src_bits = node->children(0).bits();
+      z3::expr fp = bv_to_fp(context_, c1, src_bits);
+      z3::expr r = (node->kind() == rgd::FpToSi) ?
+        z3::expr(context_, Z3_mk_fpa_to_sbv(context_, get_rm(context_, 4 /*rtz*/), fp, node->bits())) :
+        z3::expr(context_, Z3_mk_fpa_to_ubv(context_, get_rm(context_, 4 /*rtz*/), fp, node->bits()));
+      // z3's fpa.to_sbv/to_ubv is a *partial* function: for NaN/inf and values
+      // outside the target integer range the result is unconstrained, letting the
+      // solver pick an out-of-range operand and assign the result freely (a bogus
+      // solution that doesn't match C truncation).  Constrain the operand to the
+      // representable range so the conversion is well-defined.  See z3-ts.cpp for
+      // the rationale on the 2^63-1024 / 2^64-2048 upper bounds (INT64_MAX and
+      // UINT64_MAX are not representable as doubles and round *up* out of range).
+      { z3::sort ssort = fpa_sort_for(context_, src_bits);
+        double lo, hi;
+        if (node->kind() == rgd::FpToSi) {
+          if (node->bits() >= 64) { lo = -9223372036854775808.0; hi = 9223372036854774784.0; }
+          else { lo = -(double)(1ULL << (node->bits() - 1)); hi = (double)((1ULL << (node->bits() - 1)) - 1); }
+        } else {
+          lo = 0.0;
+          hi = (node->bits() >= 64) ? 18446744073709549568.0 : (double)((1ULL << node->bits()) - 1);
+        }
+        z3::expr flo(context_, Z3_mk_fpa_numeral_double(context_, lo, ssort));
+        z3::expr fhi(context_, Z3_mk_fpa_numeral_double(context_, hi, ssort));
+        aux_constraints_.push_back(z3::expr(context_, Z3_mk_fpa_geq(context_, fp, flo)));
+        aux_constraints_.push_back(z3::expr(context_, Z3_mk_fpa_leq(context_, fp, fhi)));
+      }
+      return cache_expr(node->label(), r, expr_cache);
+    }
+    case rgd::SiToFp:
+    case rgd::UiToFp: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      z3::sort fs = fpa_sort_for(context_, node->bits());
+      z3::expr fp = (node->kind() == rgd::SiToFp) ?
+        z3::expr(context_, Z3_mk_fpa_to_fp_signed(context_, get_rm(context_, 1 /*rne*/), c1, fs)) :
+        z3::expr(context_, Z3_mk_fpa_to_fp_unsigned(context_, get_rm(context_, 1 /*rne*/), c1, fs));
+      return cache_expr(node->label(), fp_to_bv(fp), expr_cache);
+    }
+    case rgd::FpTrunc:
+    case rgd::FpExt: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      z3::expr fp = bv_to_fp(context_, c1, node->children(0).bits());
+      z3::expr fp2(context_, Z3_mk_fpa_to_fp_float(context_, get_rm(context_, 1 /*rne*/), fp,
+                                                   fpa_sort_for(context_, node->bits())));
+      return cache_expr(node->label(), fp_to_bv(fp2), expr_cache);
+    }
+    // floating-point unary intrinsics.  FpRound carries the rounding-mode
+    // selector (fp_rounding_mode) in AstNode::index().
+    case rgd::FpFabs:
+    case rgd::FpSqrt:
+    case rgd::FpRound: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      z3::expr fp = bv_to_fp(context_, c1, node->children(0).bits());
+      z3::expr r(context_);
+      switch (node->kind()) {
+        case rgd::FpFabs:
+          r = z3::expr(context_, Z3_mk_fpa_abs(context_, fp)); break;
+        case rgd::FpSqrt:
+          r = z3::expr(context_, Z3_mk_fpa_sqrt(context_, get_rm(context_, 1 /*rne*/), fp)); break;
+        case rgd::FpRound:
+          r = z3::expr(context_, Z3_mk_fpa_round_to_integral(context_, get_rm(context_, node->index()), fp)); break;
+      }
+      return cache_expr(node->label(), fp_to_bv(r), expr_cache);
+    }
+    // floating-point binary intrinsics (minnum/maxnum/copysign).
+    case rgd::FpMin:
+    case rgd::FpMax:
+    case rgd::FpCopysign: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
+      unsigned bits = node->children(0).bits();
+      if (node->kind() == rgd::FpCopysign) {
+        // copysign is pure bit manipulation: magnitude of x, sign bit of y.
+        z3::expr signmask = context_.bv_val((uint64_t)1 << (bits - 1), bits);
+        return cache_expr(node->label(), (c1 & ~signmask) | (c2 & signmask), expr_cache);
+      }
+      z3::expr f1 = bv_to_fp(context_, c1, bits);
+      z3::expr f2 = bv_to_fp(context_, c2, bits);
+      z3::expr r = (node->kind() == rgd::FpMin) ?
+        z3::expr(context_, Z3_mk_fpa_min(context_, f1, f2)) :
+        z3::expr(context_, Z3_mk_fpa_max(context_, f1, f2));
+      return cache_expr(node->label(), fp_to_bv(r), expr_cache);
+    }
+    // floating-point predicates (isnan/isinf/finite/signbit).  Unary FP operand;
+    // integer result of width node->bits() feeding a normal ICmp.
+    case rgd::FpIsNan:
+    case rgd::FpIsInf:
+    case rgd::FpIsFinite:
+    case rgd::FpSignbit: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      unsigned src_bits = node->children(0).bits();
+      if (node->kind() == rgd::FpSignbit) {
+        // signbit is a pure bit read: the IEEE sign bit is the MSB of the BV.
+        // Zero-extend that 1-bit value to the int result width (correct for -0).
+        z3::expr sign = c1.extract(src_bits - 1, src_bits - 1);
+        return cache_expr(node->label(), z3::zext(sign, node->bits() - 1), expr_cache);
+      }
+      z3::expr fp = bv_to_fp(context_, c1, src_bits);
+      z3::expr cond(context_);
+      switch (node->kind()) {
+        case rgd::FpIsNan:
+          cond = z3::expr(context_, Z3_mk_fpa_is_nan(context_, fp)); break;
+        case rgd::FpIsInf:
+          cond = z3::expr(context_, Z3_mk_fpa_is_infinite(context_, fp)); break;
+        case rgd::FpIsFinite: {
+          z3::expr nan(context_, Z3_mk_fpa_is_nan(context_, fp));
+          z3::expr inf(context_, Z3_mk_fpa_is_infinite(context_, fp));
+          cond = !nan && !inf; break;
+        }
+      }
+      return cache_expr(node->label(),
+                        z3::ite(cond, context_.bv_val(1, node->bits()),
+                                context_.bv_val(0, node->bits())),
+                        expr_cache);
+    }
+    // round-to-nearest-integer libcalls (lrint/llrint).  Round with the default
+    // mode (RNE) then convert to a signed integer of width node->bits().  Like
+    // FpToSi, z3's fpa.to_sbv is a partial function, so constrain the operand.
+    case rgd::FpLrint: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      unsigned src_bits = node->children(0).bits();
+      z3::expr fp = bv_to_fp(context_, c1, src_bits);
+      z3::expr r(context_, Z3_mk_fpa_to_sbv(context_, get_rm(context_, 1 /*rne*/), fp, node->bits()));
+      { z3::sort ssort = fpa_sort_for(context_, src_bits);
+        double lo, hi;
+        if (node->bits() >= 64) { lo = -9223372036854775808.0; hi = 9223372036854774784.0; }
+        else { lo = -(double)(1ULL << (node->bits() - 1)); hi = (double)((1ULL << (node->bits() - 1)) - 1); }
+        z3::expr flo(context_, Z3_mk_fpa_numeral_double(context_, lo, ssort));
+        z3::expr fhi(context_, Z3_mk_fpa_numeral_double(context_, hi, ssort));
+        aux_constraints_.push_back(z3::expr(context_, Z3_mk_fpa_geq(context_, fp, flo)));
+        aux_constraints_.push_back(z3::expr(context_, Z3_mk_fpa_leq(context_, fp, fhi)));
+      }
+      return cache_expr(node->label(), r, expr_cache);
+    }
     default:
       WARNF("unhandler expr: ");
       throw z3::exception("unsupported operator");
@@ -212,6 +465,16 @@ z3::expr Z3Solver::serialize_rel(uint32_t comparison,
   }
   z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
   z3::expr c2 = serialize(&node->children(1), input_args, expr_cache);
+
+  // floating-point comparison: operands are IEEE-754 bit-vectors; lift both to
+  // fpa and build a NaN-aware boolean.  The FP relational kinds map directly to
+  // LLVM FCmp predicates 1..14 (FOeq..FUne), i.e. (kind - FOeq + 1).
+  if (rgd::isFPRelationalKind(comparison)) {
+    unsigned bits = node->children(0).bits();
+    z3::expr f1 = bv_to_fp(context_, c1, bits);
+    z3::expr f2 = bv_to_fp(context_, c2, bits);
+    return get_fcmp(f1, f2, comparison - rgd::FOeq + 1);
+  }
 
   switch(comparison) {
     case rgd::Equal:
@@ -271,6 +534,7 @@ Z3Solver::solve(std::shared_ptr<SearchTask> task,
 
   try {
     solver_.reset(); // reset solver
+    aux_constraints_.clear(); // drop any FP range constraints from a prior solve
     auto base_task = task->base_task;
     std::vector<z3::expr> assumptions;
     while (base_task != nullptr) {
@@ -305,6 +569,12 @@ Z3Solver::solve(std::shared_ptr<SearchTask> task,
       z3::expr z3expr = serialize_rel(task->comparisons(i), c->get_root(), c->input_args, expr_cache);
       DEBUGF("adding expr %s\n", z3expr.to_string().c_str());
       solver_.add(z3expr);
+    }
+    // add any auxiliary FP range constraints gathered during serialization so
+    // partial fpa.to_sbv/to_ubv conversions stay well-defined.
+    for (auto const &aux : aux_constraints_) {
+      DEBUGF("adding aux constraint %s\n", aux.to_string().c_str());
+      solver_.add(aux);
     }
     auto ret = solver_.check();
     if (ret == z3::sat) {

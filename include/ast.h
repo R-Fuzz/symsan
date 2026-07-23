@@ -58,6 +58,55 @@ namespace rgd {
     Memcmp, //37
     MemcmpN, // 38
 
+    // Floating-point arithmetic (operands & result are IEEE-754 bit-vectors).
+    // The out-of-process RGD path lifts BV children to the fpa theory in the
+    // z3 solver; jigsaw JIT and i2s stay integer-only and reject these.
+    FAdd, // 39
+    FSub, // 40
+    FMul, // 41
+    FDiv, // 42
+    FRem, // 43
+    FNeg, // 44
+
+    // FP casts
+    FpToUi, // 45
+    FpToSi, // 46
+    UiToFp, // 47
+    SiToFp, // 48
+    FpTrunc, // 49
+    FpExt, // 50
+
+    // FP intrinsics / libcalls
+    FpFabs, // 51
+    FpSqrt, // 52
+    FpRound, // 53   rounding-mode selector carried in AstNode index()
+    FpMin, // 54
+    FpMax, // 55
+    FpCopysign, // 56
+    FpIsNan, // 57
+    FpIsInf, // 58
+    FpIsFinite, // 59
+    FpSignbit, // 60
+    FpLrint, // 61
+
+    // FP comparisons (LLVM FCmp predicates 1..14; FALSE/TRUE are constants).
+    // Kept OUTSIDE the isRelationalKind() range on purpose so that the
+    // integer-only jigsaw/i2s solvers cleanly reject FP tasks (fall back to z3).
+    FOeq, // 62
+    FOgt, // 63
+    FOge, // 64
+    FOlt, // 65
+    FOle, // 66
+    FOne, // 67
+    FOrd, // 68
+    FUno, // 69
+    FUeq, // 70
+    FUgt, // 71
+    FUge, // 72
+    FUlt, // 73
+    FUle, // 74
+    FUne, // 75
+
     // Last
     LastOp
   };
@@ -102,6 +151,43 @@ namespace rgd {
     "Load",
     "Memcmp",
     "MemcmpN",
+    "FAdd",
+    "FSub",
+    "FMul",
+    "FDiv",
+    "FRem",
+    "FNeg",
+    "FpToUi",
+    "FpToSi",
+    "UiToFp",
+    "SiToFp",
+    "FpTrunc",
+    "FpExt",
+    "FpFabs",
+    "FpSqrt",
+    "FpRound",
+    "FpMin",
+    "FpMax",
+    "FpCopysign",
+    "FpIsNan",
+    "FpIsInf",
+    "FpIsFinite",
+    "FpSignbit",
+    "FpLrint",
+    "FOeq",
+    "FOgt",
+    "FOge",
+    "FOlt",
+    "FOle",
+    "FOne",
+    "FOrd",
+    "FUno",
+    "FUeq",
+    "FUgt",
+    "FUge",
+    "FUlt",
+    "FUle",
+    "FUne",
   };
 
   static inline bool isRelationalKind(uint16_t kind) {
@@ -111,8 +197,33 @@ namespace rgd {
       return false;
   }
 
+  // Floating-point relational kinds are deliberately kept out of the
+  // isRelationalKind() range: the integer-only jigsaw JIT and i2s solvers
+  // dispatch on isRelationalKind(), so excluding FP makes them reject FP
+  // tasks and fall back to the (FP-aware) z3 solver.
+  static inline bool isFPRelationalKind(uint16_t kind) {
+    if (kind >= FOeq && kind <= FUne)
+      return true;
+    else
+      return false;
+  }
+
   static inline bool isBinaryOperation(uint16_t kind) {
     if (kind >= Add && kind <= AShr && kind != Neg && kind != Not)
+      return true;
+    else
+      return false;
+  }
+
+  // Any floating-point op (FP arithmetic, casts, intrinsics/libcalls, and FP
+  // comparisons) lives contiguously in [FAdd, FUne].  The integer-only solvers
+  // (jigsaw JIT, i2s input-to-state) cannot reason about these: input bytes
+  // reaching a comparison *through* an FP op (e.g. (long)x == 42, lrint(x) == 42)
+  // no longer appear literally, so copying the constant into the input produces
+  // a bogus solution.  Such solvers must reject a constraint whose ops bitset
+  // intersects this range and fall back to the FP-aware z3 solver.
+  static inline bool isFloatingPointKind(uint16_t kind) {
+    if (kind >= FAdd && kind <= FUne)
       return true;
     else
       return false;
@@ -130,6 +241,21 @@ namespace rgd {
       case Sle: return Sgt;
       case Sgt: return Sle;
       case Sge: return Slt;
+      // FP predicate negations (LLVM's ordered<->unordered complement pairs).
+      case FOeq: return FUne;
+      case FUne: return FOeq;
+      case FOgt: return FUle;
+      case FUle: return FOgt;
+      case FOge: return FUlt;
+      case FUlt: return FOge;
+      case FOlt: return FUge;
+      case FUge: return FOlt;
+      case FOle: return FUgt;
+      case FUgt: return FOle;
+      case FOne: return FUeq;
+      case FUeq: return FOne;
+      case FOrd: return FUno;
+      case FUno: return FOrd;
       default: return Bool;
     }
   }

@@ -5,6 +5,8 @@
 #include "union_find.h"
 #include "parse-rgd.h"
 
+#include <cmath>
+#include <cstring>
 #include <unordered_map>
 
 using namespace rgd;
@@ -70,6 +72,49 @@ static const std::unordered_map<unsigned, std::pair<unsigned, const char*> > OP_
   {RELATIONAL_ICMP(__dfsan::bvslt), {rgd::Slt, "slt"}},
   {RELATIONAL_ICMP(__dfsan::bvsle), {rgd::Sle, "sle"}},
 #undef RELATIONAL_ICMP
+  // floating-point arithmetic (FAdd/FSub/FMul/FDiv/FRem reuse LLVM opcodes)
+  {__dfsan::FAdd,    {rgd::FAdd, "fadd"}},
+  {__dfsan::FSub,    {rgd::FSub, "fsub"}},
+  {__dfsan::FMul,    {rgd::FMul, "fmul"}},
+  {__dfsan::FDiv,    {rgd::FDiv, "fdiv"}},
+  {__dfsan::FRem,    {rgd::FRem, "frem"}},
+  {__dfsan::fp_neg,  {rgd::FNeg, "fneg"}},
+  // floating-point casts
+  {__dfsan::FPToUI,  {rgd::FpToUi, "fptoui"}},
+  {__dfsan::FPToSI,  {rgd::FpToSi, "fptosi"}},
+  {__dfsan::UIToFP,  {rgd::UiToFp, "uitofp"}},
+  {__dfsan::SIToFP,  {rgd::SiToFp, "sitofp"}},
+  {__dfsan::FPTrunc, {rgd::FpTrunc, "fptrunc"}},
+  {__dfsan::FPExt,   {rgd::FpExt, "fpext"}},
+  // floating-point intrinsics / libcalls
+  {__dfsan::fp_fabs,      {rgd::FpFabs, "fabs"}},
+  {__dfsan::fp_sqrt,      {rgd::FpSqrt, "sqrt"}},
+  {__dfsan::fp_round,     {rgd::FpRound, "fround"}},
+  {__dfsan::fp_min,       {rgd::FpMin, "fmin"}},
+  {__dfsan::fp_max,       {rgd::FpMax, "fmax"}},
+  {__dfsan::fp_copysign,  {rgd::FpCopysign, "copysign"}},
+  {__dfsan::fp_is_nan,    {rgd::FpIsNan, "isnan"}},
+  {__dfsan::fp_is_inf,    {rgd::FpIsInf, "isinf"}},
+  {__dfsan::fp_is_finite, {rgd::FpIsFinite, "isfinite"}},
+  {__dfsan::fp_signbit,   {rgd::FpSignbit, "signbit"}},
+  {__dfsan::fp_lrint,     {rgd::FpLrint, "lrint"}},
+  // floating-point comparisons (predicate encoded in the high byte, same as ICmp)
+#define RELATIONAL_FCMP(cmp) (__dfsan::FCmp | (cmp << 8))
+  {RELATIONAL_FCMP(1),  {rgd::FOeq, "foeq"}},
+  {RELATIONAL_FCMP(2),  {rgd::FOgt, "fogt"}},
+  {RELATIONAL_FCMP(3),  {rgd::FOge, "foge"}},
+  {RELATIONAL_FCMP(4),  {rgd::FOlt, "folt"}},
+  {RELATIONAL_FCMP(5),  {rgd::FOle, "fole"}},
+  {RELATIONAL_FCMP(6),  {rgd::FOne, "fone"}},
+  {RELATIONAL_FCMP(7),  {rgd::FOrd, "ford"}},
+  {RELATIONAL_FCMP(8),  {rgd::FUno, "funo"}},
+  {RELATIONAL_FCMP(9),  {rgd::FUeq, "fueq"}},
+  {RELATIONAL_FCMP(10), {rgd::FUgt, "fugt"}},
+  {RELATIONAL_FCMP(11), {rgd::FUge, "fuge"}},
+  {RELATIONAL_FCMP(12), {rgd::FUlt, "fult"}},
+  {RELATIONAL_FCMP(13), {rgd::FUle, "fule"}},
+  {RELATIONAL_FCMP(14), {rgd::FUne, "fune"}},
+#undef RELATIONAL_FCMP
 };
 
 static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
@@ -93,6 +138,44 @@ static inline bool eval_icmp(uint16_t op, uint64_t op1, uint64_t op2) {
     }
   }
   return false;
+}
+
+// Decode an IEEE-754 bit pattern into a C double (widening 32-bit floats).
+static inline double fp_decode(uint64_t bits_val, uint8_t bits) {
+  if (bits == 64) {
+    double d; memcpy(&d, &bits_val, sizeof(d)); return d;
+  } else if (bits == 32) {
+    uint32_t u = (uint32_t)bits_val; float f; memcpy(&f, &u, sizeof(f)); return (double)f;
+  }
+  // half and other widths: not decoded for concrete evaluation
+  return 0.0;
+}
+
+// Concrete evaluation of an FCmp given the LLVM predicate (0..15) and the
+// IEEE-754 bit patterns of the operands.  Used to constant-fold a fully
+// concretized comparison during root discovery (mirrors eval_icmp).
+static inline bool eval_fcmp(uint16_t predicate, uint64_t val1, uint64_t val2, uint8_t bits) {
+  double a = fp_decode(val1, bits), b = fp_decode(val2, bits);
+  bool ord = !(std::isnan(a) || std::isnan(b));
+  switch (predicate) {
+    case 0:  return false;         // FCMP_FALSE
+    case 1:  return ord && a == b; // FCMP_OEQ
+    case 2:  return ord && a > b;  // FCMP_OGT
+    case 3:  return ord && a >= b; // FCMP_OGE
+    case 4:  return ord && a < b;  // FCMP_OLT
+    case 5:  return ord && a <= b; // FCMP_OLE
+    case 6:  return ord && a != b; // FCMP_ONE
+    case 7:  return ord;           // FCMP_ORD
+    case 8:  return !ord;          // FCMP_UNO
+    case 9:  return !ord || a == b; // FCMP_UEQ
+    case 10: return !ord || a > b;  // FCMP_UGT
+    case 11: return !ord || a >= b; // FCMP_UGE
+    case 12: return !ord || a < b;  // FCMP_ULT
+    case 13: return !ord || a <= b; // FCMP_ULE
+    case 14: return !ord || a != b; // FCMP_UNE
+    case 15: return true;           // FCMP_TRUE
+    default: return false;
+  }
 }
 
 static void printAst(FILE* f, const rgd::AstNode *node, int indent) {
@@ -406,7 +489,8 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     visited.insert(info->l1);
   } else {
     if (unlikely(needs_concretization)) {
-      if (unlikely(!rgd::isRelationalKind(ret->kind()))) {
+      if (unlikely(!rgd::isRelationalKind(ret->kind()) &&
+                   !rgd::isFPRelationalKind(ret->kind()))) {
         WARNF("invalid kind for concretization %u\n", ret->kind());
         return false;
       }
@@ -439,12 +523,28 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
 #endif
   }
 
-  // unary ops
+  // unary ops.  FP casts (FPToUI/FPToSI/UIToFP/SIToFP/FPTrunc/FPExt), FP
+  // unary intrinsics (fneg/fabs/sqrt/round) and the FP predicate/rounding
+  // libcalls (isnan/isinf/finite/signbit/lrint) all take a single operand in
+  // l1, so they short-circuit here before a (nonexistent) right child is built.
+  bool is_fp_unary =
+      info->op == __dfsan::FPToUI || info->op == __dfsan::FPToSI ||
+      info->op == __dfsan::UIToFP || info->op == __dfsan::SIToFP ||
+      info->op == __dfsan::FPTrunc || info->op == __dfsan::FPExt ||
+      info->op == __dfsan::fp_neg || info->op == __dfsan::fp_fabs ||
+      info->op == __dfsan::fp_sqrt || info->op == __dfsan::fp_round ||
+      info->op == __dfsan::fp_is_nan || info->op == __dfsan::fp_is_inf ||
+      info->op == __dfsan::fp_is_finite || info->op == __dfsan::fp_signbit ||
+      info->op == __dfsan::fp_lrint;
   if (info->op == __dfsan::ZExt || info->op == __dfsan::SExt ||
-      info->op == __dfsan::Extract || info->op == __dfsan::Trunc) {
+      info->op == __dfsan::Extract || info->op == __dfsan::Trunc ||
+      is_fp_unary) {
     uint32_t hash = rgd::xxhash(info->size, ret->kind(), left->hash());
     ret->set_hash(hash);
-    uint64_t offset = info->op == __dfsan::Extract ? info->op2.i : 0;
+    // Extract carries a bit offset in op2; fp_round carries its rounding-mode
+    // selector (fp_rounding_mode) in op1.  Both are stashed in index().
+    uint64_t offset = info->op == __dfsan::Extract ? info->op2.i :
+                      (info->op == __dfsan::fp_round ? info->op1.i : 0);
     ret->set_index(offset);
     return true;
   }
@@ -461,7 +561,8 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     visited.insert(info->l2);
   } else {
     if (unlikely(needs_concretization)) {
-      if (unlikely(!rgd::isRelationalKind(ret->kind()))) {
+      if (unlikely(!rgd::isRelationalKind(ret->kind()) &&
+                   !rgd::isFPRelationalKind(ret->kind()))) {
         WARNF("invalid kind for concretization %u\n", ret->kind());
         return false;
       }
@@ -495,7 +596,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   }
 
   // record comparison operands
-  if (rgd::isRelationalKind(ret->kind())) {
+  if (rgd::isRelationalKind(ret->kind()) || rgd::isFPRelationalKind(ret->kind())) {
     constraint->op1 = info->op1.i;
     constraint->op2 = info->op2.i;
   }
@@ -515,7 +616,9 @@ RGDAstParser::constraint_t RGDAstParser::parse_constraint(dfsan_label label) {
   // make sure root is a comparison node
   // XXX: root should never go oob?
   dfsan_label_info *info = get_label_info(label);
-  if (unlikely(((info->op & 0xff) != __dfsan::ICmp) && (info->op != __dfsan::fmemcmp))) {
+  if (unlikely(((info->op & 0xff) != __dfsan::ICmp) &&
+               ((info->op & 0xff) != __dfsan::FCmp) &&
+               (info->op != __dfsan::fmemcmp))) {
     WARNF("invalid root node %u, non-comparison root op: %u\n", label, info->op);
     return nullptr;
   }
@@ -581,8 +684,10 @@ dfsan_label RGDAstParser::strip_zext(dfsan_label label) {
     if (info->size == 1) {
       // extending a boolean value
       return child;
-    } else if ((info->op & 0xff) == __dfsan::ICmp || info->op == __dfsan::fmemcmp) {
-      // extending the result of icmp or memcmp
+    } else if ((info->op & 0xff) == __dfsan::ICmp ||
+               (info->op & 0xff) == __dfsan::FCmp ||
+               info->op == __dfsan::fmemcmp) {
+      // extending the result of icmp, fcmp or memcmp
       return child;
     }
   }
@@ -1029,6 +1134,65 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
             node->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
             node->clear_children();
           }
+        } else if ((info->op & 0xff) == __dfsan::FCmp) {
+          // fcmp node (relational leaf).  Unlike icmp, both operands are FP
+          // values, so an fcmp never has a nested comparison child -- the
+          // children_size should always be 0 here.
+          node->set_bits(1);
+          if (likely(node->children_size() == 0)) {
+            // check size, concretize if too large (mirror the icmp leaf path)
+            auto size = ast_size_cache.at(curr);
+            auto citr = concretize_node.find(curr);
+            uint8_t concretize = (citr != concretize_node.end() ? citr->second : 0);
+            if (size > max_ast_size_) {
+              DEBUGF("AST size too large: %d = %u\n", curr, size);
+              auto left_size = ast_size_cache.at(info->l1);
+              auto right_size = ast_size_cache.at(info->l2);
+              if (left_size > max_ast_size_) {
+                concretize |= 1;
+                size -= (left_size - 1);
+              }
+              if (right_size > max_ast_size_) {
+                concretize |= 2;
+                size -= (right_size - 1);
+              }
+              DEBUGF("new size: %d = %u\n", curr, size);
+              ast_size_cache[curr] = size;
+              concretize_node[curr] = concretize;
+            }
+
+            // check for concrete ops
+            uint8_t concrete_ops = concretize;
+            concrete_ops |= info->l1 == 0 ? 1 : 0;
+            concrete_ops |= info->l2 == 0 ? 2 : 0;
+            if (concrete_ops == 3) {
+              // both sides concrete, constant-fold the comparison.  For a cmp
+              // node info->size is the operand width (see TaintPass), which is
+              // exactly what eval_fcmp needs to decode the IEEE bit patterns.
+              node->set_kind(rgd::Bool);
+              node->set_boolvalue(eval_fcmp(info->op >> 8, info->op1.i, info->op2.i, info->size));
+            } else {
+              auto itr = OP_MAP.find(info->op);
+              if (unlikely(itr == OP_MAP.end())) {
+                WARNF("invalid fcmp op: %d\n", info->op);
+                return INVALID_NODE;
+              }
+              node->set_kind(itr->second.first);
+              node->set_label(curr);
+#ifdef DEBUG
+              subroots.insert(curr);
+#endif
+            }
+          } else {
+            // unexpected nested comparison inside an FP operand; constant-fold
+            uint32_t opw = 64;
+            if (info->l1 != 0) opw = get_label_info(info->l1)->size;
+            else if (info->l2 != 0) opw = get_label_info(info->l2)->size;
+            WARNF("unexpected nested cmp under fcmp: %d\n", info->op);
+            node->set_kind(rgd::Bool);
+            node->set_boolvalue(eval_fcmp(info->op >> 8, info->op1.i, info->op2.i, opw));
+            node->clear_children();
+          }
         } else if (info->op == __dfsan::fmemcmp) {
           // memcmp is also considered as a root node (relational comparison)
           if (unlikely(node->children_size() != 0)) {
@@ -1151,7 +1315,8 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
       uint8_t nested = 0;
       nested += info->l1 == 0 ? 0 : nested_cmp_cache[info->l1];
       nested += info->l2 == 0 ? 0 : nested_cmp_cache[info->l2];
-      if (info->op == __dfsan::fmemcmp || (info->op & 0xff) == __dfsan::ICmp)
+      if (info->op == __dfsan::fmemcmp || (info->op & 0xff) == __dfsan::ICmp ||
+          (info->op & 0xff) == __dfsan::FCmp)
         nested += 1;
       nested_cmp_cache.push_back(nested);
     }
@@ -1244,7 +1409,8 @@ int RGDAstParser::to_nnf(bool expected_r, rgd::AstNode *node) {
       if (unlikely(ret != 0)) { return ret; }
     } else {
       // leaf node
-      if (rgd::isRelationalKind(node->kind())) {
+      if (rgd::isRelationalKind(node->kind()) ||
+          rgd::isFPRelationalKind(node->kind())) {
         node->set_kind(rgd::negate_cmp(node->kind()));
       } else if (node->kind() == rgd::Memcmp) {
         // memcmp is also considered as a leaf node (relational comparison)

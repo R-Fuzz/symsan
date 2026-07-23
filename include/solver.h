@@ -48,6 +48,9 @@ private:
 
   z3::context &context_;
   z3::solver solver_;
+  // auxiliary range constraints emitted while serializing partial FP casts
+  // (fpa.to_sbv/to_ubv); collected during serialize() and added before check().
+  std::vector<z3::expr> aux_constraints_;
 };
 
 class JITSolver : public Solver {
@@ -79,6 +82,9 @@ private:
   uint64_t matches;
   uint64_t mismatches;
   std::bitset<rgd::LastOp> binop_mask;
+  // bits for every FP op kind; a constraint touching any of these is not
+  // solvable by integer input-to-state and is rejected (falls back to z3).
+  std::bitset<rgd::LastOp> fp_ops_mask;
 
   solver_result_t solve_icmp(std::shared_ptr<const Constraint> const& c,
                              std::unique_ptr<ConsMeta> const& cm,

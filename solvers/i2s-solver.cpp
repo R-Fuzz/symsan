@@ -211,6 +211,10 @@ I2SSolver::I2SSolver(): matches(0), mismatches(0) {
   // binop_mask.set(rgd::Shl);
   binop_mask.set(rgd::LShr);
   binop_mask.set(rgd::AShr);
+
+  // every FP op kind lives contiguously in [FAdd, FUne]; see isFloatingPointKind
+  for (uint16_t k = rgd::FAdd; k <= rgd::FUne; ++k)
+    fp_ops_mask.set(k);
 }
 
 solver_result_t
@@ -557,6 +561,16 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
     auto const& c = task->constraints(i);
     auto const& cm = task->consmetas(i);
     auto comparison = task->comparisons(i);
+    // i2s is integer-only: if the constraint involves any FP op, the input
+    // bytes reach the comparison through an FP transformation (e.g. an FPToSI
+    // cast or lrint()), so they no longer appear literally in the compared
+    // value.  Attempting input-to-state here would copy the constant into the
+    // raw FP bytes and yield a bogus "solution".  Reject and let z3 handle it.
+    if (unlikely((c->ops & fp_ops_mask).any())) {
+      DEBUGF("i2s: skip FP-derived constraint\n");
+      mismatches++;
+      continue;
+    }
     if (likely(isRelationalKind(comparison))) {
       if (solve_icmp(c, cm, comparison, in_buf, in_size, out_buf, out_size) == SOLVER_SAT) {
         // be optimistic, as long as there's one match, we should try the output
