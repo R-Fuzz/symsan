@@ -82,11 +82,19 @@ private:
   uint64_t matches;
   uint64_t mismatches;
   std::bitset<rgd::LastOp> binop_mask;
-  // bits for every FP op kind; a constraint touching any of these is not
-  // solvable by integer input-to-state and is rejected (falls back to z3).
+  // bits for the FP op kinds that input-to-state cannot invert (all FP
+  // arithmetic, casts, and intrinsics/libcalls -- i.e. every FP op EXCEPT the
+  // top-level FP comparisons).  A constraint touching any of these is rejected
+  // and falls back to z3.  A "direct" FCmp (input bytes -> FCmp against a
+  // constant) sets no bit here and is handled by solve_fcmp.
   std::bitset<rgd::LastOp> fp_ops_mask;
 
   solver_result_t solve_icmp(std::shared_ptr<const Constraint> const& c,
+                             std::unique_ptr<ConsMeta> const& cm,
+                             uint32_t comparison,
+                             const uint8_t *in_buf, size_t in_size,
+                             uint8_t *out_buf, size_t &out_size);
+  solver_result_t solve_fcmp(std::shared_ptr<const Constraint> const& c,
                              std::unique_ptr<ConsMeta> const& cm,
                              uint32_t comparison,
                              const uint8_t *in_buf, size_t in_size,

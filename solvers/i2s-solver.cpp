@@ -93,6 +93,121 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
   return v;
 }
 
+//===----------------------------------------------------------------------===//
+// Floating-point input-to-state helpers
+//
+// FP-typed labels carry the IEEE-754 encoding as a bit-vector, so a "direct"
+// FCmp (an input value read straight into an FP compare against a constant)
+// looks, at the byte level, exactly like the integer i2s case: the symbolic
+// operand's bytes appear literally in the input and can be replaced wholesale.
+// The only twist is that the replacement value must satisfy an FP relation, so
+// we decode to a C double/float, pick a satisfying value (using nextafter for
+// strict inequalities), and re-encode.  Every guess is verified against the
+// actual FP semantics before we claim SAT (see solve_fcmp).
+//===----------------------------------------------------------------------===//
+
+// Decode an IEEE-754 bit pattern (4- or 8-byte) into a C double.
+static inline double fp_decode(uint64_t bits, uint32_t bytes) {
+  if (bytes == 8) {
+    double d; memcpy(&d, &bits, sizeof(d)); return d;
+  } else { // 4
+    uint32_t u = (uint32_t)bits; float f; memcpy(&f, &u, sizeof(f)); return (double)f;
+  }
+}
+
+// Encode a C double into an IEEE-754 bit pattern of the given width (narrowing
+// to float for 4-byte).  Inverse of fp_decode.
+static inline uint64_t fp_encode(double d, uint32_t bytes) {
+  if (bytes == 8) {
+    uint64_t b; memcpy(&b, &d, sizeof(b)); return b;
+  } else { // 4
+    float f = (float)d; uint32_t u; memcpy(&u, &f, sizeof(u)); return (uint64_t)u;
+  }
+}
+
+// Next representable value from x toward dir (+/-inf), at the target precision.
+static inline double fp_next(double x, double dir, uint32_t bytes) {
+  if (bytes == 8) return nextafter(x, dir);
+  else return (double)nextafterf((float)x, (float)dir);
+}
+
+// Map an rgd FP relational kind to the LLVM FCmp predicate (1..14).
+static inline uint32_t fcmp_predicate(uint32_t comparison) {
+  return comparison - rgd::FOeq + 1;
+}
+
+// Swap the operands of an FCmp predicate: returns the predicate P' such that
+// (a P b) == (b P' a).  Only the ordering-sensitive predicates change.
+static inline uint32_t swap_fcmp_predicate(uint32_t pred) {
+  switch (pred) {
+    case 2:  return 4;  // OGT <-> OLT
+    case 3:  return 5;  // OGE <-> OLE
+    case 4:  return 2;
+    case 5:  return 3;
+    case 10: return 12; // UGT <-> ULT
+    case 11: return 13; // UGE <-> ULE
+    case 12: return 10;
+    case 13: return 11;
+    default: return pred; // OEQ, ONE, ORD, UNO, UEQ, UNE are symmetric
+  }
+}
+
+// Concrete evaluation of an FCmp (LLVM predicate 1..14) on two doubles.
+static inline bool i2s_eval_fcmp(uint32_t pred, double a, double b) {
+  bool ord = !(isnan(a) || isnan(b));
+  switch (pred) {
+    case 1:  return ord && a == b; // OEQ
+    case 2:  return ord && a > b;  // OGT
+    case 3:  return ord && a >= b; // OGE
+    case 4:  return ord && a < b;  // OLT
+    case 5:  return ord && a <= b; // OLE
+    case 6:  return ord && a != b; // ONE
+    case 7:  return ord;           // ORD
+    case 8:  return !ord;          // UNO
+    case 9:  return !ord || a == b; // UEQ
+    case 10: return !ord || a > b;  // UGT
+    case 11: return !ord || a >= b; // UGE
+    case 12: return !ord || a < b;  // ULT
+    case 13: return !ord || a <= b; // ULE
+    case 14: return !ord || a != b; // UNE
+    default: return false;
+  }
+}
+
+// Pick a value for the symbolic operand that satisfies (sym <pred> k) when the
+// symbolic operand is the lhs, or (k <pred> sym) when it is the rhs.  We fold
+// the rhs case into the lhs case by swapping the predicate, then choose a
+// witness relative to the constant k.  The result is still verified by the
+// caller, so an unsatisfiable predicate (e.g. OGT against +inf) just fails
+// verification and is skipped.
+static inline double fp_i2s_target(uint32_t pred, double k, bool sym_is_lhs,
+                                   uint32_t bytes) {
+  uint32_t p = sym_is_lhs ? pred : swap_fcmp_predicate(pred);
+  switch (p) {
+    case 1:  // OEQ: sym == k
+    case 3:  // OGE: sym >= k
+    case 5:  // OLE: sym <= k
+    case 7:  // ORD: sym is not NaN
+    case 9:  // UEQ: sym == k (or NaN)
+    case 11: // UGE
+    case 13: // ULE
+      return k;
+    case 2:  // OGT: sym > k
+    case 10: // UGT
+      return fp_next(k, HUGE_VAL, bytes); // toward +inf
+    case 4:  // OLT: sym < k
+    case 12: // ULT
+      return fp_next(k, -HUGE_VAL, bytes); // toward -inf
+    case 6:  // ONE: sym != k, not NaN
+    case 14: // UNE
+      return k == 0.0 ? 1.0 : 0.0;
+    case 8:  // UNO: sym is NaN (k is a concrete constant, assumed not NaN)
+      return (double)NAN;
+    default:
+      return k;
+  }
+}
+
 static inline uint64_t _get_binop_value(uint64_t v1, uint64_t v2, uint16_t kind) {
   switch (kind) {
     case rgd::Add: return v1 + v2;
@@ -212,9 +327,68 @@ I2SSolver::I2SSolver(): matches(0), mismatches(0) {
   binop_mask.set(rgd::LShr);
   binop_mask.set(rgd::AShr);
 
-  // every FP op kind lives contiguously in [FAdd, FUne]; see isFloatingPointKind
-  for (uint16_t k = rgd::FAdd; k <= rgd::FUne; ++k)
+  // FP ops that input-to-state cannot invert: all FP arithmetic, casts, and
+  // intrinsics/libcalls, i.e. [FAdd, FpLrint] -- everything below the first FP
+  // comparison kind (FOeq).  The FP relational kinds are deliberately left out
+  // so a direct FCmp (input -> compare against a constant) is not rejected and
+  // can be handled by solve_fcmp.
+  for (uint16_t k = rgd::FAdd; k < rgd::FOeq; ++k)
     fp_ops_mask.set(k);
+}
+
+solver_result_t
+I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
+                      std::unique_ptr<ConsMeta> const& cm,
+                      uint32_t comparison,
+                      const uint8_t *in_buf, size_t in_size,
+                      uint8_t *out_buf, size_t &out_size) {
+
+  uint32_t predicate = fcmp_predicate(comparison);
+  for (auto const& candidate : cm->i2s_candidates) {
+    size_t offset = candidate.first;
+    uint32_t bytes = candidate.second;
+    // only IEEE single/double are decoded here
+    if (bytes != 4 && bytes != 8) {
+      continue;
+    }
+    uint64_t mask = (bytes == 8) ? ~0ULL : 0xffffffffULL;
+    uint64_t value = 0;
+    memcpy(&value, &in_buf[offset], bytes);
+    value &= mask;
+    // identify which operand the input bytes correspond to (the other one is
+    // the concrete constant we compare against)
+    bool sym_is_lhs;
+    uint64_t const_bits;
+    if ((c->op1 & mask) == value) {
+      sym_is_lhs = true;
+      const_bits = c->op2 & mask;
+    } else if ((c->op2 & mask) == value) {
+      sym_is_lhs = false;
+      const_bits = c->op1 & mask;
+    } else {
+      continue; // input does not feed this comparison directly
+    }
+    double k = fp_decode(const_bits, bytes);
+    double s = fp_i2s_target(predicate, k, sym_is_lhs, bytes);
+    uint64_t r = fp_encode(s, bytes);
+    // re-decode so verification uses the exact stored value
+    double sv = fp_decode(r, bytes);
+    double a = sym_is_lhs ? sv : k;
+    double b = sym_is_lhs ? k : sv;
+    DEBUGF("i2s: fcmp pred %u @ %lu (%u bytes) sym_lhs=%d k=%g -> %g\n",
+           predicate, offset, bytes, sym_is_lhs, k, sv);
+    if (!i2s_eval_fcmp(predicate, a, b)) {
+      // our heuristic guess doesn't satisfy the relation (e.g. OGT against the
+      // max representable value); don't claim a bogus SAT, let z3 handle it
+      continue;
+    }
+    if (out_size == 0) memcpy(out_buf, in_buf, in_size); // make a copy
+    out_size = in_size;
+    memcpy(&out_buf[offset], &r, bytes);
+    matches++;
+    return SOLVER_SAT;
+  }
+  return SOLVER_TIMEOUT;
 }
 
 solver_result_t
@@ -561,11 +735,14 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
     auto const& c = task->constraints(i);
     auto const& cm = task->consmetas(i);
     auto comparison = task->comparisons(i);
-    // i2s is integer-only: if the constraint involves any FP op, the input
-    // bytes reach the comparison through an FP transformation (e.g. an FPToSI
-    // cast or lrint()), so they no longer appear literally in the compared
-    // value.  Attempting input-to-state here would copy the constant into the
-    // raw FP bytes and yield a bogus "solution".  Reject and let z3 handle it.
+    // If the constraint involves an FP op that i2s cannot invert (FP
+    // arithmetic, a cast such as FPToSI, or a libcall such as lrint()), the
+    // input bytes reach the comparison through that transformation and no
+    // longer appear literally in the compared value.  Attempting input-to-state
+    // here would copy the constant into the raw FP bytes and yield a bogus
+    // "solution"; reject and let z3 handle it.  A direct FCmp (input bytes
+    // compared against a constant) sets no bit in fp_ops_mask and is handled
+    // below by solve_fcmp.
     if (unlikely((c->ops & fp_ops_mask).any())) {
       DEBUGF("i2s: skip FP-derived constraint\n");
       mismatches++;
@@ -573,6 +750,13 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
     }
     if (likely(isRelationalKind(comparison))) {
       if (solve_icmp(c, cm, comparison, in_buf, in_size, out_buf, out_size) == SOLVER_SAT) {
+        // be optimistic, as long as there's one match, we should try the output
+        ret = SOLVER_SAT;
+      } else {
+        mismatches++;
+      }
+    } else if (isFPRelationalKind(comparison)) {
+      if (solve_fcmp(c, cm, comparison, in_buf, in_size, out_buf, out_size) == SOLVER_SAT) {
         // be optimistic, as long as there's one match, we should try the output
         ret = SOLVER_SAT;
       } else {
