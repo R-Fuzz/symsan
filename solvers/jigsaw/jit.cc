@@ -6,6 +6,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -28,6 +29,25 @@ using namespace llvm;
 using namespace rgd;
 
 std::unique_ptr<GradJit> JIT;
+
+// --- floating-point codegen helpers --------------------------------------
+// Node values in this JIT are always integers of node->bits() width; for an FP
+// node that integer holds the raw IEEE-754 encoding.  as_fp() reinterprets such
+// an integer as the matching float/double so we can emit native FP ops, and
+// as_bits() reinterprets an FP result back to the integer bit-pattern that the
+// rest of codegen (and the value cache) expects.
+static inline llvm::Type* fp_type(llvm::IRBuilder<> &Builder, unsigned bits) {
+  return bits == 32 ? Builder.getFloatTy() : Builder.getDoubleTy();
+}
+static inline llvm::Value* as_fp(llvm::IRBuilder<> &Builder, llvm::Value* v,
+                                 unsigned bits) {
+  return Builder.CreateBitCast(v, fp_type(Builder, bits));
+}
+static inline llvm::Value* as_bits(llvm::IRBuilder<> &Builder, llvm::Value* v,
+                                   unsigned bits) {
+  return Builder.CreateBitCast(v,
+      llvm::Type::getIntNTy(Builder.getContext(), bits));
+}
 
 static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
     const AstNode* node,
@@ -357,19 +377,213 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
 #endif
       break;
     }
-    // floating-point transcendentals (exp/exp2/log/log2/log10/log1p/pow).
-    // jigsaw is integer-only and has no FP support yet, so reject them
-    // explicitly (FP support is a future task).  The out-of-process chain tries
-    // i2s first, which flips these guards numerically; rejecting here makes
-    // addFunction fail so jit-solver falls through cleanly.
+    // floating-point arithmetic: reinterpret the integer children as fp, emit
+    // the native FP op, then reinterpret the result back to its bit-pattern.
+    case rgd::FAdd:
+    case rgd::FSub:
+    case rgd::FMul:
+    case rgd::FDiv:
+    case rgd::FRem: {
+      const AstNode* rc1 = &node->children(0);
+      const AstNode* rc2 = &node->children(1);
+      llvm::Value* c1 = as_fp(Builder,
+          codegen(Builder, rc1, local_map, arg, value_cache), rc1->bits());
+      llvm::Value* c2 = as_fp(Builder,
+          codegen(Builder, rc2, local_map, arg, value_cache), rc2->bits());
+      llvm::Value* r;
+      switch (node->kind()) {
+        case rgd::FAdd: r = Builder.CreateFAdd(c1, c2); break;
+        case rgd::FSub: r = Builder.CreateFSub(c1, c2); break;
+        case rgd::FMul: r = Builder.CreateFMul(c1, c2); break;
+        case rgd::FDiv: r = Builder.CreateFDiv(c1, c2); break;
+        default:        r = Builder.CreateFRem(c1, c2); break;
+      }
+      ret = as_bits(Builder, r, node->bits());
+      break;
+    }
+    case rgd::FNeg: {
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = as_fp(Builder,
+          codegen(Builder, rc, local_map, arg, value_cache), rc->bits());
+      ret = as_bits(Builder, Builder.CreateFNeg(c), node->bits());
+      break;
+    }
+    // FP -> integer casts (result is a plain integer of node->bits()).
+    case rgd::FpToUi:
+    case rgd::FpToSi: {
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = as_fp(Builder,
+          codegen(Builder, rc, local_map, arg, value_cache), rc->bits());
+      llvm::Type* iTy = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
+      ret = (node->kind() == rgd::FpToUi) ? Builder.CreateFPToUI(c, iTy)
+                                          : Builder.CreateFPToSI(c, iTy);
+      break;
+    }
+    // integer -> FP casts (child is a plain integer, result is fp bits).
+    case rgd::UiToFp:
+    case rgd::SiToFp: {
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = codegen(Builder, rc, local_map, arg, value_cache);
+      llvm::Type* fTy = fp_type(Builder, node->bits());
+      llvm::Value* r = (node->kind() == rgd::UiToFp) ? Builder.CreateUIToFP(c, fTy)
+                                                     : Builder.CreateSIToFP(c, fTy);
+      ret = as_bits(Builder, r, node->bits());
+      break;
+    }
+    // FP -> FP width changes.
+    case rgd::FpTrunc: {
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = as_fp(Builder,
+          codegen(Builder, rc, local_map, arg, value_cache), rc->bits());
+      ret = as_bits(Builder,
+          Builder.CreateFPTrunc(c, fp_type(Builder, node->bits())), node->bits());
+      break;
+    }
+    case rgd::FpExt: {
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = as_fp(Builder,
+          codegen(Builder, rc, local_map, arg, value_cache), rc->bits());
+      ret = as_bits(Builder,
+          Builder.CreateFPExt(c, fp_type(Builder, node->bits())), node->bits());
+      break;
+    }
+    // unary FP intrinsics (fabs/sqrt) and transcendentals lowered to libm calls
+    // (exp/exp2/log/log2/log10).  The JIT resolves the libm symbols from the
+    // solver process (see rgdJit.h).
+    case rgd::FpFabs:
+    case rgd::FpSqrt:
     case rgd::FpExp:
     case rgd::FpExp2:
     case rgd::FpLog:
     case rgd::FpLog2:
-    case rgd::FpLog10:
-    case rgd::FpLog1p:
+    case rgd::FpLog10: {
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = as_fp(Builder,
+          codegen(Builder, rc, local_map, arg, value_cache), rc->bits());
+      llvm::Intrinsic::ID id;
+      switch (node->kind()) {
+        case rgd::FpFabs:  id = llvm::Intrinsic::fabs;  break;
+        case rgd::FpSqrt:  id = llvm::Intrinsic::sqrt;  break;
+        case rgd::FpExp:   id = llvm::Intrinsic::exp;   break;
+        case rgd::FpExp2:  id = llvm::Intrinsic::exp2;  break;
+        case rgd::FpLog:   id = llvm::Intrinsic::log;   break;
+        case rgd::FpLog2:  id = llvm::Intrinsic::log2;  break;
+        default:           id = llvm::Intrinsic::log10; break;
+      }
+      ret = as_bits(Builder, Builder.CreateUnaryIntrinsic(id, c), node->bits());
+      break;
+    }
+    // round-to-integral; rounding-mode selector (fp_rounding_mode) in index().
+    case rgd::FpRound: {
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = as_fp(Builder,
+          codegen(Builder, rc, local_map, arg, value_cache), rc->bits());
+      llvm::Intrinsic::ID id;
+      switch (node->index()) {
+        case 0:  id = llvm::Intrinsic::round;     break; // rna: ties away
+        case 1:  id = llvm::Intrinsic::roundeven; break; // rne: ties to even
+        case 2:  id = llvm::Intrinsic::ceil;      break; // rtp: toward +inf
+        case 3:  id = llvm::Intrinsic::floor;     break; // rtn: toward -inf
+        default: id = llvm::Intrinsic::trunc;     break; // rtz: toward zero
+      }
+      ret = as_bits(Builder, Builder.CreateUnaryIntrinsic(id, c), node->bits());
+      break;
+    }
+    // binary FP intrinsics (min/max/copysign) and pow (lowered to a libm call).
+    case rgd::FpMin:
+    case rgd::FpMax:
+    case rgd::FpCopysign:
     case rgd::FpPow: {
-      throw std::invalid_argument("floating-point not supported in jigsaw");
+      const AstNode* rc1 = &node->children(0);
+      const AstNode* rc2 = &node->children(1);
+      llvm::Value* c1 = as_fp(Builder,
+          codegen(Builder, rc1, local_map, arg, value_cache), rc1->bits());
+      llvm::Value* c2 = as_fp(Builder,
+          codegen(Builder, rc2, local_map, arg, value_cache), rc2->bits());
+      llvm::Intrinsic::ID id;
+      switch (node->kind()) {
+        case rgd::FpMin:      id = llvm::Intrinsic::minnum;   break;
+        case rgd::FpMax:      id = llvm::Intrinsic::maxnum;   break;
+        case rgd::FpCopysign: id = llvm::Intrinsic::copysign; break;
+        default:              id = llvm::Intrinsic::pow;      break;
+      }
+      ret = as_bits(Builder, Builder.CreateBinaryIntrinsic(id, c1, c2), node->bits());
+      break;
+    }
+    // lrint: round-to-nearest-integer returning an integer (node->bits()).
+    case rgd::FpLrint: {
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = as_fp(Builder,
+          codegen(Builder, rc, local_map, arg, value_cache), rc->bits());
+      llvm::Type* iTy = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
+      ret = Builder.CreateIntrinsic(llvm::Intrinsic::lrint,
+                                    {iTy, c->getType()}, {c});
+      break;
+    }
+    // log1p has no LLVM intrinsic; call the libm function directly (resolved
+    // from the solver process by the JIT's dynamic-library symbol generator).
+    case rgd::FpLog1p: {
+      const AstNode* rc = &node->children(0);
+      unsigned bits = node->bits();
+      llvm::Value* c = as_fp(Builder,
+          codegen(Builder, rc, local_map, arg, value_cache), rc->bits());
+      llvm::Type* fTy = fp_type(Builder, bits);
+      llvm::Module* M = Builder.GetInsertBlock()->getModule();
+      llvm::FunctionCallee fn = M->getOrInsertFunction(
+          bits == 32 ? "log1pf" : "log1p", fTy, fTy);
+      ret = as_bits(Builder, Builder.CreateCall(fn, {c}), bits);
+      break;
+    }
+    // FP comparisons (top level, like the integer compare case): we don't apply
+    // the predicate here, we just save the two operands so gd.cc get_distance()
+    // can compute the per-predicate distance.  Promote both operands to double
+    // and store their IEEE bits, so get_distance reinterprets arg[0]/arg[1]
+    // uniformly as doubles regardless of the original float/double width.
+    case rgd::FOeq:
+    case rgd::FOgt:
+    case rgd::FOge:
+    case rgd::FOlt:
+    case rgd::FOle:
+    case rgd::FOne:
+    case rgd::FOrd:
+    case rgd::FUno:
+    case rgd::FUeq:
+    case rgd::FUgt:
+    case rgd::FUge:
+    case rgd::FUlt:
+    case rgd::FUle:
+    case rgd::FUne: {
+      const AstNode* rc1 = &node->children(0);
+      const AstNode* rc2 = &node->children(1);
+      llvm::Value* c1 = as_fp(Builder,
+          codegen(Builder, rc1, local_map, arg, value_cache), rc1->bits());
+      llvm::Value* c2 = as_fp(Builder,
+          codegen(Builder, rc2, local_map, arg, value_cache), rc2->bits());
+      if (rc1->bits() == 32) c1 = Builder.CreateFPExt(c1, Builder.getDoubleTy());
+      if (rc2->bits() == 32) c2 = Builder.CreateFPExt(c2, Builder.getDoubleTy());
+      llvm::Value* c1e = Builder.CreateBitCast(c1, Builder.getInt64Ty());
+      llvm::Value* c2e = Builder.CreateBitCast(c2, Builder.getInt64Ty());
+
+      // save the (double-promoted) comparison operands to the output args
+      llvm::Value* idx[1];
+      idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), 0);
+      Builder.CreateStore(c1e,
+                          Builder.CreateGEP(Builder.getInt64Ty(), arg, idx));
+      idx[0] = llvm::ConstantInt::get(Builder.getInt32Ty(), 1);
+      Builder.CreateStore(c2e,
+                          Builder.CreateGEP(Builder.getInt64Ty(), arg, idx));
+
+      ret = nullptr;
+      break;
+    }
+    // The four FP boolean predicates produce a bit, not a measurable magnitude,
+    // so gradient descent has nothing to follow.  Reject them explicitly; the
+    // out-of-process chain falls back to the FP-aware z3 solver for these.
+    case rgd::FpIsNan:
+    case rgd::FpIsInf:
+    case rgd::FpIsFinite:
+    case rgd::FpSignbit: {
+      throw std::invalid_argument("floating-point predicate not supported in jigsaw");
       break;
     }
     default:
@@ -391,6 +605,7 @@ int rgd::addFunction(const AstNode* node,
     uint64_t id) {
 
   if ((!isRelationalKind(node->kind()) &&
+      !isFPRelationalKind(node->kind()) &&
       node->kind() != rgd::Memcmp &&
       node->kind() != rgd::MemcmpN)) {
     std::cerr << "non-relational expr\n";

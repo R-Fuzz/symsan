@@ -1,6 +1,9 @@
 #include <stdint.h>
 #include <assert.h>
 #include <iostream>
+#include <cmath>
+#include <cstring>
+#include <cfloat>
 
 #include "jit.h"
 #include "input.h"
@@ -116,8 +119,54 @@ static uint32_t negate(uint32_t op) {
 }
 
 
+// Distance for an FP comparison.  The jitted function stores the two operands
+// promoted to IEEE-754 double bit-patterns at a/b (see jit.cc FOeq..FUne case).
+// We compute a NON-NEGATIVE double distance d that is exactly 0 iff the
+// predicate holds, then return its IEEE bit-pattern: for d>=0 the bit-pattern
+// is monotonic in d and is 0 iff d==0 -- exactly what gradient descent needs.
+// NOTE: these bit-patterns are ~1e18-scale integers, far larger than typical
+// integer distances, so a mixed FP+integer task can be dominated/saturated by
+// the FP term when summed via sat_inc.  Acceptable: GD stays monotonic within a
+// single FP constraint, which is the common case.
+static uint64_t fp_get_distance(uint32_t comp, uint64_t a, uint64_t b) {
+  double da, db;
+  memcpy(&da, &a, sizeof(da));
+  memcpy(&db, &b, sizeof(db));
+  bool nan = std::isnan(da) || std::isnan(db);
+  double d = 0.0;
+  // smallest positive double, used to keep strict predicates non-zero at the
+  // boundary (a == b) -- mirrors the integer sat_inc(a-b, 1) nudge.
+  const double eps = DBL_TRUE_MIN;
+  switch (comp) {
+    // ordered predicates: false (max distance sense) if either operand is NaN.
+    case rgd::FOeq: d = nan ? (double)INFINITY : std::fabs(da - db); break;
+    case rgd::FOne: d = nan ? (double)INFINITY : (da == db ? 1.0 : 0.0); break;
+    case rgd::FOlt: d = (!nan && da <  db) ? 0.0 : (da - db) + eps; break;
+    case rgd::FOle: d = (!nan && da <= db) ? 0.0 : (da - db) + eps; break;
+    case rgd::FOgt: d = (!nan && da >  db) ? 0.0 : (db - da) + eps; break;
+    case rgd::FOge: d = (!nan && da >= db) ? 0.0 : (db - da) + eps; break;
+    case rgd::FOrd: d = nan ? 1.0 : 0.0; break;
+    // unordered predicates: satisfied whenever either operand is NaN.
+    case rgd::FUno: d = nan ? 0.0 : 1.0; break;
+    case rgd::FUeq: d = nan ? 0.0 : std::fabs(da - db); break;
+    case rgd::FUne: d = nan ? 0.0 : (da == db ? 1.0 : 0.0); break;
+    case rgd::FUlt: d = (nan || da <  db) ? 0.0 : (da - db) + eps; break;
+    case rgd::FUle: d = (nan || da <= db) ? 0.0 : (da - db) + eps; break;
+    case rgd::FUgt: d = (nan || da >  db) ? 0.0 : (db - da) + eps; break;
+    case rgd::FUge: d = (nan || da >= db) ? 0.0 : (db - da) + eps; break;
+    default:
+      fprintf(stderr, "Non-relational FP op!\n");
+  }
+  double m = std::fabs(d);
+  uint64_t u;
+  memcpy(&u, &m, sizeof(u));
+  return u;
+}
+
 static uint64_t get_distance(uint32_t comp, uint64_t a, uint64_t b) {
   uint64_t dis = 0;
+  if (rgd::isFPRelationalKind(comp))
+    return fp_get_distance(comp, a, b);
   switch (comp) {
     case rgd::Equal:
       if (a >= b) dis = a - b;
