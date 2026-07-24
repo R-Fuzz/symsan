@@ -14,7 +14,7 @@ std::vector<GradUnit>& Grad::get_value() {
 
 uint64_t Grad::max_val() {
   uint64_t ret = 0;
-  for (auto gradu : grads) {
+  for (auto &gradu : grads) { // by reference: avoid copying each GradUnit in this hot loop
     //std::cout << "graud value is " << gradu.val <<std::endl;
     if (gradu.val > ret)
       ret = gradu.val;
@@ -32,7 +32,7 @@ void Grad::normalize() {
 }
 
 void Grad::clear() {
-  for (auto gradu : grads) {
+  for (auto &gradu : grads) { // by reference: iterating by value zeroed only copies
     gradu.val = 0;
     gradu.pct = 0.0;
   }
@@ -45,9 +45,11 @@ size_t Grad::len() {
 
 uint64_t Grad::val_sum() {
   uint64_t ret = 0;
-  for (auto gradu : grads) {
+  for (auto &gradu : grads) {
     //FIXME: saturating_add
-    ret += gradu.val;
+    // done: saturate on overflow so descend's guess_step (f0 / val_sum) stays sane
+    uint64_t next = ret + gradu.val;
+    ret = (next < ret) ? (uint64_t)-1 : next;
   }
   return ret;
 }
