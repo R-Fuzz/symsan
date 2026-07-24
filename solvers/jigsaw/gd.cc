@@ -649,6 +649,15 @@ static uint64_t try_new_i2s_fp_value(std::shared_ptr<const Constraint> const& c,
 
 
 static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, std::shared_ptr<SearchTask> task) {
+  // Iterate the input-to-state pass to a (bounded) fixpoint.  A single snap can
+  // turn a previously-satisfied coupled equality unsatisfied -- e.g. snapping X to
+  // a constant to satisfy `X == C` breaks `X == assemble(bytes)` by exactly the same
+  // amount, leaving the global distance unchanged (a lateral move).  The strict
+  // improvement gate alone would revert such a move and deadlock, so we ALSO accept
+  // lateral (equal-f) snaps that shift WHICH constraints are satisfied; a later round
+  // then snaps the now-unsatisfied side (the assembly bytes) to a strict improvement.
+  // Bounded by I2S_MAX_ROUNDS so any lateral cycle terminates.
+  for (int round = 0; round < I2S_MAX_ROUNDS; round++) {
   temp_input = input_min;
   bool updated = false;
   for (int k = 0; k < task->size(); k++) {
@@ -846,15 +855,28 @@ try_reverse:
       }
     }
   }
-  if (updated) {
-    uint64_t f_new = distance(temp_input, task->distances, task);
-    if (f_new < f0) {
-      // std::cout << "i2s succeeded: " << f0 << " -> " << f_new << std::endl;
-      input_min = temp_input;
-      task->min_distances = task->distances;
-      return f_new;
-    }
+  if (!updated) break; // no snap applied this round -> fixpoint
+  uint64_t f_new = distance(temp_input, task->distances, task);
+  if (f_new < f0) {
+    // std::cout << "i2s succeeded: " << f0 << " -> " << f_new << std::endl;
+    input_min = temp_input;
+    task->min_distances = task->distances;
+    f0 = f_new;
+    if (f0 == 0) break; // solved
+    continue;           // strict progress; look for more snaps
   }
+  if (f_new == f0) {
+    // Lateral move: total distance unchanged.  Keep it only if it actually shifted
+    // which constraints are satisfied (min_distances != distances), so that the next
+    // round has a newly-unsatisfied constraint to snap.  Otherwise stop -- committing
+    // a no-op would just spin until the round cap.
+    if (task->min_distances == task->distances) break;
+    input_min = temp_input;
+    task->min_distances = task->distances;
+    continue;
+  }
+  break; // f_new > f0: the snap worsened the global distance, discard it
+  } // end round loop
   return f0;
 }
 
@@ -878,14 +900,22 @@ static uint64_t reload_input(MutInput &input_min, std::shared_ptr<SearchTask> ta
 }
 
 bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
+  // JIGSAW_DEBUG=1 traces which phase produced the solution (i2s vs gradient
+  // descent) and the attempt count -- useful for telling apart constraints that
+  // are actually *searched* from those the i2s heuristic snaps for free.
+  static const bool dbg = (getenv("JIGSAW_DEBUG") != nullptr);
   MutInput input(task->inputs_size());
   MutInput scratch_input(task->inputs_size());
   task->attempts = 0;
 
   uint64_t f0 = reload_input(input, task);
   f0 = try_i2s(input, scratch_input, f0, task);
-  if (task->stopped)
+  if (task->stopped) {
+    if (dbg)
+      fprintf(stderr, "[jigsaw] solved=%d by i2s (initial), attempts=%lu\n",
+              task->solved, (unsigned long)task->attempts);
     return task->solved;
+  }
 
   if (f0 == UINTMAX_MAX)
     return false;
@@ -918,8 +948,12 @@ bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
       //f0 = reload_input(input);
       f0 = repick_start_point(input, task);
       f0 = try_i2s(input, scratch_input, f0, task);
-      if (task->stopped)
+      if (task->stopped) {
+        if (dbg)
+          fprintf(stderr, "[jigsaw] solved=%d by i2s (restart), attempts=%lu\n",
+                  task->solved, (unsigned long)task->attempts);
         break;
+      }
       grad.clear();
       cal_gradient(input, f0, grad, task);
     }
@@ -930,9 +964,15 @@ bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
     //TODO
     grad.normalize();
     f0 = descend(input, scratch_input, f0, grad, task);
+    if (dbg && task->solved)
+      fprintf(stderr, "[jigsaw] solved=1 by gradient descent, epoch=%d attempts=%lu\n",
+              ep_i, (unsigned long)task->attempts);
     ep_i += 1;
     //if (ep_i == 2) break;
   }
 
+  if (dbg && !task->solved)
+    fprintf(stderr, "[jigsaw] gave up (unsolved), epochs=%d attempts=%lu\n",
+            ep_i, (unsigned long)task->attempts);
   return task->solved;
 }
