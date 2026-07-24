@@ -60,6 +60,13 @@ public:
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
   void print_stats(int fd) override;
+  // timing accessors (microseconds), cumulative across solve() calls:
+  //   codegen  = AST -> LLVM IR (addFunction)
+  //   jit      = LLVM IR -> native code (performJit)
+  //   solving  = gradient-descent search (gd_entry)
+  uint64_t get_codegen_time() const { return process_time.load(); }
+  uint64_t get_jit_time() const { return jit_time.load(); }
+  uint64_t get_solving_time() const { return solving_time.load(); }
 private:
   std::atomic_ulong uuid;
   std::atomic_ulong cache_hits;
