@@ -209,8 +209,62 @@ static inline double fp_i2s_target(uint32_t pred, double k, bool sym_is_lhs,
 }
 
 // True for the FP binops that solve_fcmp can invert against a constant.
+// FpPow is included: it is binary (base, exponent) with one constant operand,
+// so it reuses the same fp_binop_eval/invert/const machinery as FAdd..FDiv.
 static inline bool isFPArithKind(uint16_t kind) {
-  return kind >= rgd::FAdd && kind <= rgd::FDiv;
+  return (kind >= rgd::FAdd && kind <= rgd::FDiv) || kind == rgd::FpPow;
+}
+
+// True for the unary FP transcendentals solve_fcmp can invert numerically
+// (exp/exp2/log/log2/log10/log1p).  z3 cannot invert these, but i2s computes
+// the closed-form libm inverse (see fp_trans_invert) and verifies it.
+static inline bool isFPTransKind(uint16_t kind) {
+  return kind >= rgd::FpExp && kind <= rgd::FpLog1p;
+}
+
+// Forward-evaluate a unary FP transcendental at the target precision (float for
+// 4-byte, double for 8-byte), mirroring fp_binop_eval so the structural check
+// matches the runtime-recorded result bit-exactly.
+static inline double fp_trans_eval(double v, uint16_t kind, uint32_t bytes) {
+  if (bytes == 4) {
+    float fv = (float)v, fr;
+    switch (kind) {
+      case rgd::FpExp:   fr = expf(fv); break;
+      case rgd::FpExp2:  fr = exp2f(fv); break;
+      case rgd::FpLog:   fr = logf(fv); break;
+      case rgd::FpLog2:  fr = log2f(fv); break;
+      case rgd::FpLog10: fr = log10f(fv); break;
+      case rgd::FpLog1p: fr = log1pf(fv); break;
+      default: fr = fv;
+    }
+    return (double)fr;
+  } else {
+    switch (kind) {
+      case rgd::FpExp:   return exp(v);
+      case rgd::FpExp2:  return exp2(v);
+      case rgd::FpLog:   return log(v);
+      case rgd::FpLog2:  return log2(v);
+      case rgd::FpLog10: return log10(v);
+      case rgd::FpLog1p: return log1p(v);
+      default: return v;
+    }
+  }
+}
+
+// Invert a unary FP transcendental: return the input value x such that
+// f(x) == s.  A heuristic guess (FP rounding is not exactly invertible), always
+// re-verified by the caller.  exp<->log, exp2<->log2, log10->pow(10,.),
+// log1p->expm1.
+static inline double fp_trans_invert(double s, uint16_t kind) {
+  switch (kind) {
+    case rgd::FpExp:   return log(s);
+    case rgd::FpExp2:  return log2(s);
+    case rgd::FpLog:   return exp(s);
+    case rgd::FpLog2:  return exp2(s);
+    case rgd::FpLog10: return pow(10.0, s);
+    case rgd::FpLog1p: return expm1(s);
+    default: return s;
+  }
 }
 
 // Forward-evaluate an FP binop in the target precision (float for 4-byte, double
@@ -226,6 +280,9 @@ static inline double fp_binop_eval(double v, double cst, uint16_t kind,
       case rgd::FSub: fr = const_is_rhs ? fv - fc : fc - fv; break;
       case rgd::FMul: fr = fv * fc; break;                       // commutative
       case rgd::FDiv: fr = const_is_rhs ? fv / fc : fc / fv; break;
+      // pow(base, exp): const_is_rhs -> exponent is constant (v^c), else base
+      // is constant (c^v).
+      case rgd::FpPow: fr = const_is_rhs ? powf(fv, fc) : powf(fc, fv); break;
       default: fr = fv;
     }
     return (double)fr;
@@ -235,6 +292,7 @@ static inline double fp_binop_eval(double v, double cst, uint16_t kind,
       case rgd::FSub: return const_is_rhs ? v - cst : cst - v;
       case rgd::FMul: return v * cst;                            // commutative
       case rgd::FDiv: return const_is_rhs ? v / cst : cst / v;
+      case rgd::FpPow: return const_is_rhs ? pow(v, cst) : pow(cst, v);
       default: return v;
     }
   }
@@ -250,6 +308,8 @@ static inline double fp_binop_invert(double s, double cst, uint16_t kind,
     case rgd::FSub: return const_is_rhs ? s + cst : cst - s;    // v op cst / cst op v
     case rgd::FMul: return s / cst;                             // v = s / cst
     case rgd::FDiv: return const_is_rhs ? s * cst : cst / s;    // v op cst / cst op v
+    // pow: exponent const -> v = s^(1/cst); base const -> v = log(s)/log(cst)
+    case rgd::FpPow: return const_is_rhs ? pow(s, 1.0 / cst) : log(s) / log(cst);
     default: return s;
   }
 }
@@ -393,16 +453,23 @@ I2SSolver::I2SSolver(): matches(0), mismatches(0) {
 
   // FP ops that input-to-state cannot invert: FRem, FNeg, and all FP casts and
   // intrinsics/libcalls, i.e. [FRem, FpLrint] -- everything from FRem up to (but
-  // not including) the first FP comparison kind (FOeq).  The FP relational kinds
-  // are left out so a direct FCmp (input -> compare against a constant) is not
-  // rejected; the invertible FP binops (FAdd/FSub/FMul/FDiv) are also left out
-  // so an "x op C <cmp> K" constraint reaches solve_fcmp, which inverts it.
-  for (uint16_t k = rgd::FRem; k < rgd::FOeq; ++k)
+  // not including) the first invertible transcendental kind (FpExp).  The FP
+  // relational kinds are left out so a direct FCmp (input -> compare against a
+  // constant) is not rejected; the invertible FP binops (FAdd/FSub/FMul/FDiv),
+  // the transcendentals (FpExp..FpLog1p) and FpPow are also left out so an
+  // "f(x) <cmp> K" / "x op C <cmp> K" constraint reaches solve_fcmp.
+  for (uint16_t k = rgd::FRem; k < rgd::FpExp; ++k)
     fp_ops_mask.set(k);
 
-  // Invertible FP binops handled by solve_fcmp's arith fallback: [FAdd, FRem).
+  // Invertible FP binops handled by solve_fcmp's arith fallback: [FAdd, FRem)
+  // plus FpPow (binary, one constant operand).
   for (uint16_t k = rgd::FAdd; k < rgd::FRem; ++k)
     fp_arith_mask.set(k);
+  fp_arith_mask.set(rgd::FpPow);
+
+  // Invertible unary FP transcendentals handled by solve_fcmp: [FpExp, FpPow).
+  for (uint16_t k = rgd::FpExp; k < rgd::FpPow; ++k)
+    fp_trans_mask.set(k);
 }
 
 solver_result_t
@@ -426,19 +493,42 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
   bool arith_is_lhs = false;
   if (isFPArithKind(lc.kind())) { arith = &lc; arith_is_lhs = true; }
   else if (isFPArithKind(rc.kind())) { arith = &rc; arith_is_lhs = false; }
+  const AstNode *trans = nullptr;
+  bool trans_is_lhs = false;
+  if (isFPTransKind(lc.kind())) { trans = &lc; trans_is_lhs = true; }
+  else if (isFPTransKind(rc.kind())) { trans = &rc; trans_is_lhs = false; }
 
   uint16_t arith_kind = 0;
+  uint16_t trans_kind = 0;
   uint64_t cst_bits = 0;
   bool const_is_rhs = false;
-  if ((fp_arith_mask & c->ops).any()) {
+  // combined set of invertible FP ops (arith incl pow, and transcendentals):
+  // i2s can only handle a SINGLE such op that is a direct child of the compare.
+  std::bitset<rgd::LastOp> invertible = (fp_arith_mask | fp_trans_mask) & c->ops;
+  DEBUGF("i2s fcmp: lc.kind=%u rc.kind=%u arith=%p(lhs=%d) trans=%p invertible.count=%zu "
+         "trans_any=%d arith_any=%d ncand=%zu\n",
+         lc.kind(), rc.kind(), (void*)arith, arith_is_lhs, (void*)trans,
+         invertible.count(), (int)(fp_trans_mask & c->ops).any(),
+         (int)(fp_arith_mask & c->ops).any(), cm->i2s_candidates.size());
+  if ((fp_trans_mask & c->ops).any()) {
+    // f(x) <cmp> K for a unary transcendental f; invert via the libm inverse.
+    if (trans == nullptr || invertible.count() != 1) {
+      return SOLVER_TIMEOUT;
+    }
+    trans_kind = trans->kind();
+  } else if ((fp_arith_mask & c->ops).any()) {
     // FP arithmetic is involved; i2s can only invert a SINGLE arith op that is a
     // direct child of the comparison and has a constant operand.  Anything else
     // (nested/multiple arith, or two symbolic operands) is left for z3.
-    if (arith == nullptr || (fp_arith_mask & c->ops).count() != 1 ||
+    if (arith == nullptr || invertible.count() != 1 ||
         !fp_binop_const(c, *arith, cst_bits, const_is_rhs)) {
+      DEBUGF("i2s fcmp: arith branch reject arith=%p count=%zu\n",
+             (void*)arith, invertible.count());
       return SOLVER_TIMEOUT;
     }
     arith_kind = arith->kind();
+    DEBUGF("i2s fcmp: arith accepted kind=%u cst_bits=0x%lx const_is_rhs=%d\n",
+           arith_kind, cst_bits, const_is_rhs);
   }
 
   for (auto const& candidate : cm->i2s_candidates) {
@@ -458,7 +548,26 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
     // and left for z3.
     bool sym_is_lhs;
     uint64_t r = 0;
-    if (arith != nullptr) {
+    if (trans != nullptr) {
+      // f(x) <cmp> K -- invert the transcendental to recover x (e.g. exp -> log).
+      sym_is_lhs = trans_is_lhs;
+      double x_in = fp_decode(value, bytes);
+      // structural check: confirm these input bytes really produce the recorded
+      // transcendental-side operand value (guards against a coincidental match).
+      uint64_t fwd_bits = fp_encode(fp_trans_eval(x_in, trans_kind, bytes), bytes) & mask;
+      uint64_t trans_side = (sym_is_lhs ? c->op1 : c->op2) & mask;
+      if (fwd_bits != trans_side) continue;
+      // pick a target for the function *result*, then invert to recover the input.
+      double k = fp_decode((sym_is_lhs ? c->op2 : c->op1) & mask, bytes);
+      double s = fp_i2s_target(predicate, k, sym_is_lhs, bytes);
+      double x_new = fp_trans_invert(s, trans_kind);
+      r = fp_encode(x_new, bytes) & mask;
+      // verify end-to-end: re-apply the transcendental to the value we would write.
+      double res = fp_trans_eval(fp_decode(r, bytes), trans_kind, bytes);
+      double a = sym_is_lhs ? res : k;
+      double b = sym_is_lhs ? k : res;
+      if (!i2s_eval_fcmp(predicate, a, b)) continue;
+    } else if (arith != nullptr) {
       // (x op C) <cmp> K -- invert the arith op to recover x, mirroring the
       // integer binop path in solve_icmp.
       sym_is_lhs = arith_is_lhs;
@@ -469,6 +578,8 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
       uint64_t fwd_bits =
           fp_encode(fp_binop_eval(x_in, cst, arith_kind, const_is_rhs, bytes), bytes) & mask;
       uint64_t arith_side = (sym_is_lhs ? c->op1 : c->op2) & mask;
+      DEBUGF("i2s fcmp arith cand off=%zu bytes=%u x_in=%g cst=%g fwd=0x%lx arith_side=0x%lx\n",
+             offset, bytes, x_in, cst, fwd_bits, arith_side);
       if (fwd_bits != arith_side) continue;
       // pick a target for the arith *result*, then invert to recover the input.
       double k = fp_decode((sym_is_lhs ? c->op2 : c->op1) & mask, bytes);

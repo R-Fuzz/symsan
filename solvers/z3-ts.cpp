@@ -917,6 +917,18 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       RECORD_VALUE(fp_encode(rv, bits));
       continue;
     }
+    // floating-point transcendentals (exp/exp2/log/log2/log10/log1p/pow).  z3's
+    // fpa theory has no operation to invert them, so reject explicitly.  In the
+    // out-of-process RGD chain the i2s solver (tried first) flips these guards
+    // numerically; the in-process path here simply cannot solve them.
+    else if (info->op == __dfsan::fp_exp || info->op == __dfsan::fp_exp2 ||
+             info->op == __dfsan::fp_log || info->op == __dfsan::fp_log2 ||
+             info->op == __dfsan::fp_log10 || info->op == __dfsan::fp_log1p ||
+             info->op == __dfsan::fp_pow) {
+      fprintf(stderr, "WARNING: unsupported FP transcendental op %u "
+              "(i2s-only) for label %u\n", info->op & 0xff, l);
+      throw z3::exception("unsupported FP transcendental (i2s-only)");
+    }
     // symsan-defined
     else if (info->op == __dfsan::Extract) {
       z3::expr base = get_cached_expr(info->l1, input_deps);

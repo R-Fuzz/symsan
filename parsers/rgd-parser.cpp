@@ -98,6 +98,14 @@ static const std::unordered_map<unsigned, std::pair<unsigned, const char*> > OP_
   {__dfsan::fp_is_finite, {rgd::FpIsFinite, "isfinite"}},
   {__dfsan::fp_signbit,   {rgd::FpSignbit, "signbit"}},
   {__dfsan::fp_lrint,     {rgd::FpLrint, "lrint"}},
+  // floating-point transcendentals (i2s-only: z3/jigsaw reject them)
+  {__dfsan::fp_exp,       {rgd::FpExp, "exp"}},
+  {__dfsan::fp_exp2,      {rgd::FpExp2, "exp2"}},
+  {__dfsan::fp_log,       {rgd::FpLog, "log"}},
+  {__dfsan::fp_log2,      {rgd::FpLog2, "log2"}},
+  {__dfsan::fp_log10,     {rgd::FpLog10, "log10"}},
+  {__dfsan::fp_log1p,     {rgd::FpLog1p, "log1p"}},
+  {__dfsan::fp_pow,       {rgd::FpPow, "pow"}},
   // floating-point comparisons (predicate encoded in the high byte, same as ICmp)
 #define RELATIONAL_FCMP(cmp) (__dfsan::FCmp | (cmp << 8))
   {RELATIONAL_FCMP(1),  {rgd::FOeq, "foeq"}},
@@ -524,9 +532,11 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   }
 
   // unary ops.  FP casts (FPToUI/FPToSI/UIToFP/SIToFP/FPTrunc/FPExt), FP
-  // unary intrinsics (fneg/fabs/sqrt/round) and the FP predicate/rounding
-  // libcalls (isnan/isinf/finite/signbit/lrint) all take a single operand in
-  // l1, so they short-circuit here before a (nonexistent) right child is built.
+  // unary intrinsics (fneg/fabs/sqrt/round), the FP predicate/rounding
+  // libcalls (isnan/isinf/finite/signbit/lrint) and the unary transcendentals
+  // (exp/exp2/log/log2/log10/log1p) all take a single operand in l1, so they
+  // short-circuit here before a (nonexistent) right child is built.  (pow is
+  // binary and goes through the normal binary path below.)
   bool is_fp_unary =
       info->op == __dfsan::FPToUI || info->op == __dfsan::FPToSI ||
       info->op == __dfsan::UIToFP || info->op == __dfsan::SIToFP ||
@@ -535,7 +545,10 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       info->op == __dfsan::fp_sqrt || info->op == __dfsan::fp_round ||
       info->op == __dfsan::fp_is_nan || info->op == __dfsan::fp_is_inf ||
       info->op == __dfsan::fp_is_finite || info->op == __dfsan::fp_signbit ||
-      info->op == __dfsan::fp_lrint;
+      info->op == __dfsan::fp_lrint ||
+      info->op == __dfsan::fp_exp || info->op == __dfsan::fp_exp2 ||
+      info->op == __dfsan::fp_log || info->op == __dfsan::fp_log2 ||
+      info->op == __dfsan::fp_log10 || info->op == __dfsan::fp_log1p;
   if (info->op == __dfsan::ZExt || info->op == __dfsan::SExt ||
       info->op == __dfsan::Extract || info->op == __dfsan::Trunc ||
       is_fp_unary) {

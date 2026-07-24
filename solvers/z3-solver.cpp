@@ -448,6 +448,18 @@ z3::expr Z3Solver::serialize(const AstNode* node,
       }
       return cache_expr(node->label(), r, expr_cache);
     }
+    // FP transcendentals (exp/exp2/log/log2/log10/log1p/pow) are i2s-only: z3's
+    // fpa theory has no operation to invert them, so reject explicitly and let
+    // the chain fall back (the i2s solver, tried first, handles these).
+    case rgd::FpExp:
+    case rgd::FpExp2:
+    case rgd::FpLog:
+    case rgd::FpLog2:
+    case rgd::FpLog10:
+    case rgd::FpLog1p:
+    case rgd::FpPow:
+      throw z3::exception("unsupported FP transcendental (i2s-only)");
+      break;
     default:
       WARNF("unhandler expr: ");
       throw z3::exception("unsupported operator");

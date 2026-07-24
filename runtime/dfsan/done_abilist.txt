@@ -1,7 +1,7 @@
 ##########
 # added by user
 #########
-fun:log10=functional
+fun:log10=custom
 fun:__ctype_toupper_loc=discard
 fun:isatty=discard
 fun:longjmp=discard
@@ -102,8 +102,12 @@ fun:isspace=functional
 # wrapper instead records the actual operation so the z3 solver can flip branches
 # like `if (isnan(x))` or `if (lrint(x) == 42)`.  The long double (`*l`) variants
 # stay `functional`: our FP lifting only supports IEEE 16/32/64-bit sorts, not
-# x86_fp80.  Transcendentals (exp/log/pow/...) also stay `functional` for now:
-# z3's FP theory has no operation to invert them.
+# x86_fp80.  Monotonic transcendentals (exp/exp2/log/log2/log10/log1p and pow
+# with a constant operand) are now `custom` too: z3 still cannot invert them and
+# jigsaw is integer-only, but the i2s solver flips such guards by computing the
+# numeric libm inverse (e.g. log for exp) and verifying it.  Non-monotonic /
+# multi-output libcalls (fmod, frexp, modf, nextafter/nexttoward) stay
+# `functional` -- i2s cannot invert them either.
 fun:__isinf=custom
 fun:__isinff=custom
 fun:__signbit=custom
@@ -111,9 +115,9 @@ fun:__signbitf=custom
 fun:__signbitl=functional
 fun:abs=functional
 fun:btowc=functional
-fun:exp=functional
-fun:exp2=functional
-fun:expf=functional
+fun:exp=custom
+fun:exp2=custom
+fun:expf=custom
 fun:expl=functional
 fun:fabs=custom
 fun:finite=custom
@@ -136,12 +140,12 @@ fun:lrintl=functional
 fun:llrint=custom
 fun:llrintf=custom
 fun:llrintl=functional
-fun:log=functional
-fun:log1p=functional
-fun:log1pf=functional
+fun:log=custom
+fun:log1p=custom
+fun:log1pf=custom
 fun:log1pl=functional
-fun:log2=functional
-fun:log2f=functional
+fun:log2=custom
+fun:log2f=custom
 fun:log2l=functional
 fun:modf=functional
 fun:nextafter=functional
@@ -150,8 +154,8 @@ fun:nextafterl=functional
 fun:nexttoward=functional
 fun:nexttowardf=functional
 fun:nexttowardl=functional
-fun:pow=functional
-fun:powf=functional
+fun:pow=custom
+fun:powf=custom
 fun:powl=functional
 fun:round=custom
 fun:sqrt=custom

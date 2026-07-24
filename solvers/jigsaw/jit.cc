@@ -357,6 +357,21 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
 #endif
       break;
     }
+    // floating-point transcendentals (exp/exp2/log/log2/log10/log1p/pow).
+    // jigsaw is integer-only and has no FP support yet, so reject them
+    // explicitly (FP support is a future task).  The out-of-process chain tries
+    // i2s first, which flips these guards numerically; rejecting here makes
+    // addFunction fail so jit-solver falls through cleanly.
+    case rgd::FpExp:
+    case rgd::FpExp2:
+    case rgd::FpLog:
+    case rgd::FpLog2:
+    case rgd::FpLog10:
+    case rgd::FpLog1p:
+    case rgd::FpPow: {
+      throw std::invalid_argument("floating-point not supported in jigsaw");
+      break;
+    }
     default:
       throw std::invalid_argument("unhandled expression");
       //printExpression(node);

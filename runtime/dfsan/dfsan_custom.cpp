@@ -1094,6 +1094,17 @@ DFSW_FP_UNARY(round, round, __dfsan::fp_round, __dfsan::fp_rm_rna)
 DFSW_FP_UNARY(rint, rint, __dfsan::fp_round, __dfsan::fp_rm_rne)
 DFSW_FP_UNARY(nearbyint, nearbyint, __dfsan::fp_round, __dfsan::fp_rm_rne)
 
+// Transcendentals.  Marked =custom (not =functional) so the operand's taint is
+// preserved: z3 cannot invert these but the i2s solver flips the guard by
+// computing the numeric libm inverse and verifying it.  (log10/exp2 have no
+// float variant in the abilist; the generated __dfsw_*f wrappers are unused.)
+DFSW_FP_UNARY(exp, exp, __dfsan::fp_exp, 0)
+DFSW_FP_UNARY(exp2, exp2, __dfsan::fp_exp2, 0)
+DFSW_FP_UNARY(log, log, __dfsan::fp_log, 0)
+DFSW_FP_UNARY(log2, log2, __dfsan::fp_log2, 0)
+DFSW_FP_UNARY(log10, log10, __dfsan::fp_log10, 0)
+DFSW_FP_UNARY(log1p, log1p, __dfsan::fp_log1p, 0)
+
 #undef DFSW_FP_UNARY
 
 // Binary intrinsic-style math functions (double/float).  The IEEE bits of both
@@ -1119,6 +1130,9 @@ DFSW_FP_UNARY(nearbyint, nearbyint, __dfsan::fp_round, __dfsan::fp_rm_rne)
 DFSW_FP_BINARY(fmin, fmin, __dfsan::fp_min)
 DFSW_FP_BINARY(fmax, fmax, __dfsan::fp_max)
 DFSW_FP_BINARY(copysign, copysign, __dfsan::fp_copysign)
+// pow(base, exp): i2s inverts against whichever operand is a constant (the
+// concrete, label-0 operand); its IEEE bits arrive via op1/op2 above.
+DFSW_FP_BINARY(pow, pow, __dfsan::fp_pow)
 
 #undef DFSW_FP_BINARY
 

@@ -227,7 +227,18 @@ enum operators {
   fp_is_finite = last_llvm_op + 31, // 98 finite/finitef
   fp_signbit   = last_llvm_op + 32, // 99 __signbit/__signbitf
   fp_lrint     = last_llvm_op + 33, // 100 lrint/lrintf/llrint/llrintf
-  LastOp    = last_llvm_op + 34, // 101
+  // FP transcendentals modeled as custom wrappers (see done_abilist.txt /
+  // dfsan_custom.cpp).  z3 cannot invert them and jigsaw is integer-only, so
+  // only the i2s solver flips these guards (it computes the numeric libm
+  // inverse and verifies).  fp_pow is binary (base, exponent).
+  fp_exp       = last_llvm_op + 34, // 101 exp/expf
+  fp_exp2      = last_llvm_op + 35, // 102 exp2
+  fp_log       = last_llvm_op + 36, // 103 log/logf
+  fp_log2      = last_llvm_op + 37, // 104 log2/log2f
+  fp_log10     = last_llvm_op + 38, // 105 log10
+  fp_log1p     = last_llvm_op + 39, // 106 log1p/log1pf
+  fp_pow       = last_llvm_op + 40, // 107 pow/powf
+  LastOp    = last_llvm_op + 41, // 108
 };
 
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP

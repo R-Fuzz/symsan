@@ -87,11 +87,15 @@ private:
   // is rejected and falls back to z3.  A "direct" FCmp (input bytes -> FCmp
   // against a constant) sets no bit here and is handled by solve_fcmp.
   std::bitset<rgd::LastOp> fp_ops_mask;
-  // bits for the invertible FP binops (FAdd/FSub/FMul/FDiv) that solve_fcmp can
-  // reverse against a constant operand (x + C <cmp> K -> write K-C into input).
-  // These are deliberately NOT in fp_ops_mask so such a constraint reaches
-  // solve_fcmp instead of being rejected.
+  // bits for the invertible FP binops (FAdd/FSub/FMul/FDiv, plus FpPow) that
+  // solve_fcmp can reverse against a constant operand (x + C <cmp> K -> write
+  // K-C into input).  These are deliberately NOT in fp_ops_mask so such a
+  // constraint reaches solve_fcmp instead of being rejected.
   std::bitset<rgd::LastOp> fp_arith_mask;
+  // bits for the invertible unary FP transcendentals (exp/exp2/log/log2/log10/
+  // log1p) that solve_fcmp reverses via the numeric libm inverse (log for exp,
+  // ...) and verifies.  Also kept out of fp_ops_mask so they reach solve_fcmp.
+  std::bitset<rgd::LastOp> fp_trans_mask;
 
   solver_result_t solve_icmp(std::shared_ptr<const Constraint> const& c,
                              std::unique_ptr<ConsMeta> const& cm,

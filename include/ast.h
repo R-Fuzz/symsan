@@ -89,23 +89,36 @@ namespace rgd {
     FpSignbit, // 60
     FpLrint, // 61
 
+    // FP transcendentals (exp/log/pow family).  z3's fpa theory has no way to
+    // invert these and jigsaw is integer-only, so those solvers reject them
+    // (see below); the i2s solver instead computes the numeric libm inverse
+    // (e.g. log for exp) and VERIFIES it, so it can flip these guards.  Kept
+    // inside the [FAdd, FUne] range so isFloatingPointKind() covers them.
+    FpExp, // 62
+    FpExp2, // 63
+    FpLog, // 64
+    FpLog2, // 65
+    FpLog10, // 66
+    FpLog1p, // 67
+    FpPow, // 68   binary: base and exponent (one is a constant for i2s)
+
     // FP comparisons (LLVM FCmp predicates 1..14; FALSE/TRUE are constants).
     // Kept OUTSIDE the isRelationalKind() range on purpose so that the
     // integer-only jigsaw/i2s solvers cleanly reject FP tasks (fall back to z3).
-    FOeq, // 62
-    FOgt, // 63
-    FOge, // 64
-    FOlt, // 65
-    FOle, // 66
-    FOne, // 67
-    FOrd, // 68
-    FUno, // 69
-    FUeq, // 70
-    FUgt, // 71
-    FUge, // 72
-    FUlt, // 73
-    FUle, // 74
-    FUne, // 75
+    FOeq, // 69
+    FOgt, // 70
+    FOge, // 71
+    FOlt, // 72
+    FOle, // 73
+    FOne, // 74
+    FOrd, // 75
+    FUno, // 76
+    FUeq, // 77
+    FUgt, // 78
+    FUge, // 79
+    FUlt, // 80
+    FUle, // 81
+    FUne, // 82
 
     // Last
     LastOp
@@ -174,6 +187,13 @@ namespace rgd {
     "FpIsFinite",
     "FpSignbit",
     "FpLrint",
+    "FpExp",
+    "FpExp2",
+    "FpLog",
+    "FpLog2",
+    "FpLog10",
+    "FpLog1p",
+    "FpPow",
     "FOeq",
     "FOgt",
     "FOge",
