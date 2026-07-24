@@ -208,6 +208,70 @@ static inline double fp_i2s_target(uint32_t pred, double k, bool sym_is_lhs,
   }
 }
 
+// True for the FP binops that solve_fcmp can invert against a constant.
+static inline bool isFPArithKind(uint16_t kind) {
+  return kind >= rgd::FAdd && kind <= rgd::FDiv;
+}
+
+// Forward-evaluate an FP binop in the target precision (float for 4-byte, double
+// for 8-byte).  const_is_rhs selects operand order for the non-commutative ops:
+// true  -> (v op cst), false -> (cst op v).  Computing in the target precision
+// lets the structural check below match the runtime-recorded result bit-exactly.
+static inline double fp_binop_eval(double v, double cst, uint16_t kind,
+                                   bool const_is_rhs, uint32_t bytes) {
+  if (bytes == 4) {
+    float fv = (float)v, fc = (float)cst, fr;
+    switch (kind) {
+      case rgd::FAdd: fr = fv + fc; break;                       // commutative
+      case rgd::FSub: fr = const_is_rhs ? fv - fc : fc - fv; break;
+      case rgd::FMul: fr = fv * fc; break;                       // commutative
+      case rgd::FDiv: fr = const_is_rhs ? fv / fc : fc / fv; break;
+      default: fr = fv;
+    }
+    return (double)fr;
+  } else {
+    switch (kind) {
+      case rgd::FAdd: return v + cst;                            // commutative
+      case rgd::FSub: return const_is_rhs ? v - cst : cst - v;
+      case rgd::FMul: return v * cst;                            // commutative
+      case rgd::FDiv: return const_is_rhs ? v / cst : cst / v;
+      default: return v;
+    }
+  }
+}
+
+// Invert an FP binop: return the operand value that makes the binop produce s.
+// The result is a heuristic guess (FP rounding is not exactly invertible) and is
+// always re-verified by the caller.
+static inline double fp_binop_invert(double s, double cst, uint16_t kind,
+                                     bool const_is_rhs) {
+  switch (kind) {
+    case rgd::FAdd: return s - cst;                             // v = s - cst
+    case rgd::FSub: return const_is_rhs ? s + cst : cst - s;    // v op cst / cst op v
+    case rgd::FMul: return s / cst;                             // v = s / cst
+    case rgd::FDiv: return const_is_rhs ? s * cst : cst / s;    // v op cst / cst op v
+    default: return s;
+  }
+}
+
+// Find the Constant child of an FP binop node and return its IEEE bits plus
+// which side it is on.  Mirrors get_binop_value's constant lookup.
+static inline bool fp_binop_const(std::shared_ptr<const Constraint> constraint,
+    const AstNode &node, uint64_t &cst_bits, bool &const_is_rhs) {
+  auto &left = node.children(0);
+  auto &right = node.children(1);
+  if (left.kind() == Constant) {
+    cst_bits = constraint->input_args[left.index()].second;
+    const_is_rhs = false;
+    return true;
+  } else if (right.kind() == Constant) {
+    cst_bits = constraint->input_args[right.index()].second;
+    const_is_rhs = true;
+    return true;
+  }
+  return false;
+}
+
 static inline uint64_t _get_binop_value(uint64_t v1, uint64_t v2, uint16_t kind) {
   switch (kind) {
     case rgd::Add: return v1 + v2;
@@ -327,13 +391,18 @@ I2SSolver::I2SSolver(): matches(0), mismatches(0) {
   binop_mask.set(rgd::LShr);
   binop_mask.set(rgd::AShr);
 
-  // FP ops that input-to-state cannot invert: all FP arithmetic, casts, and
-  // intrinsics/libcalls, i.e. [FAdd, FpLrint] -- everything below the first FP
-  // comparison kind (FOeq).  The FP relational kinds are deliberately left out
-  // so a direct FCmp (input -> compare against a constant) is not rejected and
-  // can be handled by solve_fcmp.
-  for (uint16_t k = rgd::FAdd; k < rgd::FOeq; ++k)
+  // FP ops that input-to-state cannot invert: FRem, FNeg, and all FP casts and
+  // intrinsics/libcalls, i.e. [FRem, FpLrint] -- everything from FRem up to (but
+  // not including) the first FP comparison kind (FOeq).  The FP relational kinds
+  // are left out so a direct FCmp (input -> compare against a constant) is not
+  // rejected; the invertible FP binops (FAdd/FSub/FMul/FDiv) are also left out
+  // so an "x op C <cmp> K" constraint reaches solve_fcmp, which inverts it.
+  for (uint16_t k = rgd::FRem; k < rgd::FOeq; ++k)
     fp_ops_mask.set(k);
+
+  // Invertible FP binops handled by solve_fcmp's arith fallback: [FAdd, FRem).
+  for (uint16_t k = rgd::FAdd; k < rgd::FRem; ++k)
+    fp_arith_mask.set(k);
 }
 
 solver_result_t
@@ -344,6 +413,34 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
                       uint8_t *out_buf, size_t &out_size) {
 
   uint32_t predicate = fcmp_predicate(comparison);
+
+  // Classify the comparison by AST structure (not by value matching): is one
+  // operand produced by a single invertible FP arith op against a constant, or
+  // is it a direct compare of an input operand?  Deciding by structure avoids a
+  // false "direct" match when an arith result happens to equal the raw input
+  // bytes (e.g. 0.0 * C == 0.0 on an all-zero seed).
+  auto const& root = *c->get_root();
+  auto const& lc = root.children(0);
+  auto const& rc = root.children(1);
+  const AstNode *arith = nullptr;
+  bool arith_is_lhs = false;
+  if (isFPArithKind(lc.kind())) { arith = &lc; arith_is_lhs = true; }
+  else if (isFPArithKind(rc.kind())) { arith = &rc; arith_is_lhs = false; }
+
+  uint16_t arith_kind = 0;
+  uint64_t cst_bits = 0;
+  bool const_is_rhs = false;
+  if ((fp_arith_mask & c->ops).any()) {
+    // FP arithmetic is involved; i2s can only invert a SINGLE arith op that is a
+    // direct child of the comparison and has a constant operand.  Anything else
+    // (nested/multiple arith, or two symbolic operands) is left for z3.
+    if (arith == nullptr || (fp_arith_mask & c->ops).count() != 1 ||
+        !fp_binop_const(c, *arith, cst_bits, const_is_rhs)) {
+      return SOLVER_TIMEOUT;
+    }
+    arith_kind = arith->kind();
+  }
+
   for (auto const& candidate : cm->i2s_candidates) {
     size_t offset = candidate.first;
     uint32_t bytes = candidate.second;
@@ -355,33 +452,57 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
     uint64_t value = 0;
     memcpy(&value, &in_buf[offset], bytes);
     value &= mask;
-    // identify which operand the input bytes correspond to (the other one is
-    // the concrete constant we compare against)
+    // Every guess below is verified with i2s_eval_fcmp before we claim SAT, so a
+    // heuristic guess that does not satisfy the relation (e.g. OGT against the
+    // max representable value, or an FP inversion broken by rounding) is skipped
+    // and left for z3.
     bool sym_is_lhs;
-    uint64_t const_bits;
-    if ((c->op1 & mask) == value) {
-      sym_is_lhs = true;
-      const_bits = c->op2 & mask;
-    } else if ((c->op2 & mask) == value) {
-      sym_is_lhs = false;
-      const_bits = c->op1 & mask;
+    uint64_t r = 0;
+    if (arith != nullptr) {
+      // (x op C) <cmp> K -- invert the arith op to recover x, mirroring the
+      // integer binop path in solve_icmp.
+      sym_is_lhs = arith_is_lhs;
+      double x_in = fp_decode(value, bytes);
+      double cst = fp_decode(cst_bits & mask, bytes);
+      // structural check: confirm these input bytes really produce the recorded
+      // arith-side operand value (guards against a coincidental offset match).
+      uint64_t fwd_bits =
+          fp_encode(fp_binop_eval(x_in, cst, arith_kind, const_is_rhs, bytes), bytes) & mask;
+      uint64_t arith_side = (sym_is_lhs ? c->op1 : c->op2) & mask;
+      if (fwd_bits != arith_side) continue;
+      // pick a target for the arith *result*, then invert to recover the input.
+      double k = fp_decode((sym_is_lhs ? c->op2 : c->op1) & mask, bytes);
+      double s = fp_i2s_target(predicate, k, sym_is_lhs, bytes);
+      double x_new = fp_binop_invert(s, cst, arith_kind, const_is_rhs);
+      r = fp_encode(x_new, bytes) & mask;
+      // verify end-to-end: re-apply the arith op to the value we would write.
+      double res = fp_binop_eval(fp_decode(r, bytes), cst, arith_kind, const_is_rhs, bytes);
+      double a = sym_is_lhs ? res : k;
+      double b = sym_is_lhs ? k : res;
+      if (!i2s_eval_fcmp(predicate, a, b)) continue;
     } else {
-      continue; // input does not feed this comparison directly
+      // direct FCmp: the input bytes are one of the comparison operands, and the
+      // other is the concrete constant we compare against.
+      uint64_t const_bits;
+      if ((c->op1 & mask) == value) {
+        sym_is_lhs = true;
+        const_bits = c->op2 & mask;
+      } else if ((c->op2 & mask) == value) {
+        sym_is_lhs = false;
+        const_bits = c->op1 & mask;
+      } else {
+        continue; // input does not feed this comparison directly
+      }
+      double k = fp_decode(const_bits, bytes);
+      double s = fp_i2s_target(predicate, k, sym_is_lhs, bytes);
+      r = fp_encode(s, bytes) & mask;
+      double sv = fp_decode(r, bytes); // re-decode: verify the exact stored value
+      double a = sym_is_lhs ? sv : k;
+      double b = sym_is_lhs ? k : sv;
+      if (!i2s_eval_fcmp(predicate, a, b)) continue;
     }
-    double k = fp_decode(const_bits, bytes);
-    double s = fp_i2s_target(predicate, k, sym_is_lhs, bytes);
-    uint64_t r = fp_encode(s, bytes);
-    // re-decode so verification uses the exact stored value
-    double sv = fp_decode(r, bytes);
-    double a = sym_is_lhs ? sv : k;
-    double b = sym_is_lhs ? k : sv;
-    DEBUGF("i2s: fcmp pred %u @ %lu (%u bytes) sym_lhs=%d k=%g -> %g\n",
-           predicate, offset, bytes, sym_is_lhs, k, sv);
-    if (!i2s_eval_fcmp(predicate, a, b)) {
-      // our heuristic guess doesn't satisfy the relation (e.g. OGT against the
-      // max representable value); don't claim a bogus SAT, let z3 handle it
-      continue;
-    }
+    DEBUGF("i2s: fcmp pred %u @ %lu (%u bytes) sym_lhs=%d -> 0x%lx\n",
+           predicate, offset, bytes, sym_is_lhs, r);
     if (out_size == 0) memcpy(out_buf, in_buf, in_size); // make a copy
     out_size = in_size;
     memcpy(&out_buf[offset], &r, bytes);

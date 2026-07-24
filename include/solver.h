@@ -82,12 +82,16 @@ private:
   uint64_t matches;
   uint64_t mismatches;
   std::bitset<rgd::LastOp> binop_mask;
-  // bits for the FP op kinds that input-to-state cannot invert (all FP
-  // arithmetic, casts, and intrinsics/libcalls -- i.e. every FP op EXCEPT the
-  // top-level FP comparisons).  A constraint touching any of these is rejected
-  // and falls back to z3.  A "direct" FCmp (input bytes -> FCmp against a
-  // constant) sets no bit here and is handled by solve_fcmp.
+  // bits for the FP op kinds that input-to-state cannot invert (FRem, FNeg, and
+  // all FP casts and intrinsics/libcalls).  A constraint touching any of these
+  // is rejected and falls back to z3.  A "direct" FCmp (input bytes -> FCmp
+  // against a constant) sets no bit here and is handled by solve_fcmp.
   std::bitset<rgd::LastOp> fp_ops_mask;
+  // bits for the invertible FP binops (FAdd/FSub/FMul/FDiv) that solve_fcmp can
+  // reverse against a constant operand (x + C <cmp> K -> write K-C into input).
+  // These are deliberately NOT in fp_ops_mask so such a constraint reaches
+  // solve_fcmp instead of being rejected.
+  std::bitset<rgd::LastOp> fp_arith_mask;
 
   solver_result_t solve_icmp(std::shared_ptr<const Constraint> const& c,
                              std::unique_ptr<ConsMeta> const& cm,
