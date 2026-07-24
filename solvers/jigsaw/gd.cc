@@ -122,12 +122,16 @@ static uint32_t negate(uint32_t op) {
 // Distance for an FP comparison.  The jitted function stores the two operands
 // promoted to IEEE-754 double bit-patterns at a/b (see jit.cc FOeq..FUne case).
 // We compute a NON-NEGATIVE double distance d that is exactly 0 iff the
-// predicate holds, then return its IEEE bit-pattern: for d>=0 the bit-pattern
-// is monotonic in d and is 0 iff d==0 -- exactly what gradient descent needs.
-// NOTE: these bit-patterns are ~1e18-scale integers, far larger than typical
-// integer distances, so a mixed FP+integer task can be dominated/saturated by
-// the FP term when summed via sat_inc.  Acceptable: GD stays monotonic within a
-// single FP constraint, which is the common case.
+// predicate holds, then map it to a uint64: for d>=0 the IEEE bit-pattern is
+// monotonic in d and is 0 iff d==0 -- exactly what gradient descent needs.
+// The raw bit-pattern of an O(1) distance is ~2^62, though, far larger than
+// typical integer distances, so a mixed FP+integer task would be dominated (and
+// sat_inc could saturate) by the FP term.  We therefore shift off the low 32
+// bits (see the mapping below): this divides the scale by 2^32 -- an O(1)
+// distance now maps to ~2^30 and the whole finite range stays below 2^31, so a
+// single FP term no longer swamps integer distances -- while preserving both
+// required properties (still monotonic in d, still 0 iff d==0) and the log-like
+// wide dynamic range GD relies on.
 static uint64_t fp_get_distance(uint32_t comp, uint64_t a, uint64_t b) {
   double da, db;
   memcpy(&da, &a, sizeof(da));
@@ -160,7 +164,11 @@ static uint64_t fp_get_distance(uint32_t comp, uint64_t a, uint64_t b) {
   double m = std::fabs(d);
   uint64_t u;
   memcpy(&u, &m, sizeof(u));
-  return u;
+  // Rescale the bit-pattern down by 2^32 (exponent bits give octave resolution,
+  // the retained high mantissa bits give within-octave resolution) so the FP
+  // term is comparable in scale to integer distances -- see the note above.
+  u >>= 32;
+  return (u == 0 && m > 0.0) ? 1 : u; // any nonzero distance stays strictly positive
 }
 
 static uint64_t get_distance(uint32_t comp, uint64_t a, uint64_t b) {

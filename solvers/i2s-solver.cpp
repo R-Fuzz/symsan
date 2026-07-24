@@ -662,6 +662,24 @@ I2SSolver::solve_icmp(std::shared_ptr<const Constraint> const& c,
 
   uint64_t value = 0, value_r = 0;
   uint64_t r = 0;
+  // Structural anchor by INPUT OFFSET (mirrors solve_fcmp).  The value-only
+  // direct-match checks below can be fooled when two symbolic operands hold
+  // coincidentally-equal values (e.g. `b + 1 == a` on a seed where a == b): the
+  // b candidate's raw bytes equal op2's value, so op2's inverted result would be
+  // written to b -- the WRONG input.  When a compared side is a plain Read, its
+  // AST node records the exact input offset it reads (Read::index()); only accept
+  // a direct match at that offset.  When a side is not a plain Read (e.g. a binop,
+  // handled structurally by the binop branch below), fall back to the value check.
+  auto const& root = *c->get_root();
+  auto const& lc = root.children(0);
+  auto const& rc = root.children(1);
+  auto read_offset = [](const AstNode &n, size_t &off) -> bool {
+    if (n.kind() == rgd::Read) { off = n.index(); return true; }
+    return false;
+  };
+  size_t lc_off = 0, rc_off = 0;
+  bool have_lc_off = read_offset(lc, lc_off);
+  bool have_rc_off = read_offset(rc, rc_off);
   for (auto const& candidate : cm->i2s_candidates) {
     size_t offset = candidate.first;
     uint32_t bytes = candidate.second;
@@ -676,17 +694,17 @@ I2SSolver::solve_icmp(std::shared_ptr<const Constraint> const& c,
       value_r = SWAP64(value) >> (64 - bytes * 8);
       DEBUGF("i2s: try %lu, length %u = 0x%016lx, 0x%016lx, comparison = %d\n",
           offset, bytes, value, value_r, comparison);
-      if (c->op1 == value) {
+      if (c->op1 == value && (!have_lc_off || offset == lc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op2, false);
-      } else if (c->op2 == value) {
+      } else if (c->op2 == value && (!have_rc_off || offset == rc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op1, true);
-      } else if (c->op1 == value_r) {
+      } else if (c->op1 == value_r && (!have_lc_off || offset == lc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op2, false);
         r = SWAP64(r) >> (64 - bytes * 8);
-      } else if (c->op2 == value_r) {
+      } else if (c->op2 == value_r && (!have_rc_off || offset == rc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op1, true);
         r = SWAP64(r) >> (64 - bytes * 8);
