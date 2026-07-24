@@ -558,6 +558,41 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
 }
 
 
+// FP analogue of get_i2s_value.  v is the CONSTANT operand's value; rhs==true
+// means the input is the LEFT operand (op1) and v is op2, rhs==false means the
+// input is the RIGHT operand (op2) and v is op1.  Returns the value to assign to
+// the input side so that (op1 <comp> op2) holds.  Strict inequalities nudge by
+// one ULP in the correct precision (nextafterf for float) toward the satisfying
+// side; the caller VERIFIES via fp_get_distance == 0, so a wrong guess is simply
+// rejected.  FOrd/FUno depend on NaN-ness (not i2s-able) -> return v (rejected).
+static double get_i2s_fp_value(uint32_t comp, double v, bool rhs, bool is_float) {
+  auto up = [&](double x) {
+    return is_float ? (double)std::nextafterf((float)x, INFINITY)
+                    : std::nextafter(x, INFINITY);
+  };
+  auto down = [&](double x) {
+    return is_float ? (double)std::nextafterf((float)x, -INFINITY)
+                    : std::nextafter(x, -INFINITY);
+  };
+  switch (comp) {
+    case rgd::FOeq: case rgd::FUeq:
+    case rgd::FOle: case rgd::FUle: // op1<=op2 satisfied by equality
+    case rgd::FOge: case rgd::FUge: // op1>=op2 satisfied by equality
+      return v;
+    case rgd::FOlt: case rgd::FUlt: // op1 < op2
+      return rhs ? down(v)   // input=op1 -> just below op2
+                 : up(v);    // input=op2 -> just above op1
+    case rgd::FOgt: case rgd::FUgt: // op1 > op2
+      return rhs ? up(v)     // input=op1 -> just above op2
+                 : down(v);  // input=op2 -> just below op1
+    case rgd::FOne: case rgd::FUne: // op1 != op2
+      return up(v);
+    default:
+      return v;
+  }
+}
+
+
 static uint64_t try_new_i2s_value(std::shared_ptr<const Constraint> const& c, uint32_t comparison, uint64_t value, std::shared_ptr<SearchTask> task) {
   int i = 0;
   for (auto const& [offset, lidx] : c->local_map) {
@@ -571,6 +606,34 @@ static uint64_t try_new_i2s_value(std::shared_ptr<const Constraint> const& c, ui
     // is fine because the constants are always the same
     if (!arg.first) task->scratch_args[RET_OFFSET + arg_idx] = arg.second;
     ++arg_idx;
+  }
+  c->fn(task->scratch_args);
+  return get_distance(comparison, task->scratch_args[0], task->scratch_args[1]);
+}
+
+
+// FP variant of try_new_i2s_value.  Unlike the integer helper (which writes the
+// candidate's `value` across the whole local_map -- fine only for single-chunk
+// constraints), this seeds EVERY arg from the current input and overrides just
+// the candidate's `size` bytes, so other symbolic operands (e.g. y in x==y+1.0)
+// keep their current values instead of being clobbered.
+static uint64_t try_new_i2s_fp_value(std::shared_ptr<const Constraint> const& c,
+    std::unique_ptr<ConsMeta> const& cm, MutInput &input_min, uint32_t comparison,
+    size_t offset, uint32_t size, uint64_t value, std::shared_ptr<SearchTask> task) {
+  int arg_idx = 0;
+  for (auto const& arg : cm->input_args) {
+    if (arg.first) // symbolic: keep the current input value
+      task->scratch_args[RET_OFFSET + arg_idx] = input_min.get(arg.second);
+    else
+      task->scratch_args[RET_OFFSET + arg_idx] = arg.second;
+    ++arg_idx;
+  }
+  // override only the candidate bytes with the target value
+  int i = 0;
+  for (size_t off = offset; off < offset + size; off++) {
+    const uint32_t lidx = c->local_map.at(off);
+    task->scratch_args[RET_OFFSET + lidx] = ((value >> i) & 0xff);
+    i += 8;
   }
   c->fn(task->scratch_args);
   return get_distance(comparison, task->scratch_args[0], task->scratch_args[1]);
@@ -657,6 +720,86 @@ try_reverse:
             updated = true;
             break;
           }
+        } // end foreach candidate
+      } else if (rgd::isFPRelationalKind(cm->comparison)) {
+        // FP input-to-state.  The jitted fn stores both compare operands as
+        // IEEE-754 *double* bit-patterns (see jit.cc), so detect a candidate
+        // input chunk whose FP value equals one operand, then snap it to the
+        // value that satisfies the predicate against the other (constant)
+        // operand.  This lets jigsaw hit exact FP equalities (e.g. x == y with
+        // two symbolic operands, or x == C) that gradient descent alone cannot.
+        double op1d, op2d;
+        memcpy(&op1d, &cm->op1, sizeof(op1d));
+        memcpy(&op2d, &cm->op2, sizeof(op2d));
+        bool fp_done = false;
+        for (auto const& candidate : cm->i2s_candidates) {
+          const size_t c_off = candidate.first;
+          const uint32_t c_size = candidate.second;
+          // A candidate is a maximal run of *consecutive* symbolic input bytes,
+          // so two adjacent FP operands (e.g. x@0 and y@8 in `x == y + 1.0`)
+          // merge into one oversized run.  Rather than require the whole run to
+          // be exactly a float/double, slide an FP-sized window across it and
+          // test each position: reassemble the window's raw bytes, match its FP
+          // value against a stored operand, and snap it to satisfy the predicate
+          // against the other operand.  try_new_i2s_fp_value VERIFIES every
+          // guess (fp_get_distance == 0), so windows that don't line up with a
+          // real operand are simply rejected.  This lets jigsaw hit exact FP
+          // equalities (e.g. x == y with two symbolic operands, or x == C) that
+          // gradient descent alone cannot.
+          for (uint32_t fpsize : {(uint32_t)8, (uint32_t)4}) {
+            if (c_size < fpsize) continue;
+            const bool is_float = (fpsize == 4);
+            for (size_t offset = c_off; offset + fpsize <= c_off + c_size; offset++) {
+              // reassemble the raw input bytes of this window
+              uint64_t input = 0;
+              int i = 0;
+              for (size_t off = offset; off < offset + fpsize; off++) {
+                const uint32_t lidx = c->local_map.at(off);
+                uint64_t v = input_min.get(cm->input_args[lidx].second);
+                input |= (v << i);
+                i += 8;
+              }
+              // interpret the chunk as an FP number, promoted to double so it can
+              // be matched against the (always double) stored operands
+              double cur;
+              if (is_float) { float f; memcpy(&f, &input, sizeof(f)); cur = (double)f; }
+              else { memcpy(&cur, &input, sizeof(cur)); }
+              uint64_t cur_bits;
+              memcpy(&cur_bits, &cur, sizeof(cur_bits));
+
+              double target;
+              if (cur_bits == cm->op1) {
+                target = get_i2s_fp_value(cm->comparison, op2d, true, is_float);
+              } else if (cur_bits == cm->op2) {
+                target = get_i2s_fp_value(cm->comparison, op1d, false, is_float);
+              } else {
+                continue;
+              }
+
+              // encode the target in the input's native FP width
+              uint64_t value = 0;
+              if (is_float) { float tf = (float)target; memcpy(&value, &tf, sizeof(tf)); }
+              else { memcpy(&value, &target, sizeof(target)); }
+
+              // test the new value (verifies via fp_get_distance == 0)
+              uint64_t dis = try_new_i2s_fp_value(c, cm, input_min, cm->comparison,
+                                                  offset, fpsize, value, task);
+              if (dis == 0) {
+                i = 0;
+                for (size_t off = offset; off < offset + fpsize; off++) {
+                  const uint32_t lidx = c->local_map.at(off);
+                  uint8_t v = ((value >> i) & 0xff);
+                  temp_input.set(cm->input_args[lidx].second, v);
+                  i += 8;
+                }
+                updated = true;
+                fp_done = true;
+                break; // one match per comparison
+              }
+            } // end foreach window position
+            if (fp_done) break;
+          } // end foreach fp width
+          if (fp_done) break;
         } // end foreach candidate
       } else if (cm->comparison == rgd::Memcmp) {
         size_t const_index = 0;
