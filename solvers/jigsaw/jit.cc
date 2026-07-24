@@ -49,6 +49,120 @@ static inline llvm::Value* as_bits(llvm::IRBuilder<> &Builder, llvm::Value* v,
       llvm::Type::getIntNTy(Builder.getContext(), bits));
 }
 
+// --- over-width shift / divide-by-zero semantics -------------------------
+// Over-width shifts (amount >= bit-width) and integer div/rem by zero are
+// UNDEFINED in C/C++ (x86 masks the shift count; integer /0 traps), but are
+// fully DEFINED in SMT-LIB2:
+//   bvshl / bvlshr by >= width -> 0 ;   bvashr by >= width -> sign fill
+//   bvudiv x 0 -> ~0 (all ones)     ;   bvurem x 0 -> x (the dividend)
+//   bvsdiv x 0 -> (x s>= 0 ? ~0 : 1);   bvsrem x 0 -> x (the dividend)
+// SymSan's z3 backends (z3-solver.cpp / z3-ts.cpp) model these with SMT-LIB
+// semantics, so jigsaw must match to keep the i2s->jigsaw->z3 chain sound --
+// otherwise jigsaw can report a SAT that its own z3 oracle rejects.  Define
+// JIGSAW_HW_SEMANTICS to instead use the legacy hardware behavior (raw LLVM
+// shift, relying on x86 count masking; the divisor=1 div-by-zero hack), e.g.
+// to match a C/C++ program's concrete execution rather than the SMT-LIB model.
+#ifndef JIGSAW_HW_SEMANTICS
+#define JIGSAW_SMTLIB_SEMANTICS 1
+#endif
+
+static inline llvm::Value* int_const(llvm::IRBuilder<> &B, unsigned bits,
+                                     uint64_t v) {
+  return llvm::ConstantInt::get(
+      llvm::Type::getIntNTy(B.getContext(), bits), v);
+}
+
+static llvm::Value* build_shl(llvm::IRBuilder<> &B, llvm::Value* a,
+                              llvm::Value* b, unsigned bits) {
+#ifdef JIGSAW_SMTLIB_SEMANTICS
+  // (amount < width) ? (a << b) : 0
+  llvm::Value* in_range = B.CreateICmpULT(b, int_const(B, bits, bits));
+  return B.CreateSelect(in_range, B.CreateShl(a, b), int_const(B, bits, 0));
+#else
+  return B.CreateShl(a, b); // legacy: relies on x86 shift-count masking
+#endif
+}
+
+static llvm::Value* build_lshr(llvm::IRBuilder<> &B, llvm::Value* a,
+                               llvm::Value* b, unsigned bits) {
+#ifdef JIGSAW_SMTLIB_SEMANTICS
+  // (amount < width) ? (a >>u b) : 0
+  llvm::Value* in_range = B.CreateICmpULT(b, int_const(B, bits, bits));
+  return B.CreateSelect(in_range, B.CreateLShr(a, b), int_const(B, bits, 0));
+#else
+  return B.CreateLShr(a, b); // legacy: relies on x86 shift-count masking
+#endif
+}
+
+static llvm::Value* build_ashr(llvm::IRBuilder<> &B, llvm::Value* a,
+                               llvm::Value* b, unsigned bits) {
+#ifdef JIGSAW_SMTLIB_SEMANTICS
+  // shift by >= width fills with the sign bit == shifting by (width-1)
+  llvm::Value* in_range = B.CreateICmpULT(b, int_const(B, bits, bits));
+  llvm::Value* amt = B.CreateSelect(in_range, b, int_const(B, bits, bits - 1));
+  return B.CreateAShr(a, amt);
+#else
+  return B.CreateAShr(a, b); // legacy: relies on x86 shift-count masking
+#endif
+}
+
+// a divisor that is never zero, so the hardware div/rem cannot trap/poison.
+static inline llvm::Value* nonzero_divisor(llvm::IRBuilder<> &B, llvm::Value* d,
+                                           unsigned bits) {
+  // FIXME: this is a hack to avoid division by zero, but should use a better way
+  // FIXME: should record the divisor to avoid gradient vanish
+  llvm::Value* is_zero = B.CreateICmpEQ(d, int_const(B, bits, 0));
+  return B.CreateSelect(is_zero, int_const(B, bits, 1), d);
+}
+
+static llvm::Value* build_udiv(llvm::IRBuilder<> &B, llvm::Value* a,
+                               llvm::Value* b, unsigned bits) {
+  llvm::Value* q = B.CreateUDiv(a, nonzero_divisor(B, b, bits));
+#ifdef JIGSAW_SMTLIB_SEMANTICS
+  llvm::Value* is_zero = B.CreateICmpEQ(b, int_const(B, bits, 0));
+  return B.CreateSelect(is_zero, llvm::ConstantInt::getAllOnesValue(a->getType()), q);
+#else
+  return q; // legacy: divisor forced to 1
+#endif
+}
+
+static llvm::Value* build_sdiv(llvm::IRBuilder<> &B, llvm::Value* a,
+                               llvm::Value* b, unsigned bits) {
+  llvm::Value* q = B.CreateSDiv(a, nonzero_divisor(B, b, bits));
+#ifdef JIGSAW_SMTLIB_SEMANTICS
+  // bvsdiv x 0 = (x s>= 0) ? ~0 : 1
+  llvm::Value* is_zero = B.CreateICmpEQ(b, int_const(B, bits, 0));
+  llvm::Value* nonneg = B.CreateICmpSGE(a, int_const(B, bits, 0));
+  llvm::Value* zval = B.CreateSelect(nonneg,
+      llvm::ConstantInt::getAllOnesValue(a->getType()), int_const(B, bits, 1));
+  return B.CreateSelect(is_zero, zval, q);
+#else
+  return q; // legacy: divisor forced to 1
+#endif
+}
+
+static llvm::Value* build_urem(llvm::IRBuilder<> &B, llvm::Value* a,
+                               llvm::Value* b, unsigned bits) {
+  llvm::Value* r = B.CreateURem(a, nonzero_divisor(B, b, bits));
+#ifdef JIGSAW_SMTLIB_SEMANTICS
+  llvm::Value* is_zero = B.CreateICmpEQ(b, int_const(B, bits, 0));
+  return B.CreateSelect(is_zero, a, r); // bvurem x 0 = x
+#else
+  return r; // legacy: divisor forced to 1 -> x % 1 == 0
+#endif
+}
+
+static llvm::Value* build_srem(llvm::IRBuilder<> &B, llvm::Value* a,
+                               llvm::Value* b, unsigned bits) {
+  llvm::Value* r = B.CreateSRem(a, nonzero_divisor(B, b, bits));
+#ifdef JIGSAW_SMTLIB_SEMANTICS
+  llvm::Value* is_zero = B.CreateICmpEQ(b, int_const(B, bits, 0));
+  return B.CreateSelect(is_zero, a, r); // bvsrem x 0 = x
+#else
+  return r; // legacy: divisor forced to 1 -> x % 1 == 0
+#endif
+}
+
 static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
     const AstNode* node,
     std::map<size_t, uint32_t> const& local_map, llvm::Value* arg,
@@ -184,13 +298,7 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      llvm::Value* VA0 = llvm::ConstantInt::get(llvm::Type::getIntNTy(Builder.getContext(), node->bits()), 0);
-      llvm::Value* VA1 = llvm::ConstantInt::get(llvm::Type::getIntNTy(Builder.getContext(), node->bits()), 1);
-      // FIXME: this is a hack to avoid division by zero, but should use a better way
-      // FIXME: should record the divisor to avoid gradient vanish
-      llvm::Value* cond = Builder.CreateICmpEQ(c2, VA0);
-      llvm::Value* divisor = Builder.CreateSelect(cond, VA1, c2);
-      ret = Builder.CreateUDiv(c1, divisor);
+      ret = build_udiv(Builder, c1, c2, node->bits());
       break;
     }
     case rgd::SDiv: {
@@ -198,13 +306,7 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      llvm::Value* VA0 = llvm::ConstantInt::get(llvm::Type::getIntNTy(Builder.getContext(), node->bits()), 0);
-      llvm::Value* VA1 = llvm::ConstantInt::get(llvm::Type::getIntNTy(Builder.getContext(), node->bits()), 1);
-      // FIXME: this is a hack to avoid division by zero, but should use a better way
-      // FIXME: should record the divisor to avoid gradient vanish
-      llvm::Value* cond = Builder.CreateICmpEQ(c2, VA0);
-      llvm::Value* divisor = Builder.CreateSelect(cond, VA1, c2);
-      ret = Builder.CreateSDiv(c1, divisor);
+      ret = build_sdiv(Builder, c1, c2, node->bits());
       break;
     }
     case rgd::URem: {
@@ -212,13 +314,7 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      llvm::Value* VA0 = llvm::ConstantInt::get(llvm::Type::getIntNTy(Builder.getContext(), node->bits()), 0);
-      llvm::Value* VA1 = llvm::ConstantInt::get(llvm::Type::getIntNTy(Builder.getContext(), node->bits()), 1);
-      // FIXME: this is a hack to avoid division by zero, but should use a better way
-      // FIXME: should record the divisor to avoid gradient vanish
-      llvm::Value* cond = Builder.CreateICmpEQ(c2, VA0);
-      llvm::Value* divisor = Builder.CreateSelect(cond, VA1, c2);
-      ret = Builder.CreateURem(c1, divisor);
+      ret = build_urem(Builder, c1, c2, node->bits());
       break;
     }
     case rgd::SRem: {
@@ -226,13 +322,7 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      llvm::Value* VA0 = llvm::ConstantInt::get(llvm::Type::getIntNTy(Builder.getContext(), node->bits()), 0);
-      llvm::Value* VA1 = llvm::ConstantInt::get(llvm::Type::getIntNTy(Builder.getContext(), node->bits()), 1);
-      // FIXME: this is a hack to avoid division by zero, but should use a better way
-      // FIXME: should record the divisor to avoid gradient vanish
-      llvm::Value* cond = Builder.CreateICmpEQ(c2, VA0);
-      llvm::Value* divisor = Builder.CreateSelect(cond, VA1, c2);
-      ret = Builder.CreateSRem(c1, divisor);
+      ret = build_srem(Builder, c1, c2, node->bits());
       break;
     }
     case rgd::Neg: {
@@ -276,7 +366,7 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      ret = Builder.CreateShl(c1, c2);
+      ret = build_shl(Builder, c1, c2, node->bits());
       break;
     }
     case rgd::LShr: {
@@ -284,7 +374,7 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      ret = Builder.CreateLShr(c1, c2);
+      ret = build_lshr(Builder, c1, c2, node->bits());
       break;
     }
     case rgd::AShr: {
@@ -292,7 +382,7 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      ret = Builder.CreateAShr(c1, c2);
+      ret = build_ashr(Builder, c1, c2, node->bits());
       break;
     }
     // all the following ICmp expressions should be top level
@@ -311,9 +401,17 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       const AstNode* rc2 = &node->children(1);
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
-      // extend to 64-bit to avoid overflow
-      llvm::Value* c1e = Builder.CreateZExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = Builder.CreateZExt(c2, Builder.getInt64Ty());
+      // extend to 64-bit to avoid overflow.  For SIGNED comparisons the operands
+      // must be sign-extended, otherwise a negative sub-64-bit value (e.g. the
+      // i32 0xFE000000) becomes a large positive i64 and get_distance's
+      // (int64_t)a </<= (int64_t)b test in gd.cc is wrong -- jigsaw would report
+      // an unsound SAT.  Unsigned/Equal/Distinct stay zero-extended.
+      bool is_signed = (node->kind() == rgd::Slt || node->kind() == rgd::Sle ||
+                        node->kind() == rgd::Sgt || node->kind() == rgd::Sge);
+      llvm::Value* c1e = is_signed ? Builder.CreateSExt(c1, Builder.getInt64Ty())
+                                   : Builder.CreateZExt(c1, Builder.getInt64Ty());
+      llvm::Value* c2e = is_signed ? Builder.CreateSExt(c2, Builder.getInt64Ty())
+                                   : Builder.CreateZExt(c2, Builder.getInt64Ty());
 
       // save the comparison operands to the output args
       // so it's easier to negate the condition
