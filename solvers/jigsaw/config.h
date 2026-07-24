@@ -7,4 +7,8 @@
 // X==const pins X), which a later round can then snap.  Bounded to guarantee
 // termination even if lateral (non-worsening) snaps cycle.
 #define I2S_MAX_ROUNDS 8
+// Max bisection probes when descend's doubling line search overshoots a minimum
+// (f grew between step/2 and step). Bounded so backtracking stays cheap relative
+// to the high-throughput search budget.
+#define BACKTRACK_MAX 5
 #endif

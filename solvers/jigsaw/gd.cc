@@ -421,6 +421,12 @@ static void compute_delta_all(MutInput &input, Grad &grad, size_t step) {
 
 
 static void cal_gradient(MutInput &input, uint64_t f0, Grad &grad, std::shared_ptr<SearchTask> task) {
+  // #4: skip probing bytes that touch no currently-unsatisfied constraint. Their
+  // partial derivative is definitionally 0 (f0 = sum of constraint distances; a
+  // byte that only feeds already-satisfied (distance-0) constraints cannot lower
+  // any term, only keep it 0 or raise it), so partial_derivative would burn ~16
+  // probes just to conclude val=0. Skipping produces a bit-identical gradient
+  // vector while reclaiming that budget for the MAX_EXEC_TIMES-capped search.
   uint64_t max = 0;
   uint32_t index = 0;
   for (auto &gradu : grad.get_value()) {
@@ -431,6 +437,17 @@ static void cal_gradient(MutInput &input, uint64_t f0, Grad &grad, std::shared_p
     bool sign = false;
     bool is_linear = false;
     uint64_t val = 0;
+
+    bool relevant = false;
+    for (size_t cons_id : task->cmap(index)) {
+      if (task->min_distances[cons_id]) { relevant = true; break; }
+    }
+    if (!relevant) {
+      gradu.sign = false;
+      gradu.val = 0;
+      index++;
+      continue;
+    }
 
     partial_derivative(input, index, f0, &sign, &is_linear, &val, task);
     if (val > max) {
@@ -520,6 +537,49 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
         return 0;
       } else if (f_new > f_last) { // use > to give the next larger step a chance
         //if (f_new == UINTMAX_MAX)
+        // #5: the doubling line search jumped from the last-accepted point
+        // (== input_min, f_last) straight to a worse point at `step`, stepping
+        // over a possible minimum in between. Instead of abandoning it, bisect a
+        // few times back toward input_min along the same gradient to recover a
+        // better point before falling through to coordinate descent.
+        if (step > 1) {
+          size_t bstep = step >> 1;
+          for (int bt = 0; bt < BACKTRACK_MAX && bstep >= 1; bt++) {
+            if (task->stopped)
+              break;
+            input = input_min;
+            uint64_t fb = 0;
+            if (doDelta) {
+              double movement = grad.get_value()[deltaIdx].pct * (double)bstep;
+              input.update(deltaIdx, grad.get_value()[deltaIdx].sign, (uint64_t)movement);
+              single_distance(input, task->distances, task, deltaIdx);
+              for (int i = 0, n = task->size(); i < n; i++)
+                fb = sat_inc(fb, task->distances[i]);
+              task->attempts += 1;
+              if (task->attempts > MAX_EXEC_TIMES)
+                task->stopped = true;
+            } else {
+              compute_delta_all(input, grad, bstep);
+              fb = distance(input, task->distances, task);
+            }
+            if (fb == 0) {
+              task->stopped = true;
+              task->solved = true;
+              add_results(input, task);
+              return 0;
+            }
+            if (fb < f_last) {
+              input_min = input;
+              task->min_distances = task->distances;
+              f_last = fb;
+              break; // recovered a better point; stop bisecting
+            }
+            bstep >>= 1;
+          }
+          // restore best-known state for the next coordinate phase
+          input = input_min;
+          task->distances = task->min_distances;
+        }
         break;
       }
 
