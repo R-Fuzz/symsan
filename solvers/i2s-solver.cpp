@@ -531,6 +531,30 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
            arith_kind, cst_bits, const_is_rhs);
   }
 
+  // Structural anchor by INPUT OFFSET.  The value-only structural checks below
+  // can be fooled when two operands hold coincidentally-equal values.  For
+  // example `fa == fb + C` on a seed where fa == fb: feeding fa through `+ C`
+  // yields the same value as fb+C, so the fa candidate passes the value check
+  // and the inverted result gets written to fa -- the WRONG input.  When the
+  // operand we intend to modify is a plain Read, its AST node records the exact
+  // input offset it reads (Read::index()); only accept the candidate at that
+  // offset.  If the operand is not a plain Read (transformed input, offset not
+  // determinable), fall back to the value-only check to preserve behavior.
+  auto read_offset = [](const AstNode &n, size_t &off) -> bool {
+    if (n.kind() == rgd::Read) { off = n.index(); return true; }
+    return false;
+  };
+  size_t sym_off = 0;
+  bool have_sym_off = false;   // arith/trans: offset of the symbolic operand
+  if (trans != nullptr) {
+    have_sym_off = read_offset(trans->children(0), sym_off);
+  } else if (arith != nullptr) {
+    have_sym_off = read_offset(arith->children(const_is_rhs ? 0 : 1), sym_off);
+  }
+  size_t lc_off = 0, rc_off = 0;   // direct compare: offsets of each side
+  bool have_lc_off = read_offset(lc, lc_off);
+  bool have_rc_off = read_offset(rc, rc_off);
+
   for (auto const& candidate : cm->i2s_candidates) {
     size_t offset = candidate.first;
     uint32_t bytes = candidate.second;
@@ -550,6 +574,8 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
     uint64_t r = 0;
     if (trans != nullptr) {
       // f(x) <cmp> K -- invert the transcendental to recover x (e.g. exp -> log).
+      // anchor: only the input bytes the transcendental actually reads
+      if (have_sym_off && offset != sym_off) continue;
       sym_is_lhs = trans_is_lhs;
       double x_in = fp_decode(value, bytes);
       // structural check: confirm these input bytes really produce the recorded
@@ -570,6 +596,8 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
     } else if (arith != nullptr) {
       // (x op C) <cmp> K -- invert the arith op to recover x, mirroring the
       // integer binop path in solve_icmp.
+      // anchor: only the input bytes the arith's symbolic operand actually reads
+      if (have_sym_off && offset != sym_off) continue;
       sym_is_lhs = arith_is_lhs;
       double x_in = fp_decode(value, bytes);
       double cst = fp_decode(cst_bits & mask, bytes);
@@ -593,12 +621,14 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
       if (!i2s_eval_fcmp(predicate, a, b)) continue;
     } else {
       // direct FCmp: the input bytes are one of the comparison operands, and the
-      // other is the concrete constant we compare against.
+      // other is the concrete constant we compare against.  Anchor to the Read
+      // offset of each side (when it is a plain Read) so an unrelated candidate
+      // that merely holds the same value is not mistaken for the operand.
       uint64_t const_bits;
-      if ((c->op1 & mask) == value) {
+      if ((c->op1 & mask) == value && (!have_lc_off || offset == lc_off)) {
         sym_is_lhs = true;
         const_bits = c->op2 & mask;
-      } else if ((c->op2 & mask) == value) {
+      } else if ((c->op2 & mask) == value && (!have_rc_off || offset == rc_off)) {
         sym_is_lhs = false;
         const_bits = c->op1 & mask;
       } else {
