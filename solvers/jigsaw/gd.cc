@@ -306,10 +306,15 @@ static void partial_derivative(MutInput &orig_input, const uint32_t index, uint6
   uint64_t f_plus = 0, f_minus = 0;
   uint64_t single_dis;
 
-  // calculate f(x+delta)
+  // calculate f(x+delta).  The input is NOT restored between delta probes, so add
+  // only the increment (delta - added) to land exactly at orig+delta rather than the
+  // cumulative orig+1+4+16...  This is a clean finite difference at f(x+delta) -- as
+  // the comment below intends -- at the same eval count (no extra restore/reprobe).
+  uint64_t added = 0;
   for (delta = 1; delta < 256; delta = delta << 1) {
     task->plus_distances = task->min_distances;
-    orig_input.update(index, true, delta);
+    orig_input.update(index, true, delta - added);
+    added = delta;
     single_dis = single_distance(orig_input, task->plus_distances, task, index);
     if (single_dis == 0) { // well, we got lucky and found a solution
       *sign = true;
@@ -334,10 +339,12 @@ static void partial_derivative(MutInput &orig_input, const uint32_t index, uint6
   }
   orig_input.value[index] = orig_val; // restore the original value
 
-  // calculate f(x-delta)
+  // calculate f(x-delta) -- same clean-increment trick as the plus loop above
+  added = 0;
   for (delta = 1; delta < 256; delta = delta << 1) {
     task->minus_distances = task->min_distances;
-    orig_input.update(index, false, delta);
+    orig_input.update(index, false, delta - added);
+    added = delta;
     single_dis = single_distance(orig_input, task->minus_distances, task, index);
     if (single_dis == 0) { // well, we got lucky and found a solution
       *sign = false;
