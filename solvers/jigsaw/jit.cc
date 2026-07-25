@@ -408,10 +408,10 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       // an unsound SAT.  Unsigned/Equal/Distinct stay zero-extended.
       bool is_signed = (node->kind() == rgd::Slt || node->kind() == rgd::Sle ||
                         node->kind() == rgd::Sgt || node->kind() == rgd::Sge);
-      llvm::Value* c1e = is_signed ? Builder.CreateSExt(c1, Builder.getInt64Ty())
-                                   : Builder.CreateZExt(c1, Builder.getInt64Ty());
-      llvm::Value* c2e = is_signed ? Builder.CreateSExt(c2, Builder.getInt64Ty())
-                                   : Builder.CreateZExt(c2, Builder.getInt64Ty());
+      llvm::Value* c1e = is_signed ? Builder.CreateSExtOrTrunc(c1, Builder.getInt64Ty())
+                                   : Builder.CreateZExtOrTrunc(c1, Builder.getInt64Ty());
+      llvm::Value* c2e = is_signed ? Builder.CreateSExtOrTrunc(c2, Builder.getInt64Ty())
+                                   : Builder.CreateZExtOrTrunc(c2, Builder.getInt64Ty());
 
       // save the comparison operands to the output args
       // so it's easier to negate the condition

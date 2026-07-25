@@ -217,6 +217,21 @@ namespace rgd {
       return false;
   }
 
+  // Signed integer relational kinds (bvslt/bvsle/bvsgt/bvsge).  These are
+  // distinguished from the unsigned/equality relations because the jigsaw JIT
+  // SIGN-extends a signed comparison's operands to 64-bit (so gd.cc's
+  // (int64_t) distance is correct), while unsigned/equality comparisons
+  // ZERO-extend.  A signed and an unsigned comparison over identical operands
+  // therefore compile to DIFFERENT native functions and must NOT share a
+  // JIT'ed function (see isEqualAstRecursive) -- otherwise a signed constraint
+  // could reuse an unsigned (zero-extending) function and report an unsound SAT.
+  static inline bool isSignedRelationalKind(uint16_t kind) {
+    if (kind >= Slt && kind <= Sge)
+      return true;
+    else
+      return false;
+  }
+
   // Floating-point relational kinds are deliberately kept out of the
   // isRelationalKind() range: the integer-only jigsaw JIT and i2s solvers
   // dispatch on isRelationalKind(), so excluding FP makes them reject FP
@@ -412,8 +427,12 @@ namespace rgd {
     if (lhs.kind() != rhs.kind()) {
       // to maximize the reuse of JIT'ed functions, jigsaw does not
       // care about which relational operator is used, as long as
-      // they are both relational operators
-      if (isRelationalKind(lhs.kind()) && isRelationalKind(rhs.kind())) {
+      // they are both relational operators -- EXCEPT that signed and
+      // unsigned comparisons extend their operands differently in the
+      // JIT (sign- vs zero-extend), so they must stay in separate reuse
+      // classes; sharing across the boundary yields an unsound SAT.
+      if (isRelationalKind(lhs.kind()) && isRelationalKind(rhs.kind())
+          && isSignedRelationalKind(lhs.kind()) == isSignedRelationalKind(rhs.kind())) {
         // do nothing, fall through to compare operands
       } else {
         return false;
