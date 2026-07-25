@@ -47,6 +47,105 @@ static void dump_distances(std::vector<uint64_t> &distances) {
   }
 }
 
+// Per-task attempt budget.  Defaults to the compile-time MAX_EXEC_TIMES but can
+// be overridden at runtime via JIGSAW_MAX_EXEC (e.g. smttest's --budget) so the
+// search budget can be swept without rebuilding -- used to test whether a search
+// strategy's "losses" are budget-limited or genuine trajectory divergence.
+static uint64_t jigsaw_max_exec() {
+  static const uint64_t v = []() -> uint64_t {
+    const char *e = getenv("JIGSAW_MAX_EXEC");
+    return e ? (uint64_t)strtoull(e, nullptr, 0) : (uint64_t)MAX_EXEC_TIMES;
+  }();
+  return v;
+}
+
+// ---- search tracing (debug only) -----------------------------------------
+// Compiled in only under JIGSAW_SEARCH_DEBUG (see config.h); production builds
+// get the no-op stubs at the bottom of this block so the hot search loop carries
+// no tracing branches.
+// JIGSAW_TRACE=1 prints the search sequence (escapes, descend, per-round jitter
+// moves) to stderr.  JIGSAW_TARGET=<path> loads a known-good assignment
+// (offset-indexed raw bytes -- dump one from z3 via smttest's JIGSAW_DUMP_MODEL)
+// so each line ALSO reports how far the current assignment is from the actual
+// solution: it becomes obvious the moment a move steps the search AWAY from the
+// model, which byte is still wrong, and whether the metric that matters is value
+// distance or bit (Hamming) distance.
+#if JIGSAW_SEARCH_DEBUG
+static bool g_trace = false;
+static bool g_have_target = false;
+static std::vector<uint8_t> g_target; // offset-indexed target model
+
+static void trace_init() {
+  g_trace = (getenv("JIGSAW_TRACE") != nullptr);
+  g_have_target = false;
+  g_target.clear();
+  const char *tp = getenv("JIGSAW_TARGET");
+  if (tp) {
+    FILE *f = fopen(tp, "rb");
+    if (f) {
+      fseek(f, 0, SEEK_END);
+      long n = ftell(f);
+      fseek(f, 0, SEEK_SET);
+      if (n > 0) {
+        g_target.resize((size_t)n);
+        size_t rd = fread(g_target.data(), 1, (size_t)n, f);
+        (void)rd;
+        g_have_target = true;
+      }
+      fclose(f);
+    }
+  }
+}
+
+// value / Hamming distance from the current assignment to the target model,
+// plus the count of still-wrong slots (and the first few offsets).
+static void trace_target_dist(MutInput &input, std::shared_ptr<SearchTask> task,
+                              uint64_t &vdist, uint32_t &hbits, uint32_t &nwrong,
+                              char *wrong, size_t wrong_sz) {
+  vdist = 0; hbits = 0; nwrong = 0;
+  wrong[0] = '\0';
+  size_t used = 0;
+  auto const &ins = task->inputs();
+  for (uint32_t i = 0, n = (uint32_t)input.len(); i < n; i++) {
+    uint32_t off = ins[i].first;
+    uint8_t cur = (uint8_t)input.value[i];
+    uint8_t tgt = (off < g_target.size()) ? g_target[off] : 0;
+    if (cur != tgt) {
+      nwrong++;
+      vdist += (cur > tgt) ? (uint64_t)(cur - tgt) : (uint64_t)(tgt - cur);
+      hbits += (uint32_t)__builtin_popcount((unsigned)(cur ^ tgt));
+      if (used + 24 < wrong_sz) {
+        int w = snprintf(wrong + used, wrong_sz - used, "%s@%u(%u!=%u)",
+                         used ? "," : "", off, cur, tgt);
+        if (w > 0) used += (size_t)w;
+      }
+    }
+  }
+}
+
+static void trace_step(const char *label, MutInput &input, uint64_t f0,
+                       std::shared_ptr<SearchTask> task) {
+  if (!g_trace) return;
+  if (g_have_target) {
+    uint64_t vd; uint32_t hb, nw; char wrong[256];
+    trace_target_dist(input, task, vd, hb, nw, wrong, sizeof(wrong));
+    fprintf(stderr,
+        "[trace] %-14s f0=%-12lu to-model: wrong=%u/%lu vdist=%lu hbits=%u [%s]\n",
+        label, (unsigned long)f0, nw, (unsigned long)input.len(),
+        (unsigned long)vd, hb, wrong);
+  } else {
+    fprintf(stderr, "[trace] %-14s f0=%lu\n", label, (unsigned long)f0);
+  }
+}
+#else // !JIGSAW_SEARCH_DEBUG: no-op stubs so the search loop compiles unchanged
+// g_trace is a compile-time constant false here, so every "if (g_trace) ..."
+// diagnostic in the hot search/jitter paths is eliminated by the optimizer.
+static constexpr bool g_trace = false;
+static inline void trace_init() {}
+static inline void trace_step(const char *, MutInput &, uint64_t,
+                              std::shared_ptr<SearchTask>) {}
+#endif // JIGSAW_SEARCH_DEBUG
+
 
 static void add_results(MutInput &input, std::shared_ptr<SearchTask> task) {
   int i = 0;
@@ -291,7 +390,7 @@ static uint64_t distance(MutInput &input, std::vector<uint64_t> &distances, std:
     add_results(input, task);
   }
   task->attempts++;
-  if (task->attempts > MAX_EXEC_TIMES) {
+  if (task->attempts > jigsaw_max_exec()) {
     task->stopped = true;
     task->solved = false;
   }
@@ -327,7 +426,7 @@ static void partial_derivative(MutInput &orig_input, const uint32_t index, uint6
       f_plus = sat_inc(f_plus, task->plus_distances[i]);
 
     task->attempts += 1;
-    if (task->attempts > MAX_EXEC_TIMES)
+    if (task->attempts > jigsaw_max_exec())
       task->stopped = true;
     if (task->stopped) { *val = 0; return; }
 
@@ -357,7 +456,7 @@ static void partial_derivative(MutInput &orig_input, const uint32_t index, uint6
       f_minus = sat_inc(f_minus, task->minus_distances[i]);
 
     task->attempts += 1;
-    if (task->attempts > MAX_EXEC_TIMES)
+    if (task->attempts > jigsaw_max_exec())
       task->stopped = true;
     if (task->stopped) { *val = 0; return;}
 
@@ -516,7 +615,7 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
         for (int i = 0, n = task->size(); i < n; i++)
           f_new = sat_inc(f_new, task->distances[i]);
         task->attempts += 1;
-        if (task->attempts > MAX_EXEC_TIMES)
+        if (task->attempts > jigsaw_max_exec())
           task->stopped = true;
         if (single_dis == 0) {
           // if we're doing delta and the single distance is 0
@@ -556,7 +655,7 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
               for (int i = 0, n = task->size(); i < n; i++)
                 fb = sat_inc(fb, task->distances[i]);
               task->attempts += 1;
-              if (task->attempts > MAX_EXEC_TIMES)
+              if (task->attempts > jigsaw_max_exec())
                 task->stopped = true;
             } else {
               compute_delta_all(input, grad, bstep);
@@ -948,11 +1047,98 @@ try_reverse:
 }
 
 static uint64_t repick_start_point(MutInput &input_min, std::shared_ptr<SearchTask> task) {
+  // Full random restart.  A "targeted" variant that only re-rolls bytes feeding a
+  // currently-unsatisfied constraint (keeping the rest) was tried and z3-validated
+  // A/B'd over 6,636 files: it was a large net loss (union ceiling 5219->4713) --
+  // its conservatism starves the exploration a full reroll provides.  Reverted.
   input_min.randomize();
   uint64_t ret = distance(input_min, task->min_distances, task);
   return ret;
 }
 
+// #2 near-miss jitter: GD stalled (flat gradient) but the total distance is
+// small.  Run a bounded local random search -- small +/- deltas and bit flips on
+// the bytes of unsatisfied constraints, keeping any non-worsening move -- to hop
+// the tiny barriers that flat/misleading gradients leave GD stuck at.  Unlike a
+// random restart this preserves the near-solution instead of re-rolling it away.
+static uint64_t near_miss_jitter(MutInput &input, std::shared_ptr<SearchTask> task,
+                                 uint64_t f0) {
+  std::vector<uint32_t> rel;
+  for (uint32_t i = 0, n = (uint32_t)input.len(); i < n; i++) {
+    for (size_t cid : task->cmap(i)) {
+      if (task->min_distances[cid]) { rel.push_back(i); break; }
+    }
+  }
+  if (rel.empty()) return f0;
+  if (g_trace) {
+    fprintf(stderr, "[trace] jitter-begin f0=%lu rel=%zu/%lu bytes {",
+            (unsigned long)f0, rel.size(), (unsigned long)input.len());
+    for (size_t k = 0; k < rel.size(); k++)
+      fprintf(stderr, "%s%u", k ? "," : "", (unsigned)task->inputs()[rel[k]].first);
+    fprintf(stderr, "}\n");
+  }
+  uint64_t best = f0;
+  for (int r = 0; r < NEAR_MISS_ROUNDS && !task->stopped; r++) {
+    uint32_t idx = rel[input.get_rand() % rel.size()];
+    uint64_t save = input.value[idx];
+    uint8_t rnd = input.get_rand();
+    char mv[24] = "";
+    if (rnd & 1) {
+      uint32_t bit = (rnd >> 1) & 7;
+      input.flip(idx, bit); // single-bit flip
+      if (g_trace) snprintf(mv, sizeof(mv), "flip b%u", bit);
+    } else {
+      uint64_t d = ((uint64_t)(rnd >> 2) & 7) + 1; // small delta 1..8
+      input.update(idx, (rnd & 2) != 0, d);
+      if (g_trace) snprintf(mv, sizeof(mv), "%c%lu", (rnd & 2) ? '+' : '-', (unsigned long)d);
+    }
+    uint64_t f_new = distance(input, task->distances, task);
+    if (task->solved) {
+      if (g_trace)
+        fprintf(stderr, "[trace]   r%-3d off@%u %-8s -> SOLVED\n",
+                r, (unsigned)task->inputs()[idx].first, mv);
+      return 0;
+    }
+    bool accept = (f_new <= best);
+    if (g_trace) {
+      // only log accepted moves that change f (real progress) and periodic beats
+      // -- reverts and no-op laterals are the common case and would drown the log
+      if (accept && f_new < best)
+        fprintf(stderr, "[trace]   r%-3d off@%u %-8s f=%lu->%lu ACCEPT\n",
+                r, (unsigned)task->inputs()[idx].first, mv,
+                (unsigned long)best, (unsigned long)f_new);
+    }
+    if (accept) { // keep improving AND lateral moves (escape plateaus)
+      best = f_new;
+      task->min_distances = task->distances;
+    } else {
+      input.value[idx] = save; // revert a worsening move
+    }
+  }
+  if (g_trace) fprintf(stderr, "[trace] jitter-end   f0=%lu\n", (unsigned long)best);
+  return best;
+}
+
+// Unified local-optimum escape: near-miss jitter when the total distance is
+// already small (preserve the near-solution), otherwise a full random restart.
+// Used both when the gradient is flat AND when descend stagnates with a
+// non-flat-but-misleading gradient.
+//
+// jitter_calls is a per-task budget guard: each jitter runs NEAR_MISS_ROUNDS
+// evals, and the flat-gradient loop can fire many times, so uncapped jitter
+// starves the multi-epoch descent that solves near-miss cases (observed as an
+// unstable-set regression).  After NEAR_MISS_MAX_CALLS jitters we fall back to
+// the cheap restart, preserving budget for descent.
+static uint64_t do_escape(MutInput &input, std::shared_ptr<SearchTask> task,
+                          uint64_t f0, int &jitter_calls, bool allow_jitter) {
+  if (allow_jitter && f0 <= NEAR_MISS_F0 && jitter_calls < NEAR_MISS_MAX_CALLS) {
+    jitter_calls++;
+    return near_miss_jitter(input, task, f0);
+  }
+  uint64_t r = repick_start_point(input, task);
+  trace_step("restart", input, r, task);
+  return r;
+}
 
 static uint64_t reload_input(MutInput &input_min, std::shared_ptr<SearchTask> task) {
   input_min.assign(task->inputs());
@@ -967,29 +1153,54 @@ static uint64_t reload_input(MutInput &input_min, std::shared_ptr<SearchTask> ta
 }
 
 bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
+#if JIGSAW_SEARCH_DEBUG
   // JIGSAW_DEBUG=1 traces which phase produced the solution (i2s vs gradient
   // descent) and the attempt count -- useful for telling apart constraints that
   // are actually *searched* from those the i2s heuristic snaps for free.
   static const bool dbg = (getenv("JIGSAW_DEBUG") != nullptr);
+  // JIGSAW_REPORT_ITERS=1 emits a parseable "[jigsaw] iters" line on every solve
+  // (attempts-to-solve for this task).  Used to profile the attempts distribution
+  // and pick a sensible default budget (MAX_EXEC_TIMES / --budget).
+  static const bool report_iters = (getenv("JIGSAW_REPORT_ITERS") != nullptr);
+#endif
+  trace_init();
   MutInput input(task->inputs_size());
   MutInput scratch_input(task->inputs_size());
   task->attempts = 0;
 
   uint64_t f0 = reload_input(input, task);
+  trace_step("seed", input, f0, task);
   f0 = try_i2s(input, scratch_input, f0, task);
   if (task->stopped) {
+#if JIGSAW_SEARCH_DEBUG
     if (dbg)
       fprintf(stderr, "[jigsaw] solved=%d by i2s (initial), attempts=%lu\n",
               task->solved, (unsigned long)task->attempts);
+    if (report_iters && task->solved)
+      fprintf(stderr, "[jigsaw] iters=%lu phase=i2s-initial\n",
+              (unsigned long)task->attempts);
+#endif
     return task->solved;
   }
 
   if (f0 == UINTMAX_MAX)
     return false;
 
-  int ep_i = 0;
+  [[maybe_unused]] int ep_i = 0; // epoch counter (read by diagnostics / #if DEBUG)
+  // counters read only by the JIGSAW_SEARCH_DEBUG diagnostics below
+  [[maybe_unused]] int dbg_restarts = 0; // flat-gradient escape loop iterations
+  int jitter_calls = 0; // per-task jitter budget (see do_escape)
 
   Grad grad(input.len());
+
+  // DIAGNOSTIC toggle (A/B only): JIGSAW_NO_JITTER disables flat-loop jitter so a
+  // single build can reproduce the pre-jitter baseline for comparison.  Compiled
+  // out in production (a constant false), where flat-loop jitter is always on.
+#if JIGSAW_SEARCH_DEBUG
+  static const bool no_jitter = (getenv("JIGSAW_NO_JITTER") != nullptr);
+#else
+  static constexpr bool no_jitter = false;
+#endif
 
   while (true) {
     if (task->stopped) {
@@ -1011,14 +1222,17 @@ bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
       if (task->stopped)
         break;
       g_i++;
+      dbg_restarts++;
       //f0 = repick_start_point(input, f0, rng);
       //f0 = reload_input(input);
-      f0 = repick_start_point(input, task);
+      f0 = do_escape(input, task, f0, jitter_calls, !no_jitter); // flat gradient: jitter OK
       f0 = try_i2s(input, scratch_input, f0, task);
       if (task->stopped) {
+#if JIGSAW_SEARCH_DEBUG
         if (dbg)
           fprintf(stderr, "[jigsaw] solved=%d by i2s (restart), attempts=%lu\n",
                   task->solved, (unsigned long)task->attempts);
+#endif
         break;
       }
       grad.clear();
@@ -1030,16 +1244,58 @@ bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
     }
     //TODO
     grad.normalize();
+    uint64_t before = f0;
     f0 = descend(input, scratch_input, f0, grad, task);
+#if JIGSAW_SEARCH_DEBUG
     if (dbg && task->solved)
       fprintf(stderr, "[jigsaw] solved=1 by gradient descent, epoch=%d attempts=%lu\n",
               ep_i, (unsigned long)task->attempts);
+    if (g_trace) {
+      char lbl[24]; snprintf(lbl, sizeof(lbl), "descend ep%d", ep_i);
+      trace_step(lbl, input, f0, task);
+    }
+#endif
     ep_i += 1;
+    // Descend-stagnation escape: the gradient wasn't flat, but this epoch's line
+    // search failed to improve the global distance (misleading gradient / local
+    // optimum).  The flat-gradient loop above only fires when grad==0, which on
+    // sage-style tasks happens 1-3x while descend can stall for dozens of epochs.
+    // Fire the same escape here so a near-solution isn't abandoned to luck.
+    // DIAGNOSTIC toggles (A/B only): the gradient here is non-flat, so jitter
+    // (gradient-blind) may displace the descent that solves smooth near-misses.
+    //   JIGSAW_NO_STAGNATION  -> skip this hook entirely (baseline-like)
+    //   JIGSAW_STAG_RESTART   -> escape via restart only, never jitter here
+    // Compiled out in production (both constant false), where the hook fires with
+    // jitter -- the winning configuration.
+#if JIGSAW_SEARCH_DEBUG
+    static const bool no_stag = (getenv("JIGSAW_NO_STAGNATION") != nullptr);
+    static const bool stag_restart = (getenv("JIGSAW_STAG_RESTART") != nullptr);
+#else
+    static constexpr bool no_stag = false;
+    static constexpr bool stag_restart = false;
+#endif
+    if (!no_stag && !task->stopped && f0 >= before) {
+      f0 = do_escape(input, task, f0, jitter_calls, !stag_restart);
+      f0 = try_i2s(input, scratch_input, f0, task);
+    }
     //if (ep_i == 2) break;
   }
 
-  if (dbg && !task->solved)
-    fprintf(stderr, "[jigsaw] gave up (unsolved), epochs=%d attempts=%lu\n",
-            ep_i, (unsigned long)task->attempts);
+#if JIGSAW_SEARCH_DEBUG
+  if (dbg && !task->solved) {
+    uint64_t fmin = 0; uint64_t nzero = 0;
+    for (int k = 0, n = task->size(); k < n; k++) {
+      fmin = sat_inc(fmin, task->min_distances[k]);
+      if (task->min_distances[k]) nzero++;
+    }
+    fprintf(stderr,
+        "[jigsaw] gave up (unsolved), epochs=%d attempts=%lu bytes=%zu cons=%d unsat_cons=%lu final_f0=%lu flat_restarts=%d\n",
+        ep_i, (unsigned long)task->attempts, (size_t)input.len(),
+        (int)task->size(), (unsigned long)nzero, (unsigned long)fmin, dbg_restarts);
+  }
+  if (report_iters && task->solved)
+    fprintf(stderr, "[jigsaw] iters=%lu phase=search\n",
+            (unsigned long)task->attempts);
+#endif
   return task->solved;
 }
