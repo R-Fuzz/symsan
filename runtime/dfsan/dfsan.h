@@ -291,7 +291,9 @@ static inline uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predic
 }
 
 static inline bool is_commutative(uint16_t op) {
-  switch(op) {
+  // mask to the base opcode: cmp packs a predicate and FP arithmetic may pack a
+  // rounding-mode selector into the high byte (neither changes commutativity).
+  switch(op & 0xff) {
     case Not:
     case And:
     case Or:

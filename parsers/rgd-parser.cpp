@@ -461,8 +461,19 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     return false;
   }
 
-  // common ops, make sure no special ops
-  auto op_itr = OP_MAP.find(info->op);
+  // common ops, make sure no special ops.
+  // FP arithmetic (FAdd/FSub/FMul/FDiv) and fp_sqrt may carry a rounding-mode
+  // selector in the high byte of `op` (see instrumentation/TaintPass.cpp and
+  // driver/smttest.cpp); FRem never carries one (frem has no rounding).  cmp
+  // ops keep their predicate packed in the high byte and have per-predicate
+  // OP_MAP entries, so only mask the FP-arith kinds before the lookup.
+  uint16_t op_lo = info->op & 0xff;
+  bool is_fp_arith_rm =
+      op_lo == __dfsan::FAdd || op_lo == __dfsan::FSub ||
+      op_lo == __dfsan::FMul || op_lo == __dfsan::FDiv ||
+      op_lo == __dfsan::fp_sqrt;
+  uint16_t lookup_op = is_fp_arith_rm ? op_lo : info->op;
+  auto op_itr = OP_MAP.find(lookup_op);
   if (op_itr == OP_MAP.end()) {
     WARNF("invalid op: %u\n", info->op);
     return false;
@@ -537,12 +548,13 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   // (exp/exp2/log/log2/log10/log1p) all take a single operand in l1, so they
   // short-circuit here before a (nonexistent) right child is built.  (pow is
   // binary and goes through the normal binary path below.)
+  // fp_sqrt may carry a rounding selector in the high byte, so compare on op_lo.
   bool is_fp_unary =
       info->op == __dfsan::FPToUI || info->op == __dfsan::FPToSI ||
       info->op == __dfsan::UIToFP || info->op == __dfsan::SIToFP ||
       info->op == __dfsan::FPTrunc || info->op == __dfsan::FPExt ||
       info->op == __dfsan::fp_neg || info->op == __dfsan::fp_fabs ||
-      info->op == __dfsan::fp_sqrt || info->op == __dfsan::fp_round ||
+      op_lo == __dfsan::fp_sqrt || info->op == __dfsan::fp_round ||
       info->op == __dfsan::fp_is_nan || info->op == __dfsan::fp_is_inf ||
       info->op == __dfsan::fp_is_finite || info->op == __dfsan::fp_signbit ||
       info->op == __dfsan::fp_lrint ||
@@ -552,12 +564,21 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   if (info->op == __dfsan::ZExt || info->op == __dfsan::SExt ||
       info->op == __dfsan::Extract || info->op == __dfsan::Trunc ||
       is_fp_unary) {
-    uint32_t hash = rgd::xxhash(info->size, ret->kind(), left->hash());
-    ret->set_hash(hash);
     // Extract carries a bit offset in op2; fp_round carries its rounding-mode
-    // selector (fp_rounding_mode) in op1.  Both are stashed in index().
+    // selector (fp_rounding_mode) in op1; constrained fp_sqrt carries its
+    // selector in the high byte of op.  All are stashed in index().
     uint64_t offset = info->op == __dfsan::Extract ? info->op2.i :
-                      (info->op == __dfsan::fp_round ? info->op1.i : 0);
+                      (info->op == __dfsan::fp_round ? info->op1.i :
+                       (op_lo == __dfsan::fp_sqrt ? (info->op >> 8) : 0));
+    uint32_t hash = rgd::xxhash(info->size, ret->kind(), left->hash());
+    // Fold the rounding selector into the hash for FP ops whose codegen depends
+    // on it (fp_round: floor/ceil/trunc; fp_sqrt: directed rounding).  fCache
+    // buckets by hash() and confirms with isEqualAstRecursive, which ignores
+    // index() -- so without this, floor vs ceil (or RNE vs directed sqrt) over
+    // the same child would collide and reuse wrong-mode compiled code.
+    if (info->op == __dfsan::fp_round || op_lo == __dfsan::fp_sqrt)
+      hash = rgd::xxhash(hash, (uint32_t)offset, ret->kind());
+    ret->set_hash(hash);
     ret->set_index(offset);
     return true;
   }
@@ -618,6 +639,17 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   // as long as the operands are the same, we can reuse the AST/function
   uint32_t kind = rgd::isRelationalKind(ret->kind()) ? rgd::Bool : ret->kind();
   uint32_t hash = rgd::xxhash(left->hash(), (kind << 16) | ret->bits(), right->hash());
+  // FP arithmetic (FAdd/FSub/FMul/FDiv; not FRem) may carry a rounding selector
+  // in the high byte of op.  Stash it in index() so the JIT (jit.cc) and the RGD
+  // z3 path (z3-solver.cpp) emit rounding-mode-correct arithmetic, and fold it
+  // into the hash so fCache never reuses wrong-mode code (isEqualAstRecursive
+  // ignores index()).  sqrt is unary and returned above.
+  if (op_lo == __dfsan::FAdd || op_lo == __dfsan::FSub ||
+      op_lo == __dfsan::FMul || op_lo == __dfsan::FDiv) {
+    uint32_t sel = info->op >> 8;
+    ret->set_index(sel);
+    hash = rgd::xxhash(hash, sel, kind);
+  }
   ret->set_hash(hash);
 
   return true;

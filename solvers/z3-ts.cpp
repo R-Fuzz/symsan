@@ -397,6 +397,16 @@ static z3::expr get_rm(z3::context &ctx, uint32_t sel) {
   }
 }
 
+// Rounding mode for FP arithmetic/sqrt carried in the high byte of `op`.
+// Selectors 0 and 1 both mean RNE for arithmetic: plain LLVM fadd/fmul/... (and
+// non-strict compilation) leave the high byte 0, and constrained round.tonearest
+// maps to 1; rna (0) has no MXCSR representation and collides with the default,
+// so it too is treated as RNE here (matches z3-solver.cpp get_arith_rm and the
+// smttest parser, which rejects rna on arithmetic).  2/3/4 are directed.
+static z3::expr get_arith_rm(z3::context &ctx, uint32_t sel) {
+  return get_rm(ctx, sel < 2 ? __dfsan::fp_rm_rne : sel);
+}
+
 // Build a boolean expression for an FCmp with the given LLVM predicate (0..15).
 // lhs/rhs must be fpa-sorted.  Ordered (O*) predicates are false when either
 // operand is NaN; unordered (U*) predicates are true when either is NaN.
@@ -768,21 +778,24 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     // floating-point negate + intrinsics (unary).  Operand in l1; fp_round
     // carries the rounding-mode selector (fp_rounding_mode) in op1.
     else if (info->op == __dfsan::fp_neg || info->op == __dfsan::fp_fabs ||
-             info->op == __dfsan::fp_sqrt || info->op == __dfsan::fp_round) {
+             (info->op & 0xff) == __dfsan::fp_sqrt || info->op == __dfsan::fp_round) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
       unsigned bits = info->size;
       z3::expr fp = bv_to_fp(context_, base, bits);
       double a = fp_decode(value_cache_[info->l1], bits), rv = 0.0;
       z3::expr r(context_);
-      switch (info->op) {
+      // fp_sqrt may carry a rounding selector in the high byte (constrained
+      // llvm.experimental.constrained.sqrt), so dispatch on the base opcode.
+      switch (info->op & 0xff) {
         case __dfsan::fp_neg:
           r = z3::expr(context_, Z3_mk_fpa_neg(context_, fp)); rv = -a; break;
         case __dfsan::fp_fabs:
           r = z3::expr(context_, Z3_mk_fpa_abs(context_, fp)); rv = std::fabs(a); break;
         case __dfsan::fp_sqrt:
-          // runtime union-table path: llvm.sqrt is RNE and carries no rm operand
-          // here (directed sqrt only flows through the RGD path); RNE is correct.
-          r = z3::expr(context_, Z3_mk_fpa_sqrt(context_, get_rm(context_, __dfsan::fp_rm_rne), fp));
+          // Directed rounding (from constrained sqrt) is carried in op's high
+          // byte; plain llvm.sqrt leaves it 0 (RNE).  Note: the seed value `rv`
+          // uses libm sqrt (RNE); the symbolic constraint uses the true mode.
+          r = z3::expr(context_, Z3_mk_fpa_sqrt(context_, get_arith_rm(context_, info->op >> 8), fp));
           rv = std::sqrt(a); break;
         case __dfsan::fp_round: {
           uint32_t sel = (uint32_t)info->op1.i;
@@ -2131,22 +2144,23 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         break;
       }
       // floating-point arithmetic.  op1/op2 are IEEE-754 bit-vectors of `size`;
-      // lift to fpa, compute (rounding = RNE), lower back to BV.  This is the
-      // runtime union-table path: instrumented code always emits plain LLVM `fadd`
-      // etc. (RNE) and the union table carries NO rounding-mode operand for arith
-      // (unlike fp_round, whose selector is in op1.i) -- so RNE is correct here.
-      // Directed SMT-LIB rounding modes only flow through the RGD path
-      // (z3-solver.cpp / jit.cc), which reads the mode from AstNode::index().
+      // lift to fpa, compute, lower back to BV.  The rounding mode is carried in
+      // the high byte of `op`: plain LLVM `fadd`/etc. leave it 0 (RNE), but
+      // targets built with strict FP / FENV_ACCESS emit constrained intrinsics
+      // whose rounding TaintPass.cpp packs there (dynamic modes resolved at
+      // runtime via llvm.get.rounding).  FRem has no rounding.  (SMT-LIB directed
+      // modes flow through the RGD path -- z3-solver.cpp / jit.cc -- via index().)
       case __dfsan::FAdd: case __dfsan::FSub:
       case __dfsan::FMul: case __dfsan::FDiv: case __dfsan::FRem: {
         z3::expr f1 = bv_to_fp(context_, op1, size);
         z3::expr f2 = bv_to_fp(context_, op2, size);
+        z3::expr rm = get_arith_rm(context_, info->op >> 8);
         z3::expr fr(context_);
         switch (info->op & 0xff) {
-          case __dfsan::FAdd: fr = f1 + f2; break;
-          case __dfsan::FSub: fr = f1 - f2; break;
-          case __dfsan::FMul: fr = f1 * f2; break;
-          case __dfsan::FDiv: fr = f1 / f2; break;
+          case __dfsan::FAdd: fr = z3::expr(context_, Z3_mk_fpa_add(context_, rm, f1, f2)); break;
+          case __dfsan::FSub: fr = z3::expr(context_, Z3_mk_fpa_sub(context_, rm, f1, f2)); break;
+          case __dfsan::FMul: fr = z3::expr(context_, Z3_mk_fpa_mul(context_, rm, f1, f2)); break;
+          case __dfsan::FDiv: fr = z3::expr(context_, Z3_mk_fpa_div(context_, rm, f1, f2)); break;
           // NOTE: z3 fpa_rem is the IEEE-754 remainder, which differs from
           // LLVM frem / C fmod for some inputs (sign/magnitude of result).
           case __dfsan::FRem: fr = z3::rem(f1, f2); break;
