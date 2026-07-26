@@ -780,6 +780,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         case __dfsan::fp_fabs:
           r = z3::expr(context_, Z3_mk_fpa_abs(context_, fp)); rv = std::fabs(a); break;
         case __dfsan::fp_sqrt:
+          // runtime union-table path: llvm.sqrt is RNE and carries no rm operand
+          // here (directed sqrt only flows through the RGD path); RNE is correct.
           r = z3::expr(context_, Z3_mk_fpa_sqrt(context_, get_rm(context_, __dfsan::fp_rm_rne), fp));
           rv = std::sqrt(a); break;
         case __dfsan::fp_round: {
@@ -2129,7 +2131,12 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         break;
       }
       // floating-point arithmetic.  op1/op2 are IEEE-754 bit-vectors of `size`;
-      // lift to fpa, compute (rounding = context default RNE), lower back to BV.
+      // lift to fpa, compute (rounding = RNE), lower back to BV.  This is the
+      // runtime union-table path: instrumented code always emits plain LLVM `fadd`
+      // etc. (RNE) and the union table carries NO rounding-mode operand for arith
+      // (unlike fp_round, whose selector is in op1.i) -- so RNE is correct here.
+      // Directed SMT-LIB rounding modes only flow through the RGD path
+      // (z3-solver.cpp / jit.cc), which reads the mode from AstNode::index().
       case __dfsan::FAdd: case __dfsan::FSub:
       case __dfsan::FMul: case __dfsan::FDiv: case __dfsan::FRem: {
         z3::expr f1 = bv_to_fp(context_, op1, size);

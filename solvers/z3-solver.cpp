@@ -88,6 +88,15 @@ static z3::expr get_rm(z3::context &ctx, uint32_t sel) {
   }
 }
 
+// Rounding mode for FP arithmetic (FAdd/FSub/FMul/FDiv/FpSqrt).  Unlike FpRound,
+// these carry no rm in the real runtime -- index()==0 means "RNE default" -- and
+// the smttest parser rejects rna on arithmetic, so selectors 0 and 1 both map to
+// RNE here (keeping legacy RNE formulas unchanged) while 2/3/4 pick the directed
+// mode the SMT-LIB benchmark specified.
+static z3::expr get_arith_rm(z3::context &ctx, uint32_t sel) {
+  return get_rm(ctx, sel < 2 ? 1 : sel);
+}
+
 // Build a boolean expression for an FCmp with the given LLVM predicate (0..15).
 // lhs/rhs must be fpa-sorted.  Ordered (O*) predicates are false when either
 // operand is NaN; unordered (U*) predicates are true when either is NaN.
@@ -279,8 +288,8 @@ z3::expr Z3Solver::serialize(const AstNode* node,
     //   return cache_expr(node->label(), !c1, expr_cache);
     // }
     // floating-point arithmetic.  FP operands/results are IEEE-754 bit-vectors of
-    // the same width; lift both children to fpa, compute (rounding = context
-    // default RNE), lower back to BV.
+    // the same width; lift both children to fpa, compute with the node's rounding
+    // mode (index(); 0/1 == RNE default), lower back to BV.
     case rgd::FAdd:
     case rgd::FSub:
     case rgd::FMul:
@@ -291,14 +300,16 @@ z3::expr Z3Solver::serialize(const AstNode* node,
       unsigned bits = node->children(0).bits();
       z3::expr f1 = bv_to_fp(context_, c1, bits);
       z3::expr f2 = bv_to_fp(context_, c2, bits);
+      z3::expr rm = get_arith_rm(context_, node->index());
       z3::expr fr(context_);
       switch (node->kind()) {
-        case rgd::FAdd: fr = f1 + f2; break;
-        case rgd::FSub: fr = f1 - f2; break;
-        case rgd::FMul: fr = f1 * f2; break;
-        case rgd::FDiv: fr = f1 / f2; break;
+        case rgd::FAdd: fr = z3::expr(context_, Z3_mk_fpa_add(context_, rm, f1, f2)); break;
+        case rgd::FSub: fr = z3::expr(context_, Z3_mk_fpa_sub(context_, rm, f1, f2)); break;
+        case rgd::FMul: fr = z3::expr(context_, Z3_mk_fpa_mul(context_, rm, f1, f2)); break;
+        case rgd::FDiv: fr = z3::expr(context_, Z3_mk_fpa_div(context_, rm, f1, f2)); break;
         // NOTE: z3 fpa_rem is the IEEE-754 remainder, which differs from
         // LLVM frem / C fmod for some inputs (sign/magnitude of result).
+        // fp.rem carries no rounding mode (the result is exact).
         case rgd::FRem: fr = z3::rem(f1, f2); break;
       }
       return cache_expr(node->label(), fp_to_bv(fr), expr_cache);
@@ -372,7 +383,7 @@ z3::expr Z3Solver::serialize(const AstNode* node,
         case rgd::FpFabs:
           r = z3::expr(context_, Z3_mk_fpa_abs(context_, fp)); break;
         case rgd::FpSqrt:
-          r = z3::expr(context_, Z3_mk_fpa_sqrt(context_, get_rm(context_, 1 /*rne*/), fp)); break;
+          r = z3::expr(context_, Z3_mk_fpa_sqrt(context_, get_arith_rm(context_, node->index()), fp)); break;
         case rgd::FpRound:
           r = z3::expr(context_, Z3_mk_fpa_round_to_integral(context_, get_rm(context_, node->index()), fp)); break;
       }

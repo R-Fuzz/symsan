@@ -14,6 +14,10 @@ int addFunction(const AstNode* node,
 
 test_fn_type performJit(uint64_t id);
 
+// Phase-0 spike: verify the JIT honors directed FP rounding (constrained
+// intrinsics + llvm.set.rounding).  Returns 0 on success.
+int spike_fp_rounding();
+
 bool gd_entry(std::shared_ptr<SearchTask> task);
 
 }

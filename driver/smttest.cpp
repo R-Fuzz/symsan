@@ -43,6 +43,10 @@
 #include "task.h"
 #include "solver.h"
 
+// Phase-0 spike entry (defined in solvers/jigsaw/jit.cc); forward-declared here
+// to avoid pulling the jigsaw JIT headers into the front-end.
+namespace rgd { int spike_fp_rounding(); }
+
 #include "dfsan/dfsan.h"
 
 #include <cctype>
@@ -1081,8 +1085,25 @@ private:
     return false;
   }
 
-  // FP arithmetic ops (some take a leading rounding-mode argument, which we skip
-  // because the JIT uses the native/default rounding mode).
+  // Map an SMT-LIB rounding-mode token to the fp_rounding_mode selector
+  // (0=rna, 1=rne, 2=rtp, 3=rtn, 4=rtz), matching jit.cc / z3-solver.cpp.
+  static uint32_t parse_rm(const std::string &rm) {
+    if (rm == "roundNearestTiesToAway"  || rm == "RNA") return 0;
+    if (rm == "roundNearestTiesToEven"  || rm == "RNE") return 1;
+    if (rm == "roundTowardPositive"     || rm == "RTP") return 2;
+    if (rm == "roundTowardNegative"     || rm == "RTN") return 3;
+    if (rm == "roundTowardZero"         || rm == "RTZ") return 4;
+    throw Unsupported{"rounding mode " + rm};
+  }
+
+  // FP arithmetic ops.  fp.add/sub/mul/div/sqrt/roundToIntegral carry a leading
+  // rounding-mode argument.  We parse it into the fp_rounding_mode selector and
+  // stash it in the node's index(), so the JIT (jit.cc) can emit rounding-mode-
+  // correct arithmetic and the z3 backends use the matching Z3_mk_fpa rounding.
+  // The selector is folded into the node hash (below) because the JIT'd-function
+  // cache (fCache) keys on the AST hash and isEqualAst does NOT compare index()
+  // -- otherwise e.g. (fp.mul RNE ...) and (fp.mul RTN ...) would collide and
+  // one mode's compiled code would be wrongly reused for the other.
   TermInfo build_fp_op(const SExpr &e, const Env &env,
                        const std::shared_ptr<Constraint> &c, AstNode *ret) {
     const std::string &op = e.list[0].atom;
@@ -1111,18 +1132,45 @@ private:
       ret->set_hash(xxhash(l->hash(), ((uint32_t)kind << 16) | li.bits, r->hash()));
       return {li.bits, true};
     };
+    // rounding-mode-carrying variants: parse rm at rm_idx, set_index(sel), and
+    // mix sel into the hash so distinct modes get distinct cache keys.
+    // rna (ties-to-away) is rejected on FP arithmetic: x86 has no MXCSR
+    // representation for it, so the JIT can't honor it (jit.cc bails on it too).
+    // The runtime (parsers/rgd-parser.cpp) leaves index()==0 on FP-arith nodes
+    // to mean "RNE default", so jit.cc/z3 treat selector 0 and 1 both as RNE;
+    // that makes rna==0 indistinguishable from the default, hence the bail here.
+    auto build_binary_rm = [&](uint16_t kind, size_t rm_idx, size_t a, size_t b)
+        -> TermInfo {
+      if (e.list.size() <= b) throw ParseError{"bad " + op};
+      uint32_t sel = parse_rm(e.list[rm_idx].atom);
+      if (sel == 0) throw Unsupported{"rna rounding on FP arithmetic"};
+      TermInfo ti = build_binary(kind, a, b);
+      ret->set_index(sel);
+      ret->set_hash(xxhash(ret->hash(), sel, kind));
+      return ti;
+    };
+    auto build_unary_rm = [&](uint16_t kind, size_t rm_idx, size_t argidx)
+        -> TermInfo {
+      if (e.list.size() <= argidx) throw ParseError{"bad " + op};
+      uint32_t sel = parse_rm(e.list[rm_idx].atom);
+      if (sel == 0) throw Unsupported{"rna rounding on FP arithmetic"};
+      TermInfo ti = build_unary(kind, argidx);
+      ret->set_index(sel);
+      ret->set_hash(xxhash(ret->hash(), sel, kind));
+      return ti;
+    };
 
     // rounding-mode-carrying binary ops: (fp.add rm a b)
-    if (op == "fp.add") return build_binary(FAdd, 2, 3);
-    if (op == "fp.sub") return build_binary(FSub, 2, 3);
-    if (op == "fp.mul") return build_binary(FMul, 2, 3);
-    if (op == "fp.div") return build_binary(FDiv, 2, 3);
+    if (op == "fp.add") return build_binary_rm(FAdd, 1, 2, 3);
+    if (op == "fp.sub") return build_binary_rm(FSub, 1, 2, 3);
+    if (op == "fp.mul") return build_binary_rm(FMul, 1, 2, 3);
+    if (op == "fp.div") return build_binary_rm(FDiv, 1, 2, 3);
     // no rounding mode
     if (op == "fp.rem") return build_binary(FRem, 1, 2);
     if (op == "fp.min") return build_binary(FpMin, 1, 2);
     if (op == "fp.max") return build_binary(FpMax, 1, 2);
     // rounding-mode-carrying unary: (fp.sqrt rm x)
-    if (op == "fp.sqrt") return build_unary(FpSqrt, 2);
+    if (op == "fp.sqrt") return build_unary_rm(FpSqrt, 1, 2);
     // no rounding mode
     if (op == "fp.neg") return build_unary(FNeg, 1);
     if (op == "fp.abs") return build_unary(FpFabs, 1);
@@ -1130,14 +1178,7 @@ private:
     if (op == "fp.roundToIntegral") {
       // (fp.roundToIntegral rm x) -- map rm to the fp_rounding_mode selector.
       if (e.list.size() != 3) throw ParseError{"bad roundToIntegral"};
-      uint32_t sel;
-      const std::string &rm = e.list[1].atom;
-      if (rm == "roundNearestTiesToAway" || rm == "RNA") sel = 0;
-      else if (rm == "roundNearestTiesToEven" || rm == "RNE") sel = 1;
-      else if (rm == "roundTowardPositive" || rm == "RTP") sel = 2;
-      else if (rm == "roundTowardNegative" || rm == "RTN") sel = 3;
-      else if (rm == "roundTowardZero" || rm == "RTZ") sel = 4;
-      else throw Unsupported{"rounding mode " + rm};
+      uint32_t sel = parse_rm(e.list[1].atom);
       ret->set_kind(FpRound);
       AstNode *ch = ret->add_children();
       if (!ch) throw Unsupported{"AST too large"};
@@ -1145,7 +1186,10 @@ private:
       ret->set_bits(ci.bits);
       ret->set_index(sel);
       c->ops[FpRound] = true;
-      ret->set_hash(xxhash(ci.bits, FpRound, ch->hash()));
+      // fold the rounding selector into the hash: jit.cc emits a different
+      // intrinsic per mode (floor/ceil/trunc/...), so two roundToIntegral nodes
+      // that differ only in rm must not share a cached compiled function.
+      ret->set_hash(xxhash(xxhash(ci.bits, FpRound, ch->hash()), sel, FpRound));
       return {ci.bits, true};
     }
 
@@ -1209,18 +1253,49 @@ int main(int argc, char **argv) {
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    if (a == "--z3") use_z3 = true;
+    if (a == "--spike-fp-rounding") {
+      // Phase-0 feasibility spike (throwaway): does the JIT honor directed FP
+      // rounding?  Construct a JITSolver to initialize the LLVM/ORC JIT, then
+      // run the self-contained check in solvers/jigsaw/jit.cc.
+      JITSolver init;  // initializes the native target + JIT global
+      return rgd::spike_fp_rounding();
+    }
+    else if (a == "--z3") use_z3 = true;
     else if (a == "--no-jigsaw") use_jigsaw = false;
     else if (a == "--time") report_time = true;
+    else if (a == "--seed" || a.rfind("--seed=", 0) == 0) {
+      // Fix the jigsaw PRNG seed for deterministic strategy comparison.
+      // Accepts "--seed N" or "--seed=N"; propagated to MutInput via JIGSAW_SEED.
+      const char *val = nullptr;
+      if (a == "--seed") { if (i + 1 < argc) val = argv[++i]; }
+      else val = a.c_str() + 7;
+      if (!val) {
+        fprintf(stderr, "--seed requires a value\n");
+        return 2;
+      }
+      setenv("JIGSAW_SEED", val, 1);
+    }
+    else if (a == "--budget" || a.rfind("--budget=", 0) == 0) {
+      // Override the jigsaw per-task attempt budget (default MAX_EXEC_TIMES).
+      // Accepts "--budget N" or "--budget=N"; propagated via JIGSAW_MAX_EXEC.
+      const char *val = nullptr;
+      if (a == "--budget") { if (i + 1 < argc) val = argv[++i]; }
+      else val = a.c_str() + 9;
+      if (!val) {
+        fprintf(stderr, "--budget requires a value\n");
+        return 2;
+      }
+      setenv("JIGSAW_MAX_EXEC", val, 1);
+    }
     else if (a == "-h" || a == "--help") {
-      fprintf(stderr, "Usage: %s [--z3] [--no-jigsaw] [--time] file.smt2\n", argv[0]);
+      fprintf(stderr, "Usage: %s [--z3] [--no-jigsaw] [--time] [--seed N] [--budget N] file.smt2\n", argv[0]);
       return 2;
     } else {
       path = argv[i];
     }
   }
   if (!path) {
-    fprintf(stderr, "Usage: %s [--z3] [--no-jigsaw] [--time] file.smt2\n", argv[0]);
+    fprintf(stderr, "Usage: %s [--z3] [--no-jigsaw] [--time] [--seed N] [--budget N] file.smt2\n", argv[0]);
     return 2;
   }
 
@@ -1346,6 +1421,14 @@ int main(int argc, char **argv) {
       }
       if (r == SOLVER_SAT) {
         solve_us = us_since(t_solve);
+        // JIGSAW_DUMP_MODEL=<path>: write the offset-indexed model buffer so a
+        // known-good assignment (e.g. from z3 via --z3 --no-jigsaw) can be fed
+        // back to jigsaw as JIGSAW_TARGET for the search trace (gd.cc).
+        if (const char *mp = getenv("JIGSAW_DUMP_MODEL")) {
+          size_t n = out_size ? out_size : out_buf.size();
+          FILE *mf = fopen(mp, "wb");
+          if (mf) { fwrite(out_buf.data(), 1, n, mf); fclose(mf); }
+        }
         printf("sat\n");
         print_model(tr, out_buf.data(), out_size ? out_size : out_buf.size());
         emit_time();

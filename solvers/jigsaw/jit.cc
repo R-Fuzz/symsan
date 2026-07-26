@@ -7,6 +7,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/FPEnv.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -18,6 +19,9 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 
 #include <cassert>
+#include <cfenv>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <unordered_map>
 
@@ -161,6 +165,39 @@ static llvm::Value* build_srem(llvm::IRBuilder<> &B, llvm::Value* a,
 #else
   return r; // legacy: divisor forced to 1 -> x % 1 == 0
 #endif
+}
+
+// Walk the AST collecting the rounding mode used by rm-carrying FP arithmetic
+// (FAdd/FSub/FMul/FDiv and FpSqrt).  fp.rem has no rounding mode, and FpRound
+// carries its own selector but lowers to a mode-independent intrinsic
+// (floor/ceil/trunc/...), so both are skipped here.  The rm selector convention
+// is 0=rna,1=rne,2=rtp,3=rtn,4=rtz; the real runtime leaves index()==0 on
+// FP-arith nodes (RNE default) and the smttest parser rejects rna on arith, so
+// selectors 0 and 1 are both treated as RNE.  Accumulates into `acc`:
+//   -2 = none seen yet, -1 = bail, 0 = RNE, 2/3/4 = single directed mode.
+// Sets acc to -1 as soon as two distinct modes are seen (RNE mixed with a
+// directed mode counts as mixed): the single-mode-per-formula JIT can honor
+// only one MXCSR rounding mode, so mixed formulas fall back to z3.
+static void collect_fp_mode(const AstNode* node, int& acc) {
+  if (acc == -1) return; // already decided to bail
+  uint32_t k = node->kind();
+  if (k == rgd::FAdd || k == rgd::FSub || k == rgd::FMul ||
+      k == rgd::FDiv || k == rgd::FpSqrt) {
+    uint32_t sel = node->index();
+    int m = (sel >= 2 && sel <= 4) ? (int)sel : 0; // 0/1 -> RNE
+    if (acc == -2) acc = m;
+    else if (acc != m) { acc = -1; return; }
+  }
+  for (int i = 0; i < node->children_size(); ++i)
+    collect_fp_mode(&node->children(i), acc);
+}
+
+// Returns the formula's single FP rounding mode: 0 (RNE / no directed FP arith),
+// 2/3/4 (a single directed mode used throughout), or -1 (mixed -> caller bails).
+static int detect_fp_mode(const AstNode* node) {
+  int acc = -2;
+  collect_fp_mode(node, acc);
+  return acc == -2 ? 0 : acc;
 }
 
 static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
@@ -489,12 +526,27 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       llvm::Value* c2 = as_fp(Builder,
           codegen(Builder, rc2, local_map, arg, value_cache), rc2->bits());
       llvm::Value* r;
-      switch (node->kind()) {
-        case rgd::FAdd: r = Builder.CreateFAdd(c1, c2); break;
-        case rgd::FSub: r = Builder.CreateFSub(c1, c2); break;
-        case rgd::FMul: r = Builder.CreateFMul(c1, c2); break;
-        case rgd::FDiv: r = Builder.CreateFDiv(c1, c2); break;
-        default:        r = Builder.CreateFRem(c1, c2); break;
+      // Under a directed rounding mode (addFunction put the Builder in
+      // constrained-FP mode and set MXCSR) emit constrained intrinsics so the
+      // opt passes constant-fold in the chosen mode instead of RNE.  fp.rem has
+      // no rounding mode, so it always uses the plain (exact) frem.
+      if (Builder.getIsFPConstrained() && node->kind() != rgd::FRem) {
+        llvm::Intrinsic::ID cid;
+        switch (node->kind()) {
+          case rgd::FAdd: cid = llvm::Intrinsic::experimental_constrained_fadd; break;
+          case rgd::FSub: cid = llvm::Intrinsic::experimental_constrained_fsub; break;
+          case rgd::FMul: cid = llvm::Intrinsic::experimental_constrained_fmul; break;
+          default:        cid = llvm::Intrinsic::experimental_constrained_fdiv; break;
+        }
+        r = Builder.CreateConstrainedFPBinOp(cid, c1, c2);
+      } else {
+        switch (node->kind()) {
+          case rgd::FAdd: r = Builder.CreateFAdd(c1, c2); break;
+          case rgd::FSub: r = Builder.CreateFSub(c1, c2); break;
+          case rgd::FMul: r = Builder.CreateFMul(c1, c2); break;
+          case rgd::FDiv: r = Builder.CreateFDiv(c1, c2); break;
+          default:        r = Builder.CreateFRem(c1, c2); break;
+        }
       }
       ret = as_bits(Builder, r, node->bits());
       break;
@@ -558,6 +610,16 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       const AstNode* rc = &node->children(0);
       llvm::Value* c = as_fp(Builder,
           codegen(Builder, rc, local_map, arg, value_cache), rc->bits());
+      // fp.sqrt is the only rm-carrying op here: under a directed rounding mode
+      // emit the constrained sqrt so folding/rounding follow the chosen mode.
+      if (node->kind() == rgd::FpSqrt && Builder.getIsFPConstrained()) {
+        llvm::Function* decl = llvm::Intrinsic::getDeclaration(
+            Builder.GetInsertBlock()->getModule(),
+            llvm::Intrinsic::experimental_constrained_sqrt, {c->getType()});
+        ret = as_bits(Builder, Builder.CreateConstrainedFPCall(decl, {c}),
+                      node->bits());
+        break;
+      }
       llvm::Intrinsic::ID id;
       switch (node->kind()) {
         case rgd::FpFabs:  id = llvm::Intrinsic::fabs;  break;
@@ -729,6 +791,33 @@ int rgd::addFunction(const AstNode* node,
   Builder.SetInsertPoint(po);
   uint32_t idx = 0;
 
+  // Determine the formula's FP rounding mode.  0 (RNE / no directed FP arith)
+  // uses the plain native path unchanged; a single directed mode (2/3/4) needs
+  // constrained intrinsics + MXCSR; mixed modes (-1) bail so the driver falls
+  // back to z3 (which handles per-op rounding).  See detect_fp_mode above.
+  int fpmode = detect_fp_mode(node);
+  if (fpmode < 0) return -1; // mixed rounding modes: single-mode JIT can't honor
+  bool directed = (fpmode >= 2);
+  if (directed) {
+    // x86 has no per-instruction rounding: the constrained intrinsics' constant
+    // mode is only an assumption the FP env is set that way, so we must ALSO set
+    // MXCSR at entry (and restore RNE before returning, so the solver process's
+    // own FP is not left in a directed mode).  See the Phase-0 spike below.
+    llvm::RoundingMode rmode;
+    int flt_rounds; // llvm.set.rounding arg (FLT_ROUNDS): rtz=0,rne=1,rtp=2,rtn=3
+    switch (fpmode) {
+      case 2:  rmode = llvm::RoundingMode::TowardPositive; flt_rounds = 2; break; // rtp
+      case 3:  rmode = llvm::RoundingMode::TowardNegative; flt_rounds = 3; break; // rtn
+      default: rmode = llvm::RoundingMode::TowardZero;     flt_rounds = 0; break; // rtz
+    }
+    fooFunc->addFnAttr(llvm::Attribute::StrictFP);
+    Builder.setIsFPConstrained(true);
+    Builder.setDefaultConstrainedRounding(rmode);
+    Builder.setDefaultConstrainedExcept(llvm::fp::ebIgnore);
+    Builder.CreateIntrinsic(llvm::Intrinsic::set_rounding, {},
+        {Builder.getInt32(flt_rounds)});
+  }
+
   auto args = fooFunc->arg_begin();
   llvm::Value* var = &(*args);
   std::unordered_map<uint32_t, llvm::Value*> value_cache;
@@ -743,6 +832,11 @@ int rgd::addFunction(const AstNode* node,
     std::cerr << "non-comparison expr\n";
     return -1;
   }
+  if (directed) {
+    // restore round-to-nearest so subsequent FP in the solver process is RNE
+    Builder.CreateIntrinsic(llvm::Intrinsic::set_rounding, {},
+        {Builder.getInt32(1)});
+  }
   Builder.CreateRet(body);
 
   llvm::raw_ostream *stream = &llvm::outs();
@@ -754,6 +848,116 @@ int rgd::addFunction(const AstNode* node,
   JIT->addModule(std::move(TheModule), std::move(TheCtx));
 
   return 0;
+}
+
+// --- Phase-0 spike: does the JIT honor directed FP rounding? --------------
+// Load-bearing feasibility check before plumbing SMT-LIB rounding modes through
+// the AST.  x86 has no per-instruction rounding (mode lives in MXCSR), and a
+// constrained intrinsic's *constant* rounding mode is only an ASSUMPTION the FP
+// environment is set that way -- so directed rounding at JIT runtime needs BOTH
+// a constrained intrinsic (so the 4 opt passes constant-fold in the right mode
+// instead of RNE) AND llvm.set.rounding to actually set MXCSR.  This builds a
+// function computing 0.1+0.2 two ways under roundTowardNegative (a case where
+// RNE gives 0x3FD3333333333334 but RTN gives 0x3FD3333333333333 -- 1 ULP apart):
+//   out[0] = constrained.fadd(0.1, 0.2)   -- CONSTANT: tests compile-time folding
+//   out[1] = constrained.fadd(x, 0.2)     -- SYMBOLIC x=out[0]: tests runtime MXCSR
+// runs the same optimizeModule passes, JITs it, and checks both equal RTN(0.1+0.2).
+// Returns 0 on success, non-zero if the mechanism does not produce directed rounding.
+int rgd::spike_fp_rounding() {
+  auto TheCtx = std::make_unique<llvm::LLVMContext>();
+  auto TheModule = std::make_unique<Module>("spike_m", *TheCtx);
+  TheModule->setDataLayout(JIT->getDataLayout());
+  llvm::IRBuilder<> Builder(*TheCtx);
+
+  auto *I64 = Builder.getInt64Ty();
+  auto *Dbl = Builder.getDoubleTy();
+  std::vector<llvm::Type*> input_type(1, llvm::PointerType::getUnqual(I64));
+  auto *funcType = llvm::FunctionType::get(Builder.getVoidTy(), input_type, false);
+  auto *fooFunc = llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
+      "spikefn", TheModule.get());
+  fooFunc->addFnAttr(llvm::Attribute::StrictFP);
+  auto *po = llvm::BasicBlock::Create(Builder.getContext(), "entry", fooFunc);
+  Builder.SetInsertPoint(po);
+
+  // constrained-FP mode: emit strictfp calls with our chosen rounding/exception.
+  Builder.setIsFPConstrained(true);
+  Builder.setDefaultConstrainedRounding(llvm::RoundingMode::TowardNegative);
+  Builder.setDefaultConstrainedExcept(llvm::fp::ebIgnore);
+
+  auto args = fooFunc->arg_begin();
+  llvm::Value* arg = &(*args);
+
+  // set MXCSR to round-toward-negative (FLT_ROUNDS: -inf == 3)
+  Builder.CreateIntrinsic(llvm::Intrinsic::set_rounding, {},
+      {Builder.getInt32(3)});
+
+  auto *P1 = llvm::ConstantFP::get(Dbl, 0.1);
+  auto *P2 = llvm::ConstantFP::get(Dbl, 0.2);
+
+  // out[0] = 0.1 + 0.2  (both constant -> exercises compile-time folding)
+  llvm::Value* cst = Builder.CreateConstrainedFPBinOp(
+      llvm::Intrinsic::experimental_constrained_fadd, P1, P2, nullptr, "",
+      nullptr, llvm::RoundingMode::TowardNegative, llvm::fp::ebIgnore);
+
+  // x = out[0] (runtime value = 0.1), out[1] = x + 0.2  (symbolic -> exercises MXCSR)
+  llvm::Value* p0 = Builder.CreateGEP(I64, arg, Builder.getInt64(0));
+  llvm::Value* xb = Builder.CreateLoad(I64, p0);
+  llvm::Value* x  = Builder.CreateBitCast(xb, Dbl);
+  llvm::Value* dyn = Builder.CreateConstrainedFPBinOp(
+      llvm::Intrinsic::experimental_constrained_fadd, x, P2, nullptr, "",
+      nullptr, llvm::RoundingMode::TowardNegative, llvm::fp::ebIgnore);
+
+  Builder.CreateStore(Builder.CreateBitCast(cst, I64), p0);
+  llvm::Value* p1 = Builder.CreateGEP(I64, arg, Builder.getInt64(1));
+  Builder.CreateStore(Builder.CreateBitCast(dyn, I64), p1);
+
+  // restore round-to-nearest before returning
+  Builder.CreateIntrinsic(llvm::Intrinsic::set_rounding, {},
+      {Builder.getInt32(1)});
+  Builder.CreateRetVoid();
+
+  if (llvm::verifyFunction(*fooFunc, &llvm::errs())) {
+    std::cerr << "[spike] verifyFunction FAILED\n";
+    return 2;
+  }
+  if (getenv("SPIKE_DUMP_IR")) TheModule->print(llvm::errs(), nullptr);
+  JIT->addModule(std::move(TheModule), std::move(TheCtx));
+
+  auto sym = JIT->lookup("spikefn").get();
+#if LLVM_VERSION_MAJOR >= 17
+  auto fn = (void(*)(uint64_t*))sym.getAddress().getValue();
+#else
+  auto fn = (void(*)(uint64_t*))sym.getAddress();
+#endif
+
+  // reference values computed with the C FP environment.  volatile a/b defeat
+  // compile-time folding so the division happens under the set rounding mode.
+  volatile double a = 0.1, b = 0.2;
+  std::fesetround(FE_TONEAREST); volatile double rne = a + b;
+  std::fesetround(FE_DOWNWARD);  volatile double rtn = a + b;
+  std::fesetround(FE_TONEAREST);
+  uint64_t rne_b, rtn_b;
+  { double d = rne; memcpy(&rne_b, &d, 8); }
+  { double d = rtn; memcpy(&rtn_b, &d, 8); }
+
+  uint64_t out[2]; double init = 0.1; memcpy(&out[0], &init, 8); out[1] = 0;
+  fn(out);
+
+  auto show = [](const char* tag, uint64_t got, uint64_t rtn, uint64_t rne) {
+    double g; memcpy(&g, &got, 8);
+    bool ok = (got == rtn);
+    fprintf(stderr, "[spike] %-18s got=%.17g (0x%016lx)  RTN=0x%016lx RNE=0x%016lx  %s\n",
+            tag, g, (unsigned long)got, (unsigned long)rtn, (unsigned long)rne,
+            ok ? "OK (directed)" : (got == rne ? "FAIL (RNE!)" : "FAIL (other)"));
+    return ok;
+  };
+  fprintf(stderr, "[spike] RTN(1/3) and RNE(1/3) differ: %s\n",
+          rtn_b != rne_b ? "yes" : "NO -- test is degenerate!");
+  bool ok0 = show("const-folded", out[0], rtn_b, rne_b);
+  bool ok1 = show("runtime-symbolic", out[1], rtn_b, rne_b);
+  fprintf(stderr, "[spike] RESULT: %s\n",
+          (ok0 && ok1) ? "PASS -- JIT honors directed rounding" : "FAIL");
+  return (ok0 && ok1) ? 0 : 1;
 }
 
 test_fn_type rgd::performJit(uint64_t id) {
