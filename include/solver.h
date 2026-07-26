@@ -48,6 +48,9 @@ private:
 
   z3::context &context_;
   z3::solver solver_;
+  // auxiliary range constraints emitted while serializing partial FP casts
+  // (fpa.to_sbv/to_ubv); collected during serialize() and added before check().
+  std::vector<z3::expr> aux_constraints_;
 };
 
 class JITSolver : public Solver {
@@ -57,6 +60,13 @@ public:
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
   void print_stats(int fd) override;
+  // timing accessors (microseconds), cumulative across solve() calls:
+  //   codegen  = AST -> LLVM IR (addFunction)
+  //   jit      = LLVM IR -> native code (performJit)
+  //   solving  = gradient-descent search (gd_entry)
+  uint64_t get_codegen_time() const { return process_time.load(); }
+  uint64_t get_jit_time() const { return jit_time.load(); }
+  uint64_t get_solving_time() const { return solving_time.load(); }
 private:
   std::atomic_ulong uuid;
   std::atomic_ulong cache_hits;
@@ -79,8 +89,27 @@ private:
   uint64_t matches;
   uint64_t mismatches;
   std::bitset<rgd::LastOp> binop_mask;
+  // bits for the FP op kinds that input-to-state cannot invert (FRem, FNeg, and
+  // all FP casts and intrinsics/libcalls).  A constraint touching any of these
+  // is rejected and falls back to z3.  A "direct" FCmp (input bytes -> FCmp
+  // against a constant) sets no bit here and is handled by solve_fcmp.
+  std::bitset<rgd::LastOp> fp_ops_mask;
+  // bits for the invertible FP binops (FAdd/FSub/FMul/FDiv, plus FpPow) that
+  // solve_fcmp can reverse against a constant operand (x + C <cmp> K -> write
+  // K-C into input).  These are deliberately NOT in fp_ops_mask so such a
+  // constraint reaches solve_fcmp instead of being rejected.
+  std::bitset<rgd::LastOp> fp_arith_mask;
+  // bits for the invertible unary FP transcendentals (exp/exp2/log/log2/log10/
+  // log1p) that solve_fcmp reverses via the numeric libm inverse (log for exp,
+  // ...) and verifies.  Also kept out of fp_ops_mask so they reach solve_fcmp.
+  std::bitset<rgd::LastOp> fp_trans_mask;
 
   solver_result_t solve_icmp(std::shared_ptr<const Constraint> const& c,
+                             std::unique_ptr<ConsMeta> const& cm,
+                             uint32_t comparison,
+                             const uint8_t *in_buf, size_t in_size,
+                             uint8_t *out_buf, size_t &out_size);
+  solver_result_t solve_fcmp(std::shared_ptr<const Constraint> const& c,
                              std::unique_ptr<ConsMeta> const& cm,
                              uint32_t comparison,
                              const uint8_t *in_buf, size_t in_size,

@@ -165,11 +165,33 @@ static cl::opt<bool> ClTraceGEPOffset(
     cl::desc("Trace GEP offset for solving."),
     cl::Hidden, cl::init(true));
 
-// Experimental feature, trace floating point operations
+// Trace floating point operations (FP arithmetic, casts, FCmp, and common FP
+// intrinsics).  Reconstructed and solved by the z3 solver via the fpa theory.
 static cl::opt<bool> ClTraceFP(
     "taint-trace-float-pointer",
     cl::desc("Propagate taint for floating pointer instructions."),
-    cl::Hidden, cl::init(false));
+    cl::Hidden, cl::init(true));
+
+// Self-defined FP op codes.  These MUST match the __dfsan::operators enum in
+// runtime/dfsan/dfsan.h (last_llvm_op = 67 on LLVM 18).  This file does not
+// include dfsan.h, so — like the bswap Extract/Concat codes — they are hardcoded.
+enum {
+  DfsanFpNeg      = 89, // fp_neg      (last_llvm_op + 22)
+  DfsanFpFabs     = 90, // fp_fabs
+  DfsanFpSqrt     = 91, // fp_sqrt
+  DfsanFpRound    = 92, // fp_round (rounding selector in op1)
+  DfsanFpMin      = 93, // fp_min
+  DfsanFpMax      = 94, // fp_max
+  DfsanFpCopysign = 95, // fp_copysign
+};
+// Rounding-mode selector (must match __dfsan::fp_rounding_mode in dfsan.h).
+enum {
+  DfsanFpRmRna = 0, // round nearest, ties to away  (llvm.round)
+  DfsanFpRmRne = 1, // round nearest, ties to even  (llvm.rint/nearbyint)
+  DfsanFpRmRtp = 2, // round toward +inf            (llvm.ceil)
+  DfsanFpRmRtn = 3, // round toward -inf            (llvm.floor)
+  DfsanFpRmRtz = 4, // round toward zero            (llvm.trunc)
+};
 
 static cl::opt<bool> ClTraceLoop(
     "taint-trace-loop",
@@ -679,7 +701,7 @@ public:
     return TF.F->getParent()->getDataLayout();
   }
 
-  //void visitUnaryOperator(UnaryOperator &UO);
+  void visitUnaryOperator(UnaryOperator &UO);
   void visitBinaryOperator(BinaryOperator &BO);
   void visitCastInst(CastInst &CI);
   void visitCmpInst(CmpInst &CI);
@@ -3446,11 +3468,23 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
   TF.storeShadow(SI.getPointerOperand(), VT, Size, SI.getAlign(), Shadow, &SI);
 }
 
-//void TaintVisitor::visitUnaryOperator(UnaryOperator &UO) {
-//}
+void TaintVisitor::visitUnaryOperator(UnaryOperator &UO) {
+  // The only unary operator in LLVM IR is FNeg.  LLVM's FNeg opcode is a unary
+  // instruction which is not part of the __dfsan::operators enum (only binary,
+  // memory, cast and other insts are expanded from Instruction.def), so we map
+  // it to the self-defined __dfsan::fp_neg.
+  if (UO.getOpcode() != Instruction::FNeg) return;
+  if (!ClTraceFP) return;
+  Value *Shadow1 = TF.getShadow(UO.getOperand(0));
+  // combineShadows reads UO.getOperand(0) directly and bitcasts the FP operand
+  // to an integer before the union call; the second operand stays zero.
+  Value *CombinedShadow =
+    TF.combineShadows(Shadow1, TF.TT.ZeroPrimitiveShadow, DfsanFpNeg, &UO);
+  TF.setShadow(&UO, CombinedShadow);
+}
 
 void TaintVisitor::visitBinaryOperator(BinaryOperator &BO) {
-  if (BO.getType()->isFloatingPointTy()) return;
+  if (BO.getType()->isFloatingPointTy() && !ClTraceFP) return;
   Value *CombinedShadow =
     TF.combineBinaryOperatorShadows(&BO, BO.getOpcode());
   TF.setShadow(&BO, CombinedShadow);
@@ -4228,6 +4262,197 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
 void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
   // filter some obvious ones
   StringRef FN = F->getName();
+
+  // Constrained FP intrinsics (llvm.experimental.constrained.*) carry an
+  // explicit rounding-mode operand.  Default (non-strict) compilation never
+  // emits them -- plain fadd/fmul/... are round-to-nearest -- but targets built
+  // with strict FP / FENV_ACCESS (e.g. code that calls fesetround) do.  Capture
+  // them HERE, before the blanket "llvm.experimental" filter below drops all
+  // taint, so the solver sees rounding-mode-correct arithmetic.  The rounding
+  // selector is packed into the high byte of `op` (the same slot cmp uses for
+  // its predicate; FP arithmetic never carries a predicate).  A compile-time
+  // constant mode packs a constant; the common round.dynamic case reads the live
+  // MXCSR via @llvm.get.rounding at runtime and ORs the mapped selector into
+  // `op` -- so `op` is a runtime value there, not a constant.  This mirrors what
+  // the SMT-LIB benchmark path (driver/smttest.cpp) already carries in
+  // AstNode::index(); the read sides are parsers/rgd-parser.cpp (RGD/jigsaw) and
+  // solvers/z3-ts.cpp (fgtest union-table path).
+  if (ClTraceFP) {
+    Intrinsic::ID CId = F->getIntrinsicID();
+
+    // Constrained fcmp/fcmps: comparisons don't round, but strict FP lowers even
+    // `a < b` to these intrinsics, so without capturing them the branch loses all
+    // taint.  Model exactly like a regular fcmp (combineCmpInstShadows): op =
+    // FCmp with the LLVM predicate in the high byte, op1/op2 = operand bit
+    // patterns, size = operand width.  (fcmps is the signaling variant; the
+    // quiet/signaling distinction is a NaN-exception detail, irrelevant here.)
+    if (CId == Intrinsic::experimental_constrained_fcmp ||
+        CId == Intrinsic::experimental_constrained_fcmps) {
+      Value *S1 = TF.getShadow(CB.getArgOperand(0));
+      Value *S2 = TF.getShadow(CB.getArgOperand(1));
+      if (TF.TT.isZeroShadow(S1) && TF.TT.isZeroShadow(S2))
+        return;
+      Type *OpTy = CB.getArgOperand(0)->getType();
+      if (OpTy->getScalarType()->getPrimitiveSizeInBits() <= 64) {
+        IRBuilder<> IRB(&CB);
+        auto &DL = CB.getModule()->getDataLayout();
+        uint64_t Size = DL.getTypeSizeInBits(OpTy);
+        uint16_t Pred =
+            (uint16_t)cast<ConstrainedFPCmpIntrinsic>(&CB)->getPredicate();
+        uint16_t OpV = (uint16_t)Instruction::FCmp | (Pred << 8);
+        auto FpToInt = [&](Value *V) -> Value * {
+          Type *Ty = V->getType();
+          if (Ty->isHalfTy())        V = IRB.CreateBitCast(V, TF.TT.Int16Ty);
+          else if (Ty->isFloatTy())  V = IRB.CreateBitCast(V, TF.TT.Int32Ty);
+          else if (Ty->isDoubleTy()) V = IRB.CreateBitCast(V, TF.TT.Int64Ty);
+          return IRB.CreateZExtOrTrunc(V, TF.TT.Int64Ty);
+        };
+        CallInst *C = IRB.CreateCall(
+            TF.TT.TaintUnionFn,
+            {S1, S2, ConstantInt::get(TF.TT.Int16Ty, OpV),
+             ConstantInt::get(TF.TT.Int16Ty, Size),
+             FpToInt(CB.getArgOperand(0)), FpToInt(CB.getArgOperand(1))});
+        C->addRetAttr(Attribute::ZExt);
+        C->addParamAttr(0, Attribute::ZExt);
+        C->addParamAttr(1, Attribute::ZExt);
+        TF.setShadow(&CB, C);
+        return;
+      }
+    }
+  }
+
+  if (ClTraceFP && CB.getType()->isFloatingPointTy() &&
+      CB.getType()->getScalarType()->getPrimitiveSizeInBits() <= 64) {
+    Intrinsic::ID CId = F->getIntrinsicID();
+    uint16_t CFpOp = 0;         // base opcode (LLVM opcode for arith; fp_sqrt)
+    bool CBinary = false, CIsSqrt = false, CTernary = false;
+    switch (CId) {
+      case Intrinsic::experimental_constrained_fadd:
+        CFpOp = Instruction::FAdd; CBinary = true; break;
+      case Intrinsic::experimental_constrained_fsub:
+        CFpOp = Instruction::FSub; CBinary = true; break;
+      case Intrinsic::experimental_constrained_fmul:
+        CFpOp = Instruction::FMul; CBinary = true; break;
+      case Intrinsic::experimental_constrained_fdiv:
+        CFpOp = Instruction::FDiv; CBinary = true; break;
+      case Intrinsic::experimental_constrained_sqrt:
+        CFpOp = DfsanFpSqrt; CIsSqrt = true; break;
+      case Intrinsic::experimental_constrained_fmuladd:
+        CTernary = true; break;  // a*b + c, decomposed to FMul then FAdd
+      default: break;
+    }
+    if (CFpOp != 0 || CTernary) {
+      // Only the FP operands carry taint; the trailing metadata operands
+      // (rounding mode + exception behavior) never do, so check just those.
+      unsigned NumFp = CTernary ? 3 : (CBinary ? 2 : 1);
+      bool NeedInst = false;
+      for (unsigned I = 0; I < NumFp; ++I) {
+        if (!TF.TT.isZeroShadow(TF.getShadow(CB.getArgOperand(I)))) {
+          NeedInst = true;
+          break;
+        }
+      }
+      if (!NeedInst)
+        return;
+
+      IRBuilder<> IRB(&CB);
+      auto &DL = CB.getModule()->getDataLayout();
+      uint64_t Size = DL.getTypeSizeInBits(CB.getType());
+      // FP operands are bitcast to same-width integers before the union call,
+      // matching combineShadows().
+      auto FpToInt = [&](Value *V) -> Value * {
+        Type *Ty = V->getType();
+        if (Ty->isHalfTy())        V = IRB.CreateBitCast(V, TF.TT.Int16Ty);
+        else if (Ty->isFloatTy())  V = IRB.CreateBitCast(V, TF.TT.Int32Ty);
+        else if (Ty->isDoubleTy()) V = IRB.CreateBitCast(V, TF.TT.Int64Ty);
+        return IRB.CreateZExtOrTrunc(V, TF.TT.Int64Ty);
+      };
+      // Map an LLVM compile-time RoundingMode to the dfsan fp_rounding_mode
+      // selector, or -1 when it is round.dynamic / unknown (resolve at runtime).
+      auto StaticSel = [&](std::optional<RoundingMode> RM) -> int {
+        if (!RM.has_value())
+          return -1;
+        switch (*RM) {
+          case RoundingMode::NearestTiesToEven: return DfsanFpRmRne; // 1
+          case RoundingMode::TowardPositive:    return DfsanFpRmRtp; // 2
+          case RoundingMode::TowardNegative:    return DfsanFpRmRtn; // 3
+          case RoundingMode::TowardZero:        return DfsanFpRmRtz; // 4
+          case RoundingMode::NearestTiesToAway: return DfsanFpRmRna; // 0
+          default:                              return -1; // Dynamic/Invalid
+        }
+      };
+      std::optional<RoundingMode> RM =
+          cast<ConstrainedFPIntrinsic>(&CB)->getRoundingMode();
+      int Sel = StaticSel(RM);
+      // Build the packed `op` value (i16) for a given base opcode, folding the
+      // rounding selector into the high byte.
+      auto PackedOp = [&](uint16_t Base) -> Value * {
+        if (Sel >= 0)
+          return ConstantInt::get(TF.TT.Int16Ty,
+                                  Base | (uint16_t(Sel) << 8));
+        // round.dynamic: read the live rounding mode (FLT_ROUNDS encoding) and
+        // map it to our selector, then OR into the high byte at runtime.
+        // FLT_ROUNDS: 0=toward-zero, 1=to-nearest, 2=toward+inf, 3=toward-inf,
+        //             4=to-nearest-away.  Default (incl. -1/indeterminate) -> RNE.
+        Value *Fr = IRB.CreateIntrinsic(Intrinsic::get_rounding, {}, {});
+        Type *Ity = Fr->getType();
+        auto C = [&](int v) { return ConstantInt::get(Ity, v); };
+        Value *S = C(DfsanFpRmRne);
+        S = IRB.CreateSelect(IRB.CreateICmpEQ(Fr, C(4)), C(DfsanFpRmRna), S);
+        S = IRB.CreateSelect(IRB.CreateICmpEQ(Fr, C(3)), C(DfsanFpRmRtn), S);
+        S = IRB.CreateSelect(IRB.CreateICmpEQ(Fr, C(2)), C(DfsanFpRmRtp), S);
+        S = IRB.CreateSelect(IRB.CreateICmpEQ(Fr, C(0)), C(DfsanFpRmRtz), S);
+        Value *S16 = IRB.CreateZExtOrTrunc(S, TF.TT.Int16Ty);
+        Value *Hi  = IRB.CreateShl(S16, ConstantInt::get(TF.TT.Int16Ty, 8));
+        return IRB.CreateOr(Hi, ConstantInt::get(TF.TT.Int16Ty, Base));
+      };
+      auto MakeUnion = [&](Value *L1, Value *L2, Value *Op16,
+                           Value *O1, Value *O2) -> Value * {
+        CallInst *C = IRB.CreateCall(
+            TF.TT.TaintUnionFn,
+            {L1, L2, Op16, ConstantInt::get(TF.TT.Int16Ty, Size), O1, O2});
+        C->addRetAttr(Attribute::ZExt);
+        C->addParamAttr(0, Attribute::ZExt);
+        C->addParamAttr(1, Attribute::ZExt);
+        return C;
+      };
+      Value *Zero64 = ConstantInt::get(TF.TT.Int64Ty, 0);
+      if (CBinary) {
+        Value *Res = MakeUnion(TF.getShadow(CB.getArgOperand(0)),
+                               TF.getShadow(CB.getArgOperand(1)), PackedOp(CFpOp),
+                               FpToInt(CB.getArgOperand(0)),
+                               FpToInt(CB.getArgOperand(1)));
+        TF.setShadow(&CB, Res);
+        return;
+      }
+      if (CIsSqrt) {
+        // unary; l2 = 0.  The operand value is unused (an instrumented unary
+        // intrinsic always has a symbolic operand), but pass it for symmetry.
+        Value *Res = MakeUnion(TF.getShadow(CB.getArgOperand(0)),
+                               TF.TT.ZeroPrimitiveShadow, PackedOp(DfsanFpSqrt),
+                               FpToInt(CB.getArgOperand(0)), Zero64);
+        TF.setShadow(&CB, Res);
+        return;
+      }
+      if (CTernary) {
+        // constrained fmuladd: a*b + c.  Decompose into FMul then FAdd, both
+        // carrying the rounding selector (double-rounds vs a true fused op, but
+        // the <=1-ULP difference is immaterial for branch flipping), matching
+        // the non-constrained fma/fmuladd handling below.
+        Value *SA = TF.getShadow(CB.getArgOperand(0));
+        Value *SB = TF.getShadow(CB.getArgOperand(1));
+        Value *SC = TF.getShadow(CB.getArgOperand(2));
+        Value *Mul = MakeUnion(SA, SB, PackedOp(Instruction::FMul),
+                               FpToInt(CB.getArgOperand(0)),
+                               FpToInt(CB.getArgOperand(1)));
+        Value *Res = MakeUnion(Mul, SC, PackedOp(Instruction::FAdd), Zero64,
+                               FpToInt(CB.getArgOperand(2)));
+        TF.setShadow(&CB, Res);
+        return;
+      }
+    }
+  }
+
   if ((FN).starts_with("llvm.va_") || // varabile length
       (FN).starts_with("llvm.gc")  || // garbaage collection
       (FN).starts_with("llvm.experimental") ||
@@ -4295,6 +4520,124 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
 
     TF.setShadow(&CB, Result);
     return;
+  }
+
+  // Floating-point intrinsics: map to the self-defined FP ops so the z3 solver
+  // can reconstruct them via the fpa theory.  Only modeled under ClTraceFP.
+  if (ClTraceFP) {
+    // fma / fmuladd compute a*b + c.  A label node holds only two operands, so
+    // model the ternary by decomposition into FMul then FAdd, reusing the
+    // existing FP-arith solver support.  This double-rounds relative to a true
+    // fused multiply-add, but the (at most 1-ULP) difference is immaterial for
+    // branch flipping.  This path is essential, not optional: clang contracts
+    // the extremely common source pattern `a*b±c` into @llvm.fmuladd by default
+    // (-ffp-contract=on) even at -O0, so without this those branches vanish.
+    if ((IId == Intrinsic::fma || IId == Intrinsic::fmuladd) &&
+        CB.getType()->isFloatingPointTy()) {
+      IRBuilder<> IRB(&CB);
+      auto &DL = CB.getModule()->getDataLayout();
+      uint64_t Size = DL.getTypeSizeInBits(CB.getType());
+      Value *SA = TF.getShadow(CB.getArgOperand(0));
+      Value *SB = TF.getShadow(CB.getArgOperand(1));
+      Value *SC = TF.getShadow(CB.getArgOperand(2));
+      if (Size <= 64 &&
+          !(TF.TT.isZeroShadow(SA) && TF.TT.isZeroShadow(SB) &&
+            TF.TT.isZeroShadow(SC))) {
+        auto FpToInt = [&](Value *V) -> Value * {
+          Type *Ty = V->getType();
+          if (Ty->isHalfTy())        V = IRB.CreateBitCast(V, TF.TT.Int16Ty);
+          else if (Ty->isFloatTy())  V = IRB.CreateBitCast(V, TF.TT.Int32Ty);
+          else if (Ty->isDoubleTy()) V = IRB.CreateBitCast(V, TF.TT.Int64Ty);
+          return IRB.CreateZExtOrTrunc(V, TF.TT.Int64Ty);
+        };
+        auto MakeUnion = [&](Value *L1, Value *L2, uint16_t Op,
+                             Value *O1, Value *O2) -> Value * {
+          CallInst *C = IRB.CreateCall(
+              TF.TT.TaintUnionFn,
+              {L1, L2, ConstantInt::get(TF.TT.Int16Ty, Op),
+               ConstantInt::get(TF.TT.Int16Ty, Size), O1, O2});
+          C->addRetAttr(Attribute::ZExt);
+          C->addParamAttr(0, Attribute::ZExt);
+          C->addParamAttr(1, Attribute::ZExt);
+          return C;
+        };
+        Value *Zero64 = ConstantInt::get(TF.TT.Int64Ty, 0);
+        // mul = a * b  (LLVM opcodes match the __dfsan operators enum)
+        Value *Mul = MakeUnion(SA, SB, Instruction::FMul,
+                               FpToInt(CB.getArgOperand(0)),
+                               FpToInt(CB.getArgOperand(1)));
+        // result = mul + c.  The mul result is symbolic, so its op1 slot is
+        // zeroed by the runtime anyway; the solver recomputes it from value_cache.
+        Value *Res = MakeUnion(Mul, SC, Instruction::FAdd, Zero64,
+                               FpToInt(CB.getArgOperand(2)));
+        TF.setShadow(&CB, Res);
+        return;
+      }
+    }
+    uint16_t FpOp = 0;
+    uint64_t RoundingMode = 0; // rounding selector for fp_round (carried in op1)
+    bool IsBinary = false;
+    switch (IId) {
+      case Intrinsic::fabs:      FpOp = DfsanFpFabs; break;
+      case Intrinsic::sqrt:      FpOp = DfsanFpSqrt; break;
+      case Intrinsic::floor:     FpOp = DfsanFpRound; RoundingMode = DfsanFpRmRtn; break;
+      case Intrinsic::ceil:      FpOp = DfsanFpRound; RoundingMode = DfsanFpRmRtp; break;
+      case Intrinsic::trunc:     FpOp = DfsanFpRound; RoundingMode = DfsanFpRmRtz; break;
+      case Intrinsic::round:     FpOp = DfsanFpRound; RoundingMode = DfsanFpRmRna; break;
+      case Intrinsic::rint:      FpOp = DfsanFpRound; RoundingMode = DfsanFpRmRne; break;
+      case Intrinsic::nearbyint: FpOp = DfsanFpRound; RoundingMode = DfsanFpRmRne; break;
+      case Intrinsic::minnum:    FpOp = DfsanFpMin; IsBinary = true; break;
+      case Intrinsic::maxnum:    FpOp = DfsanFpMax; IsBinary = true; break;
+      case Intrinsic::copysign:  FpOp = DfsanFpCopysign; IsBinary = true; break;
+      // fma / fmuladd (3 operands) are handled above by decomposition.
+      default: break;
+    }
+    if (FpOp != 0 && CB.getType()->isFloatingPointTy()) {
+      IRBuilder<> IRB(&CB);
+      auto &DL = CB.getModule()->getDataLayout();
+      uint64_t Size = DL.getTypeSizeInBits(CB.getType());
+      // FP operands are bitcast to same-width integers before the union call,
+      // matching combineShadows().
+      auto FpToInt = [&](Value *V) -> Value * {
+        Type *Ty = V->getType();
+        if (Ty->isHalfTy())        V = IRB.CreateBitCast(V, TF.TT.Int16Ty);
+        else if (Ty->isFloatTy())  V = IRB.CreateBitCast(V, TF.TT.Int32Ty);
+        else if (Ty->isDoubleTy()) V = IRB.CreateBitCast(V, TF.TT.Int64Ty);
+        return IRB.CreateZExtOrTrunc(V, TF.TT.Int64Ty);
+      };
+      Value *Op = ConstantInt::get(TF.TT.Int16Ty, FpOp);
+      Value *SizeV = ConstantInt::get(TF.TT.Int16Ty, Size);
+      Value *Shadow1 = TF.getShadow(CB.getArgOperand(0));
+      Value *Result = nullptr;
+      if (IsBinary) {
+        Value *Shadow2 = TF.getShadow(CB.getArgOperand(1));
+        Value *Op1 = FpToInt(CB.getArgOperand(0));
+        Value *Op2 = FpToInt(CB.getArgOperand(1));
+        CallInst *C = IRB.CreateCall(TF.TT.TaintUnionFn,
+                                     {Shadow1, Shadow2, Op, SizeV, Op1, Op2});
+        C->addRetAttr(Attribute::ZExt);
+        C->addParamAttr(0, Attribute::ZExt);
+        C->addParamAttr(1, Attribute::ZExt);
+        Result = C;
+      } else {
+        // unary; l2 = 0.  For fp_round the rounding selector is carried in op1
+        // (the operand value is unused: an instrumented unary intrinsic always
+        // has a symbolic operand, so the solver rebuilds it from l1).
+        Value *Op1 = (FpOp == DfsanFpRound)
+                         ? ConstantInt::get(TF.TT.Int64Ty, RoundingMode)
+                         : FpToInt(CB.getArgOperand(0));
+        Value *Op2 = ConstantInt::get(TF.TT.Int64Ty, 0);
+        CallInst *C = IRB.CreateCall(
+            TF.TT.TaintUnionFn,
+            {Shadow1, TF.TT.ZeroPrimitiveShadow, Op, SizeV, Op1, Op2});
+        C->addRetAttr(Attribute::ZExt);
+        C->addParamAttr(0, Attribute::ZExt);
+        C->addParamAttr(1, Attribute::ZExt);
+        Result = C;
+      }
+      TF.setShadow(&CB, Result);
+      return;
+    }
   }
 
   // Other intrinsics: symbolic propagation not yet implemented — skip.

@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <link.h>
 #include <malloc.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -1042,6 +1043,155 @@ uint64_t __dfsw___bswapdi2(uint64_t x, dfsan_label x_label,
   *ret_label = bswap_label(x_label, 64);
   return ret;
 }
+
+// ---------------------------------------------------------------------------
+// Floating-point libc math wrappers.
+//
+// At -O0, clang keeps several math functions as libcalls (e.g. sqrt, due to
+// errno) instead of lowering them to @llvm.* intrinsics, so the instrumentation
+// intrinsic path never sees them.  We model them here as custom wrappers that
+// build the corresponding self-defined FP op node (see the fp_* ops in
+// dfsan.h), matching what visitIntrinsicCallBase would have produced.  The FP
+// argument's IEEE-754 bit pattern is passed in op1/op2 so constant operands and
+// the solver's value cache stay consistent with the BV-encoded FP labels.
+// ---------------------------------------------------------------------------
+
+static inline uint64_t fp64_bits(double x) {
+  uint64_t b;
+  internal_memcpy(&b, &x, sizeof(b));
+  return b;
+}
+
+static inline uint32_t fp32_bits(float x) {
+  uint32_t b;
+  internal_memcpy(&b, &x, sizeof(b));
+  return b;
+}
+
+// Unary intrinsic-style math functions (double/float).
+#define DFSW_FP_UNARY(name, cfn, op, sel)                                      \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  double __dfsw_##name(double x, dfsan_label x_label,                          \
+                       dfsan_label *ret_label) {                               \
+    double ret = cfn(x);                                                       \
+    *ret_label = dfsan_union(x_label, 0, op, 64, (sel), 0);                    \
+    return ret;                                                                \
+  }                                                                            \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  float __dfsw_##name##f(float x, dfsan_label x_label,                         \
+                         dfsan_label *ret_label) {                             \
+    float ret = cfn##f(x);                                                     \
+    *ret_label = dfsan_union(x_label, 0, op, 32, (sel), 0);                    \
+    return ret;                                                                \
+  }
+
+DFSW_FP_UNARY(sqrt, sqrt, __dfsan::fp_sqrt, 0)
+DFSW_FP_UNARY(fabs, fabs, __dfsan::fp_fabs, 0)
+DFSW_FP_UNARY(floor, floor, __dfsan::fp_round, __dfsan::fp_rm_rtn)
+DFSW_FP_UNARY(ceil, ceil, __dfsan::fp_round, __dfsan::fp_rm_rtp)
+DFSW_FP_UNARY(trunc, trunc, __dfsan::fp_round, __dfsan::fp_rm_rtz)
+DFSW_FP_UNARY(round, round, __dfsan::fp_round, __dfsan::fp_rm_rna)
+DFSW_FP_UNARY(rint, rint, __dfsan::fp_round, __dfsan::fp_rm_rne)
+DFSW_FP_UNARY(nearbyint, nearbyint, __dfsan::fp_round, __dfsan::fp_rm_rne)
+
+// Transcendentals.  Marked =custom (not =functional) so the operand's taint is
+// preserved: z3 cannot invert these but the i2s solver flips the guard by
+// computing the numeric libm inverse and verifying it.  (log10/exp2 have no
+// float variant in the abilist; the generated __dfsw_*f wrappers are unused.)
+DFSW_FP_UNARY(exp, exp, __dfsan::fp_exp, 0)
+DFSW_FP_UNARY(exp2, exp2, __dfsan::fp_exp2, 0)
+DFSW_FP_UNARY(log, log, __dfsan::fp_log, 0)
+DFSW_FP_UNARY(log2, log2, __dfsan::fp_log2, 0)
+DFSW_FP_UNARY(log10, log10, __dfsan::fp_log10, 0)
+DFSW_FP_UNARY(log1p, log1p, __dfsan::fp_log1p, 0)
+
+#undef DFSW_FP_UNARY
+
+// Binary intrinsic-style math functions (double/float).  The IEEE bits of both
+// operands are passed so a concrete (label-0) operand still solves correctly.
+#define DFSW_FP_BINARY(name, cfn, op)                                          \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  double __dfsw_##name(double a, double b, dfsan_label a_label,                \
+                       dfsan_label b_label, dfsan_label *ret_label) {          \
+    double ret = cfn(a, b);                                                    \
+    *ret_label = dfsan_union(a_label, b_label, op, 64,                         \
+                             fp64_bits(a), fp64_bits(b));                      \
+    return ret;                                                                \
+  }                                                                            \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  float __dfsw_##name##f(float a, float b, dfsan_label a_label,                \
+                         dfsan_label b_label, dfsan_label *ret_label) {        \
+    float ret = cfn##f(a, b);                                                  \
+    *ret_label = dfsan_union(a_label, b_label, op, 32,                         \
+                             fp32_bits(a), fp32_bits(b));                      \
+    return ret;                                                                \
+  }
+
+DFSW_FP_BINARY(fmin, fmin, __dfsan::fp_min)
+DFSW_FP_BINARY(fmax, fmax, __dfsan::fp_max)
+DFSW_FP_BINARY(copysign, copysign, __dfsan::fp_copysign)
+// pow(base, exp): i2s inverts against whichever operand is a constant (the
+// concrete, label-0 operand); its IEEE bits arrive via op1/op2 above.
+DFSW_FP_BINARY(pow, pow, __dfsan::fp_pow)
+
+#undef DFSW_FP_BINARY
+
+// FP predicates (double/float -> int): isnan/isinf/__isinf/finite/__signbit.
+// SymSan has no working "functional" ABI, so these must build a real op node
+// recording the predicate; otherwise a branch like `if (isnan(x))` drops the
+// operand's taint and can never be flipped.  The concrete result is computed
+// with __builtin_* (the libc names are macros that would otherwise recurse).
+// The node is created only when the argument is tainted; the operand's IEEE
+// bits reach the solver via the child label's value cache (like DFSW_FP_UNARY).
+#define DFSW_FP_PRED(name, bfn, op)                                            \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  int __dfsw_##name(double x, dfsan_label x_label,                            \
+                    dfsan_label *ret_label) {                                  \
+    int ret = bfn(x);                                                          \
+    *ret_label = x_label ? dfsan_union(x_label, 0, op, 32, 0, 0) : 0;          \
+    return ret;                                                                \
+  }                                                                            \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  int __dfsw_##name##f(float x, dfsan_label x_label,                          \
+                       dfsan_label *ret_label) {                               \
+    int ret = bfn(x);                                                          \
+    *ret_label = x_label ? dfsan_union(x_label, 0, op, 32, 0, 0) : 0;          \
+    return ret;                                                                \
+  }
+
+DFSW_FP_PRED(isnan, __builtin_isnan, __dfsan::fp_is_nan)
+DFSW_FP_PRED(isinf, __builtin_isinf, __dfsan::fp_is_inf)
+DFSW_FP_PRED(__isinf, __builtin_isinf, __dfsan::fp_is_inf)
+DFSW_FP_PRED(finite, __builtin_isfinite, __dfsan::fp_is_finite)
+DFSW_FP_PRED(__signbit, __builtin_signbit, __dfsan::fp_signbit)
+
+#undef DFSW_FP_PRED
+
+// Round-to-nearest-integer libcalls (lrint/llrint, double/float).  Modeled as
+// fp_lrint: round with the default mode (RNE) then convert to a signed integer.
+// Result width is 64 bits (long / long long on this platform).
+#define DFSW_FP_LRINT(name, cfn, ret_t)                                        \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  ret_t __dfsw_##name(double x, dfsan_label x_label,                          \
+                      dfsan_label *ret_label) {                                \
+    ret_t ret = cfn(x);                                                        \
+    *ret_label = x_label ?                                                     \
+        dfsan_union(x_label, 0, __dfsan::fp_lrint, 64, 0, 0) : 0;              \
+    return ret;                                                                \
+  }                                                                            \
+  SANITIZER_INTERFACE_ATTRIBUTE                                                \
+  ret_t __dfsw_##name##f(float x, dfsan_label x_label,                        \
+                         dfsan_label *ret_label) {                             \
+    ret_t ret = cfn##f(x);                                                     \
+    *ret_label = x_label ?                                                     \
+        dfsan_union(x_label, 0, __dfsan::fp_lrint, 64, 0, 0) : 0;              \
+    return ret;                                                                \
+  }
+
+DFSW_FP_LRINT(lrint, lrint, long)
+DFSW_FP_LRINT(llrint, llrint, long long)
+
+#undef DFSW_FP_LRINT
 
 SANITIZER_INTERFACE_ATTRIBUTE
 char *__dfsw_strcat(char *dest, const char *src, dfsan_label d_label,

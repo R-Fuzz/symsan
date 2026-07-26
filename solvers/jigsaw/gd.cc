@@ -1,6 +1,9 @@
 #include <stdint.h>
 #include <assert.h>
 #include <iostream>
+#include <cmath>
+#include <cstring>
+#include <cfloat>
 
 #include "jit.h"
 #include "input.h"
@@ -43,6 +46,105 @@ static void dump_distances(std::vector<uint64_t> &distances) {
     std::cout << "distance " << i << " is " << distances[i] << std::endl;
   }
 }
+
+// Per-task attempt budget.  Defaults to the compile-time MAX_EXEC_TIMES but can
+// be overridden at runtime via JIGSAW_MAX_EXEC (e.g. smttest's --budget) so the
+// search budget can be swept without rebuilding -- used to test whether a search
+// strategy's "losses" are budget-limited or genuine trajectory divergence.
+static uint64_t jigsaw_max_exec() {
+  static const uint64_t v = []() -> uint64_t {
+    const char *e = getenv("JIGSAW_MAX_EXEC");
+    return e ? (uint64_t)strtoull(e, nullptr, 0) : (uint64_t)MAX_EXEC_TIMES;
+  }();
+  return v;
+}
+
+// ---- search tracing (debug only) -----------------------------------------
+// Compiled in only under JIGSAW_SEARCH_DEBUG (see config.h); production builds
+// get the no-op stubs at the bottom of this block so the hot search loop carries
+// no tracing branches.
+// JIGSAW_TRACE=1 prints the search sequence (escapes, descend, per-round jitter
+// moves) to stderr.  JIGSAW_TARGET=<path> loads a known-good assignment
+// (offset-indexed raw bytes -- dump one from z3 via smttest's JIGSAW_DUMP_MODEL)
+// so each line ALSO reports how far the current assignment is from the actual
+// solution: it becomes obvious the moment a move steps the search AWAY from the
+// model, which byte is still wrong, and whether the metric that matters is value
+// distance or bit (Hamming) distance.
+#if JIGSAW_SEARCH_DEBUG
+static bool g_trace = false;
+static bool g_have_target = false;
+static std::vector<uint8_t> g_target; // offset-indexed target model
+
+static void trace_init() {
+  g_trace = (getenv("JIGSAW_TRACE") != nullptr);
+  g_have_target = false;
+  g_target.clear();
+  const char *tp = getenv("JIGSAW_TARGET");
+  if (tp) {
+    FILE *f = fopen(tp, "rb");
+    if (f) {
+      fseek(f, 0, SEEK_END);
+      long n = ftell(f);
+      fseek(f, 0, SEEK_SET);
+      if (n > 0) {
+        g_target.resize((size_t)n);
+        size_t rd = fread(g_target.data(), 1, (size_t)n, f);
+        (void)rd;
+        g_have_target = true;
+      }
+      fclose(f);
+    }
+  }
+}
+
+// value / Hamming distance from the current assignment to the target model,
+// plus the count of still-wrong slots (and the first few offsets).
+static void trace_target_dist(MutInput &input, std::shared_ptr<SearchTask> task,
+                              uint64_t &vdist, uint32_t &hbits, uint32_t &nwrong,
+                              char *wrong, size_t wrong_sz) {
+  vdist = 0; hbits = 0; nwrong = 0;
+  wrong[0] = '\0';
+  size_t used = 0;
+  auto const &ins = task->inputs();
+  for (uint32_t i = 0, n = (uint32_t)input.len(); i < n; i++) {
+    uint32_t off = ins[i].first;
+    uint8_t cur = (uint8_t)input.value[i];
+    uint8_t tgt = (off < g_target.size()) ? g_target[off] : 0;
+    if (cur != tgt) {
+      nwrong++;
+      vdist += (cur > tgt) ? (uint64_t)(cur - tgt) : (uint64_t)(tgt - cur);
+      hbits += (uint32_t)__builtin_popcount((unsigned)(cur ^ tgt));
+      if (used + 24 < wrong_sz) {
+        int w = snprintf(wrong + used, wrong_sz - used, "%s@%u(%u!=%u)",
+                         used ? "," : "", off, cur, tgt);
+        if (w > 0) used += (size_t)w;
+      }
+    }
+  }
+}
+
+static void trace_step(const char *label, MutInput &input, uint64_t f0,
+                       std::shared_ptr<SearchTask> task) {
+  if (!g_trace) return;
+  if (g_have_target) {
+    uint64_t vd; uint32_t hb, nw; char wrong[256];
+    trace_target_dist(input, task, vd, hb, nw, wrong, sizeof(wrong));
+    fprintf(stderr,
+        "[trace] %-14s f0=%-12lu to-model: wrong=%u/%lu vdist=%lu hbits=%u [%s]\n",
+        label, (unsigned long)f0, nw, (unsigned long)input.len(),
+        (unsigned long)vd, hb, wrong);
+  } else {
+    fprintf(stderr, "[trace] %-14s f0=%lu\n", label, (unsigned long)f0);
+  }
+}
+#else // !JIGSAW_SEARCH_DEBUG: no-op stubs so the search loop compiles unchanged
+// g_trace is a compile-time constant false here, so every "if (g_trace) ..."
+// diagnostic in the hot search/jitter paths is eliminated by the optimizer.
+static constexpr bool g_trace = false;
+static inline void trace_init() {}
+static inline void trace_step(const char *, MutInput &, uint64_t,
+                              std::shared_ptr<SearchTask>) {}
+#endif // JIGSAW_SEARCH_DEBUG
 
 
 static void add_results(MutInput &input, std::shared_ptr<SearchTask> task) {
@@ -116,8 +218,62 @@ static uint32_t negate(uint32_t op) {
 }
 
 
+// Distance for an FP comparison.  The jitted function stores the two operands
+// promoted to IEEE-754 double bit-patterns at a/b (see jit.cc FOeq..FUne case).
+// We compute a NON-NEGATIVE double distance d that is exactly 0 iff the
+// predicate holds, then map it to a uint64: for d>=0 the IEEE bit-pattern is
+// monotonic in d and is 0 iff d==0 -- exactly what gradient descent needs.
+// The raw bit-pattern of an O(1) distance is ~2^62, though, far larger than
+// typical integer distances, so a mixed FP+integer task would be dominated (and
+// sat_inc could saturate) by the FP term.  We therefore shift off the low 32
+// bits (see the mapping below): this divides the scale by 2^32 -- an O(1)
+// distance now maps to ~2^30 and the whole finite range stays below 2^31, so a
+// single FP term no longer swamps integer distances -- while preserving both
+// required properties (still monotonic in d, still 0 iff d==0) and the log-like
+// wide dynamic range GD relies on.
+static uint64_t fp_get_distance(uint32_t comp, uint64_t a, uint64_t b) {
+  double da, db;
+  memcpy(&da, &a, sizeof(da));
+  memcpy(&db, &b, sizeof(db));
+  bool nan = std::isnan(da) || std::isnan(db);
+  double d = 0.0;
+  // smallest positive double, used to keep strict predicates non-zero at the
+  // boundary (a == b) -- mirrors the integer sat_inc(a-b, 1) nudge.
+  const double eps = DBL_TRUE_MIN;
+  switch (comp) {
+    // ordered predicates: false (max distance sense) if either operand is NaN.
+    case rgd::FOeq: d = nan ? (double)INFINITY : std::fabs(da - db); break;
+    case rgd::FOne: d = nan ? (double)INFINITY : (da == db ? 1.0 : 0.0); break;
+    case rgd::FOlt: d = (!nan && da <  db) ? 0.0 : (da - db) + eps; break;
+    case rgd::FOle: d = (!nan && da <= db) ? 0.0 : (da - db) + eps; break;
+    case rgd::FOgt: d = (!nan && da >  db) ? 0.0 : (db - da) + eps; break;
+    case rgd::FOge: d = (!nan && da >= db) ? 0.0 : (db - da) + eps; break;
+    case rgd::FOrd: d = nan ? 1.0 : 0.0; break;
+    // unordered predicates: satisfied whenever either operand is NaN.
+    case rgd::FUno: d = nan ? 0.0 : 1.0; break;
+    case rgd::FUeq: d = nan ? 0.0 : std::fabs(da - db); break;
+    case rgd::FUne: d = nan ? 0.0 : (da == db ? 1.0 : 0.0); break;
+    case rgd::FUlt: d = (nan || da <  db) ? 0.0 : (da - db) + eps; break;
+    case rgd::FUle: d = (nan || da <= db) ? 0.0 : (da - db) + eps; break;
+    case rgd::FUgt: d = (nan || da >  db) ? 0.0 : (db - da) + eps; break;
+    case rgd::FUge: d = (nan || da >= db) ? 0.0 : (db - da) + eps; break;
+    default:
+      fprintf(stderr, "Non-relational FP op!\n");
+  }
+  double m = std::fabs(d);
+  uint64_t u;
+  memcpy(&u, &m, sizeof(u));
+  // Rescale the bit-pattern down by 2^32 (exponent bits give octave resolution,
+  // the retained high mantissa bits give within-octave resolution) so the FP
+  // term is comparable in scale to integer distances -- see the note above.
+  u >>= 32;
+  return (u == 0 && m > 0.0) ? 1 : u; // any nonzero distance stays strictly positive
+}
+
 static uint64_t get_distance(uint32_t comp, uint64_t a, uint64_t b) {
   uint64_t dis = 0;
+  if (rgd::isFPRelationalKind(comp))
+    return fp_get_distance(comp, a, b);
   switch (comp) {
     case rgd::Equal:
       if (a >= b) dis = a - b;
@@ -234,7 +390,7 @@ static uint64_t distance(MutInput &input, std::vector<uint64_t> &distances, std:
     add_results(input, task);
   }
   task->attempts++;
-  if (task->attempts > MAX_EXEC_TIMES) {
+  if (task->attempts > jigsaw_max_exec()) {
     task->stopped = true;
     task->solved = false;
   }
@@ -249,10 +405,15 @@ static void partial_derivative(MutInput &orig_input, const uint32_t index, uint6
   uint64_t f_plus = 0, f_minus = 0;
   uint64_t single_dis;
 
-  // calculate f(x+delta)
+  // calculate f(x+delta).  The input is NOT restored between delta probes, so add
+  // only the increment (delta - added) to land exactly at orig+delta rather than the
+  // cumulative orig+1+4+16...  This is a clean finite difference at f(x+delta) -- as
+  // the comment below intends -- at the same eval count (no extra restore/reprobe).
+  uint64_t added = 0;
   for (delta = 1; delta < 256; delta = delta << 1) {
     task->plus_distances = task->min_distances;
-    orig_input.update(index, true, delta);
+    orig_input.update(index, true, delta - added);
+    added = delta;
     single_dis = single_distance(orig_input, task->plus_distances, task, index);
     if (single_dis == 0) { // well, we got lucky and found a solution
       *sign = true;
@@ -265,7 +426,7 @@ static void partial_derivative(MutInput &orig_input, const uint32_t index, uint6
       f_plus = sat_inc(f_plus, task->plus_distances[i]);
 
     task->attempts += 1;
-    if (task->attempts > MAX_EXEC_TIMES)
+    if (task->attempts > jigsaw_max_exec())
       task->stopped = true;
     if (task->stopped) { *val = 0; return; }
 
@@ -277,10 +438,12 @@ static void partial_derivative(MutInput &orig_input, const uint32_t index, uint6
   }
   orig_input.value[index] = orig_val; // restore the original value
 
-  // calculate f(x-delta)
+  // calculate f(x-delta) -- same clean-increment trick as the plus loop above
+  added = 0;
   for (delta = 1; delta < 256; delta = delta << 1) {
     task->minus_distances = task->min_distances;
-    orig_input.update(index, false, delta);
+    orig_input.update(index, false, delta - added);
+    added = delta;
     single_dis = single_distance(orig_input, task->minus_distances, task, index);
     if (single_dis == 0) { // well, we got lucky and found a solution
       *sign = false;
@@ -293,7 +456,7 @@ static void partial_derivative(MutInput &orig_input, const uint32_t index, uint6
       f_minus = sat_inc(f_minus, task->minus_distances[i]);
 
     task->attempts += 1;
-    if (task->attempts > MAX_EXEC_TIMES)
+    if (task->attempts > jigsaw_max_exec())
       task->stopped = true;
     if (task->stopped) { *val = 0; return;}
 
@@ -357,6 +520,12 @@ static void compute_delta_all(MutInput &input, Grad &grad, size_t step) {
 
 
 static void cal_gradient(MutInput &input, uint64_t f0, Grad &grad, std::shared_ptr<SearchTask> task) {
+  // #4: skip probing bytes that touch no currently-unsatisfied constraint. Their
+  // partial derivative is definitionally 0 (f0 = sum of constraint distances; a
+  // byte that only feeds already-satisfied (distance-0) constraints cannot lower
+  // any term, only keep it 0 or raise it), so partial_derivative would burn ~16
+  // probes just to conclude val=0. Skipping produces a bit-identical gradient
+  // vector while reclaiming that budget for the MAX_EXEC_TIMES-capped search.
   uint64_t max = 0;
   uint32_t index = 0;
   for (auto &gradu : grad.get_value()) {
@@ -367,6 +536,17 @@ static void cal_gradient(MutInput &input, uint64_t f0, Grad &grad, std::shared_p
     bool sign = false;
     bool is_linear = false;
     uint64_t val = 0;
+
+    bool relevant = false;
+    for (size_t cons_id : task->cmap(index)) {
+      if (task->min_distances[cons_id]) { relevant = true; break; }
+    }
+    if (!relevant) {
+      gradu.sign = false;
+      gradu.val = 0;
+      index++;
+      continue;
+    }
 
     partial_derivative(input, index, f0, &sign, &is_linear, &val, task);
     if (val > max) {
@@ -435,7 +615,7 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
         for (int i = 0, n = task->size(); i < n; i++)
           f_new = sat_inc(f_new, task->distances[i]);
         task->attempts += 1;
-        if (task->attempts > MAX_EXEC_TIMES)
+        if (task->attempts > jigsaw_max_exec())
           task->stopped = true;
         if (single_dis == 0) {
           // if we're doing delta and the single distance is 0
@@ -456,6 +636,49 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
         return 0;
       } else if (f_new > f_last) { // use > to give the next larger step a chance
         //if (f_new == UINTMAX_MAX)
+        // #5: the doubling line search jumped from the last-accepted point
+        // (== input_min, f_last) straight to a worse point at `step`, stepping
+        // over a possible minimum in between. Instead of abandoning it, bisect a
+        // few times back toward input_min along the same gradient to recover a
+        // better point before falling through to coordinate descent.
+        if (step > 1) {
+          size_t bstep = step >> 1;
+          for (int bt = 0; bt < BACKTRACK_MAX && bstep >= 1; bt++) {
+            if (task->stopped)
+              break;
+            input = input_min;
+            uint64_t fb = 0;
+            if (doDelta) {
+              double movement = grad.get_value()[deltaIdx].pct * (double)bstep;
+              input.update(deltaIdx, grad.get_value()[deltaIdx].sign, (uint64_t)movement);
+              single_distance(input, task->distances, task, deltaIdx);
+              for (int i = 0, n = task->size(); i < n; i++)
+                fb = sat_inc(fb, task->distances[i]);
+              task->attempts += 1;
+              if (task->attempts > jigsaw_max_exec())
+                task->stopped = true;
+            } else {
+              compute_delta_all(input, grad, bstep);
+              fb = distance(input, task->distances, task);
+            }
+            if (fb == 0) {
+              task->stopped = true;
+              task->solved = true;
+              add_results(input, task);
+              return 0;
+            }
+            if (fb < f_last) {
+              input_min = input;
+              task->min_distances = task->distances;
+              f_last = fb;
+              break; // recovered a better point; stop bisecting
+            }
+            bstep >>= 1;
+          }
+          // restore best-known state for the next coordinate phase
+          input = input_min;
+          task->distances = task->min_distances;
+        }
         break;
       }
 
@@ -509,6 +732,41 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
 }
 
 
+// FP analogue of get_i2s_value.  v is the CONSTANT operand's value; rhs==true
+// means the input is the LEFT operand (op1) and v is op2, rhs==false means the
+// input is the RIGHT operand (op2) and v is op1.  Returns the value to assign to
+// the input side so that (op1 <comp> op2) holds.  Strict inequalities nudge by
+// one ULP in the correct precision (nextafterf for float) toward the satisfying
+// side; the caller VERIFIES via fp_get_distance == 0, so a wrong guess is simply
+// rejected.  FOrd/FUno depend on NaN-ness (not i2s-able) -> return v (rejected).
+static double get_i2s_fp_value(uint32_t comp, double v, bool rhs, bool is_float) {
+  auto up = [&](double x) {
+    return is_float ? (double)std::nextafterf((float)x, INFINITY)
+                    : std::nextafter(x, INFINITY);
+  };
+  auto down = [&](double x) {
+    return is_float ? (double)std::nextafterf((float)x, -INFINITY)
+                    : std::nextafter(x, -INFINITY);
+  };
+  switch (comp) {
+    case rgd::FOeq: case rgd::FUeq:
+    case rgd::FOle: case rgd::FUle: // op1<=op2 satisfied by equality
+    case rgd::FOge: case rgd::FUge: // op1>=op2 satisfied by equality
+      return v;
+    case rgd::FOlt: case rgd::FUlt: // op1 < op2
+      return rhs ? down(v)   // input=op1 -> just below op2
+                 : up(v);    // input=op2 -> just above op1
+    case rgd::FOgt: case rgd::FUgt: // op1 > op2
+      return rhs ? up(v)     // input=op1 -> just above op2
+                 : down(v);  // input=op2 -> just below op1
+    case rgd::FOne: case rgd::FUne: // op1 != op2
+      return up(v);
+    default:
+      return v;
+  }
+}
+
+
 static uint64_t try_new_i2s_value(std::shared_ptr<const Constraint> const& c, uint32_t comparison, uint64_t value, std::shared_ptr<SearchTask> task) {
   int i = 0;
   for (auto const& [offset, lidx] : c->local_map) {
@@ -528,7 +786,44 @@ static uint64_t try_new_i2s_value(std::shared_ptr<const Constraint> const& c, ui
 }
 
 
+// FP variant of try_new_i2s_value.  Unlike the integer helper (which writes the
+// candidate's `value` across the whole local_map -- fine only for single-chunk
+// constraints), this seeds EVERY arg from the current input and overrides just
+// the candidate's `size` bytes, so other symbolic operands (e.g. y in x==y+1.0)
+// keep their current values instead of being clobbered.
+static uint64_t try_new_i2s_fp_value(std::shared_ptr<const Constraint> const& c,
+    std::unique_ptr<ConsMeta> const& cm, MutInput &input_min, uint32_t comparison,
+    size_t offset, uint32_t size, uint64_t value, std::shared_ptr<SearchTask> task) {
+  int arg_idx = 0;
+  for (auto const& arg : cm->input_args) {
+    if (arg.first) // symbolic: keep the current input value
+      task->scratch_args[RET_OFFSET + arg_idx] = input_min.get(arg.second);
+    else
+      task->scratch_args[RET_OFFSET + arg_idx] = arg.second;
+    ++arg_idx;
+  }
+  // override only the candidate bytes with the target value
+  int i = 0;
+  for (size_t off = offset; off < offset + size; off++) {
+    const uint32_t lidx = c->local_map.at(off);
+    task->scratch_args[RET_OFFSET + lidx] = ((value >> i) & 0xff);
+    i += 8;
+  }
+  c->fn(task->scratch_args);
+  return get_distance(comparison, task->scratch_args[0], task->scratch_args[1]);
+}
+
+
 static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, std::shared_ptr<SearchTask> task) {
+  // Iterate the input-to-state pass to a (bounded) fixpoint.  A single snap can
+  // turn a previously-satisfied coupled equality unsatisfied -- e.g. snapping X to
+  // a constant to satisfy `X == C` breaks `X == assemble(bytes)` by exactly the same
+  // amount, leaving the global distance unchanged (a lateral move).  The strict
+  // improvement gate alone would revert such a move and deadlock, so we ALSO accept
+  // lateral (equal-f) snaps that shift WHICH constraints are satisfied; a later round
+  // then snaps the now-unsatisfied side (the assembly bytes) to a strict improvement.
+  // Bounded by I2S_MAX_ROUNDS so any lateral cycle terminates.
+  for (int round = 0; round < I2S_MAX_ROUNDS; round++) {
   temp_input = input_min;
   bool updated = false;
   for (int k = 0; k < task->size(); k++) {
@@ -609,6 +904,86 @@ try_reverse:
             break;
           }
         } // end foreach candidate
+      } else if (rgd::isFPRelationalKind(cm->comparison)) {
+        // FP input-to-state.  The jitted fn stores both compare operands as
+        // IEEE-754 *double* bit-patterns (see jit.cc), so detect a candidate
+        // input chunk whose FP value equals one operand, then snap it to the
+        // value that satisfies the predicate against the other (constant)
+        // operand.  This lets jigsaw hit exact FP equalities (e.g. x == y with
+        // two symbolic operands, or x == C) that gradient descent alone cannot.
+        double op1d, op2d;
+        memcpy(&op1d, &cm->op1, sizeof(op1d));
+        memcpy(&op2d, &cm->op2, sizeof(op2d));
+        bool fp_done = false;
+        for (auto const& candidate : cm->i2s_candidates) {
+          const size_t c_off = candidate.first;
+          const uint32_t c_size = candidate.second;
+          // A candidate is a maximal run of *consecutive* symbolic input bytes,
+          // so two adjacent FP operands (e.g. x@0 and y@8 in `x == y + 1.0`)
+          // merge into one oversized run.  Rather than require the whole run to
+          // be exactly a float/double, slide an FP-sized window across it and
+          // test each position: reassemble the window's raw bytes, match its FP
+          // value against a stored operand, and snap it to satisfy the predicate
+          // against the other operand.  try_new_i2s_fp_value VERIFIES every
+          // guess (fp_get_distance == 0), so windows that don't line up with a
+          // real operand are simply rejected.  This lets jigsaw hit exact FP
+          // equalities (e.g. x == y with two symbolic operands, or x == C) that
+          // gradient descent alone cannot.
+          for (uint32_t fpsize : {(uint32_t)8, (uint32_t)4}) {
+            if (c_size < fpsize) continue;
+            const bool is_float = (fpsize == 4);
+            for (size_t offset = c_off; offset + fpsize <= c_off + c_size; offset++) {
+              // reassemble the raw input bytes of this window
+              uint64_t input = 0;
+              int i = 0;
+              for (size_t off = offset; off < offset + fpsize; off++) {
+                const uint32_t lidx = c->local_map.at(off);
+                uint64_t v = input_min.get(cm->input_args[lidx].second);
+                input |= (v << i);
+                i += 8;
+              }
+              // interpret the chunk as an FP number, promoted to double so it can
+              // be matched against the (always double) stored operands
+              double cur;
+              if (is_float) { float f; memcpy(&f, &input, sizeof(f)); cur = (double)f; }
+              else { memcpy(&cur, &input, sizeof(cur)); }
+              uint64_t cur_bits;
+              memcpy(&cur_bits, &cur, sizeof(cur_bits));
+
+              double target;
+              if (cur_bits == cm->op1) {
+                target = get_i2s_fp_value(cm->comparison, op2d, true, is_float);
+              } else if (cur_bits == cm->op2) {
+                target = get_i2s_fp_value(cm->comparison, op1d, false, is_float);
+              } else {
+                continue;
+              }
+
+              // encode the target in the input's native FP width
+              uint64_t value = 0;
+              if (is_float) { float tf = (float)target; memcpy(&value, &tf, sizeof(tf)); }
+              else { memcpy(&value, &target, sizeof(target)); }
+
+              // test the new value (verifies via fp_get_distance == 0)
+              uint64_t dis = try_new_i2s_fp_value(c, cm, input_min, cm->comparison,
+                                                  offset, fpsize, value, task);
+              if (dis == 0) {
+                i = 0;
+                for (size_t off = offset; off < offset + fpsize; off++) {
+                  const uint32_t lidx = c->local_map.at(off);
+                  uint8_t v = ((value >> i) & 0xff);
+                  temp_input.set(cm->input_args[lidx].second, v);
+                  i += 8;
+                }
+                updated = true;
+                fp_done = true;
+                break; // one match per comparison
+              }
+            } // end foreach window position
+            if (fp_done) break;
+          } // end foreach fp width
+          if (fp_done) break;
+        } // end foreach candidate
       } else if (cm->comparison == rgd::Memcmp) {
         size_t const_index = 0;
         for (auto const& arg : c->input_args) {
@@ -646,24 +1021,124 @@ try_reverse:
       }
     }
   }
-  if (updated) {
-    uint64_t f_new = distance(temp_input, task->distances, task);
-    if (f_new < f0) {
-      // std::cout << "i2s succeeded: " << f0 << " -> " << f_new << std::endl;
-      input_min = temp_input;
-      task->min_distances = task->distances;
-      return f_new;
-    }
+  if (!updated) break; // no snap applied this round -> fixpoint
+  uint64_t f_new = distance(temp_input, task->distances, task);
+  if (f_new < f0) {
+    // std::cout << "i2s succeeded: " << f0 << " -> " << f_new << std::endl;
+    input_min = temp_input;
+    task->min_distances = task->distances;
+    f0 = f_new;
+    if (f0 == 0) break; // solved
+    continue;           // strict progress; look for more snaps
   }
+  if (f_new == f0) {
+    // Lateral move: total distance unchanged.  Keep it only if it actually shifted
+    // which constraints are satisfied (min_distances != distances), so that the next
+    // round has a newly-unsatisfied constraint to snap.  Otherwise stop -- committing
+    // a no-op would just spin until the round cap.
+    if (task->min_distances == task->distances) break;
+    input_min = temp_input;
+    task->min_distances = task->distances;
+    continue;
+  }
+  break; // f_new > f0: the snap worsened the global distance, discard it
+  } // end round loop
   return f0;
 }
 
 static uint64_t repick_start_point(MutInput &input_min, std::shared_ptr<SearchTask> task) {
+  // Full random restart.  A "targeted" variant that only re-rolls bytes feeding a
+  // currently-unsatisfied constraint (keeping the rest) was tried and z3-validated
+  // A/B'd over 6,636 files: it was a large net loss (union ceiling 5219->4713) --
+  // its conservatism starves the exploration a full reroll provides.  Reverted.
   input_min.randomize();
   uint64_t ret = distance(input_min, task->min_distances, task);
   return ret;
 }
 
+// #2 near-miss jitter: GD stalled (flat gradient) but the total distance is
+// small.  Run a bounded local random search -- small +/- deltas and bit flips on
+// the bytes of unsatisfied constraints, keeping any non-worsening move -- to hop
+// the tiny barriers that flat/misleading gradients leave GD stuck at.  Unlike a
+// random restart this preserves the near-solution instead of re-rolling it away.
+static uint64_t near_miss_jitter(MutInput &input, std::shared_ptr<SearchTask> task,
+                                 uint64_t f0) {
+  std::vector<uint32_t> rel;
+  for (uint32_t i = 0, n = (uint32_t)input.len(); i < n; i++) {
+    for (size_t cid : task->cmap(i)) {
+      if (task->min_distances[cid]) { rel.push_back(i); break; }
+    }
+  }
+  if (rel.empty()) return f0;
+  if (g_trace) {
+    fprintf(stderr, "[trace] jitter-begin f0=%lu rel=%zu/%lu bytes {",
+            (unsigned long)f0, rel.size(), (unsigned long)input.len());
+    for (size_t k = 0; k < rel.size(); k++)
+      fprintf(stderr, "%s%u", k ? "," : "", (unsigned)task->inputs()[rel[k]].first);
+    fprintf(stderr, "}\n");
+  }
+  uint64_t best = f0;
+  for (int r = 0; r < NEAR_MISS_ROUNDS && !task->stopped; r++) {
+    uint32_t idx = rel[input.get_rand() % rel.size()];
+    uint64_t save = input.value[idx];
+    uint8_t rnd = input.get_rand();
+    char mv[24] = "";
+    if (rnd & 1) {
+      uint32_t bit = (rnd >> 1) & 7;
+      input.flip(idx, bit); // single-bit flip
+      if (g_trace) snprintf(mv, sizeof(mv), "flip b%u", bit);
+    } else {
+      uint64_t d = ((uint64_t)(rnd >> 2) & 7) + 1; // small delta 1..8
+      input.update(idx, (rnd & 2) != 0, d);
+      if (g_trace) snprintf(mv, sizeof(mv), "%c%lu", (rnd & 2) ? '+' : '-', (unsigned long)d);
+    }
+    uint64_t f_new = distance(input, task->distances, task);
+    if (task->solved) {
+      if (g_trace)
+        fprintf(stderr, "[trace]   r%-3d off@%u %-8s -> SOLVED\n",
+                r, (unsigned)task->inputs()[idx].first, mv);
+      return 0;
+    }
+    bool accept = (f_new <= best);
+    if (g_trace) {
+      // only log accepted moves that change f (real progress) and periodic beats
+      // -- reverts and no-op laterals are the common case and would drown the log
+      if (accept && f_new < best)
+        fprintf(stderr, "[trace]   r%-3d off@%u %-8s f=%lu->%lu ACCEPT\n",
+                r, (unsigned)task->inputs()[idx].first, mv,
+                (unsigned long)best, (unsigned long)f_new);
+    }
+    if (accept) { // keep improving AND lateral moves (escape plateaus)
+      best = f_new;
+      task->min_distances = task->distances;
+    } else {
+      input.value[idx] = save; // revert a worsening move
+    }
+  }
+  if (g_trace) fprintf(stderr, "[trace] jitter-end   f0=%lu\n", (unsigned long)best);
+  return best;
+}
+
+// Unified local-optimum escape: near-miss jitter when the total distance is
+// already small (preserve the near-solution), otherwise a full random restart.
+// Used both when the gradient is flat AND when descend stagnates with a
+// non-flat-but-misleading gradient.
+//
+// jitter_calls is a per-task budget guard: each jitter runs NEAR_MISS_ROUNDS
+// evals, and the flat-gradient loop can fire many times, so uncapped jitter
+// starves the multi-epoch descent that solves near-miss cases (observed as an
+// unstable-set regression).  After NEAR_MISS_MAX_CALLS jitters we fall back to
+// the cheap restart, preserving budget for descent.
+static uint64_t do_escape(MutInput &input, std::shared_ptr<SearchTask> task,
+                          uint64_t f0, int &jitter_calls, bool allow_jitter) {
+  if (allow_jitter && f0 <= NEAR_MISS_F0 && jitter_calls < NEAR_MISS_MAX_CALLS) {
+    jitter_calls++;
+    return near_miss_jitter(input, task, f0);
+  }
+  uint64_t r = repick_start_point(input, task);
+  trace_step("restart", input, r, task);
+  return r;
+}
 
 static uint64_t reload_input(MutInput &input_min, std::shared_ptr<SearchTask> task) {
   input_min.assign(task->inputs());
@@ -678,21 +1153,54 @@ static uint64_t reload_input(MutInput &input_min, std::shared_ptr<SearchTask> ta
 }
 
 bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
+#if JIGSAW_SEARCH_DEBUG
+  // JIGSAW_DEBUG=1 traces which phase produced the solution (i2s vs gradient
+  // descent) and the attempt count -- useful for telling apart constraints that
+  // are actually *searched* from those the i2s heuristic snaps for free.
+  static const bool dbg = (getenv("JIGSAW_DEBUG") != nullptr);
+  // JIGSAW_REPORT_ITERS=1 emits a parseable "[jigsaw] iters" line on every solve
+  // (attempts-to-solve for this task).  Used to profile the attempts distribution
+  // and pick a sensible default budget (MAX_EXEC_TIMES / --budget).
+  static const bool report_iters = (getenv("JIGSAW_REPORT_ITERS") != nullptr);
+#endif
+  trace_init();
   MutInput input(task->inputs_size());
   MutInput scratch_input(task->inputs_size());
   task->attempts = 0;
 
   uint64_t f0 = reload_input(input, task);
+  trace_step("seed", input, f0, task);
   f0 = try_i2s(input, scratch_input, f0, task);
-  if (task->stopped)
+  if (task->stopped) {
+#if JIGSAW_SEARCH_DEBUG
+    if (dbg)
+      fprintf(stderr, "[jigsaw] solved=%d by i2s (initial), attempts=%lu\n",
+              task->solved, (unsigned long)task->attempts);
+    if (report_iters && task->solved)
+      fprintf(stderr, "[jigsaw] iters=%lu phase=i2s-initial\n",
+              (unsigned long)task->attempts);
+#endif
     return task->solved;
+  }
 
   if (f0 == UINTMAX_MAX)
     return false;
 
-  int ep_i = 0;
+  [[maybe_unused]] int ep_i = 0; // epoch counter (read by diagnostics / #if DEBUG)
+  // counters read only by the JIGSAW_SEARCH_DEBUG diagnostics below
+  [[maybe_unused]] int dbg_restarts = 0; // flat-gradient escape loop iterations
+  int jitter_calls = 0; // per-task jitter budget (see do_escape)
 
   Grad grad(input.len());
+
+  // DIAGNOSTIC toggle (A/B only): JIGSAW_NO_JITTER disables flat-loop jitter so a
+  // single build can reproduce the pre-jitter baseline for comparison.  Compiled
+  // out in production (a constant false), where flat-loop jitter is always on.
+#if JIGSAW_SEARCH_DEBUG
+  static const bool no_jitter = (getenv("JIGSAW_NO_JITTER") != nullptr);
+#else
+  static constexpr bool no_jitter = false;
+#endif
 
   while (true) {
     if (task->stopped) {
@@ -714,12 +1222,19 @@ bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
       if (task->stopped)
         break;
       g_i++;
+      dbg_restarts++;
       //f0 = repick_start_point(input, f0, rng);
       //f0 = reload_input(input);
-      f0 = repick_start_point(input, task);
+      f0 = do_escape(input, task, f0, jitter_calls, !no_jitter); // flat gradient: jitter OK
       f0 = try_i2s(input, scratch_input, f0, task);
-      if (task->stopped)
+      if (task->stopped) {
+#if JIGSAW_SEARCH_DEBUG
+        if (dbg)
+          fprintf(stderr, "[jigsaw] solved=%d by i2s (restart), attempts=%lu\n",
+                  task->solved, (unsigned long)task->attempts);
+#endif
         break;
+      }
       grad.clear();
       cal_gradient(input, f0, grad, task);
     }
@@ -729,10 +1244,58 @@ bool rgd::gd_entry(std::shared_ptr<SearchTask> task) {
     }
     //TODO
     grad.normalize();
+    uint64_t before = f0;
     f0 = descend(input, scratch_input, f0, grad, task);
+#if JIGSAW_SEARCH_DEBUG
+    if (dbg && task->solved)
+      fprintf(stderr, "[jigsaw] solved=1 by gradient descent, epoch=%d attempts=%lu\n",
+              ep_i, (unsigned long)task->attempts);
+    if (g_trace) {
+      char lbl[24]; snprintf(lbl, sizeof(lbl), "descend ep%d", ep_i);
+      trace_step(lbl, input, f0, task);
+    }
+#endif
     ep_i += 1;
+    // Descend-stagnation escape: the gradient wasn't flat, but this epoch's line
+    // search failed to improve the global distance (misleading gradient / local
+    // optimum).  The flat-gradient loop above only fires when grad==0, which on
+    // sage-style tasks happens 1-3x while descend can stall for dozens of epochs.
+    // Fire the same escape here so a near-solution isn't abandoned to luck.
+    // DIAGNOSTIC toggles (A/B only): the gradient here is non-flat, so jitter
+    // (gradient-blind) may displace the descent that solves smooth near-misses.
+    //   JIGSAW_NO_STAGNATION  -> skip this hook entirely (baseline-like)
+    //   JIGSAW_STAG_RESTART   -> escape via restart only, never jitter here
+    // Compiled out in production (both constant false), where the hook fires with
+    // jitter -- the winning configuration.
+#if JIGSAW_SEARCH_DEBUG
+    static const bool no_stag = (getenv("JIGSAW_NO_STAGNATION") != nullptr);
+    static const bool stag_restart = (getenv("JIGSAW_STAG_RESTART") != nullptr);
+#else
+    static constexpr bool no_stag = false;
+    static constexpr bool stag_restart = false;
+#endif
+    if (!no_stag && !task->stopped && f0 >= before) {
+      f0 = do_escape(input, task, f0, jitter_calls, !stag_restart);
+      f0 = try_i2s(input, scratch_input, f0, task);
+    }
     //if (ep_i == 2) break;
   }
 
+#if JIGSAW_SEARCH_DEBUG
+  if (dbg && !task->solved) {
+    uint64_t fmin = 0; uint64_t nzero = 0;
+    for (int k = 0, n = task->size(); k < n; k++) {
+      fmin = sat_inc(fmin, task->min_distances[k]);
+      if (task->min_distances[k]) nzero++;
+    }
+    fprintf(stderr,
+        "[jigsaw] gave up (unsolved), epochs=%d attempts=%lu bytes=%zu cons=%d unsat_cons=%lu final_f0=%lu flat_restarts=%d\n",
+        ep_i, (unsigned long)task->attempts, (size_t)input.len(),
+        (int)task->size(), (unsigned long)nzero, (unsigned long)fmin, dbg_restarts);
+  }
+  if (report_iters && task->solved)
+    fprintf(stderr, "[jigsaw] iters=%lu phase=search\n",
+            (unsigned long)task->attempts);
+#endif
   return task->solved;
 }

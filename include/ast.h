@@ -58,6 +58,68 @@ namespace rgd {
     Memcmp, //37
     MemcmpN, // 38
 
+    // Floating-point arithmetic (operands & result are IEEE-754 bit-vectors).
+    // The out-of-process RGD path lifts BV children to the fpa theory in the
+    // z3 solver; jigsaw JIT and i2s stay integer-only and reject these.
+    FAdd, // 39
+    FSub, // 40
+    FMul, // 41
+    FDiv, // 42
+    FRem, // 43
+    FNeg, // 44
+
+    // FP casts
+    FpToUi, // 45
+    FpToSi, // 46
+    UiToFp, // 47
+    SiToFp, // 48
+    FpTrunc, // 49
+    FpExt, // 50
+
+    // FP intrinsics / libcalls
+    FpFabs, // 51
+    FpSqrt, // 52
+    FpRound, // 53   rounding-mode selector carried in AstNode index()
+    FpMin, // 54
+    FpMax, // 55
+    FpCopysign, // 56
+    FpIsNan, // 57
+    FpIsInf, // 58
+    FpIsFinite, // 59
+    FpSignbit, // 60
+    FpLrint, // 61
+
+    // FP transcendentals (exp/log/pow family).  z3's fpa theory has no way to
+    // invert these and jigsaw is integer-only, so those solvers reject them
+    // (see below); the i2s solver instead computes the numeric libm inverse
+    // (e.g. log for exp) and VERIFIES it, so it can flip these guards.  Kept
+    // inside the [FAdd, FUne] range so isFloatingPointKind() covers them.
+    FpExp, // 62
+    FpExp2, // 63
+    FpLog, // 64
+    FpLog2, // 65
+    FpLog10, // 66
+    FpLog1p, // 67
+    FpPow, // 68   binary: base and exponent (one is a constant for i2s)
+
+    // FP comparisons (LLVM FCmp predicates 1..14; FALSE/TRUE are constants).
+    // Kept OUTSIDE the isRelationalKind() range on purpose so that the
+    // integer-only jigsaw/i2s solvers cleanly reject FP tasks (fall back to z3).
+    FOeq, // 69
+    FOgt, // 70
+    FOge, // 71
+    FOlt, // 72
+    FOle, // 73
+    FOne, // 74
+    FOrd, // 75
+    FUno, // 76
+    FUeq, // 77
+    FUgt, // 78
+    FUge, // 79
+    FUlt, // 80
+    FUle, // 81
+    FUne, // 82
+
     // Last
     LastOp
   };
@@ -102,6 +164,50 @@ namespace rgd {
     "Load",
     "Memcmp",
     "MemcmpN",
+    "FAdd",
+    "FSub",
+    "FMul",
+    "FDiv",
+    "FRem",
+    "FNeg",
+    "FpToUi",
+    "FpToSi",
+    "UiToFp",
+    "SiToFp",
+    "FpTrunc",
+    "FpExt",
+    "FpFabs",
+    "FpSqrt",
+    "FpRound",
+    "FpMin",
+    "FpMax",
+    "FpCopysign",
+    "FpIsNan",
+    "FpIsInf",
+    "FpIsFinite",
+    "FpSignbit",
+    "FpLrint",
+    "FpExp",
+    "FpExp2",
+    "FpLog",
+    "FpLog2",
+    "FpLog10",
+    "FpLog1p",
+    "FpPow",
+    "FOeq",
+    "FOgt",
+    "FOge",
+    "FOlt",
+    "FOle",
+    "FOne",
+    "FOrd",
+    "FUno",
+    "FUeq",
+    "FUgt",
+    "FUge",
+    "FUlt",
+    "FUle",
+    "FUne",
   };
 
   static inline bool isRelationalKind(uint16_t kind) {
@@ -111,8 +217,48 @@ namespace rgd {
       return false;
   }
 
+  // Signed integer relational kinds (bvslt/bvsle/bvsgt/bvsge).  These are
+  // distinguished from the unsigned/equality relations because the jigsaw JIT
+  // SIGN-extends a signed comparison's operands to 64-bit (so gd.cc's
+  // (int64_t) distance is correct), while unsigned/equality comparisons
+  // ZERO-extend.  A signed and an unsigned comparison over identical operands
+  // therefore compile to DIFFERENT native functions and must NOT share a
+  // JIT'ed function (see isEqualAstRecursive) -- otherwise a signed constraint
+  // could reuse an unsigned (zero-extending) function and report an unsound SAT.
+  static inline bool isSignedRelationalKind(uint16_t kind) {
+    if (kind >= Slt && kind <= Sge)
+      return true;
+    else
+      return false;
+  }
+
+  // Floating-point relational kinds are deliberately kept out of the
+  // isRelationalKind() range: the integer-only jigsaw JIT and i2s solvers
+  // dispatch on isRelationalKind(), so excluding FP makes them reject FP
+  // tasks and fall back to the (FP-aware) z3 solver.
+  static inline bool isFPRelationalKind(uint16_t kind) {
+    if (kind >= FOeq && kind <= FUne)
+      return true;
+    else
+      return false;
+  }
+
   static inline bool isBinaryOperation(uint16_t kind) {
     if (kind >= Add && kind <= AShr && kind != Neg && kind != Not)
+      return true;
+    else
+      return false;
+  }
+
+  // Any floating-point op (FP arithmetic, casts, intrinsics/libcalls, and FP
+  // comparisons) lives contiguously in [FAdd, FUne].  The integer-only solvers
+  // (jigsaw JIT, i2s input-to-state) cannot reason about these: input bytes
+  // reaching a comparison *through* an FP op (e.g. (long)x == 42, lrint(x) == 42)
+  // no longer appear literally, so copying the constant into the input produces
+  // a bogus solution.  Such solvers must reject a constraint whose ops bitset
+  // intersects this range and fall back to the FP-aware z3 solver.
+  static inline bool isFloatingPointKind(uint16_t kind) {
+    if (kind >= FAdd && kind <= FUne)
       return true;
     else
       return false;
@@ -130,6 +276,21 @@ namespace rgd {
       case Sle: return Sgt;
       case Sgt: return Sle;
       case Sge: return Slt;
+      // FP predicate negations (LLVM's ordered<->unordered complement pairs).
+      case FOeq: return FUne;
+      case FUne: return FOeq;
+      case FOgt: return FUle;
+      case FUle: return FOgt;
+      case FOge: return FUlt;
+      case FUlt: return FOge;
+      case FOlt: return FUge;
+      case FUge: return FOlt;
+      case FOle: return FUgt;
+      case FUgt: return FOle;
+      case FOne: return FUeq;
+      case FUeq: return FOne;
+      case FOrd: return FUno;
+      case FUno: return FOrd;
       default: return Bool;
     }
   }
@@ -266,8 +427,12 @@ namespace rgd {
     if (lhs.kind() != rhs.kind()) {
       // to maximize the reuse of JIT'ed functions, jigsaw does not
       // care about which relational operator is used, as long as
-      // they are both relational operators
-      if (isRelationalKind(lhs.kind()) && isRelationalKind(rhs.kind())) {
+      // they are both relational operators -- EXCEPT that signed and
+      // unsigned comparisons extend their operands differently in the
+      // JIT (sign- vs zero-extend), so they must stay in separate reuse
+      // classes; sharing across the boundary yields an unsound SAT.
+      if (isRelationalKind(lhs.kind()) && isRelationalKind(rhs.kind())
+          && isSignedRelationalKind(lhs.kind()) == isSignedRelationalKind(rhs.kind())) {
         // do nothing, fall through to compare operands
       } else {
         return false;

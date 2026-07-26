@@ -277,12 +277,21 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     uint16_t len = size > 8 ? 8 : size; // for fmemcmp, size is in bytes, not bits
     if (l1 >= CONST_OFFSET) internal_memcpy(&op1, (void*)op1, len);
     if (l2 >= CONST_OFFSET) internal_memcpy(&op2, (void*)op2, len);
-  } else if (op < __dfsan::fmemcmp &&
+  } else if ((op & 0xff) < __dfsan::fmemcmp &&
              op != __dfsan::Alloca &&
              op != __dfsan::PtrToInt &&
-             (op & 0xff) != __dfsan::ICmp) {
-    // Not a higher-order op and not Alloca/ICmp/PtrToInt - zero out for symbolic operands
-    // PtrToInt needs op1 preserved to compute base pointer for string ops
+             (op & 0xff) != __dfsan::ICmp &&
+             (op & 0xff) != __dfsan::FCmp) {
+    // mask to the base opcode: FP arithmetic (FAdd/FSub/FMul/FDiv) may pack a
+    // rounding-mode selector into the high byte, and must still zero op1/op2 for
+    // symbolic operands so identical symbolic nodes dedup (the operand values
+    // are irrelevant once symbolic; the selector lives in op, not op1/op2).
+    // Not a higher-order op and not Alloca/ICmp/FCmp/PtrToInt - zero out for
+    // symbolic operands.
+    // PtrToInt needs op1 preserved to compute base pointer for string ops.
+    // FCmp, like ICmp, keeps both operand bit patterns so the solver can
+    // validate/evaluate the comparison (FILTER_WRONG_AST) without re-deriving
+    // the concrete FP values.
     if (l1 >= CONST_OFFSET) op1 = 0;
     if (l2 >= CONST_OFFSET) op2 = 0;
   }

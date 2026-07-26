@@ -1,7 +1,7 @@
 ##########
 # added by user
 #########
-fun:log10=functional
+fun:log10=custom
 fun:__ctype_toupper_loc=discard
 fun:isatty=discard
 fun:longjmp=discard
@@ -94,44 +94,58 @@ fun:ispunct=functional
 fun:isspace=functional
 
 # Functions that return a value that is data-dependent on the input.
-fun:__isinf=functional
-fun:__isinff=functional
-fun:__signbit=functional
-fun:__signbitf=functional
+#
+# FP predicates (isnan/isinf/finite/signbit) and round-to-int (lrint/llrint) are
+# modeled as custom wrappers (see dfsan_custom.cpp / z3-ts.cpp).  SymSan has no
+# working "functional" ABI: WK_Functional in TaintPass.cpp is a no-op that drops
+# the return shadow, so a `functional` mark silently loses taint.  A custom
+# wrapper instead records the actual operation so the z3 solver can flip branches
+# like `if (isnan(x))` or `if (lrint(x) == 42)`.  The long double (`*l`) variants
+# stay `functional`: our FP lifting only supports IEEE 16/32/64-bit sorts, not
+# x86_fp80.  Monotonic transcendentals (exp/exp2/log/log2/log10/log1p and pow
+# with a constant operand) are now `custom` too: z3 still cannot invert them and
+# jigsaw is integer-only, but the i2s solver flips such guards by computing the
+# numeric libm inverse (e.g. log for exp) and verifying it.  Non-monotonic /
+# multi-output libcalls (fmod, frexp, modf, nextafter/nexttoward) stay
+# `functional` -- i2s cannot invert them either.
+fun:__isinf=custom
+fun:__isinff=custom
+fun:__signbit=custom
+fun:__signbitf=custom
 fun:__signbitl=functional
 fun:abs=functional
 fun:btowc=functional
-fun:exp=functional
-fun:exp2=functional
-fun:expf=functional
+fun:exp=custom
+fun:exp2=custom
+fun:expf=custom
 fun:expl=functional
-fun:fabs=functional
-fun:finite=functional
-fun:finitef=functional
+fun:fabs=custom
+fun:finite=custom
+fun:finitef=custom
 fun:finitel=functional
-fun:floor=functional
+fun:floor=custom
 fun:fmod=functional
 fun:frexp=functional
 fun:frexpf=functional
 fun:frexpl=functional
-fun:isinf=functional
-fun:isinff=functional
+fun:isinf=custom
+fun:isinff=custom
 fun:isinfl=functional
-fun:isnan=functional
-fun:isnanf=functional
+fun:isnan=custom
+fun:isnanf=custom
 fun:isnanl=functional
-fun:lrint=functional
-fun:lrintf=functional
+fun:lrint=custom
+fun:lrintf=custom
 fun:lrintl=functional
-fun:llrint=functional
-fun:llrintf=functional
+fun:llrint=custom
+fun:llrintf=custom
 fun:llrintl=functional
-fun:log=functional
-fun:log1p=functional
-fun:log1pf=functional
+fun:log=custom
+fun:log1p=custom
+fun:log1pf=custom
 fun:log1pl=functional
-fun:log2=functional
-fun:log2f=functional
+fun:log2=custom
+fun:log2f=custom
 fun:log2l=functional
 fun:modf=functional
 fun:nextafter=functional
@@ -140,12 +154,32 @@ fun:nextafterl=functional
 fun:nexttoward=functional
 fun:nexttowardf=functional
 fun:nexttowardl=functional
-fun:pow=functional
-fun:powf=functional
+fun:pow=custom
+fun:powf=custom
 fun:powl=functional
-fun:round=functional
-fun:sqrt=functional
-fun:sqrtf=functional
+fun:round=custom
+fun:sqrt=custom
+fun:sqrtf=custom
+# Floating-point math libcalls modeled as custom wrappers (see dfsan_custom.cpp).
+# These build the self-defined fp_* op nodes so the z3 solver can reconstruct
+# and flip FP-dependent branches even when clang keeps them as libcalls.
+fun:fabsf=custom
+fun:floorf=custom
+fun:ceil=custom
+fun:ceilf=custom
+fun:trunc=custom
+fun:truncf=custom
+fun:roundf=custom
+fun:rint=custom
+fun:rintf=custom
+fun:nearbyint=custom
+fun:nearbyintf=custom
+fun:fmin=custom
+fun:fminf=custom
+fun:fmax=custom
+fun:fmaxf=custom
+fun:copysign=custom
+fun:copysignf=custom
 fun:wctob=functional
 fun:wctob=functional
 

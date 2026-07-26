@@ -203,7 +203,52 @@ enum operators {
   fprefixof = last_llvm_op + 19, // 86 prefixof(str, prefix) using Z3 string theory
   fsuffixof = last_llvm_op + 20, // 87 suffixof(str, suffix) using Z3 string theory
   flength   = last_llvm_op + 21, // 88 z3::length(str_var), Int sort
-  LastOp    = last_llvm_op + 22, // 89
+  // floating-point ops.  Binary FP arithmetic (FAdd/FSub/FMul/FDiv/FRem),
+  // FP casts (FPToUI/FPToSI/UIToFP/SIToFP/FPTrunc/FPExt) and FCmp reuse the LLVM
+  // opcodes directly (they are already in this enum via Instruction.def).  The
+  // ops below are the ones LLVM does *not* give us a usable opcode for: FNeg is a
+  // unary instruction (Instruction.def UNARY insts are not expanded here) and the
+  // FP intrinsics have no opcode at all.  They are placed in [Add, LastOp) so
+  // is_valid_op() accepts them.
+  fp_neg      = last_llvm_op + 22, // 89 fneg (llvm FNeg is unary, not in enum)
+  fp_fabs     = last_llvm_op + 23, // 90 llvm.fabs
+  fp_sqrt     = last_llvm_op + 24, // 91 llvm.sqrt
+  fp_round    = last_llvm_op + 25, // 92 round-to-integral; rounding mode in op1
+  fp_min      = last_llvm_op + 26, // 93 llvm.minnum
+  fp_max      = last_llvm_op + 27, // 94 llvm.maxnum
+  fp_copysign = last_llvm_op + 28, // 95 llvm.copysign
+  // FP predicates + rounding-to-int libcalls modeled as custom wrappers (see
+  // done_abilist.txt / dfsan_custom.cpp).  SymSan has no working "functional"
+  // ABI (WK_Functional is a no-op that drops taint), so these must build real
+  // op nodes for the solver.  Predicate results are 0/1 integers; fp_lrint is
+  // round-to-nearest (RNE) then convert to a signed integer.
+  fp_is_nan    = last_llvm_op + 29, // 96 isnan/isnanf
+  fp_is_inf    = last_llvm_op + 30, // 97 isinf/isinff and __isinf/__isinff
+  fp_is_finite = last_llvm_op + 31, // 98 finite/finitef
+  fp_signbit   = last_llvm_op + 32, // 99 __signbit/__signbitf
+  fp_lrint     = last_llvm_op + 33, // 100 lrint/lrintf/llrint/llrintf
+  // FP transcendentals modeled as custom wrappers (see done_abilist.txt /
+  // dfsan_custom.cpp).  z3 cannot invert them and jigsaw is integer-only, so
+  // only the i2s solver flips these guards (it computes the numeric libm
+  // inverse and verifies).  fp_pow is binary (base, exponent).
+  fp_exp       = last_llvm_op + 34, // 101 exp/expf
+  fp_exp2      = last_llvm_op + 35, // 102 exp2
+  fp_log       = last_llvm_op + 36, // 103 log/logf
+  fp_log2      = last_llvm_op + 37, // 104 log2/log2f
+  fp_log10     = last_llvm_op + 38, // 105 log10
+  fp_log1p     = last_llvm_op + 39, // 106 log1p/log1pf
+  fp_pow       = last_llvm_op + 40, // 107 pow/powf
+  LastOp    = last_llvm_op + 41, // 108
+};
+
+// rounding-mode selector carried in op1 for fp_round, and used when lowering FP
+// arithmetic in the solver.  Values match z3::rounding_mode ordering.
+enum fp_rounding_mode {
+  fp_rm_rna = 0, // round nearest, ties to away (llvm.round)
+  fp_rm_rne = 1, // round nearest, ties to even (llvm.rint/nearbyint, default)
+  fp_rm_rtp = 2, // round toward +inf (llvm.ceil)
+  fp_rm_rtn = 3, // round toward -inf (llvm.floor)
+  fp_rm_rtz = 4, // round toward zero (llvm.trunc)
 };
 
 // Flag packed into the high bits of a fatoi label's op1 (which otherwise holds
@@ -246,13 +291,21 @@ static inline uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predic
 }
 
 static inline bool is_commutative(uint16_t op) {
-  switch(op) {
+  // mask to the base opcode: cmp packs a predicate and FP arithmetic may pack a
+  // rounding-mode selector into the high byte (neither changes commutativity).
+  switch(op & 0xff) {
     case Not:
     case And:
     case Or:
     case Xor:
     case Add:
     case Mul:
+    // FP add/mul/min/max are commutative (NaN propagation and signed-zero
+    // results are symmetric), so operands may be swapped for dedup.
+    case FAdd:
+    case FMul:
+    case fp_min:
+    case fp_max:
     case fmemcmp:
     case fstrcmp:
       return true;

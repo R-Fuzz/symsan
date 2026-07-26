@@ -93,6 +93,245 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
   return v;
 }
 
+//===----------------------------------------------------------------------===//
+// Floating-point input-to-state helpers
+//
+// FP-typed labels carry the IEEE-754 encoding as a bit-vector, so a "direct"
+// FCmp (an input value read straight into an FP compare against a constant)
+// looks, at the byte level, exactly like the integer i2s case: the symbolic
+// operand's bytes appear literally in the input and can be replaced wholesale.
+// The only twist is that the replacement value must satisfy an FP relation, so
+// we decode to a C double/float, pick a satisfying value (using nextafter for
+// strict inequalities), and re-encode.  Every guess is verified against the
+// actual FP semantics before we claim SAT (see solve_fcmp).
+//===----------------------------------------------------------------------===//
+
+// Decode an IEEE-754 bit pattern (4- or 8-byte) into a C double.
+static inline double fp_decode(uint64_t bits, uint32_t bytes) {
+  if (bytes == 8) {
+    double d; memcpy(&d, &bits, sizeof(d)); return d;
+  } else { // 4
+    uint32_t u = (uint32_t)bits; float f; memcpy(&f, &u, sizeof(f)); return (double)f;
+  }
+}
+
+// Encode a C double into an IEEE-754 bit pattern of the given width (narrowing
+// to float for 4-byte).  Inverse of fp_decode.
+static inline uint64_t fp_encode(double d, uint32_t bytes) {
+  if (bytes == 8) {
+    uint64_t b; memcpy(&b, &d, sizeof(b)); return b;
+  } else { // 4
+    float f = (float)d; uint32_t u; memcpy(&u, &f, sizeof(u)); return (uint64_t)u;
+  }
+}
+
+// Next representable value from x toward dir (+/-inf), at the target precision.
+static inline double fp_next(double x, double dir, uint32_t bytes) {
+  if (bytes == 8) return nextafter(x, dir);
+  else return (double)nextafterf((float)x, (float)dir);
+}
+
+// Map an rgd FP relational kind to the LLVM FCmp predicate (1..14).
+static inline uint32_t fcmp_predicate(uint32_t comparison) {
+  return comparison - rgd::FOeq + 1;
+}
+
+// Swap the operands of an FCmp predicate: returns the predicate P' such that
+// (a P b) == (b P' a).  Only the ordering-sensitive predicates change.
+static inline uint32_t swap_fcmp_predicate(uint32_t pred) {
+  switch (pred) {
+    case 2:  return 4;  // OGT <-> OLT
+    case 3:  return 5;  // OGE <-> OLE
+    case 4:  return 2;
+    case 5:  return 3;
+    case 10: return 12; // UGT <-> ULT
+    case 11: return 13; // UGE <-> ULE
+    case 12: return 10;
+    case 13: return 11;
+    default: return pred; // OEQ, ONE, ORD, UNO, UEQ, UNE are symmetric
+  }
+}
+
+// Concrete evaluation of an FCmp (LLVM predicate 1..14) on two doubles.
+static inline bool i2s_eval_fcmp(uint32_t pred, double a, double b) {
+  bool ord = !(isnan(a) || isnan(b));
+  switch (pred) {
+    case 1:  return ord && a == b; // OEQ
+    case 2:  return ord && a > b;  // OGT
+    case 3:  return ord && a >= b; // OGE
+    case 4:  return ord && a < b;  // OLT
+    case 5:  return ord && a <= b; // OLE
+    case 6:  return ord && a != b; // ONE
+    case 7:  return ord;           // ORD
+    case 8:  return !ord;          // UNO
+    case 9:  return !ord || a == b; // UEQ
+    case 10: return !ord || a > b;  // UGT
+    case 11: return !ord || a >= b; // UGE
+    case 12: return !ord || a < b;  // ULT
+    case 13: return !ord || a <= b; // ULE
+    case 14: return !ord || a != b; // UNE
+    default: return false;
+  }
+}
+
+// Pick a value for the symbolic operand that satisfies (sym <pred> k) when the
+// symbolic operand is the lhs, or (k <pred> sym) when it is the rhs.  We fold
+// the rhs case into the lhs case by swapping the predicate, then choose a
+// witness relative to the constant k.  The result is still verified by the
+// caller, so an unsatisfiable predicate (e.g. OGT against +inf) just fails
+// verification and is skipped.
+static inline double fp_i2s_target(uint32_t pred, double k, bool sym_is_lhs,
+                                   uint32_t bytes) {
+  uint32_t p = sym_is_lhs ? pred : swap_fcmp_predicate(pred);
+  switch (p) {
+    case 1:  // OEQ: sym == k
+    case 3:  // OGE: sym >= k
+    case 5:  // OLE: sym <= k
+    case 7:  // ORD: sym is not NaN
+    case 9:  // UEQ: sym == k (or NaN)
+    case 11: // UGE
+    case 13: // ULE
+      return k;
+    case 2:  // OGT: sym > k
+    case 10: // UGT
+      return fp_next(k, HUGE_VAL, bytes); // toward +inf
+    case 4:  // OLT: sym < k
+    case 12: // ULT
+      return fp_next(k, -HUGE_VAL, bytes); // toward -inf
+    case 6:  // ONE: sym != k, not NaN
+    case 14: // UNE
+      return k == 0.0 ? 1.0 : 0.0;
+    case 8:  // UNO: sym is NaN (k is a concrete constant, assumed not NaN)
+      return (double)NAN;
+    default:
+      return k;
+  }
+}
+
+// True for the FP binops that solve_fcmp can invert against a constant.
+// FpPow is included: it is binary (base, exponent) with one constant operand,
+// so it reuses the same fp_binop_eval/invert/const machinery as FAdd..FDiv.
+static inline bool isFPArithKind(uint16_t kind) {
+  return (kind >= rgd::FAdd && kind <= rgd::FDiv) || kind == rgd::FpPow;
+}
+
+// True for the unary FP transcendentals solve_fcmp can invert numerically
+// (exp/exp2/log/log2/log10/log1p).  z3 cannot invert these, but i2s computes
+// the closed-form libm inverse (see fp_trans_invert) and verifies it.
+static inline bool isFPTransKind(uint16_t kind) {
+  return kind >= rgd::FpExp && kind <= rgd::FpLog1p;
+}
+
+// Forward-evaluate a unary FP transcendental at the target precision (float for
+// 4-byte, double for 8-byte), mirroring fp_binop_eval so the structural check
+// matches the runtime-recorded result bit-exactly.
+static inline double fp_trans_eval(double v, uint16_t kind, uint32_t bytes) {
+  if (bytes == 4) {
+    float fv = (float)v, fr;
+    switch (kind) {
+      case rgd::FpExp:   fr = expf(fv); break;
+      case rgd::FpExp2:  fr = exp2f(fv); break;
+      case rgd::FpLog:   fr = logf(fv); break;
+      case rgd::FpLog2:  fr = log2f(fv); break;
+      case rgd::FpLog10: fr = log10f(fv); break;
+      case rgd::FpLog1p: fr = log1pf(fv); break;
+      default: fr = fv;
+    }
+    return (double)fr;
+  } else {
+    switch (kind) {
+      case rgd::FpExp:   return exp(v);
+      case rgd::FpExp2:  return exp2(v);
+      case rgd::FpLog:   return log(v);
+      case rgd::FpLog2:  return log2(v);
+      case rgd::FpLog10: return log10(v);
+      case rgd::FpLog1p: return log1p(v);
+      default: return v;
+    }
+  }
+}
+
+// Invert a unary FP transcendental: return the input value x such that
+// f(x) == s.  A heuristic guess (FP rounding is not exactly invertible), always
+// re-verified by the caller.  exp<->log, exp2<->log2, log10->pow(10,.),
+// log1p->expm1.
+static inline double fp_trans_invert(double s, uint16_t kind) {
+  switch (kind) {
+    case rgd::FpExp:   return log(s);
+    case rgd::FpExp2:  return log2(s);
+    case rgd::FpLog:   return exp(s);
+    case rgd::FpLog2:  return exp2(s);
+    case rgd::FpLog10: return pow(10.0, s);
+    case rgd::FpLog1p: return expm1(s);
+    default: return s;
+  }
+}
+
+// Forward-evaluate an FP binop in the target precision (float for 4-byte, double
+// for 8-byte).  const_is_rhs selects operand order for the non-commutative ops:
+// true  -> (v op cst), false -> (cst op v).  Computing in the target precision
+// lets the structural check below match the runtime-recorded result bit-exactly.
+static inline double fp_binop_eval(double v, double cst, uint16_t kind,
+                                   bool const_is_rhs, uint32_t bytes) {
+  if (bytes == 4) {
+    float fv = (float)v, fc = (float)cst, fr;
+    switch (kind) {
+      case rgd::FAdd: fr = fv + fc; break;                       // commutative
+      case rgd::FSub: fr = const_is_rhs ? fv - fc : fc - fv; break;
+      case rgd::FMul: fr = fv * fc; break;                       // commutative
+      case rgd::FDiv: fr = const_is_rhs ? fv / fc : fc / fv; break;
+      // pow(base, exp): const_is_rhs -> exponent is constant (v^c), else base
+      // is constant (c^v).
+      case rgd::FpPow: fr = const_is_rhs ? powf(fv, fc) : powf(fc, fv); break;
+      default: fr = fv;
+    }
+    return (double)fr;
+  } else {
+    switch (kind) {
+      case rgd::FAdd: return v + cst;                            // commutative
+      case rgd::FSub: return const_is_rhs ? v - cst : cst - v;
+      case rgd::FMul: return v * cst;                            // commutative
+      case rgd::FDiv: return const_is_rhs ? v / cst : cst / v;
+      case rgd::FpPow: return const_is_rhs ? pow(v, cst) : pow(cst, v);
+      default: return v;
+    }
+  }
+}
+
+// Invert an FP binop: return the operand value that makes the binop produce s.
+// The result is a heuristic guess (FP rounding is not exactly invertible) and is
+// always re-verified by the caller.
+static inline double fp_binop_invert(double s, double cst, uint16_t kind,
+                                     bool const_is_rhs) {
+  switch (kind) {
+    case rgd::FAdd: return s - cst;                             // v = s - cst
+    case rgd::FSub: return const_is_rhs ? s + cst : cst - s;    // v op cst / cst op v
+    case rgd::FMul: return s / cst;                             // v = s / cst
+    case rgd::FDiv: return const_is_rhs ? s * cst : cst / s;    // v op cst / cst op v
+    // pow: exponent const -> v = s^(1/cst); base const -> v = log(s)/log(cst)
+    case rgd::FpPow: return const_is_rhs ? pow(s, 1.0 / cst) : log(s) / log(cst);
+    default: return s;
+  }
+}
+
+// Find the Constant child of an FP binop node and return its IEEE bits plus
+// which side it is on.  Mirrors get_binop_value's constant lookup.
+static inline bool fp_binop_const(std::shared_ptr<const Constraint> constraint,
+    const AstNode &node, uint64_t &cst_bits, bool &const_is_rhs) {
+  auto &left = node.children(0);
+  auto &right = node.children(1);
+  if (left.kind() == Constant) {
+    cst_bits = constraint->input_args[left.index()].second;
+    const_is_rhs = false;
+    return true;
+  } else if (right.kind() == Constant) {
+    cst_bits = constraint->input_args[right.index()].second;
+    const_is_rhs = true;
+    return true;
+  }
+  return false;
+}
+
 static inline uint64_t _get_binop_value(uint64_t v1, uint64_t v2, uint16_t kind) {
   switch (kind) {
     case rgd::Add: return v1 + v2;
@@ -211,6 +450,207 @@ I2SSolver::I2SSolver(): matches(0), mismatches(0) {
   // binop_mask.set(rgd::Shl);
   binop_mask.set(rgd::LShr);
   binop_mask.set(rgd::AShr);
+
+  // FP ops that input-to-state cannot invert: FRem, FNeg, and all FP casts and
+  // intrinsics/libcalls, i.e. [FRem, FpLrint] -- everything from FRem up to (but
+  // not including) the first invertible transcendental kind (FpExp).  The FP
+  // relational kinds are left out so a direct FCmp (input -> compare against a
+  // constant) is not rejected; the invertible FP binops (FAdd/FSub/FMul/FDiv),
+  // the transcendentals (FpExp..FpLog1p) and FpPow are also left out so an
+  // "f(x) <cmp> K" / "x op C <cmp> K" constraint reaches solve_fcmp.
+  for (uint16_t k = rgd::FRem; k < rgd::FpExp; ++k)
+    fp_ops_mask.set(k);
+
+  // Invertible FP binops handled by solve_fcmp's arith fallback: [FAdd, FRem)
+  // plus FpPow (binary, one constant operand).
+  for (uint16_t k = rgd::FAdd; k < rgd::FRem; ++k)
+    fp_arith_mask.set(k);
+  fp_arith_mask.set(rgd::FpPow);
+
+  // Invertible unary FP transcendentals handled by solve_fcmp: [FpExp, FpPow).
+  for (uint16_t k = rgd::FpExp; k < rgd::FpPow; ++k)
+    fp_trans_mask.set(k);
+}
+
+solver_result_t
+I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
+                      std::unique_ptr<ConsMeta> const& cm,
+                      uint32_t comparison,
+                      const uint8_t *in_buf, size_t in_size,
+                      uint8_t *out_buf, size_t &out_size) {
+
+  uint32_t predicate = fcmp_predicate(comparison);
+
+  // Classify the comparison by AST structure (not by value matching): is one
+  // operand produced by a single invertible FP arith op against a constant, or
+  // is it a direct compare of an input operand?  Deciding by structure avoids a
+  // false "direct" match when an arith result happens to equal the raw input
+  // bytes (e.g. 0.0 * C == 0.0 on an all-zero seed).
+  auto const& root = *c->get_root();
+  auto const& lc = root.children(0);
+  auto const& rc = root.children(1);
+  const AstNode *arith = nullptr;
+  bool arith_is_lhs = false;
+  if (isFPArithKind(lc.kind())) { arith = &lc; arith_is_lhs = true; }
+  else if (isFPArithKind(rc.kind())) { arith = &rc; arith_is_lhs = false; }
+  const AstNode *trans = nullptr;
+  bool trans_is_lhs = false;
+  if (isFPTransKind(lc.kind())) { trans = &lc; trans_is_lhs = true; }
+  else if (isFPTransKind(rc.kind())) { trans = &rc; trans_is_lhs = false; }
+
+  uint16_t arith_kind = 0;
+  uint16_t trans_kind = 0;
+  uint64_t cst_bits = 0;
+  bool const_is_rhs = false;
+  // combined set of invertible FP ops (arith incl pow, and transcendentals):
+  // i2s can only handle a SINGLE such op that is a direct child of the compare.
+  std::bitset<rgd::LastOp> invertible = (fp_arith_mask | fp_trans_mask) & c->ops;
+  DEBUGF("i2s fcmp: lc.kind=%u rc.kind=%u arith=%p(lhs=%d) trans=%p invertible.count=%zu "
+         "trans_any=%d arith_any=%d ncand=%zu\n",
+         lc.kind(), rc.kind(), (void*)arith, arith_is_lhs, (void*)trans,
+         invertible.count(), (int)(fp_trans_mask & c->ops).any(),
+         (int)(fp_arith_mask & c->ops).any(), cm->i2s_candidates.size());
+  if ((fp_trans_mask & c->ops).any()) {
+    // f(x) <cmp> K for a unary transcendental f; invert via the libm inverse.
+    if (trans == nullptr || invertible.count() != 1) {
+      return SOLVER_TIMEOUT;
+    }
+    trans_kind = trans->kind();
+  } else if ((fp_arith_mask & c->ops).any()) {
+    // FP arithmetic is involved; i2s can only invert a SINGLE arith op that is a
+    // direct child of the comparison and has a constant operand.  Anything else
+    // (nested/multiple arith, or two symbolic operands) is left for z3.
+    if (arith == nullptr || invertible.count() != 1 ||
+        !fp_binop_const(c, *arith, cst_bits, const_is_rhs)) {
+      DEBUGF("i2s fcmp: arith branch reject arith=%p count=%zu\n",
+             (void*)arith, invertible.count());
+      return SOLVER_TIMEOUT;
+    }
+    arith_kind = arith->kind();
+    DEBUGF("i2s fcmp: arith accepted kind=%u cst_bits=0x%lx const_is_rhs=%d\n",
+           arith_kind, cst_bits, const_is_rhs);
+  }
+
+  // Structural anchor by INPUT OFFSET.  The value-only structural checks below
+  // can be fooled when two operands hold coincidentally-equal values.  For
+  // example `fa == fb + C` on a seed where fa == fb: feeding fa through `+ C`
+  // yields the same value as fb+C, so the fa candidate passes the value check
+  // and the inverted result gets written to fa -- the WRONG input.  When the
+  // operand we intend to modify is a plain Read, its AST node records the exact
+  // input offset it reads (Read::index()); only accept the candidate at that
+  // offset.  If the operand is not a plain Read (transformed input, offset not
+  // determinable), fall back to the value-only check to preserve behavior.
+  auto read_offset = [](const AstNode &n, size_t &off) -> bool {
+    if (n.kind() == rgd::Read) { off = n.index(); return true; }
+    return false;
+  };
+  size_t sym_off = 0;
+  bool have_sym_off = false;   // arith/trans: offset of the symbolic operand
+  if (trans != nullptr) {
+    have_sym_off = read_offset(trans->children(0), sym_off);
+  } else if (arith != nullptr) {
+    have_sym_off = read_offset(arith->children(const_is_rhs ? 0 : 1), sym_off);
+  }
+  size_t lc_off = 0, rc_off = 0;   // direct compare: offsets of each side
+  bool have_lc_off = read_offset(lc, lc_off);
+  bool have_rc_off = read_offset(rc, rc_off);
+
+  for (auto const& candidate : cm->i2s_candidates) {
+    size_t offset = candidate.first;
+    uint32_t bytes = candidate.second;
+    // only IEEE single/double are decoded here
+    if (bytes != 4 && bytes != 8) {
+      continue;
+    }
+    uint64_t mask = (bytes == 8) ? ~0ULL : 0xffffffffULL;
+    uint64_t value = 0;
+    memcpy(&value, &in_buf[offset], bytes);
+    value &= mask;
+    // Every guess below is verified with i2s_eval_fcmp before we claim SAT, so a
+    // heuristic guess that does not satisfy the relation (e.g. OGT against the
+    // max representable value, or an FP inversion broken by rounding) is skipped
+    // and left for z3.
+    bool sym_is_lhs;
+    uint64_t r = 0;
+    if (trans != nullptr) {
+      // f(x) <cmp> K -- invert the transcendental to recover x (e.g. exp -> log).
+      // anchor: only the input bytes the transcendental actually reads
+      if (have_sym_off && offset != sym_off) continue;
+      sym_is_lhs = trans_is_lhs;
+      double x_in = fp_decode(value, bytes);
+      // structural check: confirm these input bytes really produce the recorded
+      // transcendental-side operand value (guards against a coincidental match).
+      uint64_t fwd_bits = fp_encode(fp_trans_eval(x_in, trans_kind, bytes), bytes) & mask;
+      uint64_t trans_side = (sym_is_lhs ? c->op1 : c->op2) & mask;
+      if (fwd_bits != trans_side) continue;
+      // pick a target for the function *result*, then invert to recover the input.
+      double k = fp_decode((sym_is_lhs ? c->op2 : c->op1) & mask, bytes);
+      double s = fp_i2s_target(predicate, k, sym_is_lhs, bytes);
+      double x_new = fp_trans_invert(s, trans_kind);
+      r = fp_encode(x_new, bytes) & mask;
+      // verify end-to-end: re-apply the transcendental to the value we would write.
+      double res = fp_trans_eval(fp_decode(r, bytes), trans_kind, bytes);
+      double a = sym_is_lhs ? res : k;
+      double b = sym_is_lhs ? k : res;
+      if (!i2s_eval_fcmp(predicate, a, b)) continue;
+    } else if (arith != nullptr) {
+      // (x op C) <cmp> K -- invert the arith op to recover x, mirroring the
+      // integer binop path in solve_icmp.
+      // anchor: only the input bytes the arith's symbolic operand actually reads
+      if (have_sym_off && offset != sym_off) continue;
+      sym_is_lhs = arith_is_lhs;
+      double x_in = fp_decode(value, bytes);
+      double cst = fp_decode(cst_bits & mask, bytes);
+      // structural check: confirm these input bytes really produce the recorded
+      // arith-side operand value (guards against a coincidental offset match).
+      uint64_t fwd_bits =
+          fp_encode(fp_binop_eval(x_in, cst, arith_kind, const_is_rhs, bytes), bytes) & mask;
+      uint64_t arith_side = (sym_is_lhs ? c->op1 : c->op2) & mask;
+      DEBUGF("i2s fcmp arith cand off=%zu bytes=%u x_in=%g cst=%g fwd=0x%lx arith_side=0x%lx\n",
+             offset, bytes, x_in, cst, fwd_bits, arith_side);
+      if (fwd_bits != arith_side) continue;
+      // pick a target for the arith *result*, then invert to recover the input.
+      double k = fp_decode((sym_is_lhs ? c->op2 : c->op1) & mask, bytes);
+      double s = fp_i2s_target(predicate, k, sym_is_lhs, bytes);
+      double x_new = fp_binop_invert(s, cst, arith_kind, const_is_rhs);
+      r = fp_encode(x_new, bytes) & mask;
+      // verify end-to-end: re-apply the arith op to the value we would write.
+      double res = fp_binop_eval(fp_decode(r, bytes), cst, arith_kind, const_is_rhs, bytes);
+      double a = sym_is_lhs ? res : k;
+      double b = sym_is_lhs ? k : res;
+      if (!i2s_eval_fcmp(predicate, a, b)) continue;
+    } else {
+      // direct FCmp: the input bytes are one of the comparison operands, and the
+      // other is the concrete constant we compare against.  Anchor to the Read
+      // offset of each side (when it is a plain Read) so an unrelated candidate
+      // that merely holds the same value is not mistaken for the operand.
+      uint64_t const_bits;
+      if ((c->op1 & mask) == value && (!have_lc_off || offset == lc_off)) {
+        sym_is_lhs = true;
+        const_bits = c->op2 & mask;
+      } else if ((c->op2 & mask) == value && (!have_rc_off || offset == rc_off)) {
+        sym_is_lhs = false;
+        const_bits = c->op1 & mask;
+      } else {
+        continue; // input does not feed this comparison directly
+      }
+      double k = fp_decode(const_bits, bytes);
+      double s = fp_i2s_target(predicate, k, sym_is_lhs, bytes);
+      r = fp_encode(s, bytes) & mask;
+      double sv = fp_decode(r, bytes); // re-decode: verify the exact stored value
+      double a = sym_is_lhs ? sv : k;
+      double b = sym_is_lhs ? k : sv;
+      if (!i2s_eval_fcmp(predicate, a, b)) continue;
+    }
+    DEBUGF("i2s: fcmp pred %u @ %lu (%u bytes) sym_lhs=%d -> 0x%lx\n",
+           predicate, offset, bytes, sym_is_lhs, r);
+    if (out_size == 0) memcpy(out_buf, in_buf, in_size); // make a copy
+    out_size = in_size;
+    memcpy(&out_buf[offset], &r, bytes);
+    matches++;
+    return SOLVER_SAT;
+  }
+  return SOLVER_TIMEOUT;
 }
 
 solver_result_t
@@ -222,6 +662,24 @@ I2SSolver::solve_icmp(std::shared_ptr<const Constraint> const& c,
 
   uint64_t value = 0, value_r = 0;
   uint64_t r = 0;
+  // Structural anchor by INPUT OFFSET (mirrors solve_fcmp).  The value-only
+  // direct-match checks below can be fooled when two symbolic operands hold
+  // coincidentally-equal values (e.g. `b + 1 == a` on a seed where a == b): the
+  // b candidate's raw bytes equal op2's value, so op2's inverted result would be
+  // written to b -- the WRONG input.  When a compared side is a plain Read, its
+  // AST node records the exact input offset it reads (Read::index()); only accept
+  // a direct match at that offset.  When a side is not a plain Read (e.g. a binop,
+  // handled structurally by the binop branch below), fall back to the value check.
+  auto const& root = *c->get_root();
+  auto const& lc = root.children(0);
+  auto const& rc = root.children(1);
+  auto read_offset = [](const AstNode &n, size_t &off) -> bool {
+    if (n.kind() == rgd::Read) { off = n.index(); return true; }
+    return false;
+  };
+  size_t lc_off = 0, rc_off = 0;
+  bool have_lc_off = read_offset(lc, lc_off);
+  bool have_rc_off = read_offset(rc, rc_off);
   for (auto const& candidate : cm->i2s_candidates) {
     size_t offset = candidate.first;
     uint32_t bytes = candidate.second;
@@ -236,17 +694,17 @@ I2SSolver::solve_icmp(std::shared_ptr<const Constraint> const& c,
       value_r = SWAP64(value) >> (64 - bytes * 8);
       DEBUGF("i2s: try %lu, length %u = 0x%016lx, 0x%016lx, comparison = %d\n",
           offset, bytes, value, value_r, comparison);
-      if (c->op1 == value) {
+      if (c->op1 == value && (!have_lc_off || offset == lc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op2, false);
-      } else if (c->op2 == value) {
+      } else if (c->op2 == value && (!have_rc_off || offset == rc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op1, true);
-      } else if (c->op1 == value_r) {
+      } else if (c->op1 == value_r && (!have_lc_off || offset == lc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op2, false);
         r = SWAP64(r) >> (64 - bytes * 8);
-      } else if (c->op2 == value_r) {
+      } else if (c->op2 == value_r && (!have_rc_off || offset == rc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op1, true);
         r = SWAP64(r) >> (64 - bytes * 8);
@@ -557,8 +1015,28 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
     auto const& c = task->constraints(i);
     auto const& cm = task->consmetas(i);
     auto comparison = task->comparisons(i);
+    // If the constraint involves an FP op that i2s cannot invert (FP
+    // arithmetic, a cast such as FPToSI, or a libcall such as lrint()), the
+    // input bytes reach the comparison through that transformation and no
+    // longer appear literally in the compared value.  Attempting input-to-state
+    // here would copy the constant into the raw FP bytes and yield a bogus
+    // "solution"; reject and let z3 handle it.  A direct FCmp (input bytes
+    // compared against a constant) sets no bit in fp_ops_mask and is handled
+    // below by solve_fcmp.
+    if (unlikely((c->ops & fp_ops_mask).any())) {
+      DEBUGF("i2s: skip FP-derived constraint\n");
+      mismatches++;
+      continue;
+    }
     if (likely(isRelationalKind(comparison))) {
       if (solve_icmp(c, cm, comparison, in_buf, in_size, out_buf, out_size) == SOLVER_SAT) {
+        // be optimistic, as long as there's one match, we should try the output
+        ret = SOLVER_SAT;
+      } else {
+        mismatches++;
+      }
+    } else if (isFPRelationalKind(comparison)) {
+      if (solve_fcmp(c, cm, comparison, in_buf, in_size, out_buf, out_size) == SOLVER_SAT) {
         // be optimistic, as long as there's one match, we should try the output
         ret = SOLVER_SAT;
       } else {
