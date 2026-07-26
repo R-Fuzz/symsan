@@ -1,5 +1,6 @@
 #include "input.h"
 #include <ctime>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <cstring>
@@ -77,13 +78,37 @@ uint8_t MutInput::get(const size_t i) {
   return value[i];
 }
 
+// When JIGSAW_SEED is set (e.g. via smttest's --seed), the PRNG is seeded
+// deterministically so search strategies can be compared without run-to-run
+// basin-shift noise.  Each MutInput instance still gets a distinct stream
+// (base + monotonic counter) so the two instances per solve don't collide,
+// while the whole run stays reproducible across invocations.
+static unsigned g_mutinput_seed_counter = 0;
+
 MutInput::MutInput(size_t size) {
   r_idx = 0;
   value = (uint64_t*)malloc(size * sizeof(uint64_t));
   size_ = size;
   unsigned int seed;
   //_rdseed32_step(&seed);
-  seed = (unsigned)time(NULL);
+  const char *fixed = getenv("JIGSAW_SEED");
+  if (fixed)
+    seed = (unsigned)strtoul(fixed, nullptr, 0) + g_mutinput_seed_counter++;
+  else {
+    // Production path: decorrelate the restart PRNG across parallel workers and
+    // successive instances.  time(NULL) has only 1s granularity, so fuzzing
+    // workers (and the two MutInputs per solve) constructed in the same second
+    // used to share an identical restart stream -- killing the exploration
+    // diversity random restarts exist to provide.  Mix a high-resolution
+    // monotonic clock with a monotonic counter and the instance address so no
+    // two constructions collide.
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    seed = (unsigned)ts.tv_nsec
+         ^ ((unsigned)ts.tv_sec << 16)
+         ^ (g_mutinput_seed_counter++ * 0x9E3779B9u)
+         ^ (unsigned)((uintptr_t)this >> 4);
+  }
   memset(r_s, 0, 256);
   memset(&r_d, 0, sizeof(struct random_data));
   initstate_r(seed, r_s, 256, &r_d);
