@@ -2,6 +2,12 @@
 #define SYMSAN_LAUNCH_H
 
 #include <stdint.h>
+#include <stddef.h>     /* size_t */
+#include <sys/types.h>  /* ssize_t */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define SYMSAN_INVALID_ARGS 1;
 #define SYMSAN_NO_MEMORY 2;
@@ -65,5 +71,9 @@ int symsan_get_exit_status(int *status);
 
 /// @brief teardown shared men
 void symsan_destroy();
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* !SYMSAN_LAUNCH_H */

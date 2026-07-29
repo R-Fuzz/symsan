@@ -1,0 +1,425 @@
+/*
+  rgd::ConcolicSession -- the RGD concolic-execution driver policy.
+
+  Lifted from driver/aflpp/symsan.cpp so that every front-end shares one copy.
+  The behaviour is intended to be identical to what the AFL++ mutator did; the
+  places where it deliberately is not are marked NOTE.
+
+  (c) 2023 - 2026 by Chengyu Song <csong@cs.ucr.edu>
+  License: Apache 2.0
+*/
+
+#include "concolic.h"
+
+#include <errno.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+
+using namespace __dfsan;
+
+#define SYMSAN_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define SYMSAN_LIKELY(x) __builtin_expect(!!(x), 1)
+
+namespace {
+
+void warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void warn(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  fprintf(stderr, "[symsan] ");
+  vfprintf(stderr, fmt, args);
+  va_end(args);
+}
+
+} // namespace
+
+namespace rgd {
+
+int ConcolicConfig::from_env() {
+  const char *target = getenv("SYMSAN_TARGET");
+  if (!target) {
+    warn("SYMSAN_TARGET not defined, this should point to the full path of "
+         "the symsan compiled binary\n");
+    return -1;
+  }
+  symsan_bin = target;
+
+  const char *dir = getenv("SYMSAN_OUTPUT_DIR");
+  if (dir) output_dir = dir;
+
+  if (getenv("SYMSAN_USE_JIGSAW")) use_jigsaw = true;
+  if (getenv("SYMSAN_USE_Z3")) use_z3 = true;
+  // make nested solving optional too
+  if (getenv("SYMSAN_USE_NESTED")) nested_solving = true;
+  // enable trace bounds?
+  if (getenv("SYMSAN_TRACE_BOUNDS")) trace_bounds = true;
+  // disable exit on memory error
+  if (getenv("SYMSAN_DONT_EXIT_ON_MEMERROR")) exit_on_memerror = false;
+  if (getenv("SYMSAN_SOLVE_UB")) {
+    trace_bounds = true; // solve undefined depends on trace bounds
+    solve_ub = true;
+  }
+  // XXX: force stdin? ugly hack for aixcc
+  if (getenv("SYMSAN_FORCE_STDIN")) force_stdin = true;
+  // enable saving solved tasks
+  if (getenv("SYMSAN_SAVE_SOLVED")) save_solved = true;
+
+  return 0;
+}
+
+ConcolicSession::ConcolicSession()
+    : input_fd_(-1), initialized_(false), cur_task_(nullptr),
+      cur_solver_index_(0), mutation_state_(MUTATION_INVALID) {}
+
+ConcolicSession::~ConcolicSession() {
+  if (input_fd_ >= 0) close(input_fd_);
+}
+
+int ConcolicSession::init(const ConcolicConfig &config) {
+  if (initialized_) {
+    warn("ConcolicSession::init called twice\n");
+    return -1;
+  }
+  if (config.symsan_bin.empty()) {
+    warn("ConcolicSession::init needs a symsan_bin\n");
+    return -1;
+  }
+  if (config.input_file.empty()) {
+    warn("ConcolicSession::init needs an input_file\n");
+    return -1;
+  }
+  config_ = config;
+
+  // the input file doubles as the fd we hand the launcher, so it has to be
+  // readable as well as writable
+  input_fd_ = open(config_.input_file.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (input_fd_ < 0) {
+    warn("failed to create input file %s: %s\n", config_.input_file.c_str(),
+         strerror(errno));
+    return -1;
+  }
+
+  // setup symsan launcher and map the union table
+  void *shm_base = session_.init(config_.symsan_bin.c_str(), uniontable_size);
+  if (!shm_base) {
+    return -1;
+  }
+
+  symsan::TraceConfig tc;
+  tc.input = config_.use_stdin ? "stdin" : config_.input_file;
+  tc.args = config_.args;
+  tc.timeout_ms = config_.timeout_ms;
+  tc.debug = config_.debug;
+  tc.bounds_check = config_.trace_bounds;
+  tc.solve_ub = config_.solve_ub;
+  tc.exit_on_memerror = config_.exit_on_memerror;
+  tc.force_stdin = config_.force_stdin;
+  if (session_.configure(tc) != 0) {
+    warn("failed to configure the trace session\n");
+    return -1;
+  }
+
+  // setup the parser
+  parser_.reset(new RGDAstParser(shm_base, uniontable_size,
+                                 config_.nested_solving, config_.max_ast_size));
+  task_mgr_.reset(new FIFOTaskManager());
+  cov_mgr_.reset(new EdgeCovManager());
+
+  // always use the simpler i2s solver
+  solvers_.emplace_back(std::make_shared<I2SSolver>());
+  if (config_.use_jigsaw) solvers_.emplace_back(std::make_shared<JITSolver>());
+  if (config_.use_z3) solvers_.emplace_back(std::make_shared<Z3Solver>());
+
+  // allocate output buffer
+  output_buf_.resize(config_.max_input_size + 1);
+
+  initialized_ = true;
+  return 0;
+}
+
+void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
+  if (SYMSAN_UNLIKELY(msg.label == 0)) {
+    return;
+  } else if (SYMSAN_UNLIKELY(msg.label == kInitializingLabel)) {
+    warn("UBI branch cond @%p\n", (void*)msg.addr);
+    return;
+  }
+
+  stats_.total_branches += 1;
+
+  // apply a local (per input) branch filter
+  auto &lc = local_counter_[msg.id];
+  if (lc > config_.max_local_branch_counter) {
+    return;
+  } else {
+    lc += 1;
+  }
+
+  // prase flags
+  bool always_solve = (msg.flags & F_ADD_CONS) == 0;
+  bool loop_latch = (msg.flags & F_LOOP_LATCH) != 0;
+  bool loop_exit = (msg.flags & F_LOOP_EXIT) != 0;
+
+  const std::shared_ptr<BranchContext> ctx = cov_mgr_->add_branch(
+      (void*)msg.addr, msg.id, msg.result != 0, msg.context, loop_latch, loop_exit);
+
+  std::shared_ptr<BranchContext> neg_ctx = std::make_shared<BranchContext>();
+  *neg_ctx = *ctx;
+  neg_ctx->direction = !ctx->direction;
+
+  if (cov_mgr_->is_branch_interesting(neg_ctx) || always_solve) {
+    // parse the uniont table AST to solving tasks
+    std::vector<uint64_t> tasks;
+    if (parser_->parse_cond(msg.label, ctx->direction, msg.flags & F_ADD_CONS, tasks) != 0) {
+      warn("failed to parse the condition %u\n", msg.label);
+      // session_.terminate();
+      return;
+    }
+
+    // add the tasks to the task manager
+    for (auto const& task_id : tasks) {
+      auto task = parser_->retrieve_task(task_id);
+      task_mgr_->add_task(neg_ctx, task);
+      task_size_dist_[task->size()] += 1;
+    }
+
+    stats_.total_tasks += tasks.size();
+    stats_.branches_to_solve += 1;
+  }
+}
+
+void ConcolicSession::on_gep(const symsan::pipe_msg &msg, const symsan::gep_msg &gmsg) {
+  // msg.label === gmsg.index_label
+  if (SYMSAN_UNLIKELY(msg.label == 0)) {
+    return;
+  } else if (SYMSAN_UNLIKELY(msg.label == kInitializingLabel)) {
+    warn("UBI array index @%p\n", (void*)msg.addr);
+    return;
+  }
+
+  // apply a local (per input) index filter
+  if (!local_index_filter_.insert(msg.label).second) {
+    return;
+  }
+
+  // parse the uniont table AST to solving tasks
+  std::vector<uint64_t> tasks;
+  if (parser_->parse_gep(gmsg.ptr_label, gmsg.ptr, gmsg.index_label, gmsg.index,
+        gmsg.num_elems, gmsg.elem_size, gmsg.current_offset, false, tasks) != 0) {
+    warn("failed to parse symbolic index %u\n", gmsg.index_label);
+    // session_.terminate();
+    return;
+  }
+
+  // add the tasks to the task manager, with a dummy context
+  std::shared_ptr<BranchContext> ctx = std::make_shared<BranchContext>();
+  ctx->addr = (void*)msg.addr;
+  ctx->direction = true;
+  for (auto const& task_id : tasks) {
+    auto task = parser_->retrieve_task(task_id);
+    task_mgr_->add_task(ctx, task);
+    task_size_dist_[task->size()] += 1;
+  }
+
+  stats_.total_tasks += tasks.size();
+}
+
+void ConcolicSession::on_memcmp(const symsan::pipe_msg &msg, const uint8_t *content,
+                                size_t size) {
+  // no content means both operands were symbolic, or the size was zero;
+  // either way there is nothing to record
+  if (!content) return;
+  parser_->record_memcmp(msg.label, const_cast<uint8_t*>(content), size);
+}
+
+void ConcolicSession::on_memerr(const symsan::pipe_msg &msg) {
+  warn("memory error detected @%p, type = %d\n", (void*)msg.addr, msg.flags);
+}
+
+int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
+  if (!initialized_) {
+    warn("ConcolicSession::trace called before init\n");
+    return -1;
+  }
+  if (buf_size > config_.max_input_size) {
+    return 0;
+  }
+
+  // stage the input where the target will read it from
+  if (lseek(input_fd_, 0, SEEK_SET) < 0) {
+    warn("failed to rewind input file: %s\n", strerror(errno));
+    return -1;
+  }
+  size_t written = 0;
+  while (written < buf_size) {
+    ssize_t n = write(input_fd_, buf + written, buf_size - written);
+    if (n <= 0) {
+      warn("failed to write input file: %s\n", strerror(errno));
+      return -1;
+    }
+    written += (size_t)n;
+  }
+  fsync(input_fd_);
+  if (ftruncate(input_fd_, buf_size)) {
+    warn("failed to truncate input file: %s\n", strerror(errno));
+    return -1;
+  }
+
+  // keep our own copy: the solvers need the original bytes to build a mutated
+  // buffer, and they are called long after trace() returns
+  input_.assign(buf, buf + buf_size);
+
+  // clear all caches
+  std::vector<symsan::input_t> inputs;
+  inputs.push_back({input_.data(), input_.size()});
+  parser_->restart(inputs);
+  local_counter_.clear();
+  local_index_filter_.clear();
+
+  size_t tasks_before = task_mgr_->get_num_tasks();
+  symsan::trace_result_t ret = session_.run(input_fd_, *this);
+  if (ret == symsan::TRACE_LAUNCH_ERROR) {
+    return -1;
+  }
+
+  // reinit solving state
+  cur_task_ = nullptr;
+  cur_solver_index_ = 0;
+  mutation_state_ = MUTATION_INVALID;
+
+  return (int)(task_mgr_->get_num_tasks() - tasks_before);
+}
+
+const uint8_t *ConcolicSession::next_solution(size_t *size) {
+  *size = 0;
+  if (!initialized_) {
+    warn("ConcolicSession::next_solution called before init\n");
+    return nullptr;
+  }
+
+  // NOTE: driver/aflpp/symsan.cpp made exactly one (task, solver) attempt per
+  // call and returned an empty mutation when that attempt did not produce a
+  // solution, relying on AFL++ to call it again.  We loop instead, so that a
+  // nullptr means "no work left" and a caller can write a plain while loop.
+  // The sequence of solutions produced is the same.
+  for (;;) {
+    // try to get a task if we don't already have one
+    // or if we've find a valid solution from the previous mutation
+    if (!cur_task_ || mutation_state_ == MUTATION_VALIDATED) {
+      cur_task_ = task_mgr_->get_next_task();
+      if (!cur_task_) {
+        mutation_state_ = MUTATION_INVALID;
+        return nullptr;
+      }
+      // reset the solver and state
+      cur_solver_index_ = 0;
+      mutation_state_ = MUTATION_INVALID;
+    } else if (mutation_state_ == MUTATION_IN_VALIDATION) {
+      // oops, not solve, move on to next solver
+      cur_solver_index_++;
+      if (cur_solver_index_ >= solvers_.size()) {
+        // if reached the max solver, move on to the next task
+        cur_task_ = task_mgr_->get_next_task();
+        if (!cur_task_) {
+          mutation_state_ = MUTATION_INVALID;
+          return nullptr;
+        }
+        cur_solver_index_ = 0; // reset solver index
+      }
+    }
+
+    size_t new_buf_size = 0;
+    auto &solver = solvers_[cur_solver_index_];
+    auto ret = solver->solve(cur_task_, input_.data(), input_.size(),
+                             output_buf_.data(), new_buf_size);
+    if (SYMSAN_LIKELY(ret == SOLVER_SAT)) {
+      mutation_state_ = MUTATION_IN_VALIDATION;
+      if (config_.save_solved) {
+        save_solved_input(output_buf_.data(), new_buf_size);
+      }
+      stats_.solved_tasks += 1;
+      *size = new_buf_size;
+      return output_buf_.data();
+    } else if (ret == SOLVER_TIMEOUT) {
+      // if not solved, move on to next stage
+      mutation_state_ = MUTATION_IN_VALIDATION;
+    } else if (ret == SOLVER_UNSAT) {
+      // at any stage if the task is deemed unsolvable, just skip it
+      cur_task_->skip_next = true;
+      cur_task_ = nullptr;
+      mutation_state_ = MUTATION_INVALID;
+    } else {
+      warn("unknown solver return value %d\n", ret);
+      // NOTE: symsan.cpp left the task in place here, which was safe only
+      // because it returned to AFL++ after every attempt.  Inside a loop that
+      // would spin forever, so drop the task.
+      cur_task_ = nullptr;
+      mutation_state_ = MUTATION_INVALID;
+    }
+  }
+}
+
+void ConcolicSession::report_result(bool interesting) {
+  if (mutation_state_ != MUTATION_IN_VALIDATION) {
+    return;
+  }
+  if (!interesting) {
+    // leave the state at MUTATION_IN_VALIDATION so that next_solution() moves
+    // on to the next solver for the same task
+    return;
+  }
+  mutation_state_ = MUTATION_VALIDATED;
+  if (cur_task_) {
+    cur_task_->skip_next = true;
+    stats_.solved_branches += 1;
+  }
+}
+
+void ConcolicSession::save_solved_input(const uint8_t *buf, size_t size) {
+  const char *dir = config_.output_dir.empty() ? "." : config_.output_dir.c_str();
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "%s/id_%lu", dir,
+           (unsigned long)stats_.solved_tasks);
+  int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    warn("failed to create solved file %s: %s\n", path, strerror(errno));
+    return;
+  }
+  size_t written = 0;
+  while (written < size) {
+    ssize_t n = write(fd, buf + written, size - written);
+    if (n <= 0) {
+      warn("failed to write solved file %s: %s\n", path, strerror(errno));
+      break;
+    }
+    written += (size_t)n;
+  }
+  close(fd);
+}
+
+void ConcolicSession::print_stats(int fd) const {
+  dprintf(fd,
+    "Total branches: %lu,\n"
+    "Total tasks: %lu,\n"
+    "Solved tasks: %lu,\n"
+    "Solved branches: %lu\n",
+    (unsigned long)stats_.total_branches, (unsigned long)stats_.total_tasks,
+    (unsigned long)stats_.solved_tasks, (unsigned long)stats_.solved_branches);
+  dprintf(fd, "Task size distribution:\n");
+  for (auto const& kv : task_size_dist_) {
+    dprintf(fd, "\t %lu: %lu\n", (unsigned long)kv.first, (unsigned long)kv.second);
+  }
+  for (auto const& solver : solvers_) {
+    solver->print_stats(fd);
+  }
+}
+
+}; // namespace rgd

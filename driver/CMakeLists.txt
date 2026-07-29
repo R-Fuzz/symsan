@@ -4,6 +4,9 @@ set(CMAKE_CXX_STANDARD 14)
 ## launcher lib
 add_subdirectory(launcher)
 
+## shared session code (event pump, driver policy) used by the front-ends
+add_subdirectory(session)
+
 ## simple driver for testing out-of-process solving
 add_executable(FGTest fgtest.cpp)
 set_target_properties(FGTest PROPERTIES OUTPUT_NAME "fgtest")
@@ -26,6 +29,7 @@ target_include_directories(AFLTest PUBLIC
 )
 target_link_libraries(AFLTest PRIVATE
   launcher
+  symsan-session
   rgd-parser
   rgd-solver
   ${Z3_LIBRARY}

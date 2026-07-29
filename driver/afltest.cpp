@@ -33,6 +33,7 @@ extern "C" {
 }
 
 #include "parse-rgd.h"
+#include "session.h"
 
 #include <memory>
 #include <vector>
@@ -70,7 +71,6 @@ static uint32_t __current_index = 0;
 static int __enum_gep = 0;  // GEP enumeration disabled by default
 
 // the mapped union table (shared with the launched target)
-static dfsan_label_info *__dfsan_label_info;
 static const size_t MAX_LABEL = uniontable_size / sizeof(dfsan_label_info);
 
 // the RGD parser and the solver chain (matching driver/aflpp/symsan.cpp)
@@ -81,13 +81,9 @@ static std::vector<std::shared_ptr<rgd::Solver>> __solvers;
 static uint8_t *__output_buf = nullptr;
 static size_t __output_buf_size = 0;
 
-// the i2s solver calls the global __dfsan::get_label_info, so define it here
-dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
-  if (unlikely(label >= MAX_LABEL)) {
-    throw std::out_of_range("label too large " + std::to_string(label));
-  }
-  return &__dfsan_label_info[label];
-}
+// the i2s solver calls the global __dfsan::get_label_info; symsan-session
+// provides the one definition, we just have to point it at the union table
+// (see symsan::set_label_info_base below)
 
 static void generate_input(const uint8_t *buf, size_t size) {
   char path[PATH_MAX];
@@ -245,7 +241,7 @@ int main(int argc, char* const argv[]) {
     fprintf(stderr, "Failed to map shm: %s\n", strerror(errno));
     exit(1);
   }
-  __dfsan_label_info = (dfsan_label_info *)shm_base;
+  symsan::set_label_info_base(shm_base, uniontable_size);
 
   if (symsan_set_input(is_stdin ? "stdin" : input) != 0) {
     fprintf(stderr, "Failed to set input\n");
