@@ -1,0 +1,25 @@
+[package]
+name = "symsan-fuzz"
+description = "Example LibAFL fuzzer driven by SymSan's concolic execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "symsan-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+libafl-symsan = { path = "../libafl-symsan" }
+# A direct dependency even though libafl-symsan re-exports what we use: cargo
+# only hands DEP_SYMSAN_C_* to the build scripts of *direct* dependents, and
+# build.rs needs DEP_SYMSAN_C_LIB_DIR for the rpath.
+symsan = { path = "../symsan" }
+libafl = { workspace = true, features = ["std", "derive"] }
+libafl_bolts = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+nix = { version = "0.31", features = ["signal"] }

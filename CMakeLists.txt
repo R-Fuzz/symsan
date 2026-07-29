@@ -85,3 +85,11 @@ add_subdirectory(driver)
 add_subdirectory(tests)
 add_subdirectory(libcxx)
 add_subdirectory(bindings/python)
+
+## The Rust bindings are opt-in: a C++ user should not need a Rust toolchain,
+## and cargo manages its own dependency graph and target directory, so wiring it
+## into the default build would only duplicate work cmake cannot see into.
+option(SYMSAN_BUILD_RUST "Also build the Rust bindings under bindings/rust" OFF)
+if (SYMSAN_BUILD_RUST)
+    add_subdirectory(bindings/rust)
+endif()

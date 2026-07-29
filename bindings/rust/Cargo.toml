@@ -6,11 +6,15 @@
 #
 #   symsan          safe binding over include/symsan_c.h.  No LibAFL dependency
 #                   -- it is a peer of bindings/python, usable on its own.
+#   libafl-symsan   the SymSanStage that plugs the above into a LibAFL fuzzer.
+#   fuzzer          an example front-end binary built from the two.
 
 [workspace]
 resolver = "2"
 members = [
     "symsan",
+    "libafl-symsan",
+    "fuzzer",
 ]
 
 [workspace.package]
@@ -18,6 +22,13 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/R-Fuzz/symsan"
+
+[workspace.dependencies]
+# Path dependencies on the LibAFL checkout next to this repo.  Override with
+# LIBAFL_PATH at build time if yours lives elsewhere.
+libafl = { path = "../../../libafl/crates/libafl" }
+libafl_bolts = { path = "../../../libafl/crates/libafl_bolts" }
+libafl_targets = { path = "../../../libafl/crates/libafl_targets" }
 
 [profile.release]
 debug = true
