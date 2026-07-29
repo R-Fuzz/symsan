@@ -1,0 +1,24 @@
+# Cargo workspace for SymSan's Rust bindings.
+#
+# Deliberately separate from the CMake build: `make` never invokes cargo, so a
+# C++ user does not need a Rust toolchain.  Configure symsan with
+# -DSYMSAN_BUILD_RUST=ON to get a `rust` target that runs `cargo build` here.
+#
+#   symsan          safe binding over include/symsan_c.h.  No LibAFL dependency
+#                   -- it is a peer of bindings/python, usable on its own.
+
+[workspace]
+resolver = "2"
+members = [
+    "symsan",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/R-Fuzz/symsan"
+
+[profile.release]
+debug = true
+lto = "thin"
