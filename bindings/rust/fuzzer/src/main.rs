@@ -99,6 +99,12 @@ struct Opt {
     #[arg(long = "symsan-budget", default_value = "0")]
     symsan_budget: usize,
 
+    /// Exec the SymSan target once per trace instead of forking it from a
+    /// long-lived server. Slower, but the way out if the target keeps state
+    /// across `main()` that a fork would wrongly share.
+    #[arg(long = "symsan-no-forkserver", default_value = "false")]
+    symsan_no_forkserver: bool,
+
     /// Show the target's stdout and stderr.
     #[arg(short = 'd', long = "debug-child", default_value = "false")]
     debug_child: bool,
@@ -231,6 +237,7 @@ pub fn main() -> Result<(), libafl::Error> {
                 .input_file(opt.out_dir.join(format!(".symsan_input_{}", std::process::id())))
                 .timeout_ms(opt.symsan_timeout)
                 .max_solutions_per_input(opt.symsan_budget)
+                .forkserver(!opt.symsan_no_forkserver)
                 .build()?;
             println!("symsan: tracing with {}", bin.display());
 

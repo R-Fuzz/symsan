@@ -1835,6 +1835,7 @@ extern "C" dfsan_label taint_get_base_input_label(dfsan_label label) {
 
 // information is passed implicitly through flags()
 extern "C" void InitializeSymSanSolver();
+extern "C" void InitializeSymSanForkServer();
 
 static void InitializeFlags() {
   SetCommonFlagsDefaults();
@@ -1959,6 +1960,15 @@ static void dfsan_init(int argc, char **argv, char **envp) {
 
   InitializeInterceptors();
 
+  // The fork server, if one was asked for, has to sit exactly here.  Everything
+  // above is input-independent -- the shadow and union mappings, the hashtable
+  // allocator, the interceptors -- and is what we want to pay for once and
+  // amortize over every run.  Everything below reads the input the driver
+  // staged for *this* run, so it has to happen again in each child.  (ucsan
+  // forks after its whole init instead, because thoroupy receives the input as
+  // a ticket payload rather than reading a file.)
+  InitializeSymSanForkServer();
+
   InitializeTaintFile();
 
   InitializeTaintSocket();
@@ -1987,6 +1997,9 @@ void __dfsan_ensure_init(int argc, char **argv, char **envp) {
 }
 
 SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanSolver, void) {}
+
+// Backends that do not implement a fork server just run once, as before.
+SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanForkServer, void) {}
 
 // Default empty implementations (weak) for hooks
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,

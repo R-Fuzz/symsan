@@ -41,6 +41,9 @@ DFSAN_FLAG(int, pipe_fd, -1, "communication pipe fd.")
 DFSAN_FLAG(const char *, pipe_name, "", "communication pipe filename.")
 DFSAN_FLAG(int, control_pipe_fd, -1, "control pipe fd.")
 DFSAN_FLAG(const char *, control_pipe_name, "", "control pipe filename.")
+DFSAN_FLAG(bool, forksrv, false,
+           "run as an AFL-style fork server on fds 198/199, forking once per "
+           "input instead of being exec'd once per input.")
 DFSAN_FLAG(bool, trace_bounds, false, "trace bounds info.")
 DFSAN_FLAG(bool, trace_fsize, false, "trace file size.")
 DFSAN_FLAG(bool, exit_on_memerror, true, "terminate on memory error.")

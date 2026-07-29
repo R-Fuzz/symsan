@@ -228,6 +228,13 @@ typedef struct {
   size_t max_ast_size;             /**< default 200 */
   uint8_t max_local_branch_counter;/**< default 128 */
   size_t max_input_size;           /**< default 1 MiB */
+
+  /** Keep one instance of the target alive and fork it per input, instead of
+   *  exec'ing it again for every run.  Saves the execv, the dynamic link and
+   *  the shadow/union mapping each time.  Only applies to file input, and only
+   *  to targets whose backend has a fork server -- otherwise it is silently
+   *  ignored and the per-run exec is used, so it is always safe to set. */
+  int forkserver;
 } symsan_config_t;
 
 /** Fill @p cfg with the defaults.  Always call this first. */
@@ -237,9 +244,9 @@ void symsan_config_init(symsan_config_t *cfg);
  *
  *  Reads SYMSAN_TARGET, SYMSAN_OUTPUT_DIR, SYMSAN_USE_JIGSAW, SYMSAN_USE_Z3,
  *  SYMSAN_USE_NESTED, SYMSAN_TRACE_BOUNDS, SYMSAN_SOLVE_UB,
- *  SYMSAN_DONT_EXIT_ON_MEMERROR, SYMSAN_FORCE_STDIN and SYMSAN_SAVE_SOLVED --
- *  the same knobs the AFL++ mutator honours, so front-ends stay consistent
- *  without each re-reading getenv().
+ *  SYMSAN_DONT_EXIT_ON_MEMERROR, SYMSAN_FORCE_STDIN, SYMSAN_SAVE_SOLVED and
+ *  SYMSAN_FORKSRV -- the same knobs the AFL++ mutator honours, so front-ends
+ *  stay consistent without each re-reading getenv().
  *
  *  Leaves input_file, argv/argc and use_stdin alone; those are the front-end's
  *  business.  The strings point into the environment and stay valid as long as

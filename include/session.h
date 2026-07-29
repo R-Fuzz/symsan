@@ -62,6 +62,11 @@ struct TraceConfig {
   bool exit_on_memerror = true;
   bool trace_file_size = false;
   bool force_stdin = false;
+  /// spawn the target once as a fork server and fork per input, instead of
+  /// exec'ing it again for every run.  Ignored unless the input is a file, and
+  /// silently ignored if the target's backend has no fork server; see
+  /// symsan_set_forkserver() in launch.h.
+  bool forkserver = false;
 };
 
 /// Outcome of a single TraceSession::run().

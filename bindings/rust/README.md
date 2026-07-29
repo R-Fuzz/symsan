@@ -111,6 +111,41 @@ runs:
 Two chained 4-byte equalities is 2^64 of search space; havoc is not going to
 stumble into it.
 
+## The fork server
+
+Tracing an input used to mean a full `execv`: dynamic linking, the shadow and
+union table mappings, interceptor setup — all of it repeated for every single
+input, and none of it depending on the input. The stage now spawns the target
+once and forks a child per trace instead. On `tests/data/branch.c` that is
+**24.6 ms → 16.4 ms per trace**, i.e. about 8 ms of fixed cost removed; the
+smaller the target, the larger the fraction.
+
+It is on by default in `SymSanStageBuilder`, and `--symsan-no-forkserver` turns
+it off. Using the library directly, it is `Config::forkserver(true)` (default
+off there) or `SYMSAN_FORKSRV=1`.
+
+Two conditions have to hold, and *neither is an error* — the session quietly
+falls back to exec'ing per run, so turning it on is always safe:
+
+- **File input.** A stdin target needs its fd wired into the child, and there is
+  no way to reach into a process that is already running.
+- **A backend that has one.** `backend/forkserver.cpp` is linked into Fastgen,
+  so a target built with `KO_USE_FASTGEN=1` has it. Thoroupy has its own.
+
+Turn it off if the target keeps state across `main()` that a fork would wrongly
+share — a `/dev/urandom` fd it seeded itself from, say. The fork happens before
+the input is loaded but after the runtime is set up (see the comment at the call
+to `InitializeSymSanForkServer` in `runtime/dfsan/dfsan.cpp`), so anything a
+*constructor* did is shared between runs.
+
+The protocol is AFL's, on fds 198/199, deliberately: it means a SymSan binary is
+also drivable by AFL++ or LibAFL's forkserver executor unchanged, which is what
+a coverage backend would need. The one wrinkle is that the event pipe
+no longer reaches EOF between runs, since its write end lives in the server —
+the child's wait status on fd 199 marks end-of-trace instead, and because the
+server only writes it after `waitpid()`, every event that child produced is
+already in the pipe by then.
+
 ## Process model
 
 SymSan's launcher keeps its configuration in a C file-global, so **one session

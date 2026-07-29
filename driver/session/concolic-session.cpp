@@ -71,6 +71,8 @@ int ConcolicConfig::from_env() {
   if (getenv("SYMSAN_FORCE_STDIN")) force_stdin = true;
   // enable saving solved tasks
   if (getenv("SYMSAN_SAVE_SOLVED")) save_solved = true;
+  // amortize process setup across runs instead of exec'ing every time
+  if (getenv("SYMSAN_FORKSRV")) forkserver = true;
 
   return 0;
 }
@@ -122,6 +124,7 @@ int ConcolicSession::init(const ConcolicConfig &config) {
   tc.solve_ub = config_.solve_ub;
   tc.exit_on_memerror = config_.exit_on_memerror;
   tc.force_stdin = config_.force_stdin;
+  tc.forkserver = config_.forkserver;
   if (session_.configure(tc) != 0) {
     warn("failed to configure the trace session\n");
     return -1;

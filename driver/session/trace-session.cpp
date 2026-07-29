@@ -149,6 +149,7 @@ int TraceSession::configure(const TraceConfig &config) {
   symsan_set_exit_on_memerror(config.exit_on_memerror);
   symsan_set_trace_file_size(config.trace_file_size);
   symsan_set_force_stdin(config.force_stdin);
+  symsan_set_forkserver(config.forkserver);
 
   timeout_ms_ = config.timeout_ms;
   configured_ = true;

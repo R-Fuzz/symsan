@@ -224,6 +224,8 @@ pub struct Config {
     max_ast_size: usize,
     max_local_branch_counter: u8,
     max_input_size: usize,
+
+    forkserver: bool,
 }
 
 /// Convert to a `CString`, replacing any interior NUL by truncating at it.
@@ -277,6 +279,7 @@ impl Config {
             max_ast_size: raw.max_ast_size,
             max_local_branch_counter: raw.max_local_branch_counter,
             max_input_size: raw.max_input_size,
+            forkserver: raw.forkserver != 0,
         }
     }
 
@@ -286,8 +289,8 @@ impl Config {
     /// `SYMSAN_OUTPUT_DIR`, `SYMSAN_USE_JIGSAW`, `SYMSAN_USE_Z3`,
     /// `SYMSAN_USE_NESTED`, `SYMSAN_TRACE_BOUNDS`, `SYMSAN_SOLVE_UB`,
     /// `SYMSAN_DONT_EXIT_ON_MEMERROR`, `SYMSAN_FORCE_STDIN`,
-    /// `SYMSAN_SAVE_SOLVED` -- by calling the same C++ code, so the two
-    /// front-ends cannot disagree about what a variable means.
+    /// `SYMSAN_SAVE_SOLVED`, `SYMSAN_FORKSRV` -- by calling the same C++ code,
+    /// so the two front-ends cannot disagree about what a variable means.
     ///
     /// `input_file`, `args` and `use_stdin` are left alone; they are the
     /// front-end's business, not the environment's.
@@ -313,7 +316,6 @@ impl Config {
         } else {
             Some(unsafe { CStr::from_ptr(raw.output_dir) }.to_owned())
         };
-
         Ok(Self {
             symsan_bin,
             input_file: cstring(input_file),
@@ -333,6 +335,7 @@ impl Config {
             max_ast_size: raw.max_ast_size,
             max_local_branch_counter: raw.max_local_branch_counter,
             max_input_size: raw.max_input_size,
+            forkserver: raw.forkserver != 0,
         })
     }
 
@@ -463,6 +466,22 @@ impl Config {
         self
     }
 
+    /// Trade a per-run `execv` for a `fork`.
+    ///
+    /// With this on, the target is spawned once and forks a child per input,
+    /// which skips the dynamic link and the shadow and union table setup every
+    /// time -- most of what a short run spends its time on.
+    ///
+    /// It applies only to file input (a stdin target needs its fd wired up per
+    /// run, which cannot be done from outside a running process) and only to
+    /// targets whose backend has a fork server.  Neither case is an error: the
+    /// session falls back to exec'ing per run, so this is always safe to set.
+    #[must_use]
+    pub fn forkserver(mut self, enable: bool) -> Self {
+        self.forkserver = enable;
+        self
+    }
+
     /// The scratch file inputs are staged into.
     pub fn input_file_path(&self) -> PathBuf {
         PathBuf::from(self.input_file.to_string_lossy().into_owned())
@@ -507,6 +526,7 @@ impl Config {
         raw.max_ast_size = self.max_ast_size;
         raw.max_local_branch_counter = self.max_local_branch_counter;
         raw.max_input_size = self.max_input_size;
+        raw.forkserver = self.forkserver.into();
 
         (raw, argv)
     }
@@ -783,13 +803,15 @@ mod tests {
             .jigsaw(false)
             .z3(true)
             .timeout_ms(1234)
-            .max_ast_size(42);
+            .max_ast_size(42)
+            .forkserver(true);
         assert_eq!(cfg.args.len(), 2);
         assert!(cfg.use_stdin);
         assert!(!cfg.use_jigsaw);
         assert!(cfg.use_z3);
         assert_eq!(cfg.timeout_ms, 1234);
         assert_eq!(cfg.max_ast_size, 42);
+        assert!(cfg.forkserver);
         assert_eq!(cfg.input_file_path(), Path::new("/tmp/in"));
     }
 

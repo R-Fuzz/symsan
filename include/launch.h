@@ -51,6 +51,18 @@ int symsan_set_trace_file_size(int enable);
 /// @brief set the force stdin mode for the target binary
 int symsan_set_force_stdin(int enable);
 
+/// @brief run the target as a fork server instead of exec'ing it per input
+///
+/// The target is spawned once, on the first symsan_run(), and thereafter forks
+/// a child per input -- which skips execv, dynamic linking and the shadow and
+/// union table setup every time.  Requires a target built against a backend
+/// that implements one (currently Fastgen); if the handshake does not come
+/// back, the launcher falls back to exec'ing per run and this is a no-op.
+///
+/// Only valid for file input: a stdin or network target still needs its fd
+/// wired up per run, which cannot be done from outside a running process.
+int symsan_set_forkserver(int enable);
+
 /// @brief run the target binary with the input file descriptor
 /// @param fd: input file descriptor, only used if input is "stdin"
 /// @return < 0 on syscall error, > 0 on setup error, 0 on success

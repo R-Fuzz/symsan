@@ -67,6 +67,10 @@ struct ConcolicConfig {
   bool force_stdin = false;       // SYMSAN_FORCE_STDIN
   bool save_solved = false;       // SYMSAN_SAVE_SOLVED
   bool debug = false;
+  /// keep one instance of the target alive and fork it per input, instead of
+  /// exec'ing it again every run (SYMSAN_FORKSRV).  Only takes effect for file
+  /// input against a backend that has a fork server; otherwise it is a no-op.
+  bool forkserver = false;        // SYMSAN_FORKSRV
   /// per-run timeout in milliseconds; also arms the deadloop guard
   unsigned timeout_ms = 50;       // MIN_TIMEOUT in driver/aflpp/symsan.cpp
 

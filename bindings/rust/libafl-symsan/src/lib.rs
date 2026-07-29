@@ -117,6 +117,7 @@ pub struct SymSanStageBuilder {
     debug: bool,
     timeout_ms: Option<u32>,
     max_solutions_per_input: usize,
+    forkserver: bool,
 }
 
 impl SymSanStageBuilder {
@@ -127,6 +128,10 @@ impl SymSanStageBuilder {
             // makes the RGD stack worth running.
             jigsaw: true,
             z3: true,
+            // Also the fuzzing default: a trace of a short-running target
+            // spends a good fraction of its wall clock on process setup, and
+            // the fallback when a target cannot be served this way is silent.
+            forkserver: true,
             ..Default::default()
         }
     }
@@ -235,6 +240,21 @@ impl SymSanStageBuilder {
         self
     }
 
+    /// Trade a per-trace `execv` for a `fork`. On by default.
+    ///
+    /// The target is spawned once and forks a child per input, which skips the
+    /// dynamic link and the shadow and union table setup every trace. It needs
+    /// file input (`@@`) and a target whose backend has a fork server; neither
+    /// is an error, since the session falls back to exec'ing per run.
+    ///
+    /// Turn it off if the target keeps state across `main()` that a fork would
+    /// wrongly share -- a `/dev/urandom` fd it seeds itself from, say.
+    #[must_use]
+    pub fn forkserver(mut self, enable: bool) -> Self {
+        self.forkserver = enable;
+        self
+    }
+
     /// Create the session and the stage.
     ///
     /// Fails if `target` was not set, if a session already exists in this
@@ -273,7 +293,8 @@ impl SymSanStageBuilder {
             .nested_solving(self.nested)
             .trace_bounds(self.trace_bounds)
             .solve_ub(self.solve_ub)
-            .debug(self.debug);
+            .debug(self.debug)
+            .forkserver(self.forkserver);
         if let Some(ms) = self.timeout_ms {
             config = config.timeout_ms(ms);
         }
@@ -500,5 +521,10 @@ mod tests {
         assert!(b.jigsaw, "jigsaw should default on");
         assert!(b.z3, "z3 should default on");
         assert!(!b.nested, "nested solving should default off");
+        assert!(
+            b.forkserver,
+            "the fork server should default on: it is a throughput win and \
+             falls back on its own when a target cannot be served that way"
+        );
     }
 }

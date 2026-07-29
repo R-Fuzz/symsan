@@ -17,7 +17,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
@@ -55,7 +57,20 @@ struct symsan_config {
 
   int exit_status;
   int is_killed;
+
+  // fork server state.  requested is what the caller asked for; active is
+  // whether the handshake actually came back, so that a target built without
+  // a fork server silently keeps the exec-per-run path.
+  int forksrv_requested;
+  int forksrv_active;
+  int forksrv_ctl_fd;   // we write "go" here, child reads it on fd 198
+  int forksrv_st_fd;    // child writes pid then status here, on fd 199
+  int forksrv_pid;      // the server itself, as opposed to the current child
 };
+
+// AFL's fork server descriptors, which the target hard-codes; see
+// backend/forkserver.cpp.
+#define FORKSRV_FD 198
 
 static struct symsan_config g_config;
 
@@ -89,6 +104,11 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   g_config.dev_null_fd = -1;
   g_config.exit_status = 0;
   g_config.is_killed = 0;
+  g_config.forksrv_requested = 0;
+  g_config.forksrv_active = 0;
+  g_config.forksrv_ctl_fd = -1;
+  g_config.forksrv_st_fd = -1;
+  g_config.forksrv_pid = -1;
 
   // open /dev/null
   g_config.dev_null_fd = open("/dev/null", O_RDWR);
@@ -219,6 +239,314 @@ int symsan_set_force_stdin(int enable) {
 }
 
 __attribute__((visibility("default")))
+int symsan_set_forkserver(int enable) {
+  g_config.forksrv_requested = !!enable;
+  return 0;
+}
+
+/* Read exactly n bytes, retrying on a short read.  Pipe reads of four bytes
+   will not normally split, but a signal can still cut one short and the
+   protocol has no way to resynchronize afterwards. */
+static int read_exact(int fd, void *buf, size_t n) {
+  size_t done = 0;
+  while (done < n) {
+    ssize_t r = read(fd, (char *)buf + done, n - done);
+    if (r > 0) {
+      done += (size_t)r;
+    } else if (r == 0) {
+      return -1; // the other end closed
+    } else if (errno != EINTR) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* Build the TAINT_OPTIONS string for the child.  Its own function because the
+   fork server fallback has to build it a second time with forksrv turned back
+   off. */
+static char *build_symsan_env(int use_forksrv) {
+  return alloc_printf(
+      "taint_file=\"%s\":shm_fd=%d:pipe_fd=%d:debug=%d:trace_bounds=%d:"
+      "solve_ub=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d:"
+      "forksrv=%d",
+      g_config.input_file, g_config.shm_fd, g_config.pipefds[1],
+      g_config.enable_debug, g_config.enable_bounds_check,
+      g_config.enable_solve_ub, g_config.exit_on_memerror,
+      g_config.trace_file_size, g_config.force_stdin, use_forksrv);
+}
+
+/* Spawn the fork server itself.  Unlike the exec-per-run path this happens
+   once, so the event pipe and the two protocol pipes all outlive a single
+   traced input. */
+static int forksrv_spawn(void) {
+  int ctl[2], st[2];
+
+  if (pipe(ctl) != 0) {
+    return SYMSAN_NO_MEMORY;
+  }
+  if (pipe(st) != 0) {
+    close(ctl[0]);
+    close(ctl[1]);
+    return SYMSAN_NO_MEMORY;
+  }
+
+  g_config.forksrv_pid = fork();
+  if (g_config.forksrv_pid < 0) {
+    close(ctl[0]); close(ctl[1]);
+    close(st[0]); close(st[1]);
+    return g_config.forksrv_pid;
+  }
+
+  if (g_config.forksrv_pid == 0) {
+    // clear signal handlers and masks
+    sigset_t set;
+    sigemptyset(&set);
+    sigprocmask(SIG_SETMASK, &set, NULL);
+
+    // disable core dump as shadow mem is toooooo large
+    struct rlimit limit;
+    limit.rlim_cur = limit.rlim_max = 0;
+    setrlimit(RLIMIT_CORE, &limit);
+
+    close(g_config.pipefds[0]); // close the read fd
+
+    // Move the protocol ends onto the numbers the target expects.  dup2()
+    // clears FD_CLOEXEC, which matters because we are about to execv().
+    if (dup2(ctl[0], FORKSRV_FD) < 0) _exit(1);
+    if (dup2(st[1], FORKSRV_FD + 1) < 0) _exit(1);
+    close(ctl[0]); close(ctl[1]);
+    close(st[0]); close(st[1]);
+
+    setenv("TAINT_OPTIONS", (char*)g_config.symsan_env, 1);
+    unsetenv("LD_PRELOAD"); // don't preload anything
+    if (!g_config.enable_debug) {
+      close(1);
+      close(2);
+      dup2(g_config.dev_null_fd, 1);
+      dup2(g_config.dev_null_fd, 2);
+    }
+    execv(g_config.symsan_bin, g_config.argv);
+    _exit(1); // only reached if execv failed
+  }
+
+  close(ctl[0]);
+  close(st[1]);
+  g_config.forksrv_ctl_fd = ctl[1];
+  g_config.forksrv_st_fd = st[0];
+
+  // The handshake doubles as a check that this target actually has a fork
+  // server: an older binary ignores forksrv=1 and runs straight through, so
+  // the read fails and we fall back rather than hanging.
+  //
+  // The wait is bounded because a target can also hang *before* saying hello --
+  // a constructor that blocks on something that never arrives -- and there is
+  // no per-run timeout to catch it here, only on the event pipe.  Ten seconds
+  // is AFL's default for the same handshake and is far more than a process
+  // needs to reach dfsan_init().
+  uint32_t hello = 0;
+  fd_set hfds;
+  FD_ZERO(&hfds);
+  FD_SET(g_config.forksrv_st_fd, &hfds);
+  struct timeval htv = { .tv_sec = 10, .tv_usec = 0 };
+  int hready = select(g_config.forksrv_st_fd + 1, &hfds, NULL, NULL, &htv);
+  if (hready <= 0 ||
+      read_exact(g_config.forksrv_st_fd, &hello, sizeof(hello)) != 0) {
+    if (g_config.forksrv_pid > 0) {
+      kill(g_config.forksrv_pid, SIGKILL);
+    }
+    close(g_config.forksrv_ctl_fd);
+    close(g_config.forksrv_st_fd);
+    g_config.forksrv_ctl_fd = -1;
+    g_config.forksrv_st_fd = -1;
+    waitpid(g_config.forksrv_pid, NULL, 0);
+    g_config.forksrv_pid = -1;
+    return -1;
+  }
+
+  // From here on we write to a pipe whose far end is a process that can die --
+  // a target that faults during init, say -- and the default SIGPIPE would
+  // take the whole driver down with it.  A short write is what we want to see
+  // instead, so that forksrv_poke() can report the failure.
+  //
+  // Deliberately after the fork: SIG_IGN survives execve(), so doing this any
+  // earlier would hand the target a signal disposition it did not ask for.
+  // Only claim the disposition if nobody else has, since this is a library.
+  struct sigaction old;
+  if (sigaction(SIGPIPE, NULL, &old) == 0 && old.sa_handler == SIG_DFL) {
+    struct sigaction ign;
+    memset(&ign, 0, sizeof(ign));
+    ign.sa_handler = SIG_IGN;
+    sigemptyset(&ign.sa_mask);
+    sigaction(SIGPIPE, &ign, NULL);
+  }
+
+  g_config.forksrv_active = 1;
+  return 0;
+}
+
+/* Ask the fork server for another child, and learn its pid so that a timeout
+   can kill the run rather than the server. */
+static int forksrv_poke(void) {
+  uint32_t go = 0;
+  if (write(g_config.forksrv_ctl_fd, &go, sizeof(go)) != (ssize_t)sizeof(go)) {
+    return -1;
+  }
+
+  int pid = -1;
+  if (read_exact(g_config.forksrv_st_fd, &pid, sizeof(pid)) != 0) {
+    return -1;
+  }
+
+  g_config.symsan_pid = pid;
+  g_config.is_killed = 0;
+  return 0;
+}
+
+static int forksrv_nfds(void) {
+  int hi = g_config.pipefds[0] > g_config.forksrv_st_fd
+               ? g_config.pipefds[0]
+               : g_config.forksrv_st_fd;
+  return hi + 1;
+}
+
+/* Collect the finished child's wait status, throwing away anything it left in
+   the event pipe.  Called once per run, whether the run ended by itself or we
+   killed it: leftover bytes would otherwise turn up as phantom events at the
+   head of the *next* trace. */
+static void forksrv_reap(void) {
+  if (!g_config.forksrv_active || g_config.symsan_pid < 0) {
+    return;
+  }
+
+  char scratch[4096];
+
+  while (1) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(g_config.pipefds[0], &rfds);
+    FD_SET(g_config.forksrv_st_fd, &rfds);
+
+    if (select(forksrv_nfds(), &rfds, NULL, NULL, NULL) < 0) {
+      if (errno == EINTR) continue;
+      g_config.forksrv_active = 0; // the server is gone; fall back next run
+      break;
+    }
+
+    // Events first, always: the status only shows up after the child has been
+    // reaped, so whatever is still in the pipe belongs to the run we are
+    // closing out.
+    if (FD_ISSET(g_config.pipefds[0], &rfds)) {
+      ssize_t n = read(g_config.pipefds[0], scratch, sizeof(scratch));
+      if (n > 0) continue;
+      if (n < 0 && errno == EINTR) continue;
+      g_config.forksrv_active = 0;
+      break;
+    }
+
+    if (read_exact(g_config.forksrv_st_fd, &g_config.exit_status,
+                   sizeof(g_config.exit_status)) != 0) {
+      g_config.forksrv_active = 0;
+    }
+    break;
+  }
+
+  g_config.symsan_pid = -1;
+}
+
+/* One event, fork-server flavoured.
+
+   The event pipe's write end lives in the fork server rather than in the child,
+   so it never reaches EOF and cannot mark the end of a run the way it does on
+   the exec path.  What does mark it is the child's wait status turning up on fd
+   199 -- and since the server only writes that after waitpid() has reaped the
+   child, every event the child produced is already in the pipe by then.  So we
+   watch both, drain the pipe first, and report "pipe empty and status ready" to
+   the caller as this run's end of file. */
+static ssize_t forksrv_read_event(void *buf, size_t size,
+                                  unsigned int timeout) {
+  // The run this call belongs to is already over and the next one has not been
+  // asked for.  On the exec path the closed pipe reports that by itself; here
+  // the pipe is still open and shared with the server, so a select() would
+  // simply block on a child that is not coming.  Callers that read a message
+  // header and then go back for its payload can land here after an error, so
+  // this is not just belt and braces.
+  if (g_config.symsan_pid < 0) {
+    return 0;
+  }
+
+  while (1) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(g_config.pipefds[0], &rfds);
+    FD_SET(g_config.forksrv_st_fd, &rfds);
+
+    struct timeval tv;
+    struct timeval *ptv = NULL;
+    if (timeout) {
+      tv.tv_sec = (timeout / 1000);
+      tv.tv_usec = (timeout % 1000) * 1000;
+      ptv = &tv;
+    }
+
+    int ret = select(forksrv_nfds(), &rfds, NULL, NULL, ptv);
+    if (ret < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+
+    if (ret == 0) {
+      // Timed out.  Kill the run, not the server -- then still wait for the
+      // status, so the next run starts on clean pipes.
+      if (g_config.symsan_pid > 0) {
+        kill(g_config.symsan_pid, SIGKILL);
+      }
+      g_config.is_killed = 1;
+      forksrv_reap();
+      return -1;
+    }
+
+    if (FD_ISSET(g_config.pipefds[0], &rfds)) {
+      ssize_t n = read(g_config.pipefds[0], buf, size);
+      if (n > 0) {
+        return n;
+      }
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      // n == 0 cannot happen while the server holds the write end, so this is
+      // a real error.
+      forksrv_reap();
+      return n;
+    }
+
+    forksrv_reap();
+    return 0; // end of this run's trace
+  }
+}
+
+/* Shut the fork server itself down.  Closing the control pipe is its cue: the
+   blocking read on fd 198 comes up short and it exits. */
+static void forksrv_shutdown(void) {
+  if (g_config.forksrv_ctl_fd >= 0) {
+    close(g_config.forksrv_ctl_fd);
+    g_config.forksrv_ctl_fd = -1;
+  }
+  if (g_config.forksrv_st_fd >= 0) {
+    close(g_config.forksrv_st_fd);
+    g_config.forksrv_st_fd = -1;
+  }
+  if (g_config.forksrv_pid > 0) {
+    // It has no state of its own to flush -- the shm and the input file are
+    // ours -- so there is nothing to lose by not waiting for a clean exit.
+    kill(g_config.forksrv_pid, SIGKILL);
+    waitpid(g_config.forksrv_pid, NULL, 0);
+    g_config.forksrv_pid = -1;
+  }
+  g_config.forksrv_active = 0;
+}
+
+__attribute__((visibility("default")))
 int symsan_run(int fd) {
   if (fd < 0) {
     return SYMSAN_INVALID_ARGS;
@@ -240,6 +568,20 @@ int symsan_run(int fd) {
     return SYMSAN_MISSING_INPUT;
   }
 
+  // Fork server already up: everything below has been done once already, and
+  // all that is left is to ask for another child.  The input is picked up from
+  // the file the caller just wrote, which is why the target forks before it
+  // loads its input rather than after.
+  if (g_config.forksrv_active) {
+    return forksrv_poke();
+  }
+
+  // A fork server cannot serve a stdin or network target: those need their fd
+  // wired into the child, and there is no way to reach into a process that is
+  // already running.  Silently use the exec path instead of failing, so that
+  // turning the fork server on is safe regardless of the input mode.
+  int use_forksrv = g_config.forksrv_requested && g_config.is_input_file;
+
   // unlikely but double check
   if (g_config.pipefds[0] != -1) {
     close(g_config.pipefds[0]);
@@ -257,19 +599,45 @@ int symsan_run(int fd) {
   }
 
   // fds and configs could have been changed, so always set up new ones
-  g_config.symsan_env = alloc_printf(
-      "taint_file=\"%s\":shm_fd=%d:pipe_fd=%d:debug=%d:trace_bounds=%d:"
-      "solve_ub=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d",
-      g_config.input_file, g_config.shm_fd, g_config.pipefds[1],
-      g_config.enable_debug, g_config.enable_bounds_check,
-      g_config.enable_solve_ub, g_config.exit_on_memerror,
-      g_config.trace_file_size, g_config.force_stdin);
+  g_config.symsan_env = build_symsan_env(use_forksrv);
   if (g_config.symsan_env == NULL) {
     return SYMSAN_NO_MEMORY;
   }
 
   if (g_config.enable_debug) {
     fprintf(stderr, "SYMSAN_ENV: %s\n", g_config.symsan_env);
+  }
+
+  if (use_forksrv) {
+    int err = forksrv_spawn();
+    if (err == 0) {
+      free(g_config.symsan_env);
+      g_config.symsan_env = NULL;
+      close(g_config.pipefds[1]); // the server holds the write end now
+      g_config.pipefds[1] = -1;
+      g_config.is_killed = 0;
+      return forksrv_poke();
+    }
+    // The target does not have a fork server, or we could not spawn one.
+    // Fall through to the exec path -- but only after telling the caller, in
+    // debug builds, since a silent 100x slowdown is worth a line of output.
+    if (g_config.enable_debug) {
+      fprintf(stderr, "SYMSAN: no fork server in %s, exec'ing per run\n",
+              g_config.symsan_bin);
+    }
+    g_config.forksrv_requested = 0;
+
+    // Rebuild the options without forksrv, so the child we are about to exec
+    // does not go looking for a fork server pipe that nobody is holding.
+    free(g_config.symsan_env);
+    g_config.symsan_env = build_symsan_env(0);
+    if (g_config.symsan_env == NULL) {
+      close(g_config.pipefds[0]);
+      close(g_config.pipefds[1]);
+      g_config.pipefds[0] = -1;
+      g_config.pipefds[1] = -1;
+      return SYMSAN_NO_MEMORY;
+    }
   }
 
   g_config.symsan_pid = fork();
@@ -322,6 +690,10 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
     return 0;
   }
 
+  if (g_config.forksrv_active) {
+    return forksrv_read_event(buf, size, timeout);
+  }
+
   int ret = 1;
 
   if (timeout) {
@@ -359,6 +731,18 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
 
 __attribute__((visibility("default")))
 int symsan_terminate() {
+  if (g_config.forksrv_active) {
+    // End this run, but keep the server: it is the thing we spawned once and
+    // want to keep for the next input.  Tearing it down is symsan_destroy()'s
+    // job.  The event pipe stays open too, for the same reason.
+    if (g_config.symsan_pid > 0) {
+      kill(g_config.symsan_pid, SIGKILL);
+      g_config.is_killed = 1;
+      forksrv_reap();
+    }
+    return 0;
+  }
+
   if (g_config.symsan_pid == -1) {
     // already terminated
     return 0;
@@ -387,6 +771,12 @@ int symsan_get_exit_status(int *status) {
 __attribute__((visibility("default")))
 void symsan_destroy() {
   symsan_terminate();
+  forksrv_shutdown();
+
+  if (g_config.pipefds[0] != -1) {
+    close(g_config.pipefds[0]);
+    g_config.pipefds[0] = -1;
+  }
 
   if (g_config.label_info != NULL) {
     munmap(g_config.label_info, g_config.shm_size);

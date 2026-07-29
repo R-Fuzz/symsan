@@ -327,6 +327,7 @@ void symsan_config_init(symsan_config_t *cfg) {
   cfg->force_stdin = def.force_stdin;
   cfg->save_solved = def.save_solved;
   cfg->debug = def.debug;
+  cfg->forkserver = def.forkserver;
   cfg->timeout_ms = def.timeout_ms;
   cfg->max_ast_size = def.max_ast_size;
   cfg->max_local_branch_counter = def.max_local_branch_counter;
@@ -358,6 +359,7 @@ symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
     cfg->exit_on_memerror = c.exit_on_memerror;
     cfg->force_stdin = c.force_stdin;
     cfg->save_solved = c.save_solved;
+    cfg->forkserver = c.forkserver;
     return SYMSAN_OK;
   });
 }
@@ -413,6 +415,7 @@ symsan_status_t symsan_session_init(symsan_session_t *s,
     c.force_stdin = cfg->force_stdin != 0;
     c.save_solved = cfg->save_solved != 0;
     c.debug = cfg->debug != 0;
+    c.forkserver = cfg->forkserver != 0;
     c.timeout_ms = cfg->timeout_ms;
     if (cfg->max_ast_size) c.max_ast_size = cfg->max_ast_size;
     if (cfg->max_local_branch_counter) {
