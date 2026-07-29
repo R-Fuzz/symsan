@@ -14,7 +14,7 @@ set_target_properties(pysymsan PROPERTIES PREFIX "")
 set_target_properties(pysymsan PROPERTIES OUTPUT_NAME "symsan")
 set_target_properties(pysymsan PROPERTIES SUFFIX ".cpython-${Python3_VERSION_MAJOR}${Python3_VERSION_MINOR}-x86_64-linux-gnu.so")
 target_include_directories(pysymsan PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime
   ${Python3_INCLUDE_DIRS}
 )
 target_link_libraries(pysymsan PRIVATE
@@ -24,4 +24,4 @@ target_link_libraries(pysymsan PRIVATE
   ${Python3_LIBRARIES}
   rt
 )
-install (TARGETS Fastgen DESTINATION ${SYMSAN_LIB_DIR})
+install (TARGETS pysymsan DESTINATION ${SYMSAN_LIB_DIR})
