@@ -21,6 +21,7 @@ target_include_directories(SymSanMutator PRIVATE
   ${AFLPP_PATH}/include
 )
 target_link_libraries(SymSanMutator
+  symsan-session
   launcher
   rgd-parser
   rgd-solver
