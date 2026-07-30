@@ -73,6 +73,9 @@ int ConcolicConfig::from_env() {
   if (getenv("SYMSAN_SAVE_SOLVED")) save_solved = true;
   // amortize process setup across runs instead of exec'ing every time
   if (getenv("SYMSAN_FORKSRV")) forkserver = true;
+  // share the branch namespace with the fuzzer?
+  const char *bmap = getenv("SYMSAN_BRANCH_MAP");
+  if (bmap) branch_map = bmap;
 
   return 0;
 }
@@ -134,7 +137,31 @@ int ConcolicSession::init(const ConcolicConfig &config) {
   parser_.reset(new RGDAstParser(shm_base, uniontable_size,
                                  config_.nested_solving, config_.max_ast_size));
   task_mgr_.reset(new FIFOTaskManager());
-  cov_mgr_.reset(new EdgeCovManager());
+
+  // A branch map lets us ask what the *fuzzer* has covered instead of only what
+  // this process has seen.  A map that fails to load is not fatal -- the point
+  // of it is to skip redundant work, and the fallback is doing that work.
+  if (!config_.branch_map.empty()) {
+    std::unique_ptr<BranchMap> bm(new BranchMap());
+    int n = bm->load(config_.branch_map, 0);
+    if (n <= 0) {
+      warn("branch map %s unusable, falling back to local coverage only\n",
+           config_.branch_map.c_str());
+    } else {
+      if (config_.debug) {
+        warn("branch map %s: %d branch directions, %zu lines without a source "
+             "location\n", config_.branch_map.c_str(), n, bm->skipped());
+      }
+      branch_map_.reset(bm.release());
+    }
+  }
+  if (branch_map_) {
+    auto *shared = new SharedMapCovManager(branch_map_.get());
+    shared_cov_ = shared;
+    cov_mgr_.reset(shared);
+  } else {
+    cov_mgr_.reset(new EdgeCovManager());
+  }
 
   // always use the simpler i2s solver
   solvers_.emplace_back(std::make_shared<I2SSolver>());
@@ -145,6 +172,12 @@ int ConcolicSession::init(const ConcolicConfig &config) {
   output_buf_.resize(config_.max_input_size + 1);
 
   initialized_ = true;
+  return 0;
+}
+
+int ConcolicSession::set_coverage(const uint8_t *map, size_t len) {
+  if (!shared_cov_) return -1;
+  shared_cov_->set_coverage(map, len);
   return 0;
 }
 
@@ -178,7 +211,15 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
   *neg_ctx = *ctx;
   neg_ctx->direction = !ctx->direction;
 
-  if (cov_mgr_->is_branch_interesting(neg_ctx) || always_solve) {
+  bool interesting = cov_mgr_->is_branch_interesting(neg_ctx);
+  if (shared_cov_) {
+    // the manager counts what it looked up; mirror it so that stats() is the
+    // one place a front-end has to read
+    stats_.mapped_branches = shared_cov_->mapped();
+    stats_.unmapped_branches = shared_cov_->unmapped();
+  }
+
+  if (interesting || always_solve) {
     // parse the uniont table AST to solving tasks
     std::vector<uint64_t> tasks;
     if (parser_->parse_cond(msg.label, ctx->direction, msg.flags & F_ADD_CONS, tasks) != 0) {
@@ -416,6 +457,12 @@ void ConcolicSession::print_stats(int fd) const {
     "Solved branches: %lu\n",
     (unsigned long)stats_.total_branches, (unsigned long)stats_.total_tasks,
     (unsigned long)stats_.solved_tasks, (unsigned long)stats_.solved_branches);
+  if (branch_map_) {
+    dprintf(fd,
+      "Branch map: %lu entries, %lu mapped, %lu unmapped\n",
+      (unsigned long)branch_map_->size(), (unsigned long)stats_.mapped_branches,
+      (unsigned long)stats_.unmapped_branches);
+  }
   dprintf(fd, "Task size distribution:\n");
   for (auto const& kv : task_size_dist_) {
     dprintf(fd, "\t %lu: %lu\n", (unsigned long)kv.first, (unsigned long)kv.second);

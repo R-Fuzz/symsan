@@ -360,6 +360,8 @@ symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
     cfg->force_stdin = c.force_stdin;
     cfg->save_solved = c.save_solved;
     cfg->forkserver = c.forkserver;
+    const char *bmap = getenv("SYMSAN_BRANCH_MAP");
+    if (bmap) cfg->branch_map = bmap;
     return SYMSAN_OK;
   });
 }
@@ -416,6 +418,7 @@ symsan_status_t symsan_session_init(symsan_session_t *s,
     c.save_solved = cfg->save_solved != 0;
     c.debug = cfg->debug != 0;
     c.forkserver = cfg->forkserver != 0;
+    if (cfg->branch_map) c.branch_map = cfg->branch_map;
     c.timeout_ms = cfg->timeout_ms;
     if (cfg->max_ast_size) c.max_ast_size = cfg->max_ast_size;
     if (cfg->max_local_branch_counter) {
@@ -478,6 +481,25 @@ void symsan_session_report_result(symsan_session_t *s, int interesting) {
   guard_void([&] { s->session.report_result(interesting != 0); });
 }
 
+symsan_status_t symsan_session_set_coverage(symsan_session_t *s,
+                                            const uint8_t *map, size_t len) {
+  if (!s || (!map && len)) {
+    set_error("symsan_session_set_coverage: session/map required");
+    return SYMSAN_ERR_INVALID;
+  }
+  if (!s->initialized) {
+    set_error("symsan_session_set_coverage: session not initialized");
+    return SYMSAN_ERR_NOT_READY;
+  }
+  return guard(SYMSAN_ERR_FAILED, [&] {
+    if (s->session.set_coverage(map, len) != 0) {
+      set_error("symsan_session_set_coverage: session has no branch map");
+      return SYMSAN_ERR_INVALID;
+    }
+    return SYMSAN_OK;
+  });
+}
+
 symsan_status_t symsan_session_stats(const symsan_session_t *s,
                                      symsan_stats_t *out) {
   if (!s || !out) {
@@ -490,6 +512,8 @@ symsan_status_t symsan_session_stats(const symsan_session_t *s,
   out->total_tasks = st.total_tasks;
   out->solved_tasks = st.solved_tasks;
   out->solved_branches = st.solved_branches;
+  out->mapped_branches = st.mapped_branches;
+  out->unmapped_branches = st.unmapped_branches;
   return SYMSAN_OK;
 }
 

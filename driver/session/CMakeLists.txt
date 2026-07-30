@@ -14,6 +14,7 @@ set(CMAKE_CXX_STANDARD 17)
 add_library(symsan-session STATIC
   trace-session.cpp
   concolic-session.cpp
+  branch-map.cpp
 )
 target_include_directories(symsan-session PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime

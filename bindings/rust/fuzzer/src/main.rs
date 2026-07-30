@@ -99,6 +99,13 @@ struct Opt {
     #[arg(long = "symsan-budget", default_value = "0")]
     symsan_budget: usize,
 
+    /// Branch-id map for the coverage target, as written by a patched AFL++
+    /// with `AFL_LLVM_DOCUMENT_IDS=<file> afl-clang-lto -g`. Given one, the
+    /// concolic stage can see which branches the fuzzer has already covered
+    /// and stops solving for them.
+    #[arg(long = "branch-map")]
+    branch_map: Option<PathBuf>,
+
     /// Exec the SymSan target once per trace instead of forking it from a
     /// long-lived server. Slower, but the way out if the target keeps state
     /// across `main()` that a fork would wrongly share.
@@ -142,9 +149,14 @@ pub fn main() -> Result<(), libafl::Error> {
     }
     let shmem_buf = shmem.as_slice_mut();
 
+    // The name is load-bearing beyond display: MaxMapFeedback inherits it and
+    // files its history map under it, which is how the SymSan stage finds that
+    // map again when it is sharing coverage.
+    let edges_observer_name = "shared_mem";
     // SAFETY: the map outlives the observer -- `shmem` is alive for all of main.
     let edges_observer = unsafe {
-        HitcountsMapObserver::new(StdMapObserver::new("shared_mem", shmem_buf)).track_indices()
+        HitcountsMapObserver::new(StdMapObserver::new(edges_observer_name, shmem_buf))
+            .track_indices()
     };
     let time_observer = TimeObserver::new("time");
 
@@ -228,7 +240,7 @@ pub fn main() -> Result<(), libafl::Error> {
     // "optional stage" means two code paths, not an `if`.
     match opt.symsan_bin {
         Some(bin) => {
-            let symsan = SymSanStage::builder()
+            let mut builder = SymSanStage::builder()
                 .target(&bin)
                 // The stage does its own `@@` expansion against its own input
                 // file, so it gets the raw arguments rather than the ones the
@@ -237,8 +249,18 @@ pub fn main() -> Result<(), libafl::Error> {
                 .input_file(opt.out_dir.join(format!(".symsan_input_{}", std::process::id())))
                 .timeout_ms(opt.symsan_timeout)
                 .max_solutions_per_input(opt.symsan_budget)
-                .forkserver(!opt.symsan_no_forkserver)
-                .build()?;
+                .forkserver(!opt.symsan_no_forkserver);
+            if let Some(map) = &opt.branch_map {
+                // The observer above is named "shared_mem", which is also the
+                // name MaxMapFeedback::new() inherits and files its history map
+                // under -- so the stage's default is already right, but say it
+                // rather than leave the coupling implicit.
+                builder = builder
+                    .branch_map(map)
+                    .coverage_map_name(edges_observer_name);
+                println!("symsan: sharing coverage via {}", map.display());
+            }
+            let symsan = builder.build()?;
             println!("symsan: tracing with {}", bin.display());
 
             // SymSan first: trace a newly scheduled entry before havoc starts

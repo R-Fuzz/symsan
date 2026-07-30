@@ -20,6 +20,7 @@
 
 #include "session.h"
 
+#include "branch_map.h"
 #include "cov.h"
 #include "parse-rgd.h"
 #include "solver.h"
@@ -71,6 +72,11 @@ struct ConcolicConfig {
   /// exec'ing it again every run (SYMSAN_FORKSRV).  Only takes effect for file
   /// input against a backend that has a fork server; otherwise it is a no-op.
   bool forkserver = false;        // SYMSAN_FORKSRV
+  /// AFL++ AFL_LLVM_DOCUMENT_IDS output for the *fuzzer's* build of the same
+  /// target (SYMSAN_BRANCH_MAP).  Setting it lets the session skip branches the
+  /// fuzzer has already covered; see include/branch_map.h.  Empty means "no
+  /// map", and the session then only knows what it has seen itself.
+  std::string branch_map;
   /// per-run timeout in milliseconds; also arms the deadloop guard
   unsigned timeout_ms = 50;       // MIN_TIMEOUT in driver/aflpp/symsan.cpp
 
@@ -95,6 +101,11 @@ struct ConcolicStats {
   uint64_t total_tasks = 0;
   uint64_t solved_tasks = 0;
   uint64_t solved_branches = 0;
+  /// Branch directions the BranchMap could and could not resolve to fuzzer edge
+  /// ids.  Both stay 0 without a map; with one, the ratio is the diagnostic for
+  /// whether the two builds actually agree on branch names.
+  uint64_t mapped_branches = 0;
+  uint64_t unmapped_branches = 0;
 };
 
 class ConcolicSession : public symsan::EventHandler {
@@ -141,6 +152,16 @@ public:
   /// result (a LibAFL stage sees ExecuteInputResult directly) reports the truth.
   void report_result(bool interesting);
 
+  /// Hand the session a snapshot of the fuzzer's coverage map, so that a branch
+  /// the fuzzer already covered is not solved again.  Only has an effect when a
+  /// branch map was loaded; without one there is no way to tell which entry of
+  /// @p map corresponds to which branch, and the call is silently ignored.
+  ///
+  /// The snapshot is copied, so @p map need not outlive the call.  Call it
+  /// before trace(); passing nullptr forgets the previous snapshot.
+  /// @return 0 on success, -1 if no branch map is in use
+  int set_coverage(const uint8_t *map, size_t len);
+
   const ConcolicStats &stats() const { return stats_; }
   /// Write the counters and each solver's own stats to @p fd.
   void print_stats(int fd) const;
@@ -176,6 +197,11 @@ private:
   std::unique_ptr<RGDAstParser> parser_;
   std::unique_ptr<TaskManager> task_mgr_;
   std::unique_ptr<CovManager> cov_mgr_;
+  std::unique_ptr<BranchMap> branch_map_;
+  /// cov_mgr_ again when it is a SharedMapCovManager, so that set_coverage()
+  /// and the join-rate counters do not have to go through a dynamic_cast on
+  /// every branch.  Owned by cov_mgr_; null when no map was loaded.
+  SharedMapCovManager *shared_cov_ = nullptr;
   std::vector<std::shared_ptr<Solver>> solvers_;
 
   /// the input trace() was last called with; the solvers mutate a copy of it

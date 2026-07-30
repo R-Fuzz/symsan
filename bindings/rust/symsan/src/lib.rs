@@ -225,6 +225,7 @@ pub struct Config {
     max_local_branch_counter: u8,
     max_input_size: usize,
 
+    branch_map: Option<CString>,
     forkserver: bool,
 }
 
@@ -279,6 +280,7 @@ impl Config {
             max_ast_size: raw.max_ast_size,
             max_local_branch_counter: raw.max_local_branch_counter,
             max_input_size: raw.max_input_size,
+            branch_map: None,
             forkserver: raw.forkserver != 0,
         }
     }
@@ -289,8 +291,8 @@ impl Config {
     /// `SYMSAN_OUTPUT_DIR`, `SYMSAN_USE_JIGSAW`, `SYMSAN_USE_Z3`,
     /// `SYMSAN_USE_NESTED`, `SYMSAN_TRACE_BOUNDS`, `SYMSAN_SOLVE_UB`,
     /// `SYMSAN_DONT_EXIT_ON_MEMERROR`, `SYMSAN_FORCE_STDIN`,
-    /// `SYMSAN_SAVE_SOLVED`, `SYMSAN_FORKSRV` -- by calling the same C++ code,
-    /// so the two front-ends cannot disagree about what a variable means.
+    /// `SYMSAN_SAVE_SOLVED`, `SYMSAN_FORKSRV`, `SYMSAN_BRANCH_MAP` -- by calling the same C++
+    /// code, so the two front-ends cannot disagree about what a variable means.
     ///
     /// `input_file`, `args` and `use_stdin` are left alone; they are the
     /// front-end's business, not the environment's.
@@ -316,6 +318,12 @@ impl Config {
         } else {
             Some(unsafe { CStr::from_ptr(raw.output_dir) }.to_owned())
         };
+        let branch_map = if raw.branch_map.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(raw.branch_map) }.to_owned())
+        };
+
         Ok(Self {
             symsan_bin,
             input_file: cstring(input_file),
@@ -335,6 +343,7 @@ impl Config {
             max_ast_size: raw.max_ast_size,
             max_local_branch_counter: raw.max_local_branch_counter,
             max_input_size: raw.max_input_size,
+            branch_map,
             forkserver: raw.forkserver != 0,
         })
     }
@@ -466,6 +475,23 @@ impl Config {
         self
     }
 
+    /// Share a branch namespace with the fuzzer.
+    ///
+    /// `path` is the file a patched AFL++ writes when `AFL_LLVM_DOCUMENT_IDS`
+    /// is set while building the *fuzzer's* copy of the target (see
+    /// `patches/aflpp-document-ids.patch`).  It says which AFL++ edge id each
+    /// source-level branch direction corresponds to, which is what lets
+    /// [`Session::set_coverage`] tell the session that a branch has already
+    /// been covered and is not worth solving for again.
+    ///
+    /// Without this, the session only knows what it has seen itself, so every
+    /// freshly started session re-solves branches the fuzzer covered long ago.
+    #[must_use]
+    pub fn branch_map(mut self, path: impl AsRef<str>) -> Self {
+        self.branch_map = Some(cstring(path));
+        self
+    }
+
     /// Trade a per-run `execv` for a `fork`.
     ///
     /// With this on, the target is spawned once and forks a child per input,
@@ -526,6 +552,10 @@ impl Config {
         raw.max_ast_size = self.max_ast_size;
         raw.max_local_branch_counter = self.max_local_branch_counter;
         raw.max_input_size = self.max_input_size;
+        raw.branch_map = self
+            .branch_map
+            .as_ref()
+            .map_or(std::ptr::null(), |p| p.as_ptr());
         raw.forkserver = self.forkserver.into();
 
         (raw, argv)
@@ -550,6 +580,17 @@ pub struct Stats {
     /// Branches a solution actually flipped, as reported by the front-end
     /// through [`Session::report_result`].
     pub solved_branches: u64,
+    /// Branch directions the branch map resolved to fuzzer edge ids.
+    ///
+    /// Zero unless [`Config::branch_map`] was set.  With a map, the split
+    /// between this and [`unmapped_branches`](Stats::unmapped_branches) is the
+    /// diagnostic for whether the two builds of the target actually agree on
+    /// branch names: a near-zero ratio usually means the two clangs disagree
+    /// about column numbers, or that the fuzzer's build was missing `-g`.
+    pub mapped_branches: u64,
+    /// Branch directions the branch map had nothing to say about, so the
+    /// session fell back to its own coverage.
+    pub unmapped_branches: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +740,25 @@ impl Session {
         unsafe { sys::symsan_session_report_result(self.raw.as_ptr(), interesting.into()) }
     }
 
+    /// Hand the session a snapshot of the fuzzer's coverage map, so it stops
+    /// solving for branches the fuzzer has already reached.
+    ///
+    /// `map` is indexed by AFL++ edge id and read as "non-zero means covered",
+    /// so either a hit-count map or LibAFL's history map works.  It is copied,
+    /// and it only affects branches the [`Config::branch_map`] resolves --
+    /// everything else keeps behaving as if this had not been called.
+    ///
+    /// Call it before [`trace`](Session::trace).  Returns [`Error::Invalid`] if
+    /// the session was initialized without a branch map, since then there is no
+    /// way to know which entry of `map` belongs to which branch.
+    pub fn set_coverage(&mut self, map: &[u8]) -> Result<(), Error> {
+        // SAFETY: valid handle; `map` is a valid slice for the duration of the
+        // call and the C side copies it before returning.
+        check(unsafe {
+            sys::symsan_session_set_coverage(self.raw.as_ptr(), map.as_ptr(), map.len())
+        })
+    }
+
     /// Counters for the whole session.
     pub fn stats(&self) -> Stats {
         let mut raw = sys::symsan_stats_t {
@@ -707,6 +767,8 @@ impl Session {
             total_tasks: 0,
             solved_tasks: 0,
             solved_branches: 0,
+            mapped_branches: 0,
+            unmapped_branches: 0,
         };
         // SAFETY: valid handle and a valid out-pointer. Errors here can only
         // mean a null argument, which we just ruled out, so the zeroed struct
@@ -718,6 +780,8 @@ impl Session {
             total_tasks: raw.total_tasks,
             solved_tasks: raw.solved_tasks,
             solved_branches: raw.solved_branches,
+            mapped_branches: raw.mapped_branches,
+            unmapped_branches: raw.unmapped_branches,
         }
     }
 

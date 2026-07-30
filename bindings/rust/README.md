@@ -111,6 +111,57 @@ runs:
 Two chained 4-byte equalities is 2^64 of search space; havoc is not going to
 stumble into it.
 
+## Sharing coverage with the fuzzer (`--branch-map`)
+
+By default the stage only knows what *it* has traced, so it happily spends
+solver time on branches the fuzzer covered an hour ago. The two sides name
+branches differently — SymSan by source location, AFL++ by a sequential edge id
+— so neither can read the other's knowledge.
+
+`--branch-map` closes that. A patched AFL++ (`patches/aflpp-document-ids.patch`,
+recipe in `patches/README.md`) makes `AFL_LLVM_DOCUMENT_IDS` emit the source
+location each edge id came from, which is enough to join the two namespaces:
+
+```bash
+# build the coverage target with LTO, debug info, and the id dump
+AFL_LLVM_DOCUMENT_IDS=$PWD/branch.map \
+    <aflpp>/afl-clang-lto -g -o target.afl target.c
+
+KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -o target.symsan target.c
+
+./target/release/symsan-fuzz -i ./seeds -o ./out \
+    --symsan ./target.symsan --branch-map ./branch.map -- ./target.afl @@
+```
+
+The stage then reads `MaxMapFeedback`'s history map before each trace and hands
+it to the session, which treats a branch direction whose edge ids are all
+already covered as not worth solving.
+
+Where the map has nothing to say the behaviour is exactly what it was without
+it, so a partial map costs opportunities, not correctness — a solution the
+solver does produce is as valid as before. (A map left over from a *different*
+build is the one case worth avoiding: it can point a branch at some other
+branch's edge id and make the stage skip work it should have done. Regenerate
+the map whenever you rebuild the target.) Three things make a correct map
+partial, all of them expected:
+
+- **AFL++ prunes blocks** that dominate all their successors, so those branch
+  directions have no edge id at all. There is no way to turn this off through
+  `ld.lld`; see `patches/README.md`.
+- **`switch` is not covered.** SymSan gives every case of a switch the same
+  branch id, so a (id, direction) pair cannot name a case block.
+- **The two clangs must agree on column numbers**, which in practice means the
+  same major version. They currently both use LLVM 18.
+
+`Stats::mapped_branches` and `Stats::unmapped_branches` are the split, and the
+honest way to check whether any of this is working on your target:
+`print_stats` reports them as `Branch map: N entries, M mapped, K unmapped`.
+
+Building without `--branch-map` keeps the old behaviour, including for anyone
+using the library directly: `Config::branch_map` and `Session::set_coverage` are
+both optional, and `set_coverage` on a session with no map is an error rather
+than a silent no-op.
+
 ## The fork server
 
 Tracing an input used to mean a full `execv`: dynamic linking, the shadow and

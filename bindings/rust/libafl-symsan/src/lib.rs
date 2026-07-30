@@ -64,6 +64,7 @@ use std::path::{Path, PathBuf};
 use libafl::{
     Error, HasNamedMetadata,
     corpus::{CorpusId, HasCurrentCorpusId},
+    feedbacks::MapFeedbackMetadata,
     fuzzer::{Evaluator, ExecuteInputResult},
     inputs::BytesInput,
     stages::{Restartable, RetryCountRestartHelper, Stage},
@@ -75,6 +76,10 @@ pub use symsan::{Config, Session, Stats};
 
 /// Default name, used to key the stage's restart metadata in the state.
 pub const SYMSAN_STAGE_NAME: &str = "symsan";
+
+/// Default name of the coverage observer whose history map the stage reads,
+/// matching the one the bundled fuzzer gives its edges observer.
+pub const DEFAULT_COVERAGE_MAP_NAME: &str = "shared_mem";
 
 /// The AFL-style placeholder for "the input file goes here".
 const INPUT_FILE_PLACEHOLDER: &str = "@@";
@@ -108,6 +113,8 @@ pub struct SymSanStageBuilder {
     args: Vec<String>,
     input_file: Option<PathBuf>,
     output_dir: Option<PathBuf>,
+    branch_map: Option<PathBuf>,
+    coverage_map_name: Option<String>,
     name: Option<String>,
     jigsaw: bool,
     z3: bool,
@@ -169,6 +176,35 @@ impl SymSanStageBuilder {
     #[must_use]
     pub fn output_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.output_dir = Some(path.into());
+        self
+    }
+
+    /// Share a branch namespace -- and therefore coverage -- with the fuzzer.
+    ///
+    /// `path` is what a patched AFL++ writes when `AFL_LLVM_DOCUMENT_IDS` is
+    /// set while building the *coverage* copy of the target (see
+    /// `patches/aflpp-document-ids.patch` in the SymSan tree). It maps each
+    /// source-level branch direction onto the AFL++ edge ids that represent it,
+    /// which is what lets the stage look a branch up in the fuzzer's history
+    /// map and skip solving for one the fuzzer already reached.
+    ///
+    /// Without it the session only knows what it has traced itself, so it keeps
+    /// paying to re-solve branches the fuzzer covered long ago.
+    #[must_use]
+    pub fn branch_map(mut self, path: impl Into<PathBuf>) -> Self {
+        self.branch_map = Some(path.into());
+        self
+    }
+
+    /// Name of the coverage observer whose history map to read, when a
+    /// [`branch_map`](Self::branch_map) is in use.
+    ///
+    /// This is the name of the *observer* the `MaxMapFeedback` was built from,
+    /// since the feedback stores its metadata under its own name and inherits
+    /// that from the observer. Defaults to [`DEFAULT_COVERAGE_MAP_NAME`].
+    #[must_use]
+    pub fn coverage_map_name(mut self, name: impl Into<String>) -> Self {
+        self.coverage_map_name = Some(name.into());
         self
     }
 
@@ -301,6 +337,22 @@ impl SymSanStageBuilder {
         if let Some(dir) = &self.output_dir {
             config = config.output_dir(path_str(dir)?);
         }
+        if let Some(map) = &self.branch_map {
+            config = config.branch_map(path_str(map)?);
+        }
+        // Reading the history map is only meaningful with a branch map to join
+        // it against, so the observer name is remembered only in that case --
+        // and asking for one without the other is a mistake worth naming.
+        let coverage_map_name = match (&self.branch_map, self.coverage_map_name) {
+            (Some(_), name) => Some(name.unwrap_or_else(|| DEFAULT_COVERAGE_MAP_NAME.to_owned())),
+            (None, Some(_)) => {
+                return Err(Error::illegal_argument(
+                    "coverage_map_name() without branch_map(): there is no way to tell \
+                     which entry of the coverage map belongs to which branch",
+                ));
+            }
+            (None, None) => None,
+        };
 
         let mut session = Session::new().map_err(to_libafl)?;
         session.init(&config).map_err(to_libafl)?;
@@ -310,6 +362,8 @@ impl SymSanStageBuilder {
             name: Cow::Owned(self.name.unwrap_or_else(|| SYMSAN_STAGE_NAME.to_owned())),
             traced: HashSet::new(),
             max_solutions_per_input: self.max_solutions_per_input,
+            coverage_map_name,
+            coverage_warned: false,
             solutions: 0,
             solved: 0,
         })
@@ -350,6 +404,13 @@ pub struct SymSanStage {
     /// work its new session never actually did.
     traced: HashSet<CorpusId>,
     max_solutions_per_input: usize,
+    /// Observer name to read the fuzzer's history map from before each trace,
+    /// or `None` when no branch map was configured and the session therefore
+    /// has no way to interpret it.
+    coverage_map_name: Option<String>,
+    /// Whether the "could not read the history map" warning has already been
+    /// issued. It would otherwise repeat once per corpus entry.
+    coverage_warned: bool,
     solutions: u64,
     solved: u64,
 }
@@ -404,7 +465,13 @@ where
     // The state must have a corpus of byte inputs and know which entry is
     // current. `HasCurrentTestcase` -- which gives us `current_input_cloned()`
     // -- is blanket-implemented for exactly that combination.
-    S: HasCorpus<BytesInput> + HasCurrentCorpusId + HasCurrentTestcase<BytesInput>,
+    // `HasNamedMetadata` is where the coverage feedback keeps its history map,
+    // which is what branch_map() needs to read; `Restartable` requires it of
+    // `S` anyway, so it costs a stage nothing.
+    S: HasCorpus<BytesInput>
+        + HasCurrentCorpusId
+        + HasCurrentTestcase<BytesInput>
+        + HasNamedMetadata,
     // ...and the fuzzer must be able to run and judge an input for us. This is
     // the bound that makes honest reporting possible.
     Z: Evaluator<E, EM, BytesInput, S>,
@@ -435,6 +502,35 @@ where
         // not compile -- and if it did, it would be a RefCell panic at runtime.
         let input: BytesInput = state.current_input_cloned()?;
         let bytes: Vec<u8> = input.into();
+
+        // Tell the session what the fuzzer has already covered, so it does not
+        // spend the whole trace solving for branches that were won hours ago.
+        // Done per entry rather than once: the history map only grows, and a
+        // stale snapshot would just mean redundant work, not wrong answers.
+        if let Some(map_name) = &self.coverage_map_name {
+            match state.named_metadata::<MapFeedbackMetadata<u8>>(map_name) {
+                Ok(meta) => {
+                    if let Err(e) = self.session.set_coverage(&meta.history_map) {
+                        if !self.coverage_warned {
+                            log::warn!("symsan: cannot share coverage: {e}");
+                            self.coverage_warned = true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Wrong observer name, or a fuzzer whose map is not u8.
+                    // Not fatal -- without a snapshot the session simply falls
+                    // back to its own view, which is what it did before.
+                    if !self.coverage_warned {
+                        log::warn!(
+                            "symsan: no u8 coverage map named {map_name:?} in the state ({e}); \
+                             running without shared coverage"
+                        );
+                        self.coverage_warned = true;
+                    }
+                }
+            }
+        }
 
         let tasks = match self.session.trace(&bytes) {
             Ok(n) => n,

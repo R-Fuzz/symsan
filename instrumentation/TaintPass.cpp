@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 //#include "defs.h"
+#include "branch_id.h"
 #include "UCSanSummary.h"
 
 #include <optional>
@@ -884,16 +885,20 @@ uint32_t Taint::getInstructionId(Instruction *Inst) {
 
   // otherwise, fallback to hash
   static uint32_t unamed = 0;
-  auto SourceInfo = Mod->getSourceFileName();
   DILocation *Loc = Inst->getDebugLoc();
   if (Loc) {
     auto Line = Loc->getLine();
     auto Col = Loc->getColumn();
-    SourceInfo += ":" + std::to_string(Line) + ":" + std::to_string(Col);
-  } else {
-    SourceInfo += "unamed:" + std::to_string(unamed++);
+    // Hash the *debug location's* file, not Mod->getSourceFileName(): the two
+    // differ for anything the inliner moved, and only the former is a key
+    // AFL++'s link-time instrumentation can compute for the same branch.
+    // symsan::branch_cid is the single definition of that key; see
+    // include/branch_id.h.
+    return symsan::branch_cid(Loc->getFilename().str(), Line, Col);
   }
 
+  auto SourceInfo = Mod->getSourceFileName();
+  SourceInfo += "unamed:" + std::to_string(unamed++);
   return djbHash(SourceInfo);
 }
 

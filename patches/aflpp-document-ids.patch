@@ -1,0 +1,48 @@
+diff --git a/instrumentation/SanitizerCoverageLTO.so.cc b/instrumentation/SanitizerCoverageLTO.so.cc
+index 508c02c7..16d9da31 100644
+--- a/instrumentation/SanitizerCoverageLTO.so.cc
++++ b/instrumentation/SanitizerCoverageLTO.so.cc
+@@ -2669,7 +2669,42 @@ void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
+       unsigned long long int moduleID =
+           (((unsigned long long int)(rand() & 0xffffffff)) << 32) | getpid();
+       dFile << "ModuleID=" << moduleID << " Function=" << F.getName().str()
+-            << " edgeID=" << afl_global_id << "\n";
++            << " edgeID=" << afl_global_id;
++
++      /* Where this edge comes from, for consumers that have their own name for
++         the same branch -- a symbolic execution engine, say, which identifies
++         branches by source location rather than by edge id.  Function
++         granularity alone is not enough to join on.
++
++         SplitAllCriticalEdges() has already run, so both successors of a
++         conditional branch have that branch's block as their single
++         predecessor: if this block has one predecessor ending in a conditional
++         br, this block *is* one side of that branch, and which side is decided
++         by successor order.  Emitted last because a path may contain spaces and
++         colons; parse it from the right.  Requires -g. */
++
++      if (const BasicBlock *Pred = BB.getSinglePredecessor()) {
++
++        if (const BranchInst *BI =
++                dyn_cast<BranchInst>(Pred->getTerminator())) {
++
++          if (BI->isConditional()) {
++
++            if (const DebugLoc &DL = BI->getDebugLoc()) {
++
++              dFile << " dir=" << (BI->getSuccessor(0) == &BB ? 1 : 0)
++                    << " src=" << DL->getFilename().str() << ":" << DL.getLine()
++                    << ":" << DL.getCol();
++
++            }
++
++          }
++
++        }
++
++      }
++
++      dFile << "\n";
+ 
+     }
+ 

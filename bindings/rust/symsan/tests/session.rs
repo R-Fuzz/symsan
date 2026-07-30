@@ -203,6 +203,18 @@ fn end_to_end() {
         "report_result(true) did not register a solved branch"
     );
 
+    // ---- coverage sharing needs a branch map --------------------------------
+    //
+    // This config has none, so there is no way to know which entry of a
+    // coverage map belongs to which branch. Saying so is better than silently
+    // ignoring the snapshot and leaving the caller to wonder why nothing
+    // changed. tests/branch_map.rs covers the case where a map *is* present.
+    match session.set_coverage(&[0u8; 64]) {
+        Err(symsan::Error::Invalid(_)) => {}
+        Err(e) => panic!("expected Error::Invalid without a branch map, got {e}"),
+        Ok(()) => panic!("set_coverage succeeded without a branch map"),
+    }
+
     // ---- process model ------------------------------------------------------
 
     // One session per process: the second create must fail, not silently hand

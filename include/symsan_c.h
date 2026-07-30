@@ -229,6 +229,13 @@ typedef struct {
   uint8_t max_local_branch_counter;/**< default 128 */
   size_t max_input_size;           /**< default 1 MiB */
 
+  /** AFL++ AFL_LLVM_DOCUMENT_IDS output for the fuzzer's build of the same
+   *  target, or NULL.  Given one, the session can tell that a branch the fuzzer
+   *  already covered is not worth solving; feed it the coverage map with
+   *  symsan_session_set_coverage().  See include/branch_map.h and
+   *  patches/aflpp-document-ids.patch. */
+  const char *branch_map;
+
   /** Keep one instance of the target alive and fork it per input, instead of
    *  exec'ing it again for every run.  Saves the execv, the dynamic link and
    *  the shadow/union mapping each time.  Only applies to file input, and only
@@ -244,8 +251,9 @@ void symsan_config_init(symsan_config_t *cfg);
  *
  *  Reads SYMSAN_TARGET, SYMSAN_OUTPUT_DIR, SYMSAN_USE_JIGSAW, SYMSAN_USE_Z3,
  *  SYMSAN_USE_NESTED, SYMSAN_TRACE_BOUNDS, SYMSAN_SOLVE_UB,
- *  SYMSAN_DONT_EXIT_ON_MEMERROR, SYMSAN_FORCE_STDIN, SYMSAN_SAVE_SOLVED and
- *  SYMSAN_FORKSRV -- the same knobs the AFL++ mutator honours, so front-ends
+ *  SYMSAN_DONT_EXIT_ON_MEMERROR, SYMSAN_FORCE_STDIN, SYMSAN_SAVE_SOLVED,
+ *  SYMSAN_FORKSRV and
+ *  SYMSAN_BRANCH_MAP -- the same knobs the AFL++ mutator honours, so front-ends
  *  stay consistent without each re-reading getenv().
  *
  *  Leaves input_file, argv/argc and use_stdin alone; those are the front-end's
@@ -315,6 +323,21 @@ const uint8_t *symsan_session_next_solution(symsan_session_t *s, size_t *size);
  */
 void symsan_session_report_result(symsan_session_t *s, int interesting);
 
+/** Give the session a snapshot of the fuzzer's coverage map, so that it stops
+ *  solving for branches the fuzzer has already reached.
+ *
+ *  @p map is indexed by AFL++ edge id and read as "non-zero means covered", so
+ *  either a hit-count map or a history map works.  It is copied, and only the
+ *  branches the branch map resolves are affected -- everything else keeps
+ *  today's behaviour.  Pass NULL to forget the previous snapshot.
+ *
+ *  Call before trace().  Returns SYMSAN_ERR_INVALID if the session was
+ *  initialized without a branch_map, since then there is no way to know which
+ *  entry of @p map belongs to which branch.
+ */
+symsan_status_t symsan_session_set_coverage(symsan_session_t *s,
+                                            const uint8_t *map, size_t len);
+
 /** Counters mirroring rgd::ConcolicStats. */
 typedef struct {
   uint64_t total_branches;
@@ -322,6 +345,10 @@ typedef struct {
   uint64_t total_tasks;
   uint64_t solved_tasks;
   uint64_t solved_branches;
+  /** branch directions the branch map could and could not resolve to fuzzer
+   *  edge ids; both 0 when no branch map is in use */
+  uint64_t mapped_branches;
+  uint64_t unmapped_branches;
 } symsan_stats_t;
 
 symsan_status_t symsan_session_stats(const symsan_session_t *s,
