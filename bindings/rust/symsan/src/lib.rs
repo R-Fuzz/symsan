@@ -227,6 +227,7 @@ pub struct Config {
 
     branch_map: Option<CString>,
     forkserver: bool,
+    validate_coverage: bool,
 }
 
 /// Convert to a `CString`, replacing any interior NUL by truncating at it.
@@ -282,6 +283,7 @@ impl Config {
             max_input_size: raw.max_input_size,
             branch_map: None,
             forkserver: raw.forkserver != 0,
+            validate_coverage: raw.validate_coverage != 0,
         }
     }
 
@@ -345,6 +347,7 @@ impl Config {
             max_input_size: raw.max_input_size,
             branch_map,
             forkserver: raw.forkserver != 0,
+            validate_coverage: raw.validate_coverage != 0,
         })
     }
 
@@ -508,6 +511,21 @@ impl Config {
         self
     }
 
+    /// Record which branch directions each trace takes, so that
+    /// [`Session::check_coverage`] can hold the branch map against ground
+    /// truth.
+    ///
+    /// Off by default.  [`Stats::mapped_branches`] only says how *much* of the
+    /// map lands; a map that resolved every branch to the wrong edge would
+    /// report a perfect ratio while silently suppressing every solve, and this
+    /// is what tells the two apart.  It costs a hash insert per branch, so it
+    /// is a diagnostic rather than something a fuzzing run wants on.
+    #[must_use]
+    pub fn validate_coverage(mut self, enable: bool) -> Self {
+        self.validate_coverage = enable;
+        self
+    }
+
     /// The scratch file inputs are staged into.
     pub fn input_file_path(&self) -> PathBuf {
         PathBuf::from(self.input_file.to_string_lossy().into_owned())
@@ -557,6 +575,7 @@ impl Config {
             .as_ref()
             .map_or(std::ptr::null(), |p| p.as_ptr());
         raw.forkserver = self.forkserver.into();
+        raw.validate_coverage = self.validate_coverage.into();
 
         (raw, argv)
     }
@@ -591,6 +610,35 @@ pub struct Stats {
     /// Branch directions the branch map had nothing to say about, so the
     /// session fell back to its own coverage.
     pub unmapped_branches: u64,
+}
+
+/// What [`Session::check_coverage`] found: does the branch map point at the
+/// edges the fuzzer's build actually covers?
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct JoinReport {
+    /// Distinct branch directions the last trace took.
+    pub executed: usize,
+    /// Of those, the ones the branch map resolved to exactly one edge id.
+    pub checked: usize,
+    /// Of the checked ones, those whose edge the fuzzer's build did *not*
+    /// record.  Any non-zero value is a bug.
+    pub violations: usize,
+    /// Directions resolving to several edge ids, because the branch was
+    /// inlined.  A run takes one of the copies, so these can only be checked
+    /// as "at least one covered".
+    pub ambiguous: usize,
+    /// Of the ambiguous ones, those where *none* of the edge ids was recorded.
+    pub ambiguous_violations: usize,
+    /// Directions the map had nothing to say about.  Expected to be non-zero
+    /// -- AFL++ prunes blocks -- and merely costs opportunities.
+    pub unmapped: usize,
+}
+
+impl JoinReport {
+    /// True when nothing contradicted the map.
+    pub fn is_consistent(&self) -> bool {
+        self.violations == 0 && self.ambiguous_violations == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +804,51 @@ impl Session {
         // call and the C side copies it before returning.
         check(unsafe {
             sys::symsan_session_set_coverage(self.raw.as_ptr(), map.as_ptr(), map.len())
+        })
+    }
+
+    /// Hold the branch map against ground truth for the input just traced.
+    ///
+    /// Where [`set_coverage`](Session::set_coverage) *uses* the map, this
+    /// *checks* it.  `covered` is the set of AFL++ edge ids the **fuzzer's**
+    /// build of the same target recorded for the same bytes -- a corpus
+    /// entry's `MapIndexesMetadata`, or the output of `afl-showmap`.  Every
+    /// direction the trace took should resolve to an edge in there, so a
+    /// non-zero [`JoinReport::violations`] means the map names the wrong edge,
+    /// or the two builds took different paths.
+    ///
+    /// The converse says nothing and is not reported: the fuzzer records
+    /// concrete branches, switch cases and plain blocks, none of which reach a
+    /// concolic trace.
+    ///
+    /// Needs both [`Config::branch_map`] and [`Config::validate_coverage`];
+    /// returns [`Error::Invalid`] otherwise.
+    pub fn check_coverage(&self, covered: &[u32]) -> Result<JoinReport, Error> {
+        let mut raw = sys::symsan_join_report_t {
+            executed: 0,
+            checked: 0,
+            violations: 0,
+            ambiguous: 0,
+            ambiguous_violations: 0,
+            unmapped: 0,
+        };
+        // SAFETY: valid handle, valid slice for the duration of the call, and a
+        // valid out-pointer.
+        check(unsafe {
+            sys::symsan_session_check_coverage(
+                self.raw.as_ptr(),
+                covered.as_ptr(),
+                covered.len(),
+                &mut raw,
+            )
+        })?;
+        Ok(JoinReport {
+            executed: raw.executed,
+            checked: raw.checked,
+            violations: raw.violations,
+            ambiguous: raw.ambiguous,
+            ambiguous_violations: raw.ambiguous_violations,
+            unmapped: raw.unmapped,
         })
     }
 

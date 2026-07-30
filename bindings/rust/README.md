@@ -162,6 +162,69 @@ using the library directly: `Config::branch_map` and `Session::set_coverage` are
 both optional, and `set_coverage` on a session with no map is an error rather
 than a silent no-op.
 
+### Checking that the two sides really do agree
+
+`mapped_branches` only says how *much* of the join lands. It cannot say whether
+the join is *right*, and that is the failure that costs bugs: a map that
+resolved every branch to some other branch's edge id reports a perfect ratio
+while telling the stage that everything is already covered. Nothing errors out.
+The fuzzer just quietly finds less.
+
+Three checks, cheapest first.
+
+**1. Compare the two id tables, without running anything.** SymSan has its own
+counterpart to `AFL_LLVM_DOCUMENT_IDS`: set `SYMSAN_DOCUMENT_IDS` and the
+instrumentation appends a `cid=`/`src=` line per branch it instruments, in the
+same shape AFL++ uses.
+
+```bash
+SYMSAN_DOCUMENT_IDS=$PWD/symsan.ids \
+    KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -g -o target.symsan target.c
+```
+
+Both files are appended to, so delete them before a rebuild. Comparing the
+`src=` columns of the two answers the question no ratio can: a location both
+sides emit but with *different* columns means the two clangs disagree and the
+join is dead, while a location only SymSan emits is AFL++ having pruned the
+block, which is expected. `kind=switch` and `kind=select` lines can never join
+— see the limits above — so they are labelled rather than left to look like
+breakage.
+
+**2. Check one input against `afl-showmap`.** `b4/bin/covcheck` traces an input
+through the SymSan build and checks every branch direction it took against the
+edges the fuzzer's build recorded for the same bytes:
+
+```bash
+<aflpp>/afl-showmap -o showmap.out -- ./target.afl input
+<symsan>/b4/bin/covcheck -m branch.map -c showmap.out -i input -- ./target.symsan @@
+```
+
+It exits non-zero on a contradiction. `tests/branch_map_join.c` in the SymSan
+tree is this run as a lit test, including the negative half — the same run with
+a deliberately wrong map has to come out `INCONSISTENT`, or a vacuous check
+would look identical to a passing one.
+
+**3. Audit every entry during a real run.** `--validate-branch-map` (or
+`SymSanStageBuilder::validate_coverage`) does the same comparison on each traced
+corpus entry, and logs at `error` level when one contradicts the map:
+
+```bash
+RUST_LOG=error ./target/release/symsan-fuzz -i ./seeds -o ./out \
+    --symsan ./target.symsan --branch-map ./branch.map --validate-branch-map \
+    -- ./target.afl @@
+```
+
+The ground truth is free: the fuzzer's map feedback is built with
+`track_indices()`, so every corpus entry already carries the edge set its own
+execution produced — nothing is run a second time. It still costs a hash insert
+per branch, so this is a check to run when setting up a new target, not to leave
+on.
+
+All three only ever report one direction of disagreement: every branch SymSan
+executed must map to an edge the fuzzer recorded. The converse means nothing —
+the fuzzer records concrete branches, switch cases and plain blocks, none of
+which a concolic trace ever hears about.
+
 ## The fork server
 
 Tracing an input used to mean a full `execv`: dynamic linking, the shadow and

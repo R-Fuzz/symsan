@@ -3,8 +3,10 @@
 #include "branch_map.h"
 
 #include <stdint.h>
+#include <stddef.h>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <utility>
 
@@ -76,6 +78,29 @@ public:
   }
 };
 
+/// What a validation run found: does the branch map point at the edges the
+/// fuzzer's build actually covers?
+///
+/// mapped()/unmapped() only say how *much* of the map lands, and a map that
+/// resolved every branch to the wrong edge would report a perfect ratio while
+/// quietly suppressing every solve.  This is the counterpart that can tell the
+/// difference, because it compares against a ground truth: the edges the
+/// fuzzer's own build recorded for the very same input.
+struct JoinReport {
+  /// distinct branch directions the trace actually took
+  size_t executed = 0;
+  /// of those, the ones mapping to exactly one edge id
+  size_t checked = 0;
+  /// of the checked ones, those whose edge the fuzzer's build did *not* record
+  size_t violations = 0;
+  /// directions mapping to several edge ids because the branch was inlined
+  size_t ambiguous = 0;
+  /// of those, the ones where *none* of the edges was recorded
+  size_t ambiguous_violations = 0;
+  /// directions the map had nothing to say about
+  size_t unmapped = 0;
+};
+
 /// EdgeCovManager, but a branch the *fuzzer* has already covered is not
 /// interesting either.
 ///
@@ -105,9 +130,55 @@ private:
   uint64_t mapped_ = 0;
   uint64_t unmapped_ = 0;
 
+  /// Branch directions this trace actually took, as (cid << 1) | direction.
+  /// Only kept when validating -- a hot loop would otherwise push an entry per
+  /// iteration.  A set rather than a list because the question is which
+  /// directions were reached, not how often.
+  std::unordered_set<uint64_t> taken_;
+  bool validating_ = false;
+
 public:
   explicit SharedMapCovManager(const BranchMap *map)
       : map_(map) { _ctx = std::make_shared<BranchContext>(); }
+
+  /// Start (or stop) recording the directions each trace takes, for validate().
+  void set_validating(bool on) { validating_ = on; if (!on) taken_.clear(); }
+  /// Forget the previous trace's directions.  Call at the top of each trace.
+  void clear_taken() { taken_.clear(); }
+
+  /// Check the map against ground truth: @p covered is the set of edge ids the
+  /// *fuzzer's* build recorded for the same input this session just traced.
+  ///
+  /// The invariant is one-directional.  Every direction we took must map to an
+  /// edge the fuzzer also recorded, so a violation is real: either the map
+  /// points at the wrong edge, or the two builds diverged on this input.  The
+  /// converse says nothing -- the fuzzer records concrete branches, switch
+  /// cases and plain blocks, none of which reach us.
+  ///
+  /// Inlining costs precision: one source branch becomes N edge ids and a run
+  /// takes one of them, so those can only be checked as "at least one covered"
+  /// and are counted apart from the exact ones.
+  void validate(const uint32_t *covered, size_t n, JoinReport *out) const {
+    std::unordered_set<uint32_t> hit(covered, covered + n);
+    for (uint64_t key : taken_) {
+      out->executed += 1;
+      const std::vector<uint32_t> *edges =
+          map_ ? map_->lookup((uint32_t)(key >> 1), (key & 1) != 0) : nullptr;
+      if (!edges || edges->empty()) {
+        out->unmapped += 1;
+      } else if (edges->size() == 1) {
+        out->checked += 1;
+        if (hit.find((*edges)[0]) == hit.end()) out->violations += 1;
+      } else {
+        out->ambiguous += 1;
+        bool any = false;
+        for (uint32_t e : *edges) {
+          if (hit.find(e) != hit.end()) { any = true; break; }
+        }
+        if (!any) out->ambiguous_violations += 1;
+      }
+    }
+  }
 
   /// Replace the coverage snapshot.  Cheap enough to do once per traced input;
   /// the map is tens of kilobytes and tracing a target costs milliseconds.
@@ -127,6 +198,10 @@ public:
     itr.first |= direction? true : false;
     itr.second |= direction? false : true;
     cids[addr] = id;
+    // Here rather than in is_branch_interesting(), which is handed the
+    // *negated* context: this is the only place the direction actually taken
+    // is in hand, and that is the one the fuzzer's map can be checked against.
+    if (validating_) taken_.insert(((uint64_t)id << 1) | (direction ? 1 : 0));
     _ctx->addr = addr;
     _ctx->direction = direction;
     return _ctx;

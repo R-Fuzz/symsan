@@ -38,6 +38,19 @@ point: every successor of a conditional branch has that branch's block as its
 single predecessor, so "this block has one predecessor ending in a conditional
 `br`" identifies the edge exactly.
 
+### Checking the result
+
+SymSan has the mirror image of this: `SYMSAN_DOCUMENT_IDS=<file>` makes its
+instrumentation append the same shape of line for each branch *it* names,
+`cid=` in place of `edgeID=` plus a `kind=` saying `br`, `switch` or `select`.
+Diffing the `src=` columns of the two files says whether the two toolchains
+agree, without running anything — and separates "the two clangs disagree" (same
+location, different column) from "AFL++ pruned it" (a location only SymSan
+emits). `b4/bin/covcheck` is the dynamic version, against `afl-showmap` as
+ground truth; see the SymSan tree's `bindings/rust/README.md`.
+
+Note both files are *appended* to, so remove them before a rebuild.
+
 ### Requirements and limits
 
 - **LTO only.** `AFL_LLVM_DOCUMENT_IDS` is not implemented for PCGUARD, and

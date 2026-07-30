@@ -242,6 +242,15 @@ typedef struct {
    *  to targets whose backend has a fork server -- otherwise it is silently
    *  ignored and the per-run exec is used, so it is always safe to set. */
   int forkserver;
+
+  /** Record which branch directions each trace takes, so that
+   *  symsan_session_check_coverage() can hold the branch map against ground
+   *  truth.  Off by default: it costs a hash insert per branch, and is a
+   *  diagnostic rather than something a fuzzing run needs.
+   *
+   *  (New fields go at the end, so that a caller built against an older header
+   *  keeps a valid prefix.) */
+  int validate_coverage;
 } symsan_config_t;
 
 /** Fill @p cfg with the defaults.  Always call this first. */
@@ -337,6 +346,46 @@ void symsan_session_report_result(symsan_session_t *s, int interesting);
  */
 symsan_status_t symsan_session_set_coverage(symsan_session_t *s,
                                             const uint8_t *map, size_t len);
+
+/** What symsan_session_check_coverage() found.  See include/cov.h. */
+typedef struct {
+  /** distinct branch directions the last trace took */
+  size_t executed;
+  /** of those, the ones the branch map resolved to exactly one edge id */
+  size_t checked;
+  /** of the checked ones, those whose edge the fuzzer's build did *not* record.
+   *  Any non-zero value is a bug: either the map names the wrong edge, or the
+   *  two builds took different paths on the same bytes. */
+  size_t violations;
+  /** directions resolving to several edge ids, because the branch was inlined */
+  size_t ambiguous;
+  /** of those, the ones where *none* of the edge ids was recorded */
+  size_t ambiguous_violations;
+  /** directions the branch map had nothing to say about.  Expected to be
+   *  non-zero -- AFL++ prunes blocks -- and merely costs opportunities. */
+  size_t unmapped;
+} symsan_join_report_t;
+
+/** Hold the branch map against ground truth for the input just traced.
+ *
+ *  Where symsan_session_set_coverage() *uses* the map, this *checks* it.  The
+ *  mapped/unmapped counters in symsan_stats_t only say how much of the map
+ *  lands; a map that resolved every branch to the wrong edge would report a
+ *  perfect ratio while silently suppressing every solve.  This call can tell
+ *  the difference, because it is given a ground truth.
+ *
+ *  @p covered is the set of AFL++ edge ids the *fuzzer's* build of the same
+ *  target recorded for the same bytes -- a corpus entry's tracked indices, or
+ *  the output of afl-showmap.  Every direction the trace took should resolve to
+ *  an edge in there.
+ *
+ *  Needs both a branch_map and validate_coverage set at init(); returns
+ *  SYMSAN_ERR_INVALID otherwise.
+ */
+symsan_status_t symsan_session_check_coverage(const symsan_session_t *s,
+                                              const uint32_t *covered,
+                                              size_t n,
+                                              symsan_join_report_t *out);
 
 /** Counters mirroring rgd::ConcolicStats. */
 typedef struct {

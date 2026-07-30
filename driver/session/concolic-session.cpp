@@ -76,6 +76,8 @@ int ConcolicConfig::from_env() {
   // share the branch namespace with the fuzzer?
   const char *bmap = getenv("SYMSAN_BRANCH_MAP");
   if (bmap) branch_map = bmap;
+  // check that shared branch namespace against ground truth?
+  if (getenv("SYMSAN_VALIDATE_COV")) validate_coverage = true;
 
   return 0;
 }
@@ -157,6 +159,7 @@ int ConcolicSession::init(const ConcolicConfig &config) {
   }
   if (branch_map_) {
     auto *shared = new SharedMapCovManager(branch_map_.get());
+    shared->set_validating(config_.validate_coverage);
     shared_cov_ = shared;
     cov_mgr_.reset(shared);
   } else {
@@ -178,6 +181,16 @@ int ConcolicSession::init(const ConcolicConfig &config) {
 int ConcolicSession::set_coverage(const uint8_t *map, size_t len) {
   if (!shared_cov_) return -1;
   shared_cov_->set_coverage(map, len);
+  return 0;
+}
+
+int ConcolicSession::check_coverage(const uint32_t *covered, size_t n,
+                                    JoinReport *out) const {
+  if (!shared_cov_ || !out) return -1;
+  if (!config_.validate_coverage) return -1;
+  if (covered == nullptr && n) return -1;
+  *out = JoinReport();
+  shared_cov_->validate(covered, n, out);
   return 0;
 }
 
@@ -327,6 +340,9 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   parser_->restart(inputs);
   local_counter_.clear();
   local_index_filter_.clear();
+  // check_coverage() asks about *this* input, so the recorded directions have
+  // to be this input's.  Unconditional: cheap when nothing was recorded.
+  if (shared_cov_) shared_cov_->clear_taken();
 
   size_t tasks_before = task_mgr_->get_num_tasks();
   symsan::trace_result_t ret = session_.run(input_fd_, *this);

@@ -62,9 +62,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use libafl::{
-    Error, HasNamedMetadata,
+    Error, HasMetadata, HasNamedMetadata,
     corpus::{CorpusId, HasCurrentCorpusId},
-    feedbacks::MapFeedbackMetadata,
+    feedbacks::{MapFeedbackMetadata, MapIndexesMetadata},
     fuzzer::{Evaluator, ExecuteInputResult},
     inputs::BytesInput,
     stages::{Restartable, RetryCountRestartHelper, Stage},
@@ -72,7 +72,7 @@ use libafl::{
 };
 use libafl_bolts::Named;
 
-pub use symsan::{Config, Session, Stats};
+pub use symsan::{Config, JoinReport, Session, Stats};
 
 /// Default name, used to key the stage's restart metadata in the state.
 pub const SYMSAN_STAGE_NAME: &str = "symsan";
@@ -115,6 +115,7 @@ pub struct SymSanStageBuilder {
     output_dir: Option<PathBuf>,
     branch_map: Option<PathBuf>,
     coverage_map_name: Option<String>,
+    validate_coverage: bool,
     name: Option<String>,
     jigsaw: bool,
     z3: bool,
@@ -205,6 +206,29 @@ impl SymSanStageBuilder {
     #[must_use]
     pub fn coverage_map_name(mut self, name: impl Into<String>) -> Self {
         self.coverage_map_name = Some(name.into());
+        self
+    }
+
+    /// Check the branch map against ground truth on every traced entry.
+    ///
+    /// A debugging mode, off by default. Where
+    /// [`branch_map`](Self::branch_map) *uses* the join, this *audits* it: for
+    /// each entry, the edges the fuzzer's own build recorded (the testcase's
+    /// `MapIndexesMetadata`) are held against the edges the map claims the
+    /// trace's branch directions correspond to. Mismatches are logged.
+    ///
+    /// Worth turning on once when setting up a new target, because a map that
+    /// joins to the *wrong* edges fails silently -- the stage simply stops
+    /// solving, and [`Stats::mapped_branches`] still looks healthy. Not worth
+    /// leaving on: it costs a hash insert per branch and a comparison per
+    /// entry.
+    ///
+    /// Requires a [`branch_map`](Self::branch_map), and the fuzzer's map
+    /// feedback to have been built with `track_indices()` -- the bundled
+    /// fuzzer's is.
+    #[must_use]
+    pub fn validate_coverage(mut self, yes: bool) -> Self {
+        self.validate_coverage = yes;
         self
     }
 
@@ -340,6 +364,15 @@ impl SymSanStageBuilder {
         if let Some(map) = &self.branch_map {
             config = config.branch_map(path_str(map)?);
         }
+        if self.validate_coverage {
+            if self.branch_map.is_none() {
+                return Err(Error::illegal_argument(
+                    "validate_coverage() without branch_map(): there is no join to check",
+                ));
+            }
+            config = config.validate_coverage(true);
+        }
+
         // Reading the history map is only meaningful with a branch map to join
         // it against, so the observer name is remembered only in that case --
         // and asking for one without the other is a mistake worth naming.
@@ -364,6 +397,10 @@ impl SymSanStageBuilder {
             max_solutions_per_input: self.max_solutions_per_input,
             coverage_map_name,
             coverage_warned: false,
+            validate_coverage: self.validate_coverage,
+            validate_warned: false,
+            join: JoinReport::default(),
+            join_entries: 0,
             solutions: 0,
             solved: 0,
         })
@@ -411,6 +448,16 @@ pub struct SymSanStage {
     /// Whether the "could not read the history map" warning has already been
     /// issued. It would otherwise repeat once per corpus entry.
     coverage_warned: bool,
+    /// Audit the branch map against each entry's tracked edge indices. See
+    /// [`SymSanStageBuilder::validate_coverage`].
+    validate_coverage: bool,
+    /// As `coverage_warned`, for the audit's own setup complaints.
+    validate_warned: bool,
+    /// The audit's counters, summed over every entry checked. Per-entry reports
+    /// are logged as they happen; this is what a caller can read at the end.
+    join: JoinReport,
+    /// Entries the audit actually managed to check.
+    join_entries: u64,
     solutions: u64,
     solved: u64,
 }
@@ -445,6 +492,25 @@ impl SymSanStage {
     #[must_use]
     pub fn traced(&self) -> usize {
         self.traced.len()
+    }
+
+    /// The branch-map audit's totals, summed over every entry it checked.
+    ///
+    /// All zero unless [`SymSanStageBuilder::validate_coverage`] was set. A
+    /// non-zero [`JoinReport::violations`] means the map names the wrong edge
+    /// for at least one branch -- see [`join_entries`](Self::join_entries) for
+    /// how much evidence that is drawn from.
+    #[must_use]
+    pub fn join_report(&self) -> JoinReport {
+        self.join
+    }
+
+    /// Corpus entries the audit managed to check. Zero with a non-zero
+    /// [`join_report`](Self::join_report) is impossible; zero with the audit on
+    /// means it never found the tracked indices to check against.
+    #[must_use]
+    pub fn join_entries(&self) -> u64 {
+        self.join_entries
     }
 
     /// Write SymSan's full statistics -- counters, the task-size histogram and
@@ -503,6 +569,31 @@ where
         let input: BytesInput = state.current_input_cloned()?;
         let bytes: Vec<u8> = input.into();
 
+        // Ground truth for the branch-map audit: the edge ids the *fuzzer's*
+        // build recorded for these very bytes. Free, because a `MaxMapFeedback`
+        // built with `track_indices()` attaches them to every corpus entry, so
+        // nothing has to be executed a second time.
+        //
+        // Read here rather than after the trace because the loop below needs
+        // `&mut state`, and the `Ref` into the corpus cannot survive that.
+        let covered: Option<Vec<u32>> = if self.validate_coverage {
+            let indices = state.current_testcase().ok().and_then(|tc| {
+                tc.metadata::<MapIndexesMetadata>()
+                    .ok()
+                    .map(|m| m.list.iter().map(|&i| i as u32).collect::<Vec<u32>>())
+            });
+            if indices.is_none() && !self.validate_warned {
+                log::warn!(
+                    "symsan: validate_coverage is on but corpus entries carry no \
+                     MapIndexesMetadata; build the map feedback with track_indices()"
+                );
+                self.validate_warned = true;
+            }
+            indices
+        } else {
+            None
+        };
+
         // Tell the session what the fuzzer has already covered, so it does not
         // spend the whole trace solving for branches that were won hours ago.
         // Done per entry rather than once: the history map only grows, and a
@@ -542,6 +633,57 @@ where
                 return Ok(());
             }
         };
+        // Audit the join now, while the session still holds the directions this
+        // trace took. Deliberately before the `tasks == 0` bail-out: an entry
+        // that yields nothing to solve has still exercised branches, and a
+        // wrong map is exactly why it might have yielded nothing.
+        if let Some(covered) = &covered {
+            match self.session.check_coverage(covered) {
+                Ok(r) => {
+                    self.join_entries += 1;
+                    self.join.executed += r.executed;
+                    self.join.checked += r.checked;
+                    self.join.violations += r.violations;
+                    self.join.ambiguous += r.ambiguous;
+                    self.join.ambiguous_violations += r.ambiguous_violations;
+                    self.join.unmapped += r.unmapped;
+                    if r.is_consistent() {
+                        log::debug!(
+                            "symsan: entry {corpus_id} join ok: {}/{} directions checked \
+                             against {} fuzzer edges, {} unmapped, {} ambiguous",
+                            r.checked,
+                            r.executed,
+                            covered.len(),
+                            r.unmapped,
+                            r.ambiguous
+                        );
+                    } else {
+                        // Loud, because this is not a missed opportunity: the
+                        // map is pointing at edges the fuzzer never took, so
+                        // every branch it resolves is being judged against
+                        // somebody else's coverage.
+                        log::error!(
+                            "symsan: entry {corpus_id} contradicts the branch map: \
+                             {} of {} checked directions map to an edge the fuzzer's \
+                             build did not record ({} of {} ambiguous ones too). \
+                             The two builds disagree about branch identity, or they \
+                             took different paths on the same input.",
+                            r.violations,
+                            r.checked,
+                            r.ambiguous_violations,
+                            r.ambiguous
+                        );
+                    }
+                }
+                Err(e) => {
+                    if !self.validate_warned {
+                        log::warn!("symsan: cannot audit the branch map: {e}");
+                        self.validate_warned = true;
+                    }
+                }
+            }
+        }
+
         if tasks == 0 {
             return Ok(());
         }

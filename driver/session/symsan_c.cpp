@@ -328,6 +328,7 @@ void symsan_config_init(symsan_config_t *cfg) {
   cfg->save_solved = def.save_solved;
   cfg->debug = def.debug;
   cfg->forkserver = def.forkserver;
+  cfg->validate_coverage = def.validate_coverage;
   cfg->timeout_ms = def.timeout_ms;
   cfg->max_ast_size = def.max_ast_size;
   cfg->max_local_branch_counter = def.max_local_branch_counter;
@@ -362,6 +363,7 @@ symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
     cfg->forkserver = c.forkserver;
     const char *bmap = getenv("SYMSAN_BRANCH_MAP");
     if (bmap) cfg->branch_map = bmap;
+    cfg->validate_coverage = c.validate_coverage;
     return SYMSAN_OK;
   });
 }
@@ -419,6 +421,7 @@ symsan_status_t symsan_session_init(symsan_session_t *s,
     c.debug = cfg->debug != 0;
     c.forkserver = cfg->forkserver != 0;
     if (cfg->branch_map) c.branch_map = cfg->branch_map;
+    c.validate_coverage = cfg->validate_coverage != 0;
     c.timeout_ms = cfg->timeout_ms;
     if (cfg->max_ast_size) c.max_ast_size = cfg->max_ast_size;
     if (cfg->max_local_branch_counter) {
@@ -496,6 +499,35 @@ symsan_status_t symsan_session_set_coverage(symsan_session_t *s,
       set_error("symsan_session_set_coverage: session has no branch map");
       return SYMSAN_ERR_INVALID;
     }
+    return SYMSAN_OK;
+  });
+}
+
+symsan_status_t symsan_session_check_coverage(const symsan_session_t *s,
+                                              const uint32_t *covered,
+                                              size_t n,
+                                              symsan_join_report_t *out) {
+  if (!s || !out || (!covered && n)) {
+    set_error("symsan_session_check_coverage: session/out required");
+    return SYMSAN_ERR_INVALID;
+  }
+  if (!s->initialized) {
+    set_error("symsan_session_check_coverage: session not initialized");
+    return SYMSAN_ERR_NOT_READY;
+  }
+  return guard(SYMSAN_ERR_FAILED, [&] {
+    rgd::JoinReport r;
+    if (s->session.check_coverage(covered, n, &r) != 0) {
+      set_error("symsan_session_check_coverage: needs a branch map and "
+                "validate_coverage");
+      return SYMSAN_ERR_INVALID;
+    }
+    out->executed = r.executed;
+    out->checked = r.checked;
+    out->violations = r.violations;
+    out->ambiguous = r.ambiguous;
+    out->ambiguous_violations = r.ambiguous_violations;
+    out->unmapped = r.unmapped;
     return SYMSAN_OK;
   });
 }

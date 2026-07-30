@@ -37,6 +37,23 @@ target_link_libraries(AFLTest PRIVATE
 )
 install (TARGETS AFLTest DESTINATION ${SYMSAN_BIN_DIR})
 
+## offline check that the branch map joins SymSan branches to the *right* AFL++
+## edges, against an afl-showmap run as ground truth
+add_executable(CovCheck covcheck.cpp)
+set_target_properties(CovCheck PROPERTIES OUTPUT_NAME "covcheck" CXX_STANDARD 17)
+target_include_directories(CovCheck PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+)
+target_link_libraries(CovCheck PRIVATE
+  launcher
+  symsan-session
+  rgd-parser
+  rgd-solver
+  ${Z3_LIBRARY}
+  rt
+)
+install (TARGETS CovCheck DESTINATION ${SYMSAN_BIN_DIR})
+
 ## standalone SMT-LIB2 front-end for the RGD jigsaw solver (bridges smtlib2 ->
 ## rgd::SearchTask directly, no target execution / launcher / parser needed)
 add_executable(SMTTest smttest.cpp)

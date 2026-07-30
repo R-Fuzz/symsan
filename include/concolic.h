@@ -77,6 +77,11 @@ struct ConcolicConfig {
   /// fuzzer has already covered; see include/branch_map.h.  Empty means "no
   /// map", and the session then only knows what it has seen itself.
   std::string branch_map;
+  /// Record which branch directions each trace takes, so that check_coverage()
+  /// can hold the branch map against ground truth (SYMSAN_VALIDATE_COV).  Off
+  /// by default: it costs a hash insert per branch and is a diagnostic, not
+  /// something a fuzzing run needs.
+  bool validate_coverage = false; // SYMSAN_VALIDATE_COV
   /// per-run timeout in milliseconds; also arms the deadloop guard
   unsigned timeout_ms = 50;       // MIN_TIMEOUT in driver/aflpp/symsan.cpp
 
@@ -161,6 +166,18 @@ public:
   /// before trace(); passing nullptr forgets the previous snapshot.
   /// @return 0 on success, -1 if no branch map is in use
   int set_coverage(const uint8_t *map, size_t len);
+
+  /// Check the branch map against ground truth for the input just traced.
+  ///
+  /// @p covered is the set of AFL++ edge ids the *fuzzer's* build of the same
+  /// target recorded for the same bytes -- from a corpus entry's tracked
+  /// indices, or from afl-showmap.  Every direction this trace took should map
+  /// to an edge in there; anything else means the map names the wrong edge, or
+  /// the two builds took different paths.
+  ///
+  /// Needs both a branch map and ConcolicConfig::validate_coverage.
+  /// @return 0 on success, -1 otherwise
+  int check_coverage(const uint32_t *covered, size_t n, JoinReport *out) const;
 
   const ConcolicStats &stats() const { return stats_; }
   /// Write the counters and each solver's own stats to @p fd.

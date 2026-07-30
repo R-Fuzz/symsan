@@ -90,6 +90,14 @@
 #include <utility>
 #include <vector>
 
+// for the SYMSAN_DOCUMENT_IDS dump, which several TUs of a parallel build
+// append to at once
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 using namespace llvm;
 
 // This must be consistent with ShadowWidthBits.
@@ -520,6 +528,18 @@ class Taint {
   uint32_t getInstructionId(Instruction *Inst);
   const uint32_t InvalidInstructionId = -1;
 
+  /// Record that @p Inst was instrumented with branch id @p cid, for
+  /// SYMSAN_DOCUMENT_IDS.  @p Kind is "br", "select" or "switch"; see
+  /// documentBranchId() for why the caller has to say.
+  void documentBranchId(uint32_t cid, Instruction *Inst, const char *Kind);
+  void flushDocumentedIds();
+  /// Value of SYMSAN_DOCUMENT_IDS, or empty when the dump is off.
+  std::string DocumentIdsPath;
+  /// Lines accumulated by documentBranchId(), written out once per module so
+  /// that a parallel build takes the file lock once per TU rather than once
+  /// per branch.
+  std::vector<std::string> DocumentedIds;
+
   void initializeRuntimeFunctions(Module &M);
   void initializeCallbackFunctions(Module &M);
   bool initializeModule(Module &M);
@@ -902,6 +922,76 @@ uint32_t Taint::getInstructionId(Instruction *Inst) {
   return djbHash(SourceInfo);
 }
 
+// The counterpart of AFL++'s AFL_LLVM_DOCUMENT_IDS.  That one says which source
+// location each *edge id* came from; this one says which source location each
+// *branch id* came from.  Diffing the two tables answers "do the two builds
+// name the same branch the same way?" without running anything, and separates
+// the two ways the join can be thin: a location both sides emit but with
+// different columns means the two clangs disagree and the join is dead, while a
+// location only this side emits is AFL++ having pruned the block, which is
+// expected and merely costs opportunities.
+//
+// The line deliberately echoes AFL++'s: same ModuleID=/Function= lead-in, and
+// src= last because a path may contain spaces and colons, so it is parsed from
+// the right.
+//
+// Kind is passed in rather than sniffed from Inst because the interesting
+// distinction is not the LLVM opcode.  A select has no edge on the AFL++ side
+// at all, and a switch has one cid shared by every case, so neither can ever
+// join -- saying so here keeps them from being read as evidence of a broken
+// build.
+void Taint::documentBranchId(uint32_t cid, Instruction *Inst,
+                             const char *Kind) {
+  if (DocumentIdsPath.empty())
+    return;
+
+  std::string Line = "ModuleID=" + Mod->getSourceFileName();
+  if (const Function *F = Inst->getFunction())
+    Line += " Function=" + F->getName().str();
+  Line += " cid=" + std::to_string(cid);
+  Line += " kind=";
+  Line += Kind;
+  // No debug location means the id came from the "unamed:" counter, which is
+  // per-module state and not a key anything else can compute.  Emit the line
+  // anyway: a build accidentally missing -g shows up as every line lacking a
+  // src=, which is a much clearer diagnosis than an empty intersection.
+  if (const DILocation *Loc = Inst->getDebugLoc()) {
+    Line += " src=" + Loc->getFilename().str() + ":" +
+            std::to_string(Loc->getLine()) + ":" +
+            std::to_string(Loc->getColumn());
+  }
+  DocumentedIds.push_back(std::move(Line));
+}
+
+void Taint::flushDocumentedIds() {
+  if (DocumentIdsPath.empty() || DocumentedIds.empty())
+    return;
+
+  std::string Buf;
+  for (const auto &Line : DocumentedIds) {
+    Buf += Line;
+    Buf += '\n';
+  }
+  DocumentedIds.clear();
+
+  // Every TU of a parallel build appends to the same file, so take the lock
+  // rather than trusting one write() to be indivisible.  A failure here is
+  // reported and otherwise ignored: this is a diagnostic, and refusing to
+  // compile because it could not be written would be the wrong trade.
+  int Fd = open(DocumentIdsPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+  if (Fd < 0) {
+    errs() << "SymSan: cannot open SYMSAN_DOCUMENT_IDS file "
+           << DocumentIdsPath << ": " << strerror(errno) << "\n";
+    return;
+  }
+  if (flock(Fd, LOCK_EX) == 0) {
+    if (write(Fd, Buf.data(), Buf.size()) != (ssize_t)Buf.size())
+      errs() << "SymSan: short write to " << DocumentIdsPath << "\n";
+    flock(Fd, LOCK_UN);
+  }
+  close(Fd);
+}
+
 void Taint::addContextRecording(Function &F) {
   // Most code from Angora
   BasicBlock *BB = &F.getEntryBlock();
@@ -977,6 +1067,11 @@ bool Taint::initializeModule(Module &M) {
 
   Mod = &M;
   Ctx = &M.getContext();
+  // An environment variable rather than a -mllvm flag, to match how AFL++
+  // spells the same thing and so that a whole build can be documented by
+  // exporting one variable.
+  if (const char *P = getenv("SYMSAN_DOCUMENT_IDS"))
+    DocumentIdsPath = P;
   Int8Ty = IntegerType::get(*Ctx, 8);
   Int16Ty = IntegerType::get(*Ctx, 16);
   Int32Ty = IntegerType::get(*Ctx, 32);
@@ -1748,6 +1843,8 @@ bool Taint::runImpl(Module &M) {
     if (ClTraceBound && ClHoistBoundsChecks)
       TF.hoistBoundsChecks();
   }
+
+  flushDocumentedIds();
 
   return Changed || !FnsToInstrument.empty() ||
          M.global_size() != InitialGlobalSize || M.size() != InitialModuleSize;
@@ -3553,6 +3650,7 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   uint32_t cid = TT.getInstructionId(I);
   if (cid == TT.InvalidInstructionId)
     return;
+  TT.documentBranchId(cid, I, "switch");
   unsigned size = DL.getTypeSizeInBits(Cond->getType());
   ConstantInt *Size = ConstantInt::get(TT.Int32Ty, size);
   ConstantInt *Predicate = ConstantInt::get(TT.Int32Ty, 32); // EQ, ==
@@ -4843,6 +4941,7 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   uint32_t cid = TT.getInstructionId(I);
   if (cid == TT.InvalidInstructionId)
     return; // XXX: forget about loop?
+  TT.documentBranchId(cid, I, isa<BranchInst>(I) ? "br" : "select");
   ConstantInt *LF = ConstantInt::get(TT.Int8Ty, flag);
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, cid);
   IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, LF, CID});

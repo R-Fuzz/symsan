@@ -106,6 +106,14 @@ struct Opt {
     #[arg(long = "branch-map")]
     branch_map: Option<PathBuf>,
 
+    /// Audit the branch map instead of trusting it: on every traced entry,
+    /// check that the edges the map claims for the branches SymSan executed are
+    /// edges the fuzzer's own build actually recorded. A wrong map otherwise
+    /// fails silently -- the stage just stops solving. Slow; a setup check for
+    /// a new target, not something to leave on.
+    #[arg(long = "validate-branch-map", default_value = "false")]
+    validate_branch_map: bool,
+
     /// Exec the SymSan target once per trace instead of forking it from a
     /// long-lived server. Slower, but the way out if the target keeps state
     /// across `main()` that a fork would wrongly share.
@@ -257,8 +265,17 @@ pub fn main() -> Result<(), libafl::Error> {
                 // rather than leave the coupling implicit.
                 builder = builder
                     .branch_map(map)
-                    .coverage_map_name(edges_observer_name);
+                    .coverage_map_name(edges_observer_name)
+                    .validate_coverage(opt.validate_branch_map);
                 println!("symsan: sharing coverage via {}", map.display());
+                if opt.validate_branch_map {
+                    // The observer tracks indices (see `.track_indices()`
+                    // above), so every corpus entry already carries the edge
+                    // set the audit needs -- nothing is re-executed for it.
+                    println!("symsan: auditing the branch map (RUST_LOG=error to see verdicts)");
+                }
+            } else if opt.validate_branch_map {
+                println!("symsan: --validate-branch-map ignored without --branch-map");
             }
             let symsan = builder.build()?;
             println!("symsan: tracing with {}", bin.display());

@@ -2,5 +2,8 @@ config.build_dir = "@CMAKE_BINARY_DIR@"
 config.source_dir = "@CMAKE_SOURCE_DIR@"
 config.install_dir = "@CMAKE_INSTALL_PREFIX@"
 config.llvm_bin_dir = "@LLVM_TOOLS_BINARY_DIR@"
+# Empty unless the tree was configured with -DAFLPP_PATH; the tests that need
+# the fuzzer's own toolchain check for it and are skipped otherwise.
+config.aflpp_path = "@AFLPP_PATH@"
 
 lit_config.load_config(config, "@CMAKE_SOURCE_DIR@/tests/lit.cfg")
