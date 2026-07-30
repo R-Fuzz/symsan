@@ -6,7 +6,7 @@
 // freely -- producing an input that does not actually satisfy the branch.  Each
 // branch below casts a tainted double to a 64-bit integer and compares to a
 // concrete value; the all-zero seed misses both, so a single concolic run flips
-// each and emits one input per branch (see tests/switch.c for the pattern).
+// each and emits one input per branch (see tests/symsan/switch.c for the pattern).
 //
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out

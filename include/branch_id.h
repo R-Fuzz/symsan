@@ -24,7 +24,7 @@ namespace symsan {
 /// Daniel J. Bernstein's string hash -- byte for byte what llvm::djbHash()
 /// does.  Reimplemented rather than #include'd from "llvm/Support/DJB.h" so
 /// that the driver can compute a branch id without linking LLVM's support
-/// library; tests/branch_id.cpp pins the two together.
+/// library; tests/symsan/branch_id.cpp pins the two together.
 inline uint32_t djb_hash(const char *s, size_t n) {
   uint32_t h = 5381;
   for (size_t i = 0; i < n; ++i)

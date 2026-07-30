@@ -18,7 +18,7 @@
 // exercise the in-process z3 path, which has no jigsaw/i2s chain.
 //
 // The checks are independent (not nested behind an early bail), so one concolic
-// run emits one input per check (see tests/switch.c).
+// run emits one input per check (see tests/symsan/switch.c).
 //
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out

@@ -11,7 +11,7 @@
 //
 // Because only i2s (in the out-of-process RGD chain) can invert transcendentals,
 // this test uses ONLY the %afltest RUN lines.  It deliberately omits the
-// %fgtest / KO_USE_Z3 lines that tests/fp_arith_i2s.c keeps: those exercise the
+// %fgtest / KO_USE_Z3 lines that tests/symsan/fp_arith_i2s.c keeps: those exercise the
 // in-process z3 path, which has no i2s and therefore cannot solve these guards.
 //
 // NOTE on pow exponents/bases: LLVM's simplify-libcalls (optimizePow) rewrites
@@ -21,7 +21,7 @@
 // base-constant case, both of which keep the pow libcall (and thus the fp_pow op).
 //
 // The checks are independent (not nested behind an early bail), so one concolic
-// run emits one input per check (see tests/switch.c).
+// run emits one input per check (see tests/symsan/switch.c).
 //
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out

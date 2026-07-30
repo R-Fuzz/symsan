@@ -68,8 +68,14 @@ adapted by [@insuyun](https://github.com/insuyun) to lit):
 ```
 $ pip install lit
 $ cd your_build_dir
-$ lit tests
+$ lit tests/symsan
 ```
+
+`tests/symsan` is symbolic execution and solving, and depends on nothing outside
+this tree; it is what CI runs. `tests/fuzzing` checks the integration with a
+real fuzzer and needs that fuzzer's toolchain built, so those tests announce
+what they need with `REQUIRES:` and are skipped where it is absent — configure
+with `-DAFLPP_PATH=<path to a built AFL++>` and run `lit tests` to include them.
 
 ### Environment Options
 

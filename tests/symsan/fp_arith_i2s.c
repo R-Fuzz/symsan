@@ -10,7 +10,7 @@
 // Covers FAdd/FMul (float) and FSub/FDiv (double), including a constant on the
 // left of a non-commutative op (`10.0 - x`).  The checks are independent (not
 // nested behind an early bail), so one concolic run emits one input per check
-// (see tests/switch.c).
+// (see tests/symsan/switch.c).
 //
 // The %afltest lines exercise the out-of-process RGD path with i2s only (no
 // SYMSAN_USE_Z3), demonstrating that i2s alone solves each branch; the %fgtest /

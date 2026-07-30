@@ -3,7 +3,7 @@
 // This is a *host* test: it links neither the runtime nor LLVM, it just checks
 // arithmetic, so it is compiled with a plain clang++ rather than %ko-clangxx.
 //
-// RUN: clang++ -std=c++17 -Wall -Werror -I%S/../include %s -o %t
+// RUN: clang++ -std=c++17 -Wall -Werror -I%S/../../include %s -o %t
 // RUN: %t
 
 #include "branch_id.h"

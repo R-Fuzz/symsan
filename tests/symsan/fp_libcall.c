@@ -5,7 +5,7 @@
 // clang keeps these as real calls (isnan/isinf/finite are lowered inline and
 // are already covered by the FCmp path).  Reads tainted bytes into three
 // doubles; the all-zero seed misses every branch, so a single concolic run
-// flips each and emits one input per branch -- see tests/switch.c for the same
+// flips each and emits one input per branch -- see tests/symsan/switch.c for the same
 // multi-output pattern.
 //
 // RUN: rm -rf %t.out

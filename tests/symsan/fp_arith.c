@@ -4,7 +4,7 @@
 // (FPToSI), the sqrt libcall (custom wrapper), and the fabs intrinsic, each
 // guarding a hard-to-reach branch.  The seed (x = 1.0) misses all four, so a
 // single concolic run flips each and emits one input per branch -- see
-// tests/switch.c for the same multi-output pattern.
+// tests/symsan/switch.c for the same multi-output pattern.
 //
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out

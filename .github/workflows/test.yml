@@ -62,6 +62,11 @@ jobs:
     - name: install lit
       run: pip install lit
 
+    # tests/symsan only.  tests/fuzzing needs a *built* AFL++ (the checkout
+    # above is for driver/aflpp's headers, and afl-clang-lto is a build
+    # product), so those tests would report UNSUPPORTED here anyway -- naming
+    # the suite says that on purpose instead of by accident, and keeps the merge
+    # gate free of any toolchain this workflow does not build itself.
     - name: test
-      run: lit --verbose tests
+      run: lit --verbose tests/symsan
       working-directory: ${{ github.workspace }}/build

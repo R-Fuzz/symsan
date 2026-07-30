@@ -10,7 +10,7 @@
 // (x = lo) already lands inside the range (lo <= hi), so a single concolic run
 // solves each range -- no arithmetic reasoning / z3 required.  The three checks
 // are independent (not nested behind an early bail), so one run emits one input
-// per check (see tests/switch.c for the multi-output pattern).
+// per check (see tests/symsan/switch.c for the multi-output pattern).
 //
 // The %afltest lines exercise the out-of-process RGD path with i2s only (no
 // SYMSAN_USE_Z3), demonstrating that i2s alone solves the challenge; the

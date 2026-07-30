@@ -199,7 +199,7 @@ edges the fuzzer's build recorded for the same bytes:
 <symsan>/b4/bin/covcheck -m branch.map -c showmap.out -i input -- ./target.symsan @@
 ```
 
-It exits non-zero on a contradiction. `tests/branch_map_join.c` in the SymSan
+It exits non-zero on a contradiction. `tests/fuzzing/branch_map_join.c` in the SymSan
 tree is this run as a lit test, including the negative half — the same run with
 a deliberately wrong map has to come out `INCONSISTENT`, or a vacuous check
 would look identical to a passing one.

@@ -2,7 +2,7 @@
 // value to the offset the operand ACTUALLY reads, not to an unrelated input that
 // merely holds a coincidentally-equal value.
 //
-// This is the integer analogue of tests/fp_i2s_offset.c.  Each guard pairs a
+// This is the integer analogue of tests/symsan/fp_i2s_offset.c.  Each guard pairs a
 // single-arith-op operand (`X op C`) with a plain-Read operand.  On the all-zero
 // seed every symbolic byte is 0, so the arith operand's raw input bytes (0) equal
 // the OTHER (plain-Read) operand's value (0).  solve_icmp's direct-match branch
@@ -24,7 +24,7 @@
 // SYMSAN_USE_JIGSAW / SYMSAN_USE_Z3, no in-process z3 %fgtest lines).
 //
 // The checks are independent (not nested behind an early bail), so one concolic
-// run emits one input per check (see tests/switch.c).
+// run emits one input per check (see tests/symsan/switch.c).
 //
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out

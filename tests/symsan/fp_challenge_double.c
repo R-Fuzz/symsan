@@ -2,7 +2,7 @@
 // "test-double.c" challenge: land four float64 values (read from tainted bytes)
 // inside very tight ranges / on an exact constant that random mutation can't hit.
 //
-// Like the float32 challenge (tests/fp_challenge_float.c), these guards are
+// Like the float32 challenge (tests/symsan/fp_challenge_float.c), these guards are
 // DIRECT comparisons of an input-derived double against a constant, so the
 // *input-to-state* (i2s) solver flips them by copying the constant's IEEE-754
 // bytes into the input -- no FP arithmetic reasoning / z3 required.  The last
@@ -10,7 +10,7 @@
 // pi's exact bit pattern; the AFL original notes "no fuzzer can solve double
 // arithmetic", so the exact-equality form is the hardest case still i2s-solvable.
 // The four checks are independent (not nested behind an early bail), so one
-// concolic run emits one input per check (see tests/switch.c).
+// concolic run emits one input per check (see tests/symsan/switch.c).
 //
 // The %afltest lines exercise the out-of-process RGD path with i2s only (no
 // SYMSAN_USE_Z3), demonstrating that i2s alone solves the challenge; the
