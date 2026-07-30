@@ -817,9 +817,9 @@ impl Session {
     /// non-zero [`JoinReport::violations`] means the map names the wrong edge,
     /// or the two builds took different paths.
     ///
-    /// The converse says nothing and is not reported: the fuzzer records
-    /// concrete branches, switch cases and plain blocks, none of which reach a
-    /// concolic trace.
+    /// The converse says nothing and is not reported: the fuzzer records every
+    /// edge it walks, and the ones whose condition did not depend on the input
+    /// never reach a concolic trace.
     ///
     /// Needs both [`Config::branch_map`] and [`Config::validate_coverage`];
     /// returns [`Error::Invalid`] otherwise.

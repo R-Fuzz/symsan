@@ -52,4 +52,29 @@ inline uint32_t branch_cid(const std::string &file, unsigned line,
   return djb_hash(key);
 }
 
+/// The identity of one case of a switch: the switch's own id, continued over
+/// the case value.
+///
+/// A case has no source location either side can name it by.  SymSan's
+/// instrumentation only ever holds the SwitchInst, whose debug location belongs
+/// to the switch as a whole, and AFL++ only holds the case's destination block,
+/// whose location is the case *body* rather than the label.  What both do have
+/// is the switch's location and the case's constant value, so that pair is the
+/// key.
+///
+/// @p case_value is the value zero-extended (or truncated) to 64 bits, which is
+/// what TaintFunction::visitSwitchInst already passes to the runtime; the AFL++
+/// side has to normalise the same way or the two hashes will not meet.
+///
+/// Spelled with the bytes taken out one at a time rather than by hashing the
+/// object representation, so that the id does not depend on the host's byte
+/// order -- and with no std::string, so that the taint runtime can compute it
+/// too.
+inline uint32_t switch_case_cid(uint32_t switch_cid, uint64_t case_value) {
+  uint32_t h = switch_cid;
+  for (unsigned i = 0; i < 8; ++i)
+    h = (h << 5) + h + (unsigned char)((case_value >> (i * 8)) & 0xff);
+  return h;
+}
+
 } // namespace symsan

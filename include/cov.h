@@ -152,8 +152,8 @@ public:
   /// The invariant is one-directional.  Every direction we took must map to an
   /// edge the fuzzer also recorded, so a violation is real: either the map
   /// points at the wrong edge, or the two builds diverged on this input.  The
-  /// converse says nothing -- the fuzzer records concrete branches, switch
-  /// cases and plain blocks, none of which reach us.
+  /// converse says nothing -- the fuzzer records every edge it walks, and the
+  /// ones whose condition did not depend on the input never reach us.
   ///
   /// Inlining costs precision: one source branch becomes N edge ids and a run
   /// takes one of them, so those can only be checked as "at least one covered"

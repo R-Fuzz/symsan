@@ -529,9 +529,11 @@ class Taint {
   const uint32_t InvalidInstructionId = -1;
 
   /// Record that @p Inst was instrumented with branch id @p cid, for
-  /// SYMSAN_DOCUMENT_IDS.  @p Kind is "br", "select" or "switch"; see
-  /// documentBranchId() for why the caller has to say.
-  void documentBranchId(uint32_t cid, Instruction *Inst, const char *Kind);
+  /// SYMSAN_DOCUMENT_IDS.  @p Kind is "br", "select", "switch" or
+  /// "switch-case"; see documentBranchId() for why the caller has to say, and
+  /// for what @p Extra is.
+  void documentBranchId(uint32_t cid, Instruction *Inst, const char *Kind,
+                        const std::string &Extra = std::string());
   void flushDocumentedIds();
   /// Value of SYMSAN_DOCUMENT_IDS, or empty when the dump is off.
   std::string DocumentIdsPath;
@@ -936,12 +938,18 @@ uint32_t Taint::getInstructionId(Instruction *Inst) {
 // the right.
 //
 // Kind is passed in rather than sniffed from Inst because the interesting
-// distinction is not the LLVM opcode.  A select has no edge on the AFL++ side
-// at all, and a switch has one cid shared by every case, so neither can ever
-// join -- saying so here keeps them from being read as evidence of a broken
-// build.
+// distinction is not the LLVM opcode but whether the line can join at all.  A
+// "switch" line never can -- the switch as a whole is not an edge on the AFL++
+// side, only its individual cases are, and those come out as "switch-case"
+// lines with their own cid.  A "select" line cannot join either, though only
+// for want of a patch: AFL++ does allocate two edge ids per scalar select, it
+// just never writes them to its ids file.  Saying which is which here keeps a
+// line with no counterpart from being read as evidence of a broken build.
+//
+// Extra is anything belonging between kind= and src=; a switch case uses it to
+// carry the case value that, with the switch's location, makes up its id.
 void Taint::documentBranchId(uint32_t cid, Instruction *Inst,
-                             const char *Kind) {
+                             const char *Kind, const std::string &Extra) {
   if (DocumentIdsPath.empty())
     return;
 
@@ -951,6 +959,8 @@ void Taint::documentBranchId(uint32_t cid, Instruction *Inst,
   Line += " cid=" + std::to_string(cid);
   Line += " kind=";
   Line += Kind;
+  if (!Extra.empty())
+    Line += " " + Extra;
   // No debug location means the id came from the "unamed:" counter, which is
   // per-module state and not a key anything else can compute.  Emit the line
   // anyway: a build accidentally missing -g shows up as every line lacking a
@@ -3660,11 +3670,26 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   for (auto C : I->cases()) {
     Value *CV = C.getCaseValue();
 
+    // Each case gets its own id.  They all used to share the switch's cid,
+    // which left (cid, direction) unable to say *which* case, and so left every
+    // case unjoinable with the fuzzer's per-case-block edge ids.  The case
+    // value is taken zero-extended to 64 bits because that is the form the
+    // CreateZExtOrTrunc below hands the runtime, and the form AFL++'s ids file
+    // has to agree on; see symsan::switch_case_cid in include/branch_id.h.
+    uint64_t CaseValue =
+        C.getCaseValue()->getValue().zextOrTrunc(64).getZExtValue();
+    uint32_t case_cid = symsan::switch_case_cid(cid, CaseValue);
+    TT.documentBranchId(case_cid, I, "switch-case",
+                        "case=" + std::to_string(CaseValue));
+    ConstantInt *CaseCID = ConstantInt::get(TT.Int32Ty, case_cid);
+
     Cond = IRB.CreateZExtOrTrunc(Cond, TT.Int64Ty);
     CV = IRB.CreateZExtOrTrunc(CV, TT.Int64Ty);
     IRB.CreateCall(TT.TaintTraceCmpFn, {CondShadow, TT.ZeroPrimitiveShadow,
-                   Size, Predicate, Cond, CV, CID});
+                   Size, Predicate, Cond, CV, CaseCID});
   }
+  // The switch's own cid, not any case's: the runtime uses it to tell that the
+  // case it has stashed belongs to this switch.
   IRB.CreateCall(TT.TaintTraceSwitchEndFn, {CID});
 }
 

@@ -148,8 +148,14 @@ partial, all of them expected:
 - **AFL++ prunes blocks** that dominate all their successors, so those branch
   directions have no edge id at all. There is no way to turn this off through
   `ld.lld`; see `patches/README.md`.
-- **`switch` is not covered.** SymSan gives every case of a switch the same
-  branch id, so a (id, direction) pair cannot name a case block.
+- **A switch case joins in one direction only.** Each case has its own id on
+  both sides (the switch's location plus the case value), but only "take this
+  case" is an edge; "go anywhere but this case" is not, and stays unmapped. The
+  `default:` destination is never mapped either. That is the direction worth
+  having: the stage asks whether the branch it did *not* take is worth solving,
+  which for a case it skipped is "would taking it be interesting?".
+- **`select` is not covered.** AFL++ allocates edge ids for both arms but does
+  not export them, so the map has nothing to join against.
 - **The two clangs must agree on column numbers**, which in practice means the
   same major version. They currently both use LLVM 18.
 
@@ -186,9 +192,10 @@ Both files are appended to, so delete them before a rebuild. Comparing the
 `src=` columns of the two answers the question no ratio can: a location both
 sides emit but with *different* columns means the two clangs disagree and the
 join is dead, while a location only SymSan emits is AFL++ having pruned the
-block, which is expected. `kind=switch` and `kind=select` lines can never join
-— see the limits above — so they are labelled rather than left to look like
-breakage.
+block, which is expected. A `kind=switch` line never joins — only its cases
+are edges, and those come out as `kind=switch-case` lines carrying their case
+value — and neither does `kind=select`; see the limits above. They are labelled
+rather than left to look like breakage.
 
 **2. Check one input against `afl-showmap`.** `b4/bin/covcheck` traces an input
 through the SymSan build and checks every branch direction it took against the
@@ -202,7 +209,8 @@ edges the fuzzer's build recorded for the same bytes:
 It exits non-zero on a contradiction. `tests/fuzzing/branch_map_join.c` in the SymSan
 tree is this run as a lit test, including the negative half — the same run with
 a deliberately wrong map has to come out `INCONSISTENT`, or a vacuous check
-would look identical to a passing one.
+would look identical to a passing one. `tests/fuzzing/branch_map_switch.c` is the same
+for switch cases, corrupting only the lines that carry a `case=`.
 
 **3. Audit every entry during a real run.** `--validate-branch-map` (or
 `SymSanStageBuilder::validate_coverage`) does the same comparison on each traced
@@ -222,8 +230,9 @@ on.
 
 All three only ever report one direction of disagreement: every branch SymSan
 executed must map to an edge the fuzzer recorded. The converse means nothing —
-the fuzzer records concrete branches, switch cases and plain blocks, none of
-which a concolic trace ever hears about.
+the fuzzer records every edge it walks, including concrete branches and plain
+blocks, and a concolic trace only ever hears about the ones whose condition
+depended on the input.
 
 ## The fork server
 

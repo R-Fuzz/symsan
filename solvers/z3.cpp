@@ -3,6 +3,7 @@
 #include "sanitizer_common/sanitizer_posix.h"
 #include "dfsan/dfsan.h"
 
+#include "branch_id.h"
 #include "parse-z3.h"
 
 #include <z3++.h>
@@ -127,6 +128,10 @@ static inline bool __solve_task(uint64_t task_id) {
 static struct switch_true_case {
   dfsan_label label;
   uint32_t cid;
+  // the case value that made this the true case; cid names the case rather
+  // than the switch, so this is what ties the stash back to the switch whose
+  // end we will see next.  See include/branch_id.h.
+  uint64_t val;
 } __switch_true_case = {0};
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -159,6 +164,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
     // so the nested constraint will not affect other cases
     __switch_true_case.label = temp;
     __switch_true_case.cid = cid;
+    __switch_true_case.val = c2;
     return;
   }
 
@@ -186,16 +192,22 @@ __taint_trace_switch_end(uint32_t cid) {
   if (__switch_true_case.label == 0) {
     // filtering should have been done before
     return;
-  } else if (__switch_true_case.cid != cid) {
-    AOUT("WARNING: switch end cid mismatch %u vs %u\n",
-         __switch_true_case.cid, cid);
+  }
+
+  // We are given the switch's cid, the stash holds a *case* cid; recomputing
+  // one from the other and the stashed case value checks that the stash is
+  // ours.  See include/branch_id.h.
+  uint32_t case_cid = symsan::switch_case_cid(cid, __switch_true_case.val);
+  if (__switch_true_case.cid != case_cid) {
+    AOUT("WARNING: switch end cid mismatch %u vs %u (switch 0x%x, case %lu)\n",
+         __switch_true_case.cid, case_cid, cid, __switch_true_case.val);
     return;
   }
 
   void *addr = __builtin_return_address(0);
   dfsan_label label = __switch_true_case.label;
 
-  AOUT("solving switch end: %u 0x%x @%p\n", label, cid, addr);
+  AOUT("solving switch end: %u 0x%x @%p\n", label, case_cid, addr);
 
   std::vector<uint64_t> tasks;
   if (__z3_parser->parse_cond(label, 1, 1, tasks)) {

@@ -19,7 +19,7 @@
 namespace {
 
 /// Value of the whitespace-separated " <name>=" field in @p line, or an empty
-/// string if absent.  Every field we want (edgeID, dir) is preceded by
+/// string if absent.  Every field we want (edgeID, dir, case) is preceded by
 /// ModuleID, so the leading space is always there.  Not usable for src=, whose
 /// value deliberately runs to the end of the line.
 std::string field(const std::string &line, const char *name) {
@@ -80,7 +80,18 @@ int BranchMap::load(const std::string &path, size_t map_size) {
       continue;
     }
 
+    // A switch case block carries the switch's src= plus the case value, since
+    // the location alone names the switch rather than the case; see
+    // symsan::switch_case_cid.  Two cases that share a destination block share
+    // an edge id, and AFL++ writes one line per value, so this can add the same
+    // id under two keys -- which is right: either case reaching it is the same
+    // edge.
     uint32_t cid = symsan::branch_cid(file, lineno, col);
+    std::string case_value = field(line, "case");
+    if (!case_value.empty()) {
+      cid = symsan::switch_case_cid(
+          cid, strtoull(case_value.c_str(), nullptr, 10));
+    }
     edges_[key(cid, dir != "0")].push_back((uint32_t)edge_id);
   }
 

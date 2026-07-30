@@ -18,6 +18,8 @@
 
 #include "solver_common.h"
 
+#include "branch_id.h"
+
 static inline void __send_ubi(dfsan_label label, uint64_t result,
                               uint32_t cid, void *addr) {
   if (__pipe_fd < 0)
@@ -42,6 +44,10 @@ static inline void __send_ubi(dfsan_label label, uint64_t result,
 static struct switch_true_case {
   dfsan_label label;
   uint32_t cid;
+  // the case value that made this the true case.  Kept because cid now names
+  // the *case* rather than the switch, so it is the only thing left that ties
+  // the stash back to the switch whose end we are about to see.
+  uint64_t val;
 } __switch_true_case = {0};
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -80,6 +86,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
     // so the nested constraint will not affect other cases
     __switch_true_case.label = temp;
     __switch_true_case.cid = cid;
+    __switch_true_case.val = c2;
   } else {
     // solve without add_nested
     __taint_send_cond(temp, r, 0, 0, cid, addr);
@@ -90,19 +97,26 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_switch_end(uint32_t cid) {
   if (__switch_true_case.label == 0) {
     return;
-  } else if (__switch_true_case.cid != cid) {
-    AOUT("WARNING: switch end cid mismatch %u vs %u\n",
-         __switch_true_case.cid, cid);
+  }
+
+  // The cid handed to __taint_trace_cmp names a case; the one handed to us
+  // names the switch.  Recomputing the former from the latter and the stashed
+  // case value checks both that the stash belongs to this switch and that the
+  // two sides derive case ids the same way -- see include/branch_id.h.
+  uint32_t case_cid = symsan::switch_case_cid(cid, __switch_true_case.val);
+  if (__switch_true_case.cid != case_cid) {
+    AOUT("WARNING: switch end cid mismatch %u vs %u (switch 0x%x, case %lu)\n",
+         __switch_true_case.cid, case_cid, cid, __switch_true_case.val);
     return;
   }
 
   void *addr = __builtin_return_address(0);
 
   AOUT("solving switch end: %u 0x%x @%p\n",
-       __switch_true_case.label, cid, addr);
+       __switch_true_case.label, case_cid, addr);
 
   // solve the true case
-  __taint_send_cond(__switch_true_case.label, 1, 1, 0, cid, addr);
+  __taint_send_cond(__switch_true_case.label, 1, 1, 0, case_cid, addr);
   __switch_true_case.label = 0;
 }
 

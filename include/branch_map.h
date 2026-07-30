@@ -7,15 +7,24 @@
 
       ModuleID=<n> Function=<name> edgeID=<n> dir=<0|1> src=<file>:<line>:<col>
 
+  and, for a switch case block, one line per case value landing there:
+
+      ModuleID=<n> Function=<name> edgeID=<n> dir=1 case=<v> src=<switch loc>
+
   The src/dir fields are present only for edges that come out of a conditional
-  branch, which is exactly the set SymSan also names.  Hashing src with
-  symsan::branch_cid() (include/branch_id.h) gives the same number SymSan's
+  branch or a switch, which is exactly the set SymSan also names.  Hashing src
+  with symsan::branch_cid() (include/branch_id.h) -- then, for a case, mixing in
+  the value with symsan::switch_case_cid() -- gives the same number SymSan's
   instrumentation baked into the binary, so the two toolchains end up talking
   about the same branch without either having to know about the other.
 
   Both directions of the relation are many-to-one: inlining duplicates a source
   branch into N copies, each with its own edge id, so one (cid, direction) maps
   to a *list*.
+
+  A case has only a dir=1 entry.  "Take this case" is a block; "do not take this
+  case" is not one edge but everywhere else the switch could go, so that side
+  stays unmapped and falls back to what this process has seen itself.
 
   (c) 2026 by Chengyu Song <csong@cs.ucr.edu>
   License: Apache 2.0

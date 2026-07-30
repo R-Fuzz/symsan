@@ -1,13 +1,13 @@
 diff --git a/instrumentation/SanitizerCoverageLTO.so.cc b/instrumentation/SanitizerCoverageLTO.so.cc
-index 508c02c7..16d9da31 100644
+index 508c02c7..01851493 100644
 --- a/instrumentation/SanitizerCoverageLTO.so.cc
 +++ b/instrumentation/SanitizerCoverageLTO.so.cc
-@@ -2669,7 +2669,42 @@ void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
+@@ -2668,8 +2668,81 @@ void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
+ 
        unsigned long long int moduleID =
            (((unsigned long long int)(rand() & 0xffffffff)) << 32) | getpid();
-       dFile << "ModuleID=" << moduleID << " Function=" << F.getName().str()
+-      dFile << "ModuleID=" << moduleID << " Function=" << F.getName().str()
 -            << " edgeID=" << afl_global_id << "\n";
-+            << " edgeID=" << afl_global_id;
 +
 +      /* Where this edge comes from, for consumers that have their own name for
 +         the same branch -- a symbolic execution engine, say, which identifies
@@ -19,30 +19,70 @@ index 508c02c7..16d9da31 100644
 +         predecessor: if this block has one predecessor ending in a conditional
 +         br, this block *is* one side of that branch, and which side is decided
 +         by successor order.  Emitted last because a path may contain spaces and
-+         colons; parse it from the right.  Requires -g. */
++         colons; parse it from the right.  Requires -g.
 +
-+      if (const BasicBlock *Pred = BB.getSinglePredecessor()) {
++         A switch is the same idea with a wider key.  The location alone names
++         the switch rather than any one case, so a case block is emitted as the
++         switch's location plus the case value, and always as dir=1: "take this
++         case" is this block, while "do not take it" is everywhere else the
++         switch could go and is not an edge at all.  Edge splitting normally
++         gives each case value a block to itself, so this usually writes one
++         line, but it declines unreachable destinations, and two values sharing
++         a block put the switch in the predecessor list twice -- hence a line
++         per matching value, and the *unique* predecessor rather than the single
++         one, which that duplicate would defeat. */
 +
-+        if (const BranchInst *BI =
-+                dyn_cast<BranchInst>(Pred->getTerminator())) {
++      auto emitLine = [&](const std::string &Suffix) {
 +
-+          if (BI->isConditional()) {
++        dFile << "ModuleID=" << moduleID << " Function=" << F.getName().str()
++              << " edgeID=" << afl_global_id << Suffix << "\n";
 +
-+            if (const DebugLoc &DL = BI->getDebugLoc()) {
++      };
 +
-+              dFile << " dir=" << (BI->getSuccessor(0) == &BB ? 1 : 0)
-+                    << " src=" << DL->getFilename().str() << ":" << DL.getLine()
-+                    << ":" << DL.getCol();
++      auto srcOf = [](const DebugLoc &DL) {
 +
-+            }
++        return " src=" + DL->getFilename().str() + ":" +
++               std::to_string(DL.getLine()) + ":" + std::to_string(DL.getCol());
 +
-+          }
++      };
++
++      const BasicBlock *SinglePred = BB.getSinglePredecessor();
++      const BasicBlock *UniquePred = BB.getUniquePredecessor();
++      const BranchInst *BI =
++          SinglePred ? dyn_cast<BranchInst>(SinglePred->getTerminator())
++                     : nullptr;
++      const SwitchInst *SI =
++          UniquePred ? dyn_cast<SwitchInst>(UniquePred->getTerminator())
++                     : nullptr;
++      bool documented = false;
++
++      if (BI && BI->isConditional() && BI->getDebugLoc()) {
++
++        emitLine(" dir=" + std::to_string(BI->getSuccessor(0) == &BB ? 1 : 0) +
++                 srcOf(BI->getDebugLoc()));
++        documented = true;
++
++      } else if (SI && SI->getDebugLoc()) {
++
++        for (auto C : SI->cases()) {
++
++          if (C.getCaseSuccessor() != &BB) continue;
++          /* Zero-extended to 64 bits because that is the form the consumer's
++             own instrumentation sees; both sides have to normalise alike. */
++          emitLine(" dir=1 case=" +
++                   std::to_string(
++                       C.getCaseValue()->getValue().zextOrTrunc(64).getZExtValue()) +
++                   srcOf(SI->getDebugLoc()));
++          documented = true;
 +
 +        }
 +
 +      }
 +
-+      dFile << "\n";
++      /* Unconditional edges, function entries, the default destination of a
++         switch, and anything built without -g. */
++
++      if (!documented) emitLine("");
  
      }
  
