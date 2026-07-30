@@ -63,7 +63,7 @@ bindings/rust/
 │   └── src/lib.rs        SymSanStage + SymSanStageBuilder
 └── fuzzer/
     ├── build.rs          ditto
-    └── src/main.rs       forkserver_simple + the SymSan stage
+    └── src/main.rs       forkserver_simple + the SymSan stage + a cmplog baseline
 ```
 
 Nothing here is built by `make`; a C++ user needs no Rust toolchain. Configure
@@ -264,6 +264,47 @@ Using the library directly the knobs are `Config::i2s/jigsaw/z3`, or
 Note the defaults differ by entry point: `SymSanStageBuilder` is set up for
 fuzzing (i2s + jigsaw), while `Config` and the C++ `ConcolicConfig` start from
 i2s alone and add to it, which is what the older drivers expect.
+
+## The cmplog baseline (`--cmplog`)
+
+The question SymSan has to answer is not "does it find things" but "does it find
+things the cheap technique does not". The cheap technique is cmplog: log both
+operands of every comparison the target executes, then splice the operand it
+wanted into the input bytes it read. No solver, no constraints — the same idea as
+the i2s rung, reached by observation instead of symbolic execution.
+
+`symsan-fuzz --cmplog <binary>` runs LibAFL's own implementation of it, against a
+third build of the target:
+
+```bash
+AFL_LLVM_CMPLOG=1 afl-clang-fast -o target.cmplog target.c
+
+# the baseline
+symsan-fuzz -i ./seeds -o ./out --cmplog ./target.cmplog -- ./target.afl @@
+# SymSan
+symsan-fuzz -i ./seeds -o ./out --symsan ./target.symsan -- ./target.afl @@
+# both
+symsan-fuzz -i ./seeds -o ./out --symsan ./target.symsan \
+                                --cmplog ./target.cmplog -- ./target.afl @@
+# and with neither flag, the floor: havoc alone
+```
+
+Three LibAFL stages behind the one flag, gated to run once per corpus entry
+(colorization and the trace both cost real executions, and the answer does not
+change the second time round):
+
+1. **`ColorizationStage`** replaces input bytes with random ones that leave the
+   coverage bitmap unchanged. What survives is the bytes the comparisons depend
+   on — the map from "this value" back to "these offsets".
+2. **`AflppCmplogTracingStage`** runs the cmplog build, which writes every
+   comparison's operands into a shared `AflppCmpLogMap`.
+3. **`AflppRedQueen`** puts each logged operand where the colorized bytes say the
+   other one came from.
+
+Two flags, four arms, one binary — which is the point. Comparing against
+`afl-fuzz -c` instead would mean comparing two different fuzzers, and any
+difference could be the scheduler, the mutator or the feedback rather than the
+technique. Here everything outside the stage list is literally the same code.
 
 ## The fork server
 

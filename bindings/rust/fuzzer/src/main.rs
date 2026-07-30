@@ -27,6 +27,21 @@
 //! `@@` means "the input file", as in AFL. It is expanded twice, to two
 //! different paths: the forkserver's own scratch file, and the stage's.
 //!
+//! # The cmplog baseline
+//!
+//! `--cmplog` turns on LibAFL's own cmplog pipeline against a third build:
+//!
+//! ```text
+//! AFL_LLVM_CMPLOG=1 afl-clang-fast -o target.cmplog target.c
+//! symsan-fuzz -i ./seeds -o ./out --cmplog ./target.cmplog -- ./target.afl @@
+//! ```
+//!
+//! It exists so that "what does concolic execution buy?" has an answer measured
+//! against the cheap technique that solves many of the same branches, rather
+//! than against plain havoc. The two flags are independent -- pass either, both,
+//! or neither, which puts all four arms of that comparison in one binary and
+//! rules out the fuzzer itself as a variable between them.
+//!
 //! # Single core
 //!
 //! This example runs one fuzzer in one process, which is also the natural unit
@@ -39,20 +54,29 @@ use std::time::Duration;
 
 use clap::Parser;
 use libafl::{
-    HasMetadata,
+    Error, HasMetadata,
     corpus::{Corpus, InMemoryCorpus, OnDiskCorpus},
     events::SimpleEventManager,
-    executors::{HasObservers, StdChildArgs, forkserver::ForkserverExecutor},
+    executors::{
+        HasObservers, StdChildArgs,
+        forkserver::{ForkserverExecutor, SHM_CMPLOG_ENV_VAR},
+    },
     feedback_and_fast, feedback_or,
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::BytesInput,
     monitors::SimpleMonitor,
-    mutators::{HavocScheduledMutator, Tokens, havoc_mutations, tokens_mutations},
+    mutators::{
+        HavocScheduledMutator, Tokens, havoc_mutations, token_mutations::AflppRedQueen,
+        tokens_mutations,
+    },
     observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
-    stages::mutational::StdMutationalStage,
-    state::{HasCorpus, StdState},
+    stages::{
+        ColorizationStage, IfStage, OptionalStage,
+        mutational::{MultiMutationalStage, StdMutationalStage},
+    },
+    state::{HasCorpus, HasCurrentTestcase, StdState},
 };
 use libafl_bolts::{
     AsSliceMut, StdTargetArgs, Truncate,
@@ -61,6 +85,10 @@ use libafl_bolts::{
     tuples::{Handled, Merge, tuple_list},
 };
 use libafl_symsan::SymSanStage;
+use libafl_targets::{
+    AflppCmpLogMap,
+    cmps::{observers::AflppCmpLogObserver, stages::AflppCmplogTracingStage},
+};
 use nix::sys::signal::Signal;
 
 /// Size of the AFL-style coverage map shared with the forkserver.
@@ -85,6 +113,15 @@ struct Opt {
     /// useful for an A/B against plain havoc fuzzing.
     #[arg(long = "symsan")]
     symsan_bin: Option<PathBuf>,
+
+    /// The cmplog-instrumented build of the target
+    /// (`AFL_LLVM_CMPLOG=1 afl-clang-fast`). Given one, LibAFL's own cmplog
+    /// pipeline runs: colorization, then a trace through this binary, then
+    /// AFL++'s RedQueen. It is independent of `--symsan`; give both, either or
+    /// neither, which is what puts all four arms of the comparison in one
+    /// binary.
+    #[arg(long = "cmplog")]
+    cmplog_bin: Option<PathBuf>,
 
     /// Per-execution timeout for the forkserver, in milliseconds.
     #[arg(short = 't', long = "timeout", default_value = "1200")]
@@ -219,6 +256,10 @@ pub fn main() -> Result<(), libafl::Error> {
     // --- the executor -------------------------------------------------------
 
     let observer_ref = edges_observer.handle();
+    // Built here, before `build()` takes the observer by value: colorization
+    // needs it to tell "this byte changed nothing" from "this byte changed the
+    // path". Cheap to construct and unused unless --cmplog was given.
+    let colorization = ColorizationStage::new(&edges_observer);
     let mut tokens = Tokens::new();
     let mut executor = ForkserverExecutor::builder()
         .program(executable)
@@ -257,15 +298,19 @@ pub fn main() -> Result<(), libafl::Error> {
     let mutator =
         HavocScheduledMutator::with_max_stack_pow(havoc_mutations().merge(tokens_mutations()), 6);
 
-    // The two arms differ only in whether the concolic stage is present, but
-    // they cannot share a variable: `tuple_list!` builds a distinct *type* per
-    // arrangement of stages, and that type is baked in at compile time. This is
-    // how LibAFL avoids dynamic dispatch in the hot loop -- the cost is that
-    // "optional stage" means two code paths, not an `if`.
-    match opt.symsan_bin {
+    // `tuple_list!` builds a distinct *type* per arrangement of stages, and
+    // that type is baked in at compile time -- which is how LibAFL avoids
+    // dynamic dispatch in the hot loop. So "optional stage" cannot be an `if`
+    // around the tuple: two optional stages would be four arms, each with its
+    // own `fuzz_loop` call. `OptionalStage` is LibAFL's answer -- one type
+    // either way, holding `Option<inner tuple>` and doing nothing when it is
+    // `None`, at the cost of one branch per entry, which is nothing next to a
+    // target execution.
+
+    let symsan_stages = match &opt.symsan_bin {
         Some(bin) => {
             let mut builder = SymSanStage::builder()
-                .target(&bin)
+                .target(bin)
                 // The stage does its own `@@` expansion against its own input
                 // file, so it gets the raw arguments rather than the ones the
                 // forkserver builder already rewrote.
@@ -317,19 +362,105 @@ pub fn main() -> Result<(), libafl::Error> {
             } else {
                 println!("symsan: solvers {}", ladder.join(" -> "));
             }
-
-            // SymSan first: trace a newly scheduled entry before havoc starts
-            // rewriting it, so the constraints describe the entry as it was
-            // found interesting.
-            let mut stages = tuple_list!(symsan, StdMutationalStage::new(mutator));
-            fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
+            Some(tuple_list!(symsan))
         }
         None => {
             println!("symsan: disabled (pass --symsan <binary> to enable)");
-            let mut stages = tuple_list!(StdMutationalStage::new(mutator));
-            fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
+            None
         }
-    }
+    };
+
+    // --- the cmplog baseline ------------------------------------------------
+    //
+    // LibAFL's own cmplog pipeline, wired the way its
+    // fuzzers/forkserver/fuzzbench_forkserver_cmplog example wires it, so that
+    // "SymSan versus cmplog" compares SymSan against a cmplog somebody else
+    // tuned rather than against one written to lose:
+    //
+    //   colorization -- replace input bytes with random ones that keep the
+    //                   coverage identical, so what is left is the bytes the
+    //                   comparisons actually depend on;
+    //   tracing      -- run the cmplog build, which logs both operands of every
+    //                   comparison into a shared map;
+    //   RedQueen     -- for each logged pair, put the other operand where the
+    //                   colorized bytes say this one came from.
+    //
+    // It is the same idea as SymSan's i2s rung, reached by observation instead
+    // of by symbolic execution: no solver, no constraint, just "this comparison
+    // wanted that value, and these input bytes reach it".
+    //
+    // The map itself has to be held one scope out: the observer borrows it, so
+    // it has to outlive the stages, and it is declared before them so that it is
+    // dropped after them.
+    let mut cmplog_shmem_holder = None;
+    let cmplog_stages = match &opt.cmplog_bin {
+        Some(bin) => {
+            let cmplog_shmem =
+                cmplog_shmem_holder.insert(shmem_provider.uninit_on_shmem::<AflppCmpLogMap>()?);
+            // SAFETY: still single-threaded, and the map outlives the executor
+            // that is about to be told its id.
+            unsafe {
+                cmplog_shmem.write_to_env(SHM_CMPLOG_ENV_VAR)?;
+            }
+            // SAFETY: the shmem is alive for the rest of main, and only the
+            // observer built from it reads it.
+            let cmpmap = unsafe { AflppCmpLogMap::from_shmem(cmplog_shmem) };
+
+            let cmplog_observer = AflppCmpLogObserver::new("cmplog", cmpmap, true);
+            let cmplog_ref = cmplog_observer.handle();
+
+            let cmplog_executor = ForkserverExecutor::builder()
+                .program(bin)
+                .debug_child(opt.debug_child)
+                .shmem_provider(&mut shmem_provider)
+                .parse_afl_cmdline(target_args.to_vec())
+                .coverage_map_size(MAP_SIZE)
+                // A cmplog run logs every comparison it reaches, so it is
+                // slower than a plain one by a wide margin; the same x10 the
+                // upstream example uses.
+                .timeout(Duration::from_millis(opt.timeout * 10))
+                .kill_signal(opt.signal)
+                .build(tuple_list!(cmplog_observer))?;
+
+            let tracing = AflppCmplogTracingStage::new(cmplog_executor, cmplog_ref);
+            let rq: MultiMutationalStage<_, _, BytesInput, _, _, _> =
+                MultiMutationalStage::new(AflppRedQueen::with_cmplog_options(true, true));
+
+            // Once per entry, not once per scheduling: colorization and the
+            // trace cost real executions, and the answer does not change when
+            // the same entry comes round again. Upstream picks the second
+            // scheduling rather than the first, so an entry has to prove it is
+            // worth coming back to before it earns the trace.
+            let run_once_per_entry =
+                |_fuzzer: &mut _,
+                 _executor: &mut _,
+                 state: &mut StdState<InMemoryCorpus<BytesInput>, _, _, _>,
+                 _mgr: &mut _|
+                 -> Result<bool, Error> {
+                    Ok(state.current_testcase()?.scheduled_count() == 1)
+                };
+
+            println!("cmplog: tracing with {}", bin.display());
+            Some(tuple_list!(IfStage::new(
+                run_once_per_entry,
+                tuple_list!(colorization, tracing, rq)
+            )))
+        }
+        None => {
+            println!("cmplog: disabled (pass --cmplog <binary> to enable)");
+            None
+        }
+    };
+
+    // Order: SymSan first, so a newly scheduled entry is traced before havoc
+    // starts rewriting it and the constraints describe the entry as it was
+    // found interesting. Then cmplog, then havoc.
+    let mut stages = tuple_list!(
+        OptionalStage::new(symsan_stages),
+        OptionalStage::new(cmplog_stages),
+        StdMutationalStage::new(mutator)
+    );
+    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
 
     Ok(())
 }
