@@ -234,6 +234,37 @@ the fuzzer records every edge it walks, including concrete branches and plain
 blocks, and a concolic trace only ever hears about the ones whose condition
 depended on the input.
 
+## The solver ladder
+
+Three solvers, tried in cost order, each one asked only what the cheaper ones
+could not answer — `report_result(false)` is what escalates a task to the next
+rung (see above).
+
+| rung | what it is good at | default in `symsan-fuzz` |
+| --- | --- | --- |
+| **i2s** | input-to-state: an input byte, or a run of them, compared against a constant. Nearly free — it reads the answer off the constraint rather than searching. | on (`--symsan-no-i2s`) |
+| **jigsaw** | JITs the constraint and runs gradient descent on it. Handles arithmetic i2s cannot invert, at maybe tens of microseconds a task. | on (`--symsan-no-jigsaw`) |
+| **z3** | a real SMT solver: decides what the other two only search for, and is the only one that can say *unsat*. Also the only one that can spend seconds on one task. | **off** (`--symsan-z3`) |
+
+Z3 is off by default because a fuzzing loop is a throughput game, and a rung
+that occasionally blocks for seconds costs more exec's than the extra solves
+return. That is a default, not a judgement: turn it on for a target whose checks
+jigsaw's descent cannot climb — and if you do, `--symsan-timeout` is what bounds
+the damage.
+
+Turning a rung off is otherwise a measurement tool: run the same target with
+`--symsan-no-i2s` to see what the rungs behind it were actually contributing,
+since i2s alone cracks most of the branches a real target has. With every rung
+off the stage still traces (and still costs what tracing costs) but can solve
+nothing; it says so at startup rather than looking like a target that resists
+solving.
+
+Using the library directly the knobs are `Config::i2s/jigsaw/z3`, or
+`SYMSAN_NO_I2S`, `SYMSAN_USE_JIGSAW` and `SYMSAN_USE_Z3` in the environment.
+Note the defaults differ by entry point: `SymSanStageBuilder` is set up for
+fuzzing (i2s + jigsaw), while `Config` and the C++ `ConcolicConfig` start from
+i2s alone and add to it, which is what the older drivers expect.
+
 ## The fork server
 
 Tracing an input used to mean a full `execv`: dynamic linking, the shadow and

@@ -84,13 +84,19 @@ const char *symsan_last_error(void);
 /** Opaque RGD context: one rgd::RGDAstParser plus its solver ladder. */
 typedef struct symsan_rgd symsan_rgd_t;
 
-/** Which solvers to put in the ladder, in this order.  i2s is always first and
- *  cannot be disabled -- it is the cheap one, and the others assume it ran. */
+/** Which solvers to put in the ladder, in this order.  i2s comes first -- it is
+ *  the cheap one, and the others assume it ran -- and is on unless you say
+ *  otherwise, which is why its field is the negative one: a zeroed struct, like
+ *  a NULL pointer, means "i2s only". */
 typedef struct {
   int use_jigsaw;     /**< add the JIT/gradient-descent solver */
   int use_z3;         /**< add the Z3 solver as a last resort */
   int solve_nested;   /**< carry nested constraints into each task */
   size_t max_ast_size; /**< skip ASTs larger than this; 0 means the default 200 */
+  /** drop the input-to-state solver, leaving only whichever of the two above
+   *  are set.  Only useful for attributing solves to one solver; a ladder with
+   *  nothing in it solves nothing. */
+  int no_i2s;
 } symsan_rgd_options_t;
 
 /** Result of a solve attempt; mirrors rgd::solver_result_t. */
@@ -209,7 +215,7 @@ typedef struct {
   /** non-zero if the target reads its input from stdin rather than input_file */
   int use_stdin;
 
-  /* solver ladder; i2s is always enabled */
+  /* solver ladder, run in this order; see also use_i2s at the end */
   int use_jigsaw;
   int use_z3;
   int nested_solving;
@@ -251,6 +257,12 @@ typedef struct {
    *  (New fields go at the end, so that a caller built against an older header
    *  keeps a valid prefix.) */
   int validate_coverage;
+
+  /** Run the input-to-state solver, the first rung of the ladder.  Default 1,
+   *  like exit_on_memerror -- turning it off only makes sense when measuring
+   *  what one of the other solvers can do on its own.  Belongs next to
+   *  use_jigsaw/use_z3 above and is here for the reason just given. */
+  int use_i2s;
 } symsan_config_t;
 
 /** Fill @p cfg with the defaults.  Always call this first. */
@@ -258,7 +270,8 @@ void symsan_config_init(symsan_config_t *cfg);
 
 /** Overlay the SYMSAN_* environment variables onto @p cfg.
  *
- *  Reads SYMSAN_TARGET, SYMSAN_OUTPUT_DIR, SYMSAN_USE_JIGSAW, SYMSAN_USE_Z3,
+ *  Reads SYMSAN_TARGET, SYMSAN_OUTPUT_DIR, SYMSAN_NO_I2S, SYMSAN_USE_JIGSAW,
+ *  SYMSAN_USE_Z3,
  *  SYMSAN_USE_NESTED, SYMSAN_TRACE_BOUNDS, SYMSAN_SOLVE_UB,
  *  SYMSAN_DONT_EXIT_ON_MEMERROR, SYMSAN_FORCE_STDIN, SYMSAN_SAVE_SOLVED,
  *  SYMSAN_FORKSRV and

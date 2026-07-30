@@ -56,7 +56,10 @@ struct ConcolicConfig {
   bool use_stdin = true;
 
   // --- solver ladder -------------------------------------------------------
-  /// the i2s solver is always enabled; these add to it, in this order
+  /// which solvers to run, in this order.  i2s is on by default -- it is the
+  /// cheap one and the others assume it has already been tried -- but it is
+  /// still a knob, so that a measurement can attribute solves to one solver.
+  bool use_i2s = true;       // cleared by SYMSAN_NO_I2S
   bool use_jigsaw = false;   // SYMSAN_USE_JIGSAW
   bool use_z3 = false;       // SYMSAN_USE_Z3
   bool nested_solving = false; // SYMSAN_USE_NESTED

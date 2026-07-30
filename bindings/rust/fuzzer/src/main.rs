@@ -120,6 +120,22 @@ struct Opt {
     #[arg(long = "symsan-no-forkserver", default_value = "false")]
     symsan_no_forkserver: bool,
 
+    /// Drop the input-to-state solver from the ladder. It is the cheapest rung
+    /// and cracks most branches on its own, so this is for measuring what the
+    /// others contribute, not for fuzzing.
+    #[arg(long = "symsan-no-i2s", default_value = "false")]
+    symsan_no_i2s: bool,
+
+    /// Drop the JIT/gradient-descent solver from the ladder.
+    #[arg(long = "symsan-no-jigsaw", default_value = "false")]
+    symsan_no_jigsaw: bool,
+
+    /// Add Z3 to the ladder as a last resort. Off by default: it solves what
+    /// the other two cannot, but it is also the only one that can spend
+    /// seconds on a single task, which a fuzzing loop pays for in exec rate.
+    #[arg(long = "symsan-z3", default_value = "false")]
+    symsan_z3: bool,
+
     /// Show the target's stdout and stderr.
     #[arg(short = 'd', long = "debug-child", default_value = "false")]
     debug_child: bool,
@@ -257,7 +273,10 @@ pub fn main() -> Result<(), libafl::Error> {
                 .input_file(opt.out_dir.join(format!(".symsan_input_{}", std::process::id())))
                 .timeout_ms(opt.symsan_timeout)
                 .max_solutions_per_input(opt.symsan_budget)
-                .forkserver(!opt.symsan_no_forkserver);
+                .forkserver(!opt.symsan_no_forkserver)
+                .i2s(!opt.symsan_no_i2s)
+                .jigsaw(!opt.symsan_no_jigsaw)
+                .z3(opt.symsan_z3);
             if let Some(map) = &opt.branch_map {
                 // The observer above is named "shared_mem", which is also the
                 // name MaxMapFeedback::new() inherits and files its history map
@@ -279,6 +298,25 @@ pub fn main() -> Result<(), libafl::Error> {
             }
             let symsan = builder.build()?;
             println!("symsan: tracing with {}", bin.display());
+            // Which rungs are in play decides both what gets solved and what a
+            // run costs, so print it: an A/B between two ladders is otherwise
+            // two logs that look identical.
+            let ladder: Vec<&str> = [
+                (!opt.symsan_no_i2s, "i2s"),
+                (!opt.symsan_no_jigsaw, "jigsaw"),
+                (opt.symsan_z3, "z3"),
+            ]
+            .iter()
+            .filter_map(|&(on, name)| on.then_some(name))
+            .collect();
+            if ladder.is_empty() {
+                // Tracing still runs, and still costs what tracing costs, but
+                // no task can ever be solved. Say so rather than let it look
+                // like a target nothing works on.
+                println!("symsan: no solver enabled; tracing only");
+            } else {
+                println!("symsan: solvers {}", ladder.join(" -> "));
+            }
 
             // SymSan first: trace a newly scheduled entry before havoc starts
             // rewriting it, so the constraints describe the entry as it was

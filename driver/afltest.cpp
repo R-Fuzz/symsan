@@ -13,6 +13,8 @@
 //   SYMSAN_USE_JIGSAW=1  add the jigsaw JIT solver to the chain
 //   SYMSAN_USE_Z3=1      add the z3 solver to the chain (needed for FP)
 //   SYMSAN_USE_NESTED=1  enable nested constraint solving in the parser
+//   SYMSAN_NO_I2S=1      drop the i2s solver, which is otherwise always first;
+//                        the way to ask what one of the others can do alone
 //
 // Solved inputs are written to <output_dir>/id-<inst>-<sess>-<idx>, one per
 // solved task, mirroring fgtest's output naming so the lit tests can reuse the
@@ -280,8 +282,9 @@ int main(int argc, char* const argv[]) {
     exit(1);
   }
 
-  // always use the simple i2s solver first
-  __solvers.emplace_back(std::make_shared<rgd::I2SSolver>());
+  // the simple i2s solver first, unless it is the thing being measured out
+  if (!getenv("SYMSAN_NO_I2S"))
+    __solvers.emplace_back(std::make_shared<rgd::I2SSolver>());
   if (getenv("SYMSAN_USE_JIGSAW"))
     __solvers.emplace_back(std::make_shared<rgd::JITSolver>());
   if (getenv("SYMSAN_USE_Z3"))

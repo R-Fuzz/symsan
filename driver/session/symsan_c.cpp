@@ -149,7 +149,9 @@ symsan_rgd_t *symsan_rgd_create(void *union_table, size_t ut_size,
         union_table, ut_size, opts ? opts->solve_nested != 0 : false, max_ast));
 
     // the ladder order matters: cheapest first, z3 last
-    rgd->solvers.emplace_back(std::make_shared<rgd::I2SSolver>());
+    if (!opts || !opts->no_i2s) {
+      rgd->solvers.emplace_back(std::make_shared<rgd::I2SSolver>());
+    }
     if (opts && opts->use_jigsaw) {
       rgd->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
     }
@@ -318,6 +320,7 @@ void symsan_config_init(symsan_config_t *cfg) {
   // so the two cannot drift.
   rgd::ConcolicConfig def;
   cfg->use_stdin = def.use_stdin;
+  cfg->use_i2s = def.use_i2s;
   cfg->use_jigsaw = def.use_jigsaw;
   cfg->use_z3 = def.use_z3;
   cfg->nested_solving = def.nested_solving;
@@ -352,6 +355,7 @@ symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
     cfg->symsan_bin = getenv("SYMSAN_TARGET");
     const char *dir = getenv("SYMSAN_OUTPUT_DIR");
     if (dir) cfg->output_dir = dir;
+    cfg->use_i2s = c.use_i2s;
     cfg->use_jigsaw = c.use_jigsaw;
     cfg->use_z3 = c.use_z3;
     cfg->nested_solving = c.nested_solving;
@@ -410,6 +414,7 @@ symsan_status_t symsan_session_init(symsan_session_t *s,
       c.args.emplace_back(cfg->argv[i]);
     }
     c.use_stdin = cfg->use_stdin != 0;
+    c.use_i2s = cfg->use_i2s != 0;
     c.use_jigsaw = cfg->use_jigsaw != 0;
     c.use_z3 = cfg->use_z3 != 0;
     c.nested_solving = cfg->nested_solving != 0;

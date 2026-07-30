@@ -55,6 +55,8 @@ int ConcolicConfig::from_env() {
   const char *dir = getenv("SYMSAN_OUTPUT_DIR");
   if (dir) output_dir = dir;
 
+  // i2s is the one that is on unless asked otherwise, so its knob is negative
+  if (getenv("SYMSAN_NO_I2S")) use_i2s = false;
   if (getenv("SYMSAN_USE_JIGSAW")) use_jigsaw = true;
   if (getenv("SYMSAN_USE_Z3")) use_z3 = true;
   // make nested solving optional too
@@ -166,10 +168,15 @@ int ConcolicSession::init(const ConcolicConfig &config) {
     cov_mgr_.reset(new EdgeCovManager());
   }
 
-  // always use the simpler i2s solver
-  solvers_.emplace_back(std::make_shared<I2SSolver>());
+  // the simpler i2s solver first, then the expensive ones in cost order
+  if (config_.use_i2s) solvers_.emplace_back(std::make_shared<I2SSolver>());
   if (config_.use_jigsaw) solvers_.emplace_back(std::make_shared<JITSolver>());
   if (config_.use_z3) solvers_.emplace_back(std::make_shared<Z3Solver>());
+  // Not an error -- tracing still runs, and a trace with no solver is a
+  // legitimate way to measure what the tracing alone costs -- but it is far
+  // more likely to be a front-end that turned everything off by accident, and
+  // the symptom (no inputs, ever) says nothing about the cause.
+  if (solvers_.empty()) warn("no solver enabled; nothing will be solved\n");
 
   // allocate output buffer
   output_buf_.resize(config_.max_input_size + 1);

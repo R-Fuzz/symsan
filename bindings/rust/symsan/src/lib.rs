@@ -209,6 +209,7 @@ pub struct Config {
     args: Vec<CString>,
     use_stdin: bool,
 
+    use_i2s: bool,
     use_jigsaw: bool,
     use_z3: bool,
     nested_solving: bool,
@@ -268,6 +269,7 @@ impl Config {
             output_dir: None,
             args: Vec::new(),
             use_stdin: raw.use_stdin != 0,
+            use_i2s: raw.use_i2s != 0,
             use_jigsaw: raw.use_jigsaw != 0,
             use_z3: raw.use_z3 != 0,
             nested_solving: raw.nested_solving != 0,
@@ -290,7 +292,7 @@ impl Config {
     /// Overlay the `SYMSAN_*` environment variables.
     ///
     /// Honours the same knobs as the AFL++ mutator -- `SYMSAN_TARGET`,
-    /// `SYMSAN_OUTPUT_DIR`, `SYMSAN_USE_JIGSAW`, `SYMSAN_USE_Z3`,
+    /// `SYMSAN_OUTPUT_DIR`, `SYMSAN_NO_I2S`, `SYMSAN_USE_JIGSAW`, `SYMSAN_USE_Z3`,
     /// `SYMSAN_USE_NESTED`, `SYMSAN_TRACE_BOUNDS`, `SYMSAN_SOLVE_UB`,
     /// `SYMSAN_DONT_EXIT_ON_MEMERROR`, `SYMSAN_FORCE_STDIN`,
     /// `SYMSAN_SAVE_SOLVED`, `SYMSAN_FORKSRV`, `SYMSAN_BRANCH_MAP` -- by calling the same C++
@@ -332,6 +334,7 @@ impl Config {
             output_dir,
             args: Vec::new(),
             use_stdin: raw.use_stdin != 0,
+            use_i2s: raw.use_i2s != 0,
             use_jigsaw: raw.use_jigsaw != 0,
             use_z3: raw.use_z3 != 0,
             nested_solving: raw.nested_solving != 0,
@@ -381,6 +384,17 @@ impl Config {
     #[must_use]
     pub fn use_stdin(mut self, yes: bool) -> Self {
         self.use_stdin = yes;
+        self
+    }
+
+    /// Run the input-to-state solver, the first rung of the ladder. On by
+    /// default, and the one to leave on: it is nearly free, and it is what
+    /// cracks the "input byte compared against a constant" shape that most of
+    /// a real target's branches turn out to be. Turn it off only to measure
+    /// what the solvers behind it can do without its help.
+    #[must_use]
+    pub fn i2s(mut self, yes: bool) -> Self {
+        self.use_i2s = yes;
         self
     }
 
@@ -557,6 +571,7 @@ impl Config {
         raw.argv = argv.as_ptr();
         raw.argc = argv.len() as i32;
         raw.use_stdin = self.use_stdin.into();
+        raw.use_i2s = self.use_i2s.into();
         raw.use_jigsaw = self.use_jigsaw.into();
         raw.use_z3 = self.use_z3.into();
         raw.nested_solving = self.nested_solving.into();
@@ -950,6 +965,7 @@ mod tests {
         assert_eq!(cfg.max_input_size, 1 << 20);
         assert!(!cfg.save_solved, "save_solved is a debugging aid, default off");
         assert!(!cfg.debug);
+        assert!(cfg.use_i2s, "i2s should default on; it is the cheap rung");
     }
 
     #[test]
@@ -957,6 +973,7 @@ mod tests {
         let cfg = Config::new("/bin/true", "/tmp/in")
             .args(["/bin/true", "/tmp/in"])
             .use_stdin(true)
+            .i2s(false)
             .jigsaw(false)
             .z3(true)
             .timeout_ms(1234)
@@ -964,6 +981,7 @@ mod tests {
             .forkserver(true);
         assert_eq!(cfg.args.len(), 2);
         assert!(cfg.use_stdin);
+        assert!(!cfg.use_i2s);
         assert!(!cfg.use_jigsaw);
         assert!(cfg.use_z3);
         assert_eq!(cfg.timeout_ms, 1234);

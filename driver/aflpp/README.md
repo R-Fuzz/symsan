@@ -69,6 +69,9 @@ to load the plugin and control its behavior:
 * `SYMSAN_OUTPUT_DIR=/none/default/dir` (optional): a different directory to store temporary outputs from SymSan
 * `SYMSAN_USE_JIGSAW=1` (optional): use JIGSAW as the solver
 * `SYMSAN_USE_Z3=1` (optional): use Z3 as the solver
+* `SYMSAN_NO_I2S=1` (optional): drop the input-to-state solver, which otherwise
+  always runs first. Only useful for measuring what the solvers behind it
+  contribute; with the two above unset it leaves nothing to solve with
 * `SYMSAN_USE_NESTED=1` (optional): consider nested branches when constructing a solving task
 
 ## Some high-level design

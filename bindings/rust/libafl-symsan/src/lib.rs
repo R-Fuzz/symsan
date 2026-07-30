@@ -117,6 +117,7 @@ pub struct SymSanStageBuilder {
     coverage_map_name: Option<String>,
     validate_coverage: bool,
     name: Option<String>,
+    i2s: bool,
     jigsaw: bool,
     z3: bool,
     nested: bool,
@@ -131,11 +132,18 @@ pub struct SymSanStageBuilder {
 impl SymSanStageBuilder {
     fn new() -> Self {
         Self {
-            // Sensible defaults for fuzzing: the full ladder. i2s alone is fast
-            // but only cracks direct input-to-state comparisons; jigsaw is what
-            // makes the RGD stack worth running.
+            // Sensible defaults for fuzzing: i2s and jigsaw, but not Z3. i2s
+            // alone is fast but only cracks direct input-to-state comparisons;
+            // jigsaw is what makes the RGD stack worth running.
+            //
+            // Z3 is off because a fuzzing loop is a throughput game and Z3 is
+            // the one rung that can spend seconds on a single task. It is the
+            // most *capable* solver, so leaving it out does lose solves -- turn
+            // it on for a target whose checks jigsaw's gradient descent cannot
+            // climb, and expect the exec rate to drop for them.
+            i2s: true,
             jigsaw: true,
-            z3: true,
+            z3: false,
             // Also the fuzzing default: a trace of a short-running target
             // spends a good fraction of its wall clock on process setup, and
             // the fallback when a target cannot be served this way is silent.
@@ -239,6 +247,15 @@ impl SymSanStageBuilder {
         self
     }
 
+    /// Include the input-to-state solver, the cheapest rung. On by default,
+    /// and worth leaving on: it costs almost nothing and it is what cracks the
+    /// "input byte compared against a constant" shape most branches have.
+    #[must_use]
+    pub fn i2s(mut self, yes: bool) -> Self {
+        self.i2s = yes;
+        self
+    }
+
     /// Include the JIT/gradient-descent solver. On by default.
     #[must_use]
     pub fn jigsaw(mut self, yes: bool) -> Self {
@@ -246,7 +263,8 @@ impl SymSanStageBuilder {
         self
     }
 
-    /// Include Z3 as the last resort. On by default.
+    /// Include Z3 as the last resort. **Off** by default: it is the only rung
+    /// that can spend seconds on one task, which a fuzzing loop feels.
     #[must_use]
     pub fn z3(mut self, yes: bool) -> Self {
         self.z3 = yes;
@@ -348,6 +366,7 @@ impl SymSanStageBuilder {
         let mut config = Config::new(&target, &input_file_str)
             .args(argv)
             .use_stdin(!uses_file)
+            .i2s(self.i2s)
             .jigsaw(self.jigsaw)
             .z3(self.z3)
             .nested_solving(self.nested)
@@ -754,10 +773,15 @@ mod tests {
     }
 
     #[test]
-    fn ladder_defaults_are_on() {
+    fn ladder_defaults_are_the_fast_two() {
         let b = SymSanStage::builder();
+        assert!(b.i2s, "i2s should default on");
         assert!(b.jigsaw, "jigsaw should default on");
-        assert!(b.z3, "z3 should default on");
+        assert!(
+            !b.z3,
+            "z3 should default off: it is the one rung slow enough to cost a \
+             fuzzing loop more than it returns"
+        );
         assert!(!b.nested, "nested solving should default off");
         assert!(
             b.forkserver,
