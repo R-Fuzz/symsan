@@ -599,6 +599,93 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   return ret;
 }
 
+// Which comparison op the str*cmp family should build, using the same rule
+// __dfsw_memcmp and __dfsw_bcmp above already apply: string theory is only
+// needed when an operand is itself the result of a string op (a substring, a
+// strchr position, ...).  "input bytes against a literal" is a fixed-length
+// byte comparison whichever libc function spelled it.
+//
+// This matters beyond tidiness.  parsers/rgd-parser.cpp understands fmemcmp
+// but has no fstrcmp case, so an fstrcmp label falls through to the OP_MAP
+// lookup and is rejected with "invalid op: 85" -- the task is never built and
+// the whole RGD ladder (i2s, jigsaw, and its z3) never sees the constraint.
+// Only solvers/z3-ts.cpp knows fstrcmp.  Tagging every str*cmp fstrcmp
+// therefore put the entire family out of reach of the fuzzing path, including
+// the common case that is plainly just a memcmp.
+static inline uint16_t str_cmp_op(dfsan_label l1, dfsan_label l2) {
+  bool l1_is_string_op =
+      (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
+  bool l2_is_string_op =
+      (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
+  return (l1_is_string_op || l2_is_string_op) ? __dfsan::fstrcmp
+                                              : __dfsan::fmemcmp;
+}
+
+// How wide an unbounded strcmp/strcasecmp is once it lowers to fmemcmp.  A
+// strcmp stops at the first terminator, so the width that says "these are the
+// same string" is the *concrete* side's length plus its NUL -- requiring that
+// terminator is what separates "equal" from "is a prefix of".  Measuring the
+// symbolic side instead, which is what the fstrcmp path does, would make the
+// constant content run off the end of the literal and constrain whatever
+// happens to follow it in .rodata.
+static inline size_t str_cmp_len(const char *s1, const char *s2, dfsan_label l1,
+                                 dfsan_label l2) {
+  size_t len1 = strlen(s1);
+  size_t len2 = strlen(s2);
+  if (l2 == 0) return len2 + 1;
+  if (l1 == 0) return len1 + 1;
+  // Both sides symbolic: neither length is fixed, so compare as far as they
+  // both go on this execution.
+  return (len1 < len2 ? len1 : len2) + 1;
+}
+
+// Pick that op *and* the operand labels to build it from, for a str*cmp that
+// compares n bytes.  Returns the op and updates l1/l2 in place; on entry they
+// must be the get_str_label() results, which is what decides whether string
+// theory is needed at all.
+//
+// An fmemcmp is a fixed-width comparison and its operands have to be exactly
+// that wide: parsers/rgd-parser.cpp builds the constant side at info->size * 8
+// bits and takes the symbolic side's width from the label itself, so the two
+// must describe the same n bytes.  get_str_label() does not promise that -- it
+// measures with strlen(), and for a buffer whose tainted bytes run past the
+// compared prefix (an unterminated read(2) buffer, say) or for a string whose
+// content label was stashed whole by strdup, the label it hands back is wider
+// than n.  The mismatch survives all the way into the solvers: z3 rejects the
+// term with "Sorts (_ BitVec 56) and (_ BitVec 176) are incompatible", and
+// jigsaw's JIT emits "icmp eq i64 %x, i512 %y" and dies in the IR verifier,
+// taking the fuzzer with it.  __dfsw_memcmp has never had the problem because
+// it reads exactly n bytes to begin with.
+//
+// So read exactly n bytes here too, and read them straight out of the shadow
+// rather than through get_str_label_n(): the whole point is to describe the n
+// bytes on the wire, and the fsubstr/str_map recovery get_str_label_n does is
+// what returns a wider label.  Nothing is lost by skipping it, because an
+// operand that really is a string term was already spotted above and left to
+// string theory, which is where its length belongs.
+//
+// If the read still does not line up -- it should not, but the operand widths
+// are the invariant the solvers segfault on -- keep the original labels and
+// fall back to fstrcmp, which is exactly what this code did before fmemcmp was
+// an option.
+static inline bool cmp_label_fits(dfsan_label l, size_t n) {
+  return l == 0 || dfsan_get_label_info(l)->size == n * 8;
+}
+
+static inline uint16_t str_cmp_operands(const char *s1, const char *s2, size_t n,
+                                        dfsan_label *l1, dfsan_label *l2) {
+  if (str_cmp_op(*l1, *l2) == __dfsan::fstrcmp) return __dfsan::fstrcmp;
+
+  dfsan_label b1 = dfsan_read_label(s1, n);
+  dfsan_label b2 = dfsan_read_label(s2, n);
+  if (!cmp_label_fits(b1, n) || !cmp_label_fits(b2, n))
+    return __dfsan::fstrcmp;
+
+  *l1 = b1;
+  *l2 = b2;
+  return __dfsan::fmemcmp;
+}
+
 DECLARE_WEAK_INTERCEPTOR_HOOK(dfsan_weak_hook_strcmp, uptr caller_pc,
                               const char *s1, const char *s2,
                               dfsan_label s1_label, dfsan_label s2_label)
@@ -627,10 +714,13 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
     dfsan_label s1_fsubstr = taint_get_str_content_label(s1);
     if (s1_fsubstr != 0)
       n = strlen(s2) + 1;  // use concrete side for length
+    else if (str_cmp_op(l1, l2) == __dfsan::fmemcmp)
+      n = str_cmp_len(s1, s2, l1, l2);
 
-    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
+    // the comparison op is commutative - dfsan_union will swap to put
+    // concrete in op1
+    uint16_t op = str_cmp_operands(s1, s2, n, &l1, &l2);
+    dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
   }
@@ -789,10 +879,13 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
     dfsan_label s1_fsubstr = taint_get_str_content_label(s1);
     if (s1_fsubstr != 0)
       n = strlen(s2) + 1;
+    else if (str_cmp_op(l1, l2) == __dfsan::fmemcmp)
+      n = str_cmp_len(s1, s2, l1, l2);
 
-    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
+    // the comparison op is commutative - dfsan_union will swap to put
+    // concrete in op1
+    uint16_t op = str_cmp_operands(s1, s2, n, &l1, &l2);
+    dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
   }
@@ -832,8 +925,8 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
     if (l2 == 0 && strlen(s2) < (n - 1))
       n = strlen(s2) + 1;
 
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
+    uint16_t op = str_cmp_operands(s1, s2, n, &l1, &l2);
+    dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
   }
@@ -864,8 +957,8 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
     if (l2 == 0 && strlen(s2) < (n - 1))
       n = strlen(s2) + 1;
 
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
+    uint16_t op = str_cmp_operands(s1, s2, n, &l1, &l2);
+    dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
   }
