@@ -230,6 +230,31 @@ static inline dfsan_label get_str_label(const char *s, dfsan_label s_label) {
   return get_str_label_n(s, s_label, len + 1, term_label);
 }
 
+// Same thing for the strn* family, which looks at *at most* n bytes.
+//
+// get_str_label() measures with strlen(), and for a buffer that is not
+// terminated inside the compared prefix that walks arbitrarily far past it: in
+// test-transform the strncmp of 5 bytes at buff+24 read 41, off the end of the
+// 64 bytes the harness had actually written into buff[100].  Two things go
+// wrong at once there.  The label describes 41 bytes when the comparison is
+// about 5, which is the width mismatch str_cmp_operands has to paper over; and
+// the read runs into the alloca's never-written tail, where __taint_union_load
+// finds kInitializingLabel.  So bound the read the way the comparison itself is
+// bounded -- up to the terminator, never past n.
+static inline dfsan_label get_strn_label(const char *s, dfsan_label s_label,
+                                         size_t n, dfsan_label n_label) {
+  size_t len = strnlen(s, n);
+  if (len < n) {
+    // the terminator is part of what strncmp looked at, and it may itself sit
+    // at a position an earlier strchr found -- the same recovery get_str_label
+    // does, only worth trying when we did not already get a length label.
+    if (n_label == 0)
+      n_label = taint_get_str_indexof_label(s + len);
+    len++;
+  }
+  return get_str_label_n(s, s_label, len, n_label);
+}
+
 static inline dfsan_label get_label_for(int fd, off_t offset) {
   // check if fd is stdin, if so, the label hasn't been pre-allocated
   if (is_stdin_taint() || (fd ==0 && flags().force_stdin))
@@ -279,6 +304,48 @@ static inline dfsan_label net16_label(dfsan_label label) {
 #else
   return label;
 #endif
+}
+
+// Model a case fold (tolower = c | 0x20, toupper = c & 0x5f) over the label of
+// an argument that has already been promoted to int.
+//
+// tolower/toupper take an `int`, so the caller widens the byte before the call
+// and c_label is a 32-bit ZExt (or SExt, for a signed char) of the real 8-bit
+// value.  This used to build the mask node as
+//
+//   dfsan_union(0, c_label, Or, 8, 0x20, 0)
+//
+// whose declared size, 8, contradicts its operand's, 32.  Both solver front
+// ends happen to survive that -- they re-extend the operand and the mask fits
+// in 8 bits, so the value comes out right either way -- but it is a node that
+// does not describe a term, and nothing downstream is obliged to keep guessing
+// what was meant.
+//
+// So peel the promotion, apply the mask at the operand's own width, and put the
+// promotion back on top: every node then means what it says.  Re-wrapping
+// rather than leaving the 8-bit result bare is what keeps the common caller
+// working -- `c = tolower(c)` stores back into a char, the store truncates, and
+// __taint_union's Trunc(ZExt(x)) -> x rule folds the pair away to an exactly
+// 8-bit node, which is the width dfsan_read_label and cmp_label_fits want when
+// the bytes later reach a str*cmp.  A caller that keeps the full int is equally
+// well served, since ZExt32(Or8(x, 0x20)) and Or32(ZExt32(x), 0x20) denote the
+// same value.
+static inline dfsan_label case_fold_label(dfsan_label c_label, uint16_t op,
+                                          uint64_t mask) {
+  if (c_label == 0)
+    return 0;
+  dfsan_label_info *info = dfsan_get_label_info(c_label);
+  if ((info->op == __dfsan::ZExt || info->op == __dfsan::SExt) && info->l1) {
+    dfsan_label base = info->l1;
+    dfsan_label folded = dfsan_union(0, base, op,
+                                     dfsan_get_label_info(base)->size, mask, 0);
+    if (folded == 0)
+      return 0;
+    return dfsan_union(folded, 0, info->op, info->size, 0, 0);
+  }
+  // nothing to peel: a genuinely wide symbolic argument.  Still size the node
+  // to the operand rather than to a hardcoded 8.
+  return dfsan_union(0, c_label, op, info->size, mask, 0);
 }
 
 static inline dfsan_label net32_label(dfsan_label label) {
@@ -912,9 +979,9 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
 
   int ret = strncmp(s1, s2, n);
 
-  // Use unified get_str_label for fsubstr support
-  dfsan_label l1 = get_str_label(s1, s1_label);
-  dfsan_label l2 = get_str_label(s2, s2_label);
+  // Use unified get_str_label for fsubstr support, bounded by n
+  dfsan_label l1 = get_strn_label(s1, s1_label, n, n_label);
+  dfsan_label l2 = get_strn_label(s2, s2_label, n, n_label);
 
   if (l1 == 0 && l2 == 0) {
     *ret_label = 0;
@@ -944,9 +1011,9 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
 
   int ret = strncasecmp(s1, s2, n);
   // doing an optimistic solving here too, hoping the case can be the same
-  // Use unified get_str_label for fsubstr support
-  dfsan_label l1 = get_str_label(s1, s1_label);
-  dfsan_label l2 = get_str_label(s2, s2_label);
+  // Use unified get_str_label for fsubstr support, bounded by n
+  dfsan_label l1 = get_strn_label(s1, s1_label, n, n_label);
+  dfsan_label l2 = get_strn_label(s2, s2_label, n, n_label);
 
   if (l1 == 0 && l2 == 0) {
     *ret_label = 0;
@@ -1054,14 +1121,14 @@ void *__dfsw_memset(void *s, int c, size_t n,
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_tolower(int c, dfsan_label c_label, dfsan_label *ret_label) {
   int ret = tolower(c);
-  *ret_label = dfsan_union(0, c_label, __dfsan::Or, 8, 0x20, 0);
+  *ret_label = case_fold_label(c_label, __dfsan::Or, 0x20);
   return ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_toupper(int c, dfsan_label c_label, dfsan_label *ret_label) {
   int ret = toupper(c);
-  *ret_label = dfsan_union(0, c_label, __dfsan::And, 8, 0x5f, 0);
+  *ret_label = case_fold_label(c_label, __dfsan::And, 0x5f);
   return ret;
 }
 

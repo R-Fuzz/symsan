@@ -1284,7 +1284,20 @@ SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
 dfsan_read_label(const void *addr, uptr size) {
   if (size == 0)
     return 0;
-  return __taint_union_load(shadow_for(addr), size, size * 8, sizeof(dfsan_label));
+  dfsan_label label =
+      __taint_union_load(shadow_for(addr), size, size * 8, sizeof(dfsan_label));
+  // __taint_union_load hands kInitializingLabel back to instrumented loads on
+  // purpose: it is the marker __taint_trace_alloca writes over an alloca's
+  // shadow, and propagating it is how a load of never-written stack memory
+  // stays flagged.  It is not a label, though, and this is the entry point the
+  // custom wrappers read shadow through.  They pass what they get straight to
+  // dfsan_get_label_info(), whose dfsan_check_label() reports
+  // "FATAL: Taint: out of labels" and Die()s -- losing the entire trace from
+  // there on, over a buffer that merely had an unwritten tail.  A range that
+  // includes uninitialized bytes has no label; say that instead.
+  if (label == kInitializingLabel)
+    return 0;
+  return label;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
