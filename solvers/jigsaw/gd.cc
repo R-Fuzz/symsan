@@ -716,15 +716,23 @@ static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
     case rgd::Sle:
     case rgd::Sge:
       return v;
+    // rhs==true means the INPUT is op1 and v is op2, so the value returned has
+    // to satisfy (returned <comp> v); rhs==false is the mirror, (v <comp>
+    // returned).  The two strict-inequality groups used to be swapped -- Ult
+    // returned v+1 for the op1 side, which cannot be < v -- so every strict
+    // integer inequality produced a value the try_new_i2s_value gate then threw
+    // away.  Silent: a wrong guess here is rejected, never acted on, so the
+    // only symptom was i2s declining a whole class of comparison it can invert
+    // exactly.  Non-strict and Equal were always right.
     case rgd::Distinct:
-    case rgd::Ugt:
-    case rgd::Sgt:
-      if (rhs) return v - 1;
-      else return v + 1;
     case rgd::Ult:
     case rgd::Slt:
-      if (rhs) return v + 1;
-      else return v - 1;
+      if (rhs) return v - 1; // input is op1: sit just below op2
+      else return v + 1;     // input is op2: sit just above op1
+    case rgd::Ugt:
+    case rgd::Sgt:
+      if (rhs) return v + 1; // input is op1: sit just above op2
+      else return v - 1;     // input is op2: sit just below op1
     default:
       fprintf(stderr, "Non-relational op!\n");
   }
