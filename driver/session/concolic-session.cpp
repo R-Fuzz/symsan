@@ -363,6 +363,9 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   // check_coverage() asks about *this* input, so the recorded directions have
   // to be this input's.  Unconditional: cheap when nothing was recorded.
   if (shared_cov_) shared_cov_->clear_taken();
+  // and whatever else the manager keeps per trace rather than per session --
+  // the hit counts that tell one loop iteration from the next.
+  cov_mgr_->new_trace();
   // likewise input_taint(): it describes the input being traced now
   traced_branches_.clear();
   task_branch_.clear();

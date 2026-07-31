@@ -338,6 +338,17 @@ pub fn main() -> Result<(), libafl::Error> {
     // `None`, at the cost of one branch per entry, which is nothing next to a
     // target execution.
 
+    // The branch map names branches in the *coverage* build, so it belongs next
+    // to that binary; pick it up from there when `--branch-map` was not given.
+    // Without a map the stage falls back to SymSan's own address-keyed,
+    // session-lifetime table, which cannot tell the second traversal of a loop
+    // branch from the first -- a real loss of solving power, and one that used
+    // to happen silently. Hence both the default and the log lines below.
+    let branch_map = opt.branch_map.clone().or_else(|| {
+        let guess = PathBuf::from(format!("{executable}.map"));
+        guess.is_file().then_some(guess)
+    });
+
     let symsan_stages = match &opt.symsan_bin {
         Some(bin) => {
             let mut builder = SymSanStage::builder()
@@ -354,7 +365,7 @@ pub fn main() -> Result<(), libafl::Error> {
                 .jigsaw(!opt.symsan_no_jigsaw)
                 .z3(opt.symsan_z3)
                 .cmplog_filter(cmplog_filter);
-            if let Some(map) = &opt.branch_map {
+            if let Some(map) = &branch_map {
                 // The observer above is named "shared_mem", which is also the
                 // name MaxMapFeedback::new() inherits and files its history map
                 // under -- so the stage's default is already right, but say it
@@ -363,15 +374,28 @@ pub fn main() -> Result<(), libafl::Error> {
                     .branch_map(map)
                     .coverage_map_name(edges_observer_name)
                     .validate_coverage(opt.validate_branch_map);
-                println!("symsan: sharing coverage via {}", map.display());
+                println!(
+                    "symsan: sharing the fuzzer's coverage via {}{}",
+                    map.display(),
+                    if opt.branch_map.is_some() { "" } else { " (auto-detected)" }
+                );
                 if opt.validate_branch_map {
                     // The observer tracks indices (see `.track_indices()`
                     // above), so every corpus entry already carries the edge
                     // set the audit needs -- nothing is re-executed for it.
                     println!("symsan: auditing the branch map (RUST_LOG=error to see verdicts)");
                 }
-            } else if opt.validate_branch_map {
-                println!("symsan: --validate-branch-map ignored without --branch-map");
+            } else {
+                // Say which coverage is deciding what to solve, always. An
+                // A/B that accidentally ran without the map is otherwise
+                // indistinguishable from one that ran with it.
+                println!(
+                    "symsan: no branch map ({executable}.map absent); using SymSan's own \
+                     per-session coverage, so each branch is solvable once per session"
+                );
+                if opt.validate_branch_map {
+                    println!("symsan: --validate-branch-map ignored without a branch map");
+                }
             }
             let symsan = builder.build()?;
             println!("symsan: tracing with {}", bin.display());

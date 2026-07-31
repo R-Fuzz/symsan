@@ -253,14 +253,20 @@ fn the_fuzzers_coverage_settles_bytes() {
         TaintClass::Open,
         "the inner branch is unsolved and, by this snapshot, unreached",
     );
-    // The outer branch is settled either way -- this trace takes it the other
-    // way from the seed -- so it says nothing about the map. Asserted only so a
-    // failure shows which half moved.
+    // The outer branch is decided by the map too. Only its *taken* side was
+    // pruned by AFL++; the side this trace did not take has an edge id, so the
+    // snapshot answers for it -- and this snapshot claims nothing is covered.
+    // That the session itself walked both directions, across the seed trace and
+    // this one, no longer overrules that: a branch the map can name is the
+    // fuzzer's call, which is the whole point of sharing coverage. (Before that
+    // rule, our own session-lifetime record won here and these bytes came back
+    // Settled.) Asserted so a failure shows which half moved.
     assert_all(
         &uncovered,
         X,
-        TaintClass::Settled,
-        "both directions of the outer branch have now been executed",
+        TaintClass::Open,
+        "the snapshot claims no edge is covered, and the direction this trace \
+         did not take has one",
     );
 
     // ---- B: the same trace, with the fuzzer claiming everything ------------

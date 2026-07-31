@@ -58,6 +58,11 @@ public:
     is_target_uncovered(const std::shared_ptr<BranchContext> context) {
       return is_branch_interesting(context);
     }
+
+  /// A new input is about to be traced.  For per-trace state; anything the
+  /// manager keeps for the life of the session must survive this.  Defaulted,
+  /// so a manager with no per-trace state needs no override.
+  virtual void new_trace() {}
 };
 
 class EdgeCovManager : public CovManager {
@@ -160,6 +165,30 @@ private:
   std::unordered_set<uint64_t> taken_;
   bool validating_ = false;
 
+  /// How many times this trace has traversed each branch address, both
+  /// directions together.  Per trace, not per session: it is how far around a
+  /// loop we are, which is what tells the k-th iteration of a branch apart from
+  /// the first.
+  std::unordered_map<void*, uint32_t> trace_hits_;
+
+  /// AFL's hit-count buckets -- 1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+ --
+  /// each collapsed onto its lower bound.  LibAFL's HitcountsMapObserver
+  /// classifies the fuzzer's edge counts this way before MaxMapFeedback
+  /// compares them against the history map, so these are the values host_
+  /// holds and the only granularity at which asking "would the fuzzer call
+  /// this new?" means anything.
+  static uint8_t count_class(uint32_t hits) {
+    if (hits == 0) return 0;
+    if (hits == 1) return 1;
+    if (hits == 2) return 2;
+    if (hits == 3) return 4;
+    if (hits <= 7) return 8;
+    if (hits <= 15) return 16;
+    if (hits <= 31) return 32;
+    if (hits <= 127) return 64;
+    return 128;
+  }
+
 public:
   explicit SharedMapCovManager(const BranchMap *map)
       : map_(map) { _ctx = std::make_shared<BranchContext>(); }
@@ -168,6 +197,8 @@ public:
   void set_validating(bool on) { validating_ = on; if (!on) taken_.clear(); }
   /// Forget the previous trace's directions.  Call at the top of each trace.
   void clear_taken() { taken_.clear(); }
+
+  void new_trace() override { trace_hits_.clear(); }
 
   /// Check the map against ground truth: @p covered is the set of edge ids the
   /// *fuzzer's* build recorded for the same input this session just traced.
@@ -221,6 +252,7 @@ public:
     itr.first |= direction? true : false;
     itr.second |= direction? false : true;
     cids[addr] = id;
+    trace_hits_[addr] += 1;
     // Here rather than in is_branch_interesting(), which is handed the
     // *negated* context: this is the only place the direction actually taken
     // is in hand, and that is the one the fuzzer's map can be checked against.
@@ -253,26 +285,48 @@ private:
             : nullptr;
     if (edges) {
       if (count) mapped_ += 1;
+      // "Has the fuzzer covered this edge?" is not a yes/no question to
+      // MaxMapFeedback -- it compares hit-count *classes*, so the second
+      // traversal of an edge is a different observation from the first.  That
+      // distinction is the whole reason a loop body is solvable more than
+      // once, and asking host_[e] == 0 threw it away: one hit on the flipped
+      // edge, ever, and every later iteration of the loop looked covered.
+      //
+      // trace_hits_ is how far around the loop this branch already is, so
+      // class(hits) is the class the flipped edge would land in.  It is an
+      // estimate -- what the fuzzer records depends on the whole rewritten
+      // trace, which we would have to run to know -- and it errs towards
+      // solving, which is the right way to err for a stage that is gated to
+      // once per corpus entry anyway.
+      auto hit = trace_hits_.find(context->addr);
+      uint8_t want = count_class(hit == trace_hits_.end() ? 1 : hit->second);
       // Inlining gives one source branch several edge ids.  One uncovered copy
       // is still worth solving for, so this is "any", not "all".
       host_says_new = false;
       for (uint32_t e : *edges) {
-        if (e >= host_.size() || host_[e] == 0) { host_says_new = true; break; }
+        if (e >= host_.size() || host_[e] < want) { host_says_new = true; break; }
       }
-    } else {
-      if (count) unmapped_ += 1;
+      // The map answered, so it decides.  `branches` is keyed on address and
+      // lives as long as the session, which makes it wrong in exactly the case
+      // we came here to fix: it can only ever say "solved once already", and a
+      // branch inside a loop is worth solving at every depth.  Letting it veto
+      // is what kept test-crc32 stuck -- the fuzzer would happily have taken
+      // the input, and we never built the task.
+      return host_says_new;
     }
 
+    if (count) unmapped_ += 1;
+    // No edge for this branch: a name the two builds disagree on, or one AFL++
+    // pruned.  Nothing better to consult than our own history, which is
+    // EdgeCovManager's answer -- the documented degrade path.
     auto itr = branches.find(context->addr);
     // assert(itr != branches.end());
     // ...except when is_target_uncovered() asks: it also asks about symbolic
     // array indices, and on_gep() does not call add_branch().  Something we
     // have no record of reaching is unreached.
-    bool locally_new = itr == branches.end()
-                           ? true
-                           : (context->direction ? itr->second.first == false
-                                                 : itr->second.second == false);
-    return locally_new && host_says_new;
+    if (itr == branches.end()) return true;
+    return context->direction ? itr->second.first == false
+                              : itr->second.second == false;
   }
 };
 
