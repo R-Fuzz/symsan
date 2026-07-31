@@ -436,6 +436,639 @@ static uint64_t get_binop_value(std::shared_ptr<const Constraint> constraint,
   return r;
 }
 
+//===----------------------------------------------------------------------===//
+// AST-guided input-to-state
+//
+// The value-based matching above looks for a *whole* compared operand in the
+// input and inverts at most one binary operation sitting directly under the
+// comparison.  Two shapes fall outside that:
+//
+//   - a lookup table (rgd::TLookup).  The compared value never appears in the
+//     input at all; only the index into the table does, and the table's bytes
+//     are carried in the node's constant args.
+//   - nested arithmetic such as (dehex[a] << 4) + dehex[b]: several binop
+//     kinds, more than one level, and an Add whose two operands are both
+//     symbolic so neither is the "constant" the flat path needs.
+//
+// Both fall out of a pair of mutually recursive walks: an evaluator that
+// computes a subtree's concrete value under a candidate input, and an inverter
+// that pushes a wanted value down toward the Read leaves.  Where the inverter
+// has to guess -- a non-injective table, a bitwise op with no exact inverse, an
+// operand pinned at the value it happens to hold -- the guess is checked, both
+// locally by re-evaluating the subtree and again at the top by re-evaluating
+// the whole comparison.  Same discipline as the FP path (see solve_fcmp):
+// speculate freely, claim SAT only on a verified candidate.
+//
+// Nodes these walks do not understand (FP kinds, Ite, Neg/Not, and the
+// label-only stubs the parser leaves behind for a subexpression it has already
+// emitted once in this constraint) make the walk fail.  A miss, never a guess.
+//===----------------------------------------------------------------------===//
+
+// How deep the walks will go.  Bounds both the work per attempt and the blowup
+// from a non-injective table, where each level may try several entries.
+static const uint32_t kI2SMaxDepth = 16;
+
+// Separate, much larger bound for the Concat spine of a wide (memcmp-sized)
+// buffer: that spine is one level per element, so a 64-byte target is 64 deep
+// before any real expression is reached.
+static const uint32_t kI2SMaxWideDepth = 256;
+
+// Largest operand value set i2s_value_domain will enumerate.  Anything wider is
+// reported as not enumerable rather than truncated, so the caller falls back to
+// the single current value instead of searching a silently partial set.
+static const size_t kI2SMaxDomain = 64;
+
+// Total inversion steps allowed per top-level solve.  Enumerating an operand's
+// domain multiplies the branching factor at every binop level, so a deep tree
+// of tables could otherwise walk the solver into a stall; i2s is the cheap path
+// and has to stay cheap.
+static const uint32_t kI2SMaxSteps = 20000;
+
+// A pending byte-level assignment: input offset -> new value.  Collected rather
+// than written straight into out_buf so a failed branch (the wrong entry of a
+// non-injective table, say) can be abandoned by truncating the vector, leaving
+// no trace for the next candidate to trip over.
+typedef std::vector<std::pair<size_t, uint8_t>> i2s_assignment_t;
+
+// Map from label to the one fully-expanded node bearing it.  The parser emits
+// each distinct label once per constraint and leaves a stub -- label and width
+// only, kind rgd::Bool, no children -- everywhere else it appears (see the
+// `visited` set in RGDAstParser::do_uta_rel).  Both walks below would stop dead
+// at a stub, and they meet them constantly: `buff[i] >> 4` and `buff[i] % 16`
+// share their Read, so the second lookup of a hex-encoding pair is all stub.
+typedef std::unordered_map<uint32_t, const AstNode *> i2s_node_map_t;
+
+// Everything the walks carry around.  Bundled because there are five of them
+// and they are threaded through every recursive call.
+struct i2s_ctx {
+  std::shared_ptr<const Constraint> c;
+  const uint8_t *in_buf;
+  size_t in_size;
+  i2s_node_map_t nodes;
+  i2s_assignment_t assign;
+  uint32_t steps;
+};
+
+// Read one input byte under the pending assignment.  Later entries win, so
+// truncating the vector restores the previous view for free.
+static inline uint8_t i2s_peek(const i2s_ctx &ctx, size_t offset, bool &ok) {
+  for (size_t i = ctx.assign.size(); i > 0; --i) {
+    if (ctx.assign[i - 1].first == offset) return ctx.assign[i - 1].second;
+  }
+  if (unlikely(offset >= ctx.in_size)) { ok = false; return 0; }
+  return ctx.in_buf[offset];
+}
+
+// Mask to a node's width.  Callers reject widths above 64 bits, so the
+// undefined 64-bit shift is unreachable.
+static inline uint64_t i2s_mask(uint32_t bits) {
+  return bits >= 64 ? ~0ULL : ((1ULL << bits) - 1);
+}
+
+// Sign-extend a value that is `bits` wide to a full 64-bit signed value.
+static inline int64_t i2s_sext(uint64_t v, uint32_t bits) {
+  if (bits >= 64) return (int64_t)v;
+  uint32_t sh = 64 - bits;
+  return ((int64_t)(v << sh)) >> sh;
+}
+
+// Index the fully-expanded nodes of a constraint so stubs can be redirected.
+static void i2s_index_nodes(const AstNode &node, i2s_node_map_t &map,
+                            uint32_t depth) {
+  if (unlikely(depth > 1024)) return; // the AST is a tree, but be defensive
+  // stubs are exactly the kind-Bool nodes; a real Bool carries no label either
+  if (node.kind() != rgd::Bool && node.label() != 0)
+    map.emplace(node.label(), &node);
+  uint32_t n = node.children_size();
+  for (uint32_t i = 0; i < n; ++i)
+    i2s_index_nodes(node.children(i), map, depth + 1);
+}
+
+// Follow a stub to the node it stands for.  Returns nullptr for a stub whose
+// label was never expanded, which makes the caller fail rather than guess.
+static inline const AstNode *i2s_resolve(const i2s_ctx &ctx, const AstNode &node) {
+  if (likely(node.kind() != rgd::Bool)) return &node;
+  auto itr = ctx.nodes.find(node.label());
+  return itr == ctx.nodes.end() ? nullptr : itr->second;
+}
+
+// Fetch element `idx` of the table packed into a TLookup node's constant args.
+// Layout, starting at index() (see parsers/rgd-parser.cpp): the element count,
+// then the raw bytes, 8 per arg, little-endian.
+static bool i2s_table_elem(const i2s_ctx &ctx, const AstNode &node,
+                           uint64_t idx, uint64_t &out) {
+  auto const& args = ctx.c->input_args;
+  uint32_t base = node.index();
+  if (unlikely(base >= args.size())) return false;
+  uint64_t num_elems = args[base].second;
+  if (idx >= num_elems) return false; // out of range: not this table's business
+  uint32_t elem_size = node.bits() / 8;
+  if (unlikely(elem_size == 0 || elem_size > 8 || node.bits() % 8 != 0)) return false;
+  uint64_t val = 0;
+  for (uint32_t b = 0; b < elem_size; ++b) {
+    uint64_t byte_off = idx * elem_size + b;
+    size_t arg = base + 1 + (size_t)(byte_off / 8);
+    if (unlikely(arg >= args.size())) return false;
+    val |= ((args[arg].second >> ((byte_off % 8) * 8)) & 0xff) << (b * 8);
+  }
+  out = val;
+  return true;
+}
+
+// Concrete value of a subtree under the current input plus any pending
+// assignment.  Returns false on anything it cannot compute exactly.
+static bool i2s_eval_int(i2s_ctx &ctx, const AstNode &n_, uint64_t &out,
+                         uint32_t depth) {
+  if (unlikely(depth > kI2SMaxDepth)) return false;
+  const AstNode *np = i2s_resolve(ctx, n_);
+  if (unlikely(np == nullptr)) return false;
+  auto const& node = *np;
+  if (unlikely(node.bits() == 0 || node.bits() > 64)) return false;
+  switch (node.kind()) {
+    case rgd::Constant: {
+      if (unlikely(node.index() >= ctx.c->input_args.size())) return false;
+      out = ctx.c->input_args[node.index()].second & i2s_mask(node.bits());
+      return true;
+    }
+    case rgd::Read: {
+      uint32_t bytes = node.bits() / 8;
+      if (unlikely(bytes == 0 || bytes > 8 || node.bits() % 8 != 0)) return false;
+      bool ok = true;
+      uint64_t v = 0;
+      for (uint32_t i = 0; i < bytes; ++i)
+        v |= (uint64_t)i2s_peek(ctx, node.index() + i, ok) << (i * 8);
+      if (unlikely(!ok)) return false;
+      out = v;
+      return true;
+    }
+    case rgd::ZExt: {
+      auto const& ch = node.children(0);
+      uint64_t v;
+      if (!i2s_eval_int(ctx, ch, v, depth + 1)) return false;
+      out = v & i2s_mask(ch.bits());
+      return true;
+    }
+    case rgd::SExt: {
+      auto const& ch = node.children(0);
+      uint64_t v;
+      if (!i2s_eval_int(ctx, ch, v, depth + 1)) return false;
+      out = (uint64_t)i2s_sext(v, ch.bits()) & i2s_mask(node.bits());
+      return true;
+    }
+    case rgd::Extract: {
+      auto const& ch = node.children(0);
+      uint64_t v;
+      if (unlikely(ch.bits() > 64 || node.index() >= 64)) return false;
+      if (!i2s_eval_int(ctx, ch, v, depth + 1)) return false;
+      out = (v >> node.index()) & i2s_mask(node.bits());
+      return true;
+    }
+    case rgd::Concat: {
+      // children(1) holds the HIGH bits: z3-solver.cpp serializes this node as
+      // concat(c2, c1), and z3's concat puts its first argument on top.
+      auto const& lo = node.children(0);
+      uint64_t lv, hv;
+      if (unlikely(lo.bits() >= 64)) return false;
+      if (!i2s_eval_int(ctx, lo, lv, depth + 1)) return false;
+      if (!i2s_eval_int(ctx, node.children(1), hv, depth + 1)) return false;
+      out = ((lv & i2s_mask(lo.bits())) | (hv << lo.bits())) & i2s_mask(node.bits());
+      return true;
+    }
+    case rgd::TLookup: {
+      uint64_t idx;
+      if (!i2s_eval_int(ctx, node.children(0), idx, depth + 1)) return false;
+      return i2s_table_elem(ctx, node, idx, out);
+    }
+    default: break;
+  }
+  if (!isBinaryOperation(node.kind())) return false;
+  uint64_t v1, v2;
+  if (!i2s_eval_int(ctx, node.children(0), v1, depth + 1)) return false;
+  if (!i2s_eval_int(ctx, node.children(1), v2, depth + 1)) return false;
+  switch (node.kind()) {
+    // an over-wide shift or a division by zero is poison in LLVM, so there is
+    // no value to report -- fail instead of inventing one (and instead of
+    // executing the matching UB in _get_binop_value)
+    case rgd::Shl: case rgd::LShr: case rgd::AShr:
+      if (v2 >= node.bits()) return false;
+      break;
+    case rgd::UDiv: case rgd::URem:
+      if (v2 == 0) return false;
+      break;
+    case rgd::SDiv: case rgd::SRem:
+      if (v2 == 0) return false;
+      // INT_MIN / -1 traps on x86; poison in LLVM either way
+      if (i2s_sext(v2, node.bits()) == -1 &&
+          i2s_sext(v1, node.bits()) == i2s_sext(1ULL << (node.bits() - 1), node.bits()))
+        return false;
+      break;
+    default: break;
+  }
+  // the signed operations are computed on 64-bit signed values, so the operands
+  // have to carry their sign up from the node's width first
+  switch (node.kind()) {
+    case rgd::AShr:
+      v1 = (uint64_t)i2s_sext(v1, node.bits());
+      break;
+    case rgd::SDiv: case rgd::SRem:
+      v1 = (uint64_t)i2s_sext(v1, node.bits());
+      v2 = (uint64_t)i2s_sext(v2, node.bits());
+      break;
+    default: break;
+  }
+  out = _get_binop_value(v1, v2, node.kind()) & i2s_mask(node.bits());
+  return true;
+}
+
+// The distinct values a subtree can take, when that set is small and statically
+// knowable.  Only a lookup table gives one: a TLookup can produce nothing but
+// the values its table holds, and a width cast or an operation against a
+// constant maps that set through.  Returns false as soon as the set stops being
+// enumerable, leaving the caller to fall back to the single value the subtree
+// holds under the current input.
+static bool i2s_value_domain_r(i2s_ctx &ctx, const AstNode &n_,
+                               std::vector<uint64_t> &out, uint32_t depth) {
+  if (unlikely(depth > kI2SMaxDepth)) return false;
+  const AstNode *np = i2s_resolve(ctx, n_);
+  if (unlikely(np == nullptr)) return false;
+  auto const& node = *np;
+  if (unlikely(node.bits() == 0 || node.bits() > 64)) return false;
+  uint64_t m = i2s_mask(node.bits());
+  auto emit = [&out, m](uint64_t v) -> bool {
+    v &= m;
+    for (auto e : out) if (e == v) return true;
+    if (out.size() >= kI2SMaxDomain) return false;
+    out.push_back(v);
+    return true;
+  };
+  switch (node.kind()) {
+    case rgd::TLookup: {
+      if (unlikely(node.index() >= ctx.c->input_args.size())) return false;
+      uint64_t num_elems = ctx.c->input_args[node.index()].second;
+      if (num_elems == 0 || num_elems > kI2SMaxDomain) return false;
+      for (uint64_t i = 0; i < num_elems; ++i) {
+        uint64_t elem = 0;
+        if (!i2s_table_elem(ctx, node, i, elem)) return false;
+        if (!emit(elem)) return false;
+      }
+      return true;
+    }
+    case rgd::ZExt: case rgd::SExt: case rgd::Extract: {
+      auto const& ch = node.children(0);
+      std::vector<uint64_t> sub;
+      if (!i2s_value_domain_r(ctx, ch, sub, depth + 1)) return false;
+      if (node.kind() == rgd::Extract && node.index() >= 64) return false;
+      for (auto v : sub) {
+        uint64_t r;
+        if (node.kind() == rgd::ZExt) r = v & i2s_mask(ch.bits());
+        else if (node.kind() == rgd::SExt) r = (uint64_t)i2s_sext(v, ch.bits());
+        else r = v >> node.index();
+        if (!emit(r)) return false;
+      }
+      return true;
+    }
+    // deliberately no Concat: the cross product of two domains is not small
+    default: break;
+  }
+  // A binary operation against a constant maps the other operand's domain
+  // through it -- (dehex[a] << 4) has the same 16-element domain that dehex
+  // does, scaled.  Division and remainder are left out rather than guarded
+  // against their poison cases; nothing needs them here.
+  switch (node.kind()) {
+    case rgd::Add: case rgd::Sub: case rgd::Mul: case rgd::Xor:
+    case rgd::And: case rgd::Or:
+    case rgd::Shl: case rgd::LShr: case rgd::AShr:
+      break;
+    default: return false;
+  }
+  auto const& l = node.children(0);
+  auto const& r = node.children(1);
+  bool sym_is_rhs;
+  if (l.kind() == rgd::Constant) sym_is_rhs = true;
+  else if (r.kind() == rgd::Constant) sym_is_rhs = false;
+  else return false;
+  uint64_t const_op = 0;
+  if (!i2s_eval_int(ctx, sym_is_rhs ? l : r, const_op, depth + 1)) return false;
+  std::vector<uint64_t> sub;
+  if (!i2s_value_domain_r(ctx, sym_is_rhs ? r : l, sub, depth + 1)) return false;
+  for (auto v : sub) {
+    uint64_t v1 = sym_is_rhs ? const_op : v;
+    uint64_t v2 = sym_is_rhs ? v : const_op;
+    switch (node.kind()) {
+      // an over-wide shift is poison, so there is no value to report
+      case rgd::Shl: case rgd::LShr: case rgd::AShr:
+        if (v2 >= node.bits()) return false;
+        if (node.kind() == rgd::AShr) v1 = (uint64_t)i2s_sext(v1, node.bits());
+        break;
+      default: break;
+    }
+    if (!emit(_get_binop_value(v1, v2, node.kind()))) return false;
+  }
+  return true;
+}
+
+// Values worth pinning an operand at, best first.  Always begins with the value
+// the operand already holds, so a constraint that solves today keeps taking the
+// same route; a table-derived operand then contributes the rest of its range.
+//
+// The extra values are what split an Add whose operands are both symbolic and
+// neither of which can reach the target alone.  In
+// (dehex[a] << 4) + dehex[b] == 0xab the left operand can only be a multiple of
+// 16 and the right only 0..15, so pinning either at whatever it happens to hold
+// never finds the 0xa0 + 0x0b split; enumerating one side's 16 values does.
+static void i2s_value_domain(i2s_ctx &ctx, const AstNode &node, uint64_t cur,
+                             std::vector<uint64_t> &out, uint32_t depth) {
+  out.clear();
+  if (!i2s_value_domain_r(ctx, node, out, depth)) out.clear();
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (out[i] == cur) { std::swap(out[0], out[i]); return; }
+  }
+  out.insert(out.begin(), cur);
+}
+
+// Reverse a binary operation for its symbolic operand: given the other
+// operand's value `const_op`, the wanted result `target`, and the value the
+// symbolic operand holds right now (`cur`), produce the value it should take.
+// `rhs` says the symbolic operand is on the right of the operation.
+//
+// The kinds handled explicitly are the ones that do NOT determine every bit of
+// their operand -- a shift drops bits off one end, a mask keeps only the bits
+// the constant selects, a remainder fixes only the residue.  Those bits are
+// filled back in from `cur` rather than zeroed, which is what makes a
+// hex-encoding pair work: `x >> 4` and `x % 16` constrain different nibbles of
+// the same input byte, and each has to leave the other's nibble alone.
+// Everything else falls through to _get_binop_value_r, whose rejects are
+// screened here because they would otherwise warn and return a placeholder
+// (solving for a shift amount) or divide by zero.
+//
+// Returns false when the target is unreachable through this operation.
+static bool i2s_binop_invert(uint16_t kind, bool rhs, uint64_t const_op,
+                             uint64_t target, uint64_t cur, uint32_t bits,
+                             uint64_t &want) {
+  uint64_t m = i2s_mask(bits);
+  target &= m; const_op &= m; cur &= m;
+  switch (kind) {
+    case rgd::And: {
+      // v & c == r: r may not set a bit that c clears, and the bits c clears
+      // are unconstrained in v, so keep them
+      if ((target & ~const_op & m) != 0) return false;
+      want = (target & const_op) | (cur & ~const_op & m);
+      return true;
+    }
+    case rgd::Or: {
+      // v | c == r: every bit c sets must be set in r, and those bits of v are
+      // free
+      if ((const_op & ~target & m) != 0) return false;
+      want = (target & ~const_op & m) | (cur & const_op);
+      return true;
+    }
+    case rgd::Shl: case rgd::LShr: case rgd::AShr: {
+      if (rhs) return false; // solving for the shift amount is not supported
+      if (const_op >= bits) return false;
+      if (const_op == 0) { want = target; return true; }
+      if (kind == rgd::Shl) {
+        // v << c == r: the low c bits of r must be zero; the top c bits of v
+        // are shifted out and keep whatever they hold
+        if ((target & i2s_mask((uint32_t)const_op)) != 0) return false;
+        uint64_t det = i2s_mask(bits - (uint32_t)const_op);
+        want = ((target >> const_op) & det) | (cur & ~det & m);
+      } else {
+        // v >> c == r: the low c bits of v are shifted out and keep whatever
+        // they hold.  An AShr target that disagrees with the sign it implies is
+        // left for the caller's re-evaluation to reject.
+        if (kind == rgd::LShr && (target >> (bits - (uint32_t)const_op)) != 0)
+          return false; // r too wide to have come from a logical shift
+        uint64_t det = ~i2s_mask((uint32_t)const_op) & m;
+        want = ((target << const_op) & det) | (cur & ~det & m);
+      }
+      return true;
+    }
+    case rgd::URem: case rgd::SRem: {
+      if (rhs) return false; // solving for the divisor is not supported
+      if (const_op == 0 || target >= const_op) return false;
+      // v % c == r: only the residue is pinned, so stay on the multiple of c
+      // that `cur` already sits on
+      want = ((cur / const_op) * const_op + target) & m;
+      return true;
+    }
+    case rgd::Mul:
+      if (const_op == 0) return false; // v = r / const_op, either side
+      break;
+    case rgd::UDiv: case rgd::SDiv:
+      // lhs: v = r * const_op.  rhs: v = const_op / r, so r must be a safe divisor
+      if (rhs && (target == 0 || (int64_t)target == -1)) return false;
+      break;
+    case rgd::Add: case rgd::Sub: case rgd::Xor:
+      break;
+    default:
+      return false;
+  }
+  want = _get_binop_value_r(target, const_op, kind, rhs) & m;
+  return true;
+}
+
+// Push `target` down the AST toward the Read leaves, recording the byte writes
+// it implies in ctx.assign.  On failure ctx.assign is left as it was on entry.
+static bool i2s_invert(i2s_ctx &ctx, const AstNode &n_, uint64_t target,
+                       uint32_t depth) {
+  if (unlikely(depth > kI2SMaxDepth || ctx.steps == 0)) return false;
+  ctx.steps--;
+  const AstNode *np = i2s_resolve(ctx, n_);
+  if (unlikely(np == nullptr)) return false;
+  auto const& node = *np;
+  if (unlikely(node.bits() == 0 || node.bits() > 64)) return false;
+  target &= i2s_mask(node.bits());
+  DEBUGF("i2s-invert: %*skind %u, bits %u, target 0x%lx\n", depth * 2, "",
+         node.kind(), node.bits(), target);
+  switch (node.kind()) {
+    case rgd::Read: {
+      uint32_t bytes = node.bits() / 8;
+      if (unlikely(bytes == 0 || bytes > 8 || node.bits() % 8 != 0)) return false;
+      if (unlikely(node.index() + bytes > ctx.in_size)) return false;
+      for (uint32_t i = 0; i < bytes; ++i)
+        ctx.assign.push_back({node.index() + i, (uint8_t)(target >> (i * 8))});
+      return true;
+    }
+    case rgd::Constant:
+      // nothing to rewrite; reachable only if it already holds the wanted value
+      return node.index() < ctx.c->input_args.size() &&
+             (ctx.c->input_args[node.index()].second & i2s_mask(node.bits())) == target;
+    case rgd::ZExt: {
+      auto const& ch = node.children(0);
+      // the extended bits are zero by construction, so a target that sets any
+      // of them is simply unreachable
+      if (ch.bits() < 64 && (target >> ch.bits()) != 0) return false;
+      return i2s_invert(ctx, ch, target, depth + 1);
+    }
+    case rgd::SExt: {
+      auto const& ch = node.children(0);
+      int64_t s = i2s_sext(target, node.bits());
+      // must be representable in the narrower child, or nothing extends to it
+      if (i2s_sext((uint64_t)s, ch.bits()) != s) return false;
+      return i2s_invert(ctx, ch, (uint64_t)s, depth + 1);
+    }
+    case rgd::Extract: {
+      // only the extracted window is constrained; hold the rest of the child at
+      // whatever it evaluates to now
+      auto const& ch = node.children(0);
+      if (unlikely(ch.bits() > 64 || node.index() + node.bits() > ch.bits()))
+        return false;
+      uint64_t cur = 0;
+      if (!i2s_eval_int(ctx, ch, cur, depth + 1)) return false;
+      uint64_t win = i2s_mask(node.bits()) << node.index();
+      return i2s_invert(ctx, ch, (cur & ~win) | (target << node.index()), depth + 1);
+    }
+    case rgd::Concat: {
+      auto const& lo = node.children(0);
+      auto const& hi = node.children(1);
+      if (unlikely(lo.bits() >= 64)) return false;
+      size_t mark = ctx.assign.size();
+      if (!i2s_invert(ctx, lo, target & i2s_mask(lo.bits()), depth + 1) ||
+          !i2s_invert(ctx, hi, target >> lo.bits(), depth + 1)) {
+        ctx.assign.resize(mark);
+        return false;
+      }
+      return true;
+    }
+    case rgd::TLookup: {
+      // Scan the table for an entry equal to the wanted output and drive the
+      // index expression to its position.  Tables are routinely non-injective
+      // (a dehex table maps both '0'..'9' and 'a'..'f' onto 0..15), so try each
+      // matching entry in turn and keep the first whose index actually inverts.
+      // The re-evaluation matters: inverting through a bitwise op is a guess.
+      if (unlikely(node.index() >= ctx.c->input_args.size())) return false;
+      uint64_t num_elems = ctx.c->input_args[node.index()].second;
+      for (uint64_t i = 0; i < num_elems; ++i) {
+        uint64_t elem = 0;
+        if (!i2s_table_elem(ctx, node, i, elem)) return false;
+        if (elem != target) continue;
+        size_t mark = ctx.assign.size();
+        if (i2s_invert(ctx, node.children(0), i, depth + 1)) {
+          uint64_t check = 0;
+          if (i2s_eval_int(ctx, node.children(0), check, depth + 1) && check == i)
+            return true;
+        }
+        ctx.assign.resize(mark);
+      }
+      return false;
+    }
+    default: break;
+  }
+  if (!isBinaryOperation(node.kind())) return false;
+
+  // Binary operation.  With one Constant child there is a single way down, and
+  // _get_binop_value_r is an exact inverse for most kinds.  With two symbolic
+  // children -- the (dehex[a] << 4) + dehex[b] shape -- neither side is fixed,
+  // so pin one at the value it takes under the current input and invert the
+  // other as if that were the constant; try both orders.  Pinning is only valid
+  // while the pinned side's bytes stay put, which is exactly what the
+  // re-evaluation at the bottom of the loop checks.
+  auto const& l = node.children(0);
+  auto const& r = node.children(1);
+  const AstNode *sym[2] = {nullptr, nullptr};
+  bool sym_is_rhs[2] = {false, false};
+  size_t n_try = 0;
+  if (l.kind() == rgd::Constant) {
+    sym[n_try] = &r; sym_is_rhs[n_try] = true; n_try++;
+  } else if (r.kind() == rgd::Constant) {
+    sym[n_try] = &l; sym_is_rhs[n_try] = false; n_try++;
+  } else {
+    sym[0] = &l; sym_is_rhs[0] = false;
+    sym[1] = &r; sym_is_rhs[1] = true;
+    n_try = 2;
+  }
+  std::vector<uint64_t> domain;
+  for (size_t k = 0; k < n_try; ++k) {
+    auto const& other = sym_is_rhs[k] ? l : r;
+    uint64_t other_cur = 0, cur = 0;
+    if (!i2s_eval_int(ctx, other, other_cur, depth + 1)) continue;
+    // the symbolic side's present value, so that an operation which does not
+    // determine all of its operand's bits can carry the rest over unchanged
+    if (!i2s_eval_int(ctx, *sym[k], cur, depth + 1)) continue;
+    if (other.kind() == rgd::Constant) domain.assign(1, other_cur);
+    else i2s_value_domain(ctx, other, other_cur, domain, depth + 1);
+    for (uint64_t const_op : domain) {
+      uint64_t want = 0;
+      if (!i2s_binop_invert(node.kind(), sym_is_rhs[k], const_op, target, cur,
+                            node.bits(), want))
+        continue;
+      size_t mark = ctx.assign.size();
+      // A pin at a value the operand does not already hold has to be made true,
+      // not just assumed -- drive that side first, then the other.  The two can
+      // land on the same input byte, which is what the whole-node re-evaluation
+      // below is here to catch.
+      bool pinned = const_op == other_cur ||
+                    i2s_invert(ctx, other, const_op, depth + 1);
+      if (pinned && i2s_invert(ctx, *sym[k], want, depth + 1)) {
+        uint64_t check = 0;
+        if (i2s_eval_int(ctx, node, check, depth) &&
+            (check & i2s_mask(node.bits())) == target)
+          return true;
+      }
+      ctx.assign.resize(mark);
+    }
+  }
+  return false;
+}
+
+// Walk a Concat spine, handing each leaf the slice of `target` it covers.
+// `bit_off` is the leaf's position within the buffer, low bits first: byte 0 of
+// a memcmp target is the low end, the same convention the direct path in
+// solve_memcmp writes with.  The whole spine is split here rather than in
+// i2s_invert because every level would otherwise eat one of that walk's depth
+// budget, and a 16-element buffer is 15 levels deep before any real expression
+// begins.
+//
+// With invert=false this only re-evaluates and compares, which is how the whole
+// candidate is verified once every leaf has been written -- leaves are inverted
+// independently, so two of them sharing an input byte can only be caught at the
+// end.
+static bool i2s_walk_wide(i2s_ctx &ctx, const AstNode &n_, const uint8_t *target,
+                          size_t target_size, size_t bit_off, bool invert,
+                          uint32_t depth) {
+  if (unlikely(depth > kI2SMaxWideDepth)) return false;
+  const AstNode *np = i2s_resolve(ctx, n_);
+  if (unlikely(np == nullptr)) return false;
+  auto const& node = *np;
+  if (unlikely(node.bits() == 0 || node.bits() % 8 != 0)) return false;
+  if (node.kind() == rgd::Concat) {
+    auto const& lo = node.children(0);
+    return i2s_walk_wide(ctx, lo, target, target_size, bit_off, invert, depth + 1) &&
+           i2s_walk_wide(ctx, node.children(1), target, target_size,
+                         bit_off + lo.bits(), invert, depth + 1);
+  }
+  if (unlikely(node.bits() > 64 || bit_off % 8 != 0)) return false;
+  size_t byte_off = bit_off / 8;
+  size_t n = node.bits() / 8;
+  if (unlikely(byte_off + n > target_size)) return false;
+  uint64_t want = 0;
+  for (size_t i = 0; i < n; ++i)
+    want |= (uint64_t)target[byte_off + i] << (i * 8);
+  if (invert)
+    return i2s_invert(ctx, node, want, 0);
+  uint64_t got = 0;
+  return i2s_eval_int(ctx, node, got, 0) && got == want;
+}
+
+// already be masked to `bits`.
+static bool i2s_eval_icmp(uint32_t comparison, uint64_t a, uint64_t b,
+                          uint32_t bits) {
+  int64_t sa = i2s_sext(a, bits), sb = i2s_sext(b, bits);
+  switch (comparison) {
+    case rgd::Equal:    return a == b;
+    case rgd::Distinct: return a != b;
+    case rgd::Ult:      return a < b;
+    case rgd::Ule:      return a <= b;
+    case rgd::Ugt:      return a > b;
+    case rgd::Uge:      return a >= b;
+    case rgd::Slt:      return sa < sb;
+    case rgd::Sle:      return sa <= sb;
+    case rgd::Sgt:      return sa > sb;
+    case rgd::Sge:      return sa >= sb;
+    default:            return false;
+  }
+}
+
 I2SSolver::I2SSolver(): matches(0), mismatches(0) {
   binop_mask.set(rgd::Add);
   binop_mask.set(rgd::Sub);
@@ -852,7 +1485,110 @@ I2SSolver::solve_icmp(std::shared_ptr<const Constraint> const& c,
       return SOLVER_SAT;
     }
   }
+  // No offset in the input holds the compared value (or its byte-reverse), and
+  // no single binop under the comparison explains one.  Fall back to walking
+  // the AST, which is the only route to a table lookup -- whose output is never
+  // in the input -- or to nested arithmetic.  Placed after the loop rather than
+  // inside it so nothing above changes behaviour.
+  return solve_ast(c, comparison, in_buf, in_size, out_buf, out_size);
+}
+
+solver_result_t
+I2SSolver::solve_ast(std::shared_ptr<const Constraint> const& c,
+                     uint32_t comparison,
+                     const uint8_t *in_buf, size_t in_size,
+                     uint8_t *out_buf, size_t &out_size) {
+
+  auto const& root = *c->get_root();
+  if (unlikely(root.children_size() != 2)) return SOLVER_TIMEOUT;
+  auto const& lc = root.children(0);
+  auto const& rc = root.children(1);
+  uint32_t bits = lc.bits();
+  if (unlikely(bits == 0 || bits > 64 || rc.bits() != bits)) return SOLVER_TIMEOUT;
+
+  DEBUGF("i2s: try ast, comparison = %u, bits = %u\n", comparison, bits);
+
+  i2s_ctx ctx{c, in_buf, in_size, {}, {}, kI2SMaxSteps};
+  i2s_index_nodes(root, ctx.nodes, 0);
+  // Try each side as the one to rewrite: pin the other at the value it takes
+  // under the current input, aim for whatever makes the comparison hold, and
+  // push that down the AST.
+  for (int side = 0; side < 2; ++side) {
+    auto const& sym = side == 0 ? lc : rc;
+    auto const& fixed = side == 0 ? rc : lc;
+    if (sym.kind() == rgd::Constant) continue;
+    ctx.assign.clear();
+    uint64_t pinned = 0;
+    if (!i2s_eval_int(ctx, fixed, pinned, 0)) continue;
+    // get_i2s_value's rhs argument means "the rewritten side is the right hand
+    // side of the comparison", so it is side != 0 here
+    uint64_t target =
+        get_i2s_value(comparison, pinned & i2s_mask(bits), side != 0) & i2s_mask(bits);
+    if (!i2s_invert(ctx, sym, target, 0)) continue;
+    // Verify.  Everything above may have guessed, so re-evaluate BOTH sides
+    // under the candidate and check the relation really holds -- the pinned
+    // side included, since inverting the other one may have moved bytes it
+    // reads.
+    uint64_t a = 0, b = 0;
+    if (!i2s_eval_int(ctx, lc, a, 0)) continue;
+    if (!i2s_eval_int(ctx, rc, b, 0)) continue;
+    if (!i2s_eval_icmp(comparison, a & i2s_mask(bits), b & i2s_mask(bits), bits))
+      continue;
+    matches++;
+    if (out_size == 0) memcpy(out_buf, in_buf, in_size); // make a copy
+    out_size = in_size;
+    for (auto const& kv : ctx.assign) {
+      if (likely(kv.first < in_size)) out_buf[kv.first] = (uint8_t)kv.second;
+      DEBUGF("i2s-ast: %zu = 0x%02x\n", kv.first, kv.second);
+    }
+    return SOLVER_SAT;
+  }
   return SOLVER_TIMEOUT;
+}
+
+solver_result_t
+I2SSolver::solve_memcmp_ast(std::shared_ptr<const Constraint> const& c,
+                            const uint8_t *in_buf, size_t in_size,
+                            uint8_t *out_buf, size_t &out_size) {
+
+  auto const& root = *c->get_root();
+  if (unlikely(root.children_size() != 2)) return SOLVER_TIMEOUT;
+  auto const& want_node = root.children(0);
+  auto const& sym = root.children(1);
+  // same restriction as the value-based path: only memcmp(const, symbolic)
+  if (want_node.kind() != rgd::Constant) return SOLVER_TIMEOUT;
+  uint32_t bits = sym.bits();
+  if (unlikely(bits == 0 || bits % 8 != 0 || want_node.bits() != bits))
+    return SOLVER_TIMEOUT;
+  size_t nbytes = bits / 8;
+
+  DEBUGF("i2s: try memcmp ast, %zu bytes\n", nbytes);
+
+  // unpack the memcmp target: 8 bytes per constant arg, little-endian, in
+  // increasing address order (parsers/rgd-parser.cpp packs it that way)
+  uint32_t base = want_node.index();
+  std::vector<uint8_t> want(nbytes);
+  for (size_t i = 0; i < nbytes; ++i) {
+    size_t arg = base + i / 8;
+    if (unlikely(arg >= c->input_args.size())) return SOLVER_TIMEOUT;
+    want[i] = (uint8_t)(c->input_args[arg].second >> ((i % 8) * 8));
+  }
+
+  i2s_ctx ctx{c, in_buf, in_size, {}, {}, kI2SMaxSteps};
+  i2s_index_nodes(root, ctx.nodes, 0);
+  if (!i2s_walk_wide(ctx, sym, want.data(), nbytes, 0, /*invert=*/true, 0))
+    return SOLVER_TIMEOUT;
+  if (!i2s_walk_wide(ctx, sym, want.data(), nbytes, 0, /*invert=*/false, 0))
+    return SOLVER_TIMEOUT;
+
+  matches++;
+  if (out_size == 0) memcpy(out_buf, in_buf, in_size); // make a copy
+  out_size = in_size;
+  for (auto const& kv : ctx.assign) {
+    if (likely(kv.first < in_size)) out_buf[kv.first] = (uint8_t)kv.second;
+    DEBUGF("i2s-memcmp-ast: %zu = 0x%02x\n", kv.first, kv.second);
+  }
+  return SOLVER_SAT;
 }
 
 solver_result_t
@@ -875,14 +1611,15 @@ I2SSolver::solve_memcmp(std::shared_ptr<const Constraint> const& c,
   }
   if (cm->i2s_candidates.size() != 1) {
     // FIXME: only support single i2s candidate
-    WARNF("only support single i2s candidate\n");
-    return SOLVER_TIMEOUT;
+    // The AST walk has no such restriction: it writes wherever the Read leaves
+    // say, so scattered input bytes are fine.
+    return solve_memcmp_ast(c, in_buf, in_size, out_buf, out_size);
   }
   size_t offset = cm->i2s_candidates[0].first;
   uint32_t size = cm->i2s_candidates[0].second;
   if (size != c->local_map.size()) {
     WARNF("input size mismatch\n");
-    return SOLVER_TIMEOUT;
+    return solve_memcmp_ast(c, in_buf, in_size, out_buf, out_size);
   }
   // make a copy of the input if not already
   if (out_size == 0) memcpy(out_buf, in_buf, in_size);
@@ -907,6 +1644,16 @@ I2SSolver::solve_memcmp(std::shared_ptr<const Constraint> const& c,
     return SOLVER_SAT;
   } else {
     // there could be transformations on the input
+    //
+    // Try the AST walk first.  Its answer is verified byte by byte, while the
+    // one-sample guesses below are inferred from a single input/output pair and
+    // can return a confident wrong answer: a `% 16` in the encoder puts SRem in
+    // c->ops, and _get_binop_value_r reverses SRem-with-a-constant-divisor as
+    // the identity, so the guess degenerates into copying the memcmp target
+    // straight into the input.  Fall through to them only if the AST is not
+    // enough (an encoding built from ops the walk does not model).
+    if (solve_memcmp_ast(c, in_buf, in_size, out_buf, out_size) == SOLVER_SAT)
+      return SOLVER_SAT;
     auto *info = __dfsan::get_label_info(c->get_root()->label());
     uint64_t sample = info->op2.i;
     uint16_t sample_len = info->size > 8 ? 8 : info->size;
@@ -994,6 +1741,7 @@ I2SSolver::solve_memcmp(std::shared_ptr<const Constraint> const& c,
       out_size = in_size;
       return SOLVER_SAT;
     } else {
+      // the AST walk was already tried at the top of this branch
       return SOLVER_TIMEOUT;
     }
   }

@@ -41,6 +41,7 @@ public:
     (void)inputs;
     (void)copy_input;
     memcmp_cache_.clear();
+    table_cache_.clear();
     return 0;
   }
   /// @brief Parse a conditional branch
@@ -90,6 +91,27 @@ public:
     return 0;
   };
 
+  /// @brief Record the contents of a read-only global lookup table
+  ///
+  /// Unlike memcmp targets, a table is keyed on its base address rather than a
+  /// label: one table backs every tlookup over it, and the runtime therefore
+  /// ships the bytes only on the first lookup of each trace.
+  ///
+  /// @param ptr base address of the table in the target's address space
+  /// @param buf table contents, copied
+  /// @param size num_elems * elem_size, in bytes
+  /// @return 0 on success, -1 on failure
+  virtual int record_table(uint64_t ptr, uint8_t* buf, size_t size) {
+    auto content = std::make_unique<uint8_t[]>(size);
+    memcpy(content.get(), buf, size);
+    // overwrite rather than insert: a table resent after the tracked-tables cap
+    // was exceeded carries the same bytes, but re-recording keeps it simple
+    auto &entry = table_cache_[ptr];
+    entry.data = std::move(content);
+    entry.size = size;
+    return 0;
+  };
+
   // use shared_ptr to auto-free task
   virtual std::shared_ptr<T> retrieve_task(uint64_t id) {
     auto it = tasks_.find(id);
@@ -115,11 +137,20 @@ protected:
     return tid;
   }
 
+  /// A lookup table's shipped bytes.  The size is kept alongside because,
+  /// unlike a memcmp target, it cannot be recovered from a single label: the
+  /// element count lives in op2 of whichever tlookup label is being parsed.
+  struct table_content {
+    std::unique_ptr<uint8_t[]> data;
+    size_t size = 0;
+  };
+
   dfsan_label_info *base_;
   size_t size_;
   uint64_t prev_task_id_;
   std::unordered_map<uint64_t, std::shared_ptr<T>> tasks_;
   std::unordered_map<dfsan_label, std::unique_ptr<uint8_t[]>> memcmp_cache_;
+  std::unordered_map<uint64_t, table_content> table_cache_;
 };
 
 }; // namespace symsan

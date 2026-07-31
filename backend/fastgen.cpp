@@ -261,6 +261,84 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
   return;
 }
 
+// Lookup tables whose contents we have already shipped.  Each trace runs in a
+// freshly forked child, so this needs no explicit per-trace reset.  If a program
+// somehow exceeds the cap we simply resend, which costs bandwidth but stays
+// correct.
+static const unsigned kMaxTrackedTables = 64;
+static uptr __sent_tables[kMaxTrackedTables];
+static unsigned __num_sent_tables = 0;
+
+static bool __table_already_sent(uptr ptr) {
+  for (unsigned i = 0; i < __num_sent_tables; i++) {
+    if (__sent_tables[i] == ptr)
+      return true;
+  }
+  if (__num_sent_tables < kMaxTrackedTables)
+    __sent_tables[__num_sent_tables++] = ptr;
+  return false;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
+__taint_table_lookup(dfsan_label index_label, int64_t index,
+                     uint64_t table_ptr, uint64_t num_elems,
+                     uint64_t elem_size) {
+  if (index_label == 0)
+    return 0;
+
+  void *addr = __builtin_return_address(0);
+
+  if (index_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", index_label, addr);
+    if (flags().exit_on_memerror) Die();
+    else return 0;
+  }
+
+  // Out-of-range index: the trace has already read past the table, so the value
+  // loaded is not something this op describes.  Leave it concrete rather than
+  // handing the solver a model that does not match what ran.
+  if (index < 0 || (uint64_t)index >= num_elems)
+    return 0;
+
+  AOUT("tainted table lookup: table %lx[%lld] = %d, ne: %lu, es: %lu\n",
+       table_ptr, index, index_label, num_elems, elem_size);
+
+  // The solver is in another process and cannot read the table, so ship its
+  // contents once.  Same two-part shape as the memcmp target above.
+  if (__pipe_fd >= 0 && !__table_already_sent((uptr)table_ptr)) {
+    uint64_t content_size = num_elems * elem_size;
+    pipe_msg msg = {
+      .msg_type = table_type,
+      .flags = 0,
+      .instance_id = __instance_id,
+      .addr = (uptr)addr,
+      .context = __taint_trace_callstack,
+      .label = index_label, // just in case
+      .result = content_size
+    };
+
+    if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
+      Die();
+    }
+
+    size_t msg_size = sizeof(table_msg) + content_size;
+    table_msg *tmsg = (table_msg*)__builtin_alloca(msg_size);
+    tmsg->ptr = (uptr)table_ptr;
+    tmsg->num_elems = num_elems;
+    tmsg->elem_size = elem_size;
+    internal_memcpy(tmsg->content, (void*)table_ptr, content_size);
+
+    // FIXME: assuming single writer so msg will arrive in the same order
+    if (internal_write(__pipe_fd, tmsg, msg_size) < 0) {
+      Die();
+    }
+  }
+
+  return dfsan_union(index_label, 0, __dfsan::tlookup,
+                     (uint16_t)(elem_size * 8), table_ptr, num_elems);
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, s64 offset, unsigned size) {
   // use add_constraint_type to send offset constraints

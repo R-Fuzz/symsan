@@ -227,6 +227,8 @@ public:
   void on_cond(const symsan::pipe_msg &msg) override;
   void on_gep(const symsan::pipe_msg &msg, const symsan::gep_msg &gmsg) override;
   void on_memcmp(const symsan::pipe_msg &msg, const uint8_t *content, size_t size) override;
+  void on_table(const symsan::pipe_msg &msg, const symsan::table_msg &tmsg,
+                const uint8_t *content, size_t size) override;
   void on_memerr(const symsan::pipe_msg &msg) override;
 
 private:

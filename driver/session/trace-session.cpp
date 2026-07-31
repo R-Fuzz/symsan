@@ -228,6 +228,27 @@ trace_result_t TraceSession::run(int fd, EventHandler &handler) {
         break;
       }
 
+      case table_type: {
+        // Always carries a payload -- unlike memcmp there is no "both operands
+        // symbolic" case -- so drain it before any validation, or a rejected
+        // table takes the rest of the stream with it.
+        size_t msg_size = sizeof(table_msg) + msg.result;
+        payload.resize(msg_size);
+        table_msg *tmsg = (table_msg *)payload.data();
+        if (symsan_read_event(tmsg, msg_size, 0) != (ssize_t)msg_size) {
+          warn("failed to receive table msg: %s\n", strerror(errno));
+          break;
+        }
+        // double check: the runtime derives result from the table geometry
+        if (tmsg->num_elems * tmsg->elem_size != msg.result) {
+          warn("incorrect table msg: %lu x %lu vs %lu\n", tmsg->num_elems,
+               tmsg->elem_size, msg.result);
+          break;
+        }
+        handler.on_table(msg, *tmsg, tmsg->content, msg.result);
+        break;
+      }
+
       case add_constraint_type:
         handler.on_add_constraint(msg);
         break;

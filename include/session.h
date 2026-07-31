@@ -32,6 +32,7 @@ namespace symsan {
 using __dfsan::pipe_msg;
 using __dfsan::gep_msg;
 using __dfsan::memcmp_msg;
+using __dfsan::table_msg;
 
 /// Install the union table that __dfsan::get_label_info() resolves against.
 ///
@@ -89,6 +90,8 @@ enum trace_result_t {
 /// delivered once its gep_msg has been read and its index_label matches, and a
 /// memcmp event only once its payload has been read and its label matches.
 /// Malformed events are dropped with a diagnostic and never reach the handler.
+/// Note that dropping still consumes the payload, so that one bad event costs
+/// that event rather than desynchronizing the rest of the stream.
 class EventHandler {
 public:
   virtual ~EventHandler() {}
@@ -107,6 +110,15 @@ public:
   /// operands were symbolic or the compared size was zero.
   virtual void on_memcmp(const pipe_msg &msg, const uint8_t *content, size_t size) {
     (void)msg; (void)content; (void)size;
+  }
+
+  /// the contents of a read-only global lookup table (table_type), shipped once
+  /// per table per trace because the solver runs in another process.  @p content
+  /// points at @p size bytes valid only for the duration of the call; the table
+  /// is identified by @p tmsg.ptr, not by a label.
+  virtual void on_table(const pipe_msg &msg, const table_msg &tmsg,
+                        const uint8_t *content, size_t size) {
+    (void)msg; (void)tmsg; (void)content; (void)size;
   }
 
   /// an explicit constraint, typically from a symbolic offset (add_constraint_type)

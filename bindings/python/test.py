@@ -18,6 +18,13 @@ class memcmp_msg(ctypes.Structure):
     _fields_ = [("label", ctypes.c_uint32)]
     content = bytes()
 
+class table_msg(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [("ptr", ctypes.c_ulonglong),
+                ("num_elems", ctypes.c_ulonglong),
+                ("elem_size", ctypes.c_ulonglong)]
+    content = bytes()
+
 prog = sys.argv[1]
 file = sys.argv[2]
 
@@ -56,6 +63,18 @@ while True:
         buf.content = m[ctypes.sizeof(memcmp_msg):]
         print(f"memcmp content: {buf.content.hex()}")
         symsan.record_memcmp(label, buf.content)
+    elif msg.type == 11:
+        # table_type: the z3 backend does not model tlookup, but the payload
+        # still has to be consumed or every later message is misread
+        size = msg.result
+        m = symsan.read_event(ctypes.sizeof(table_msg) + size)
+        if len(m) < ctypes.sizeof(table_msg) + size:
+            print("error reading table msg")
+            break
+        tbl = table_msg.from_buffer_copy(m)
+        tbl.content = m[ctypes.sizeof(table_msg):]
+        print(f"table {tbl.ptr:x}: {tbl.num_elems} x {tbl.elem_size}, "
+              f"{tbl.content.hex()}")
 
     for task in tasks:
         r, sols = symsan.solve_task(task)

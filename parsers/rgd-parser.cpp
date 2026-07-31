@@ -204,6 +204,7 @@ int RGDAstParser::restart(std::vector<symsan::input_t> &inputs, bool copy_input)
   inputs_cache = inputs;
   // clear caches
   memcmp_cache_.clear(); // inherited from ASTParser
+  table_cache_.clear();  // ditto; both overrides skip ASTParser::restart
   root_expr_cache.clear();
   constraint_cache.clear();
   ast_size_cache.clear();
@@ -389,6 +390,78 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_hash(hash);
 #if NEED_OFFLINE
     ret->set_name("memcmp");
+#endif
+    return true;
+  } else if (info->op == __dfsan::tlookup) {
+    // A load from a read-only global table at a symbolic index.  The single
+    // child is the index expression; the loaded value is what this node stands
+    // for.  Table contents travel out of band (table_type messages, cached by
+    // base address) because the solver is in another process, and they are
+    // packed into input_args the same way a memcmp target is -- AstNode has
+    // nowhere else to carry a blob.  Layout, starting at index():
+    //
+    //   [0]            num_elems
+    //   [1 .. 1+n-1]   the table bytes, 8 per arg, little-endian
+    //
+    // so the node is self-describing to solvers/i2s-solver.cpp, the only
+    // consumer.  jigsaw and z3 decline this kind.
+    auto itr = table_cache_.find(info->op1.i);
+    if (unlikely(itr == table_cache_.end())) {
+      WARNF("table contents not found for %#lx (label %u)\n", info->op1.i, label);
+      return false;
+    }
+    uint64_t num_elems = info->op2.i;
+    size_t tbl_size = itr->second.size;
+    if (unlikely(info->size == 0 || info->size % 8 != 0 ||
+                 num_elems * (info->size / 8) != tbl_size)) {
+      WARNF("table geometry mismatch for label %u: %lu x %u vs %lu bytes\n",
+            label, num_elems, info->size / 8, tbl_size);
+      return false;
+    }
+    rgd::AstNode *index = ret->add_children();
+    if (unlikely(index == nullptr)) {
+      WARNF("failed to add children\n");
+      return false;
+    }
+    if (unlikely(info->l1 < CONST_OFFSET)) {
+      // a concrete index would have left the load concrete in the first place
+      WARNF("table lookup with concrete index, label %u\n", label);
+      return false;
+    }
+    if (!do_uta_rel(info->l1, index, constraint, visited)) {
+      return false;
+    }
+    visited.insert(info->l1);
+    // pack num_elems then the contents, folding both into a content hash
+    uint32_t arg_index = (uint32_t)constraint->input_args.size();
+    constraint->input_args.push_back(std::make_pair(false, num_elems));
+    constraint->const_num += 1;
+    uint32_t thash = rgd::xxhash((uint32_t)num_elems, rgd::TLookup, (uint32_t)tbl_size);
+    const uint8_t *tbl = itr->second.data.get();
+    for (size_t i = 0; i < tbl_size; i += 8) {
+      uint64_t val = 0;
+      size_t chunk = tbl_size - i < 8 ? tbl_size - i : 8;
+      for (size_t j = 0; j < chunk; j++) {
+        val |= (uint64_t)tbl[i + j] << (j * 8);
+      }
+      constraint->input_args.push_back(std::make_pair(false, val));
+      constraint->const_num += 1;
+      thash = rgd::xxhash(thash, (uint32_t)val, (uint32_t)(val >> 32));
+    }
+    ret->set_kind(rgd::TLookup);
+    ret->set_bits(info->size);
+    ret->set_label(label);
+    ret->set_index(arg_index);
+    constraint->ops[rgd::TLookup] = true;
+    // The contents must be in the hash: isEqualAstRecursive falls back to
+    // hash() when the kinds match and ignores index(), so two lookups over
+    // different tables with the same index expression would otherwise be
+    // conflated by the constraint/function caches.  Hashing the bytes rather
+    // than the base address also keeps this stable across ASLR.
+    ret->set_hash(rgd::xxhash(index->hash(),
+                              (rgd::TLookup << 16) | info->size, thash));
+#if NEED_OFFLINE
+    ret->set_name("tlookup");
 #endif
     return true;
   } else if (info->op == __dfsan::fatoi) {

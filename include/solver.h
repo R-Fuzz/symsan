@@ -118,6 +118,19 @@ private:
                                std::unique_ptr<ConsMeta> const& cm,
                                const uint8_t *in_buf, size_t in_size,
                                uint8_t *out_buf, size_t &out_size);
+  // AST-guided fallbacks, tried only where the value-based matching above has
+  // already given up.  They walk the constraint's AST instead of looking for
+  // the compared value in the input, which is the only way to reach a table
+  // lookup (whose output never appears in the input) or nested arithmetic with
+  // more than one operation.  Every candidate they produce is verified by
+  // re-evaluating the constraint before it is returned.
+  solver_result_t solve_ast(std::shared_ptr<const Constraint> const& c,
+                            uint32_t comparison,
+                            const uint8_t *in_buf, size_t in_size,
+                            uint8_t *out_buf, size_t &out_size);
+  solver_result_t solve_memcmp_ast(std::shared_ptr<const Constraint> const& c,
+                                   const uint8_t *in_buf, size_t in_size,
+                                   uint8_t *out_buf, size_t &out_size);
 };
 
 }; // namespace rgd

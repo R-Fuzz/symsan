@@ -471,6 +471,12 @@ z3::expr Z3Solver::serialize(const AstNode* node,
     case rgd::FpPow:
       throw z3::exception("unsupported FP transcendental (i2s-only)");
       break;
+    // Table lookups are i2s-only too: modelling one in z3 means either a
+    // select over an array theory or an ite chain per element, neither of
+    // which this backend builds.  i2s inverts it by scanning the table.
+    case rgd::TLookup:
+      throw z3::exception("unsupported table lookup (i2s-only)");
+      break;
     default:
       WARNF("unhandler expr: ");
       throw z3::exception("unsupported operator");

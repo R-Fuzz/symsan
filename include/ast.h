@@ -120,6 +120,14 @@ namespace rgd {
     FUle, // 81
     FUne, // 82
 
+    // Load of a read-only global lookup table at a symbolic index; the single
+    // child is the index expression.  Table contents travel out of band and are
+    // held by the parser, keyed on the base address.  Appended here (rather than
+    // reusing the reserved Load, 36) so existing kind numbering is untouched.
+    // i2s-only: jigsaw's JIT and both z3 backends reject it, see
+    // solvers/z3-solver.cpp and solvers/jigsaw/jit.cc.
+    TLookup, // 83
+
     // Last
     LastOp
   };
@@ -208,6 +216,7 @@ namespace rgd {
     "FUlt",
     "FUle",
     "FUne",
+    "TLookup",
   };
 
   static inline bool isRelationalKind(uint16_t kind) {

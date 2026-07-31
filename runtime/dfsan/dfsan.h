@@ -238,7 +238,16 @@ enum operators {
   fp_log10     = last_llvm_op + 38, // 105 log10
   fp_log1p     = last_llvm_op + 39, // 106 log1p/log1pf
   fp_pow       = last_llvm_op + 40, // 107 pow/powf
-  LastOp    = last_llvm_op + 41, // 108
+  // Load from a read-only global lookup table at a symbolic index.  Produced at
+  // the *load*, not the GEP, so the loaded value gets a real shadow instead of
+  // going concrete (shadow memory over globals is zero).  l1 is the index label,
+  // op1 the table base address, op2 the element count; size is elem_size * 8.
+  // The table contents are shipped separately (see table_type) because the
+  // solver runs in another process and cannot read the target's memory.
+  // Neither z3 nor jigsaw model this: only the i2s solver inverts it, by
+  // scanning the table for the wanted output and re-targeting the index.
+  tlookup      = last_llvm_op + 41, // 108
+  LastOp    = last_llvm_op + 42, // 109
 };
 
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP
@@ -345,6 +354,9 @@ enum pipe_msg_type {
   event_type,
   gv_type,
   minimize_type,
+  // contents of a read-only global lookup table, sent once per table per trace
+  // so the out-of-process solver can invert a tlookup (see table_msg)
+  table_type,
 };
 
 static const uint8_t TrueBranchLoopLatch = 0x8;
@@ -409,6 +421,16 @@ struct gep_msg {
 // saving the memcmp target
 struct memcmp_msg {
   uint32_t label;
+  uint8_t content[0];
+} __attribute__((packed));
+
+// contents of a read-only lookup table, keyed on its base address (the same
+// value a tlookup label carries in op1).  Sent once per table per trace: the
+// solver runs in a different process and cannot read the target's memory.
+struct table_msg {
+  uptr ptr;
+  uint64_t num_elems;
+  uint64_t elem_size;
   uint8_t content[0];
 } __attribute__((packed));
 

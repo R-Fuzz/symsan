@@ -201,6 +201,7 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
 
   // reset caches
   memcmp_cache_.clear();
+  table_cache_.clear(); // unused by this backend, but recorded by the drivers
   string_ranges_.clear();
   string_ranges_.resize(inputs.size()); // vector indexed by input_id
   tsize_cache_.clear();

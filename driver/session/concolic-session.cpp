@@ -317,6 +317,13 @@ void ConcolicSession::on_memcmp(const symsan::pipe_msg &msg, const uint8_t *cont
   parser_->record_memcmp(msg.label, const_cast<uint8_t*>(content), size);
 }
 
+void ConcolicSession::on_table(const symsan::pipe_msg &msg,
+                               const symsan::table_msg &tmsg,
+                               const uint8_t *content, size_t size) {
+  (void)msg;
+  parser_->record_table(tmsg.ptr, const_cast<uint8_t*>(content), size);
+}
+
 void ConcolicSession::on_memerr(const symsan::pipe_msg &msg) {
   warn("memory error detected @%p, type = %d\n", (void*)msg.addr, msg.flags);
 }

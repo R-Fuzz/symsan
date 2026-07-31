@@ -295,6 +295,7 @@ int main(int argc, char* const argv[]) {
   dfsan_label_info *info;
   size_t msg_size;
   memcmp_msg *mmsg = nullptr;
+  table_msg *tmsg = nullptr;
 
   while (symsan_read_event(&msg, sizeof(msg), 0) > 0) {
     // solve constraints
@@ -340,6 +341,26 @@ int main(int argc, char* const argv[]) {
         // save the content
         __parser->record_memcmp(msg.label, mmsg->content, msg.result);
         free(mmsg);
+        break;
+      case table_type:
+        // always carries a payload, so drain it before validating anything
+        msg_size = sizeof(table_msg) + msg.result;
+        tmsg = (table_msg*)malloc(msg_size);
+        if (symsan_read_event(tmsg, msg_size, 0) != msg_size) {
+          fprintf(stderr, "Failed to receive table msg: %s\n", strerror(errno));
+          free(tmsg);
+          break;
+        }
+        // double check
+        if (tmsg->num_elems * tmsg->elem_size != msg.result) {
+          fprintf(stderr, "Incorrect table msg: %lu x %lu vs %lu\n",
+                  tmsg->num_elems, tmsg->elem_size, msg.result);
+          free(tmsg);
+          break;
+        }
+        // save the content
+        __parser->record_table(tmsg->ptr, tmsg->content, msg.result);
+        free(tmsg);
         break;
       case add_constraint_type:
         __parser->add_constraints(msg.label, msg.result);

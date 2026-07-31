@@ -31,6 +31,7 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Transforms/Utils/GlobalStatus.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/AttributeMask.h"
@@ -173,6 +174,23 @@ static cl::opt<bool> ClTraceGEPOffset(
     "taint-trace-gep",
     cl::desc("Trace GEP offset for solving."),
     cl::Hidden, cl::init(true));
+
+// Symbolize loads from read-only global lookup tables at a symbolic index.
+// Shadow memory over globals is zero, so hex[i] would otherwise produce a
+// concrete value and the comparison that consumes it never reaches the solver.
+// Only the i2s solver inverts the resulting tlookup op.
+static cl::opt<bool> ClTraceTableLookup(
+    "taint-trace-table-lookup",
+    cl::desc("Symbolize loads from read-only global tables at symbolic index."),
+    cl::Hidden, cl::init(true));
+
+// Upper bound on the byte size of a table we are willing to symbolize.  The
+// contents have to be shipped to the solver and packed into the constraint's
+// constant args, so a large table is paid for on every solve that touches it.
+static cl::opt<unsigned> ClMaxTableBytes(
+    "taint-max-table-bytes",
+    cl::desc("Maximum size in bytes of a symbolized lookup table."),
+    cl::Hidden, cl::init(4096));
 
 // Trace floating point operations (FP arithmetic, casts, FCmp, and common FP
 // intrinsics).  Reconstructed and solved by the z3 solver via the fpa theory.
@@ -462,6 +480,7 @@ class Taint {
   FunctionType *TaintTraceSelectFnTy;
   FunctionType *TaintTraceIndirectCallFnTy;
   FunctionType *TaintTraceGEPFnTy;
+  FunctionType *TaintTableLookupFnTy;
   FunctionType *TaintPushStackFrameFnTy;
   FunctionType *TaintPopStackFrameFnTy;
   FunctionType *TaintTraceAllocaFnTy;
@@ -488,6 +507,7 @@ class Taint {
   FunctionCallee TaintTraceSelectFn;
   FunctionCallee TaintTraceIndirectCallFn;
   FunctionCallee TaintTraceGEPFn;
+  FunctionCallee TaintTableLookupFn;
   FunctionCallee TaintPushStackFrameFn;
   FunctionCallee TaintPopStackFrameFn;
   FunctionCallee TaintTraceAllocaFn;
@@ -499,6 +519,12 @@ class Taint {
   FunctionCallee TaintDebugFn;
   FunctionCallee TaintMinimizeLabelFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
+  /// Read-only global arrays eligible to be treated as lookup tables, mapped to
+  /// {num_elements, element_size}.  Computed once, before anything is
+  /// instrumented, because the instrumentation itself passes globals to runtime
+  /// calls (see getShadowForGlobal) and GlobalStatus then reports them as
+  /// unanalyzable.  Populated by findReadOnlyTables().
+  DenseMap<const GlobalVariable *, std::pair<uint64_t, uint64_t>> ReadOnlyTables;
   Constant *CallStack;
   MDNode *ColdCallWeights;
   TaintABIList ABIList;
@@ -523,6 +549,7 @@ class Taint {
                                  GlobalValue::LinkageTypes NewFLink,
                                  FunctionType *NewFT);
 
+  void findReadOnlyTables(Module &M);
   void addContextRecording(Function &F);
   void addFrameTracing(Function &F);
   uint32_t getInstructionId(Instruction *Inst);
@@ -618,6 +645,19 @@ struct TaintFunction {
   /// BasicBlock like CachedShadows, but uses domination between values.
   DenseMap<Value *, Value *> CachedCollapsedShadows;
   DenseMap<Value *, std::set<Value *>> ShadowElements;
+
+  /// A GEP that indexes a read-only global table with a symbolic index.  Keyed
+  /// on the GEP itself so the load that consumes it can be given a real shadow
+  /// (see visitLoadInst); instructions are visited in order, so the GEP is
+  /// always recorded before its load.
+  struct TableGEPInfo {
+    Value *IndexShadow; // shadow of the symbolic index
+    Value *Index;       // the index, zext/trunc'd to i64
+    Value *TablePtr;    // base address of the global, as i64
+    uint64_t NumElements;
+    uint64_t ElemSize;
+  };
+  DenseMap<Value *, TableGEPInfo> TableGEPs;
 
   TaintFunction(Taint &TT, Function *F, bool IsNativeABI,
                 bool IsForceZeroLabels)
@@ -1152,6 +1192,12 @@ bool Taint::initializeModule(Module &M) {
       Int64Ty, Int64Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceGEPFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceGEPArgs, false);
+  // __taint_table_lookup(index_label, index, table_ptr, num_elems, elem_size)
+  // -> label for the loaded element
+  Type *TaintTableLookupArgs[5] =
+      { PrimitiveShadowTy, Int64Ty, Int64Ty, Int64Ty, Int64Ty };
+  TaintTableLookupFnTy = FunctionType::get(
+      PrimitiveShadowTy, TaintTableLookupArgs, false);
   TaintPushStackFrameFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), {}, false);
   TaintPopStackFrameFnTy = FunctionType::get(
@@ -1458,6 +1504,14 @@ void Taint::initializeCallbackFunctions(Module &M) {
   {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
+    TaintTableLookupFn =
+        Mod->getOrInsertFunction("__taint_table_lookup", TaintTableLookupFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     TaintPushStackFrameFn =
         Mod->getOrInsertFunction("__taint_push_stack_frame", TaintPushStackFrameFnTy, AL);
   }
@@ -1533,6 +1587,8 @@ void Taint::initializeCallbackFunctions(Module &M) {
   TaintRuntimeFunctions.insert(
       TaintTraceGEPFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
+      TaintTableLookupFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
       TaintPushStackFrameFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintPopStackFrameFn.getCallee()->stripPointerCasts());
@@ -1582,6 +1638,9 @@ bool Taint::runImpl(Module &M) {
 
   initializeCallbackFunctions(M);
   initializeRuntimeFunctions(M);
+
+  // Before touching any IR: see findReadOnlyTables().
+  findReadOnlyTables(M);
 
   std::vector<Function *> FnsToInstrument;
   SmallPtrSet<Function *, 8> IFuncs;
@@ -3443,9 +3502,38 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
     TF.checkBounds(LI.getPointerOperand(),
                    ConstantInt::get(TF.TT.Int64Ty, Size), Pos);
 
-  Value *Shadow =
-      TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
-                    LI.getAlign(), Pos);
+  // A load from a read-only global table at a symbolic index: shadow memory
+  // over globals is zero, so the value we just loaded is concrete and any
+  // comparison consuming it never reaches the solver.  Give it a real shadow
+  // describing the lookup instead.  Done at the load, not the GEP, so the
+  // loaded value itself carries the label and propagates normally from here.
+  //
+  // This replaces the shadow load rather than combining with it: the table is a
+  // read-only global, so its shadow is zero by construction and loading it
+  // would only cost an access.  (Testing isZeroShadow() on the loaded shadow
+  // would never fire -- loadShadow returns an instruction, not a constant.)
+  Value *Shadow = nullptr;
+  if (ClTraceTableLookup) {
+    auto It = TF.TableGEPs.find(LI.getPointerOperand());
+    if (It != TF.TableGEPs.end()) {
+      const auto &TGI = It->second;
+      // Only the element type we recorded; a differently-sized load through the
+      // same GEP (type punning) is not the lookup we analyzed.
+      if (DL.getTypeStoreSize(LI.getType()) == TGI.ElemSize &&
+          LI.getType()->isIntegerTy()) {
+        IRBuilder<> IRB(Pos);
+        Shadow = IRB.CreateCall(
+            TF.TT.TaintTableLookupFn,
+            {TGI.IndexShadow, TGI.Index, TGI.TablePtr,
+             ConstantInt::get(TF.TT.Int64Ty, TGI.NumElements),
+             ConstantInt::get(TF.TT.Int64Ty, TGI.ElemSize)});
+      }
+    }
+  }
+
+  if (!Shadow)
+    Shadow = TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
+                           LI.getAlign(), Pos);
 #if 0
   //FIXME: tainted pointer
   if (ClCombinePointerLabelsOnLoad) {
@@ -3453,6 +3541,7 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
     Shadow = TF.combineShadows(Shadow, PtrShadow, Pos);
   }
 #endif
+
   if (!TF.TT.isZeroShadow(Shadow))
     TF.NonZeroChecks.push_back(Shadow);
 
@@ -3729,6 +3818,67 @@ void TaintVisitor::visitLandingPadInst(LandingPadInst &LPI) {
   TF.setShadow(&LPI, TF.TT.getZeroShadow(&LPI));
 }
 
+// Is GV a lookup table we can safely treat as a constant array?
+//
+// Note we deliberately do NOT use GV->isConstant(): tables are routinely
+// declared plain `static` rather than `const` (e.g. `static uint8_t hex[16]`),
+// and at -O0 GlobalOpt never runs to infer constancy, so isConstant() would
+// silently miss the common case.  GlobalStatus is the analysis GlobalOpt itself
+// uses to answer this.
+//
+// NotStored only tells us the global is never written *in this module*, so it
+// is sufficient only when no other module can reach it -- hence the linkage
+// check.  An external non-const global could be written from another TU.
+static bool isReadOnlyLookupTable(const GlobalVariable *GV, const DataLayout &DL,
+                                  uint64_t &NumElements, uint64_t &ElemSize) {
+  if (!GV->hasInitializer() || GV->isDeclaration())
+    return false;
+  // A non-const global with external linkage could be written from another
+  // translation unit, so "no stores in this module" would not be sound.
+  if (!GV->hasLocalLinkage() && !GV->isConstant())
+    return false;
+
+  GlobalStatus GS;
+  if (GlobalStatus::analyzeGlobal(GV, GS))
+    return false; // analysis bailed out; assume the worst
+  if (GS.StoredType != GlobalStatus::NotStored)
+    return false;
+
+  ArrayType *ATy = dyn_cast<ArrayType>(GV->getValueType());
+  if (!ATy)
+    return false;
+  Type *ETy = ATy->getElementType();
+  // Only integer elements: the loaded value has to fit in a label's 64-bit
+  // value slot, and i2s inverts by scanning for an exact integer match.
+  if (!ETy->isIntegerTy() || ETy->getIntegerBitWidth() > 64)
+    return false;
+
+  NumElements = ATy->getNumElements();
+  ElemSize = DL.getTypeAllocSize(ETy);
+  if (NumElements == 0 || ElemSize == 0)
+    return false;
+  if (NumElements * ElemSize > ClMaxTableBytes)
+    return false;
+  return true;
+}
+
+/// Find the read-only global arrays worth treating as lookup tables.
+///
+/// Must run before any instrumentation: getShadowForGlobal() passes a global's
+/// address to __taint_trace_global, and GlobalStatus::analyzeGlobal() gives up
+/// on any global whose address escapes into a call -- so asking the question
+/// later always answers "unanalyzable", and no table is ever found.
+void Taint::findReadOnlyTables(Module &M) {
+  if (!ClTraceTableLookup)
+    return;
+  const DataLayout &DL = M.getDataLayout();
+  for (GlobalVariable &GV : M.globals()) {
+    uint64_t NumElements = 0, ElemSize = 0;
+    if (isReadOnlyLookupTable(&GV, DL, NumElements, ElemSize))
+      ReadOnlyTables[&GV] = {NumElements, ElemSize};
+  }
+}
+
 void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   Module *M = F->getParent();
   auto &DL = M->getDataLayout();
@@ -3802,6 +3952,22 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
           if (ClTraceGEPOffset) {
             IRB.CreateCall(TT.TaintTraceGEPFn,
                            {Shadow, Ptr, IndexShadow, Index, NE, ES, Offset, CID});
+          }
+          if (ClTraceTableLookup) {
+            // If this GEP indexes a read-only global table, remember it so the
+            // load that consumes it can be symbolized (visitLoadInst).  Note we
+            // check the *underlying* object, and only accept a GlobalVariable:
+            // glibc's ctype tables are reached via __ctype_b_loc(), so the base
+            // is a load rather than a global and they are skipped -- which is
+            // what keeps this from firing on every isupper()/tolower().
+            auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(Base));
+            auto TblItr = GV ? TT.ReadOnlyTables.find(GV)
+                             : TT.ReadOnlyTables.end();
+            if (TblItr != TT.ReadOnlyTables.end()) {
+              Value *TablePtr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
+              TableGEPs[I] = {IndexShadow, Index, TablePtr,
+                              TblItr->second.first, TblItr->second.second};
+            }
           }
         } else {
           break;
