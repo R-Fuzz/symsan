@@ -466,6 +466,7 @@ class Taint {
   Constant *ArgTLS;
   Constant *RetvalTLS;
   FunctionType *TaintUnionFnTy;
+  FunctionType *TaintGetWideFnTy;
   FunctionType *TaintUnionLoadFnTy;
   FunctionType *TaintUnionStoreFnTy;
   FunctionType *TaintGEPOffsetFnTy;
@@ -493,6 +494,7 @@ class Taint {
   FunctionType *TaintDebugFnTy;
   FunctionType *TaintMinimizeLabelFnTy;
   FunctionCallee TaintUnionFn;
+  FunctionCallee TaintGetWideFn;
   FunctionCallee TaintUnionLoadFn;
   FunctionCallee TaintUnionStoreFn;
   FunctionCallee TaintGEPOffsetFn;
@@ -1146,6 +1148,15 @@ bool Taint::initializeModule(Module &M) {
       Int16Ty, Int16Ty, Int64Ty, Int64Ty};
   TaintUnionFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintUnionArgs, /*isVarArg=*/ false);
+  // Normalizes ONE operand of an operation wider than 64 bits to a real label,
+  // to be called before __taint_union rather than instead of it: a symbolic
+  // operand keeps its label, a concrete one becomes a WideConst leaf built from
+  // the full value.  Hence lo and hi -- op1/op2 in dfsan_label_info are 64 bits
+  // each, so a >64-bit concrete operand does not fit in one.
+  // args: label, lo, hi, size
+  Type *TaintGetWideArgs[4] = { PrimitiveShadowTy, Int64Ty, Int64Ty, Int16Ty };
+  TaintGetWideFnTy = FunctionType::get(
+      PrimitiveShadowTy, TaintGetWideArgs, /*isVarArg=*/ false);
   Type *TaintUnionLoadArgs[4] = { PrimitiveShadowPtrTy, IntptrTy, Int64Ty, Int64Ty };
   TaintUnionLoadFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintUnionLoadArgs, /*isVarArg=*/ false);
@@ -1365,6 +1376,15 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
+    // only param 0 is a label; 1 and 2 are full i64 value halves
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    TaintGetWideFn =
+        Mod->getOrInsertFunction("__taint_get_wide", TaintGetWideFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
     TaintUnionLoadFn =
         Mod->getOrInsertFunction("__taint_union_load", TaintUnionLoadFnTy, AL);
   }
@@ -1419,6 +1439,8 @@ void Taint::initializeRuntimeFunctions(Module &M) {
 
   TaintRuntimeFunctions.insert(
       TaintUnionFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintGetWideFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintUnionLoadFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -2128,6 +2150,11 @@ Value *TaintFunction::combineBinaryOperatorShadows(BinaryOperator *BO,
   return Shadow;
 }
 
+// Widest operand the label format can describe.  op1 and op2 are 64 bits each,
+// which is exactly what a concrete 128-bit operand needs; anything above this
+// would require a side channel, and nothing observed needs one.
+static const uint64_t kMaxOperandBits = 128;
+
 Value *TaintFunction::combineShadows(Value *V1, Value *V2,
                                      uint16_t op,
                                      Instruction *Pos) {
@@ -2166,7 +2193,18 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   if (CmpInst *CI = dyn_cast<CmpInst>(Pos))
     size = DL.getTypeSizeInBits(CI->getOperand(0)->getType());
   // FIXME: do not handle type larger than 64-bit
-  if (size > 64) return TT.getZeroShadow(Pos);
+  //
+  // Relaxed to 128 so __int128 arithmetic is tracked -- the shape at the core of
+  // every modern 64-bit hash (`(unsigned __int128)a * b >> 64`) and of
+  // __builtin_mul_overflow on uint64_t.  128 is a hard ceiling rather than an
+  // arbitrary one: a concrete operand has to travel in the label's op1 and op2
+  // slots, which are exactly 64 bits each (see WideConst in dfsan.h), so
+  // _BitInt(256) and friends still decline here.  Floating point never reaches
+  // this point above 64 bits -- the half/float/double filter above already
+  // rejects x86_fp80/fp128/ppc_fp128, which need a format conversion rather than
+  // a wider integer, not least because x86_fp80 has an explicit significand bit
+  // that z3's (_ FloatingPoint 15 64) does not.
+  if (size > kMaxOperandBits) return TT.getZeroShadow(Pos);
 
   IRBuilder<> IRB(Pos);
   if (CmpInst *CI = dyn_cast<CmpInst>(Pos)) { // for both icmp and fcmp
@@ -2201,6 +2239,56 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
     else if (Ty->isPointerTy())
       Op2 = IRB.CreatePtrToInt(Op2, TT.Int64Ty);
     Op2 = IRB.CreateZExtOrTrunc(Op2, TT.Int64Ty);
+  }
+  // A concrete operand of a wide operation cannot ride in the Op1/Op2 slots
+  // above -- they are 64 bits and the extends just truncated into them, so the
+  // runtime would embed a wrong constant in the AST without any way to tell.
+  // Such an operand needs a real label instead (see WideConst in dfsan.h), and
+  // that applies to small values too: `(unsigned __int128)x >> 64` has to go
+  // through it, because what a zero shadow cannot express is not "large" but
+  // "exact".
+  //
+  // Which operands are concrete is a *runtime* question, not one that can be
+  // settled here.  It is tempting to look for a ConstantInt and give up on
+  // anything else, but at -O0 clang keeps even a literal `__int128` in an
+  // alloca, so `a == 0x0123...` reaches the icmp as `load i128` with no
+  // constant in sight -- the shape would have worked only in optimized builds,
+  // which is exactly backwards.  So hand each operand's full value to
+  // __taint_get_wide, which can see the label: symbolic keeps its label,
+  // concrete becomes a WideConst leaf.  Normalizing the operands rather than
+  // replacing the union call is what keeps this to one extra entry point -- the
+  // union below is the same one every other width uses, and only the operands
+  // it is given have changed.  Both sides tainted costs two calls that return
+  // their argument, and no union-table entry.
+  if (size > 64) {
+    // Only integers should get this far -- the FP filter above rejects every
+    // float format wider than double, and a pointer is 64 bits -- but `fpext
+    // double to x86_fp80` slips past it, because that filter looks at operand 0
+    // and operand 0 is the double.  It arrives here at size 80, and an fp80 has
+    // no integer high half to extract, so decline it the way the old
+    // constant-only path did (by finding no ConstantInt) rather than asserting
+    // in CreateZExtOrTrunc.
+    for (unsigned i = 0, n = Pos->getNumOperands(); i < n && i < 2; ++i)
+      if (!Pos->getOperand(i)->getType()->isIntegerTy())
+        return TT.getZeroShadow(Pos);
+    Type *Int128Ty = IntegerType::get(Pos->getContext(), 128);
+    // the high half of an operand narrower than the operation (`zext i64 to
+    // i128`) is zero, which the zext produces without a special case
+    auto getWide = [&](Value *Label, Value *Lo, Value *Operand) -> Value * {
+      Value *W = IRB.CreateZExtOrTrunc(Operand, Int128Ty);
+      Value *Hi = IRB.CreateTrunc(IRB.CreateLShr(W, 64), TT.Int64Ty);
+      CallInst *C = IRB.CreateCall(TT.TaintGetWideFn, {Label, Lo, Hi, Size});
+      C->addRetAttr(Attribute::ZExt);
+      C->addParamAttr(0, Attribute::ZExt);
+      return C;
+    };
+    V1 = getWide(V1, Op1, Pos->getOperand(0));
+    // Only promote a slot that actually holds an operand value.  This is why
+    // the getter is per-operand: the caller knows, whereas a wide union would
+    // have to re-derive it from the opcode (a Load keeps a byte count in op2,
+    // an Extract a bit offset, a unary op nothing at all).
+    if (Pos->getNumOperands() > 1)
+      V2 = getWide(V2, Op2, Pos->getOperand(1));
   }
   CallInst *Call = IRB.CreateCall(TT.TaintUnionFn, {V1, V2, Op, Size, Op1, Op2});
   Call->addRetAttr(Attribute::ZExt);

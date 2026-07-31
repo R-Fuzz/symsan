@@ -324,6 +324,29 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_name("read");
 #endif
     return true;
+  } else if (info->op == __dfsan::WideConst) {
+    // A concrete operand of an operation wider than 64 bits, carried as a leaf
+    // label because the label's two op slots together are exactly 128 bits.
+    // Lower it to the multi-slot rgd::Constant convention that z3-solver.cpp
+    // and jit.cc already read: consecutive input_args, LOW half first.
+    ret->set_kind(rgd::Constant);
+    ret->set_bits(info->size);
+    ret->set_label(label);
+    uint32_t arg_index = (uint32_t)constraint->input_args.size();
+    ret->set_index(arg_index);
+    constraint->input_args.push_back(std::make_pair(false, info->op1.i));
+    constraint->input_args.push_back(std::make_pair(false, info->op2.i));
+    constraint->const_num += 2;
+    uint32_t hash = rgd::xxhash(info->size, rgd::Constant, arg_index);
+    ret->set_hash(hash);
+#if NEED_OFFLINE
+    char hexbuf[40];
+    snprintf(hexbuf, sizeof(hexbuf), "0x%016lx%016lx",
+             (unsigned long)info->op2.i, (unsigned long)info->op1.i);
+    ret->set_value(hexbuf);
+    ret->set_name("constant");
+#endif
+    return true;
   } else if (info->op == __dfsan::fmemcmp) {
     rgd::AstNode *s1 = ret->add_children();
     if (unlikely(s1 == nullptr)) {
@@ -704,7 +727,15 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
 #endif
   }
 
-  // record comparison operands
+  // record comparison operands.  These are the values the trace saw, extended
+  // to 64 bits by combineShadows -- so for a comparison wider than that they
+  // hold only the LOW half, and a consumer that treats them as the whole value
+  // gets a wrong answer rather than no answer.  Both consumers are guarded:
+  // I2SSolver::solve_icmp/solve_fcmp never read them at that width (a wide
+  // equality routes to solve_memcmp_ast, which works off input_args instead,
+  // and anything else declines), and jigsaw never sees one because addFunction()
+  // rejects a wide comparison during codegen, which fails the whole task in
+  // jit-solver.cpp before try_i2s can run.
   if (rgd::isRelationalKind(ret->kind()) || rgd::isFPRelationalKind(ret->kind())) {
     constraint->op1 = info->op1.i;
     constraint->op2 = info->op2.i;

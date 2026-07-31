@@ -237,7 +237,10 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       Type* CTy = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
       llvm::PointerType* CPTy = llvm::PointerType::getUnqual(CTy);
       ret = Builder.CreateBitCast(ret, CPTy);
-      ret = Builder.CreateLoad(CTy, ret); // load length bytes at once
+      // The args array is uint64_t, so it is only 8-byte aligned.  An i128 load
+      // would otherwise take LLVM's ABI alignment of 16 and be free to select a
+      // 16-byte-aligned instruction against an address that may not be.
+      ret = Builder.CreateAlignedLoad(CTy, ret, llvm::Align(sizeof(uint64_t)));
       break;
     }
     case rgd::Read: {
@@ -448,6 +451,16 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
     // we don't really care about the comparison, just need to save the operands
       const AstNode* rc1 = &node->children(0);
       const AstNode* rc2 = &node->children(1);
+      // The operands are stored into the args array below as i64 and compared
+      // there by get_distance, which is uint64 by construction.  An operand
+      // wider than that would be TRUNCATED by the extend below, and a distance
+      // of 0 computed over the low 64 bits alone is a false SAT -- jigsaw would
+      // hand back a model that does not satisfy the constraint.  Decline the
+      // whole task instead: the codegen caller catches invalid_argument and
+      // returns -1.  A wide sub-expression under a <=64-bit comparison is fine
+      // and still goes through -- only the comparison itself is limited.
+      if (rc1->bits() > 64 || rc2->bits() > 64)
+        throw std::invalid_argument("comparison operand wider than 64 bits");
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
       // extend to 64-bit to avoid overflow.  For SIGNED comparisons the operands

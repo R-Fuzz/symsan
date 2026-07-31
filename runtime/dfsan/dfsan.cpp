@@ -234,6 +234,12 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_event_addr(uint32_t label, uint32_t event_id,
                               uint64_t info, void* addr, uint32_t info2);
 
+// A WideConst leaf is a constant that happens to need a real label to hold its
+// 128 bits, so it carries no more symbolic content than a small literal does.
+static inline bool is_wide_const(dfsan_label l) {
+  return l != 0 && get_label_info(l)->op == __dfsan::WideConst;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2) {
@@ -247,7 +253,29 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     Swap(op1, op2);
   }
   if (l1 == 0 && l2 < CONST_OFFSET &&
-      op != fsize && op != __dfsan::Alloca)
+      op != fsize && op != __dfsan::Alloca && op != __dfsan::WideConst)
+    return 0;
+  // Operations wider than 64 bits can only be represented when every value
+  // operand has a real label: op1/op2 hold 64 bits each and combineShadows
+  // truncates into them, so a concrete wide operand arriving as a zero label is
+  // indistinguishable from an exact one and would be embedded as a wrong
+  // constant.  Instrumented code calls __taint_get_wide on each operand first,
+  // which turns a concrete one into a WideConst leaf before getting here, so a
+  // zero label at this point comes from a caller that has no high half to offer
+  // -- dfsan_union, a libc wrapper -- and there is nothing to do but drop the
+  // shadow rather than lie about it.
+  if (size > 64 && wide_op_reads_op2(op) && (l1 == 0 || l2 == 0))
+    return 0;
+  // ...and every value operand having a real label is now weaker than having
+  // symbolic content, since __taint_get_wide hands out a label for a concrete
+  // operand too.  When it did so for all of them the result is concrete, which
+  // is what the l2 < CONST_OFFSET early-out above drops for narrow ops; it
+  // cannot see this case because a WideConst is a real label, not a small
+  // literal.  Untainted wide arithmetic is common enough -- program startup,
+  // any instrumented i128 that never meets input -- that skipping this would
+  // fill the union table with nodes that constrain nothing.
+  if (size > 64 && is_wide_const(l1) &&
+      (!wide_op_reads_op2(op) || is_wide_const(l2)))
     return 0;
   if (l1 == kInitializingLabel || l2 == kInitializingLabel)
     return kInitializingLabel;
@@ -368,8 +396,22 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     return label;
   }
 
+  // All the ubsan modeling below is 64-bit arithmetic: it builds masks as
+  // (1UL << size) - 1 and sign bits as 1ULL << (size - 1).  Once an operand can
+  // be wider than 64 bits those shifts are undefined, and on x86 the shift count
+  // is masked -- so a 128-bit Add computes mask 0 and sign_bit 1ULL << 63, and
+  // every overflow ICmp derived from them is garbage.  That garbage is not a
+  // missing check: it is handed straight to __taint_trace_cond as a real branch
+  // constraint, i.e. a formula that does not describe the program.  Skip the
+  // checks when any width involved exceeds 64 bits.  The operand widths matter
+  // as well as the result's -- a Trunc from i128 to i64 has size == 64 but still
+  // evaluates 1UL << size on a value it only holds the low half of.
+  const bool ub_width_ok = size <= 64 &&
+                           (l1 == 0 || get_label_info(l1)->size <= 64) &&
+                           (l2 == 0 || get_label_info(l2)->size <= 64);
+
   // ubsan checks, after dedup, so we don't do redundant checks
-  if (l2 && flags().solve_ub) {
+  if (l2 && flags().solve_ub && ub_width_ok) {
     dfsan_label cond = 0;
     uint16_t op_size = get_label_info(l2)->size;
     switch(op & 0xff) {
@@ -434,7 +476,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   dfsan_label label = add_taint_info(&label_info);
   __union_table.insert(&__dfsan_label_info[label], label);
 
-  if (flags().solve_ub) {
+  if (flags().solve_ub && ub_width_ok) {
     if (op == __dfsan::Trunc && l1) {
       // check for data loss, after the new label is created
       // -fsanitize=implicit-unsigned-integer-truncation
@@ -2168,6 +2210,40 @@ dfsan_label __taint_get_ptr_bounds_label(void *ptr, uint64_t lower, uint64_t upp
   AOUT("new ptr bounds label %d, lower = %p, upper = %p\n",
        bound, (void*)lower, (void*)upper);
   return bound;
+}
+
+// Materialize a concrete operand of an operation wider than 64 bits as a leaf
+// label, so it reaches the solver at full width instead of being truncated into
+// a single op slot.  Applies to small values too, like the 64 in
+// `(unsigned __int128)x >> 64`, because what a zero label cannot express is not
+// "large" but "exact".  dfsan_union dedups on (l1, l2, op, size, op1, op2), so
+// repeated uses of the same value collapse to one union-table entry for the
+// whole trace.
+SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_wide_const(uint64_t lo, uint64_t hi, uint16_t size) {
+  if (size <= 64 || size > 128) return 0;
+  dfsan_label label = dfsan_union(0, 0, __dfsan::WideConst, size, lo, hi);
+  AOUT("wide const label %d, size %u, lo = 0x%lx, hi = 0x%lx\n",
+       label, size, lo, hi);
+  return label;
+}
+
+// Give ONE operand of an operation wider than 64 bits a real label: a symbolic
+// operand already has one, a concrete operand gets a WideConst leaf built from
+// its full value.  Instrumented code calls this on each operand and then hands
+// the results to the ordinary __taint_union, so there is no wide variant of the
+// union itself to keep in step with it.
+//
+// The point of doing this in the runtime rather than in the instrumentation is
+// that only the runtime knows which operands are actually tainted.  Deciding at
+// compile time would mean recognising a ConstantInt operand, and at -O0 a
+// literal __int128 is not one -- clang keeps it in an alloca and loads it -- so
+// the whole shape would have worked only under optimization.
+SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_get_wide(dfsan_label label, uint64_t lo, uint64_t hi,
+                             uint16_t size) {
+  if (label) return label;
+  return __taint_wide_const(lo, hi, size);
 }
 
 // Weak stub for UCSan's event tracing

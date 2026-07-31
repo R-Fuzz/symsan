@@ -219,6 +219,8 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
 #if FILTER_WRONG_AST
   value_cache_.clear();
   value_cache_.resize(1); // reserve for CONST_OFFSET
+  value_unknown_.clear();
+  value_unknown_.resize(1); // reserve for CONST_OFFSET
 #endif
   // Label-level tracking caches
   is_label_bv_.clear();
@@ -539,7 +541,10 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
     }
     input_deps.insert(std::make_pair(input, offset + i));
 #if FILTER_WRONG_AST
-    if (!is_negative_offset(offset + i) && inputs_cache_.size() > input &&
+    // val is 64 bits, so a load wider than 8 bytes can only keep its low half;
+    // shifting past that is undefined.  wide_value_unknown() marks the label so
+    // nothing trusts the partial value.
+    if (i < 8 && !is_negative_offset(offset + i) && inputs_cache_.size() > input &&
         inputs_cache_[input].second > offset + i) {
       val |= (uint64_t)inputs_cache_[input].first[offset + i] << (i * 8);
     }
@@ -551,6 +556,53 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
 
   return val;
 }
+
+// Mask of the low `bits` bits, saturating at 64.  `(1UL << bits) - 1` is UB at
+// bits == 64 and, worse, x86 masks the shift count so bits == 128 yields 0 --
+// a mask that silently zeroes the value it was meant to leave alone.  Widths of
+// exactly 64 and of 128 both became reachable here when operands widened: a
+// `zext i64 to i128` has a 64-bit source and a `trunc i128 to i64` a 64-bit
+// result, and neither existed while everything wider than 64 bits was declined.
+static inline uint64_t low64_mask(unsigned bits) {
+  return bits >= 64 ? ~0UL : (1UL << bits) - 1;
+}
+
+#if FILTER_WRONG_AST
+// value_cache_ entries are uint64.  Once an operand can be wider than that, the
+// cache holds only the value's LOW half, and the low half is preserved by
+// add/sub/mul/and/or/xor/shl but NOT by udiv/urem/sdiv/srem/lshr/ashr -- and
+// `(unsigned __int128)a * b >> 64` is precisely the shape that breaks it.
+// FILTER_WRONG_AST is a debugging aid, not a correctness mechanism, so rather
+// than widen the cache to 128 bits we mark such a value unknown and have the
+// consistency checks skip it.  Unknown has to be contagious, and in particular
+// has to survive a narrowing back to <= 64 bits: a Trunc of a wrong i128 is a
+// wrong i64 whose own size no longer shows that anything is amiss.
+static bool wide_value_unknown(const dfsan_label_info *info,
+                               const std::vector<uint8_t> &unknown) {
+  auto is_unknown = [&unknown](dfsan_label l) {
+    return l >= CONST_OFFSET && l < unknown.size() && unknown[l];
+  };
+  if (info->size > 64) return true;
+  // These are the only ops that can yield <= 64 bits while reading a wider
+  // operand: LLVM integer arithmetic is same-width, so anything else with a
+  // wide operand also has a wide result and is caught by the size test above.
+  // Consulting l1/l2 generically would be wrong -- Load keeps a byte count in
+  // l2 rather than a label, and CONST_OFFSET is 1.
+  switch (info->op & 0xff) {
+    case __dfsan::Trunc:
+    case __dfsan::Extract:
+    // an int-to-FP conversion narrows too: `sitofp i128 to double` records the
+    // width of its double result, so the size test above does not see it.
+    case __dfsan::SIToFP:
+    case __dfsan::UIToFP:
+      return is_unknown(info->l1);
+    case __dfsan::ICmp:
+      return is_unknown(info->l1) || is_unknown(info->l2);
+    default:
+      return false;
+  }
+}
+#endif
 
 z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel) {
@@ -565,6 +617,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     deps_cache_.reserve(label + SIZE_INCREMENT);
 #if FILTER_WRONG_AST
     value_cache_.reserve(label + SIZE_INCREMENT);
+    value_unknown_.reserve(label + SIZE_INCREMENT);
 #endif
     is_label_bv_.reserve(label + SIZE_INCREMENT);
     is_label_seq_.reserve(label + SIZE_INCREMENT);
@@ -574,7 +627,10 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
 
 #if FILTER_WRONG_AST
 #define RECORD_VALUE(value) \
-  value_cache_.emplace_back((uint64_t)(value))
+  do { \
+    value_cache_.emplace_back((uint64_t)(value)); \
+    value_unknown_.emplace_back(wide_value_unknown(info, value_unknown_)); \
+  } while (0)
 #else
 #define RECORD_VALUE(value) \
   do { } while (0)
@@ -625,6 +681,23 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(val);
       continue;
+    } else if (info->op == __dfsan::WideConst) {
+      // A concrete operand of an operation wider than 64 bits: op1 holds the
+      // low half and op2 the high half (see WideConst in dfsan.h).  Rebuild it
+      // as a bv of exactly info->size bits -- concat puts its first argument in
+      // the high bits, and a width that is not a multiple of 64 (there is no
+      // such integer type today, but the encoding allows one) is extracted back
+      // down afterwards.
+      z3::expr wide = z3::concat(context_.bv_val((uint64_t)info->op2.i, 64),
+                                 context_.bv_val((uint64_t)info->op1.i, 64));
+      if (info->size < 128)
+        wide = wide.extract(info->size - 1, 0);
+      tsize_cache_.emplace_back(1);
+      cache_expr(l, wide);
+      TRACK_LABEL_BV_ONLY();
+      // the low half is all value_cache_ can hold; wide_value_unknown() flags it
+      RECORD_VALUE(info->op1.i);
+      continue;
     } else if (info->op == __dfsan::ZExt) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
       if (base.is_bool()) // dirty hack since llvm lacks bool
@@ -634,7 +707,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, z3::zext(base, info->size - base_size));
       TRACK_LABEL_BV_ONLY();
-      RECORD_VALUE(value_cache_[info->l1] & ((1UL << base_size) - 1));
+      RECORD_VALUE(value_cache_[info->l1] & low64_mask(base_size));
       continue;
     } else if (info->op == __dfsan::SExt) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
@@ -643,8 +716,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       cache_expr(l, z3::sext(base, info->size - base_size));
       TRACK_LABEL_BV_ONLY();
       // Sign extend: shift left to put sign bit at MSB, then arithmetic shift right
-      uint64_t base_val = value_cache_[info->l1] & ((1UL << base_size) - 1);
-      RECORD_VALUE(((int64_t)(base_val << (64 - base_size))) >> (64 - base_size));
+      uint64_t base_val = value_cache_[info->l1] & low64_mask(base_size);
+      // `sext i65 to i128` is constructible from _BitInt and would make
+      // `64 - base_size` underflow; the value is unknown at that width anyway.
+      const unsigned sext_sh = base_size >= 64 ? 0 : 64 - base_size;
+      RECORD_VALUE(((int64_t)(base_val << sext_sh)) >> sext_sh);
       continue;
     } else if (info->op == __dfsan::Trunc) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
@@ -659,7 +735,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         trunc_expr = (trunc_expr == context_.bv_val(1, 1));
       cache_expr(l, trunc_expr);
       TRACK_LABEL_BV_ONLY();
-      RECORD_VALUE(value_cache_[info->l1] & ((1UL << info->size) - 1));
+      RECORD_VALUE(value_cache_[info->l1] & low64_mask(info->size));
       continue;
     } else if (info->op == __dfsan::bitreverse) {
       // z3 has no bit-reversal primitive, so expand to a concat of single-bit
@@ -750,6 +826,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       { z3::sort ssort = fpa_sort_for(context_, src_bits);
         double lo, hi;
         if (info->op == __dfsan::FPToSI) {
+          // At size 128 these are the 64-bit bounds, which over-constrains the
+          // operand rather than under-constraining it: a `fptosi double to
+          // i128` beyond the int64 range becomes unsat here instead of wrong.
           if (info->size >= 64) { lo = -9223372036854775808.0; hi = 9223372036854774784.0; }
           else { lo = -(double)(1ULL << (info->size - 1)); hi = (double)((1ULL << (info->size - 1)) - 1); }
         } else {
@@ -778,10 +857,14 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, fp_to_bv(fp));
       TRACK_LABEL_BV_ONLY();
-      { uint64_t iv = value_cache_[info->l1] & (src_bits >= 64 ? ~0UL : ((1UL << src_bits) - 1));
+      { uint64_t iv = value_cache_[info->l1] & low64_mask(src_bits);
         double d;
         if (info->op == __dfsan::SIToFP) {
-          int64_t s = (int64_t)(iv << (64 - src_bits)) >> (64 - src_bits);
+          // `iv` is only the low half when src_bits is 128, so its real sign is
+          // not knowable here -- wide_value_unknown marks the result unusable.
+          // The clamp is just to keep the shift defined.
+          const unsigned sh = src_bits >= 64 ? 0 : 64 - src_bits;
+          int64_t s = (int64_t)(iv << sh) >> sh;
           d = (double)s;
         } else {
           d = (double)iv;
@@ -981,8 +1064,9 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       }
       cache_expr(l, base.extract((info->op2.i + info->size) - 1, info->op2.i));
       TRACK_LABEL_BV_ONLY();
-      RECORD_VALUE((value_cache_[info->l1] >> info->op2.i) &
-                    ((1UL << info->size) - 1));
+      RECORD_VALUE(info->op2.i >= 64 ? 0 :
+                   ((value_cache_[info->l1] >> info->op2.i) &
+                    low64_mask(info->size)));
       continue;
     } else if (info->op == __dfsan::Not) {
       if (info->l2 == 0 || info->size != 1) {
@@ -1919,6 +2003,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         // For string ops, calculate value based on found/not-found semantics
         bool cmp_result = (predicate == __dfsan::bvneq) ? found : !found;
         value_cache_.emplace_back(cmp_result ? 1 : 0);
+        value_unknown_.emplace_back(0); // a string-op result, always known
 #endif
         continue;
       }
@@ -1929,7 +2014,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     if (info->op == __dfsan::Concat && info->l1 == 0) {
       assert(info->l2 >= CONST_OFFSET);
       size = info->size - get_label_info(info->l2)->size;
-      valmask = (1UL << size) - 1;
+      valmask = size < 64 ? (1UL << size) - 1 : ~0UL; // size can now reach 128
     }
     z3::expr op1 = context_.bv_val((uint64_t)info->op1.i, size);
     uint64_t val1 = info->op1.i & valmask;
@@ -1937,7 +2022,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       op1 = get_cached_expr(info->l1, input_deps).simplify();
       if (op1.is_bv() && info->op != __dfsan::Concat) {
         // XXX: fix size mismatch, only for bv and not concat
-        uint8_t op_size = op1.get_sort().bv_size();
+        unsigned op_size = op1.get_sort().bv_size(); // was uint8_t; wraps at 256
         if (op_size > size) {
           op1 = op1.extract(size - 1, 0);
         } else if (op_size < size) {
@@ -1954,7 +2039,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     if (info->op == __dfsan::Concat && info->l2 == 0) {
       assert(info->l1 >= CONST_OFFSET);
       size = info->size - get_label_info(info->l1)->size;
-      valmask = (1UL << size) - 1;
+      valmask = size < 64 ? (1UL << size) - 1 : ~0UL; // size can now reach 128
     }
     z3::expr op2 = context_.bv_val((uint64_t)info->op2.i, size);
     uint64_t val2 = info->op2.i & valmask;
@@ -1962,7 +2047,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       op2 = get_cached_expr(info->l2, input_deps).simplify();
       if (op2.is_bv() && info->op != __dfsan::Concat) {
         // XXX: fix size mismatch, only for bv and not concat
-        uint8_t op_size = op2.get_sort().bv_size();
+        unsigned op_size = op2.get_sort().bv_size(); // was uint8_t; wraps at 256
         if (op_size > size) {
           op2 = op2.extract(size - 1, 0);
         } else if (op_size < size) {
@@ -2217,9 +2302,20 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         //         val1, val2, (uint64_t)info->op1.i, (uint64_t)info->op2.i);
 
 #if FILTER_WRONG_AST
+        // An operand wider than 64 bits leaves both sides of this check
+        // partial: value_cache_ holds only a low half (see wide_value_unknown),
+        // and info->op1/op2 are themselves zext/trunc'd to 64 bits by
+        // combineShadows.  Comparing the two low halves would report a mismatch
+        // for a perfectly good AST -- `(u128)a * b >> 64` shifts the real value
+        // out of the cached half entirely -- and throwing would drop the whole
+        // constraint.  Skip the check and record the result as unknown too.
+        bool operands_unknown =
+            (info->l1 >= CONST_OFFSET && value_is_unknown(info->l1)) ||
+            (info->l2 >= CONST_OFFSET && value_is_unknown(info->l2));
         // we have both operands recorded for ICmp
-        if ((info->op1.i & valmask) != val1 ||
-            (info->op2.i & valmask) != val2) {
+        if (!operands_unknown &&
+            ((info->op1.i & valmask) != val1 ||
+             (info->op2.i & valmask) != val2)) {
           fprintf(stderr, "DEBUG serialize ICmp: VALUE MISMATCH detected\n");
           // fprintf(stderr, "WARNING: value mismatch for label %u: "
           //         "expected op1 %lu, got %lu, expected op2 %lu, got %lu\n",
@@ -2253,9 +2349,14 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             throw z3::exception("value mismatch for ICmp");
           }
         }
-        uint64_t icmp_result = eval_icmp(info->op >> 8, val1, val2, size) ? 1 : 0;
+        // Only evaluate when the operands are real values.  Besides being
+        // meaningless on two low halves, eval_icmp sign-extends with
+        // `<< (64 - bits)`, which at size 128 is a shift by -64.
+        uint64_t icmp_result = operands_unknown ? 0 :
+            (eval_icmp(info->op >> 8, val1, val2, size) ? 1 : 0);
         // fprintf(stderr, "DEBUG serialize ICmp: recording value_cache_[%u] = %lu\n", l, icmp_result);
         value_cache_.emplace_back(icmp_result);
+        value_unknown_.emplace_back(operands_unknown ? 1 : 0);
 #endif
         // Cache the expression AFTER updating value_cache to maintain consistency
         // if an exception is thrown above
@@ -2345,7 +2446,11 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     // Skip validation for indexOf operations (op1 repurposed for haystack pointer)
     bool contains_indexof = label_contains_indexof(label);
 
-    if (!contains_indexof && value_cache_[label] != result) {
+    // A condition derived from an operand wider than 64 bits has no trustworthy
+    // cached value (see wide_value_unknown), so this comparison would reject a
+    // correct AST.
+    if (!contains_indexof && !value_is_unknown(label) &&
+        value_cache_[label] != result) {
       // recalcuated value must match the recorded value
       fprintf(stderr, "WARNING: value mismatch for label %u: expected %lu, got %d\n",
               label, value_cache_[label], result);
@@ -2438,7 +2543,7 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
     z3::expr i = serialize(index_label, inputs);
 
 #if FILTER_WRONG_AST
-    if (value_cache_[index_label] != index) {
+    if (!value_is_unknown(index_label) && value_cache_[index_label] != index) {
       // recalculated value must match the recorded value
       fprintf(stderr, "WARNING: value mismatch for label %u: expected %ld, got %ld\n",
               index_label, value_cache_[index_label], index);
@@ -2548,7 +2653,8 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
     // Skip validation for indexOf operations (op1 repurposed for haystack pointer,
     // RECORD_VALUE uses placeholder 0 which propagates wrong concrete values to
     // downstream ICmp labels, causing spurious mismatches)
-    if (!label_contains_indexof(label) && value_cache_[label] != result) {
+    if (!label_contains_indexof(label) && !value_is_unknown(label) &&
+        value_cache_[label] != result) {
       // recalculated value must match the recorded value
       fprintf(stderr, "WARNING: value mismatch for label %u: expected %ld, got %ld\n",
               label, value_cache_[label], result);

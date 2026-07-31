@@ -256,7 +256,23 @@ enum operators {
   // extracts, jigsaw JITs the native LLVM intrinsic, and i2s inverts it by
   // reversing the wanted value.
   bitreverse   = last_llvm_op + 42, // 109
-  LastOp    = last_llvm_op + 43, // 110
+  // A concrete operand of an operation wider than 64 bits, carried as a leaf
+  // label: l1 = l2 = 0, op1 = low 64 bits, op2 = high 64 bits, size = width.
+  // The traced-operand slots in dfsan_label_info are 64 bits each, so a wide
+  // concrete operand reaching __taint_union the normal way (as a zero label
+  // plus a value in op1/op2) would be TRUNCATED and embedded in the AST as a
+  // wrong constant -- silently, since a wrong constant is still a well-formed
+  // formula.  Giving it a real label instead moves the value into op1+op2
+  // together, which is exactly 128 bits, and costs one union-table entry per
+  // *distinct* constant for the whole trace: operator== in union_util.cpp
+  // compares both slots, so identical constants dedup and distinct ones do not
+  // collide.  Note this is needed even for small constants like the 64 in
+  // `(unsigned __int128)x >> 64` -- what matters is that the runtime can tell
+  // an exact value from a truncated one, and a zero label cannot say which it
+  // is.  The parser lowers it to a multi-slot rgd::Constant, the convention
+  // z3-solver.cpp and jit.cc already read.
+  WideConst = last_llvm_op + 43, // 110
+  LastOp    = last_llvm_op + 44, // 111
 };
 
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP
@@ -306,6 +322,39 @@ static inline uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predic
     default: break;
   }
   return 0;
+}
+
+// For an operation wider than 64 bits, does op2 carry a value operand?  A
+// concrete value operand cannot be represented at that width -- op1/op2 are 64
+// bits each and the instrumentation truncates into them -- so a zero l2 on such
+// an op has to be declined rather than embedded as a wrong constant.  See
+// WideConst, which is how a *constant* operand avoids this; a zero label
+// reaching here at >64 bits therefore means a runtime-untainted wide value.
+//
+// Written as a list of the ops that do NOT read op2 as a value, so anything not
+// considered here is declined: a miss rather than a wrong formula.
+static inline bool wide_op_reads_op2(uint16_t op) {
+  switch (op & 0xff) {
+    case Not: case Neg:
+    // every unary cast, which is the rule rather than a list of the ones that
+    // happen to be reachable wide today: `fptosi double to i128` is the one
+    // that is, and declining it would be a gratuitous miss.
+    case Trunc: case ZExt: case SExt: case BitCast:
+    case FPToUI: case FPToSI: case UIToFP: case SIToFP:
+    case FPTrunc: case FPExt: case PtrToInt: case IntToPtr:
+    case AddrSpaceCast:
+    case bitreverse:
+    // Extract does read op2, but it is the bit offset the instrumentation
+    // emitted, always < the operand width and so never truncated.
+    case Extract:
+    // Load keeps a byte count in l2, not a label.
+    case Load:
+    // the wide-constant leaf itself, whose whole purpose is to fill op1+op2
+    case WideConst:
+      return false;
+    default:
+      return true;
+  }
 }
 
 static inline bool is_commutative(uint16_t op) {

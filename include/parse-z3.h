@@ -112,6 +112,14 @@ private:
   std::vector<input_dep_set_t> deps_cache_;
   std::vector<Z3_ast> expr_cache_;
   std::vector<uint64_t> value_cache_;
+  // parallel to value_cache_: this label's concrete value did not fit in 64
+  // bits (or descends from one that did not), so the cached value is only a low
+  // half and every FILTER_WRONG_AST consistency check must skip it
+  std::vector<uint8_t> value_unknown_;
+  // true when value_cache_[l] is only a low half and must not be checked
+  bool value_is_unknown(uint32_t l) const {
+    return l < value_unknown_.size() && value_unknown_[l];
+  }
   static const size_t SIZE_INCREMENT = 2048;
 
   // Label-level tracking: what type of variables does each expression involve?

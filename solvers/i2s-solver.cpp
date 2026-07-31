@@ -1065,7 +1065,30 @@ static bool i2s_walk_wide(i2s_ctx &ctx, const AstNode &n_, const uint8_t *target
            i2s_walk_wide(ctx, node.children(1), target, target_size,
                          bit_off + lo.bits(), invert, depth + 1);
   }
-  if (unlikely(node.bits() > 64 || bit_off % 8 != 0)) return false;
+  if (unlikely(bit_off % 8 != 0)) return false;
+  // A contiguous read wider than 64 bits is NOT a Concat spine -- the parser
+  // emits one Read whose bits are the byte count times eight -- so it needs a
+  // base case of its own or it falls off the width test below and the whole
+  // walk declines.  The split is exact rather than a guess: byte i of the read
+  // is input byte index() + i, in the same low-end-first order `target` uses.
+  if (node.bits() > 64 && node.kind() == rgd::Read) {
+    size_t byte_off = bit_off / 8;
+    size_t n = node.bits() / 8;
+    if (unlikely(byte_off + n > target_size)) return false;
+    if (invert) {
+      if (unlikely(node.index() + n > ctx.in_size)) return false;
+      for (size_t i = 0; i < n; ++i)
+        ctx.assign.push_back({node.index() + i, target[byte_off + i]});
+      return true;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < n; ++i) {
+      if (i2s_peek(ctx, node.index() + i, ok) != target[byte_off + i]) return false;
+      if (unlikely(!ok)) return false;
+    }
+    return true;
+  }
+  if (unlikely(node.bits() > 64)) return false;
   size_t byte_off = bit_off / 8;
   size_t n = node.bits() / 8;
   if (unlikely(byte_off + n > target_size)) return false;
@@ -1141,6 +1164,15 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
                       uint8_t *out_buf, size_t &out_size) {
 
   uint32_t predicate = fcmp_predicate(comparison);
+
+  // Same 64-bit ceiling as solve_icmp, and for the same reason: c->op1/op2 are
+  // extended to 64 bits by the instrumentation.  It bites harder here, because
+  // fp_decode only knows 32- and 64-bit IEEE layouts and returns 0.0 for
+  // anything else -- an fp80 or fp128 compare would be "solved" against two
+  // zeroes rather than declined.
+  auto const& cmp_root = *c->get_root();
+  if (cmp_root.children(0).bits() > 64 || cmp_root.children(1).bits() > 64)
+    return SOLVER_TIMEOUT;
 
   // Classify the comparison by AST structure (not by value matching): is one
   // operand produced by a single invertible FP arith op against a constant, or
@@ -1323,6 +1355,27 @@ I2SSolver::solve_icmp(std::shared_ptr<const Constraint> const& c,
 
   uint64_t value = 0, value_r = 0;
   uint64_t r = 0;
+  // c->op1 and c->op2 are the operand values the trace recorded, and the
+  // instrumentation extends them to 64 bits -- so for a comparison wider than
+  // that they hold only the LOW half.  Every match below compares them against
+  // reassembled input bytes, and a match on the low half of a 128-bit operand
+  // says nothing about the high half: the value written back would satisfy 64
+  // bits of a 128-bit constraint.  Decline; the recursive helpers already stop
+  // at 64 bits (i2s_eval_int, i2s_invert), this is the entry that does not.
+  //
+  // This is a limit of the *traced value* transport, NOT of input-to-state.
+  // solve_memcmp_ast does width-agnostic i2s: it assembles the wanted bytes
+  // from consecutive input_args slots and matches them through i2s_walk_wide,
+  // which needs no traced value at all.  A WideConst operand lands in exactly
+  // that multi-slot form, so an equality against one routes there instead.
+  // Only equality: get_i2s_value, which is what turns a relation into a wanted
+  // value, is uint64 and has no wide counterpart.
+  if (c->get_root()->children(0).bits() > 64 ||
+      c->get_root()->children(1).bits() > 64) {
+    if (comparison == rgd::Equal)
+      return solve_memcmp_ast(c, in_buf, in_size, out_buf, out_size);
+    return SOLVER_TIMEOUT;
+  }
   // Structural anchor by INPUT OFFSET (mirrors solve_fcmp).  The value-only
   // direct-match checks below can be fooled when two symbolic operands hold
   // coincidentally-equal values (e.g. `b + 1 == a` on a seed where a == b): the
@@ -1606,9 +1659,13 @@ I2SSolver::solve_memcmp_ast(std::shared_ptr<const Constraint> const& c,
 
   auto const& root = *c->get_root();
   if (unlikely(root.children_size() != 2)) return SOLVER_TIMEOUT;
-  auto const& want_node = root.children(0);
-  auto const& sym = root.children(1);
-  // same restriction as the value-based path: only memcmp(const, symbolic)
+  // Same restriction as the value-based path: only const-against-symbolic.
+  // Which child holds the constant is fixed for a memcmp root but not for an
+  // ICmp one -- __taint_union swaps the operands of a commutative op to order
+  // the labels, so a wide equality can arrive either way round.
+  bool const_first = root.children(0).kind() == rgd::Constant;
+  auto const& want_node = const_first ? root.children(0) : root.children(1);
+  auto const& sym = const_first ? root.children(1) : root.children(0);
   if (want_node.kind() != rgd::Constant) return SOLVER_TIMEOUT;
   uint32_t bits = sym.bits();
   if (unlikely(bits == 0 || bits % 8 != 0 || want_node.bits() != bits))
