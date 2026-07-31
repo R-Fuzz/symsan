@@ -2079,6 +2079,13 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
     // check for FP
     if (!ClTraceFP)
       return TT.getZeroShadow(Pos);
+    // only half/float/double have a bitcast to an integer that fits the 64-bit
+    // union below.  Anything wider (x86_fp80, fp128, ppc_fp128) would fall
+    // through to the CreateZExtOrTrunc and emit `trunc x86_fp80 to i64`, which
+    // the backend cannot select ("Cannot select: i64 = truncate (f80 load)").
+    // Drop the shadow instead: imprecise, but it compiles and stays sound.
+    if (!Ty->isHalfTy() && !Ty->isFloatTy() && !Ty->isDoubleTy())
+      return TT.getZeroShadow(Pos);
   } else if (Ty->isVectorTy()) {
     // FIXME: vector type
     return TT.getZeroShadow(Pos);
@@ -2091,12 +2098,18 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   // filter size
   auto &DL = Pos->getModule()->getDataLayout();
   uint64_t size = DL.getTypeSizeInBits(Pos->getType());
+  // a comparison records the width of its operands, not of its i1 result, so
+  // the size filter below has to look at the operands too -- otherwise a
+  // 128-bit icmp sails through (result is i1) and its operands get truncated
+  // to 64 bits while the label still claims size = 128, which is a wrong
+  // formula the solver will happily model
+  if (CmpInst *CI = dyn_cast<CmpInst>(Pos))
+    size = DL.getTypeSizeInBits(CI->getOperand(0)->getType());
   // FIXME: do not handle type larger than 64-bit
   if (size > 64) return TT.getZeroShadow(Pos);
 
   IRBuilder<> IRB(Pos);
   if (CmpInst *CI = dyn_cast<CmpInst>(Pos)) { // for both icmp and fcmp
-    size = DL.getTypeSizeInBits(CI->getOperand(0)->getType());
     // op should be predicate
     op |= (CI->getPredicate() << 8);
   }
@@ -3626,6 +3639,10 @@ void TaintFunction::visitCmpInst(CmpInst *I) {
   Module *M = F->getParent();
   auto &DL = M->getDataLayout();
   unsigned size = DL.getTypeSizeInBits(Op1->getType());
+  // same 64-bit ceiling as combineShadows: truncating wider operands while
+  // reporting their real width would hand the solver a wrong formula
+  if (size > 64)
+    return;
 
   IRBuilder<> IRB(I);
   Op1 = IRB.CreateZExtOrTrunc(Op1, TT.Int64Ty);
