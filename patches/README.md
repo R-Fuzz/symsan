@@ -55,6 +55,24 @@ of a switch. Splitting declines unreachable destinations, so two case values
 can still share a block; then both are emitted, against the one edge id, and the
 predecessor is asked for as the *unique* one rather than the single one.
 
+The branch is not always the *immediate* predecessor, though. Pruning (below)
+drops a block that fully dominates its successors, so wherever one side of an
+`if` opens with a straight-line chain — a `while (1) { …; return; }` bail macro,
+a loop body falling into its latch — the block that survives to be instrumented
+sits one or more **unconditional** hops below the branch. Asking only the
+immediate predecessor left most edges on a real target undocumented; the patch
+therefore walks those hops back up before looking for the branch. The walk is
+exact rather than heuristic: each step requires the child to be its parent's
+only successor *and* the parent to be the child's only predecessor, so the two
+blocks run under precisely the same condition and the edge means the same thing
+at either end. It is bounded at 16 hops because an unconditional cycle is
+representable in IR, if not reachable at runtime.
+
+The difference is not marginal. On `fuzzer-challenges` the walk roughly doubles
+the documented edges per target — `test-crc32` 8 → 16, `test-transform` 17 → 30
+— and, more to the point, the recovered edges are the ones inside loops, which
+is where a coverage-sharing consumer most needs an answer.
+
 ### Checking the result
 
 SymSan has the mirror image of this: `SYMSAN_DOCUMENT_IDS=<file>` makes its
@@ -80,8 +98,11 @@ Note both files are *appended* to, so remove them before a rebuild.
   as an error.
 - **Pruned blocks have no id.** `shouldInstrumentBlock()` drops blocks that
   dominate all their successors, so some branch directions are simply absent
-  from the file — typically the side that leads into a nested branch. Consumers
-  must treat "not in the map" as "no information" and fall back.
+  from the file — typically the side that leads into a nested branch. The
+  walk-up described above recovers the cases where the pruned block is followed
+  by an unconditional chain, but not the ones where nothing downstream is
+  instrumented either. Consumers must still treat "not in the map" as "no
+  information" and fall back.
 
   There is no way to turn that pruning off: the `lto-coverage-prune-blocks`
   `cl::opt` is registered by the plugin, but `ld.lld` parses `--mllvm` before it
