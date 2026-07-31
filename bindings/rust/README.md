@@ -306,6 +306,56 @@ Two flags, four arms, one binary — which is the point. Comparing against
 difference could be the scheduler, the mutator or the feedback rather than the
 technique. Here everything outside the stage list is literally the same code.
 
+### Dividing the work when both are on
+
+With `--symsan` and `--cmplog` together, the two stages run the same
+input-to-state technique over the same corpus entry, neither aware of the other
+— and SymSan got there first, having *proved* which bytes reach which branch
+while it traced. So it tells cmplog what is left. This is on by default when
+both flags are given; `--no-symsan-cmplog-filter` turns it off, and `--cmplog`
+on its own is untouched by any of it, which is what keeps the baseline arm of
+the measurement honest.
+
+SymSan's session classifies every input byte after a trace — untainted (no
+branch on this path read it), *open* (some branch target that depends on it is
+still unflipped), or *settled* (tainted, and every target depending on it has
+been reached, whether by SymSan solving it, by a later trace taking it the other
+way, or by the fuzzer's own coverage map). The classification is per data-flow
+group, not per byte, so a coupled four-byte integer is never half-frozen. It is
+published as a `SymSanTaintMetadata` on the testcase — on the *testcase*, not on
+the state, because the trace and the cmplog group are a scheduling apart and one
+state-wide slot would always be stale by the time it was read. Two things then
+read it:
+
+- **`SymSanColorizationStage`** replaces `ColorizationStage`. It randomizes the
+  open and untainted bytes, keeps the settled ones at their original value, and
+  verifies the result with **two executions** — the original and the candidate,
+  same map hash — rather than the `1 + 2 * input_len` the stock stage pays to
+  rediscover a dependency map SymSan is already holding. If the hashes differ,
+  it records a fallback and the stock stage runs behind it, unchanged.
+- **The gate on the whole group.** An entry with no open byte left is one SymSan
+  finished; colorization, the cmplog trace and RedQueen are all skipped for it.
+
+Freezing a byte is the entire mechanism, and it needs no change to RedQueen:
+`AflppRedQueen` acts on an integer comparison only when the operand actually
+moved between the original run and the colorized one —
+`if new_v0 != orig_v0 && orig_v0 != orig_v1`, on each of the U16/U32/U64 arms
+(`token_mutations.rs:1518,1607,1700`). A byte held still fails that test for
+every comparison it feeds, and drops out of the work list.
+
+Two things it therefore cannot do, both worth knowing before reading a number:
+
+- **RTN comparisons are not filtered.** The `CmpValues::Bytes` arm — `memcmp`,
+  `strcmp` and friends — has no such guard: `rtn_extend_encoding` matches the
+  pattern against both buffers and splices regardless of whether the colorized
+  input moved. Narrowing those means bounding RedQueen's own
+  `for cmp_buf_idx in 0..input_len` loop, i.e. vendoring it.
+- **There is no U8 arm at all.** LibAFL's RedQueen has the byte-wide case
+  commented out (`token_mutations.rs:1423`, "just don't do it for u8, not worth
+  it. not even instrumented"), and AFL++'s cmplog pass does not log sub-16-bit
+  comparisons either. Nothing here changes what happens to a single-byte
+  comparison in the baseline.
+
 ## The fork server
 
 Tracing an input used to mean a full `execv`: dynamic linking, the shadow and

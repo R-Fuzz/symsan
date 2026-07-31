@@ -84,7 +84,10 @@ use libafl_bolts::{
     shmem::{ShMem, ShMemProvider, UnixShMemProvider},
     tuples::{Handled, Merge, tuple_list},
 };
-use libafl_symsan::SymSanStage;
+use libafl_symsan::{
+    SymSanColorizationStage, SymSanStage, symsan_cmplog_worthwhile,
+    symsan_needs_stock_colorization,
+};
 use libafl_targets::{
     AflppCmpLogMap,
     cmps::{observers::AflppCmpLogObserver, stages::AflppCmplogTracingStage},
@@ -122,6 +125,22 @@ struct Opt {
     /// binary.
     #[arg(long = "cmplog")]
     cmplog_bin: Option<PathBuf>,
+
+    /// Run cmplog at full strength even when SymSan has already been over the
+    /// entry.
+    ///
+    /// With both `--symsan` and `--cmplog`, the two do the same job twice by
+    /// default -- so by default SymSan's taint is handed to cmplog: bytes whose
+    /// branches SymSan already flipped are held still, which makes RedQueen
+    /// skip the comparisons they feed, and colorization costs two executions
+    /// instead of one per two input bytes. An entry SymSan finished off skips
+    /// the cmplog group entirely.
+    ///
+    /// Pass this to turn that off and get stock LibAFL cmplog, which is the
+    /// honest baseline to measure the filter against. It has no effect without
+    /// both binaries.
+    #[arg(long = "no-symsan-cmplog-filter", default_value = "false")]
+    no_symsan_cmplog_filter: bool,
 
     /// Per-execution timeout for the forkserver, in milliseconds.
     #[arg(short = 't', long = "timeout", default_value = "1200")]
@@ -196,6 +215,13 @@ pub fn main() -> Result<(), libafl::Error> {
         .split_first()
         .expect("clap guarantees at least one element");
 
+    // Only meaningful when both pipelines are in play: there is nothing to
+    // filter cmplog with if SymSan is not running, and nothing to filter if
+    // cmplog is not. Decided here because it has to be known before the
+    // observer is handed to the executor, several sections below.
+    let cmplog_filter =
+        opt.symsan_bin.is_some() && opt.cmplog_bin.is_some() && !opt.no_symsan_cmplog_filter;
+
     // --- coverage plumbing --------------------------------------------------
     //
     // Straight out of LibAFL's forkserver_simple example: a shared memory map
@@ -260,6 +286,11 @@ pub fn main() -> Result<(), libafl::Error> {
     // needs it to tell "this byte changed nothing" from "this byte changed the
     // path". Cheap to construct and unused unless --cmplog was given.
     let colorization = ColorizationStage::new(&edges_observer);
+    // Its cheaper stand-in, for when SymSan has already worked out which bytes
+    // matter. `None` unless both pipelines are on, in which case the stock
+    // stage above still runs behind it whenever this one cannot answer.
+    let symsan_colorization = cmplog_filter
+        .then(|| tuple_list!(SymSanColorizationStage::new(&edges_observer)));
     let mut tokens = Tokens::new();
     let mut executor = ForkserverExecutor::builder()
         .program(executable)
@@ -321,7 +352,8 @@ pub fn main() -> Result<(), libafl::Error> {
                 .forkserver(!opt.symsan_no_forkserver)
                 .i2s(!opt.symsan_no_i2s)
                 .jigsaw(!opt.symsan_no_jigsaw)
-                .z3(opt.symsan_z3);
+                .z3(opt.symsan_z3)
+                .cmplog_filter(cmplog_filter);
             if let Some(map) = &opt.branch_map {
                 // The observer above is named "shared_mem", which is also the
                 // name MaxMapFeedback::new() inherits and files its history map
@@ -431,19 +463,56 @@ pub fn main() -> Result<(), libafl::Error> {
             // the same entry comes round again. Upstream picks the second
             // scheduling rather than the first, so an entry has to prove it is
             // worth coming back to before it earns the trace.
+            //
+            // With the filter on there is a second reason to skip: SymSan may
+            // have left nothing behind worth mutating, in which case the trace
+            // and RedQueen would both run for nothing.
             let run_once_per_entry =
-                |_fuzzer: &mut _,
-                 _executor: &mut _,
-                 state: &mut StdState<InMemoryCorpus<BytesInput>, _, _, _>,
-                 _mgr: &mut _|
-                 -> Result<bool, Error> {
-                    Ok(state.current_testcase()?.scheduled_count() == 1)
+                move |_fuzzer: &mut _,
+                      _executor: &mut _,
+                      state: &mut StdState<InMemoryCorpus<BytesInput>, _, _, _>,
+                      _mgr: &mut _|
+                      -> Result<bool, Error> {
+                    if state.current_testcase()?.scheduled_count() != 1 {
+                        return Ok(false);
+                    }
+                    if cmplog_filter {
+                        return symsan_cmplog_worthwhile(state);
+                    }
+                    Ok(true)
+                };
+
+            // The stock colorization stage, kept behind the SymSan one as the
+            // way out: it runs whenever the cheap stage had no answer, and
+            // unconditionally when the filter is off, which is what keeps
+            // `--cmplog` on its own the same pipeline it always was.
+            let needs_stock_colorization =
+                move |_fuzzer: &mut _,
+                      _executor: &mut _,
+                      state: &mut StdState<InMemoryCorpus<BytesInput>, _, _, _>,
+                      _mgr: &mut _|
+                      -> Result<bool, Error> {
+                    if cmplog_filter {
+                        return symsan_needs_stock_colorization(state);
+                    }
+                    Ok(true)
                 };
 
             println!("cmplog: tracing with {}", bin.display());
+            if cmplog_filter {
+                println!(
+                    "cmplog: filtered by SymSan's taint \
+                     (--no-symsan-cmplog-filter for the stock pipeline)"
+                );
+            }
             Some(tuple_list!(IfStage::new(
                 run_once_per_entry,
-                tuple_list!(colorization, tracing, rq)
+                tuple_list!(
+                    OptionalStage::new(symsan_colorization),
+                    IfStage::new(needs_stock_colorization, tuple_list!(colorization)),
+                    tracing,
+                    rq
+                )
             )))
         }
         None => {

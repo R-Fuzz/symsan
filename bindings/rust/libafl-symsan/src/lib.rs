@@ -27,6 +27,19 @@
 //! instrumentation, and both are required. This mirrors how the AFL++ mutator
 //! took its target from `$SYMSAN_TARGET`.
 //!
+//! # Sharing the work with cmplog
+//!
+//! A fuzzer that runs SymSan *and* AFL++ cmplog runs two input-to-state
+//! techniques over the same entry, each unaware of the other. Turn on
+//! [`SymSanStageBuilder::cmplog_filter`] and the second one is told what the
+//! first already did: [`SymSanStage`] publishes a [`SymSanTaintMetadata`] per
+//! traced entry, [`SymSanColorizationStage`] turns it into a colorized input in
+//! two executions rather than `1 + 2 * input_len`, and
+//! [`symsan_cmplog_worthwhile`] skips the whole cmplog group for an entry
+//! SymSan finished off. What cmplog still sees is the comparisons SymSan could
+//! not crack. See [`SymSanColorizationStage`] for why freezing a byte is all it
+//! takes, and for the two kinds of comparison this cannot filter.
+//!
 //! # One stage per process
 //!
 //! [`SymSanStage`] owns a [`Session`], and SymSan permits one per process. With
@@ -59,20 +72,31 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::hash::Hash;
+use std::marker::PhantomData;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use libafl::{
     Error, HasMetadata, HasNamedMetadata,
     corpus::{CorpusId, HasCurrentCorpusId},
+    events::EventFirer,
+    executors::{Executor, HasObservers},
     feedbacks::{MapFeedbackMetadata, MapIndexesMetadata},
     fuzzer::{Evaluator, ExecuteInputResult},
-    inputs::BytesInput,
-    stages::{Restartable, RetryCountRestartHelper, Stage},
-    state::{HasCorpus, HasCurrentTestcase},
+    inputs::{BytesInput, HasMutatorBytes},
+    observers::ObserversTuple,
+    stages::{Restartable, RetryCountRestartHelper, Stage, TaintMetadata},
+    state::{HasCorpus, HasCurrentTestcase, HasRand},
 };
-use libafl_bolts::Named;
+use libafl_bolts::{
+    Named, generic_hash_std, nonzero,
+    rands::Rand,
+    tuples::{Handle, Handled},
+};
+use serde::{Deserialize, Serialize};
 
-pub use symsan::{Config, JoinReport, Session, Stats};
+pub use symsan::{Config, JoinReport, Session, Stats, TaintClass};
 
 /// Default name, used to key the stage's restart metadata in the state.
 pub const SYMSAN_STAGE_NAME: &str = "symsan";
@@ -127,6 +151,7 @@ pub struct SymSanStageBuilder {
     timeout_ms: Option<u32>,
     max_solutions_per_input: usize,
     forkserver: bool,
+    cmplog_filter: bool,
 }
 
 impl SymSanStageBuilder {
@@ -333,6 +358,26 @@ impl SymSanStageBuilder {
         self
     }
 
+    /// Publish, after each trace, which of the entry's bytes are still worth
+    /// mutating -- so a cmplog pipeline running alongside can leave the rest
+    /// alone. Off by default, because it only pays for itself when there *is*
+    /// such a pipeline.
+    ///
+    /// With it on, the stage attaches a [`SymSanTaintMetadata`] to the state
+    /// for every entry it traces. [`SymSanColorizationStage`] turns that into
+    /// the colorized input AFL++ RedQueen consumes, and
+    /// [`symsan_cmplog_worthwhile`] / [`symsan_needs_stock_colorization`] gate
+    /// the rest of the pipeline on it. See the [module docs](crate) for why
+    /// freezing a byte is enough to make RedQueen skip it.
+    ///
+    /// Costs one flag on the session and a bitset walk per trace; nothing runs
+    /// twice.
+    #[must_use]
+    pub fn cmplog_filter(mut self, yes: bool) -> Self {
+        self.cmplog_filter = yes;
+        self
+    }
+
     /// Create the session and the stage.
     ///
     /// Fails if `target` was not set, if a session already exists in this
@@ -373,7 +418,8 @@ impl SymSanStageBuilder {
             .trace_bounds(self.trace_bounds)
             .solve_ub(self.solve_ub)
             .debug(self.debug)
-            .forkserver(self.forkserver);
+            .forkserver(self.forkserver)
+            .export_taint(self.cmplog_filter);
         if let Some(ms) = self.timeout_ms {
             config = config.timeout_ms(ms);
         }
@@ -422,6 +468,7 @@ impl SymSanStageBuilder {
             join_entries: 0,
             solutions: 0,
             solved: 0,
+            cmplog_filter: self.cmplog_filter,
         })
     }
 }
@@ -479,6 +526,9 @@ pub struct SymSanStage {
     join_entries: u64,
     solutions: u64,
     solved: u64,
+    /// Publish a [`SymSanTaintMetadata`] per traced entry. See
+    /// [`SymSanStageBuilder::cmplog_filter`].
+    cmplog_filter: bool,
 }
 
 impl SymSanStage {
@@ -537,6 +587,52 @@ impl SymSanStage {
     pub fn print_stats(&self, fd: i32) {
         self.session.print_stats(fd);
     }
+
+    /// Attach this entry's byte classification to its testcase, for the cmplog
+    /// pipeline to read when the entry is scheduled again. A no-op unless
+    /// [`cmplog_filter`](SymSanStageBuilder::cmplog_filter) is on.
+    ///
+    /// Every way of failing publishes nothing at all, because "this testcase
+    /// carries no taint" is precisely how the readers are told to do the full
+    /// job.
+    fn publish_taint<S>(&mut self, state: &mut S, corpus_id: CorpusId, input_len: usize)
+    where
+        S: HasCurrentTestcase<BytesInput>,
+    {
+        if !self.cmplog_filter {
+            return;
+        }
+        let classes = match self.session.input_taint() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("symsan: cannot read the taint of entry {corpus_id}: {e}");
+                return;
+            }
+        };
+        // The session clamps what it traces to max_input_size, so a long entry
+        // can come back classified only in part. Rather than teach every reader
+        // about a partial answer, say nothing and let them do the full job.
+        if classes.len() != input_len {
+            log::debug!(
+                "symsan: entry {corpus_id} is {input_len} bytes but only {} were traced; \
+                 not filtering cmplog for it",
+                classes.len()
+            );
+            return;
+        }
+
+        let meta = SymSanTaintMetadata::new(&classes);
+        log::debug!(
+            "symsan: entry {corpus_id} taint: {} settled, {} open, {} untainted",
+            meta.settled_count(),
+            meta.open_count(),
+            input_len - meta.tainted()
+        );
+        match state.current_testcase_mut() {
+            Ok(mut testcase) => testcase.add_metadata(meta),
+            Err(e) => log::warn!("symsan: cannot record the taint of entry {corpus_id}: {e}"),
+        }
+    }
 }
 
 impl Named for SymSanStage {
@@ -552,10 +648,12 @@ where
     // -- is blanket-implemented for exactly that combination.
     // `HasNamedMetadata` is where the coverage feedback keeps its history map,
     // which is what branch_map() needs to read; `Restartable` requires it of
-    // `S` anyway, so it costs a stage nothing.
+    // `S` anyway, so it costs a stage nothing. `HasMetadata` is where
+    // cmplog_filter() publishes its answer.
     S: HasCorpus<BytesInput>
         + HasCurrentCorpusId
         + HasCurrentTestcase<BytesInput>
+        + HasMetadata
         + HasNamedMetadata,
     // ...and the fuzzer must be able to run and judge an input for us. This is
     // the bound that makes honest reporting possible.
@@ -703,42 +801,50 @@ where
             }
         }
 
-        if tasks == 0 {
-            return Ok(());
-        }
-        log::debug!("symsan: corpus entry {corpus_id} produced {tasks} tasks");
+        // Not an early return, unlike every other bail-out above: an entry with
+        // nothing to solve has still exercised branches, and "every target on
+        // this path is already reached" is the single most useful answer the
+        // taint export can give -- it is what lets the cmplog group be skipped
+        // outright. So fall through to publish it.
+        if tasks != 0 {
+            log::debug!("symsan: corpus entry {corpus_id} produced {tasks} tasks");
 
-        let mut produced = 0usize;
-        while let Some(solution) = self.session.next_solution() {
-            self.solutions += 1;
-            produced += 1;
+            let mut produced = 0usize;
+            while let Some(solution) = self.session.next_solution() {
+                self.solutions += 1;
+                produced += 1;
 
-            // Hand the solved input to the fuzzer exactly as a mutational stage
-            // would: it runs it on the *coverage-instrumented* build, applies
-            // the feedbacks, and adds it to the corpus if it is interesting.
-            // `evaluate_filtered` honours the fuzzer's input filter, so an
-            // input we have already seen is not re-run.
-            let (result, _) =
-                fuzzer.evaluate_filtered(state, executor, manager, &BytesInput::new(solution))?;
+                // Hand the solved input to the fuzzer exactly as a mutational
+                // stage would: it runs it on the *coverage-instrumented* build,
+                // applies the feedbacks, and adds it to the corpus if it is
+                // interesting. `evaluate_filtered` honours the fuzzer's input
+                // filter, so an input we have already seen is not re-run.
+                let (result, _) =
+                    fuzzer.evaluate_filtered(state, executor, manager, &BytesInput::new(solution))?;
 
-            let interesting = result != ExecuteInputResult::None;
-            if interesting {
-                self.solved += 1;
+                let interesting = result != ExecuteInputResult::None;
+                if interesting {
+                    self.solved += 1;
+                }
+                // The honest answer. `false` makes the session escalate this
+                // task to the next solver in the ladder; `true` retires it.
+                self.session.report_result(interesting);
+
+                if self.max_solutions_per_input != 0 && produced >= self.max_solutions_per_input {
+                    log::debug!(
+                        "symsan: hit the {} solution budget for corpus entry {corpus_id}, \
+                         dropping {} pending tasks",
+                        self.max_solutions_per_input,
+                        self.session.pending_tasks()
+                    );
+                    break;
+                }
             }
-            // The honest answer. `false` makes the session escalate this task
-            // to the next solver in the ladder; `true` retires it.
-            self.session.report_result(interesting);
-
-            if self.max_solutions_per_input != 0 && produced >= self.max_solutions_per_input {
-                log::debug!(
-                    "symsan: hit the {} solution budget for corpus entry {corpus_id}, \
-                     dropping {} pending tasks",
-                    self.max_solutions_per_input,
-                    self.session.pending_tasks()
-                );
-                break;
-            }
         }
+
+        // Last, because a target only counts as reached once report_result()
+        // has said its solution was interesting.
+        self.publish_taint(state, corpus_id, bytes.len());
 
         Ok(())
     }
@@ -757,6 +863,446 @@ where
 
     fn clear_progress(&mut self, state: &mut S) -> Result<(), Error> {
         RetryCountRestartHelper::clear_progress(state, &self.name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// telling cmplog which bytes are still worth attacking
+// ---------------------------------------------------------------------------
+
+/// What SymSan's trace said about the bytes of one corpus entry.
+///
+/// Published by [`SymSanStage`] when
+/// [`cmplog_filter`](SymSanStageBuilder::cmplog_filter) is on, and consumed by
+/// [`SymSanColorizationStage`] and the two gates below.
+///
+/// It lives on the **testcase**, not on the state, because the two sides of
+/// this are a scheduling apart: SymSan traces an entry the first time it is
+/// scheduled, while the cmplog group waits for the second (`scheduled_count()
+/// == 1`, the same condition upstream's cmplog fuzzers use). A single slot in
+/// the state would have been overwritten by every entry traced in between.
+///
+/// Stored as the *runs* of bytes still worth moving rather than a flag per
+/// byte, which keeps it to a few words per entry however long the input is --
+/// it has to survive on the testcase until that second scheduling, and a
+/// per-byte vector would have doubled what the corpus costs to hold.
+#[derive(Debug, Serialize, Deserialize)]
+// impl_serdeany! gives the type a `pub unsafe fn register`, which is all this
+// lint is reacting to.
+#[allow(clippy::unsafe_derive_deserialize)]
+pub struct SymSanTaintMetadata {
+    /// Ascending, non-adjacent runs of the bytes an input-to-state pass should
+    /// still move. Everything outside them is settled: every branch target
+    /// reading it has been reached, so there is nothing left to flip there.
+    movable: Vec<Range<usize>>,
+    /// Length of the input this describes, so a reader can tell it is looking
+    /// at the entry it thinks it is.
+    input_len: usize,
+    /// How many bytes any branch on the traced path read at all. The rest are
+    /// bytes SymSan saw nothing depend on -- which is *not* the same as bytes
+    /// nothing depends on, so they are never frozen.
+    tainted: usize,
+    /// Set by [`SymSanColorizationStage`] when its one-shot colorized input did
+    /// not reproduce the original coverage, meaning the stock bisecting
+    /// [`ColorizationStage`](libafl::stages::ColorizationStage) has to run
+    /// after all.
+    fallback: bool,
+}
+
+libafl_bolts::impl_serdeany!(SymSanTaintMetadata);
+
+impl SymSanTaintMetadata {
+    fn new(classes: &[TaintClass]) -> Self {
+        let mut movable: Vec<Range<usize>> = Vec::new();
+        let mut tainted = 0;
+        for (i, class) in classes.iter().enumerate() {
+            if *class != TaintClass::Untainted {
+                tainted += 1;
+            }
+            if *class == TaintClass::Settled {
+                continue;
+            }
+            match movable.last_mut() {
+                Some(last) if last.end == i => last.end = i + 1,
+                _ => movable.push(i..i + 1),
+            }
+        }
+        Self {
+            movable,
+            input_len: classes.len(),
+            tainted,
+            fallback: false,
+        }
+    }
+
+    /// The runs of bytes an input-to-state pass should still move.
+    #[must_use]
+    pub fn movable(&self) -> &[Range<usize>] {
+        &self.movable
+    }
+
+    /// Length of the input this describes.
+    #[must_use]
+    pub fn input_len(&self) -> usize {
+        self.input_len
+    }
+
+    /// Bytes some branch on the traced path read.
+    #[must_use]
+    pub fn tainted(&self) -> usize {
+        self.tainted
+    }
+
+    /// Bytes that are settled, and so may be held still.
+    #[must_use]
+    pub fn settled_count(&self) -> usize {
+        self.input_len - self.movable.iter().map(Range::len).sum::<usize>()
+    }
+
+    /// Tainted bytes that are *not* settled -- some target reading them is
+    /// still unreached.
+    #[must_use]
+    pub fn open_count(&self) -> usize {
+        self.tainted - self.settled_count()
+    }
+
+    /// Whether the stock colorization stage still has to run for this entry.
+    #[must_use]
+    pub fn fallback(&self) -> bool {
+        self.fallback
+    }
+
+    /// Is there anything here for an input-to-state pass to do?
+    ///
+    /// False only when *every* byte is settled. Note this is weaker than "no
+    /// open byte": untainted bytes count as work too, because SymSan's taint
+    /// under-approximates -- a comparison reached through something it does not
+    /// model (a libc call it has no wrapper for, hand-written assembly) leaves
+    /// its operands looking untainted, and cmplog observes those just fine.
+    /// Freezing them would hand cmplog exactly the blind spots SymSan has.
+    #[must_use]
+    pub fn worth_mutating(&self) -> bool {
+        !self.movable.is_empty()
+    }
+}
+
+/// Should the cmplog pipeline run at all for the entry being fuzzed?
+///
+/// True unless SymSan traced this very entry and found every one of its bytes
+/// settled -- see [`SymSanTaintMetadata::worth_mutating`]. No answer, because
+/// the entry was never traced or the trace failed, means yes, run it: this
+/// filter only ever removes work it can prove is redundant.
+pub fn symsan_cmplog_worthwhile<S>(state: &S) -> Result<bool, Error>
+where
+    S: HasCurrentTestcase<BytesInput> + HasCurrentCorpusId,
+{
+    let Some(corpus_id) = state.current_corpus_id()? else {
+        return Ok(true);
+    };
+    let Ok(meta) = state
+        .current_testcase()?
+        .metadata::<SymSanTaintMetadata>()
+        .map(SymSanTaintMetadata::worth_mutating)
+    else {
+        return Ok(true);
+    };
+    if !meta {
+        log::debug!("symsan: skipping cmplog for entry {corpus_id}: every byte is settled");
+    }
+    Ok(meta)
+}
+
+/// Does the stock [`ColorizationStage`](libafl::stages::ColorizationStage)
+/// still have to run for the entry being fuzzed?
+///
+/// True when [`SymSanColorizationStage`] could not do the job -- no taint for
+/// this entry, or a colorized input whose coverage did not match. Meant to gate
+/// a stock colorization stage placed immediately after it.
+pub fn symsan_needs_stock_colorization<S>(state: &S) -> Result<bool, Error>
+where
+    S: HasCurrentTestcase<BytesInput> + HasCurrentCorpusId,
+{
+    if state.current_corpus_id()?.is_none() {
+        return Ok(true);
+    }
+    Ok(state
+        .current_testcase()?
+        .metadata::<SymSanTaintMetadata>()
+        .map_or(true, SymSanTaintMetadata::fallback))
+}
+
+/// Default name for [`SymSanColorizationStage`].
+pub const SYMSAN_COLORIZATION_STAGE_NAME: &str = "symsan_colorization";
+
+/// Colorize an input the way AFL++ does, but using SymSan's taint instead of
+/// bisection to decide which bytes may move.
+///
+/// A drop-in replacement for LibAFL's
+/// [`ColorizationStage`](libafl::stages::ColorizationStage) that costs **two**
+/// executions per entry instead of `1 + 2 * input_len`. Both stages answer the
+/// same question -- which bytes can be replaced without changing the path? --
+/// but where the stock one discovers it by halving ranges and re-running,
+/// SymSan already computed it exactly while tracing.
+///
+/// It does more than save executions, and that is the point of the whole
+/// exercise: the bytes it holds still are the ones whose branches SymSan
+/// *already solved*, and AFL++ RedQueen acts on an integer comparison only when
+/// its operand actually moved between the original run and the colorized one.
+/// So a frozen byte silently removes every integer comparison it feeds from
+/// RedQueen's work list, with no change to RedQueen itself. What is left is the
+/// comparisons SymSan could not crack -- which is exactly what cmplog is for.
+///
+/// Two things it cannot filter, both properties of RedQueen rather than of the
+/// taint: the `Bytes`/RTN arm (`memcmp`, `strcmp`) splices its pattern in
+/// regardless of whether the operand moved, and LibAFL's RedQueen has no `U8`
+/// arm at all.
+///
+/// Requires [`SymSanStage`] with
+/// [`cmplog_filter`](SymSanStageBuilder::cmplog_filter) on, earlier in the same
+/// stage list. Without a fresh [`SymSanTaintMetadata`] it does nothing at all,
+/// which is why it should be paired with a stock colorization stage gated on
+/// [`symsan_needs_stock_colorization`].
+#[derive(Debug, Clone)]
+pub struct SymSanColorizationStage<C, O> {
+    map_observer_handle: Handle<C>,
+    name: Cow<'static, str>,
+    /// `O` appears only in the [`Stage`] bounds -- it is the observer's own
+    /// type, behind the `AsRef` the hash is taken through.
+    phantom: PhantomData<O>,
+}
+
+impl<C, O> SymSanColorizationStage<C, O>
+where
+    C: Named,
+{
+    /// Create the stage, reading coverage from `map_observer` -- the same
+    /// observer the stock colorization stage would be given.
+    #[must_use]
+    pub fn new(map_observer: &C) -> Self {
+        let obs_name = map_observer.name().clone().into_owned();
+        Self {
+            map_observer_handle: map_observer.handle(),
+            name: Cow::Owned(SYMSAN_COLORIZATION_STAGE_NAME.to_owned() + ":" + obs_name.as_str()),
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<C, O> Named for SymSanColorizationStage<C, O> {
+    fn name(&self) -> &Cow<'static, str> {
+        &self.name
+    }
+}
+
+impl<C, E, EM, O, S, Z> Stage<E, EM, S, Z> for SymSanColorizationStage<C, O>
+where
+    C: AsRef<O> + Named,
+    O: Hash,
+    E: HasObservers + Executor<EM, BytesInput, S, Z>,
+    E::Observers: ObserversTuple<BytesInput, S>,
+    EM: EventFirer<BytesInput, S>,
+    S: HasCorpus<BytesInput>
+        + HasCurrentCorpusId
+        + HasCurrentTestcase<BytesInput>
+        + HasMetadata
+        + HasRand,
+{
+    fn perform(
+        &mut self,
+        fuzzer: &mut Z,
+        executor: &mut E,
+        state: &mut S,
+        manager: &mut EM,
+    ) -> Result<(), Error> {
+        let Some(corpus_id) = state.current_corpus_id()? else {
+            return Ok(());
+        };
+
+        // Copied out rather than borrowed: running the target below needs
+        // `&mut state`, which a borrow of the testcase cannot survive. The runs
+        // double as the `ranges` handed to TaintMetadata at the end -- they are
+        // the same thing seen from both sides, the bytes free to move.
+        let Some((ranges, taint_len, settled_count)) = state
+            .current_testcase()?
+            .metadata::<SymSanTaintMetadata>()
+            .ok()
+            .map(|m| (m.movable.clone(), m.input_len(), m.settled_count()))
+        else {
+            // Nothing to go on. Deliberately *not* recorded as a fallback:
+            // symsan_needs_stock_colorization() already reads missing metadata
+            // as "run the stock stage", and writing a marker here would only
+            // make a later reader mistake it for a real answer.
+            log::debug!("symsan: no taint for entry {corpus_id}; not colorizing it");
+            return Ok(());
+        };
+
+        let input: BytesInput = state.current_input_cloned()?;
+        if input.mutator_bytes().len() != taint_len {
+            // The entry changed length since it was traced. Cheap to guard, and
+            // impossible to recover from.
+            log::debug!(
+                "symsan: entry {corpus_id} is {} bytes but its taint covers {taint_len}; \
+                 falling back to stock colorization",
+                input.mutator_bytes().len(),
+            );
+            set_fallback(state, true);
+            return Ok(());
+        }
+
+        let orig_hash = self.map_hash(fuzzer, executor, state, manager, &input)?;
+
+        let mut bytes = input.mutator_bytes().to_vec();
+        for range in &ranges {
+            for byte in &mut bytes[range.clone()] {
+                *byte = type_replace(*byte, state.rand_mut());
+            }
+        }
+        let colorized = BytesInput::new(bytes);
+        let colorized_hash = self.map_hash(fuzzer, executor, state, manager, &colorized)?;
+
+        if orig_hash != colorized_hash {
+            // Randomizing every unsettled byte at once took the target down a
+            // different path. The taint is not wrong -- it describes the
+            // *symbolic* build, and the two builds can disagree about a
+            // comparison SymSan never modelled -- but it is not usable here, so
+            // hand the entry to the stage that finds out the slow way.
+            log::debug!(
+                "symsan: colorizing entry {corpus_id} changed its coverage; \
+                 falling back to stock colorization"
+            );
+            set_fallback(state, true);
+            return Ok(());
+        }
+
+        log::debug!(
+            "symsan: colorized entry {corpus_id} in 2 execs, holding {settled_count} of \
+             {taint_len} bytes still across {} range(s)",
+            ranges.len()
+        );
+
+        let colorized_bytes = colorized.mutator_bytes().to_vec();
+        if let Some(meta) = state.metadata_map_mut().get_mut::<TaintMetadata>() {
+            meta.update(colorized_bytes, ranges);
+        } else {
+            state.add_metadata(TaintMetadata::new(colorized_bytes, ranges));
+        }
+        set_fallback(state, false);
+        Ok(())
+    }
+}
+
+impl<C, O, S> Restartable<S> for SymSanColorizationStage<C, O>
+where
+    S: HasNamedMetadata + HasCurrentCorpusId,
+{
+    fn should_restart(&mut self, state: &mut S) -> Result<bool, Error> {
+        // Deterministic, like the stage it replaces: if it failed once it will
+        // fail again.
+        RetryCountRestartHelper::no_retry(state, &self.name)
+    }
+
+    fn clear_progress(&mut self, state: &mut S) -> Result<(), Error> {
+        RetryCountRestartHelper::clear_progress(state, &self.name)
+    }
+}
+
+impl<C, O> SymSanColorizationStage<C, O> {
+    /// Run the target and hash the coverage map, before the hitcount observer's
+    /// `post_exec` classifies it -- the same raw hash the stock colorization
+    /// stage compares, so the two agree on what "the same path" means.
+    fn map_hash<E, EM, S, Z>(
+        &self,
+        fuzzer: &mut Z,
+        executor: &mut E,
+        state: &mut S,
+        manager: &mut EM,
+        input: &BytesInput,
+    ) -> Result<usize, Error>
+    where
+        C: AsRef<O> + Named,
+        O: Hash,
+        E: HasObservers + Executor<EM, BytesInput, S, Z>,
+        E::Observers: ObserversTuple<BytesInput, S>,
+    {
+        executor.observers_mut().pre_exec_all(state, input)?;
+        let exit_kind = executor.run_target(fuzzer, state, manager, input)?;
+        let hash = {
+            let observers = executor.observers();
+            generic_hash_std(observers[&self.map_observer_handle].as_ref()) as usize
+        };
+        executor
+            .observers_mut()
+            .post_exec_all(state, input, &exit_kind)?;
+        Ok(hash)
+    }
+}
+
+/// Record on the current testcase whether the stock colorization stage is
+/// needed. Silently does nothing if the testcase carries no taint, which is
+/// already read as "run the stock stage".
+fn set_fallback<S>(state: &mut S, yes: bool)
+where
+    S: HasCurrentTestcase<BytesInput>,
+{
+    if let Ok(mut testcase) = state.current_testcase_mut() {
+        if let Ok(meta) = testcase.metadata_mut::<SymSanTaintMetadata>() {
+            meta.fallback = yes;
+        }
+    }
+}
+
+/// Replace a byte with a different one of the same kind: a digit stays a digit,
+/// a letter a letter, whitespace whitespace.
+///
+/// AFL++'s `type_replace`, one byte at a time. Copied rather than called
+/// because LibAFL's is private to its colorization stage, and reimplemented
+/// rather than simplified because the *kind*-preserving part is what keeps a
+/// text input parseable -- colorize a JSON file into random bytes and the
+/// parser rejects it before reaching any of the comparisons cmplog wants to
+/// see. Every arm returns a value different from its input, which is what makes
+/// RedQueen notice the byte moved.
+fn type_replace(byte: u8, rand: &mut impl Rand) -> u8 {
+    match byte {
+        // 'A' + 1 + rand('F' - 'A')
+        0x41..=0x46 => 0x41 + 1 + rand.below(nonzero!(5)) as u8,
+        // 'a' + 1 + rand('f' - 'a')
+        0x61..=0x66 => 0x61 + 1 + rand.below(nonzero!(5)) as u8,
+        // '0' -> '1'
+        0x30 => 0x31,
+        // '1' -> '0'
+        0x31 => 0x30,
+        // '2' + 1 + rand('9' - '2')
+        0x32..=0x39 => 0x32 + 1 + rand.below(nonzero!(7)) as u8,
+        // 'G' + 1 + rand('Z' - 'G')
+        0x47..=0x5a => 0x47 + 1 + rand.below(nonzero!(19)) as u8,
+        // 'g' + 1 + rand('z' - 'g')
+        0x67..=0x7a => 0x67 + 1 + rand.below(nonzero!(19)) as u8,
+        // '!' + 1 + rand('*' - '!')
+        0x21..=0x2a => 0x21 + 1 + rand.below(nonzero!(9)) as u8,
+        // ',' + 1 + rand('.' - ',')
+        0x2c..=0x2e => 0x2c + 1 + rand.below(nonzero!(2)) as u8,
+        // ':' + 1 + rand('@' - ':')
+        0x3a..=0x40 => 0x3a + 1 + rand.below(nonzero!(6)) as u8,
+        // '[' + 1 + rand('`' - '[')
+        0x5b..=0x60 => 0x5b + 1 + rand.below(nonzero!(5)) as u8,
+        // '{' + 1 + rand('~' - '{')
+        0x7b..=0x7e => 0x7b + 1 + rand.below(nonzero!(3)) as u8,
+        // '+' -> '/'
+        0x2b => 0x2f,
+        // '/' -> '+'
+        0x2f => 0x2b,
+        // ' ' -> '\t'
+        0x20 => 0x9,
+        // '\t' -> ' '
+        0x9 => 0x20,
+        // '\r' -> '\n'
+        0xd => 0xa,
+        // '\n' -> '\r'
+        0xa => 0xd,
+        0x0 => 0x1,
+        0x1 | 0xff => 0x0,
+        other if other < 32 => other ^ 0x1f,
+        other => other ^ 0x7f,
     }
 }
 
