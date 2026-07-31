@@ -285,6 +285,18 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
           llvm::Type::getIntNTy(Builder.getContext(), node->bits()));
       break;
     }
+    case rgd::BitReverse: {
+      // Same width in as out, and LLVM has the intrinsic natively -- x86 has no
+      // bit-reverse instruction, but the backend's expansion is still a handful
+      // of shifts and masks, far cheaper than reconstructing it out of AST
+      // nodes.
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = codegen(Builder, rc, local_map, arg, value_cache);
+      llvm::Type* Ty = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
+      c = Builder.CreateZExtOrTrunc(c, Ty);
+      ret = Builder.CreateIntrinsic(llvm::Intrinsic::bitreverse, {Ty}, {c});
+      break;
+    }
     case rgd::ZExt: {
 #if DEBUG
       // std::cerr << "ZExt the bits is " << node->bits() << std::endl;

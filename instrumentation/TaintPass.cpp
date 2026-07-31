@@ -210,6 +210,7 @@ enum {
   DfsanFpMin      = 93, // fp_min
   DfsanFpMax      = 94, // fp_max
   DfsanFpCopysign = 95, // fp_copysign
+  DfsanBitReverse = 109, // bitreverse (last_llvm_op + 42)
 };
 // Rounding-mode selector (must match __dfsan::fp_rounding_mode in dfsan.h).
 enum {
@@ -4831,6 +4832,40 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
 
     TF.setShadow(&CB, Result);
     return;
+  }
+
+  // bitreverse: one op node, not a decomposition.  Reversing an i64 the way
+  // bswap is handled above would take 64 Extracts plus 63 Concats per dynamic
+  // execution, and clang's idiom recognizer turns the reflection loop of every
+  // reflected CRC into an @llvm.bitreverse.i8 per message byte -- so the
+  // decomposition would be paid thousands of times per trace.  The solvers
+  // expand it instead: z3 as a concat of single-bit extracts, jigsaw as the
+  // native intrinsic.  Without this the shadow is dropped and the whole message
+  // silently goes concrete (see tests/symsan/bitreverse*.c).
+  if (IId == Intrinsic::bitreverse) {
+    Value *Arg = CB.getArgOperand(0);
+    Type *ArgTy = Arg->getType();
+    // The intrinsic is also defined on vectors, and getIntegerBitWidth() is a
+    // cast<IntegerType> away from asserting on one, so ask before assuming.
+    if (ArgTy->isIntegerTy() && ArgTy->getIntegerBitWidth() <= 64) {
+      unsigned Bits = ArgTy->getIntegerBitWidth();
+      Value *Shadow = TF.getShadow(Arg);
+      IRBuilder<> IRB(&CB);
+      CallInst *C = IRB.CreateCall(
+          TF.TT.TaintUnionFn,
+          {Shadow, TF.TT.ZeroPrimitiveShadow,
+           ConstantInt::get(TF.TT.Int16Ty, DfsanBitReverse),
+           ConstantInt::get(TF.TT.Int16Ty, Bits),
+           IRB.CreateZExtOrTrunc(Arg, TF.TT.Int64Ty),
+           ConstantInt::get(TF.TT.Int64Ty, 0)});
+      C->addRetAttr(Attribute::ZExt);
+      C->addParamAttr(0, Attribute::ZExt);
+      C->addParamAttr(1, Attribute::ZExt);
+      TF.setShadow(&CB, C);
+      return;
+    }
+    // A vector, or wider than a label's op1 slot: fall through and drop the
+    // shadow, the way this file already does for everything it cannot model.
   }
 
   // Floating-point intrinsics: map to the self-defined FP ops so the z3 solver

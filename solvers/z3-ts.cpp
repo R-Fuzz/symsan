@@ -39,6 +39,7 @@ static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::And,     "And"},
   {__dfsan::Or,      "Or"},
   {__dfsan::Xor,     "Xor"},
+  {__dfsan::bitreverse, "BitReverse"},
   // relational comparisons
 #define RELATIONAL_ICMP(cmp) (__dfsan::ICmp | (cmp << 8))
   {RELATIONAL_ICMP(__dfsan::bveq),  "Equal"},
@@ -659,6 +660,30 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       cache_expr(l, trunc_expr);
       TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(value_cache_[info->l1] & ((1UL << info->size) - 1));
+      continue;
+    } else if (info->op == __dfsan::bitreverse) {
+      // z3 has no bit-reversal primitive, so expand to a concat of single-bit
+      // extracts.  concat puts its first argument in the high bits, so walking
+      // the operand from bit 0 upwards lays input bit 0 down as the result's
+      // MSB -- which is the reversal.  The blaster collapses this to wiring.
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      if (!base.is_bv()) {
+        fprintf(stderr, "WARNING: BitReverse on non-BV (label=%u, l1=%u, sort=%s)\n",
+                l, info->l1, base.get_sort().to_string().c_str());
+        throw z3::exception("bitreverse on non-bitvector operand");
+      }
+      uint32_t bits = base.get_sort().bv_size();
+      z3::expr r = base.extract(0, 0);
+      for (uint32_t i = 1; i < bits; ++i)
+        r = z3::concat(r, base.extract(i, i));
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      cache_expr(l, r);
+      TRACK_LABEL_BV_ONLY();
+      uint64_t bv = value_cache_[info->l1];
+      uint64_t rv = 0;
+      for (uint32_t i = 0; i < bits; ++i)
+        rv |= ((bv >> i) & 1UL) << (bits - 1 - i);
+      RECORD_VALUE(rv);
       continue;
     } else if (info->op == __dfsan::IntToPtr) {
       z3::expr e = get_cached_expr(info->l1, input_deps);

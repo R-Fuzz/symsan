@@ -128,6 +128,11 @@ namespace rgd {
     // solvers/z3-solver.cpp and solvers/jigsaw/jit.cc.
     TLookup, // 83
 
+    // llvm.bitreverse: reverse the operand's bit order.  One child, same width
+    // in as out.  Deliberately NOT in the isBinaryOperation range -- it is
+    // unary, and the integer solvers dispatch on that.
+    BitReverse, // 84
+
     // Last
     LastOp
   };
@@ -217,6 +222,7 @@ namespace rgd {
     "FUle",
     "FUne",
     "TLookup",
+    "BitReverse",
   };
 
   static inline bool isRelationalKind(uint16_t kind) {

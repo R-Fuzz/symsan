@@ -14,16 +14,23 @@
 // bytes bought nothing this does not already show and cost a great deal of
 // wall clock.
 //
-// CRC-CCITT rather than the CRC-32 the header defaults to, and that is not
-// arbitrary: CRC-32 sets REFLECT_DATA, so each message byte goes through
-// reflect(x, 8), which clang's idiom recognizer turns into @llvm.bitreverse.i8
-// at -O3.  TaintPass handles llvm.bswap but has no case for llvm.bitreverse,
-// so the shadow is dropped and the whole message silently goes concrete --
-// the test would still pass, in a fraction of the time, having checked
-// nothing but "solve for the checksum field".  CCITT does not reflect, so
-// nothing hides the gap here.  (reflect() itself is left in place and only its
-// 1 << n -> 1UL << n overflow was fixed; it is dead code under CCITT, and
-// wrong for any WIDTH above 32 without the fix.)
+// CRC-CCITT rather than the CRC-32 the header defaults to.  That started as a
+// workaround: CRC-32 sets REFLECT_DATA, so each message byte goes through
+// reflect(x, 8), which clang's idiom recognizer turns into @llvm.bitreverse.i8,
+// and TaintPass had no case for that intrinsic -- the shadow was dropped, the
+// whole message silently went concrete, and the test still passed, in a
+// fraction of the time, having checked nothing but "solve for the checksum
+// field".  CCITT does not reflect, so nothing could hide behind it.
+//
+// The gap is closed (TaintPass emits a bitreverse op, and every solver handles
+// it -- tests/symsan/bitreverse.c and tests/symsan/bitreverse_idiom.c, the
+// latter on exactly this reflect() shape), so a CRC-32 build now stays
+// symbolic through the reflection.  CCITT stays here for the reason the
+// message length is 16: the reflected variants only add work this file does
+// not otherwise measure, and reflection has its own, much cheaper tests.
+// (reflect() itself is left in place and only its 1 << n -> 1UL << n overflow
+// was fixed; it is dead code under CCITT, and wrong for any WIDTH above 32
+// without the fix.)
 //
 // Replayed as a set rather than by name: what is being asserted is that some
 // generated input satisfies the checksum, not where in the queue it lands.

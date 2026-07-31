@@ -532,6 +532,15 @@ static inline int64_t i2s_sext(uint64_t v, uint32_t bits) {
   return ((int64_t)(v << sh)) >> sh;
 }
 
+// Reverse the low `bits` bits of `v`, which is what llvm.bitreverse does.  Its
+// own inverse, so the same helper serves both evaluation and inversion.
+static inline uint64_t i2s_bitrev(uint64_t v, uint32_t bits) {
+  uint64_t r = 0;
+  for (uint32_t i = 0; i < bits; ++i)
+    r |= ((v >> i) & 1ULL) << (bits - 1 - i);
+  return r;
+}
+
 // Index the fully-expanded nodes of a constraint so stubs can be redirected.
 static void i2s_index_nodes(const AstNode &node, i2s_node_map_t &map,
                             uint32_t depth) {
@@ -639,6 +648,12 @@ static bool i2s_eval_int(i2s_ctx &ctx, const AstNode &n_, uint64_t &out,
       if (!i2s_eval_int(ctx, node.children(0), idx, depth + 1)) return false;
       return i2s_table_elem(ctx, node, idx, out);
     }
+    case rgd::BitReverse: {
+      uint64_t v;
+      if (!i2s_eval_int(ctx, node.children(0), v, depth + 1)) return false;
+      out = i2s_bitrev(v, node.bits());
+      return true;
+    }
     default: break;
   }
   if (!isBinaryOperation(node.kind())) return false;
@@ -725,6 +740,14 @@ static bool i2s_value_domain_r(i2s_ctx &ctx, const AstNode &n_,
         else r = v >> node.index();
         if (!emit(r)) return false;
       }
+      return true;
+    }
+    case rgd::BitReverse: {
+      // a bijection on the same width, so it maps a domain through one-for-one
+      std::vector<uint64_t> sub;
+      if (!i2s_value_domain_r(ctx, node.children(0), sub, depth + 1)) return false;
+      for (auto v : sub)
+        if (!emit(i2s_bitrev(v, node.bits()))) return false;
       return true;
     }
     // deliberately no Concat: the cross product of two domains is not small
@@ -952,6 +975,11 @@ static bool i2s_invert(i2s_ctx &ctx, const AstNode &n_, uint64_t target,
       }
       return false;
     }
+    case rgd::BitReverse:
+      // its own inverse, and it determines every bit of its operand, so this is
+      // exact rather than a guess: reverse the target and push it down
+      return i2s_invert(ctx, node.children(0),
+                        i2s_bitrev(target, node.bits()), depth + 1);
     default: break;
   }
   if (!isBinaryOperation(node.kind())) return false;
@@ -1313,6 +1341,31 @@ I2SSolver::solve_icmp(std::shared_ptr<const Constraint> const& c,
   size_t lc_off = 0, rc_off = 0;
   bool have_lc_off = read_offset(lc, lc_off);
   bool have_rc_off = read_offset(rc, rc_off);
+  // A bit-reversed side is a trap for the value match specifically because the
+  // reversal is an involution.  A palindromic byte -- 0x24, 0x18, 0x81, and 14
+  // others -- reverses to itself, so the compared value IS the input byte it
+  // came from, the match fires as if the side were a plain Read, and the
+  // replacement gets written without being reversed.  A confident wrong answer,
+  // not a miss.  Exclude the shape and let it fall through to the AST walk,
+  // which pushes the target down through the reversal and then verifies.
+  // (Only bitreverse is special-cased here.  The value match is a one-sample
+  // guess and any non-Read side can mislead it -- bswap has the same
+  // involution trap, through its Extract/Concat decomposition -- but checking
+  // every candidate is a change to every integer target, not to this op.)
+  auto through_casts = [](const AstNode &n) -> const AstNode * {
+    const AstNode *p = &n;
+    for (int i = 0; i < 4 && p->children_size() == 1; ++i) {
+      switch (p->kind()) {
+        case rgd::ZExt: case rgd::SExt: case rgd::Extract:
+          p = &p->children(0);
+          continue;
+        default: return p;
+      }
+    }
+    return p;
+  };
+  bool lc_reversed = through_casts(lc)->kind() == rgd::BitReverse;
+  bool rc_reversed = through_casts(rc)->kind() == rgd::BitReverse;
   for (auto const& candidate : cm->i2s_candidates) {
     size_t offset = candidate.first;
     uint32_t bytes = candidate.second;
@@ -1327,17 +1380,17 @@ I2SSolver::solve_icmp(std::shared_ptr<const Constraint> const& c,
       value_r = SWAP64(value) >> (64 - bytes * 8);
       DEBUGF("i2s: try %lu, length %u = 0x%016lx, 0x%016lx, comparison = %d\n",
           offset, bytes, value, value_r, comparison);
-      if (c->op1 == value && (!have_lc_off || offset == lc_off)) {
+      if (!lc_reversed && c->op1 == value && (!have_lc_off || offset == lc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op2, false);
-      } else if (c->op2 == value && (!have_rc_off || offset == rc_off)) {
+      } else if (!rc_reversed && c->op2 == value && (!have_rc_off || offset == rc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op1, true);
-      } else if (c->op1 == value_r && (!have_lc_off || offset == lc_off)) {
+      } else if (!lc_reversed && c->op1 == value_r && (!have_lc_off || offset == lc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op2, false);
         r = SWAP64(r) >> (64 - bytes * 8);
-      } else if (c->op2 == value_r && (!have_rc_off || offset == rc_off)) {
+      } else if (!rc_reversed && c->op2 == value_r && (!have_rc_off || offset == rc_off)) {
         matches++;
         r = get_i2s_value(comparison, c->op1, true);
         r = SWAP64(r) >> (64 - bytes * 8);

@@ -247,7 +247,16 @@ enum operators {
   // Neither z3 nor jigsaw model this: only the i2s solver inverts it, by
   // scanning the table for the wanted output and re-targeting the index.
   tlookup      = last_llvm_op + 41, // 108
-  LastOp    = last_llvm_op + 42, // 109
+  // llvm.bitreverse: reverse the bit order of the operand.  Unary, l1 is the
+  // operand; size is the operand width, which is also the result width.  Kept
+  // as one node rather than decomposed the way bswap is (into size Extracts and
+  // size-1 Concats): bswap costs 15 union-table entries for an i64, bit
+  // reversal would cost 127, and clang's idiom recognizer emits this for every
+  // byte of a CRC's reflection loop.  z3 expands it to a concat of one-bit
+  // extracts, jigsaw JITs the native LLVM intrinsic, and i2s inverts it by
+  // reversing the wanted value.
+  bitreverse   = last_llvm_op + 42, // 109
+  LastOp    = last_llvm_op + 43, // 110
 };
 
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP
