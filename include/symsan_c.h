@@ -263,6 +263,13 @@ typedef struct {
    *  what one of the other solvers can do on its own.  Belongs next to
    *  use_jigsaw/use_z3 above and is here for the reason just given. */
   int use_i2s;
+
+  /** Record which input offsets each branch reads, so that
+   *  symsan_session_input_taint() can say which bytes are still worth
+   *  mutating.  Off by default: it makes every branch pay for its dependency
+   *  scan, even the ones that are never solved, and only a front-end running
+   *  its own input-to-state pass has a use for the answer. */
+  int export_taint;
 } symsan_config_t;
 
 /** Fill @p cfg with the defaults.  Always call this first. */
@@ -399,6 +406,33 @@ symsan_status_t symsan_session_check_coverage(const symsan_session_t *s,
                                               const uint32_t *covered,
                                               size_t n,
                                               symsan_join_report_t *out);
+
+/** Which bytes of the input just traced are still worth mutating.
+ *
+ *  Writes one byte per input offset into @p out:
+ *
+ *    0 untainted -- no branch on this path read it
+ *    1 open      -- some branch target that depends on it is still unflipped
+ *    2 settled   -- a branch read it, and every target depending on it has been
+ *                   reached, so there is nothing left to find there
+ *
+ *  For a fuzzer that also runs its own input-to-state pass: it can hold the
+ *  settled bytes still and spend the pass on the open ones.  The answer is
+ *  computed per data-flow group rather than per byte, so bytes a constraint
+ *  couples together -- the four bytes of a 32-bit compare, say -- always come
+ *  back with the same class.
+ *
+ *  Call it after draining symsan_session_next_solution(): a target counts as
+ *  flipped only once symsan_session_report_result() has said its solution was
+ *  interesting, so asking earlier reports more open bytes than there are.
+ *
+ *  @p size receives the traced input size even when it exceeds @p len, in which
+ *  case only the first @p len offsets were written.  Needs export_taint set at
+ *  init(); returns SYMSAN_ERR_INVALID otherwise.
+ */
+symsan_status_t symsan_session_input_taint(symsan_session_t *s,
+                                           uint8_t *out, size_t len,
+                                           size_t *size);
 
 /** Counters mirroring rgd::ConcolicStats. */
 typedef struct {

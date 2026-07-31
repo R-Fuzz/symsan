@@ -85,6 +85,12 @@ struct ConcolicConfig {
   /// by default: it costs a hash insert per branch and is a diagnostic, not
   /// something a fuzzing run needs.
   bool validate_coverage = false; // SYMSAN_VALIDATE_COV
+  /// Record which input offsets each branch reads, so that input_taint() can
+  /// tell the front-end which bytes are still worth mutating (SYMSAN_EXPORT_TAINT).
+  /// Off by default: it makes every branch pay for its dependency scan, even
+  /// the ones that are never solved, and only a front-end running its own
+  /// input-to-state pass has any use for the answer.
+  bool export_taint = false;      // SYMSAN_EXPORT_TAINT
   /// per-run timeout in milliseconds; also arms the deadloop guard
   unsigned timeout_ms = 50;       // MIN_TIMEOUT in driver/aflpp/symsan.cpp
 
@@ -182,6 +188,28 @@ public:
   /// @return 0 on success, -1 otherwise
   int check_coverage(const uint32_t *covered, size_t n, JoinReport *out) const;
 
+  /// Which bytes of the input just traced are still worth mutating.
+  ///
+  /// Writes one byte per input offset into @p out:
+  ///
+  ///   0 untainted -- no branch on this path read it
+  ///   1 open      -- some branch target that depends on it is still unflipped
+  ///   2 settled   -- a branch read it, and every target depending on it has
+  ///                  been reached, so there is nothing left to find there
+  ///
+  /// The point is a fuzzer that also runs its own input-to-state pass: it can
+  /// hold the settled bytes still and spend the pass on the open ones.  The
+  /// classification is per data-flow group, not per byte, so bytes a constraint
+  /// couples together are always classified the same way.
+  ///
+  /// Needs ConcolicConfig::export_taint, and is only meaningful once the caller
+  /// has drained next_solution() -- a branch counts as flipped only after
+  /// report_result() says its solution was interesting.
+  ///
+  /// @return the traced input size (which may be larger than @p len, in which
+  ///         case only the first @p len offsets were written), or -1
+  int input_taint(uint8_t *out, size_t len);
+
   const ConcolicStats &stats() const { return stats_; }
   /// Write the counters and each solver's own stats to @p fd.
   void print_stats(int fd) const;
@@ -212,6 +240,21 @@ private:
 
   void save_solved_input(const uint8_t *buf, size_t size);
 
+  /// One branch target this trace could have flipped but did not take.
+  ///
+  /// Recorded for *every* branch, including the ones that never became a task
+  /// -- whether a task was built is a solving decision, while the question
+  /// input_taint() asks is a coverage one.
+  struct TracedBranch {
+    dfsan_label label;
+    void *addr;
+    bool neg_direction; ///< the direction we did *not* take
+    bool flipped;       ///< a solution for it came back interesting
+  };
+  /// Record @p label and the direction not taken, for input_taint().  No-op
+  /// unless export_taint is set.  @return the index, or SIZE_MAX
+  size_t note_branch(dfsan_label label, void *addr, bool neg_direction);
+
   ConcolicConfig config_;
   symsan::TraceSession session_;
   std::unique_ptr<RGDAstParser> parser_;
@@ -238,6 +281,15 @@ private:
   // per-input filters, cleared by trace()
   std::unordered_map<uint32_t, uint8_t> local_counter_;
   std::unordered_set<uint32_t> local_index_filter_;
+
+  // per-input taint export state, cleared by trace(); only touched when
+  // config_.export_taint is set
+  std::vector<TracedBranch> traced_branches_;
+  /// which TracedBranch a task came from.  The link has to live here because
+  /// FIFOTaskManager drops the context it is handed.
+  std::unordered_map<const SearchTask *, size_t> task_branch_;
+  /// every offset any branch on the path read
+  RGDAstParser::input_dep_t traced_taint_;
 
   ConcolicStats stats_;
   std::map<uint64_t, uint64_t> task_size_dist_;

@@ -1379,6 +1379,22 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
   return true;
 }
 
+bool RGDAstParser::note_deps(dfsan_label label, input_dep_t &acc) {
+  if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
+    return false;
+  }
+  // usually a no-op: the cache is filled linearly, so any earlier parse_cond()
+  // or note_deps() for a higher label has already covered this one
+  if (!scan_labels(label)) {
+    return false;
+  }
+  if (acc.size() != input_size_) {
+    acc.resize(input_size_);
+  }
+  acc |= branch_to_inputs[label];
+  return true;
+}
+
 RGDAstParser::expr_t RGDAstParser::get_root_expr(dfsan_label label) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
     return nullptr;

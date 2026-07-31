@@ -28,6 +28,37 @@ public:
 
   int add_constraints(dfsan_label label, uint64_t result) override;
 
+  // --- dependency queries ----------------------------------------------------
+  // The parser already computes which input offsets each label reads, and which
+  // offsets are coupled by data flow, as a side effect of parsing.  These expose
+  // that to a caller that wants to know which bytes are still worth mutating,
+  // without making it reach into the caches.
+
+  /// Set of input offsets, flattened across all inputs -- bit i is the offset
+  /// input_to_dep_idx() maps <input_id, offset> to.
+  using input_dep_t = boost::dynamic_bitset<>;
+
+  /// OR the input offsets @p label depends on into @p acc, growing @p acc to the
+  /// traced input's size if needed.
+  ///
+  /// Cheap enough to call for every branch, solved or not: scan_labels() fills
+  /// the cache linearly up to @p label, so a label the cache already reaches
+  /// costs nothing and the total across a trace is one pass over the labels.
+  ///
+  /// @return false if @p label is out of range or the union table held an
+  ///         invalid entry, in which case @p acc is untouched
+  [[nodiscard]] bool note_deps(dfsan_label label, input_dep_t &acc);
+
+  /// The data-flow group @p offset belongs to, named by a representative offset.
+  /// Offsets no task has coupled to anything are their own group.
+  size_t dep_group(size_t offset) { return data_flow_deps.find(offset); }
+
+  /// Every offset in @p offset's data-flow group, itself included.
+  /// @return the group size, or UnionFind::INVALID if @p offset is out of range
+  size_t dep_members(size_t offset, std::unordered_set<size_t> &out) {
+    return data_flow_deps.get_set(offset, out);
+  }
+
 protected:
   const bool solve_nested_;
   const size_t max_ast_size_;
@@ -55,7 +86,6 @@ private:
 
   // dependencies tracking
   size_t input_size_; // record the whole input size
-  using input_dep_t = boost::dynamic_bitset<>;
   std::vector<input_dep_t> branch_to_inputs; // label -> flattened input dependencies
   // <input_id, offset> will be flattened to bit \sigma_{i=0}^{input_id}{size_of(input_i)} + offset
   inline size_t input_to_dep_idx(uint32_t input_id, uint32_t offset) {

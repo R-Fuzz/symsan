@@ -80,6 +80,8 @@ int ConcolicConfig::from_env() {
   if (bmap) branch_map = bmap;
   // check that shared branch namespace against ground truth?
   if (getenv("SYMSAN_VALIDATE_COV")) validate_coverage = true;
+  // tell the front-end which input bytes are still worth mutating?
+  if (getenv("SYMSAN_EXPORT_TAINT")) export_taint = true;
 
   return 0;
 }
@@ -211,6 +213,11 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
 
   stats_.total_branches += 1;
 
+  // Record the dependency before the filters below, not after: a branch we
+  // throttle away is still a branch whose target is unflipped, and the bytes it
+  // reads are exactly the ones a front-end should keep mutating.
+  size_t branch_idx = note_branch(msg.label, (void*)msg.addr, msg.result == 0);
+
   // apply a local (per input) branch filter
   auto &lc = local_counter_[msg.id];
   if (lc > config_.max_local_branch_counter) {
@@ -251,6 +258,7 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
     // add the tasks to the task manager
     for (auto const& task_id : tasks) {
       auto task = parser_->retrieve_task(task_id);
+      if (branch_idx != SIZE_MAX) task_branch_[task.get()] = branch_idx;
       task_mgr_->add_task(neg_ctx, task);
       task_size_dist_[task->size()] += 1;
     }
@@ -268,6 +276,10 @@ void ConcolicSession::on_gep(const symsan::pipe_msg &msg, const symsan::gep_msg 
     warn("UBI array index @%p\n", (void*)msg.addr);
     return;
   }
+
+  // a symbolic index is an unflipped target in the same sense a branch is:
+  // the bytes it reads are worth mutating until some other index is reached
+  size_t branch_idx = note_branch(gmsg.index_label, (void*)msg.addr, true);
 
   // apply a local (per input) index filter
   if (!local_index_filter_.insert(msg.label).second) {
@@ -289,6 +301,7 @@ void ConcolicSession::on_gep(const symsan::pipe_msg &msg, const symsan::gep_msg 
   ctx->direction = true;
   for (auto const& task_id : tasks) {
     auto task = parser_->retrieve_task(task_id);
+    if (branch_idx != SIZE_MAX) task_branch_[task.get()] = branch_idx;
     task_mgr_->add_task(ctx, task);
     task_size_dist_[task->size()] += 1;
   }
@@ -350,6 +363,11 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   // check_coverage() asks about *this* input, so the recorded directions have
   // to be this input's.  Unconditional: cheap when nothing was recorded.
   if (shared_cov_) shared_cov_->clear_taken();
+  // likewise input_taint(): it describes the input being traced now
+  traced_branches_.clear();
+  task_branch_.clear();
+  traced_taint_.clear();
+  traced_taint_.resize(input_.size());
 
   size_t tasks_before = task_mgr_->get_num_tasks();
   symsan::trace_result_t ret = session_.run(input_fd_, *this);
@@ -447,7 +465,76 @@ void ConcolicSession::report_result(bool interesting) {
   if (cur_task_) {
     cur_task_->skip_next = true;
     stats_.solved_branches += 1;
+    // the target this task was for has now been reached, so input_taint() can
+    // stop calling its bytes open
+    auto itr = task_branch_.find(cur_task_.get());
+    if (itr != task_branch_.end()) {
+      traced_branches_[itr->second].flipped = true;
+    }
   }
+}
+
+size_t ConcolicSession::note_branch(dfsan_label label, void *addr,
+                                    bool neg_direction) {
+  if (!config_.export_taint) {
+    return SIZE_MAX;
+  }
+  // note_deps() is a linear fill up to label, so this is free for any label an
+  // earlier call already reached -- which, labels being handed out in order, is
+  // most of them
+  if (!parser_->note_deps(label, traced_taint_)) {
+    return SIZE_MAX;
+  }
+  traced_branches_.push_back({label, addr, neg_direction, false});
+  return traced_branches_.size() - 1;
+}
+
+int ConcolicSession::input_taint(uint8_t *out, size_t len) {
+  if (!initialized_ || !config_.export_taint) {
+    return -1;
+  }
+  if (out == nullptr && len) {
+    return -1;
+  }
+
+  const size_t size = input_.size();
+  // offsets some target still depends on.  Asked now rather than reusing what
+  // on_cond() computed: add_branch() marks the direction taken as covered as it
+  // goes, so a branch the trace later took the other way answers "covered" here
+  // for free, and a solved-and-accepted one is skipped outright.
+  RGDAstParser::input_dep_t open(size);
+  auto ctx = std::make_shared<BranchContext>();
+  for (auto const& b : traced_branches_) {
+    if (b.flipped) continue;
+    ctx->addr = b.addr;
+    ctx->direction = b.neg_direction;
+    if (!cov_mgr_->is_target_uncovered(ctx)) continue;
+    (void)parser_->note_deps(b.label, open);
+  }
+
+  // Classify per data-flow group, never per byte: the bytes of a 4-byte compare
+  // are one thing to mutate, and freezing half of them would leave the caller
+  // with a value it cannot move.  Accumulate onto the group's root rather than
+  // expanding each byte's group -- the latter costs O(k^2) for a group of k
+  // bytes, and on a large input the whole thing can end up in one group.
+  auto root_of = [&](size_t i) {
+    size_t r = parser_->dep_group(i);
+    return r == rgd::UnionFind::INVALID ? i : r; // never merged: its own group
+  };
+  std::unordered_map<size_t, uint8_t> group_bits; // 1 = has an open byte, 2 = tainted
+  for (size_t i = 0; i < size; ++i) {
+    uint8_t bits = (open.test(i) ? 1 : 0) | (traced_taint_.test(i) ? 2 : 0);
+    if (bits) group_bits[root_of(i)] |= bits;
+  }
+
+  for (size_t i = 0; i < size && i < len; ++i) {
+    auto itr = group_bits.find(root_of(i));
+    uint8_t bits = itr == group_bits.end() ? 0 : itr->second;
+    // one unflipped target anywhere in the group keeps the whole group open
+    out[i] = (bits & 1) ? 1 : ((bits & 2) ? 2 : 0);
+  }
+
+  return (int)size;
 }
 
 void ConcolicSession::save_solved_input(const uint8_t *buf, size_t size) {

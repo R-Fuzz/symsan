@@ -332,6 +332,7 @@ void symsan_config_init(symsan_config_t *cfg) {
   cfg->debug = def.debug;
   cfg->forkserver = def.forkserver;
   cfg->validate_coverage = def.validate_coverage;
+  cfg->export_taint = def.export_taint;
   cfg->timeout_ms = def.timeout_ms;
   cfg->max_ast_size = def.max_ast_size;
   cfg->max_local_branch_counter = def.max_local_branch_counter;
@@ -368,6 +369,7 @@ symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
     const char *bmap = getenv("SYMSAN_BRANCH_MAP");
     if (bmap) cfg->branch_map = bmap;
     cfg->validate_coverage = c.validate_coverage;
+    cfg->export_taint = c.export_taint;
     return SYMSAN_OK;
   });
 }
@@ -427,6 +429,7 @@ symsan_status_t symsan_session_init(symsan_session_t *s,
     c.forkserver = cfg->forkserver != 0;
     if (cfg->branch_map) c.branch_map = cfg->branch_map;
     c.validate_coverage = cfg->validate_coverage != 0;
+    c.export_taint = cfg->export_taint != 0;
     c.timeout_ms = cfg->timeout_ms;
     if (cfg->max_ast_size) c.max_ast_size = cfg->max_ast_size;
     if (cfg->max_local_branch_counter) {
@@ -533,6 +536,28 @@ symsan_status_t symsan_session_check_coverage(const symsan_session_t *s,
     out->ambiguous = r.ambiguous;
     out->ambiguous_violations = r.ambiguous_violations;
     out->unmapped = r.unmapped;
+    return SYMSAN_OK;
+  });
+}
+
+symsan_status_t symsan_session_input_taint(symsan_session_t *s,
+                                           uint8_t *out, size_t len,
+                                           size_t *size) {
+  if (!s || !size || (!out && len)) {
+    set_error("symsan_session_input_taint: session/size required");
+    return SYMSAN_ERR_INVALID;
+  }
+  if (!s->initialized) {
+    set_error("symsan_session_input_taint: session not initialized");
+    return SYMSAN_ERR_NOT_READY;
+  }
+  return guard(SYMSAN_ERR_FAILED, [&] {
+    int n = s->session.input_taint(out, len);
+    if (n < 0) {
+      set_error("symsan_session_input_taint: needs export_taint");
+      return SYMSAN_ERR_INVALID;
+    }
+    *size = (size_t)n;
     return SYMSAN_OK;
   });
 }

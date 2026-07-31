@@ -229,6 +229,7 @@ pub struct Config {
     branch_map: Option<CString>,
     forkserver: bool,
     validate_coverage: bool,
+    export_taint: bool,
 }
 
 /// Convert to a `CString`, replacing any interior NUL by truncating at it.
@@ -286,6 +287,7 @@ impl Config {
             branch_map: None,
             forkserver: raw.forkserver != 0,
             validate_coverage: raw.validate_coverage != 0,
+            export_taint: raw.export_taint != 0,
         }
     }
 
@@ -351,6 +353,7 @@ impl Config {
             branch_map,
             forkserver: raw.forkserver != 0,
             validate_coverage: raw.validate_coverage != 0,
+            export_taint: raw.export_taint != 0,
         })
     }
 
@@ -540,6 +543,18 @@ impl Config {
         self
     }
 
+    /// Record which input offsets each branch reads, so that
+    /// [`Session::input_taint`] can say which bytes are still worth mutating.
+    ///
+    /// Off by default: it makes every branch pay for its dependency scan, even
+    /// the ones that are never solved, and only a front-end running its own
+    /// input-to-state pass has a use for the answer.
+    #[must_use]
+    pub fn export_taint(mut self, enable: bool) -> Self {
+        self.export_taint = enable;
+        self
+    }
+
     /// The scratch file inputs are staged into.
     pub fn input_file_path(&self) -> PathBuf {
         PathBuf::from(self.input_file.to_string_lossy().into_owned())
@@ -591,6 +606,7 @@ impl Config {
             .map_or(std::ptr::null(), |p| p.as_ptr());
         raw.forkserver = self.forkserver.into();
         raw.validate_coverage = self.validate_coverage.into();
+        raw.export_taint = self.export_taint.into();
 
         (raw, argv)
     }
@@ -653,6 +669,47 @@ impl JoinReport {
     /// True when nothing contradicted the map.
     pub fn is_consistent(&self) -> bool {
         self.violations == 0 && self.ambiguous_violations == 0
+    }
+}
+
+/// What [`Session::input_taint`] says about one input offset.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaintClass {
+    /// No branch on the traced path read this byte.  Mutating it steers
+    /// nothing the trace saw -- though it may of course open a path the trace
+    /// never reached.
+    #[default]
+    Untainted,
+    /// Some branch target that reads this byte is still unreached.  Either
+    /// SymSan did not solve for it, or it did and the solution was not
+    /// accepted.  This is the byte a fuzzer's own input-to-state pass should
+    /// spend its budget on.
+    Open,
+    /// Every branch target reading this byte has been reached.  There is
+    /// nothing left here for an input-to-state pass to flip, so it can hold
+    /// the byte at its original value.
+    Settled,
+}
+
+impl TaintClass {
+    /// Decode the C encoding: 0 untainted, 1 open, 2 settled.
+    ///
+    /// Anything else is treated as [`Open`](TaintClass::Open).  Both errors are
+    /// possible if the two sides ever disagree, and this is the cheap one: an
+    /// extra open byte only costs the caller some mutation budget, while a
+    /// spurious `Settled` freezes a byte that still matters.
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Untainted,
+            2 => Self::Settled,
+            _ => Self::Open,
+        }
+    }
+
+    /// True for the bytes an input-to-state pass should still mutate --
+    /// everything but [`Settled`](TaintClass::Settled).
+    pub fn is_worth_mutating(self) -> bool {
+        self != Self::Settled
     }
 }
 
@@ -865,6 +922,43 @@ impl Session {
             ambiguous_violations: raw.ambiguous_violations,
             unmapped: raw.unmapped,
         })
+    }
+
+    /// Which bytes of the input just traced are still worth mutating.
+    ///
+    /// One [`TaintClass`] per input offset.  The intended reader is a fuzzer
+    /// that also runs its own input-to-state pass -- AFL++ RedQueen, say: it
+    /// can hold the [`Settled`](TaintClass::Settled) bytes still and spend the
+    /// pass on the [`Open`](TaintClass::Open) ones, instead of rediscovering
+    /// the dependency map the trace already computed.
+    ///
+    /// The answer is per data-flow group, not per byte, so bytes a constraint
+    /// couples together -- the four bytes of a 32-bit compare -- always come
+    /// back with the same class.  Freezing half of such a group would leave the
+    /// caller with a value it cannot move.
+    ///
+    /// Call it *after* draining [`next_solution`](Session::next_solution): a
+    /// target counts as flipped only once
+    /// [`report_result`](Session::report_result) has said its solution was
+    /// interesting, so asking earlier reports more open bytes than there are.
+    ///
+    /// Needs [`Config::export_taint`]; returns [`Error::Invalid`] otherwise.
+    pub fn input_taint(&mut self) -> Result<Vec<TaintClass>, Error> {
+        // Ask for the size first rather than assuming it matches the slice
+        // passed to trace(): the session clamps to max_input_size.
+        let mut size = 0usize;
+        // SAFETY: valid handle; a null buffer with a zero length is what the C
+        // side documents as the size query.
+        check(unsafe {
+            sys::symsan_session_input_taint(self.raw.as_ptr(), std::ptr::null_mut(), 0, &mut size)
+        })?;
+
+        let mut out = vec![0u8; size];
+        // SAFETY: valid handle, and out is size bytes long.
+        check(unsafe {
+            sys::symsan_session_input_taint(self.raw.as_ptr(), out.as_mut_ptr(), size, &mut size)
+        })?;
+        Ok(out.into_iter().map(TaintClass::from_raw).collect())
     }
 
     /// Counters for the whole session.
