@@ -31,12 +31,19 @@
 //
 // Every rung of the ladder is exercised on its own: %fgtest and KO_USE_Z3 for
 // the two z3 stacks, then %afltest three times -- i2s alone (the default),
-// jigsaw alone, and RGD z3 alone.  Jigsaw gets its own expectations: it lands
-// every OkN, but only the i8 and i16 inequalities.  Gradient descent steers by
-// value distance, and bit reversal scrambles it into a flat plateau, so above
-// 16 bits there is no gradient to follow (see the deferred edit-distance search
-// idea).  Not asserted absent -- if jigsaw learns the shape, this test should
-// not be what stops it.
+// jigsaw alone, and RGD z3 alone.  All five are held to the same eight guards.
+//
+// Jigsaw needed two fixes to get there, and it is worth recording that neither
+// was the gradient descent everyone reaches for first.  It initially landed
+// every OkN but only the i8 and i16 inequalities, which looks exactly like a
+// plateau -- bit reversal does scramble value distance -- and is not.  Its
+// input-to-state pass (gd.cc try_i2s) can invert this shape exactly, and was
+// declining for two unrelated reasons: it had no bit-reversed candidate
+// encoding, only a byte-swapped one, so the reversed chunk never matched a
+// recorded operand; and get_i2s_value had the strict-inequality directions
+// swapped, so even once matched it proposed a value on the wrong side of the
+// bound.  The i32/i64 inequalities are the regression test for both -- they
+// need the two together, and each alone still misses them.
 //
 // Replayed as a set rather than by name; what is asserted is which guards get
 // satisfied, not the queue order.
@@ -73,7 +80,7 @@
 //
 // RUN: rm -rf %t.out && mkdir -p %t.out
 // RUN: env SYMSAN_NO_I2S=1 SYMSAN_USE_JIGSAW=1 TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %afltest %t.fg %t.bin
-// RUN: ls %t.out/* | xargs -n1 %t.uninstrumented | FileCheck --check-prefix=CHECK-JIGSAW %s
+// RUN: ls %t.out/* | xargs -n1 %t.uninstrumented | FileCheck --check-prefix=CHECK-ALL %s
 
 #include <stdint.h>
 #include <stdio.h>
@@ -104,12 +111,10 @@ int main(int argc, char **argv) {
   // the reversal against a fixed bound: only the reversed side can move
   if (__builtin_bitreverse8(a) < 0x10) {
     // CHECK-ALL-DAG: Good8
-    // CHECK-JIGSAW-DAG: Good8
     printf("Good8\n");
   }
   if (__builtin_bitreverse16(b) < 0x10) {
     // CHECK-ALL-DAG: Good16
-    // CHECK-JIGSAW-DAG: Good16
     printf("Good16\n");
   }
   if (__builtin_bitreverse32(c) < 0x10u) {
@@ -125,22 +130,18 @@ int main(int argc, char **argv) {
   // replay only prints if the solver got the reversal exactly right
   if (__builtin_bitreverse8(a) == ra) {
     // CHECK-ALL-DAG: Ok8
-    // CHECK-JIGSAW-DAG: Ok8
     printf("Ok8\n");
   }
   if (__builtin_bitreverse16(b) == rb) {
     // CHECK-ALL-DAG: Ok16
-    // CHECK-JIGSAW-DAG: Ok16
     printf("Ok16\n");
   }
   if (__builtin_bitreverse32(c) == rc) {
     // CHECK-ALL-DAG: Ok32
-    // CHECK-JIGSAW-DAG: Ok32
     printf("Ok32\n");
   }
   if (__builtin_bitreverse64(d) == rd) {
     // CHECK-ALL-DAG: Ok64
-    // CHECK-JIGSAW-DAG: Ok64
     printf("Ok64\n");
   }
 

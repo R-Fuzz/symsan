@@ -708,6 +708,17 @@ static uint64_t descend(MutInput &input_min, MutInput &input, uint64_t f0, Grad 
 }
 
 
+// Reverse the low `bits` bits of v, which is what llvm.bitreverse computes.
+// Its own inverse, so the same helper serves both the candidate match and the
+// write-back.  SWAP64 above is the byte-granular sibling.
+static inline uint64_t bitrev_n(uint64_t v, uint32_t bits) {
+  uint64_t r = 0;
+  for (uint32_t i = 0; i < bits; ++i)
+    r |= ((v >> i) & 1ULL) << (bits - 1 - i);
+  return r;
+}
+
+
 static uint64_t get_i2s_value(uint32_t comp, uint64_t v, bool rhs) {
   switch (comp) {
     case rgd::Equal:
@@ -841,13 +852,21 @@ static uint64_t try_i2s(MutInput &input_min, MutInput &temp_input, uint64_t f0, 
       if (likely(isRelationalKind(cm->comparison))) {
         // check consecutive input bytes against comparison operands
         // FIXME: add support for other input encodings
-        uint64_t input = 0, input_r, value = 0, dis = -1;
+        uint64_t input = 0, input_r = 0, input_b = 0, value = 0, dis = -1;
         for (auto const& candidate : cm->i2s_candidates) {
           const size_t offset = candidate.first;
           const uint32_t size = candidate.second;
           if (size > 8) {
             continue;
           }
+          // Reset per candidate: these are accumulated with |= below, so
+          // carrying a previous candidate's bits in would make the match test
+          // compare a value no chunk of the input actually holds.  (input_r was
+          // additionally read uninitialized on the first candidate.)  Only ever
+          // a missed snap, never a wrong one -- try_new_i2s_value re-runs the
+          // JIT'd fn and rejects anything that does not reach distance 0.
+          input = 0;
+          input_r = 0;
           int i = 0, t = size * 8;
           for (size_t off = offset; off < offset + size; off++) {
             const uint32_t lidx = c->local_map.at(off);
@@ -892,7 +911,7 @@ try_reverse:
           } else if (input_r == cm->op2) {
             value = get_i2s_value(cm->comparison, cm->op1, false);
           } else {
-            continue;
+            goto try_bitrev;
           }
 
           // test the new value
@@ -905,6 +924,50 @@ try_reverse:
               const uint32_t lidx = c->local_map.at(off);
               uint8_t v = ((value >> i) & 0xff);
               // uint8_t v = ((value >> (t - i - 8)) & 0xff);
+              temp_input.set(cm->input_args[lidx].second, v);
+              i += 8;
+            }
+            updated = true;
+            break;
+          }
+
+try_bitrev:
+          // try bit-reversed encoding -- the same idea as the byte swap above,
+          // one granularity down.  llvm.bitreverse is what clang's idiom
+          // recognizer emits for a reflected CRC's reflect() loop, and the
+          // chunk feeding it reaches the comparison reversed, so neither the
+          // direct nor the byte-swapped form ever matches an operand and this
+          // whole pass declines on a shape it can actually invert exactly.
+          //
+          // Gated on the constraint containing a BitReverse at all: each probe
+          // costs a JIT invocation, and this is the third, so every task
+          // without the op must pay nothing for it.
+          if (!c->ops.test(rgd::BitReverse)) continue;
+          input_b = bitrev_n(input, t);
+          if (input_b == cm->op1) {
+            value = get_i2s_value(cm->comparison, cm->op2, true);
+          } else if (input_b == cm->op2) {
+            value = get_i2s_value(cm->comparison, cm->op1, false);
+          } else {
+            continue;
+          }
+
+          // reversal is an involution, so the value to write into the input is
+          // the reversal of the value the comparison wants
+          value = bitrev_n(value, t);
+          dis = try_new_i2s_value(c, cm->comparison, value, task);
+          if (dis == 0) {
+#if DEBUG
+            std::cerr << "i2s bitrev updated c = " << k << " t = " << t
+                      << " input = " << input << " input_b = " << input_b
+                      << " op1 = " << cm->op1 << " op2 = " << cm->op2
+                      << " cmp = " << cm->comparison << " value = " << value
+                      << std::endl;
+#endif
+            i = 0;
+            for (size_t off = offset; off < offset + size; off++) {
+              const uint32_t lidx = c->local_map.at(off);
+              uint8_t v = ((value >> i) & 0xff);
               temp_input.set(cm->input_args[lidx].second, v);
               i += 8;
             }
