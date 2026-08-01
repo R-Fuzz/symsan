@@ -1863,6 +1863,23 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
                  const uint8_t *in_buf, size_t in_size,
                  uint8_t *out_buf, size_t &out_size) {
 
+  // A nested task is not i2s's business.  With SYMSAN_USE_NESTED set, parse_cond
+  // builds two tasks per clause: the last branch's constraints on their own, and
+  // those plus every constraint sharing their input bytes.  The whole point of
+  // the second one is that its constraints must hold *together*, and the loop
+  // below does the opposite -- it stacks one rewrite per constraint and reports
+  // SAT if any single one matched, so it would confidently emit a buffer in
+  // which the last rewrite has stomped the earlier ones.  Leave it to z3, which
+  // walks the base_task chain and solves the conjunction properly.
+  //
+  // SOLVER_TIMEOUT rather than SOLVER_UNSAT: UNSAT sets skip_next and drops the
+  // task outright (ConcolicSession::next_solution), which would deny z3 the shot
+  // this decline exists to hand it.
+  if (task->base_task != nullptr) {
+    DEBUGF("i2s: decline nested task\n");
+    return SOLVER_TIMEOUT;
+  }
+
   solver_result_t ret = SOLVER_TIMEOUT;
   size_t n = task->size();
   DEBUGF("i2s: new task with %zu constraints\n", n);
