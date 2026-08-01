@@ -532,6 +532,66 @@ static inline int64_t i2s_sext(uint64_t v, uint32_t bits) {
   return ((int64_t)(v << sh)) >> sh;
 }
 
+// Character class of a byte, for choosing between the entries of a
+// non-injective lookup table.  The encodings such a table usually implements --
+// hex in either direction, base64 -- all draw their input characters from
+// [0-9A-Za-z+/=], so "is this an encoded character, and of which case" is a good
+// enough question to ask without fingerprinting the table itself.
+enum i2s_char_class_t {
+  I2S_CC_OTHER = 0,  // not a character an encoding would use
+  I2S_CC_DIGIT,
+  I2S_CC_LOWER,
+  I2S_CC_UPPER,
+};
+
+static inline i2s_char_class_t i2s_char_class(uint8_t c) {
+  if (c >= '0' && c <= '9') return I2S_CC_DIGIT;
+  if (c >= 'a' && c <= 'z') return I2S_CC_LOWER;
+  if (c >= 'A' && c <= 'Z') return I2S_CC_UPPER;
+  return I2S_CC_OTHER;
+}
+
+// How much we want a table candidate, lower being better.  Ordered so that a
+// plain integer comparison picks the winner.
+enum i2s_pref_t {
+  I2S_PREF_FREE = 0,   // costs no byte change at all
+  I2S_PREF_MATCH,      // agrees in character class with the byte already there
+  I2S_PREF_LOWER,      // no case evidence in the input; take the lower/digit one
+  I2S_PREF_ANY,        // anything else that inverts -- the historical behaviour
+};
+
+// Rank the byte assignment a table candidate just made.  `mark` is where this
+// candidate's writes begin in ctx.assign.
+//
+// This is AFL++'s rule, arrived at from the same problem.  Its redqueen
+// transforms keep two output tables, hex_table_up and hex_table_low, and choose
+// between them with from_up/to_up -- flags inferred from the case of the hex
+// digits already present in the input (see afl-fuzz-redqueen.c).  When the input
+// shows no case at all, to_up stays 0 and the low table wins.  Both halves
+// matter here: guards conventionally spell their hex ranges 'a'..'f', so the
+// lowercase default is the right bet precisely when there is nothing to observe.
+static i2s_pref_t i2s_table_pref(const i2s_ctx &ctx, size_t mark) {
+  // Nothing written: the input already selects this entry, so it is free.
+  if (ctx.assign.size() == mark) return I2S_PREF_FREE;
+  // Only a single-byte rewrite is a character.  A wider one is not an encoding
+  // this knows how to reason about, so it ranks last and the DFL case takes it.
+  if (ctx.assign.size() != mark + 1) return I2S_PREF_ANY;
+  size_t off = ctx.assign[mark].first;
+  if (unlikely(off >= ctx.in_size)) return I2S_PREF_ANY;
+  i2s_char_class_t want = i2s_char_class(ctx.assign[mark].second);
+  if (want == I2S_CC_OTHER) return I2S_PREF_ANY;
+  // The evidence is a property of the input as the program read it, so it comes
+  // from in_buf rather than from any pending assignment -- same as AFL++ reading
+  // orig_buf.
+  i2s_char_class_t have = i2s_char_class(ctx.in_buf[off]);
+  if (have == want) return I2S_PREF_MATCH;
+  // A digit says nothing about case, and neither does a non-character; fall back
+  // to the lowercase convention.
+  if (have != I2S_CC_LOWER && have != I2S_CC_UPPER && want != I2S_CC_UPPER)
+    return I2S_PREF_LOWER;
+  return I2S_PREF_ANY;
+}
+
 // Reverse the low `bits` bits of `v`, which is what llvm.bitreverse does.  Its
 // own inverse, so the same helper serves both evaluation and inversion.
 static inline uint64_t i2s_bitrev(uint64_t v, uint32_t bits) {
@@ -959,8 +1019,24 @@ static bool i2s_invert(i2s_ctx &ctx, const AstNode &n_, uint64_t target,
       // (a dehex table maps both '0'..'9' and 'a'..'f' onto 0..15), so try each
       // matching entry in turn and keep the first whose index actually inverts.
       // The re-evaluation matters: inverting through a bitwise op is a guess.
+      //
+      // Keeping the *first* one that inverts is what this used to do, and it is
+      // how a hex decode gets lost: dehex maps both 'F' and 'f' onto 15, 'F'
+      // comes first, and a guard gating the decode on [0-9a-f] then rejects the
+      // answer one branch earlier than the branch being solved for.  Both entries
+      // invert equally well, so nothing about the index expression separates
+      // them; the character class does (i2s_table_pref).  Rank every matching
+      // entry and keep the best instead of the first.
+      //
+      // Solving decode and guard together would instead need both constraints in
+      // one task -- nested solving -- which is far too slow to leave on.  This is
+      // the cheap approximation of that, and where its guess is wrong the
+      // I2S_PREF_ANY tier still yields whatever the plain scan used to.
       if (unlikely(node.index() >= ctx.c->input_args.size())) return false;
       uint64_t num_elems = ctx.c->input_args[node.index()].second;
+      i2s_assignment_t best_assign;
+      i2s_pref_t best = I2S_PREF_ANY;
+      bool found = false;
       for (uint64_t i = 0; i < num_elems; ++i) {
         uint64_t elem = 0;
         if (!i2s_table_elem(ctx, node, i, elem)) return false;
@@ -968,12 +1044,26 @@ static bool i2s_invert(i2s_ctx &ctx, const AstNode &n_, uint64_t target,
         size_t mark = ctx.assign.size();
         if (i2s_invert(ctx, node.children(0), i, depth + 1)) {
           uint64_t check = 0;
-          if (i2s_eval_int(ctx, node.children(0), check, depth + 1) && check == i)
-            return true;
+          if (i2s_eval_int(ctx, node.children(0), check, depth + 1) && check == i) {
+            i2s_pref_t pref = i2s_table_pref(ctx, mark);
+            // nothing outranks these, so stop with the assignment left in place
+            if (pref <= I2S_PREF_MATCH) return true;
+            if (!found || pref < best) {
+              best = pref;
+              found = true;
+              best_assign.assign(ctx.assign.begin() + mark, ctx.assign.end());
+            }
+          }
         }
         ctx.assign.resize(mark);
       }
-      return false;
+      if (!found) return false;
+      // Replay the winner's byte writes rather than inverting again.  Later
+      // entries win in i2s_peek and the losing candidates left nothing behind, so
+      // appending the saved slice reproduces exactly the state this candidate was
+      // verified under -- and it costs no further steps from the budget.
+      ctx.assign.insert(ctx.assign.end(), best_assign.begin(), best_assign.end());
+      return true;
     }
     case rgd::BitReverse:
       // its own inverse, and it determines every bit of its operand, so this is
