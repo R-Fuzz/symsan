@@ -2171,7 +2171,34 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
     // through to the CreateZExtOrTrunc and emit `trunc x86_fp80 to i64`, which
     // the backend cannot select ("Cannot select: i64 = truncate (f80 load)").
     // Drop the shadow instead: imprecise, but it compiles and stays sound.
-    if (!Ty->isHalfTy() && !Ty->isFloatTy() && !Ty->isDoubleTy())
+    //
+    // x86_fp80 is now allowed for COMPARISONS, and the selection problem above
+    // is avoided rather than hit: the operand is bitcast to i80 FIRST, and
+    // `trunc i80 to i64` (plus the lshr for the high half) selects fine.  What
+    // could not be selected was the FP-to-integer truncate, not the width.
+    //
+    // Only comparisons, deliberately.  A compare is self-contained -- both
+    // operands are fp80, the result is an i1, and the whole thing is described
+    // by the two op slots.  A conversion is not: `fpext double to x86_fp80`
+    // already slips past this filter (it looks at operand 0, which is the
+    // double) and `fptrunc x86_fp80 to double` would produce a 64-bit node
+    // whose recorded operand value is an fp80 significand.  Both are declines
+    // below rather than nodes with a plausible wrong value in them.
+    //
+    // fp80 stays declined for z3 and jigsaw, which is a format problem and not
+    // a width one: fp80 has an EXPLICIT integer significand bit, so z3's
+    // (_ FloatingPoint 15 64) is a different, 79-bit sort and reinterpreting
+    // the bits into it would be wrong, while jigsaw carries every FP value as a
+    // double in a uint64 arg slot.  i2s is the exception because it evaluates
+    // in C++ on x86, where `long double` IS x86_fp80: it can decode, compare,
+    // step and re-encode on the hardware that produced the value, with no model
+    // in between.  See solve_fcmp80 in solvers/i2s-solver.cpp.
+    //
+    // fp128 and ppc_fp128 remain declined outright: no host type evaluates them
+    // natively the way `long double` does fp80, so there is no backend that
+    // could take them even if they were transported.
+    if (!Ty->isHalfTy() && !Ty->isFloatTy() && !Ty->isDoubleTy() &&
+        !(Ty->isX86_FP80Ty() && isa<CmpInst>(Pos)))
       return TT.getZeroShadow(Pos);
   } else if (Ty->isVectorTy()) {
     // FIXME: vector type
@@ -2207,6 +2234,10 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   if (size > kMaxOperandBits) return TT.getZeroShadow(Pos);
 
   IRBuilder<> IRB(Pos);
+  // x86_fp80's integer twin.  Note this is i80 and not i128: the type is 80
+  // bits wide even though it occupies 16 bytes of storage, and bitcast demands
+  // the exact primitive size.
+  Type *Int80Ty = IntegerType::get(Pos->getContext(), 80);
   if (CmpInst *CI = dyn_cast<CmpInst>(Pos)) { // for both icmp and fcmp
     // op should be predicate
     op |= (CI->getPredicate() << 8);
@@ -2222,6 +2253,11 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
     Op1 = IRB.CreateBitCast(Op1, TT.Int32Ty);
   else if (Ty->isDoubleTy())
     Op1 = IRB.CreateBitCast(Op1, TT.Int64Ty);
+  else if (Ty->isX86_FP80Ty())
+    // the trunc to 64 below keeps the low half, which for an fp80 is the whole
+    // significand -- the high 16 bits are sign and exponent, and they travel in
+    // the WideConst produced by the size > 64 path
+    Op1 = IRB.CreateBitCast(Op1, Int80Ty);
   else if (Ty->isPointerTy())
     Op1 = IRB.CreatePtrToInt(Op1, TT.Int64Ty);
   Op1 = IRB.CreateZExtOrTrunc(Op1, TT.Int64Ty);
@@ -2236,6 +2272,8 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
       Op2 = IRB.CreateBitCast(Op2, TT.Int32Ty);
     else if (Ty->isDoubleTy())
       Op2 = IRB.CreateBitCast(Op2, TT.Int64Ty);
+    else if (Ty->isX86_FP80Ty())
+      Op2 = IRB.CreateBitCast(Op2, Int80Ty);
     else if (Ty->isPointerTy())
       Op2 = IRB.CreatePtrToInt(Op2, TT.Int64Ty);
     Op2 = IRB.CreateZExtOrTrunc(Op2, TT.Int64Ty);
@@ -2261,20 +2299,28 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   // it is given have changed.  Both sides tainted costs two calls that return
   // their argument, and no union-table entry.
   if (size > 64) {
-    // Only integers should get this far -- the FP filter above rejects every
-    // float format wider than double, and a pointer is 64 bits -- but `fpext
-    // double to x86_fp80` slips past it, because that filter looks at operand 0
-    // and operand 0 is the double.  It arrives here at size 80, and an fp80 has
-    // no integer high half to extract, so decline it the way the old
-    // constant-only path did (by finding no ConstantInt) rather than asserting
-    // in CreateZExtOrTrunc.
-    for (unsigned i = 0, n = Pos->getNumOperands(); i < n && i < 2; ++i)
-      if (!Pos->getOperand(i)->getType()->isIntegerTy())
+    // Only integers and fp80 comparison operands should get this far -- the FP
+    // filter above rejects every other float format wider than double, and a
+    // pointer is 64 bits -- but `fpext double to x86_fp80` slips past it,
+    // because that filter looks at operand 0 and operand 0 is the double.  It
+    // arrives here at size 80 with no fp80 operand to bitcast, so decline it the
+    // way the old constant-only path did (by finding no ConstantInt) rather than
+    // asserting in CreateZExtOrTrunc.
+    //
+    // An fp80 operand is admitted because it does have a high half to extract,
+    // once bitcast to i80: the top 16 bits are its sign and exponent, and they
+    // are exactly what would be lost if only the 64-bit significand travelled.
+    for (unsigned i = 0, n = Pos->getNumOperands(); i < n && i < 2; ++i) {
+      Type *OpTy = Pos->getOperand(i)->getType();
+      if (!OpTy->isIntegerTy() && !OpTy->isX86_FP80Ty())
         return TT.getZeroShadow(Pos);
+    }
     Type *Int128Ty = IntegerType::get(Pos->getContext(), 128);
     // the high half of an operand narrower than the operation (`zext i64 to
     // i128`) is zero, which the zext produces without a special case
     auto getWide = [&](Value *Label, Value *Lo, Value *Operand) -> Value * {
+      if (Operand->getType()->isX86_FP80Ty())
+        Operand = IRB.CreateBitCast(Operand, Int80Ty);
       Value *W = IRB.CreateZExtOrTrunc(Operand, Int128Ty);
       Value *Hi = IRB.CreateTrunc(IRB.CreateLShr(W, 64), TT.Int64Ty);
       CallInst *C = IRB.CreateCall(TT.TaintGetWideFn, {Label, Lo, Hi, Size});

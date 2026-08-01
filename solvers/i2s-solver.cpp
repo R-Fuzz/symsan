@@ -131,6 +131,70 @@ static inline double fp_next(double x, double dir, uint32_t bytes) {
   else return (double)nextafterf((float)x, (float)dir);
 }
 
+//===----------------------------------------------------------------------===//
+// x86_fp80
+//
+// i2s takes fp80 where the other backends decline it, and the reason is that it
+// does not model the format.  On x86, `long double` IS x86_fp80 -- the same 80
+// bits, the same EXPLICIT integer significand bit, the same x87 semantics --
+// so decoding is a memcpy and every comparison, step and re-encode below runs
+// on the hardware that produced the value in the first place.  Nothing here is
+// an approximation of fp80; it is fp80.
+//
+// That is precisely what z3 and jigsaw cannot say.  z3's (_ FloatingPoint 15
+// 64) is 79 bits with an IMPLICIT significand bit, so feeding it these bits
+// would be a reinterpretation rather than a conversion, and x87 unnormals,
+// pseudo-denormals and pseudo-NaNs have no counterpart in that sort at all.
+// jigsaw carries every FP value as a double in a uint64 arg slot.  Both still
+// decline, and tests/symsan/fp80_decline.c keeps them honest.
+//===----------------------------------------------------------------------===//
+
+// True when the host's `long double` is the x86 80-bit extended format.  The
+// guard is on the mantissa width rather than on an architecture macro because
+// that is the actual requirement: 64 explicit mantissa bits is what makes the
+// memcpy below a reinterpretation of the same format instead of a conversion.
+#if defined(__LDBL_MANT_DIG__) && __LDBL_MANT_DIG__ == 64
+#define I2S_HAVE_FP80 1
+
+// The ten bytes of an fp80, split the way a label carries them: the low 64 bits
+// are the entire significand, the top 16 are sign and exponent.  This is the
+// same split __taint_get_wide makes into op1/op2, so no repacking is needed.
+struct i2s_fp80 {
+  uint64_t lo;
+  uint16_t hi;
+};
+
+// sizeof(long double) is 16 here -- ten bytes of value and six of padding --
+// so the padding has to be zeroed explicitly rather than inherited from the
+// stack, or two encodes of the same value could differ in bytes nobody reads.
+static inline long double fp80_decode(i2s_fp80 v) {
+  long double ld;
+  uint8_t buf[sizeof(ld)];
+  memset(buf, 0, sizeof(buf));
+  memcpy(buf, &v.lo, 8);
+  memcpy(buf + 8, &v.hi, 2);
+  memcpy(&ld, buf, sizeof(ld));
+  return ld;
+}
+
+static inline i2s_fp80 fp80_encode(long double ld) {
+  uint8_t buf[sizeof(ld)];
+  memcpy(buf, &ld, sizeof(buf));
+  i2s_fp80 v;
+  memcpy(&v.lo, buf, 8);
+  memcpy(&v.hi, buf + 8, 2);
+  return v;
+}
+
+// Step at fp80 precision.  No width to switch on: 80 bits is the only size that
+// reaches here, and nextafterl steps the x87 extended format directly.
+static inline long double fp_next(long double x, long double dir,
+                                  uint32_t bytes) {
+  (void)bytes;
+  return nextafterl(x, dir);
+}
+#endif // __LDBL_MANT_DIG__ == 64
+
 // Map an rgd FP relational kind to the LLVM FCmp predicate (1..14).
 static inline uint32_t fcmp_predicate(uint32_t comparison) {
   return comparison - rgd::FOeq + 1;
@@ -153,7 +217,13 @@ static inline uint32_t swap_fcmp_predicate(uint32_t pred) {
 }
 
 // Concrete evaluation of an FCmp (LLVM predicate 1..14) on two doubles.
-static inline bool i2s_eval_fcmp(uint32_t pred, double a, double b) {
+//
+// Templated on the float type so the fp80 path gets the same fourteen cases
+// rather than a second copy of them: `long double` on x86 is the fp80 format
+// itself, so evaluating with it is not an approximation of the compare, it is
+// the compare.  Deduction keeps every existing double call site unchanged.
+template <typename F>
+static inline bool i2s_eval_fcmp(uint32_t pred, F a, F b) {
   bool ord = !(isnan(a) || isnan(b));
   switch (pred) {
     case 1:  return ord && a == b; // OEQ
@@ -180,8 +250,13 @@ static inline bool i2s_eval_fcmp(uint32_t pred, double a, double b) {
 // witness relative to the constant k.  The result is still verified by the
 // caller, so an unsatisfiable predicate (e.g. OGT against +inf) just fails
 // verification and is skipped.
-static inline double fp_i2s_target(uint32_t pred, double k, bool sym_is_lhs,
-                                   uint32_t bytes) {
+//
+// Templated alongside i2s_eval_fcmp, and for the same reason: the fp80 path
+// needs the identical witness policy, and two copies of a fourteen-case switch
+// would eventually disagree about one of them.
+template <typename F>
+static inline F fp_i2s_target(uint32_t pred, F k, bool sym_is_lhs,
+                              uint32_t bytes) {
   uint32_t p = sym_is_lhs ? pred : swap_fcmp_predicate(pred);
   switch (p) {
     case 1:  // OEQ: sym == k
@@ -194,15 +269,17 @@ static inline double fp_i2s_target(uint32_t pred, double k, bool sym_is_lhs,
       return k;
     case 2:  // OGT: sym > k
     case 10: // UGT
-      return fp_next(k, HUGE_VAL, bytes); // toward +inf
+      // the casts are load-bearing under the template: an uncast HUGE_VAL is a
+      // double, which makes the fp_next overload set ambiguous for F=long double
+      return fp_next(k, (F)HUGE_VAL, bytes); // toward +inf
     case 4:  // OLT: sym < k
     case 12: // ULT
-      return fp_next(k, -HUGE_VAL, bytes); // toward -inf
+      return fp_next(k, -(F)HUGE_VAL, bytes); // toward -inf
     case 6:  // ONE: sym != k, not NaN
     case 14: // UNE
-      return k == 0.0 ? 1.0 : 0.0;
+      return k == (F)0.0 ? (F)1.0 : (F)0.0;
     case 8:  // UNO: sym is NaN (k is a concrete constant, assumed not NaN)
-      return (double)NAN;
+      return (F)NAN;
     default:
       return k;
   }
@@ -1261,8 +1338,18 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
   // anything else -- an fp80 or fp128 compare would be "solved" against two
   // zeroes rather than declined.
   auto const& cmp_root = *c->get_root();
-  if (cmp_root.children(0).bits() > 64 || cmp_root.children(1).bits() > 64)
+  if (cmp_root.children(0).bits() > 64 || cmp_root.children(1).bits() > 64) {
+#ifdef I2S_HAVE_FP80
+    // ...except fp80, which has a host type that represents it exactly.  The
+    // instrumentation admits it for comparisons only, so it cannot arrive with
+    // arith or transcendental nodes attached and none of the machinery below
+    // would apply to it; it gets its own routine rather than a widened copy of
+    // this one.
+    if (cmp_root.children(0).bits() == 80 && cmp_root.children(1).bits() == 80)
+      return solve_fcmp80(c, cm, comparison, in_buf, in_size, out_buf, out_size);
+#endif
     return SOLVER_TIMEOUT;
+  }
 
   // Classify the comparison by AST structure (not by value matching): is one
   // operand produced by a single invertible FP arith op against a constant, or
@@ -1435,6 +1522,88 @@ I2SSolver::solve_fcmp(std::shared_ptr<const Constraint> const& c,
   }
   return SOLVER_TIMEOUT;
 }
+
+#ifdef I2S_HAVE_FP80
+solver_result_t
+I2SSolver::solve_fcmp80(std::shared_ptr<const Constraint> const& c,
+                        std::unique_ptr<ConsMeta> const& cm,
+                        uint32_t comparison,
+                        const uint8_t *in_buf, size_t in_size,
+                        uint8_t *out_buf, size_t &out_size) {
+
+  (void)cm; // located by Read offset below, so no i2s_candidates scan
+
+  uint32_t predicate = fcmp_predicate(comparison);
+  auto const& root = *c->get_root();
+  auto const& lc = root.children(0);
+  auto const& rc = root.children(1);
+
+  // Only a direct compare of input bytes against a constant.  Anything else is
+  // left alone: TaintPass admits fp80 for comparisons and nothing else, so a
+  // transformed operand here means some other node type crept in, and guessing
+  // at it is how a wrong answer gets reported as SAT.
+  const AstNode *sym = nullptr, *cst = nullptr;
+  bool sym_is_lhs;
+  if (lc.kind() == rgd::Read && rc.kind() == rgd::Constant) {
+    sym = &lc; cst = &rc; sym_is_lhs = true;
+  } else if (rc.kind() == rgd::Read && lc.kind() == rgd::Constant) {
+    sym = &rc; cst = &lc; sym_is_lhs = false;
+  } else {
+    DEBUGF("i2s fcmp80: not a direct compare (lc=%u rc=%u)\n",
+           lc.kind(), rc.kind());
+    return SOLVER_TIMEOUT;
+  }
+
+  // The constant occupies two consecutive input_args slots, low half first --
+  // the multi-slot convention the WideConst leaf lowers to (rgd-parser.cpp).
+  uint32_t ai = cst->index();
+  if (unlikely(ai + 1 >= c->input_args.size())) return SOLVER_TIMEOUT;
+  i2s_fp80 kbits = { c->input_args[ai].second,
+                     (uint16_t)c->input_args[ai + 1].second };
+  long double k = fp80_decode(kbits);
+
+  // A Read records the input offset it reads, so the operand is located exactly
+  // rather than by scanning i2s_candidates for bytes that happen to match.
+  size_t offset = sym->index();
+  if (unlikely(offset + 10 > in_size)) return SOLVER_TIMEOUT;
+
+  // Structural check, the same one the narrow path makes with a full-width
+  // value match: op1/op2 are truncated to 64 bits by the instrumentation, which
+  // for an fp80 is the entire significand -- enough to catch an operand that is
+  // not the one at this offset.  Sign and exponent are not covered here; the
+  // Read offset above is what covers them.
+  uint64_t sig = 0;
+  memcpy(&sig, &in_buf[offset], 8);
+  if ((sym_is_lhs ? c->op1 : c->op2) != sig) {
+    DEBUGF("i2s fcmp80: significand mismatch @%zu\n", offset);
+    return SOLVER_TIMEOUT;
+  }
+
+  long double s = fp_i2s_target(predicate, k, sym_is_lhs, 10u);
+  i2s_fp80 rb = fp80_encode(s);
+  // re-decode rather than trusting s: what the program will compare is the
+  // value that survives the round trip through ten bytes of input
+  long double sv = fp80_decode(rb);
+  long double a = sym_is_lhs ? sv : k;
+  long double b = sym_is_lhs ? k : sv;
+  if (!i2s_eval_fcmp(predicate, a, b)) {
+    DEBUGF("i2s fcmp80: witness fails pred %u\n", predicate);
+    return SOLVER_TIMEOUT;
+  }
+
+  DEBUGF("i2s: fcmp80 pred %u @ %zu sym_lhs=%d -> 0x%04x%016lx\n",
+         predicate, offset, sym_is_lhs, rb.hi, rb.lo);
+  if (out_size == 0) memcpy(out_buf, in_buf, in_size); // make a copy
+  out_size = in_size;
+  // ten bytes, not sixteen: the rest of the slot is padding the FP load never
+  // reads, and writing it would clobber input bytes this constraint has no
+  // claim on
+  memcpy(&out_buf[offset], &rb.lo, 8);
+  memcpy(&out_buf[offset + 8], &rb.hi, 2);
+  matches++;
+  return SOLVER_SAT;
+}
+#endif // I2S_HAVE_FP80
 
 solver_result_t
 I2SSolver::solve_icmp(std::shared_ptr<const Constraint> const& c,

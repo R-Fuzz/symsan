@@ -452,7 +452,12 @@ static inline double fp_decode(uint64_t bits_val, uint8_t bits) {
   } else if (bits == 32) {
     uint32_t u = (uint32_t)bits_val; float f; memcpy(&f, &u, sizeof(f)); return (double)f;
   }
-  // half and other widths: not decoded for concrete evaluation
+  // half and other widths: not decoded for concrete evaluation.  Returning a
+  // placeholder is safe rather than sloppy because this feeds only
+  // FILTER_WRONG_AST, and anything wider than 64 bits (x86_fp80 included) is
+  // already marked value-unknown by wide_value_unknown, so the consistency
+  // checks skip it instead of comparing against this 0.0.  The *formula* side
+  // declines fp80 separately and by format, in fpa_sort_for.
   return 0.0;
 }
 

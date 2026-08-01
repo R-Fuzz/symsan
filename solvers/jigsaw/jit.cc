@@ -40,8 +40,21 @@ std::unique_ptr<GradJit> JIT;
 // an integer as the matching float/double so we can emit native FP ops, and
 // as_bits() reinterprets an FP result back to the integer bit-pattern that the
 // rest of codegen (and the value cache) expects.
+//
+// Only the two widths whose bit-pattern round-trips through a uint64 arg slot
+// are accepted.  This used to be `bits == 32 ? float : double`, which answered
+// "double" for every other width and so emitted `bitcast i80 -> double` once
+// x86_fp80 comparisons started being instrumented: invalid IR, and the caller
+// below discarded verifyFunction's verdict, so it reached the JIT anyway.
+// Declining here rather than at each FCmp case covers the arithmetic cases too,
+// and is the single point where jigsaw's format support is stated.  x86_fp80 in
+// particular can never work here: it has an explicit integer significand bit and
+// does not fit a uint64 slot at all -- i2s handles it natively instead (see
+// solve_fcmp80), which is why the decline must be by format and not by width.
 static inline llvm::Type* fp_type(llvm::IRBuilder<> &Builder, unsigned bits) {
-  return bits == 32 ? Builder.getFloatTy() : Builder.getDoubleTy();
+  if (bits == 32) return Builder.getFloatTy();
+  if (bits == 64) return Builder.getDoubleTy();
+  throw std::invalid_argument("unsupported floating-point width in jigsaw");
 }
 static inline llvm::Value* as_fp(llvm::IRBuilder<> &Builder, llvm::Value* v,
                                  unsigned bits) {
@@ -865,7 +878,15 @@ int rgd::addFunction(const AstNode* node,
   Builder.CreateRet(body);
 
   llvm::raw_ostream *stream = &llvm::outs();
-  llvm::verifyFunction(*fooFunc, stream);
+  // verifyFunction returns true when the function is BROKEN.  That verdict used
+  // to be dropped on the floor, so malformed IR was printed and then JITed
+  // anyway -- and a bad JIT is a wrong answer, not a missing one.  Decline
+  // instead; every legitimate formula verifies, so this only ever fires on a
+  // codegen bug.
+  if (llvm::verifyFunction(*fooFunc, stream)) {
+    std::cerr << "invalid JIT function, declining task\n";
+    return -1;
+  }
 #if DEBUG
   // TheModule->print(llvm::errs(), nullptr);
 #endif

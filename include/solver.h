@@ -114,6 +114,17 @@ private:
                              uint32_t comparison,
                              const uint8_t *in_buf, size_t in_size,
                              uint8_t *out_buf, size_t &out_size);
+  // x86_fp80, kept apart from solve_fcmp rather than folded into it.  The
+  // instrumentation admits fp80 for comparisons only, so there is no arith or
+  // transcendental node to invert and none of that machinery applies; and every
+  // value here is a `long double` rather than a uint64 bit pattern, which is
+  // what makes the format tractable at all.  See the header comment on
+  // fp80_decode in i2s-solver.cpp.
+  solver_result_t solve_fcmp80(std::shared_ptr<const Constraint> const& c,
+                               std::unique_ptr<ConsMeta> const& cm,
+                               uint32_t comparison,
+                               const uint8_t *in_buf, size_t in_size,
+                               uint8_t *out_buf, size_t &out_size);
   solver_result_t solve_memcmp(std::shared_ptr<const Constraint> const& c,
                                std::unique_ptr<ConsMeta> const& cm,
                                const uint8_t *in_buf, size_t in_size,
