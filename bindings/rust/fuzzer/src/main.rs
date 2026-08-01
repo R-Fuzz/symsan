@@ -49,7 +49,7 @@
 //! which forks a process per core -- each would get its own stage and its own
 //! session, and the per-pid shared-memory names already keep them apart.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
@@ -94,8 +94,87 @@ use libafl_targets::{
 };
 use nix::sys::signal::Signal;
 
+/// Size of the AFL-style coverage map shared with the forkserver, when
+/// `AFL_MAP_SIZE` does not say otherwise.
+const DEFAULT_MAP_SIZE: usize = 65536;
+
 /// Size of the AFL-style coverage map shared with the forkserver.
-const MAP_SIZE: usize = 65536;
+///
+/// A constant is the wrong shape for this even though 64K is right for most
+/// targets: the map size is a property of the *build*, not of the fuzzer. A
+/// target whose instrumentation allocated more edges than we did does not fail
+/// loudly -- afl-cc's runtime reports its size in the forkserver handshake and
+/// LibAFL then refuses to start, or, with `AFL_LLVM_MAP_DYNAMIC`, coverage
+/// simply folds into whatever we gave it. Either way the answer is a number
+/// only whoever built the target knows.
+///
+/// `AFL_MAP_SIZE` is that number, spelled the way AFL++ and every AFL-family
+/// tool already spells it, so a harness that sets it for `afl-fuzz` needs no
+/// second knob for us. Unset, unparseable or zero all mean the default.
+fn map_size() -> usize {
+    match std::env::var("AFL_MAP_SIZE") {
+        Ok(s) => match s.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                log::warn!("ignoring unusable AFL_MAP_SIZE={s:?}; using {DEFAULT_MAP_SIZE}");
+                DEFAULT_MAP_SIZE
+            }
+        },
+        Err(_) => DEFAULT_MAP_SIZE,
+    }
+}
+
+/// Whether an afl-cc target wants persistent mode and/or a deferred forkserver.
+///
+/// afl-cc bakes a marker string into any target that defers its forkserver
+/// (`__AFL_INIT()`, which is what every libFuzzer harness linked against
+/// `libAFLDriver.a` does) or that runs a persistent loop (`__AFL_LOOP()`).
+/// The markers say what the target *can* do; whether it does it is decided by
+/// two environment variables its runtime reads at startup, and nothing sets
+/// those for us. `afl-fuzz` scans the binary for the markers and calls
+/// `setenv` itself (`src/afl-fuzz-init.c`, "Deferred forkserver binary
+/// detected"), so a target that works under `afl-fuzz` gives no warning that
+/// the fuzzer was carrying half the arrangement.
+///
+/// Skipping the scan is not a slower path, it is a silently broken one. With
+/// `__AFL_DEFER_FORKSRV` unset, the runtime's constructor starts the
+/// forkserver before `main`, so every forked child re-decides "am I running
+/// under AFL?" *after* the fork -- by which point the environment says no --
+/// and takes the standalone branch: read `argv[1]` as a corpus file, exit.
+/// The handshake succeeds, executions are counted, no signal is raised, and
+/// the coverage map comes back empty for every input, which the fuzzer reports
+/// as an uninstrumented target rather than as its own missing `setenv`.
+///
+/// Returns `(persistent, deferred)`.
+fn afl_target_modes(program: impl AsRef<Path>) -> (bool, bool) {
+    const PERSIST_SIG: &[u8] = b"##SIG_AFL_PERSISTENT##";
+    const DEFER_SIG: &[u8] = b"##SIG_AFL_DEFER_FORKSRV##";
+
+    let program = program.as_ref();
+    let contains = |data: &[u8], sig: &[u8]| data.windows(sig.len()).any(|w| w == sig);
+
+    let (mut persistent, mut deferred) = match std::fs::read(program) {
+        Ok(data) => (contains(&data, PERSIST_SIG), contains(&data, DEFER_SIG)),
+        Err(e) => {
+            log::warn!(
+                "cannot scan {} for AFL target modes ({e}); assuming neither",
+                program.display()
+            );
+            (false, false)
+        }
+    };
+
+    // The same overrides afl-fuzz honours, for a target whose markers were
+    // stripped or that was instrumented by something other than afl-cc.
+    persistent |= std::env::var_os("AFL_PERSISTENT").is_some();
+    deferred |= std::env::var_os("AFL_DEFER_FORKSRV").is_some();
+
+    log::info!(
+        "{}: persistent={persistent} deferred_forkserver={deferred}",
+        program.display()
+    );
+    (persistent, deferred)
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -228,8 +307,9 @@ pub fn main() -> Result<(), libafl::Error> {
     // the afl-cc instrumentation writes edge hits into, wrapped in an observer
     // the feedbacks read.
 
+    let map_size = map_size();
     let mut shmem_provider = UnixShMemProvider::new()?;
-    let mut shmem = shmem_provider.new_shmem(MAP_SIZE)?;
+    let mut shmem = shmem_provider.new_shmem(map_size)?;
     // SAFETY: writing to our own environment before any thread is spawned.
     unsafe {
         shmem.write_to_env("__AFL_SHM_ID")?;
@@ -292,14 +372,17 @@ pub fn main() -> Result<(), libafl::Error> {
     let symsan_colorization = cmplog_filter
         .then(|| tuple_list!(SymSanColorizationStage::new(&edges_observer)));
     let mut tokens = Tokens::new();
+    let (persistent, deferred) = afl_target_modes(executable);
     let mut executor = ForkserverExecutor::builder()
         .program(executable)
         .debug_child(opt.debug_child)
         .shmem_provider(&mut shmem_provider)
         .autotokens(&mut tokens)
+        .is_persistent(persistent)
+        .is_deferred_frksrv(deferred)
         // Handles `@@` for us, allocating the forkserver's own input file.
         .parse_afl_cmdline(target_args.to_vec())
-        .coverage_map_size(MAP_SIZE)
+        .coverage_map_size(map_size)
         .timeout(Duration::from_millis(opt.timeout))
         .kill_signal(opt.signal)
         .build(tuple_list!(time_observer, edges_observer))?;
@@ -465,12 +548,17 @@ pub fn main() -> Result<(), libafl::Error> {
             let cmplog_observer = AflppCmpLogObserver::new("cmplog", cmpmap, true);
             let cmplog_ref = cmplog_observer.handle();
 
+            // Scanned separately: it is a separate build, and one of the two
+            // could have been produced without the driver.
+            let (cmplog_persistent, cmplog_deferred) = afl_target_modes(bin);
             let cmplog_executor = ForkserverExecutor::builder()
                 .program(bin)
                 .debug_child(opt.debug_child)
                 .shmem_provider(&mut shmem_provider)
+                .is_persistent(cmplog_persistent)
+                .is_deferred_frksrv(cmplog_deferred)
                 .parse_afl_cmdline(target_args.to_vec())
-                .coverage_map_size(MAP_SIZE)
+                .coverage_map_size(map_size)
                 // A cmplog run logs every comparison it reaches, so it is
                 // slower than a plain one by a wide margin; the same x10 the
                 // upstream example uses.

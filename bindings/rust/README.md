@@ -47,6 +47,51 @@ binary came from `$SYMSAN_TARGET`.
 paths — the forkserver's scratch file and the stage's — because the two
 processes are independent. Leave it out and both read stdin.
 
+### `AFL_MAP_SIZE`
+
+The coverage map is 64K by default, which is afl-cc's own default and right for
+most targets. A big one — the sort where AFL++ tells you to set `AFL_MAP_SIZE`
+in the first place — instruments more edges than that, and the failure is not
+loud: the forkserver reports its real size during the handshake and LibAFL
+refuses to start, or, in an `AFL_LLVM_MAP_DYNAMIC` build, the extra edges just
+fold into the map we gave it and coverage quietly gets coarser.
+
+So `symsan-fuzz` reads the same variable afl-fuzz does, and a harness that
+already sets it needs no second knob:
+
+```bash
+AFL_MAP_SIZE=256000 symsan-fuzz -i ./seeds -o ./out --symsan ./target.symsan \
+    -- ./target.afl @@
+```
+
+Unset, unparseable or zero all mean 64K.
+
+### libFuzzer harnesses, persistent mode and the deferred fork server
+
+A target with no `main()` of its own — an OSS-Fuzz or Magma harness linked
+against AFL++'s `libAFLDriver.a`, say — gets both `__AFL_INIT()` and
+`__AFL_LOOP()` from the driver, and afl-cc records that in the binary as two
+marker strings. The markers only say what the target *can* do. Whether it does
+it is decided by `__AFL_DEFER_FORKSRV` and `__AFL_PERSISTENT` in its
+environment, and afl-fuzz is the one that scans for the markers and sets them.
+
+`symsan-fuzz` now does the same scan, so nothing has to be exported by hand.
+It matters most for the deferred fork server: without that variable the AFL
+runtime starts the fork server from a constructor, *before* `main`, and each
+forked child then asks "am I running under AFL?" after the fork — the answer
+being no, it reads `argv[1]` as a corpus file and exits without ever calling
+`LLVMFuzzerTestOneInput`. Nothing crashes and nothing warns; the handshake
+succeeds, executions are counted, and every coverage map comes back empty, so
+the fuzzer stops with
+
+```text
+Error: Empty("No entries in corpus. This often implies the target is not properly instrumented.")
+```
+
+which points at the target rather than at the missing variable. `AFL_PERSISTENT`
+and `AFL_DEFER_FORKSRV` still force either mode on for a target whose markers
+were stripped, exactly as in afl-fuzz.
+
 ## Layout
 
 ```
