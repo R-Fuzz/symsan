@@ -2944,6 +2944,19 @@ void TaintFunction::hoistBoundsChecks() {
       Groups[AddrLabel].push_back({AR, SizeC->getZExtValue(), CI});
     }
 
+    // The backedge-taken count is typed by the loop's induction variable,
+    // which need not be as wide as the address recurrence: an i32 IV walking
+    // an i64 address is common once inlining exposes the loop (it shows up at
+    // -O2, and after LTO even in code that was fine per-TU). SCEV requires
+    // both operands of getMulExpr/getAddExpr to have the same width, but that
+    // check is an assert -- in a release LLVM it is compiled out, the
+    // mixed-width SCEV is built anyway, and SCEVExpander later materializes
+    // it as `shl i32 %btc, i64 2`, which fails the module verifier. Coerce
+    // the count to the width we are about to combine it with.
+    auto CountAs = [&](Type *Ty) {
+      return SE.getTruncateOrZeroExtend(BTC, Ty);
+    };
+
     SCEVExpander Expander(SE, M->getDataLayout(), "bounds.hoist");
     Instruction *InsertPt = Preheader->getTerminator();
     DenseSet<CallInst *> HoistedSolveBounds;
@@ -2962,11 +2975,13 @@ void TaintFunction::hoistBoundsChecks() {
         const SCEV *Start = C.AR->getStart();
         const SCEV *Step = C.AR->getStepRecurrence(SE);
         // end of this access: start + BTC * stride + elem_size
+        // Step is always integer-typed (only an add-rec's start may be a
+        // pointer), so it is the right width to compute the extent in.
         const SCEV *End = SE.getAddExpr(
           Start,
           SE.getAddExpr(
-            SE.getMulExpr(BTC, Step),
-            SE.getConstant(BTC->getType(), C.ElemSize)
+            SE.getMulExpr(CountAs(Step->getType()), Step),
+            SE.getConstant(Step->getType(), C.ElemSize)
           )
         );
         if (SE.isKnownPredicate(ICmpInst::ICMP_ULT, Start, MinStart))
@@ -3029,10 +3044,13 @@ void TaintFunction::hoistBoundsChecks() {
       if (!isa<AllocaInst>(Arg))
         continue;
 
-      const SCEV *TripCount =
-          SE.getAddExpr(BTC, SE.getConstant(BTC->getType(), 1));
+      // Widen before the +1 and the multiply, not after: the extent is about
+      // to be expanded at i64, and a narrow induction variable would otherwise
+      // have trip_count * access_size wrap before it is zero-extended.
+      const SCEV *TripCount = SE.getAddExpr(
+          CountAs(TT.Int64Ty), SE.getConstant(TT.Int64Ty, 1));
       const SCEV *TotalSCEV = SE.getMulExpr(
-          TripCount, SE.getConstant(TripCount->getType(), Summary.AccessSize));
+          TripCount, SE.getConstant(TT.Int64Ty, Summary.AccessSize));
 
       IRBuilder<> IRB(InsertPt);
       Type *I8PtrTy = PointerType::getUnqual(F->getContext());
@@ -3164,8 +3182,8 @@ void TaintFunction::hoistBoundsChecks() {
         const SCEV *Step = C.AR->getStepRecurrence(SE);
         const SCEV *End = SE.getAddExpr(
             Start,
-            SE.getAddExpr(SE.getMulExpr(BTC, Step),
-                          SE.getConstant(BTC->getType(), C.ElemSize)));
+            SE.getAddExpr(SE.getMulExpr(CountAs(Step->getType()), Step),
+                          SE.getConstant(Step->getType(), C.ElemSize)));
         if (SE.isKnownPredicate(ICmpInst::ICMP_ULT, Start, MinStart))
           MinStart = Start;
         if (!MaxEnd || SE.isKnownPredicate(ICmpInst::ICMP_UGT, End, MaxEnd))
