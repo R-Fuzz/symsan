@@ -149,6 +149,9 @@ int ConcolicSession::init(const ConcolicConfig &config) {
   // of it is to skip redundant work, and the fallback is doing that work.
   if (!config_.branch_map.empty()) {
     std::unique_ptr<BranchMap> bm(new BranchMap());
+    // Only the audit needs to be able to name a branch, and the strings are not
+    // free, so they are kept exactly when something will read them.
+    bm->keep_sources(config_.validate_coverage);
     int n = bm->load(config_.branch_map, 0);
     if (n <= 0) {
       warn("branch map %s unusable, falling back to local coverage only\n",

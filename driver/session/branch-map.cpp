@@ -44,6 +44,7 @@ int BranchMap::load(const std::string &path, size_t map_size) {
   }
 
   edges_.clear();
+  srcs_.clear();
   dropped_ = 0;
   skipped_ = 0;
 
@@ -93,6 +94,8 @@ int BranchMap::load(const std::string &path, size_t map_size) {
           cid, strtoull(case_value.c_str(), nullptr, 10));
     }
     edges_[key(cid, dir != "0")].push_back((uint32_t)edge_id);
+    // First one wins; the copies of an inlined branch all say the same thing.
+    if (keep_sources_) srcs_.emplace(key(cid, dir != "0"), src);
   }
 
   return (int)edges_.size();

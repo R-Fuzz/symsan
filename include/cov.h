@@ -4,6 +4,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -209,27 +211,49 @@ public:
   /// converse says nothing -- the fuzzer records every edge it walks, and the
   /// ones whose condition did not depend on the input never reach us.
   ///
-  /// Inlining costs precision: one source branch becomes N edge ids and a run
-  /// takes one of them, so those can only be checked as "at least one covered"
-  /// and are counted apart from the exact ones.
+  /// A source location is not always one branch, and that costs precision: it
+  /// is N edge ids both when the branch was inlined and when a macro or a
+  /// && / || chain puts several distinct branches on one column.  A run takes
+  /// one of them, so those can only be checked as "at least one covered" and
+  /// are counted apart from the exact ones.  For the second kind even that can
+  /// fail honestly -- the direction taken may belong to a sibling comparison
+  /// whose block AFL++ pruned, leaving no edge to record -- so an
+  /// ambiguous_violation is a weaker signal than a violation.
   void validate(const uint32_t *covered, size_t n, JoinReport *out) const {
     std::unordered_set<uint32_t> hit(covered, covered + n);
+    // A count alone says a contradiction happened but not where, which is the
+    // difference between a finding and a mystery.  Print the first few, capped
+    // because a systematically wrong map would otherwise print thousands.
+    size_t named = 0;
     for (uint64_t key : taken_) {
       out->executed += 1;
-      const std::vector<uint32_t> *edges =
-          map_ ? map_->lookup((uint32_t)(key >> 1), (key & 1) != 0) : nullptr;
+      uint32_t cid = (uint32_t)(key >> 1);
+      bool dir = (key & 1) != 0;
+      const std::vector<uint32_t> *edges = map_ ? map_->lookup(cid, dir) : nullptr;
+      bool bad = false;
       if (!edges || edges->empty()) {
         out->unmapped += 1;
       } else if (edges->size() == 1) {
         out->checked += 1;
-        if (hit.find((*edges)[0]) == hit.end()) out->violations += 1;
+        bad = hit.find((*edges)[0]) == hit.end();
+        if (bad) out->violations += 1;
       } else {
         out->ambiguous += 1;
         bool any = false;
         for (uint32_t e : *edges) {
           if (hit.find(e) != hit.end()) { any = true; break; }
         }
-        if (!any) out->ambiguous_violations += 1;
+        bad = !any;
+        if (bad) out->ambiguous_violations += 1;
+      }
+      if (bad && named < 8) {
+        named += 1;
+        const std::string *src = map_->source(cid, dir);
+        fprintf(stderr, "[symsan] branch map contradiction: cid %u dir %d -> ",
+                cid, (int)dir);
+        for (uint32_t e : *edges) fprintf(stderr, "%u ", e);
+        fprintf(stderr, "(none covered), at %s\n",
+                src ? src->c_str() : "an unrecorded location");
       }
     }
   }
@@ -300,8 +324,13 @@ private:
       // once per corpus entry anyway.
       auto hit = trace_hits_.find(context->addr);
       uint8_t want = count_class(hit == trace_hits_.end() ? 1 : hit->second);
-      // Inlining gives one source branch several edge ids.  One uncovered copy
-      // is still worth solving for, so this is "any", not "all".
+      // Inlining gives one source branch several edge ids, and so does a macro
+      // or a && / || chain, which puts several *distinct* branches on one
+      // column (see include/branch_map.h).  One uncovered member is still worth
+      // solving for, so this is "any", not "all" -- which is also the safe way
+      // round for the second case, where the members are unrelated branches:
+      // it can only make us solve something already covered, never skip
+      // something that is not.
       host_says_new = false;
       for (uint32_t e : *edges) {
         if (e >= host_.size() || host_[e] < want) { host_says_new = true; break; }

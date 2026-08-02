@@ -18,9 +18,17 @@
   instrumentation baked into the binary, so the two toolchains end up talking
   about the same branch without either having to know about the other.
 
-  Both directions of the relation are many-to-one: inlining duplicates a source
-  branch into N copies, each with its own edge id, so one (cid, direction) maps
-  to a *list*.
+  Both directions of the relation are many-to-one, so one (cid, direction) maps
+  to a *list*, for two different reasons.  Inlining duplicates a source branch
+  into N copies, each with its own edge id.  And a single source location can
+  hold several *distinct* branches: clang gives every branch a macro expands to,
+  and every && / || short circuit, the location of the expression it started
+  from, so libpng's `isnonalpha(c)` -- four comparisons -- is four branches at
+  pngerror.c:445:11.  The second is the common one; on a -O0 build, where
+  nothing is inlined, it is the only one.  Both are handled the same way here,
+  but they are not equally benign: for a group of unrelated branches, "the
+  fuzzer covered one of these edges" no longer implies anything about the branch
+  we are asking about, so callers should err towards doing the work.
 
   A case has only a dir=1 entry.  "Take this case" is a block; "do not take this
   case" is not one edge but everywhere else the switch could go, so that side
@@ -43,6 +51,14 @@ namespace rgd {
 
 class BranchMap {
 public:
+  /// Also remember each entry's source location, so a validation failure can
+  /// name the branch instead of only a hash of it.  Call before load().
+  ///
+  /// Off by default: the strings cost several times what the ids they annotate
+  /// do, and nothing in the fuzzing loop reads them -- lookup() answers with
+  /// edge ids.  Only validate() needs to be able to say *which* branch.
+  void keep_sources(bool on) { keep_sources_ = on; }
+
   /// Parse @p path.  Edge ids at or beyond @p map_size cannot index the
   /// fuzzer's coverage map and are counted in dropped() rather than stored;
   /// pass 0 to keep everything.
@@ -60,6 +76,15 @@ public:
     return itr == edges_.end() ? nullptr : &itr->second;
   }
 
+  /// Where a (cid, direction) came from, or nullptr -- unknown to the map, or
+  /// keep_sources() was not set.  One location per key even when the key holds
+  /// several edge ids: they share a location by construction, whether they are
+  /// inlined copies of one branch or siblings out of one macro expansion.
+  const std::string *source(uint32_t cid, bool direction) const {
+    auto itr = srcs_.find(key(cid, direction));
+    return itr == srcs_.end() ? nullptr : &itr->second;
+  }
+
   /// Number of (cid, direction) pairs known.
   size_t size() const { return edges_.size(); }
   /// Lines skipped because their edge id was out of range.
@@ -75,6 +100,9 @@ private:
   }
 
   std::unordered_map<uint64_t, std::vector<uint32_t>> edges_;
+  /// Same keys as edges_, but only when keep_sources() was set.
+  std::unordered_map<uint64_t, std::string> srcs_;
+  bool keep_sources_ = false;
   size_t dropped_ = 0;
   size_t skipped_ = 0;
 };
