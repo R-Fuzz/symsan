@@ -119,14 +119,12 @@ public:
 struct JoinReport {
   /// distinct branch directions the trace actually took
   size_t executed = 0;
-  /// of those, the ones mapping to exactly one edge id
+  /// of those, the ones naming an edge id
   size_t checked = 0;
   /// of the checked ones, those whose edge the fuzzer's build did *not* record
   size_t violations = 0;
-  /// directions mapping to several edge ids because the branch was inlined
-  size_t ambiguous = 0;
-  /// of those, the ones where *none* of the edges was recorded
-  size_t ambiguous_violations = 0;
+  /// directions the map answered for with "AFL++ numbered no block here"
+  size_t pruned = 0;
   /// directions the map had nothing to say about
   size_t unmapped = 0;
 };
@@ -136,12 +134,13 @@ struct JoinReport {
 ///
 /// EdgeCovManager only ever knows what this process has seen, so a branch the
 /// fuzzer flipped an hour ago still looks new to every freshly started session.
-/// Given a BranchMap -- SymSan branch id to AFL++ edge ids, see
-/// include/branch_map.h -- and a snapshot of the fuzzer's history map, we can
-/// ask the question the fuzzer would answer.
+/// Given a BranchMap -- what each side of a branch reaches, in the fuzzer's own
+/// edge numbering, see include/branch_map.h -- and a snapshot of the fuzzer's
+/// history map, we can ask the question the fuzzer would answer.
 ///
-/// Where the map has nothing to say (a branch the two builds name differently,
-/// or one AFL++ pruned) this degrades exactly to EdgeCovManager.
+/// Where the map has nothing to say -- a branch out of code AFL++ never
+/// instrumented, the false side of a switch case, or a direction AFL++ pruned
+/// and so gave no edge id -- this degrades exactly to EdgeCovManager.
 class SharedMapCovManager : public CovManager {
 private:
   using BranchTargets = std::pair<bool, bool>;
@@ -211,49 +210,42 @@ public:
   /// converse says nothing -- the fuzzer records every edge it walks, and the
   /// ones whose condition did not depend on the input never reach us.
   ///
-  /// A source location is not always one branch, and that costs precision: it
-  /// is N edge ids both when the branch was inlined and when a macro or a
-  /// && / || chain puts several distinct branches on one column.  A run takes
-  /// one of them, so those can only be checked as "at least one covered" and
-  /// are counted apart from the exact ones.  For the second kind even that can
-  /// fail honestly -- the direction taken may belong to a sibling comparison
-  /// whose block AFL++ pruned, leaving no edge to record -- so an
-  /// ambiguous_violation is a weaker signal than a violation.
+  /// A direction the map answers for with kPruned has no edge to check against
+  /// anything -- AFL++ numbered no block behind it -- so it is counted apart
+  /// rather than treated as either a pass or a failure.
   void validate(const uint32_t *covered, size_t n, JoinReport *out) const {
     std::unordered_set<uint32_t> hit(covered, covered + n);
     // A count alone says a contradiction happened but not where, which is the
     // difference between a finding and a mystery.  Print the first few, capped
     // because a systematically wrong map would otherwise print thousands.
+    //
+    // Both numbers name the branch as precisely as anything can: the cid is
+    // itself one of the edge ids around it, so AFL++'s own
+    // AFL_LLVM_DOCUMENT_IDS listing for the same build turns either of them
+    // back into a source location.
     size_t named = 0;
     for (uint64_t key : taken_) {
       out->executed += 1;
       uint32_t cid = (uint32_t)(key >> 1);
       bool dir = (key & 1) != 0;
-      const std::vector<uint32_t> *edges = map_ ? map_->lookup(cid, dir) : nullptr;
-      bool bad = false;
-      if (!edges || edges->empty()) {
+      const uint32_t *edge = map_ ? map_->lookup(cid, dir) : nullptr;
+      if (!edge) {
         out->unmapped += 1;
-      } else if (edges->size() == 1) {
-        out->checked += 1;
-        bad = hit.find((*edges)[0]) == hit.end();
-        if (bad) out->violations += 1;
-      } else {
-        out->ambiguous += 1;
-        bool any = false;
-        for (uint32_t e : *edges) {
-          if (hit.find(e) != hit.end()) { any = true; break; }
-        }
-        bad = !any;
-        if (bad) out->ambiguous_violations += 1;
+        continue;
       }
-      if (bad && named < 8) {
+      if (*edge == BranchMap::kPruned) {
+        out->pruned += 1;
+        continue;
+      }
+      out->checked += 1;
+      if (hit.find(*edge) != hit.end()) continue;
+      out->violations += 1;
+      if (named < 8) {
         named += 1;
-        const std::string *src = map_->source(cid, dir);
-        fprintf(stderr, "[symsan] branch map contradiction: cid %u dir %d -> ",
-                cid, (int)dir);
-        for (uint32_t e : *edges) fprintf(stderr, "%u ", e);
-        fprintf(stderr, "(none covered), at %s\n",
-                src ? src->c_str() : "an unrecorded location");
+        fprintf(stderr,
+                "[symsan] branch map contradiction: cid %u dir %d -> edge %u, "
+                "which the fuzzer's build did not record\n",
+                cid, (int)dir, *edge);
       }
     }
   }
@@ -265,8 +257,11 @@ public:
     else host_.assign(map, map + len);
   }
 
-  /// How many branch directions we could and could not look up.  The ratio is
-  /// the diagnostic for whether the two builds actually agree on names.
+  /// How many branch directions we could and could not get an edge for.  The
+  /// ratio is the diagnostic for whether the map covers the code being traced.
+  /// A pruned direction counts as unmapped here -- the entry exists, but not an
+  /// edge to consult the fuzzer's history about.  validate() keeps the two
+  /// apart, because there the distinction is what it can and cannot check.
   uint64_t mapped() const { return mapped_; }
   uint64_t unmapped() const { return unmapped_; }
 
@@ -303,11 +298,28 @@ private:
     // check below.
     bool host_says_new = true;
     auto cid = cids.find(context->addr);
-    const std::vector<uint32_t> *edges =
+    const uint32_t *edge =
         (map_ && cid != cids.end())
             ? map_->lookup(cid->second, context->direction)
             : nullptr;
-    if (edges) {
+    // AFL++ numbered no block behind this direction, so there is no edge to ask
+    // the fuzzer's history about.  For validate() that is a real answer --
+    // nothing to contradict -- but here it must *not* be read as "flipping this
+    // buys nothing".  AFL++ also prunes a block that dominates all of its
+    // successors, and reaching those successors is new coverage by anyone's
+    // reckoning: the true side of an `if` guarding nested work is pruned
+    // exactly that way, so calling it uninteresting would refuse to solve the
+    // one branch that gates the rest of the program.  The honest statement is
+    // that this direction resolves to a *disjunction* of edges and the map
+    // holds one target per direction, so it cannot answer -- which is the same
+    // position as a branch it never heard of, and takes the same degrade path.
+    //
+    // TODO: recording the pruned block's numbered successors would let the
+    // fuzzer's history decide here too, and would be strictly better than our
+    // own session-local record.  It needs a map entry that is a set, so it
+    // waits for a format that has one.
+    if (edge && *edge == BranchMap::kPruned) edge = nullptr;
+    if (edge) {
       if (count) mapped_ += 1;
       // "Has the fuzzer covered this edge?" is not a yes/no question to
       // MaxMapFeedback -- it compares hit-count *classes*, so the second
@@ -324,17 +336,10 @@ private:
       // once per corpus entry anyway.
       auto hit = trace_hits_.find(context->addr);
       uint8_t want = count_class(hit == trace_hits_.end() ? 1 : hit->second);
-      // Inlining gives one source branch several edge ids, and so does a macro
-      // or a && / || chain, which puts several *distinct* branches on one
-      // column (see include/branch_map.h).  One uncovered member is still worth
-      // solving for, so this is "any", not "all" -- which is also the safe way
-      // round for the second case, where the members are unrelated branches:
-      // it can only make us solve something already covered, never skip
-      // something that is not.
-      host_says_new = false;
-      for (uint32_t e : *edges) {
-        if (e >= host_.size() || host_[e] < want) { host_says_new = true; break; }
-      }
+      // Past the end of the snapshot is not covered: a map shorter than the
+      // binary's id range says nothing about the ids it does not reach, and
+      // "unknown" has to read as "worth solving".
+      host_says_new = *edge >= host_.size() || host_[*edge] < want;
       // The map answered, so it decides.  `branches` is keyed on address and
       // lives as long as the session, which makes it wrong in exactly the case
       // we came here to fix: it can only ever say "solved once already", and a
@@ -345,8 +350,9 @@ private:
     }
 
     if (count) unmapped_ += 1;
-    // No edge for this branch: a name the two builds disagree on, or one AFL++
-    // pruned.  Nothing better to consult than our own history, which is
+    // Nothing in the map for this branch: code AFL++ never instrumented, one of
+    // SymSan's own checks, or the false side of a switch case, which is not one
+    // edge.  Nothing better to consult than our own history, which is
     // EdgeCovManager's answer -- the documented degrade path.
     auto itr = branches.find(context->addr);
     // assert(itr != branches.end());

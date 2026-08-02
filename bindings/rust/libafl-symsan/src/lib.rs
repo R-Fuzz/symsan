@@ -215,12 +215,11 @@ impl SymSanStageBuilder {
 
     /// Share a branch namespace -- and therefore coverage -- with the fuzzer.
     ///
-    /// `path` is what a patched AFL++ writes when `AFL_LLVM_DOCUMENT_IDS` is
-    /// set while building the *coverage* copy of the target (see
-    /// `patches/aflpp-document-ids.patch` in the SymSan tree). It maps each
-    /// source-level branch direction onto the AFL++ edge ids that represent it,
-    /// which is what lets the stage look a branch up in the fuzzer's history
-    /// map and skip solving for one the fuzzer already reached.
+    /// `path` is what TaintPass writes when `-taint-branch-map=<file>` is set
+    /// while instrumenting the target. It maps each side of each branch onto
+    /// the AFL++ edge it reaches, which is what lets the stage look a branch up
+    /// in the fuzzer's history map and skip solving for one the fuzzer already
+    /// reached.
     ///
     /// Without it the session only knows what it has traced itself, so it keeps
     /// paying to re-solve branches the fuzzer covered long ago.
@@ -761,18 +760,17 @@ where
                     self.join.executed += r.executed;
                     self.join.checked += r.checked;
                     self.join.violations += r.violations;
-                    self.join.ambiguous += r.ambiguous;
-                    self.join.ambiguous_violations += r.ambiguous_violations;
+                    self.join.pruned += r.pruned;
                     self.join.unmapped += r.unmapped;
                     if r.is_consistent() {
                         log::debug!(
                             "symsan: entry {corpus_id} join ok: {}/{} directions checked \
-                             against {} fuzzer edges, {} unmapped, {} ambiguous",
+                             against {} fuzzer edges, {} unmapped, {} pruned",
                             r.checked,
                             r.executed,
                             covered.len(),
                             r.unmapped,
-                            r.ambiguous
+                            r.pruned
                         );
                     } else {
                         // Loud, because this is not a missed opportunity: the
@@ -782,13 +780,11 @@ where
                         log::error!(
                             "symsan: entry {corpus_id} contradicts the branch map: \
                              {} of {} checked directions map to an edge the fuzzer's \
-                             build did not record ({} of {} ambiguous ones too). \
-                             The two builds disagree about branch identity, or they \
-                             took different paths on the same input.",
+                             build did not record. The two builds disagree about \
+                             branch identity, or they took different paths on the \
+                             same input.",
                             r.violations,
-                            r.checked,
-                            r.ambiguous_violations,
-                            r.ambiguous
+                            r.checked
                         );
                     }
                 }

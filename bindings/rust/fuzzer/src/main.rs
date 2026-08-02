@@ -234,10 +234,9 @@ struct Opt {
     #[arg(long = "symsan-budget", default_value = "0")]
     symsan_budget: usize,
 
-    /// Branch-id map for the coverage target, as written by a patched AFL++
-    /// with `AFL_LLVM_DOCUMENT_IDS=<file> afl-clang-lto -g`. Given one, the
-    /// concolic stage can see which branches the fuzzer has already covered
-    /// and stops solving for them.
+    /// Branch map for the SymSan target, as written by TaintPass with
+    /// `-taint-branch-map=<file>`. Given one, the concolic stage can see which
+    /// branches the fuzzer has already covered and stops solving for them.
     #[arg(long = "branch-map")]
     branch_map: Option<PathBuf>,
 

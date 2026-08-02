@@ -1,38 +1,40 @@
 /*
-  rgd::BranchMap -- the join between SymSan's branch ids and the fuzzer's edge
-  ids.
+  rgd::BranchMap -- which edge each side of a branch reaches, in the fuzzer's
+  own numbering.
 
-  A patched AFL++ (see patches/aflpp-document-ids.patch) writes one line per
-  instrumented edge when AFL_LLVM_DOCUMENT_IDS is set:
+  TaintPass writes this file beside the instrumented binary
+  (-taint-branch-map=, instrumentation/TaintPass.cpp), reading AFL++'s edge ids
+  straight out of the module it is instrumenting:
 
-      ModuleID=<n> Function=<name> edgeID=<n> dir=<0|1> src=<file>:<line>:<col>
+      # symsan branch map v1 base=<reserved> edges=<count>
+      C <cid> <true edge> <false edge>      conditional branch
+      X <cid> <true edge> <false edge>      select-lowered branch
+      D <cid> <default edge>                switch, no case matched
+      S <cid> <case value> <case edge>      switch, one line per case
 
-  and, for a switch case block, one line per case value landing there:
+  There is no join to perform.  Both arms of the build are derived from one
+  AFL++-instrumented module, so a branch's cid *is* one of the edge ids around
+  it, and all this file has to say is which edges are on which side.
 
-      ModuleID=<n> Function=<name> edgeID=<n> dir=1 case=<v> src=<switch loc>
+  Its predecessor met AFL++'s AFL_LLVM_DOCUMENT_IDS output halfway by hashing
+  source locations, and that cost precision which had nothing to do with the
+  question being asked: clang gives every branch a macro or a && / || chain
+  expands to the location of the expression it started from, so libpng's
+  `isnonalpha(c)` -- four comparisons -- was four branches at pngerror.c:445:11,
+  and one (cid, direction) resolved to a *list* of unrelated edges.  A cid taken
+  from the module names one branch, so the answer here is one edge.
 
-  The src/dir fields are present only for edges that come out of a conditional
-  branch or a switch, which is exactly the set SymSan also names.  Hashing src
-  with symsan::branch_cid() (include/branch_id.h) -- then, for a case, mixing in
-  the value with symsan::switch_case_cid() -- gives the same number SymSan's
-  instrumentation baked into the binary, so the two toolchains end up talking
-  about the same branch without either having to know about the other.
+  -1 for a direction is an answer rather than a gap.  AFL++ numbers only the
+  blocks its coverage needs, pruning any block that dominates all its successors
+  or that post-dominates them with more than one predecessor -- the latter being
+  the join an `if` with no `else` falls through to.  Reaching such a block is
+  implied by reaching the branch at all, so there is no coverage to be had by
+  flipping towards it, and lookup() says exactly that with kPruned instead of
+  declining to answer.
 
-  Both directions of the relation are many-to-one, so one (cid, direction) maps
-  to a *list*, for two different reasons.  Inlining duplicates a source branch
-  into N copies, each with its own edge id.  And a single source location can
-  hold several *distinct* branches: clang gives every branch a macro expands to,
-  and every && / || short circuit, the location of the expression it started
-  from, so libpng's `isnonalpha(c)` -- four comparisons -- is four branches at
-  pngerror.c:445:11.  The second is the common one; on a -O0 build, where
-  nothing is inlined, it is the only one.  Both are handled the same way here,
-  but they are not equally benign: for a group of unrelated branches, "the
-  fuzzer covered one of these edges" no longer implies anything about the branch
-  we are asking about, so callers should err towards doing the work.
-
-  A case has only a dir=1 entry.  "Take this case" is a block; "do not take this
-  case" is not one edge but everywhere else the switch could go, so that side
-  stays unmapped and falls back to what this process has seen itself.
+  A case has only a true direction.  "Take this case" is a block; "do not take
+  this case" is not one edge but everywhere else the switch could go, so that
+  side stays unmapped and falls back to what this process has seen itself.
 
   (c) 2026 by Chengyu Song <csong@cs.ucr.edu>
   License: Apache 2.0
@@ -45,64 +47,71 @@
 
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 namespace rgd {
 
 class BranchMap {
 public:
-  /// Also remember each entry's source location, so a validation failure can
-  /// name the branch instead of only a hash of it.  Call before load().
+  /// A direction AFL++ assigned no edge id to, because reaching the block
+  /// behind it is already implied by coverage it does record.
   ///
-  /// Off by default: the strings cost several times what the ids they annotate
-  /// do, and nothing in the fuzzing loop reads them -- lookup() answers with
-  /// edge ids.  Only validate() needs to be able to say *which* branch.
-  void keep_sources(bool on) { keep_sources_ = on; }
+  /// A real answer -- "this side is never interesting" -- and deliberately
+  /// distinct from lookup() returning nullptr, which means the map has never
+  /// heard of the branch and the caller should fall back to its own history.
+  static const uint32_t kPruned = UINT32_MAX;
 
-  /// Parse @p path.  Edge ids at or beyond @p map_size cannot index the
-  /// fuzzer's coverage map and are counted in dropped() rather than stored;
-  /// pass 0 to keep everything.
+  /// Parse @p path.
   ///
-  /// @return the number of usable entries, or -1 if the file cannot be read
-  int load(const std::string &path, size_t map_size);
+  /// @return the number of (cid, direction) pairs read, or -1 if the file
+  /// cannot be read.  Zero is not an error condition here but is certainly a
+  /// symptom: it is what a map in some other format parses to.
+  int load(const std::string &path);
 
-  /// The edge ids for one side of a branch, or nullptr if this branch
-  /// direction has no id -- either because the two builds disagree about the
-  /// source location, or because AFL++ pruned the block (see
-  /// shouldInstrumentBlock() in its LTO pass: a block that dominates all its
-  /// successors carries no counter of its own).
-  const std::vector<uint32_t> *lookup(uint32_t cid, bool direction) const {
-    auto itr = edges_.find(key(cid, direction));
-    return itr == edges_.end() ? nullptr : &itr->second;
+  /// Which edge taking @p cid in @p direction reaches: an edge id, kPruned, or
+  /// nullptr when this branch direction is not in the map at all.
+  ///
+  /// Not in the map means one of three things: a branch in code AFL++ never
+  /// instrumented (an instrumented archive linked in separately, libc++ being
+  /// the one every C++ target pulls in), one of SymSan's own checks, which is
+  /// not an edge and holds an id below base(), or the false side of a switch
+  /// case, which is not one edge.
+  const uint32_t *lookup(uint32_t cid, bool direction) const {
+    auto itr = targets_.find(key(cid, direction));
+    return itr == targets_.end() ? nullptr : &itr->second;
   }
 
-  /// Where a (cid, direction) came from, or nullptr -- unknown to the map, or
-  /// keep_sources() was not set.  One location per key even when the key holds
-  /// several edge ids: they share a location by construction, whether they are
-  /// inlined copies of one branch or siblings out of one macro expansion.
-  const std::string *source(uint32_t cid, bool direction) const {
-    auto itr = srcs_.find(key(cid, direction));
-    return itr == srcs_.end() ? nullptr : &itr->second;
-  }
+  /// How far AFL++'s numbering went in the module this map describes, from the
+  /// `edges=` header -- which is also how big a coverage map has to be for
+  /// every counter in the binary to have somewhere to land.  Zero if the file
+  /// carried no header.
+  uint32_t edges() const { return edges_; }
+
+  /// The first id AFL++ was allowed to use, from the `base=` header
+  /// (symsan::AFL_ID_BASE).  Ids below it name SymSan's own branches -- a UB
+  /// check, a bounds check, a libc-wrapper size constraint -- which exist only
+  /// in the instrumented build and appear in no coverage map.
+  uint32_t base() const { return base_; }
 
   /// Number of (cid, direction) pairs known.
-  size_t size() const { return edges_.size(); }
-  /// Lines skipped because their edge id was out of range.
+  size_t size() const { return targets_.size(); }
+  /// Lines naming an edge at or beyond edges(), which a coverage map of the
+  /// size the header asks for cannot index.  Expected to be zero: the same pass
+  /// wrote both numbers.  Anything else means the map and the binary it
+  /// describes have come apart, so those lines are left out rather than
+  /// answered with an index nobody can use.
   size_t dropped() const { return dropped_; }
-  /// Lines carrying no src=/dir= fields -- unconditional edges, function
-  /// entries, and anything compiled without -g.
+  /// Lines that did not parse -- an unknown record type, or too few fields.
   size_t skipped() const { return skipped_; }
-  bool empty() const { return edges_.empty(); }
+  bool empty() const { return targets_.empty(); }
 
 private:
   static uint64_t key(uint32_t cid, bool direction) {
     return ((uint64_t)cid << 1) | (direction ? 1u : 0u);
   }
 
-  std::unordered_map<uint64_t, std::vector<uint32_t>> edges_;
-  /// Same keys as edges_, but only when keep_sources() was set.
-  std::unordered_map<uint64_t, std::string> srcs_;
-  bool keep_sources_ = false;
+  std::unordered_map<uint64_t, uint32_t> targets_;
+  uint32_t base_ = 0;
+  uint32_t edges_ = 0;
   size_t dropped_ = 0;
   size_t skipped_ = 0;
 };

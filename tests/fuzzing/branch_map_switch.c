@@ -1,56 +1,65 @@
-// Do SymSan and the fuzzer name the same *switch case*?
+// Does the branch map point a *switch case* at the edge the fuzzer walks?
 //
-// tests/fuzzing/branch_map_join.c asks this of if-branches.  A case is harder, and used
-// not to work at all: SymSan gave every case of a switch the switch's own id,
-// so a case could not be named, and AFL++ wrote no src= for a case block at
-// all.  Both sides now key a case on the switch's location plus the case value
-// (symsan::switch_case_cid), which is the only thing they both know about it.
+// tests/fuzzing/branch_map_join.c asks this of if-branches.  A case is harder,
+// and used not to work at all: SymSan gave every case of a switch the switch's
+// own id, so a case could not be named.  A case is still not a block AFL++ has
+// any name for -- it numbers the edges out of the switch, not the values that
+// select them -- so the two are tied together by the one thing that identifies
+// a case in both worlds: the switch's id plus the case value, hashed by
+// symsan::switch_case_cid.  TaintPass writes an `S <switch cid> <value> <edge>`
+// line per case and the reader keys it the same way, so the backend can look up
+// "if this case were taken, which edge would that be" for a case it did not
+// take.
 //
-// The failure this guards against is silent in exactly the same way: a broken
-// join does not crash anything, it just means SymSan keeps solving cases the
-// fuzzer has already reached.  So the second half is the real test -- corrupt
-// *only* the lines carrying a case value and require the verdict to flip.  If
-// cases quietly stopped joining, the first run would still say "consistent"
-// and this run would too, and the test fails.
+// The failure this guards against is silent in exactly the same way as in the
+// if-branch test: a wrong target does not crash anything, it just means SymSan
+// keeps solving cases the fuzzer has already reached.  So the second half is
+// the real test -- corrupt *only* the lines carrying a case value and require
+// the verdict to flip.  If cases quietly stopped being keyed at all, the first
+// run would still say "consistent" and this run would too, and the test fails.
 //
 // REQUIRES: aflpp
 //
-// RUN: rm -f %t.map %t.wrong.map %t.ids
-// RUN: env SYMSAN_DOCUMENT_IDS=%t.ids KO_USE_FASTGEN=1 %ko-clang -g -o %t.symsan %s
-// RUN: env AFL_LLVM_DOCUMENT_IDS=%t.map %afl-clang-lto -g -o %t.afl %s
+// RUN: rm -f %t.bmap %t.wrong.bmap %t.afl.0.5.precodegen.bc
+// RUN: env AFL_LLVM_LTO_STARTID=4096 %afl-clang-lto -g -flto -fuse-ld=lld \
+// RUN:   -Wl,--save-temps=precodegen -o %t.afl %s
+// RUN: %taint-opt -taint-with-afl=1 -taint-branch-map=%t.bmap \
+// RUN:   %t.afl.0.5.precodegen.bc -o %t.taint.bc
+// RUN: llc -relocation-model=pic -filetype=obj %t.taint.bc -o %t.taint.o
+// RUN: env KO_USE_FASTGEN=1 %ko-clang -o %t.symsan %t.taint.o
 //
-// Both id tables have to describe all three cases before comparing them is
-// worth anything; a missing line on either side would make everything below
-// pass by describing nothing.  The switch itself is documented too, as the
-// thing that is deliberately *not* joinable.
-// RUN: FileCheck %s --check-prefix=IDS --input-file=%t.ids
-// IDS-DAG: kind=switch src=
-// IDS-DAG: kind=switch-case case=3735928559 src=
-// IDS-DAG: kind=switch-case case=305419896 src=
-// IDS-DAG: kind=switch-case case=7 src=
-//
-// RUN: FileCheck %s --check-prefix=MAP --input-file=%t.map
-// MAP-DAG: dir=1 case=3735928559 src=
-// MAP-DAG: dir=1 case=305419896 src=
-// MAP-DAG: dir=1 case=7 src=
+// The map has to describe all three cases before comparing anything is worth
+// doing; a missing line would make everything below pass by describing nothing.
+// The default is there too, under its own letter, as the direction that means
+// "no case matched".  Note that the two cases sharing a body still get distinct
+// edges: AFL++ splits the critical edge out of the switch per case value.
+// RUN: FileCheck %s --check-prefix=MAP --input-file=%t.bmap
+// MAP-DAG: S {{[0-9]+}} 3735928559 {{[0-9]+}}
+// MAP-DAG: S {{[0-9]+}} 305419896 {{[0-9]+}}
+// MAP-DAG: S {{[0-9]+}} 7 {{[0-9]+}}
+// MAP-DAG: D {{[0-9]+}} {{[0-9]+}}
 //
 // 0xdeadbeef little-endian, so the run below takes the first case: the trace
 // has a case it took, whose edge afl-showmap must confirm, and two it did not.
 // RUN: python -c"import sys; sys.stdout.buffer.write(bytes([0xef,0xbe,0xad,0xde]) + b'EFGH')" > %t.bin
 // RUN: %afl-showmap -o %t.showmap -- %t.afl %t.bin
-// RUN: %covcheck -m %t.map -c %t.showmap -i %t.bin -- %t.symsan @@ | FileCheck %s
+// RUN: %covcheck -m %t.bmap -c %t.showmap -i %t.bin -- %t.symsan @@ | FileCheck %s
 //
-// The two cases the trace did not take are unmapped, and stay that way by
-// design: "do not take this case" is not one edge but everywhere else the
-// switch could go.  Only dir=1 exists for a case, which is the direction worth
+// The two cases the trace did not take come back unmapped, and stay that way by
+// design: SymSan asks about the *negation* of the direction it took, and "do
+// not take this case" is not one edge but everywhere else the switch could go.
+// Only the true direction of a case has a target, which is the direction worth
 // asking about anyway.
+// CHECK: executed: 3
+// CHECK: checked: 1
 // CHECK: violations: 0
-// CHECK: ambiguous-violations: 0
 // CHECK: unmapped: 2
 // CHECK: verdict: consistent
 //
-// RUN: sed '/case=/s/edgeID=[0-9]*/edgeID=65535/' %t.map > %t.wrong.map
-// RUN: not %covcheck -m %t.wrong.map -c %t.showmap -i %t.bin -- %t.symsan @@ | FileCheck %s --check-prefix=WRONG
+// Only the case lines, pointed at edge 4096: in range, so the reader keeps it,
+// but one below where AFL++ started numbering and so an edge no run covers.
+// RUN: sed -E 's/^(S) ([0-9]+) ([0-9]+) .*/\1 \2 \3 4096/' %t.bmap > %t.wrong.bmap
+// RUN: not %covcheck -m %t.wrong.bmap -c %t.showmap -i %t.bin -- %t.symsan @@ | FileCheck %s --check-prefix=WRONG
 // WRONG: violations: 1
 // WRONG: verdict: INCONSISTENT
 

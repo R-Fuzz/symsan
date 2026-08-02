@@ -75,10 +75,10 @@ struct ConcolicConfig {
   /// exec'ing it again every run (SYMSAN_FORKSRV).  Only takes effect for file
   /// input against a backend that has a fork server; otherwise it is a no-op.
   bool forkserver = false;        // SYMSAN_FORKSRV
-  /// AFL++ AFL_LLVM_DOCUMENT_IDS output for the *fuzzer's* build of the same
-  /// target (SYMSAN_BRANCH_MAP).  Setting it lets the session skip branches the
-  /// fuzzer has already covered; see include/branch_map.h.  Empty means "no
-  /// map", and the session then only knows what it has seen itself.
+  /// TaintPass's -taint-branch-map output for this build of the target
+  /// (SYMSAN_BRANCH_MAP).  Setting it lets the session skip branches the fuzzer
+  /// has already covered; see include/branch_map.h.  Empty means "no map", and
+  /// the session then only knows what it has seen itself.
   std::string branch_map;
   /// Record which branch directions each trace takes, so that check_coverage()
   /// can hold the branch map against ground truth (SYMSAN_VALIDATE_COV).  Off

@@ -1,10 +1,9 @@
 // Offline check that SymSan and the fuzzer name the same branches.
 //
-// SymSan calls a branch by a hash of its source location; AFL++ calls an edge
-// by a sequential integer.  A BranchMap (patches/aflpp-document-ids.patch, then
-// include/branch_map.h) joins the two, and SharedMapCovManager uses the join to
-// skip branches the fuzzer already covered.  The mapped/unmapped counters say
-// how *much* of that join lands -- but a map that resolved every branch to the
+// A branch map (include/branch_map.h, written by TaintPass) says which of the
+// fuzzer's edges each side of each branch reaches, and SharedMapCovManager uses
+// it to skip branches the fuzzer already covered.  The mapped/unmapped counters
+// say how *much* of it lands -- but a map that resolved every branch to the
 // wrong edge would report a perfect ratio while silently suppressing every
 // solve.  Nothing in the fuzzing loop would notice; it would just find less.
 //
@@ -13,7 +12,7 @@
 // traces the same input through the SymSan build and checks that every branch
 // direction the trace took resolves to an edge afl-showmap saw.
 //
-// Usage: covcheck -m <branch.map> -c <showmap.out> -i <input> -- <target> [args]
+// Usage: covcheck -m <branch.bmap> -c <showmap.out> -i <input> -- <target> [args]
 //
 // Any target argument spelled @@ is replaced by the staged input path, exactly
 // as in AFL++; with no @@ the target reads the input on stdin.
@@ -39,9 +38,9 @@ namespace {
 
 void usage(const char *argv0) {
   fprintf(stderr,
-          "usage: %s -m <branch.map> -c <covered> -i <input> [-f <staged>] "
+          "usage: %s -m <branch.bmap> -c <covered> -i <input> [-f <staged>] "
           "[-d] -- <target> [args...]\n"
-          "  -m  AFL_LLVM_DOCUMENT_IDS output from the fuzzer's build\n"
+          "  -m  the target's branch map, from -taint-branch-map\n"
           "  -c  edge ids the fuzzer's build covered for this input\n"
           "      (afl-showmap's default '%%06u:%%u' output, or bare integers)\n"
           "  -i  the input to trace\n"
@@ -184,12 +183,11 @@ int main(int argc, char **argv) {
       printf("executed: %zu\n", r.executed);
       printf("checked: %zu\n", r.checked);
       printf("violations: %zu\n", r.violations);
-      printf("ambiguous: %zu\n", r.ambiguous);
-      printf("ambiguous-violations: %zu\n", r.ambiguous_violations);
+      printf("pruned: %zu\n", r.pruned);
       printf("unmapped: %zu\n", r.unmapped);
       // Say the verdict in one line as well, so a test can check for it
       // without having to know which counters are allowed to be non-zero.
-      bool consistent = r.violations == 0 && r.ambiguous_violations == 0;
+      bool consistent = r.violations == 0;
       printf("verdict: %s\n", consistent ? "consistent" : "INCONSISTENT");
       rc = consistent ? 0 : 1;
     }

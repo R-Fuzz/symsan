@@ -16,137 +16,45 @@
 //! that: the map overrules our own stale record, hit counts distinguish
 //! iterations, and an edge the fuzzer has already saturated still stops us.
 //!
-//! Needs a patched AFL++ (`patches/aflpp-document-ids.patch`); skips with an
-//! explanation when it cannot find one, so a checkout without AFL++ still gets
-//! a green `cargo test`. A file of its own for the usual reason: one
-//! [`Session`] per process, one process per test binary.
+//! Needs AFL++; skips with an explanation when it cannot find one, so a
+//! checkout without it still gets a green `cargo test`. A file of its own for
+//! the usual reason: one [`Session`] per process, one process per test binary.
+
+mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use symsan::{Config, Session};
 
-/// AFL++'s coverage map size, and therefore how long a snapshot we hand the
-/// session.
-const MAP_SIZE: usize = 65536;
+use common::MAP_SIZE;
 
 /// `tests/data/taint_loop.c` compares this many leading bytes, one per
 /// iteration of a single static branch, and never reads the rest.
 const LOOP_BYTES: usize = 8;
 const SEED_LEN: usize = 16;
 
+/// This test is about one static branch traversed eight times, not eight
+/// branches traversed once, so the loop must survive to the binary: at -O2 it
+/// is fully unrolled, and the increment becomes a `select` with no branch at
+/// all.  One flag does it for both arms now, because both arms come out of the
+/// same compile -- it used to need `-O0` on one side and `KO_DONT_OPTIMIZE` on
+/// the other, and nothing but care kept the two in step.
+const CFLAGS: &[&str] = &["-O0"];
+
 fn source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/taint_loop.c")
 }
 
-/// Where to find `afl-clang-lto`: `$AFL_PATH`, then the sibling checkout this
-/// repo is usually cloned next to, then `$PATH`.
-fn find_afl_clang_lto() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("AFL_PATH") {
-        let p = PathBuf::from(dir).join("afl-clang-lto");
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let sibling = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../aflpp/afl-clang-lto");
-    if sibling.is_file() {
-        return Some(sibling);
-    }
-    let out = Command::new("which").arg("afl-clang-lto").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let path = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
-    path.is_file().then_some(path)
-}
-
-/// Build the coverage target and its id map. `-g` is required: without debug
-/// locations there is nothing to join on. `-O0` for the same reason the SymSan
-/// build needs it -- the join is per static branch, and an unrolled loop is
-/// eight of them.
-fn build_afl_target(afl_clang_lto: &Path, out_dir: &Path) -> PathBuf {
-    let out = out_dir.join("taint_loop.afl");
-    let map = out_dir.join("taint_loop.map");
-    // AFL++ appends to the id file, so a leftover from an earlier run would
-    // still be in there claiming edge ids this binary never assigned.
-    let _ = std::fs::remove_file(&map);
-
-    let status = Command::new(afl_clang_lto)
-        .env("AFL_LLVM_DOCUMENT_IDS", &map)
-        .env("AFL_QUIET", "1")
-        .arg("-g")
-        .arg("-O0")
-        .arg(source())
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .expect("failed to run afl-clang-lto");
-    assert!(status.success(), "afl-clang-lto failed");
-
-    map
-}
-
-fn build_symsan_target(out_dir: &Path) -> PathBuf {
-    let out = out_dir.join("taint_loop.fg");
-    let ko_clang = Path::new(symsan::BUILD_DIR).join("bin/ko-clang");
-    assert!(
-        ko_clang.is_file(),
-        "{} is missing; run `cd b4 && make -j && make install` first",
-        ko_clang.display()
-    );
-
-    let status = Command::new(&ko_clang)
-        .env("KO_CC", "clang-18")
-        .env("KO_USE_FASTGEN", "1")
-        // ko-clang defaults to -O3, which unrolls the loop -- and this test is
-        // about one static branch traversed eight times, not eight branches
-        // traversed once. -O3 also turns the increment into a `select` and
-        // removes the branch entirely.
-        .env("KO_DONT_OPTIMIZE", "1")
-        .arg("-g")
-        .arg(source())
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .expect("failed to run ko-clang");
-    assert!(status.success(), "ko-clang failed");
-    out
-}
-
-fn scratch_dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../target/symsan-loop-coverage")
-        .join(format!("pid-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("failed to create the scratch dir");
-    dir
-}
-
 #[test]
 fn a_loop_branch_stays_solvable() {
-    let Some(afl_clang_lto) = find_afl_clang_lto() else {
-        eprintln!(
-            "skipping: no afl-clang-lto found (set AFL_PATH to an AFLplusplus \
-             checkout with patches/aflpp-document-ids.patch applied)"
-        );
+    let Some(afl_clang_lto) = common::find_afl_tool("afl-clang-lto") else {
+        eprintln!("skipping: no afl-clang-lto found (set AFL_PATH to an AFLplusplus checkout)");
         return;
     };
 
-    let dir = scratch_dir();
-    let map_path = build_afl_target(&afl_clang_lto, &dir);
-
-    let map_text = std::fs::read_to_string(&map_path).unwrap_or_default();
-    if !map_text.contains(" src=") {
-        eprintln!(
-            "skipping: {} has no src= fields, so {} is an unpatched AFL++ \
-             (apply patches/aflpp-document-ids.patch)",
-            map_path.display(),
-            afl_clang_lto.display()
-        );
-        std::fs::remove_dir_all(&dir).ok();
-        return;
-    }
-
-    let target = build_symsan_target(&dir);
+    let dir = common::scratch_dir("loop-coverage");
+    let built = common::build(&afl_clang_lto, &dir, &source(), "taint_loop", CFLAGS);
+    let (map_path, target) = (built.bmap, built.symsan);
     let input_file = dir.join("cur_input");
     let input_file = input_file.to_str().unwrap();
 

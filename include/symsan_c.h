@@ -235,11 +235,10 @@ typedef struct {
   uint8_t max_local_branch_counter;/**< default 128 */
   size_t max_input_size;           /**< default 1 MiB */
 
-  /** AFL++ AFL_LLVM_DOCUMENT_IDS output for the fuzzer's build of the same
-   *  target, or NULL.  Given one, the session can tell that a branch the fuzzer
-   *  already covered is not worth solving; feed it the coverage map with
-   *  symsan_session_set_coverage().  See include/branch_map.h and
-   *  patches/aflpp-document-ids.patch. */
+  /** TaintPass's -taint-branch-map output for this build of the target, or
+   *  NULL.  Given one, the session can tell that a branch the fuzzer already
+   *  covered is not worth solving; feed it the coverage map with
+   *  symsan_session_set_coverage().  See include/branch_map.h. */
   const char *branch_map;
 
   /** Keep one instance of the target alive and fork it per input, instead of
@@ -371,18 +370,18 @@ symsan_status_t symsan_session_set_coverage(symsan_session_t *s,
 typedef struct {
   /** distinct branch directions the last trace took */
   size_t executed;
-  /** of those, the ones the branch map resolved to exactly one edge id */
+  /** of those, the ones the branch map resolved to an edge id */
   size_t checked;
   /** of the checked ones, those whose edge the fuzzer's build did *not* record.
    *  Any non-zero value is a bug: either the map names the wrong edge, or the
    *  two builds took different paths on the same bytes. */
   size_t violations;
-  /** directions resolving to several edge ids, because the branch was inlined */
-  size_t ambiguous;
-  /** of those, the ones where *none* of the edge ids was recorded */
-  size_t ambiguous_violations;
+  /** directions AFL++ deliberately numbered no block behind, so there is no
+   *  edge to hold against ground truth.  Expected to be non-zero. */
+  size_t pruned;
   /** directions the branch map had nothing to say about.  Expected to be
-   *  non-zero -- AFL++ prunes blocks -- and merely costs opportunities. */
+   *  non-zero -- a switch case has no false side, and code AFL++ never
+   *  instrumented has no edges at all -- and merely costs opportunities. */
   size_t unmapped;
 } symsan_join_report_t;
 

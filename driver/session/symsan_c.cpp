@@ -533,8 +533,7 @@ symsan_status_t symsan_session_check_coverage(const symsan_session_t *s,
     out->executed = r.executed;
     out->checked = r.checked;
     out->violations = r.violations;
-    out->ambiguous = r.ambiguous;
-    out->ambiguous_violations = r.ambiguous_violations;
+    out->pruned = r.pruned;
     out->unmapped = r.unmapped;
     return SYMSAN_OK;
   });

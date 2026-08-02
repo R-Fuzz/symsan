@@ -497,12 +497,11 @@ impl Config {
 
     /// Share a branch namespace with the fuzzer.
     ///
-    /// `path` is the file a patched AFL++ writes when `AFL_LLVM_DOCUMENT_IDS`
-    /// is set while building the *fuzzer's* copy of the target (see
-    /// `patches/aflpp-document-ids.patch`).  It says which AFL++ edge id each
-    /// source-level branch direction corresponds to, which is what lets
-    /// [`Session::set_coverage`] tell the session that a branch has already
-    /// been covered and is not worth solving for again.
+    /// `path` is the file TaintPass writes when `-taint-branch-map=<file>` is
+    /// set while instrumenting the target.  It says which AFL++ edge each side
+    /// of each branch reaches, which is what lets [`Session::set_coverage`]
+    /// tell the session that a branch has already been covered and is not
+    /// worth solving for again.
     ///
     /// Without this, the session only knows what it has seen itself, so every
     /// freshly started session re-solves branches the fuzzer covered long ago.
@@ -649,26 +648,23 @@ pub struct Stats {
 pub struct JoinReport {
     /// Distinct branch directions the last trace took.
     pub executed: usize,
-    /// Of those, the ones the branch map resolved to exactly one edge id.
+    /// Of those, the ones the branch map resolved to an edge id.
     pub checked: usize,
     /// Of the checked ones, those whose edge the fuzzer's build did *not*
     /// record.  Any non-zero value is a bug.
     pub violations: usize,
-    /// Directions resolving to several edge ids, because the branch was
-    /// inlined.  A run takes one of the copies, so these can only be checked
-    /// as "at least one covered".
-    pub ambiguous: usize,
-    /// Of the ambiguous ones, those where *none* of the edge ids was recorded.
-    pub ambiguous_violations: usize,
+    /// Directions AFL++ deliberately numbered no block behind, so there is no
+    /// edge to hold against ground truth.  Expected to be non-zero.
+    pub pruned: usize,
     /// Directions the map had nothing to say about.  Expected to be non-zero
-    /// -- AFL++ prunes blocks -- and merely costs opportunities.
+    /// -- a switch case has no false side -- and merely costs opportunities.
     pub unmapped: usize,
 }
 
 impl JoinReport {
     /// True when nothing contradicted the map.
     pub fn is_consistent(&self) -> bool {
-        self.violations == 0 && self.ambiguous_violations == 0
+        self.violations == 0
     }
 }
 
@@ -900,8 +896,7 @@ impl Session {
             executed: 0,
             checked: 0,
             violations: 0,
-            ambiguous: 0,
-            ambiguous_violations: 0,
+            pruned: 0,
             unmapped: 0,
         };
         // SAFETY: valid handle, valid slice for the duration of the call, and a
@@ -918,8 +913,7 @@ impl Session {
             executed: raw.executed,
             checked: raw.checked,
             violations: raw.violations,
-            ambiguous: raw.ambiguous,
-            ambiguous_violations: raw.ambiguous_violations,
+            pruned: raw.pruned,
             unmapped: raw.unmapped,
         })
     }

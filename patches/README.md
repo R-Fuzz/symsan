@@ -19,10 +19,9 @@ make -f GNUmakefile.llvm ./SanitizerCoverageLTO.so
 ModuleID=<n> Function=<name> edgeID=<n>
 ```
 
-Function granularity is not enough to join against anything. The patch appends
-the source location of the branch the edge comes out of, so a second toolchain
-that names branches by location — SymSan does; see `include/branch_id.h` — can
-build a `branch id -> edge id` table and share coverage with the fuzzer:
+Function granularity is not enough to say anything about a particular branch.
+The patch appends the source location of the branch the edge comes out of, so a
+second toolchain can say which branch an edge id belongs to:
 
 ```
 ModuleID=<n> Function=<name> edgeID=<n> dir=<0|1> src=<file>:<line>:<col>
@@ -42,6 +41,21 @@ ModuleID=<n> Function=<name> edgeID=<n> dir=1 case=<value> src=<switch's locatio
 consumer's own instrumentation sees, so both sides normalise the same way. It is
 always `dir=1`: "take this case" is this block, while "do not take it" is
 everywhere else the switch could go and is not one edge at all.
+
+### What SymSan uses it for
+
+Not for sharing coverage — that no longer needs a patch. SymSan's own branch
+ids *are* AFL++'s edge ids now: both binaries are derived from a single
+`afl-clang-lto` link via `-Wl,--save-temps=precodegen`, and TaintPass reads the
+id AFL++ baked into the module rather than hashing a source location. See
+`include/branch_map.h` and `bindings/rust/README.md`.
+
+What is left is the check. Sharing the module makes the two arms agree by
+construction, so the interesting question is whether the `(branch, direction)
+-> edge` map TaintPass writes alongside is *correct* — and this file is the only
+independent statement of which branch AFL++ thinks each edge came from.
+Deleting the patch would delete the cross-check, which is the wrong direction
+for a change whose failure mode is silent.
 
 Fields are only appended for blocks that are one side of a conditional branch or
 the destination of a case, so existing consumers see unchanged lines everywhere
@@ -78,11 +92,11 @@ is where a coverage-sharing consumer most needs an answer.
 SymSan has the mirror image of this: `SYMSAN_DOCUMENT_IDS=<file>` makes its
 instrumentation append the same shape of line for each branch *it* names,
 `cid=` in place of `edgeID=` plus a `kind=` saying `br`, `switch`, `switch-case`
-or `select`. Diffing the `src=` columns of the two files says whether the two
-toolchains agree, without running anything — and separates "the two clangs
-disagree" (same location, different column) from "AFL++ pruned it" (a location
-only SymSan emits). `b4/bin/covcheck` is the dynamic version, against `afl-showmap` as
-ground truth; see the SymSan tree's `bindings/rust/README.md`.
+or `select`. On a shared-namespace build the `cid=` values are edge ids, so the
+two files line up directly: every target in the `.bmap` should appear here under
+the branch its source location names. `b4/bin/covcheck` is the dynamic version,
+against `afl-showmap` as ground truth; see the SymSan tree's
+`bindings/rust/README.md`.
 
 Note both files are *appended* to, so remove them before a rebuild.
 
@@ -93,9 +107,6 @@ Note both files are *appended* to, so remove them before a rebuild.
   `__sanitizer_cov_trace_pc_guard_init`, so no file written at link time can
   describe them.
 - **Needs `-g`.** Without debug info there is no location to emit.
-- **Both builds want the same clang major version.** Column numbers are the
-  fragile part of the key; a mismatch shows up as a low join rate rather than
-  as an error.
 - **Pruned blocks have no id.** `shouldInstrumentBlock()` drops blocks that
   dominate all their successors, so some branch directions are simply absent
   from the file — typically the side that leads into a nested branch. The

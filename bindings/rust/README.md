@@ -159,50 +159,70 @@ stumble into it.
 ## Sharing coverage with the fuzzer (`--branch-map`)
 
 By default the stage only knows what *it* has traced, so it happily spends
-solver time on branches the fuzzer covered an hour ago. The two sides name
-branches differently — SymSan by source location, AFL++ by a sequential edge id
-— so neither can read the other's knowledge.
+solver time on branches the fuzzer covered an hour ago. To read the fuzzer's
+knowledge it has to name branches the way the fuzzer does.
 
-`--branch-map` closes that. A patched AFL++ (`patches/aflpp-document-ids.patch`,
-recipe in `patches/README.md`) makes `AFL_LLVM_DOCUMENT_IDS` emit the source
-location each edge id came from, which is enough to join the two namespaces:
+`--branch-map` closes that, and the two sides no longer have separate names to
+reconcile: both binaries come out of **one** `afl-clang-lto` link.
+`-Wl,--save-temps=precodegen` makes lld write the merged module out as it stands
+after AFL++'s LTO pass has numbered the edges; running SymSan's TaintPass over
+*that* module makes a SymSan branch id literally be one of AFL++'s edge ids. The
+same pass writes the `.bmap` — which edge each side of each branch reaches —
+which is the part `--branch-map` reads.
 
 ```bash
-# build the coverage target with LTO, debug info, and the id dump
-AFL_LLVM_DOCUMENT_IDS=$PWD/branch.map \
-    <aflpp>/afl-clang-lto -g -o target.afl target.c
+L=<symsan>/b4/lib/symsan
 
-KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -o target.symsan target.c
+# one link: the coverage binary *and* target.afl.0.5.precodegen.bc
+AFL_LLVM_LTO_STARTID=4096 <aflpp>/afl-clang-lto \
+    -g -flto -fuse-ld=lld -Wl,--save-temps=precodegen -o target.afl target.c
+
+# the same module again, taint-instrumented, with the branch map beside it
+opt-18 -load-pass-plugin=$L/TaintPass.so -passes=taint \
+    -taint-abilist=$L/dfsan_abilist.txt -taint-abilist=$L/zlib_abilist.txt \
+    -taint-with-afl=1 -taint-branch-map=$PWD/target.bmap \
+    target.afl.0.5.precodegen.bc -o target.taint.bc
+llc-18 -relocation-model=pic -filetype=obj target.taint.bc -o target.taint.o
+KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -o target.symsan target.taint.o
 
 ./target/release/symsan-fuzz -i ./seeds -o ./out \
-    --symsan ./target.symsan --branch-map ./branch.map -- ./target.afl @@
+    --symsan ./target.symsan --branch-map ./target.bmap -- ./target.afl @@
 ```
 
+`AFL_LLVM_LTO_STARTID=4096` is `symsan::AFL_ID_BASE`: it holds the bottom of the
+numbering back for the branch ids SymSan's runtime makes up for itself (bounds
+checks, UB checks), so `cid < 4096` is a complete test for "not an edge".
+`-taint-with-afl=1` *requires* the module to be AFL++-instrumented, so a pipeline
+that quietly stops producing one fails at build time instead of shipping ids the
+fuzzer cannot look up.
+
 The stage then reads `MaxMapFeedback`'s history map before each trace and hands
-it to the session, which treats a branch direction whose edge ids are all
-already covered as not worth solving.
+it to the session, which treats a branch direction whose target edge is already
+covered as not worth solving.
 
 Where the map has nothing to say the behaviour is exactly what it was without
 it, so a partial map costs opportunities, not correctness — a solution the
 solver does produce is as valid as before. (A map left over from a *different*
 build is the one case worth avoiding: it can point a branch at some other
 branch's edge id and make the stage skip work it should have done. Regenerate
-the map whenever you rebuild the target.) Three things make a correct map
-partial, all of them expected:
+the map whenever you rebuild the target.) Three things leave a direction
+unresolved, all of them expected:
 
-- **AFL++ prunes blocks** that dominate all their successors, so those branch
-  directions have no edge id at all. There is no way to turn this off through
-  `ld.lld`; see `patches/README.md`.
-- **A switch case joins in one direction only.** Each case has its own id on
-  both sides (the switch's location plus the case value), but only "take this
-  case" is an edge; "go anywhere but this case" is not, and stays unmapped. The
-  `default:` destination is never mapped either. That is the direction worth
-  having: the stage asks whether the branch it did *not* take is worth solving,
-  which for a case it skipped is "would taking it be interesting?".
-- **`select` is not covered.** AFL++ allocates edge ids for both arms but does
-  not export them, so the map has nothing to join against.
-- **The two clangs must agree on column numbers**, which in practice means the
-  same major version. They currently both use LLVM 18.
+- **AFL++ prunes blocks** that dominate all their successors, or post-dominate
+  them with more than one predecessor, so those directions have no edge id at
+  all. The map records them explicitly, as `-1`, rather than omitting them. That
+  is not the same as "never interesting": a pruned full dominator is exactly the
+  true side of an `if` guarding nested work, and reaching what is behind it *is*
+  new coverage. What the map cannot do is name it with one edge, so the stage
+  falls back to its own history there.
+- **A switch case has a target in one direction only.** Only "take this case" is
+  an edge; "go anywhere but this case" is not one edge but everywhere else the
+  switch could go. That is the direction worth having anyway: the stage asks
+  whether the branch it did *not* take is worth solving, which for a case it
+  skipped is "would taking it be interesting?".
+- **Code AFL++ never instrumented** — a separately linked instrumented archive,
+  `libc++.a` being the one every C++ target pulls in — has no edge ids to give,
+  and those branches are not traced at all.
 
 `Stats::mapped_branches` and `Stats::unmapped_branches` are the split, and the
 honest way to check whether any of this is working on your target:
@@ -213,34 +233,33 @@ using the library directly: `Config::branch_map` and `Session::set_coverage` are
 both optional, and `set_coverage` on a session with no map is an error rather
 than a silent no-op.
 
-### Checking that the two sides really do agree
+### Checking that the map really does point at the right edges
 
-`mapped_branches` only says how *much* of the join lands. It cannot say whether
-the join is *right*, and that is the failure that costs bugs: a map that
+`mapped_branches` only says how *much* of the map lands. It cannot say whether
+the targets are *right*, and that is the failure that costs bugs: a map that
 resolved every branch to some other branch's edge id reports a perfect ratio
 while telling the stage that everything is already covered. Nothing errors out.
 The fuzzer just quietly finds less.
 
 Three checks, cheapest first.
 
-**1. Compare the two id tables, without running anything.** SymSan has its own
-counterpart to `AFL_LLVM_DOCUMENT_IDS`: set `SYMSAN_DOCUMENT_IDS` and the
-instrumentation appends a `cid=`/`src=` line per branch it instruments, in the
-same shape AFL++ uses.
+**1. Compare the map against AFL++'s own id listing, without running anything.**
+A patched AFL++ (`patches/aflpp-document-ids.patch`, recipe in
+`patches/README.md`) makes `AFL_LLVM_DOCUMENT_IDS` write one line per edge it
+numbered, with the source location and direction it came from. Set it on the
+link above and every `C`/`X`/`S` target in the `.bmap` should appear there,
+under the branch you would expect:
 
 ```bash
-SYMSAN_DOCUMENT_IDS=$PWD/symsan.ids \
-    KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -g -o target.symsan target.c
+AFL_LLVM_LTO_STARTID=4096 AFL_LLVM_DOCUMENT_IDS=$PWD/target.docids \
+    <aflpp>/afl-clang-lto -g -flto -fuse-ld=lld \
+    -Wl,--save-temps=precodegen -o target.afl target.c
 ```
 
-Both files are appended to, so delete them before a rebuild. Comparing the
-`src=` columns of the two answers the question no ratio can: a location both
-sides emit but with *different* columns means the two clangs disagree and the
-join is dead, while a location only SymSan emits is AFL++ having pruned the
-block, which is expected. A `kind=switch` line never joins — only its cases
-are edges, and those come out as `kind=switch-case` lines carrying their case
-value — and neither does `kind=select`; see the limits above. They are labelled
-rather than left to look like breakage.
+The file is appended to, so delete it before a rebuild. Sharing the module makes
+agreement structural rather than something to be measured — which is exactly
+what makes a disagreement here worth chasing: it is a bug in the map, not a
+build that drifted.
 
 **2. Check one input against `afl-showmap`.** `b4/bin/covcheck` traces an input
 through the SymSan build and checks every branch direction it took against the
@@ -248,14 +267,15 @@ edges the fuzzer's build recorded for the same bytes:
 
 ```bash
 <aflpp>/afl-showmap -o showmap.out -- ./target.afl input
-<symsan>/b4/bin/covcheck -m branch.map -c showmap.out -i input -- ./target.symsan @@
+<symsan>/b4/bin/covcheck -m target.bmap -c showmap.out -i input -- ./target.symsan @@
 ```
 
-It exits non-zero on a contradiction. `tests/fuzzing/branch_map_join.c` in the SymSan
-tree is this run as a lit test, including the negative half — the same run with
-a deliberately wrong map has to come out `INCONSISTENT`, or a vacuous check
-would look identical to a passing one. `tests/fuzzing/branch_map_switch.c` is the same
-for switch cases, corrupting only the lines that carry a `case=`.
+It exits non-zero on a contradiction. `tests/fuzzing/branch_map_join.c` in the
+SymSan tree is this run as a lit test, including the negative half — the same
+run with a deliberately wrong map has to come out `INCONSISTENT`, or a vacuous
+check would look identical to a passing one.
+`tests/fuzzing/branch_map_switch.c` is the same for switch cases, corrupting
+only the `S` lines.
 
 **3. Audit every entry during a real run.** `--validate-branch-map` (or
 `SymSanStageBuilder::validate_coverage`) does the same comparison on each traced
