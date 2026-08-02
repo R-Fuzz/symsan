@@ -694,6 +694,14 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
     return forksrv_read_event(buf, size, timeout);
   }
 
+  // The run this call belongs to is already over: the block below closed the
+  // pipe and cleared the pid when the last read came up short.  Say so now,
+  // before select() gets an fd of -1 to FD_SET and the timeout path gets a pid
+  // of -1 to kill -- and kill(-1) is every process this uid owns.
+  if (g_config.pipefds[0] < 0) {
+    return 0;
+  }
+
   int ret = 1;
 
   if (timeout) {
@@ -714,16 +722,22 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
     n = read(g_config.pipefds[0], buf, size);
   } else {
     // time out or error on select
-    kill(g_config.symsan_pid, SIGKILL);
+    if (g_config.symsan_pid > 0) {
+      kill(g_config.symsan_pid, SIGKILL);
+    }
     g_config.is_killed = 1;
   }
 
   if (n != size) {
     // error or EOF
-    waitpid(g_config.symsan_pid, &g_config.exit_status, 0);
-    g_config.symsan_pid = -1;
-    close(g_config.pipefds[0]); // close the read fd
-    g_config.pipefds[0] = -1;
+    if (g_config.symsan_pid > 0) {
+      waitpid(g_config.symsan_pid, &g_config.exit_status, 0);
+      g_config.symsan_pid = -1;
+    }
+    if (g_config.pipefds[0] >= 0) {
+      close(g_config.pipefds[0]); // close the read fd
+      g_config.pipefds[0] = -1;
+    }
   }
 
   return n;
