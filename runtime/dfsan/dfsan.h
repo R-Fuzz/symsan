@@ -120,6 +120,13 @@ void taint_set_socket(const void *addr, unsigned addrlen, int fd);
 off_t taint_get_socket(int fd);
 void taint_update_socket_offset(int fd, size_t size);
 void taint_close_socket(int fd);
+
+// AFL++ coverage map, for a binary carrying AFL++'s edge counters; afl_compat.cpp.
+// Unlike InitializeSymSanSolver/InitializeSymSanForkServer this is not a weak
+// hook a backend may or may not fill in -- it lives in the same archive as its
+// caller and decides at run time whether it applies, because --whole-archive
+// links the object either way.
+void InitializeAflCoverage(void);
 }  // extern "C"
 
 template <typename T>

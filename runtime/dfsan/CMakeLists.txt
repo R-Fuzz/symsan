@@ -5,6 +5,7 @@ set(SYMSAN_RTL_SOURCES
   dfsan.cpp
   dfsan_custom.cpp
   dfsan_interceptors.cpp
+  afl_compat.cpp
   taint_allocator.cpp
   union_util.cpp
   union_hashtable.cpp)

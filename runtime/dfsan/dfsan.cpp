@@ -2015,6 +2015,14 @@ static void dfsan_init(int argc, char **argv, char **envp) {
 
   InitializeInterceptors();
 
+  // Attach AFL++'s coverage map, if this binary carries AFL++'s edge counters
+  // (see afl_compat.cpp; a no-op when it does not).  Above the fork point along
+  // with everything else that is input-independent -- the map is shared memory
+  // the fuzzer owns for the whole campaign, not something staged per run, so
+  // attaching once and letting every child inherit the mapping is both cheaper
+  // and the only way the counts reach the fuzzer at all.
+  InitializeAflCoverage();
+
   // The fork server, if one was asked for, has to sit exactly here.  Everything
   // above is input-independent -- the shadow and union mappings, the hashtable
   // allocator, the interceptors -- and is what we want to pay for once and

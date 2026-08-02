@@ -732,3 +732,14 @@ fun:assume_cond=uninstrumented
 fun:LLVMFuzzerTestOneInput=uninstrumented
 fun:__afl_manual_init=uninstrumented
 fun:__afl_manual_init=discard
+
+# AFL++'s own runtime, generalising the __afl_manual_init pair above to the
+# whole namespace.  A post-LTO build has some of it inside the very module
+# TaintPass runs over -- AFL++'s pass appends __afl_auto_init_globals as a
+# constructor whenever the autodictionary found anything -- and the rest arrives
+# as declarations.  Neither can carry taint: they move AFL++'s own bookkeeping
+# between globals the program never reads.  Marking the namespace rather than
+# each symbol means a future __afl_ entry point is covered the day AFL++ adds
+# it, instead of the day someone notices it was renamed.
+fun:__afl_*=uninstrumented
+fun:__afl_*=discard
