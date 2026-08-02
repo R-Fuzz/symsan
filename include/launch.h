@@ -63,6 +63,42 @@ int symsan_set_force_stdin(int enable);
 /// wired up per run, which cannot be done from outside a running process.
 int symsan_set_forkserver(int enable);
 
+/// @brief size the AFL++-compatible coverage map handed to the target
+///
+/// The target's edge counters -- present when it was built the two-stage way,
+/// see instrumentation/TaintPass.cpp and runtime/dfsan/afl_compat.cpp -- write
+/// into a shared segment the launcher owns and passes down as __AFL_SHM_ID.
+/// This says how big it has to be; the answer is the target's edge count, which
+/// TaintPass records in the `edges=` header of the branch map it writes.
+///
+/// Optional.  Left unsaid, the map is created at AFL++'s own MAP_SIZE on the
+/// first symsan_run(), and a target needing more than that refuses to start
+/// with a message naming the size it wanted.  Sizes below that minimum are
+/// rounded up, and a request no larger than the current map is a no-op, so this
+/// is safe to call repeatedly.
+///
+/// Must be called before the first symsan_run() when the fork server is in use:
+/// the server attaches once, ahead of forking anything, and cannot be moved to
+/// a new segment afterwards.  Growing the map after that point returns
+/// SYMSAN_INVALID_ARGS rather than quietly leaving the children writing
+/// somewhere nobody reads.
+///
+/// @param edges: bytes of counter space needed, or 0 for the default
+/// @return success or error code
+int symsan_set_cov_map_size(size_t edges);
+
+/// @brief the coverage map, holding the edge counts of the run just finished
+///
+/// Zeroed by each symsan_run(), so between a run and the next one this is that
+/// run's coverage alone -- real AFL++ counters, including edges reached with
+/// untainted conditions, which the backend's own address bookkeeping never saw.
+/// Counts are raw, not bucketed; a consumer comparing against a fuzzer's map
+/// applies AFL's count classes itself.
+///
+/// @param size: out, size of the map in bytes; may be NULL
+/// @return base of the map, or NULL before the first symsan_run()
+uint8_t *symsan_get_cov_map(size_t *size);
+
 /// @brief run the target binary with the input file descriptor
 /// @param fd: input file descriptor, only used if input is "stdin"
 /// @return < 0 on syscall error, > 0 on setup error, 0 on success

@@ -55,6 +55,15 @@ struct symsan_config {
 
   int dev_null_fd;
 
+  // AFL++-compatible coverage map: the segment the target's edge counters write
+  // into, handed over as __AFL_SHM_ID and read back by the caller after a run.
+  // SysV rather than POSIX shm, unlike the union table above, because the
+  // attaching end is runtime/dfsan/afl_compat.cpp speaking AFL++'s ABI, and that
+  // ABI is an integer id in an environment variable.
+  int cov_shm_id;
+  uint8_t *cov_map;
+  size_t cov_map_size;
+
   int exit_status;
   int is_killed;
 
@@ -102,6 +111,9 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   g_config.trace_file_size = 0;
   g_config.force_stdin = 0;
   g_config.dev_null_fd = -1;
+  g_config.cov_shm_id = -1;
+  g_config.cov_map = NULL;
+  g_config.cov_map_size = 0;
   g_config.exit_status = 0;
   g_config.is_killed = 0;
   g_config.forksrv_requested = 0;
@@ -262,6 +274,88 @@ static int read_exact(int fd, void *buf, size_t n) {
   return 0;
 }
 
+/* AFL++'s MAP_SIZE (include/config.h), which is both the smallest map it will
+   work with and what runtime/dfsan/afl_compat.cpp falls back to when nobody has
+   said otherwise.  Keeping the two the same means a target built without the
+   AFL++ pass -- __afl_final_loc == 0, so it never attaches at all -- and one
+   built with it agree about how big "unspecified" is. */
+#define SYMSAN_DEFAULT_COV_MAP_SIZE (1U << 16)
+
+/* Drop the coverage segment.
+
+   IPC_RMID rather than merely detaching, and here rather than right after
+   shmget(): the target attaches by id, once per exec'd child or once per fork
+   server, so the id has to stay resolvable for as long as we might start
+   another one.  The cost is that a launcher killed outright leaks the segment,
+   which is a real failure mode -- symsan-fuzz accumulating segments until
+   shmget() starts returning ENOSPC is a debugging session nobody should repeat
+   -- so anything embedding this should reap on the way out.  `ipcs -m` lists
+   them; the owner is whoever ran the launcher. */
+static void cov_map_destroy(void) {
+  if (g_config.cov_map != NULL) {
+    shmdt(g_config.cov_map);
+    g_config.cov_map = NULL;
+  }
+  if (g_config.cov_shm_id != -1) {
+    shmctl(g_config.cov_shm_id, IPC_RMID, NULL);
+    g_config.cov_shm_id = -1;
+  }
+  g_config.cov_map_size = 0;
+}
+
+/* Make a coverage segment of at least `size` bytes, replacing any existing one
+   that is too small.  Returns 0 on success. */
+static int cov_map_create(size_t size) {
+  if (size == 0) {
+    size = SYMSAN_DEFAULT_COV_MAP_SIZE;
+  }
+  /* A map smaller than AFL++'s minimum is not worth the special cases: the
+     target's own size check compares against __afl_final_loc, which the pass
+     rounds up, and every consumer of the map assumes it can be indexed by any
+     edge id the binary holds. */
+  if (size < SYMSAN_DEFAULT_COV_MAP_SIZE) {
+    size = SYMSAN_DEFAULT_COV_MAP_SIZE;
+  }
+  if (g_config.cov_map != NULL && g_config.cov_map_size >= size) {
+    return 0; // the one we have already covers it
+  }
+
+  cov_map_destroy();
+
+  int id = shmget(IPC_PRIVATE, size, IPC_CREAT | IPC_EXCL | 0600);
+  if (id < 0) {
+    return -1;
+  }
+  void *base = shmat(id, NULL, 0);
+  if (base == (void *)-1) {
+    shmctl(id, IPC_RMID, NULL);
+    return -1;
+  }
+
+  g_config.cov_shm_id = id;
+  g_config.cov_map = (uint8_t *)base;
+  g_config.cov_map_size = size;
+  memset(g_config.cov_map, 0, size);
+  return 0;
+}
+
+/* Hand the segment to the child we are about to exec.
+
+   Overwrite, emphatically: symsan-fuzz publishes __AFL_SHM_ID into its own
+   environment for its own map, and every child inherits that value.  Passing 0
+   for the overwrite flag would leave it in place and the traced process would
+   count its edges into the map the fuzzer reads its coverage out of --
+   corrupting the fuzzer's picture of the target with the concolic executor's
+   footprints, silently and in the direction that looks like progress. */
+static void cov_map_export(void) {
+  if (g_config.cov_shm_id == -1) {
+    return;
+  }
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%d", g_config.cov_shm_id);
+  setenv("__AFL_SHM_ID", buf, 1);
+}
+
 /* Build the TAINT_OPTIONS string for the child.  Its own function because the
    fork server fallback has to build it a second time with forksrv turned back
    off. */
@@ -319,6 +413,11 @@ static int forksrv_spawn(void) {
     close(st[0]); close(st[1]);
 
     setenv("TAINT_OPTIONS", (char*)g_config.symsan_env, 1);
+    // The fork server attaches once, in dfsan_init, ahead of the fork point, so
+    // every child it goes on to make shares this one segment.  That is what we
+    // want -- the launcher zeroes it per run -- but it does mean the size is
+    // fixed here and symsan_set_cov_map_size() cannot move it afterwards.
+    cov_map_export();
     unsetenv("LD_PRELOAD"); // don't preload anything
     if (!g_config.enable_debug) {
       close(1);
@@ -547,6 +646,28 @@ static void forksrv_shutdown(void) {
 }
 
 __attribute__((visibility("default")))
+int symsan_set_cov_map_size(size_t edges) {
+  // Growing the map under a running fork server would be a lie: the server
+  // attached to the old segment before it forked anything and cannot be told
+  // about a new one, so every child would keep writing where we are no longer
+  // looking.  Refuse instead, which turns a silently empty map into an error at
+  // the call that caused it.
+  if (g_config.forksrv_active && g_config.cov_map != NULL &&
+      edges > g_config.cov_map_size) {
+    return SYMSAN_INVALID_ARGS;
+  }
+  return cov_map_create(edges) == 0 ? 0 : SYMSAN_NO_MEMORY;
+}
+
+__attribute__((visibility("default")))
+uint8_t *symsan_get_cov_map(size_t *size) {
+  if (size != NULL) {
+    *size = g_config.cov_map_size;
+  }
+  return g_config.cov_map;
+}
+
+__attribute__((visibility("default")))
 int symsan_run(int fd) {
   if (fd < 0) {
     return SYMSAN_INVALID_ARGS;
@@ -566,6 +687,23 @@ int symsan_run(int fd) {
 
   if (g_config.is_input_network && !g_config.input_file) {
     return SYMSAN_MISSING_INPUT;
+  }
+
+  // Coverage is per run, so the map is zeroed here rather than anywhere the
+  // caller has to remember.  Both paths below come through this point exactly
+  // once per traced input -- the fork server returns just underneath, the exec
+  // path falls through -- which is the property that makes one memset enough.
+  //
+  // Created lazily and at the default size if the caller never sized it: a
+  // target whose edge ids overflow that will refuse to start with a message
+  // saying so (afl_compat.cpp's AttachCoverageMap), which is a better failure
+  // than a launcher that insists on knowing the edge count up front.
+  if (g_config.cov_map == NULL) {
+    if (cov_map_create(0) != 0) {
+      return SYMSAN_NO_MEMORY;
+    }
+  } else {
+    memset(g_config.cov_map, 0, g_config.cov_map_size);
   }
 
   // Fork server already up: everything below has been done once already, and
@@ -654,6 +792,7 @@ int symsan_run(int fd) {
 
     close(g_config.pipefds[0]); // close the read fd
     setenv("TAINT_OPTIONS", (char*)g_config.symsan_env, 1);
+    cov_map_export();
     unsetenv("LD_PRELOAD"); // don't preload anything
     if (g_config.is_input_sdtin) {
       close(0);
@@ -801,6 +940,10 @@ void symsan_destroy() {
     close(g_config.dev_null_fd);
     g_config.dev_null_fd = -1;
   }
+
+  // After forksrv_shutdown() above, so that nothing is still attached to the
+  // segment when it goes.
+  cov_map_destroy();
 
   if (g_config.shm_fd != -1) {
     close(g_config.shm_fd);
