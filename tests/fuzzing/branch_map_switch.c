@@ -20,8 +20,9 @@
 //
 // REQUIRES: aflpp
 //
-// RUN: rm -f %t.bmap %t.wrong.bmap %t.afl.0.5.precodegen.bc
-// RUN: env AFL_LLVM_LTO_STARTID=4096 %afl-clang-lto -g -flto -fuse-ld=lld \
+// RUN: rm -f %t.bmap %t.wrong.bmap %t.docids %t.afl.0.5.precodegen.bc
+// RUN: env AFL_LLVM_LTO_STARTID=4096 AFL_LLVM_DOCUMENT_IDS=%t.docids \
+// RUN:   %afl-clang-lto -g -flto -fuse-ld=lld \
 // RUN:   -Wl,--save-temps=precodegen -o %t.afl %s
 // RUN: %taint-opt -taint-with-afl=1 -taint-branch-map=%t.bmap \
 // RUN:   %t.afl.0.5.precodegen.bc -o %t.taint.bc
@@ -38,6 +39,14 @@
 // MAP-DAG: S {{[0-9]+}} 305419896 {{[0-9]+}}
 // MAP-DAG: S {{[0-9]+}} 7 {{[0-9]+}}
 // MAP-DAG: D {{[0-9]+}} {{[0-9]+}}
+//
+// AFL++ documents a case as `edgeID=N dir=1 case=V`, so which edge each case
+// value leads to can be checked against the compiler directly and not only
+// through a run.  That matters more here than for an if-branch: the run below
+// exercises one of the three cases, and the other two are pinned by nothing
+// else.  (The default is a bare `edgeID=`, with no dir= or case= to check it
+// against; it gets no more than the range check.)
+// RUN: python %S/bmap_vs_docids.py %t.bmap %t.docids
 //
 // 0xdeadbeef little-endian, so the run below takes the first case: the trace
 // has a case it took, whose edge afl-showmap must confirm, and two it did not.

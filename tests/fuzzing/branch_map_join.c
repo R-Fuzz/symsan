@@ -25,8 +25,9 @@
 // the merged module as it stands after AFL++'s LTO pass has numbered its edges.
 // AFL_LLVM_LTO_STARTID is symsan::AFL_ID_BASE (include/branch_id.h), which holds
 // the bottom of the numbering back for SymSan's own non-edge branch ids.
-// RUN: rm -f %t.bmap %t.wrong.bmap %t.afl.0.5.precodegen.bc
-// RUN: env AFL_LLVM_LTO_STARTID=4096 %afl-clang-lto -g -flto -fuse-ld=lld \
+// RUN: rm -f %t.bmap %t.wrong.bmap %t.docids %t.afl.0.5.precodegen.bc
+// RUN: env AFL_LLVM_LTO_STARTID=4096 AFL_LLVM_DOCUMENT_IDS=%t.docids \
+// RUN:   %afl-clang-lto -g -flto -fuse-ld=lld \
 // RUN:   -Wl,--save-temps=precodegen -o %t.afl %s
 //
 // The same module again, taint-instrumented, lowered, and linked by the real
@@ -44,6 +45,14 @@
 // MAP-DAG: # symsan branch map v1 base=4096 edges=
 // MAP-DAG: C {{[0-9]+}} {{[0-9]+}} {{[0-9]+}}
 // MAP-DAG: C {{[0-9]+}} {{[0-9]+}} -1
+//
+// And the ids themselves against what AFL++ recorded for the same link: every
+// direction in the map is one AFL++ documented, on the side AFL++ has it on,
+// and every direction AFL++ documented is in the map.  Where covcheck below
+// asks whether the map survives contact with a run, this asks whether it agrees
+// with the compiler -- which catches a swapped or dropped branch that no single
+// input happens to execute.
+// RUN: python %S/bmap_vs_docids.py %t.bmap %t.docids
 //
 // 'ABCDEFGH' matches neither comparison, so the trace takes the outer branch's
 // false side -- an edge afl-showmap must confirm.
@@ -80,6 +89,19 @@
 // RUN: not %covcheck -m %t.wrong.bmap -c %t.showmap -i %t.bin -- %t.symsan @@ | FileCheck %s --check-prefix=WRONG
 // WRONG: violations: 1
 // WRONG: verdict: INCONSISTENT
+//
+// The map is one half of the claim.  The other is that a branch SymSan names by
+// an AFL++ edge id is a branch of the *fuzzer's* binary -- which nothing above
+// tests, because covcheck compares two readings of one program and would agree
+// just as happily if both were wrong.  So solve the outer comparison out of the
+// two-stage build and run the answer through the AFL++ arm of the same link: it
+// has to take the path the solve was for.  'ABCDEFGH' printed "Bad".
+// RUN: rm -rf %t.out
+// RUN: mkdir -p %t.out
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.symsan %t.bin | FileCheck %s --check-prefix=SOLVE
+// SOLVE: generate #0 output
+// RUN: not %t.afl %t.out/id-0-0-0 | FileCheck %s --check-prefix=DRIVES
+// DRIVES: Halfway
 
 // Deliberately plain C -- no lib.h -- because afl-clang-lto has to compile it
 // too, and it has none of the SymSan harness.  Two nested comparisons on
