@@ -89,28 +89,27 @@ SANITIZER_WEAK_ATTRIBUTE u32 __afl_final_loc;
 
 namespace {
 
-// How big this binary's coverage map has to be.
-uptr CoverageMapSize() {
-  // AFL_MAP_SIZE is how a fuzzer states the size of the map it made, and it
-  // wins: writing past the end of the real map is worse than under-using it.
-  if (const char *env = GetEnv("AFL_MAP_SIZE")) {
-    s64 val = internal_simple_strtoll(env, nullptr, 10);
-    if (val > 0)
-      return (uptr)val;
-  }
-  // Otherwise ask the module.  AFL++'s pass defines __afl_final_loc with the
-  // edge count as its static initialiser, already rounded up past the highest
-  // id it assigned (SanitizerCoverageLTO.so.cc:1337), so it is both the count
-  // and the size.
+// How many counter bytes this binary can actually write, which is the only
+// thing that makes a map too small.  AFL++'s pass defines __afl_final_loc with
+// the edge count as its static initialiser, already rounded up past the highest
+// id it assigned (SanitizerCoverageLTO.so.cc:1337), so it is both the count and
+// the size.
+//
+// Deliberately not AFL_MAP_SIZE, which reads like the answer and is not one.
+// AFL++ exports it into the child as DEFAULT_SHMEM_SIZE -- 8MB -- *before* it
+// knows how big a map the target wants, as a placeholder for the size the
+// forkserver handshake is about to report back (afl_fsrv_resize_mapsize,
+// src/afl-forkserver.c:2305-2317).  A SymSan binary never reaches that
+// handshake, so it only ever sees the placeholder, and a placeholder larger
+// than the segment AFL++ really made turns a working run into a fatal error.
+uptr CoverageMapNeeded() {
   if (__afl_final_loc)
     return __afl_final_loc;
   return kDefaultMapSize;
 }
 
 void AttachCoverageMap() {
-  uptr size = CoverageMapSize();
-  if (size < kDefaultMapSize)
-    size = kDefaultMapSize;
+  uptr need = CoverageMapNeeded();
 
   // Whichever map the launcher named.  Note for whoever wires the launcher up:
   // symsan-fuzz has already put its *own* map in this variable and every child
@@ -126,18 +125,24 @@ void AttachCoverageMap() {
     // offset, so every id past the end lands in whatever the fuzzer put after
     // the map, and the symptom is the fuzzer misbehaving rather than this
     // process failing.  Refusing to start is the kinder answer.
+    //
+    // The segment's own size is what to compare against: it is what the kernel
+    // will actually let us write, and unlike AFL_MAP_SIZE nobody can set it to
+    // a guess.
+    uptr have = 0;
     struct shmid_ds ds;
-    if (shmctl(id, IPC_STAT, &ds) == 0 && (uptr)ds.shm_segsz < size) {
+    if (shmctl(id, IPC_STAT, &ds) == 0)
+      have = (uptr)ds.shm_segsz;
+    if (have && have < need) {
       Report("FATAL: AFL++ coverage map is %zu bytes but this binary needs %zu; "
-             "run the fuzzer with AFL_MAP_SIZE=%zu\n",
-             (uptr)ds.shm_segsz, size, size);
+             "run the fuzzer with AFL_MAP_SIZE=%zu\n", have, need, need);
       Die();
     }
 
     void *shm = shmat(id, nullptr, 0);
     if (shm != (void *)-1) {
       __afl_area_ptr = (u8 *)shm;
-      __afl_cov_map_size = (u32)size;
+      __afl_cov_map_size = (u32)need;
       return;
     }
     Report("WARNING: failed to attach AFL++ coverage map %d, "
@@ -148,12 +153,25 @@ void AttachCoverageMap() {
   // that has not made a map.  The counters still have to land somewhere, and
   // InitialMap is somewhere, so only bother mapping when the ids do not fit.
   //
+  // No segment to fit into either, so the size may as well be whatever was
+  // asked for.  AFL_MAP_SIZE is a floor and nothing more, and it is honoured
+  // here only because a map this process alone reads costs nothing to
+  // oversize -- the reasoning on CoverageMapNeeded() is about the shm path,
+  // where believing it can be fatal.
+  //
   // MAP_PRIVATE rather than MAP_SHARED, and likewise for InitialMap being plain
   // bss: this mapping is made before the fork point, so with the fork server
   // every run inherits it, and a private mapping gives each child its own
   // copy-on-write zeroes.  That is per-run coverage for free, which is what a
   // map nobody else is reading wants to be.  (The shm case above is shared on
   // purpose, and is zeroed by whoever owns it, once per run.)
+  uptr size = need;
+  if (const char *env = GetEnv("AFL_MAP_SIZE")) {
+    s64 val = internal_simple_strtoll(env, nullptr, 10);
+    if (val > 0 && (uptr)val > size)
+      size = (uptr)val;
+  }
+
   if (size <= sizeof(InitialMap)) {
     __afl_cov_map_size = (u32)size;
     return;
