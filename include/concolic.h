@@ -250,12 +250,14 @@ private:
   struct TracedBranch {
     dfsan_label label;
     void *addr;
+    uint32_t id;        ///< the branch's cid, for the re-ask in input_taint()
     bool neg_direction; ///< the direction we did *not* take
     bool flipped;       ///< a solution for it came back interesting
   };
   /// Record @p label and the direction not taken, for input_taint().  No-op
   /// unless export_taint is set.  @return the index, or SIZE_MAX
-  size_t note_branch(dfsan_label label, void *addr, bool neg_direction);
+  size_t note_branch(dfsan_label label, void *addr, uint32_t id,
+                     bool neg_direction);
 
   ConcolicConfig config_;
   symsan::TraceSession session_;

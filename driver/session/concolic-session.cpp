@@ -124,29 +124,13 @@ int ConcolicSession::init(const ConcolicConfig &config) {
     return -1;
   }
 
-  symsan::TraceConfig tc;
-  tc.input = config_.use_stdin ? "stdin" : config_.input_file;
-  tc.args = config_.args;
-  tc.timeout_ms = config_.timeout_ms;
-  tc.debug = config_.debug;
-  tc.bounds_check = config_.trace_bounds;
-  tc.solve_ub = config_.solve_ub;
-  tc.exit_on_memerror = config_.exit_on_memerror;
-  tc.force_stdin = config_.force_stdin;
-  tc.forkserver = config_.forkserver;
-  if (session_.configure(tc) != 0) {
-    warn("failed to configure the trace session\n");
-    return -1;
-  }
-
-  // setup the parser
-  parser_.reset(new RGDAstParser(shm_base, uniontable_size,
-                                 config_.nested_solving, config_.max_ast_size));
-  task_mgr_.reset(new FIFOTaskManager());
-
   // A branch map lets us ask what the *fuzzer* has covered instead of only what
   // this process has seen.  A map that fails to load is not fatal -- the point
   // of it is to skip redundant work, and the fallback is doing that work.
+  //
+  // Before configure() rather than after, because its `edges=` header is how
+  // big the target's coverage map has to be and configure() is where that gets
+  // said.
   if (!config_.branch_map.empty()) {
     std::unique_ptr<BranchMap> bm(new BranchMap());
     int n = bm->load(config_.branch_map);
@@ -162,6 +146,28 @@ int ConcolicSession::init(const ConcolicConfig &config) {
       branch_map_.reset(bm.release());
     }
   }
+
+  symsan::TraceConfig tc;
+  tc.input = config_.use_stdin ? "stdin" : config_.input_file;
+  tc.args = config_.args;
+  tc.timeout_ms = config_.timeout_ms;
+  tc.debug = config_.debug;
+  tc.bounds_check = config_.trace_bounds;
+  tc.solve_ub = config_.solve_ub;
+  tc.exit_on_memerror = config_.exit_on_memerror;
+  tc.force_stdin = config_.force_stdin;
+  tc.forkserver = config_.forkserver;
+  tc.cov_map_size = branch_map_ ? branch_map_->edges() : 0;
+  if (session_.configure(tc) != 0) {
+    warn("failed to configure the trace session\n");
+    return -1;
+  }
+
+  // setup the parser
+  parser_.reset(new RGDAstParser(shm_base, uniontable_size,
+                                 config_.nested_solving, config_.max_ast_size));
+  task_mgr_.reset(new FIFOTaskManager());
+
   if (branch_map_) {
     auto *shared = new SharedMapCovManager(branch_map_.get());
     shared->set_validating(config_.validate_coverage);
@@ -217,7 +223,8 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
   // Record the dependency before the filters below, not after: a branch we
   // throttle away is still a branch whose target is unflipped, and the bytes it
   // reads are exactly the ones a front-end should keep mutating.
-  size_t branch_idx = note_branch(msg.label, (void*)msg.addr, msg.result == 0);
+  size_t branch_idx = note_branch(msg.label, (void*)msg.addr, msg.id,
+                                  msg.result == 0);
 
   // apply a local (per input) branch filter
   auto &lc = local_counter_[msg.id];
@@ -279,8 +286,10 @@ void ConcolicSession::on_gep(const symsan::pipe_msg &msg, const symsan::gep_msg 
   }
 
   // a symbolic index is an unflipped target in the same sense a branch is:
-  // the bytes it reads are worth mutating until some other index is reached
-  size_t branch_idx = note_branch(gmsg.index_label, (void*)msg.addr, true);
+  // the bytes it reads are worth mutating until some other index is reached.
+  // Cid 0, because an index is not a branch and has none: no branch map entry
+  // is keyed on it, so the re-ask in input_taint() takes the unmapped path.
+  size_t branch_idx = note_branch(gmsg.index_label, (void*)msg.addr, 0, true);
 
   // apply a local (per input) index filter
   if (!local_index_filter_.insert(msg.label).second) {
@@ -300,6 +309,7 @@ void ConcolicSession::on_gep(const symsan::pipe_msg &msg, const symsan::gep_msg 
   std::shared_ptr<BranchContext> ctx = std::make_shared<BranchContext>();
   ctx->addr = (void*)msg.addr;
   ctx->direction = true;
+  ctx->id = 0;
   for (auto const& task_id : tasks) {
     auto task = parser_->retrieve_task(task_id);
     if (branch_idx != SIZE_MAX) task_branch_[task.get()] = branch_idx;
@@ -485,7 +495,7 @@ void ConcolicSession::report_result(bool interesting) {
   }
 }
 
-size_t ConcolicSession::note_branch(dfsan_label label, void *addr,
+size_t ConcolicSession::note_branch(dfsan_label label, void *addr, uint32_t id,
                                     bool neg_direction) {
   if (!config_.export_taint) {
     return SIZE_MAX;
@@ -496,7 +506,7 @@ size_t ConcolicSession::note_branch(dfsan_label label, void *addr,
   if (!parser_->note_deps(label, traced_taint_)) {
     return SIZE_MAX;
   }
-  traced_branches_.push_back({label, addr, neg_direction, false});
+  traced_branches_.push_back({label, addr, id, neg_direction, false});
   return traced_branches_.size() - 1;
 }
 
@@ -519,6 +529,7 @@ int ConcolicSession::input_taint(uint8_t *out, size_t len) {
     if (b.flipped) continue;
     ctx->addr = b.addr;
     ctx->direction = b.neg_direction;
+    ctx->id = b.id;
     if (!cov_mgr_->is_target_uncovered(ctx)) continue;
     (void)parser_->note_deps(b.label, open);
   }

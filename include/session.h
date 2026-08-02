@@ -68,6 +68,15 @@ struct TraceConfig {
   /// silently ignored if the target's backend has no fork server; see
   /// symsan_set_forkserver() in launch.h.
   bool forkserver = false;
+  /// How many AFL++ edge counters the target has, i.e. how big the coverage map
+  /// handed to it must be.  It is the `edges=` header of the branch map the
+  /// same build wrote; see rgd::BranchMap::edges().
+  ///
+  /// Load-bearing above AFL++'s default 64K of counters: the target checks the
+  /// segment it is given against its own __afl_final_loc and refuses to start
+  /// if it is short (runtime/dfsan/afl_compat.cpp).  Zero leaves the launcher
+  /// to make a default-sized one on the first run().
+  size_t cov_map_size = 0;
 };
 
 /// Outcome of a single TraceSession::run().

@@ -17,9 +17,14 @@ namespace rgd {
 struct BranchContext {
   void *addr;
   bool direction;
-};
-
-struct HybridBranchContext : public BranchContext {
+  /// The id the instrumentation baked into the branch.  In an AFL++-numbered
+  /// build this is an edge id and the branch map can be asked about it; in a
+  /// per-TU build it is a source hash, and in a check the runtime raised itself
+  /// it is one of `enum undefined_check_ids`, shared by every such site.
+  ///
+  /// Carried here rather than in a derived struct so that it survives
+  /// ConcolicSession::on_cond building the negated context by assigning through
+  /// a BranchContext, which would slice a derived member straight back off.
   uint32_t id;
 };
 
@@ -35,8 +40,7 @@ struct HistoryAwareBranchContext : public BranchContext {
   uint32_t history;
 };
 
-struct FullBranchContext : public HybridBranchContext,
-                          public ContextAwareBranchContext,
+struct FullBranchContext : public ContextAwareBranchContext,
                           public LoopAwareBranchContext,
                           public HistoryAwareBranchContext {
 };
@@ -83,6 +87,7 @@ public:
     itr.second |= direction? false : true;
     _ctx->addr = addr;
     _ctx->direction = direction;
+    _ctx->id = id;
     return _ctx;
   }
 
@@ -135,27 +140,44 @@ struct JoinReport {
 /// EdgeCovManager only ever knows what this process has seen, so a branch the
 /// fuzzer flipped an hour ago still looks new to every freshly started session.
 /// Given a BranchMap -- what each side of a branch reaches, in the fuzzer's own
-/// edge numbering, see include/branch_map.h -- and a snapshot of the fuzzer's
-/// history map, we can ask the question the fuzzer would answer.
+/// edge numbering, see include/branch_map.h -- we can put the question to the
+/// fuzzer's own history (set_coverage) instead, about the edge that direction
+/// leads to.
 ///
 /// Where the map has nothing to say -- a branch out of code AFL++ never
 /// instrumented, the false side of a switch case, or a direction AFL++ pruned
 /// and so gave no edge id -- this degrades exactly to EdgeCovManager.
 class SharedMapCovManager : public CovManager {
 private:
+  /// Which directions of each branch address this session has taken.  Only the
+  /// unmapped path below consults it, and it stays keyed on the address rather
+  /// than the cid because the ids that land there are not unique: a check the
+  /// runtime raised itself carries one of `enum undefined_check_ids`, the same
+  /// sixteen values for every site in the program, and keying on those would
+  /// collapse every UB check in the target into one bucket.
   using BranchTargets = std::pair<bool, bool>;
   std::unordered_map<void*, BranchTargets> branches;
-  /// addr -> the id the instrumentation baked in.  A side table rather than a
-  /// HybridBranchContext because ConcolicSession::on_cond builds the negated
-  /// context by assigning through a BranchContext, which would slice the id
-  /// straight back off.
-  std::unordered_map<void*, uint32_t> cids;
   std::shared_ptr<BranchContext> _ctx;
 
   const BranchMap *map_;
   /// The fuzzer's history map as of the last set_coverage(); empty means "no
-  /// idea", which reads as "nothing covered".
+  /// idea", which reads as "nothing covered".  Already hit-count classed --
+  /// that is what LibAFL's HitcountsMapObserver hands MaxMapFeedback.
   std::vector<uint8_t> host_;
+  /// How many times this trace has taken each branch, keyed on the cid.  Keying
+  /// on the cid is safe here where it is not for `branches` above, because only
+  /// the mapped path reads it and a cid the map answers for is an AFL++ edge
+  /// id, unique to its branch.
+  ///
+  /// This is what the target's own AFL++ counters cannot supply, for all that
+  /// they are real counts over every edge rather than only the tainted ones.
+  /// The question is how far along *this traversal* is, and a counter map has
+  /// no ordering: we drain the event pipe of a process that is still running,
+  /// and by the time the first iteration's event is read the target has usually
+  /// finished the loop, so the map reads the same -- final -- number at every
+  /// iteration.  Measured: it collapses the graduated classes below to one
+  /// value and makes every iteration look equally new.
+  std::unordered_map<uint32_t, uint32_t> trace_hits_;
   uint64_t mapped_ = 0;
   uint64_t unmapped_ = 0;
 
@@ -165,12 +187,6 @@ private:
   /// directions were reached, not how often.
   std::unordered_set<uint64_t> taken_;
   bool validating_ = false;
-
-  /// How many times this trace has traversed each branch address, both
-  /// directions together.  Per trace, not per session: it is how far around a
-  /// loop we are, which is what tells the k-th iteration of a branch apart from
-  /// the first.
-  std::unordered_map<void*, uint32_t> trace_hits_;
 
   /// AFL's hit-count buckets -- 1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+ --
   /// each collapsed onto its lower bound.  LibAFL's HitcountsMapObserver
@@ -188,6 +204,14 @@ private:
     if (hits <= 31) return 32;
     if (hits <= 127) return 64;
     return 128;
+  }
+
+  /// The class the fuzzer's history has for @p edge.  Already classed on the
+  /// way in; past the end is not covered, because a snapshot shorter than the
+  /// binary's id range says nothing about the ids it does not reach and
+  /// "unknown" has to read as "worth solving".
+  uint8_t host_at(uint32_t edge) const {
+    return edge < host_.size() ? host_[edge] : 0;
   }
 
 public:
@@ -270,14 +294,14 @@ public:
     auto &itr = branches[addr];
     itr.first |= direction? true : false;
     itr.second |= direction? false : true;
-    cids[addr] = id;
-    trace_hits_[addr] += 1;
+    trace_hits_[id] += 1;
     // Here rather than in is_branch_interesting(), which is handed the
     // *negated* context: this is the only place the direction actually taken
     // is in hand, and that is the one the fuzzer's map can be checked against.
     if (validating_) taken_.insert(((uint64_t)id << 1) | (direction ? 1 : 0));
     _ctx->addr = addr;
     _ctx->direction = direction;
+    _ctx->id = id;
     return _ctx;
   }
 
@@ -296,12 +320,8 @@ private:
     // Consult the fuzzer first, and unconditionally, so the counters describe
     // every branch we saw rather than only the ones that got past the local
     // check below.
-    bool host_says_new = true;
-    auto cid = cids.find(context->addr);
     const uint32_t *edge =
-        (map_ && cid != cids.end())
-            ? map_->lookup(cid->second, context->direction)
-            : nullptr;
+        map_ ? map_->lookup(context->id, context->direction) : nullptr;
     // AFL++ numbered no block behind this direction, so there is no edge to ask
     // the fuzzer's history about.  For validate() that is a real answer --
     // nothing to contradict -- but here it must *not* be read as "flipping this
@@ -329,24 +349,27 @@ private:
       // edge, ever, and every later iteration of the loop looked covered.
       //
       // trace_hits_ is how far around the loop this branch already is, so
-      // class(hits) is the class the flipped edge would land in.  It is an
+      // class(that) is the class the flipped edge would land in.  It is an
       // estimate -- what the fuzzer records depends on the whole rewritten
       // trace, which we would have to run to know -- and it errs towards
       // solving, which is the right way to err for a stage that is gated to
       // once per corpus entry anyway.
-      auto hit = trace_hits_.find(context->addr);
+      auto hit = trace_hits_.find(context->id);
       uint8_t want = count_class(hit == trace_hits_.end() ? 1 : hit->second);
-      // Past the end of the snapshot is not covered: a map shorter than the
-      // binary's id range says nothing about the ids it does not reach, and
-      // "unknown" has to read as "worth solving".
-      host_says_new = *edge >= host_.size() || host_[*edge] < want;
+      // Only the fuzzer's history answers the other half.  Nothing of ours is
+      // folded in: it refreshes host_ before every traced entry
+      // (bindings/rust/libafl-symsan/src/lib.rs), so a session-lifetime record
+      // would only duplicate it -- except when it did not, and then it would be
+      // our bookkeeping vetoing the fuzzer's, which is the failure this class
+      // exists to undo.
+      uint8_t have = host_at(*edge);
       // The map answered, so it decides.  `branches` is keyed on address and
       // lives as long as the session, which makes it wrong in exactly the case
       // we came here to fix: it can only ever say "solved once already", and a
       // branch inside a loop is worth solving at every depth.  Letting it veto
       // is what kept test-crc32 stuck -- the fuzzer would happily have taken
       // the input, and we never built the task.
-      return host_says_new;
+      return have < want;
     }
 
     if (count) unmapped_ += 1;

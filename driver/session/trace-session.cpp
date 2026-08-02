@@ -151,6 +151,17 @@ int TraceSession::configure(const TraceConfig &config) {
   symsan_set_force_stdin(config.force_stdin);
   symsan_set_forkserver(config.forkserver);
 
+  // Not fatal if it fails: the launcher then makes a default-sized map on the
+  // first run, the target refuses to start if that is too small, and either way
+  // the diagnosis belongs to the run.
+  if (config.cov_map_size != 0) {
+    int ret = symsan_set_cov_map_size(config.cov_map_size);
+    if (ret != 0) {
+      warn("failed to size the coverage map at %zu bytes (%d)\n",
+           config.cov_map_size, ret);
+    }
+  }
+
   timeout_ms_ = config.timeout_ms;
   configured_ = true;
   return 0;
