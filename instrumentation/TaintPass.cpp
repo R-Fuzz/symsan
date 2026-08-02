@@ -272,6 +272,46 @@ static cl::opt<cl::boolOrDefault> ClWithAfl(
              "(default: whenever the module carries that instrumentation)."),
     cl::Hidden, cl::init(cl::BOU_UNSET));
 
+// Turns the skip above off, and gives such a branch its source-hash id with bit
+// 31 forced on.
+//
+// It exists because the skip looked like a strict loss against the source-hash
+// scheme it replaced, where every branch was traced and a branch the map could
+// not name fell back to what the session had seen itself.  The argument for the
+// skip -- that a novelty judgement the fuzzer does not share only produces
+// inputs it discards -- assumes novelty has to come from the branch's own target
+// block, and it does not: an unnumbered branch still gates numbered code
+// downstream.
+//
+// Measured (task #85), and the loss is not there.  On zlib -O2 the skip drops 10
+// of 396 branches; recovering them produced zero extra solved branches, zero
+// extra generated inputs and the same 149 edges, for 17 more solver attempts.
+// Across all 14 fuzzer-challenges targets it drops three branches in two of
+// them -- `test-u128.c:28`, `test-transform.c:148` and `:165`, every one a
+// `for`-loop latch on an untainted induction variable, which reaches the runtime
+// with label 0 and returns immediately even when it is instrumented.  fgtest is
+// identical in both arms on all of them.  `test-crc32` drops nothing at either
+// -O0 or -O2, which is worth stating because the branch that once stalled it,
+// `test-crc32.c:68:9`, is the standing example of a branch going undecidable:
+// AFL++ numbers both of its directions (`C 4107 4107 4108`).
+//
+// So keep the skip, and keep this flag to re-measure -- the case it has not seen
+// is a C++ target linking separately-instrumented archives, where unnumbered
+// branches are plentiful rather than incidental.  That is the same population as
+// the TODO on getBranchId(), and this is its tag bit prototyped.  AFL++ edge ids are sequential from AFL_LLVM_LTO_STARTID and a
+// coverage map is a few hundred kilobytes at the very most, so every real edge
+// id is far below 2^31: a tagged cid can never match a key in the .bmap, which
+// holds edge ids only.  So the lookup misses, the branch takes the documented
+// degrade path, and nothing else in the pipeline has to know it is different.
+static cl::opt<bool> ClInstrumentUnnumbered(
+    "taint-instrument-unnumbered",
+    cl::desc("Trace branches AFL++ numbered no side of, under a tagged "
+             "source-hash id that the branch map can never match."),
+    cl::Hidden, cl::init(false));
+
+/// Bit 31, set on a branch id that is not an AFL++ edge id.
+static const uint32_t kNotAnEdgeTag = 1u << 31;
+
 // A -mllvm flag rather than an environment variable, unlike
 // SYMSAN_DOCUMENT_IDS: the map is written once, by the one `opt` invocation
 // that runs this pass over the merged post-LTO module, so it belongs on that
@@ -1216,7 +1256,11 @@ bool Taint::getAflBranchTargets(Instruction *Inst,
 // hash cannot be made to avoid a range it does not know about.  The candidate
 // fix is a tag bit -- AFL++ edge ids are far below 2^31, so forcing bit 31 on
 // every non-edge cid makes "is this an edge?" a one-bit test that works across
-// archives.  Left alone for now; revisit once the pipeline has settled.
+// archives.  Prototyped as kNotAnEdgeTag under -taint-instrument-unnumbered,
+// which needs it for the same reason; what is left for #84 is applying it to the
+// hash path taken when AflMapPtr is null, and teaching the reader to treat a
+// tagged cid as unjoinable rather than letting it miss by luck.  Left alone for
+// now; revisit once the pipeline has settled.
 uint32_t Taint::getBranchId(Instruction *Inst) {
   if (AflMapPtr) {
     SmallVector<uint32_t, 4> Targets;
@@ -1226,8 +1270,27 @@ uint32_t Taint::getBranchId(Instruction *Inst) {
       // cannot be looked up in that map either, and pretending otherwise is how
       // the old join produced branches nobody could decide about.  Invalid
       // means "leave this branch alone".
-      return Inst->getMetadata("dfsan.bb") ? getInstructionId(Inst)
-                                           : InvalidInstructionId;
+      //
+      // That argument is about joining, not about solving -- the session's own
+      // record is keyed on the runtime return address and needs no id at all, so
+      // it would still have worked here.  What settles it is measurement rather
+      // than the argument: recovering these branches buys nothing on zlib or on
+      // any of the 14 fuzzer-challenges targets, because on a C target they come
+      // out to be loop latches over untainted counters.  See
+      // ClInstrumentUnnumbered for the numbers and for how to re-run it.
+      if (Inst->getMetadata("dfsan.bb"))
+        return getInstructionId(Inst);
+      if (!ClInstrumentUnnumbered)
+        return InvalidInstructionId;
+      uint32_t H = getInstructionId(Inst);
+      if (H == InvalidInstructionId)
+        return H;
+      H |= kNotAnEdgeTag;
+      // A hash whose low 31 bits are all ones would tag to InvalidInstructionId
+      // and be read as "leave this branch alone".  Move it rather than lose it.
+      if (H == InvalidInstructionId)
+        H ^= 1;
+      return H;
     }
     // Name the branch after the first of its targets AFL++ numbered: the block
     // it reaches when the condition holds, or its default destination for a
