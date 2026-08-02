@@ -21,6 +21,30 @@
 
 namespace symsan {
 
+/// How many edge ids are held back at the bottom of the coverage map for
+/// SymSan's own use.
+///
+/// Not every branch SymSan solves is an edge the fuzzer numbered: a UB check, a
+/// bounds check or a libc-wrapper size constraint is a decision point that
+/// exists only in the instrumented build, and it still needs an id that cannot
+/// be mistaken for a real edge.  Those ids are `enum undefined_check_ids` in
+/// runtime/dfsan/dfsan.h, passed to __taint_trace_cond by the runtime itself
+/// rather than assigned by the pass, and they run 1..16.  The build hands this
+/// number to AFL++ as AFL_LLVM_LTO_STARTID so that its own numbering starts
+/// above the range, which makes "cid < AFL_ID_BASE" a complete test for "this is
+/// not an edge" -- answerable without knowing how many edges the target happens
+/// to have.
+///
+/// The cost of holding ids back is one map byte each, so the number is chosen
+/// to be comfortably more than any target will need rather than tight.
+///
+/// This covers the undefined_check_ids and nothing else.  It does *not* cover a
+/// branch in code AFL++ never instrumented -- a separately-linked instrumented
+/// archive, libc++ being the one every C++ target pulls in -- which keeps a
+/// branch_cid() source hash and so can collide with a real edge id by chance.
+/// See the TODO on Taint::getBranchId() in instrumentation/TaintPass.cpp.
+static const uint32_t AFL_ID_BASE = 4096;
+
 /// Daniel J. Bernstein's string hash -- byte for byte what llvm::djbHash()
 /// does.  Reimplemented rather than #include'd from "llvm/Support/DJB.h" so
 /// that the driver can compute a branch id without linking LLVM's support

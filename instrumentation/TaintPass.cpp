@@ -250,6 +250,37 @@ static cl::opt<bool> ClTraceAnnotatedBB(
     cl::desc("Only trace annotated basic blocks."),
     cl::Hidden, cl::init(false));
 
+// Whether branch ids come from AFL++'s edge numbering rather than from the
+// source location -- and with them the rest of that mode: no source-hash
+// fallback for a branch AFL++ numbered no side of, and a branch map to dump.
+//
+// Tri-state rather than a plain switch.  Unset looks for @__afl_area_ptr and
+// decides, which is what an ordinary build wants; BOU_TRUE demands that the
+// module really is AFL++-instrumented, so that a pipeline that quietly stops
+// producing one fails at build time instead of shipping a binary whose ids can
+// never be joined; BOU_FALSE runs an AFL++-instrumented module down the old
+// path, which is how the two are measured against each other on the same
+// module.
+//
+// This deliberately gates the whole mode and not just the skip: leaving the
+// unnumbered branches on the source hash would put two id spaces in one module,
+// and a djb hash is a uniform 32-bit value that can land inside AFL++'s edge
+// range and be looked up as some unrelated edge.
+static cl::opt<cl::boolOrDefault> ClWithAfl(
+    "taint-with-afl",
+    cl::desc("Take branch ids from AFL++'s link-time edge numbering "
+             "(default: whenever the module carries that instrumentation)."),
+    cl::Hidden, cl::init(cl::BOU_UNSET));
+
+// A -mllvm flag rather than an environment variable, unlike
+// SYMSAN_DOCUMENT_IDS: the map is written once, by the one `opt` invocation
+// that runs this pass over the merged post-LTO module, so it belongs on that
+// command line.  See writeBranchMap().
+static cl::opt<std::string> ClBranchMap(
+    "taint-branch-map",
+    cl::desc("Write the branch id -> reached edge id map to this file."),
+    cl::Hidden, cl::init(""));
+
 // SYMSAN specific flags, if runs with UCSan
 static cl::opt<bool> ClWithUCSan(
     "taint-with-ucsan",
@@ -558,6 +589,34 @@ class Taint {
   uint32_t getInstructionId(Instruction *Inst);
   const uint32_t InvalidInstructionId = -1;
 
+  /// @__afl_area_ptr, when the module has been through AFL++'s link-time
+  /// instrumentation, and null otherwise.  Its presence is what says "this
+  /// module carries edge ids"; looked up once in initializeModule(), before
+  /// addGlobalNameSuffix() has had any chance to rename things.
+  GlobalVariable *AflMapPtr = nullptr;
+  /// The index operand of an AFL++ coverage-counter GEP, or null when @p GEP
+  /// is not one.
+  const Value *aflCounterIndex(const GetElementPtrInst *GEP) const;
+  /// The AFL++ edge id of @p BB, or InvalidInstructionId when it has none.
+  uint32_t getAflBlockId(const BasicBlock *BB) const;
+  /// AFL++'s pair of edge ids for a select-lowered branch.
+  bool getAflSelectIds(const SelectInst *SI, uint32_t &TrueId,
+                       uint32_t &FalseId) const;
+  /// The edge ids reached by a branch, select or switch, in the order the
+  /// runtime names its directions: true then false, or default then each case.
+  /// False when this module carries no AFL++ instrumentation, or when any one
+  /// target is unnumbered.
+  bool getAflBranchTargets(Instruction *Inst,
+                           SmallVectorImpl<uint32_t> &Targets);
+  /// The id of a branch, select or switch: the one flavour of instruction id
+  /// that has to mean the same thing to the fuzzer as it does here.
+  uint32_t getBranchId(Instruction *Inst);
+  /// AFL++'s edge count, from __afl_final_loc.
+  uint32_t AflEdges = 0;
+  /// Whether the AFL_LLVM_LTO_STARTID complaint has already been made; it is a
+  /// property of the build, so once per module is enough.
+  bool WarnedLowAflId = false;
+
   /// Record that @p Inst was instrumented with branch id @p cid, for
   /// SYMSAN_DOCUMENT_IDS.  @p Kind is "br", "select", "switch" or
   /// "switch-case"; see documentBranchId() for why the caller has to say, and
@@ -565,6 +624,8 @@ class Taint {
   void documentBranchId(uint32_t cid, Instruction *Inst, const char *Kind,
                         const std::string &Extra = std::string());
   void flushDocumentedIds();
+  /// Write the -taint-branch-map file: which edge each branch reaches.
+  void writeBranchMap(Module &M);
   /// Value of SYMSAN_DOCUMENT_IDS, or empty when the dump is off.
   std::string DocumentIdsPath;
   /// Lines accumulated by documentBranchId(), written out once per module so
@@ -967,6 +1028,242 @@ uint32_t Taint::getInstructionId(Instruction *Inst) {
   return djbHash(SourceInfo);
 }
 
+// AFL++'s link-time instrumentation (SanitizerCoverageLTO.so.cc) numbers basic
+// blocks sequentially and bumps a counter at that index in every instrumented
+// block:
+//
+//   afl.entry:
+//     %p = load ptr, ptr @__afl_area_ptr           ; hoisted, once per function
+//   ...
+//     %g = getelementptr i8, ptr %p, i32 <edge id>
+//     %c = load i8, ptr %g                         ; or a single atomicrmw,
+//     store i8 (umax(%c + 1, 1)), ptr %g           ; under threadsafe counters
+//
+// The GEP is the part of that shape both counter modes share, so match on it.
+const Value *Taint::aflCounterIndex(const GetElementPtrInst *GEP) const {
+  if (!AflMapPtr || GEP->getNumIndices() != 1)
+    return nullptr;
+  const LoadInst *Base = dyn_cast<LoadInst>(GEP->getPointerOperand());
+  if (!Base || Base->getPointerOperand() != AflMapPtr)
+    return nullptr;
+  const Value *Idx = GEP->getOperand(1);
+  // AFL++ builds the index in i32 and the GEP may want it wider.
+  while (isa<ZExtInst>(Idx) || isa<SExtInst>(Idx) || isa<TruncInst>(Idx))
+    Idx = cast<CastInst>(Idx)->getOperand(0);
+  return Idx;
+}
+
+uint32_t Taint::getAflBlockId(const BasicBlock *BB) const {
+  if (!AflMapPtr)
+    return InvalidInstructionId;
+  // AFL++ skips a block that dominates all of its successors
+  // (shouldInstrumentBlock -> isFullDominator), having first split every
+  // critical edge, so a conditional branch's *own* block is normally left
+  // unnumbered while both of its successors are numbered.  What can still be
+  // missing is the id of a successor that only forwards -- an empty block a
+  // later SplitEdge() introduced, say.  Keep hopping down for as long as the
+  // edge is unconditional in both directions, which makes the two blocks run
+  // under precisely the same condition: the mirror image of the upward walk in
+  // patches/aflpp-document-ids.patch, and bounded the same way, since an
+  // unconditional cycle is representable even if it is not reachable.
+  for (unsigned Hop = 0; BB && Hop < 16; ++Hop) {
+    for (const Instruction &I : *BB) {
+      const auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+      if (!GEP)
+        continue;
+      const Value *Idx = aflCounterIndex(GEP);
+      // Only a constant index names *this* block: a select-lowered branch puts
+      // a select there instead (see getAflSelectIds), and a CTX/NGRAM or IJON
+      // build mixes in a runtime value, leaving no static id to recover.
+      if (Idx)
+        if (const auto *CI = dyn_cast<ConstantInt>(Idx))
+          return static_cast<uint32_t>(CI->getZExtValue());
+    }
+    const auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!BI || BI->isConditional())
+      break;
+    const BasicBlock *Succ = BI->getSuccessor(0);
+    if (Succ->getSinglePredecessor() != BB)
+      break;
+    BB = Succ;
+  }
+  return InvalidInstructionId;
+}
+
+// AFL++ instruments a select-lowered branch by inserting, right after it,
+//
+//   %f = freeze i1 %cond
+//   %i = select i1 %f, i32 <true id>, i32 <false id>
+//
+// and indexing the coverage map with %i (SanitizerCoverageLTO.so.cc:2278).
+// Matching through the map GEP rather than by looking for a select on the same
+// condition matters: user code is free to write `c ? 1 : 2` as well, and the
+// counter index is the only thing that tells the two apart.
+bool Taint::getAflSelectIds(const SelectInst *SI, uint32_t &TrueId,
+                            uint32_t &FalseId) const {
+  if (!AflMapPtr)
+    return false;
+  // Walking forward from the select rather than over the whole block is what
+  // keeps two selects on the *same* condition apart: AFL++ puts each one's
+  // counter immediately after it, so the first match below is this select's.
+  for (const Instruction *I = SI->getNextNode(); I; I = I->getNextNode()) {
+    const auto *GEP = dyn_cast<GetElementPtrInst>(I);
+    if (!GEP)
+      continue;
+    const Value *Idx = aflCounterIndex(GEP);
+    const auto *Sel = Idx ? dyn_cast<SelectInst>(Idx) : nullptr;
+    if (!Sel)
+      continue;
+    const Value *Cond = Sel->getCondition();
+    if (const auto *FI = dyn_cast<FreezeInst>(Cond))
+      Cond = FI->getOperand(0);
+    if (Cond != SI->getCondition())
+      continue;
+    const auto *T = dyn_cast<ConstantInt>(Sel->getTrueValue());
+    const auto *F = dyn_cast<ConstantInt>(Sel->getFalseValue());
+    if (!T || !F)
+      continue; // the vector path, which takes a pair of ids per element
+    TrueId = static_cast<uint32_t>(T->getZExtValue());
+    FalseId = static_cast<uint32_t>(F->getZExtValue());
+    return true;
+  }
+  return false;
+}
+
+// The edges a branch reaches, one per direction, InvalidInstructionId where
+// AFL++ numbered nothing.  False if it numbered none of them.
+//
+// AFL++ deliberately does not number every block.  shouldInstrumentBlock() drops
+// a block that dominates all of its successors -- reaching a successor already
+// implies reaching it, so its count is redundant -- and, symmetrically, a block
+// that post-dominates all of its predecessors and has more than one.  Having
+// split every critical edge first, the first rule prunes almost every
+// conditional branch's own block, and the second prunes the join block of an
+// `if` with no `else`, which is where such a branch's false side lands.
+//
+// A side with no id is a side SymSan cannot decide about: is_interest() asks
+// whether the edge on the other side of a branch has been covered, and the
+// answer lives in the fuzzer's map, which has no slot for a block AFL++ chose
+// not to count.  Instrumenting the block ourselves would produce an answer, but
+// not one worth having -- in hybrid fuzzing the fuzzer's own coverage is what
+// decides whether a generated input is kept, so a novelty judgement it does not
+// share only leads to inputs it discards.  And for the post-dominator case the
+// judgement would be "not novel" anyway: a join reached whichever way the branch
+// went is not new coverage, which is precisely why AFL++ dropped it.
+//
+// So an unnumbered side is reported as such and simply never solved for, while
+// the branch as a whole is abandoned only when *no* side is numbered.  Refusing
+// the whole branch instead would throw away the informative direction along with
+// the uninformative one, which on zlib -O2 is the difference between tracing 345
+// conditional branches and tracing 789 of them.
+bool Taint::getAflBranchTargets(Instruction *Inst,
+                                SmallVectorImpl<uint32_t> &Targets) {
+  // A UCSan annotation, where there is one, is the id the rest of the pipeline
+  // has already agreed on; getInstructionId() prefers it, and so must this.
+  if (!AflMapPtr || Inst->getMetadata("dfsan.bb"))
+    return false;
+
+  if (auto *SI = dyn_cast<SelectInst>(Inst)) {
+    uint32_t TrueId, FalseId;
+    if (!getAflSelectIds(SI, TrueId, FalseId))
+      return false;
+    Targets.push_back(TrueId);
+    Targets.push_back(FalseId);
+  } else if (auto *BI = dyn_cast<BranchInst>(Inst)) {
+    if (!BI->isConditional())
+      return false;
+    Targets.push_back(getAflBlockId(BI->getSuccessor(0)));
+    Targets.push_back(getAflBlockId(BI->getSuccessor(1)));
+  } else if (auto *SW = dyn_cast<SwitchInst>(Inst)) {
+    Targets.push_back(getAflBlockId(SW->getDefaultDest()));
+    for (auto C : SW->cases())
+      Targets.push_back(getAflBlockId(C.getCaseSuccessor()));
+  } else {
+    return false;
+  }
+
+  for (uint32_t Id : Targets)
+    if (Id != InvalidInstructionId)
+      return true;
+  Targets.clear();
+  return false;
+}
+
+// The id of a branch, which unlike every other instruction id has to mean the
+// same thing to the fuzzer as it does here: it is what the coverage join is
+// keyed on.  On a module that has been through AFL++'s link-time
+// instrumentation that is the AFL++ edge id, and the source-location hash --
+// with the lossy join it forces, see include/branch_map.h -- is not needed at
+// all.  Everywhere else this is just getInstructionId().
+//
+// GEP bounds, memcmp and loop ids stay on getInstructionId() and are free to
+// collide with an edge id, because nothing joins on them: the runtime feeds a
+// cond's id to ConcolicSession's per-input throttle and to the coverage map,
+// and ignores it everywhere else.
+//
+// TODO: code AFL++ does not instrument still reaches the coverage map with a
+// source hash.  ClWithAfl keeps the two id spaces apart *within* a module, but
+// not across separately-compiled ones, and an instrumented binary always has
+// some: lib/symsan/libc++.a, libc++abi.a and libunwind.a between them hold ~50
+// __taint_trace_cond call sites, and any archive built by a plain per-TU
+// ko-clang -- an instrumented zlib, say -- adds more.  None of them are in the
+// merged module AFL++ numbered, so AflMapPtr is null when they are compiled and
+// they fall through to getInstructionId() below.  A djb hash is uniform over
+// 32 bits, so each such id lands inside AFL++'s edge range with probability
+// edges/2^32 and is then looked up as some unrelated edge -- a wrong answer
+// from is_interest() rather than a crash, which is the bad kind.  Unlike the
+// undefined_check_ids above, a reserved low range cannot fix this, because a
+// hash cannot be made to avoid a range it does not know about.  The candidate
+// fix is a tag bit -- AFL++ edge ids are far below 2^31, so forcing bit 31 on
+// every non-edge cid makes "is this an edge?" a one-bit test that works across
+// archives.  Left alone for now; revisit once the pipeline has settled.
+uint32_t Taint::getBranchId(Instruction *Inst) {
+  if (AflMapPtr) {
+    SmallVector<uint32_t, 4> Targets;
+    if (!getAflBranchTargets(Inst, Targets)) {
+      // AFL++ numbered no side of this branch, so there is nothing the coverage
+      // map can be asked about it.  Do not fall back to the source hash: a hash
+      // cannot be looked up in that map either, and pretending otherwise is how
+      // the old join produced branches nobody could decide about.  Invalid
+      // means "leave this branch alone".
+      return Inst->getMetadata("dfsan.bb") ? getInstructionId(Inst)
+                                           : InvalidInstructionId;
+    }
+    // Name the branch after the first of its targets AFL++ numbered: the block
+    // it reaches when the condition holds, or its default destination for a
+    // switch, falling back to the next direction when that one was pruned.
+    // Whichever it lands on is unique to this branch, because critical edges
+    // have been split and so a successor of a conditional terminator has this
+    // block as its only predecessor.
+    //
+    // The low ids belong to SymSan's own decision points -- UB checks, bounds
+    // checks, libc size constraints.  Those are not branches in the program and
+    // are not numbered here at all: the runtime passes an `enum
+    // undefined_check_ids` value (runtime/dfsan/dfsan.h) straight to
+    // __taint_trace_cond as the cid, so they occupy 1..16 and nothing else.
+    // symsan::AFL_ID_BASE holds that range clear with room to spare, but only as
+    // long as AFL++'s numbering really does start above it.  Nothing downstream
+    // can tell the two apart if it does not, so say so once and let the build be
+    // fixed rather than silently mis-joining.
+    uint32_t Id = InvalidInstructionId;
+    for (uint32_t T : Targets) {
+      if (T != InvalidInstructionId) {
+        Id = T;
+        break;
+      }
+    }
+    if (Id < symsan::AFL_ID_BASE && !WarnedLowAflId) {
+      WarnedLowAflId = true;
+      errs() << "SymSan: AFL++ edge id " << Id
+             << " falls inside the range reserved for SymSan's own branch ids; "
+                "build with AFL_LLVM_LTO_STARTID="
+             << symsan::AFL_ID_BASE << "\n";
+    }
+    return Id;
+  }
+  return getInstructionId(Inst);
+}
+
 // The counterpart of AFL++'s AFL_LLVM_DOCUMENT_IDS.  That one says which source
 // location each *edge id* came from; this one says which source location each
 // *branch id* came from.  Diffing the two tables answers "do the two builds
@@ -1043,6 +1340,111 @@ void Taint::flushDocumentedIds() {
     flock(Fd, LOCK_UN);
   }
   close(Fd);
+}
+
+// Which edge does taking a branch one way or the other actually reach?  The
+// backend needs that to decide whether flipping a branch is worth solving --
+// "is the edge on the other side of this branch one we have never covered?" --
+// and it is not something either side can work out on its own: the branch id
+// and the edge ids around it live in the same numbering, but only the CFG says
+// how they are connected.
+//
+//   # symsan branch map v1 base=<reserved> edges=<count>
+//   C <cid> <true edge> <false edge>      conditional branch
+//   X <cid> <true edge> <false edge>      select-lowered branch
+//   D <cid> <default edge>                switch, no case matched
+//   S <cid> <case value> <case edge>      switch, one line per case
+//
+// One line per branch this build actually traces, and no others: a branch AFL++
+// numbered no side of gets no __taint_trace_cond call either (see
+// getAflBranchTargets), so there is nothing for the backend to look up.  An
+// individual direction AFL++ pruned is written as -1, which the backend reads as
+// "never interesting" -- the honest answer, since AFL++ prunes exactly the
+// blocks whose coverage is implied by something else's.
+//
+// The header says how the numbering is laid out -- base= the ids held back below
+// AFL++'s range for SymSan's own branches (symsan::AFL_ID_BASE), edges= how far
+// AFL++'s numbering went, which is also how big the coverage map has to be.
+//
+// The cid repeats whichever edge it was taken from, so the backend can look up
+// (cid, direction) uniformly rather than special-casing the direction the id
+// happens to name.
+//
+// Case values are printed the way TaintFunction::visitSwitchInst hands them to
+// the runtime, zero-extended to 64 bits, so that a reader can rebuild the
+// per-case id with symsan::switch_case_cid() and meet the runtime's own
+// derivation.  Written before any IR is touched, so what it describes is
+// exactly the module AFL++ numbered.
+void Taint::writeBranchMap(Module &M) {
+  if (ClBranchMap.empty())
+    return;
+  if (!AflMapPtr) {
+    errs() << "SymSan: -taint-branch-map given, but this module has no "
+              "AFL++ instrumentation to map against\n";
+    return;
+  }
+
+  std::string Buf = "# symsan branch map v1 base=" +
+                    std::to_string(symsan::AFL_ID_BASE) +
+                    " edges=" + std::to_string(AflEdges) + "\n";
+
+  auto EdgeStr = [this](uint32_t Id) {
+    return Id == InvalidInstructionId ? std::string("-1") : std::to_string(Id);
+  };
+
+  SmallVector<uint32_t, 8> Targets;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        // Every select with ids, not just the ones that end up traced: whether
+        // a condition carries a label is a runtime property, and the map has to
+        // be able to answer for any branch the trace reports.
+        auto *SI = dyn_cast<SelectInst>(&I);
+        if (!SI)
+          continue;
+        Targets.clear();
+        if (!getAflBranchTargets(SI, Targets))
+          continue;
+        Buf += "X " + std::to_string(getBranchId(SI)) + " " +
+               EdgeStr(Targets[0]) + " " + EdgeStr(Targets[1]) + "\n";
+      }
+
+      Instruction *Term = BB.getTerminator();
+      Targets.clear();
+      if (!getAflBranchTargets(Term, Targets))
+        continue;
+      uint32_t Cid = getBranchId(Term);
+      if (isa<BranchInst>(Term)) {
+        Buf += "C " + std::to_string(Cid) + " " + EdgeStr(Targets[0]) + " " +
+               EdgeStr(Targets[1]) + "\n";
+      } else {
+        // Targets is [default, case 0, case 1, ...], in cases() order.
+        auto *SW = cast<SwitchInst>(Term);
+        Buf += "D " + std::to_string(Cid) + " " + EdgeStr(Targets[0]) + "\n";
+        unsigned Idx = 1;
+        for (auto C : SW->cases()) {
+          uint64_t Value =
+              C.getCaseValue()->getValue().zextOrTrunc(64).getZExtValue();
+          Buf += "S " + std::to_string(Cid) + " " + std::to_string(Value) +
+                 " " + EdgeStr(Targets[Idx++]) + "\n";
+        }
+      }
+    }
+  }
+
+  // Truncating, not appending: one module, one writer, unlike
+  // flushDocumentedIds().  A failure is fatal here -- the backend silently
+  // loses every coverage decision if the map is missing, and a build that
+  // asked for one should not quietly produce a binary without it.
+  std::error_code EC;
+  raw_fd_ostream OS(ClBranchMap, EC, sys::fs::OF_Text);
+  if (EC) {
+    report_fatal_error(Twine("SymSan: cannot write -taint-branch-map file ") +
+                       ClBranchMap + ": " + EC.message());
+  }
+  OS << Buf;
 }
 
 void Taint::addContextRecording(Function &F) {
@@ -1125,6 +1527,23 @@ bool Taint::initializeModule(Module &M) {
   // exporting one variable.
   if (const char *P = getenv("SYMSAN_DOCUMENT_IDS"))
     DocumentIdsPath = P;
+  // Left as an external declaration by AFL++'s link-time instrumentation, and
+  // absent from anything else, so it doubles as the "were we handed an
+  // AFL-instrumented module?" test.  See getBranchId() and ClWithAfl.
+  if (ClWithAfl != cl::BOU_FALSE)
+    AflMapPtr = M.getGlobalVariable("__afl_area_ptr", /*AllowInternal=*/true);
+  if (ClWithAfl == cl::BOU_TRUE && !AflMapPtr)
+    report_fatal_error("SymSan: -taint-with-afl given, but this module has no "
+                       "AFL++ link-time instrumentation (@__afl_area_ptr)");
+  // Unlike the map pointer, __afl_final_loc is *defined* by AFL++'s pass, with
+  // the edge count as its static initialiser, so how far the fuzzer's own
+  // numbering went can be read straight out of the module.
+  if (AflMapPtr) {
+    auto *FinalLoc = M.getGlobalVariable("__afl_final_loc", true);
+    if (FinalLoc && FinalLoc->hasInitializer())
+      if (auto *CI = dyn_cast<ConstantInt>(FinalLoc->getInitializer()))
+        AflEdges = (uint32_t)CI->getZExtValue();
+  }
   Int8Ty = IntegerType::get(*Ctx, 8);
   Int16Ty = IntegerType::get(*Ctx, 16);
   Int32Ty = IntegerType::get(*Ctx, 32);
@@ -1664,6 +2083,11 @@ bool Taint::runImpl(Module &M) {
 
   // Before touching any IR: see findReadOnlyTables().
   findReadOnlyTables(M);
+  // Before instrumenting too, so that the CFG this walks is the one AFL++
+  // numbered -- TaintPass splits edges of its own later on -- and so that every
+  // branch id the visitor goes on to bake into a __taint_trace_cond call is one
+  // the map has a line for.
+  writeBranchMap(M);
 
   std::vector<Function *> FnsToInstrument;
   SmallPtrSet<Function *, 8> IFuncs;
@@ -3916,7 +4340,7 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   Value *CondShadow = getShadow(Cond);
   if (TT.isZeroShadow(CondShadow))
     return;
-  uint32_t cid = TT.getInstructionId(I);
+  uint32_t cid = TT.getBranchId(I);
   if (cid == TT.InvalidInstructionId)
     return;
   TT.documentBranchId(cid, I, "switch");
@@ -4272,11 +4696,19 @@ Value* TaintFunction::visitSelectInst(Value *Cond, Value *TrueShadow,
   }
 
   // special case, when select is used to implement logical AND and OR
+  uint32_t cid = TT.getBranchId(I);
+  if (cid == TT.InvalidInstructionId) {
+    // Nothing the coverage map can be asked about (see getAflBranchTargets):
+    // leave the select untraced, and combine the shadows the way the wider
+    // types do.
+    return TrueShadow == FalseShadow ? TrueShadow :
+        SelectInst::Create(Cond, TrueShadow, FalseShadow, "", I);
+  }
   IRBuilder<> IRB(I);
   Cond = IRB.CreateZExt(Cond, TT.Int8Ty);
   Value *TrueVal = IRB.CreateZExt(I->getTrueValue(), TT.Int8Ty);
   Value *FalseVal = IRB.CreateZExt(I->getFalseValue(), TT.Int8Ty);
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, cid);
   return IRB.CreateCall(TT.TaintTraceSelectFn,
                         {CondShadow, TrueShadow, FalseShadow, Cond,
                          TrueVal, FalseVal, CID});
@@ -5333,7 +5765,7 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   // except for loop exit
   if (TT.isZeroShadow(Shadow) && (flag & LoopExitBranch) == 0)
     return;
-  uint32_t cid = TT.getInstructionId(I);
+  uint32_t cid = TT.getBranchId(I);
   if (cid == TT.InvalidInstructionId)
     return; // XXX: forget about loop?
   TT.documentBranchId(cid, I, isa<BranchInst>(I) ? "br" : "select");
