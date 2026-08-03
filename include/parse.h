@@ -112,6 +112,22 @@ public:
     return 0;
   };
 
+  /// @brief Why the last parse_cond/parse_gep produced no task
+  ///
+  /// The parsers already say why they gave up, but only to stderr and only in
+  /// prose, so the question "which rejection costs us the most branches on this
+  /// target" can be answered by grepping a log and not much else.  This is the
+  /// same reason as a short, stable string, chosen so that it can be used as a
+  /// histogram key across a whole corpus.  Empty when the last call succeeded.
+  ///
+  /// Not only the -1 returns.  A parse can also come back 0 with an empty task
+  /// list -- a condition that folded to a constant is the common one -- and
+  /// that is a rejection too as far as "which branches are we not solving" is
+  /// concerned, so it is worth a reason on the same footing.  What does *not*
+  /// belong here is an early return the caller could have predicted from its
+  /// own arguments: see parse_gep's enum_index.
+  const std::string &last_error() const { return last_error_; }
+
   // use shared_ptr to auto-free task
   virtual std::shared_ptr<T> retrieve_task(uint64_t id) {
     auto it = tasks_.find(id);
@@ -124,6 +140,12 @@ public:
   }
 
 protected:
+  /// Record why this parse is being abandoned. Pass a literal, or a message
+  /// from a caught exception; either way keep it free of labels and addresses,
+  /// so that two occurrences of the same cause share a histogram bucket.
+  inline void set_error(const char *reason) { last_error_ = reason; }
+  inline void clear_error() { last_error_.clear(); }
+
   inline dfsan_label_info* get_label_info(dfsan_label label) {
     if (label >= size_) {
       throw std::out_of_range("label too large " + std::to_string(label));
@@ -148,6 +170,7 @@ protected:
   dfsan_label_info *base_;
   size_t size_;
   uint64_t prev_task_id_;
+  std::string last_error_;
   std::unordered_map<uint64_t, std::shared_ptr<T>> tasks_;
   std::unordered_map<dfsan_label, std::unique_ptr<uint8_t[]>> memcmp_cache_;
   std::unordered_map<uint64_t, table_content> table_cache_;

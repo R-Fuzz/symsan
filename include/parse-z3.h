@@ -232,11 +232,55 @@ private:
     }
     Z3_ast ast = expr_cache_[label];
     if (ast == nullptr) {
+      // A label serialize() gave up on -- see poison_label -- or one that was
+      // never filled.  Report the original cause where we have it: "cannot find
+      // cached expression" is the symptom, and says nothing about which
+      // construct the parser could not model.
+      auto it = poison_reason_.find(label);
+      if (it != poison_reason_.end()) {
+        throw z3::exception(it->second.c_str());
+      }
+      // Alloca/Free carry concrete allocation bounds and nothing else, so
+      // serialize() caches a null for them on purpose rather than failing.
+      // Asking one for an expression means a condition compared the *pointer*
+      // -- `if (p != NULL)` on a heap object is the common shape -- which is
+      // not solvable and should not be, but it is a different thing from a
+      // label the parser could not build, and it is not worth an entry in
+      // poison_reason_ (one per allocation) to say so.
+      dfsan_label_info *info = nullptr;
+      try { info = this->get_label_info(label); } catch (...) {}
+      if (info != nullptr &&
+          (info->op == __dfsan::Alloca || info->op == __dfsan::Free)) {
+        throw z3::exception("pointer compared against allocation bounds");
+      }
       throw z3::exception("cannot find cached expression");
     }
     deps.insert(deps_cache_[label].begin(), deps_cache_[label].end());
     return z3::expr(context_, ast);
   }
+
+  /// @brief Give up on one label without giving up on the rest of the trace
+  ///
+  /// serialize() is a linear fill: it resumes at expr_cache_.size() and walks
+  /// forward, so a label that throws part-way through leaves the caches short,
+  /// and every later call restarts on that same label and throws again.  One
+  /// unmodelable label therefore used to cost the whole remainder of the trace
+  /// -- measured on a libpng corpus seed, 9159 of the 9167 rejected branches
+  /// were a single label re-hit, and the caches that do grow before the throw
+  /// (deps_cache_, tsize_cache_) ended up 9159 entries ahead of the rest, so
+  /// every subsequent deps_cache_[l] answered for a different label.
+  ///
+  /// Write a placeholder instead: a null expression, which get_cached_expr
+  /// already treats as unusable, and a neutral entry in every parallel cache.
+  /// Labels that depend on this one still fail -- correctly, the parser cannot
+  /// model them either -- and labels that do not are unaffected.
+  void poison_label(dfsan_label l, const char *reason);
+
+  /// Why each poisoned label was abandoned, so that a dependent's failure can
+  /// name the original cause rather than the missing entry.  Expected to stay
+  /// small: it holds one entry per label the parser could not build, not per
+  /// label.
+  std::unordered_map<dfsan_label, std::string> poison_reason_;
 
   inline void dump_value_cache(dfsan_label label);
 

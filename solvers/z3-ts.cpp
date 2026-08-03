@@ -16,6 +16,30 @@
 
 using namespace symsan;
 
+// Diagnostic output, same switch the sibling solvers and parsers use.  Off by
+// default: nearly everything this file used to print fires once per rejected
+// branch, and on a real target that is millions of lines -- dump_value_cache
+// alone walks the whole ancestor tree of the failing label.  What the callers
+// actually need from a rejection is now last_error(), which is a short stable
+// string they can bucket; the prose is for a human staring at one label.
+// Build with -DDEBUG=1 to get it back.
+#ifndef DEBUG
+#define DEBUG 0
+#endif
+
+#if DEBUG
+#define DEBUGF(_str...) do { fprintf(stderr, _str); } while (0)
+#else
+#undef DEBUGF
+#define DEBUGF(_str...) do { } while (0)
+#endif
+
+// Reserved for what has no other channel: a rejection the caller cannot see in
+// last_error() because it is not a parse.
+#ifndef WARNF
+#define WARNF(_str...) do { fprintf(stderr, _str); } while (0)
+#endif
+
 #define FILTER_WRONG_AST 1
 
 static const uint64_t MAX_STRLEN_EXTEND = 4096;
@@ -172,22 +196,31 @@ static std::vector<uint8_t> decode_z3_string(const std::string &str) {
 }
 
 void Z3AstParser::dump_value_cache(dfsan_label label) {
+#if !DEBUG
+  // Silencing the prints is not enough here: this recurses over the whole
+  // ancestor tree of the failing label, so at DEBUG=0 it would be a deep tree
+  // walk that produces nothing.  The callers are failure paths that fire once
+  // per rejected branch.
+  (void)label;
+}
+#else
   if (label < CONST_OFFSET || label >= size_) {
-    fprintf(stderr, "  label %u: out of range\n", label);
+    DEBUGF("  label %u: out of range\n", label);
     return;
   }
   dfsan_label_info *info = get_label_info(label);
-  fprintf(stderr, "  label %u = (l1:%u, l2:%u, op:%s(0x%x), size:%u, op1:%lu, op2:%lu)",
+  DEBUGF("  label %u = (l1:%u, l2:%u, op:%s(0x%x), size:%u, op1:%lu, op2:%lu)",
           label, info->l1, info->l2, get_op_name(info->op).c_str(), info->op,
           info->size, info->op1.i, info->op2.i);
   if (label < value_cache_.size())
-    fprintf(stderr, " val:%lu", value_cache_[label]);
-  fprintf(stderr, "\n");
+    DEBUGF(" val:%lu", value_cache_[label]);
+  DEBUGF("\n");
   if (info->l1 >= CONST_OFFSET)
     dump_value_cache(info->l1);
   if (info->l2 >= CONST_OFFSET)
     dump_value_cache(info->l2);
 }
+#endif
 
 Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
   : ASTParser(base, size), context_(context) {
@@ -227,6 +260,7 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
   is_label_bv_.resize(1);  // reserve for CONST_OFFSET
   is_label_seq_.clear();
   is_label_seq_.resize(1); // reserve for CONST_OFFSET
+  poison_reason_.clear();
 
   aux_constraints_.clear();
   minimize_hints_.clear();
@@ -609,6 +643,40 @@ static bool wide_value_unknown(const dfsan_label_info *info,
 }
 #endif
 
+void Z3AstParser::poison_label(dfsan_label l, const char *reason) {
+  // Bring every parallel cache to exactly l + 1 entries: the ones that grew
+  // before the throw (deps_cache_ and tsize_cache_ always do, being pushed
+  // ahead of the switch) are trimmed back, the ones after it are filled.
+  // Trimming rather than assuming a size keeps this correct wherever in the
+  // label body the exception came from.
+  if (expr_cache_.size() > l) {
+    for (size_t i = l; i < expr_cache_.size(); i++) {
+      if (expr_cache_[i] != nullptr) {
+        Z3_dec_ref(context_, expr_cache_[i]);
+      }
+    }
+    expr_cache_.resize(l);
+  }
+  expr_cache_.emplace_back(nullptr);
+  deps_cache_.resize(l);
+  deps_cache_.emplace_back();
+  tsize_cache_.resize(l);
+  tsize_cache_.emplace_back(1);
+#if FILTER_WRONG_AST
+  value_cache_.resize(l);
+  value_cache_.emplace_back(0);
+  // Unknown, not zero: a dependent's consistency check has nothing to compare
+  // against here, and must not read the placeholder as a real value.
+  value_unknown_.resize(l);
+  value_unknown_.emplace_back(1);
+#endif
+  is_label_bv_.resize(l);
+  is_label_bv_.emplace_back(false);
+  is_label_seq_.resize(l);
+  is_label_seq_.emplace_back(false);
+  poison_reason_[l] = reason;
+}
+
 z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel) {
     throw z3::exception("invalid label");
@@ -663,10 +731,17 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     is_label_seq_.emplace_back(seq); \
   } while (0)
 
+    // Outside the try below: an out-of-range label here means the *caller*
+    // asked for something past the end of the shadow table, and walking on to
+    // poison every label up to it would be a long way to reach the same answer.
     dfsan_label_info *info = get_label_info(l);
     // fprintf(stderr, "%u = (l1:%u, l2:%u, op:%s, size:%u, op1:%lu, op2:%lu)\n",
     //         l, info->l1, info->l2, get_op_name(info->op).c_str(),
     //         info->size, info->op1.i, info->op2.i);
+
+    // Anything this label cannot model is recorded against the label and the
+    // fill moves on; see poison_label for why that beats letting it out.
+    try {
     input_dep_set_t &input_deps = deps_cache_.emplace_back();
 
     // special ops
@@ -731,7 +806,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       if (!base.is_bv()) {
-        fprintf(stderr, "WARNING: Trunc on non-BV (label=%u, l1=%u, sort=%s)\n",
+        DEBUGF("WARNING: Trunc on non-BV (label=%u, l1=%u, sort=%s)\n",
                 l, info->l1, base.get_sort().to_string().c_str());
         dump_value_cache(l);
       }
@@ -749,7 +824,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       // MSB -- which is the reversal.  The blaster collapses this to wiring.
       z3::expr base = get_cached_expr(info->l1, input_deps);
       if (!base.is_bv()) {
-        fprintf(stderr, "WARNING: BitReverse on non-BV (label=%u, l1=%u, sort=%s)\n",
+        DEBUGF("WARNING: BitReverse on non-BV (label=%u, l1=%u, sort=%s)\n",
                 l, info->l1, base.get_sort().to_string().c_str());
         throw z3::exception("bitreverse on non-bitvector operand");
       }
@@ -1054,7 +1129,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
              info->op == __dfsan::fp_log || info->op == __dfsan::fp_log2 ||
              info->op == __dfsan::fp_log10 || info->op == __dfsan::fp_log1p ||
              info->op == __dfsan::fp_pow) {
-      fprintf(stderr, "WARNING: unsupported FP transcendental op %u "
+      DEBUGF("WARNING: unsupported FP transcendental op %u "
               "(i2s-only) for label %u\n", info->op & 0xff, l);
       throw z3::exception("unsupported FP transcendental (i2s-only)");
     }
@@ -1063,7 +1138,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       if (!base.is_bv()) {
-        fprintf(stderr, "WARNING: Extract on non-BV (label=%u, l1=%u, sort=%s)\n",
+        DEBUGF("WARNING: Extract on non-BV (label=%u, l1=%u, sort=%s)\n",
                 l, info->l1, base.get_sort().to_string().c_str());
         dump_value_cache(l);
       }
@@ -2223,7 +2298,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         cache_expr(l, z3::udiv(op1, op2));
         TRACK_LABEL_BV_ONLY();
         if (val2 == 0) {
-          fprintf(stderr, "WARNING: division by zero for label %u\n", l);
+          DEBUGF("WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
         } else
           RECORD_VALUE(val1 / val2);
@@ -2233,7 +2308,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         cache_expr(l, op1 / op2);
         TRACK_LABEL_BV_ONLY();
         if (val2 == 0) {
-          fprintf(stderr, "WARNING: division by zero for label %u\n", l);
+          DEBUGF("WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
         } else
           RECORD_VALUE((int64_t)val1 / (int64_t)val2);
@@ -2243,7 +2318,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         cache_expr(l, z3::urem(op1, op2));
         TRACK_LABEL_BV_ONLY();
         if (val2 == 0) {
-          fprintf(stderr, "WARNING: division by zero for label %u\n", l);
+          DEBUGF("WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
         } else
           RECORD_VALUE(val1 % val2);
@@ -2253,7 +2328,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         cache_expr(l, z3::srem(op1, op2));
         TRACK_LABEL_BV_ONLY();
         if (val2 == 0) {
-          fprintf(stderr, "WARNING: division by zero for label %u\n", l);
+          DEBUGF("WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
         } else
           RECORD_VALUE((int64_t)val1 % (int64_t)val2);
@@ -2321,7 +2396,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         if (!operands_unknown &&
             ((info->op1.i & valmask) != val1 ||
              (info->op2.i & valmask) != val2)) {
-          fprintf(stderr, "DEBUG serialize ICmp: VALUE MISMATCH detected\n");
+          DEBUGF("DEBUG serialize ICmp: VALUE MISMATCH detected\n");
           // fprintf(stderr, "WARNING: value mismatch for label %u: "
           //         "expected op1 %lu, got %lu, expected op2 %lu, got %lu\n",
           //         l, info->op1.i, val1, info->op2.i, val2);
@@ -2334,13 +2409,13 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // - indexOf operations: op1 repurposed for haystack pointer, skip validation
           bool is_special = false;
           if (l1_op == __dfsan::fmemcmp || l1_op == __dfsan::fatoi || l1_op == __dfsan::fstrcmp) {
-            fprintf(stderr, "DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
+            DEBUGF("DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
                     info->l1, value_cache_[info->l1], (uint64_t)info->op1.i, l1_op);
             value_cache_[info->l1] = val1 = info->op1.i;
             is_special = true;
           }
           if (l2_op == __dfsan::fmemcmp || l2_op == __dfsan::fatoi || l2_op == __dfsan::fstrcmp) {
-            fprintf(stderr, "DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
+            DEBUGF("DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
                     info->l2, value_cache_[info->l2], (uint64_t)info->op2.i, l2_op);
             value_cache_[info->l2] = val2 = info->op2.i;
             is_special = true;
@@ -2405,10 +2480,19 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         break;
       }
       default:
-        fprintf(stderr, "WARNING: unsupported operator %u for label %u\n",
+        DEBUGF("WARNING: unsupported operator %u for label %u\n",
                 info->op & 0xff, l);
         throw z3::exception("unsupported operator");
         break;
+    }
+    } catch (const std::exception &e) {
+      // z3::exception derives from std::exception and overrides what(), so this
+      // catches both the parser's own "cannot model this" throws and anything
+      // the standard library raises on the way.  The reason is kept free of the
+      // label so that two occurrences of the same cause share a bucket.
+      poison_label(l, e.what());
+    } catch (...) {
+      poison_label(l, "unknown exception");
     }
   }
 
@@ -2419,8 +2503,10 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
     // invalid label
+    set_error("invalid label");
     return -1;
   }
+  clear_error();
 
   // allocate a new task
   auto task = std::make_shared<z3_task_t>();
@@ -2428,9 +2514,12 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     // reset has_fsize flag
     has_fsize = false;
 
-    // parse last branch cond
+    // parse last branch cond.  serialize() and simplify() are kept apart so the
+    // pre-simplification expression survives: it is the only thing that can say
+    // why a condition came out constant (see below), and simplify() erases it.
     input_dep_set_t inputs;
-    z3::expr cond = serialize(label, inputs).simplify();
+    z3::expr raw = serialize(label, inputs);
+    z3::expr cond = raw.simplify();
 
     // fix cond if it's bv1
     if (cond.is_bv() && cond.get_sort().bv_size() == 1) {
@@ -2441,6 +2530,21 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
       // constant condition, no need to add constraint
       // fprintf(stderr, "DEBUG parse_cond: label %u = %s is constant %d,\n",
       //         label, cond.to_string().c_str(), result);
+      // Not a failure, but the branch is dropped all the same and it is worth
+      // being able to count that separately from the ones that threw.
+      //
+      // Two causes end up here, and only one of them is ours.  An AST that was
+      // already structurally constant is a fold __taint_union could have done
+      // and did not -- x <pred> x and a comparison against the saturated value
+      // of its own width were both found this way and are now folded at the
+      // source.  What is left is input-dependent and only decided once z3
+      // reasons about known bits and ranges (`(7 & 24*x) != 0`, or two
+      // differently-shaped expressions that denote the same value), which the
+      // runtime cannot do without a real abstract domain.  Telling the two
+      // apart again means dumping the *unsimplified* expression from `raw`
+      // here alongside the label's ancestors; simplify() has already erased the
+      // evidence by the time `cond` exists.
+      set_error("constant condition");
       return 0;
     }
 
@@ -2457,10 +2561,11 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     if (!contains_indexof && !value_is_unknown(label) &&
         value_cache_[label] != result) {
       // recalcuated value must match the recorded value
-      fprintf(stderr, "WARNING: value mismatch for label %u: expected %lu, got %d\n",
+      DEBUGF("WARNING: value mismatch for label %u: expected %lu, got %d\n",
               label, value_cache_[label], result);
-      fprintf(stderr, "cond: %s\n", cond.to_string().c_str());
+      DEBUGF("cond: %s\n", cond.to_string().c_str());
       dump_value_cache(label);
+      set_error("value mismatch for cond");
       return -1;
     }
 #endif
@@ -2486,12 +2591,18 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
     return 0; // success
   } catch (z3::exception e) {
-    fprintf(stderr, "WARNING: parsing error: %s (label=%u)\n", e.msg(), label);
+    DEBUGF("WARNING: parsing error: %s (label=%u)\n", e.msg(), label);
     try { dump_value_cache(label); } catch (...) {}
+    set_error(e.msg());
   } catch (std::exception& e) {
-    fprintf(stderr, "WARNING: std::exception in parse_cond: %s\n", e.what());
+    DEBUGF("WARNING: std::exception in parse_cond: %s\n", e.what());
+    // std::out_of_range from get_label_info carries the offending label, which
+    // would give every occurrence its own histogram bucket; the cause is the
+    // same one either way.
+    set_error("std::exception");
   } catch (...) {
-    fprintf(stderr, "WARNING: unknown exception in parse_cond\n");
+    DEBUGF("WARNING: unknown exception in parse_cond\n");
+    set_error("unknown exception");
   }
 
   // exception happened, nothing added
@@ -2528,14 +2639,25 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
       index_label == __dfsan::kInitializingLabel || index_label >= size_ ||
       ptr_label == __dfsan::kInitializingLabel || ptr_label >= size_) {
     // invalid label
+    set_error("invalid label");
     return -1;
   }
+  clear_error();
 
-  // early return if nothing to do
-  if (!enum_index || // if we are not enumerating the index
-      (num_elems == 0 && // if the GEP type is not an array,
-       // and we also don't have a pointer label
-       ptr_label == 0)) {
+  // early return if nothing to do.  Two separate cases, kept apart because only
+  // one of them is about the GEP.  Not asking for enumeration is a policy of the
+  // caller's -- ConcolicSession always passes false -- so it gets no reason:
+  // whoever passed the flag already knows, and a bucket for it says nothing
+  // about this GEP while burying the ones that do behind one row per GEP in the
+  // trace.  Having neither an array extent nor a bounds label, on the other
+  // hand, is a property of the instrumentation, and is worth a bucket.
+  if (!enum_index) {
+    return 0;
+  }
+  if (num_elems == 0 && // if the GEP type is not an array,
+      // and we also don't have a pointer label
+      ptr_label == 0) {
+    set_error("gep not enumerable");
     return 0;
   }
 
@@ -2550,8 +2672,9 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
 #if FILTER_WRONG_AST
     if (!value_is_unknown(index_label) && value_cache_[index_label] != index) {
       // recalculated value must match the recorded value
-      fprintf(stderr, "WARNING: value mismatch for label %u: expected %ld, got %ld\n",
+      DEBUGF("WARNING: value mismatch for label %u: expected %ld, got %ld\n",
               index_label, value_cache_[index_label], index);
+      set_error("value mismatch for gep index");
       return -1;
     }
 #endif
@@ -2615,10 +2738,13 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
     return 0; // success
   } catch (z3::exception e) {
     // logf("WARNING: solving error: %s\n", e.msg());
+    set_error(e.msg());
   } catch (std::exception& e) {
-    fprintf(stderr, "WARNING: std::exception in parse_gep: %s\n", e.what());
+    DEBUGF("WARNING: std::exception in parse_gep: %s\n", e.what());
+    set_error("std::exception");
   } catch (...) {
-    fprintf(stderr, "WARNING: unknown exception in parse_gep\n");
+    DEBUGF("WARNING: unknown exception in parse_gep\n");
+    set_error("unknown exception");
   }
 
   // exception happened, nothing added
@@ -2661,7 +2787,7 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
     if (!label_contains_indexof(label) && !value_is_unknown(label) &&
         value_cache_[label] != result) {
       // recalculated value must match the recorded value
-      fprintf(stderr, "WARNING: value mismatch for label %u: expected %ld, got %ld\n",
+      DEBUGF("WARNING: value mismatch for label %u: expected %ld, got %ld\n",
               label, value_cache_[label], result);
       return -1;
     }
@@ -2687,10 +2813,10 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
   } catch (z3::exception e) {
     return -1;
   } catch (std::exception& e) {
-    fprintf(stderr, "WARNING: std::exception in add_constraints: %s\n", e.what());
+    DEBUGF("WARNING: std::exception in add_constraints: %s\n", e.what());
     return -1;
   } catch (...) {
-    fprintf(stderr, "WARNING: unknown exception in add_constraints\n");
+    DEBUGF("WARNING: unknown exception in add_constraints\n");
     return -1;
   }
 
@@ -2709,7 +2835,7 @@ int Z3AstParser::record_minimize(dfsan_label label, bool allow_zero) {
       minimize_hints_.push_back({expr, allow_zero, inputs});
     }
   } catch (z3::exception e) {
-    fprintf(stderr, "WARNING: z3 exception in record_minimize: %s\n", e.msg());
+    DEBUGF("WARNING: z3 exception in record_minimize: %s\n", e.msg());
     return -1;
   } catch (...) {
     return -1;
@@ -2959,7 +3085,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           m = solver.get_model();
           // fprintf(stderr, "DEBUG solve_task[%lu]: nested SAT model:\n%s\n", task_id, m.to_string().c_str());
         } else if (res == z3::unsat) {
-          fprintf(stderr, "WARNING: nested unsat for task %lu: %s\n",
+          DEBUGF("WARNING: nested unsat for task %lu: %s\n",
               task_id, solver.to_smt2().c_str());
           ret = opt_sat_nested_unsat;
         } else {
@@ -3120,13 +3246,13 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
       ret = opt_timeout;
     }
   } catch (z3::exception ze) {
-    fprintf(stderr, "WARNING: solve_task[%lu]: z3 exception: %s\n", task_id, ze.msg());
+    WARNF("WARNING: solve_task[%lu]: z3 exception: %s\n", task_id, ze.msg());
     ret = unknown_error;
   } catch (std::bad_alloc &) {
-    fprintf(stderr, "WARNING: solve_task[%lu]: out of memory\n", task_id);
+    WARNF("WARNING: solve_task[%lu]: out of memory\n", task_id);
     ret = unknown_error;
   } catch (std::exception &e) {
-    fprintf(stderr, "WARNING: solve_task[%lu]: exception: %s\n", task_id, e.what());
+    WARNF("WARNING: solve_task[%lu]: exception: %s\n", task_id, e.what());
     ret = unknown_error;
   }
 
@@ -3298,7 +3424,7 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
           std::string raw_str = e.get_string();
           std::vector<uint8_t> bytes = decode_z3_string(raw_str);
           uint32_t new_len = bytes.size();
-          fprintf(stderr, "DEBUG generate_solution: str-%u-%u-%u: orig=%u, new=%u, raw='%s'\n",
+          DEBUGF("DEBUG generate_solution: str-%u-%u-%u: orig=%u, new=%u, raw='%s'\n",
                   input, offset, orig_len, orig_len, new_len, raw_str.c_str());
 
           // Skip empty str- variables that are connected (via adjacent or
@@ -3347,7 +3473,7 @@ void Z3ParserSolver::generate_solution(z3::model &m, solution_t &solutions) {
                 }
               }
               if (has_nonempty_sibling) {
-                fprintf(stderr, "DEBUG generate_solution: str-%u-%u-%u: "
+                DEBUGF("DEBUG generate_solution: str-%u-%u-%u: "
                         "skipping empty (has non-empty adjacent sibling)\n",
                         input, offset, orig_len);
                 continue;
@@ -3466,13 +3592,13 @@ int Z3ParserSolver::export_task_smt2(uint64_t task_id, int fd) {
     }
     return 0;
   } catch (z3::exception &e) {
-    fprintf(stderr, "WARNING: export_task_smt2[%lu]: %s\n", task_id, e.msg());
+    WARNF("WARNING: export_task_smt2[%lu]: %s\n", task_id, e.msg());
     return -1;
   } catch (std::bad_alloc &) {
-    fprintf(stderr, "WARNING: export_task_smt2[%lu]: out of memory\n", task_id);
+    WARNF("WARNING: export_task_smt2[%lu]: out of memory\n", task_id);
     return -1;
   } catch (std::exception &e) {
-    fprintf(stderr, "WARNING: export_task_smt2[%lu]: %s\n", task_id, e.what());
+    WARNF("WARNING: export_task_smt2[%lu]: %s\n", task_id, e.what());
     return -1;
   }
 }
