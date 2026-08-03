@@ -1,11 +1,12 @@
 //! Which stage found each corpus entry.
 //!
 //! The fuzzer runs three stages that can add to the corpus -- SymSan, cmplog's
-//! RedQueen, and havoc -- and until now nothing recorded which one did.  The
-//! corpus is an `InMemoryCorpus`, so it is not even on disk to inspect
-//! afterwards, and a testcase carries no tag saying where it came from: every
-//! stage reaches the corpus through the same `fuzzer.evaluate_*`, which has no
-//! idea who called it.
+//! RedQueen, and havoc -- and until now nothing recorded which one did.  A
+//! testcase carries no tag saying where it came from: every stage reaches the
+//! corpus through the same `fuzzer.evaluate_*`, which has no idea who called
+//! it.  The corpus is on disk (`<out>/queue`), so an entry can at least be
+//! inspected afterwards, but its name is a hash of its contents and says
+//! nothing about its origin either.
 //!
 //! [`CreditedStage`] answers the question from the outside instead of threading
 //! provenance through LibAFL: it wraps a stage and measures how much the corpus

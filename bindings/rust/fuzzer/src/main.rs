@@ -57,7 +57,7 @@ use std::time::Duration;
 use clap::Parser;
 use libafl::{
     Error, HasMetadata,
-    corpus::{Corpus, InMemoryCorpus, OnDiskCorpus},
+    corpus::{CachedOnDiskCorpus, Corpus, DynamicCorpus, InMemoryCorpus, OnDiskCorpus},
     events::SimpleEventManager,
     executors::{
         HasObservers, StdChildArgs,
@@ -101,6 +101,24 @@ use nix::sys::signal::Signal;
 /// Size of the AFL-style coverage map shared with the forkserver, when
 /// `AFL_MAP_SIZE` does not say otherwise.
 const DEFAULT_MAP_SIZE: usize = 65536;
+
+/// Default for `--corpus-cache`: how many corpus entries the on-disk corpus
+/// keeps in memory.
+///
+/// Every entry is on disk either way; this only decides how often one has to be
+/// read back. A libpng campaign reaches a few hundred entries in ten minutes,
+/// so at this size nothing is evicted in a short run and a long one keeps its
+/// working set -- the scheduler comes back to recent entries far more often
+/// than to old ones.
+const CORPUS_CACHE: usize = 4096;
+
+/// The corpus, chosen at startup by `--in-memory-corpus`.
+///
+/// `DynamicCorpus` is LibAFL's two-variant enum rather than a `dyn Corpus`, so
+/// the choice costs a match per access and nothing in the type system: one
+/// monomorphised fuzzing loop serves both.
+type FuzzCorpus =
+    DynamicCorpus<CachedOnDiskCorpus<BytesInput>, InMemoryCorpus<BytesInput>, BytesInput>;
 
 /// Size of the AFL-style coverage map shared with the forkserver.
 ///
@@ -190,7 +208,7 @@ struct Opt {
     #[arg(short = 'i', long = "input", required = true)]
     in_dir: PathBuf,
 
-    /// Directory for crashes.
+    /// Directory for the corpus (`queue/`) and the crashes (`crashes/`).
     #[arg(short = 'o', long = "output", default_value = "./out")]
     out_dir: PathBuf,
 
@@ -291,6 +309,21 @@ struct Opt {
     #[arg(long = "symsan-solve-ub", default_value = "false")]
     symsan_solve_ub: bool,
 
+    /// Keep the corpus in memory only, instead of writing it to
+    /// `<output>/queue`. The queue is what lets a trace be replayed after the
+    /// fact, so this is for a run whose corpus is of no interest afterwards --
+    /// or one whose output directory is somewhere writing it would hurt.
+    /// Crashes are written either way.
+    #[arg(long = "in-memory-corpus", default_value = "false")]
+    in_memory_corpus: bool,
+
+    /// How many corpus entries to hold in memory when the corpus is on disk.
+    /// Entries past this are read back from `<output>/queue` when the scheduler
+    /// asks for them; no entry is ever lost, so this trades memory for reads.
+    /// Ignored with `--in-memory-corpus`.
+    #[arg(long = "corpus-cache", default_value_t = CORPUS_CACHE)]
+    corpus_cache: usize,
+
     /// Show the target's stdout and stderr.
     #[arg(short = 'd', long = "debug-child", default_value = "false")]
     debug_child: bool,
@@ -363,11 +396,26 @@ pub fn main() -> Result<(), libafl::Error> {
 
     std::fs::create_dir_all(&opt.out_dir)?;
 
+    // On disk by default, in AFL's spelling, because an in-memory corpus cannot
+    // be debugged after the fact: the interesting question about a campaign is
+    // usually "what did SymSan do with *that* input", and answering it needs the
+    // input.  Cached rather than plain on-disk so the hot path -- the scheduler
+    // handing the same entry back for another round -- still reads from memory;
+    // `--corpus-cache` bounds that cache, not the corpus.
+    let corpus = if opt.in_memory_corpus {
+        FuzzCorpus::corpus2(InMemoryCorpus::new())
+    } else {
+        FuzzCorpus::corpus1(CachedOnDiskCorpus::new(
+            opt.out_dir.join("queue"),
+            opt.corpus_cache,
+        )?)
+    };
+
     let mut state = StdState::new(
         // `from_entropy` rather than a fixed seed: two instances started in the
         // same second should not explore identically.
         StdRand::new(),
-        InMemoryCorpus::<BytesInput>::new(),
+        corpus,
         OnDiskCorpus::new(opt.out_dir.join("crashes"))?,
         &mut feedback,
         &mut objective,
@@ -609,7 +657,7 @@ pub fn main() -> Result<(), libafl::Error> {
             let run_once_per_entry =
                 move |_fuzzer: &mut _,
                       _executor: &mut _,
-                      state: &mut StdState<InMemoryCorpus<BytesInput>, _, _, _>,
+                      state: &mut StdState<FuzzCorpus, _, _, _>,
                       _mgr: &mut _|
                       -> Result<bool, Error> {
                     if state.current_testcase()?.scheduled_count() != 1 {
@@ -628,7 +676,7 @@ pub fn main() -> Result<(), libafl::Error> {
             let needs_stock_colorization =
                 move |_fuzzer: &mut _,
                       _executor: &mut _,
-                      state: &mut StdState<InMemoryCorpus<BytesInput>, _, _, _>,
+                      state: &mut StdState<FuzzCorpus, _, _, _>,
                       _mgr: &mut _|
                       -> Result<bool, Error> {
                     if cmplog_filter {
