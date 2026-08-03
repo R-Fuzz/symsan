@@ -11,6 +11,8 @@
 
 #include "concolic.h"
 
+#include "branch_id.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -227,6 +229,12 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
                                   msg.result == 0);
 
   // apply a local (per input) branch filter
+  //
+  // For a runtime check the key is the check *kind* rather than the site, since
+  // that is all its cid says, so the budget is shared by every division in the
+  // program.  Which is the behaviour to want here: with solve_ub on, a check
+  // rides along with every tainted arithmetic op, and a per-site budget would
+  // be no bound at all on the tasks one input can produce.
   auto &lc = local_counter_[msg.id];
   if (lc > config_.max_local_branch_counter) {
     return;
@@ -239,14 +247,49 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
   bool loop_latch = (msg.flags & F_LOOP_LATCH) != 0;
   bool loop_exit = (msg.flags & F_LOOP_EXIT) != 0;
 
-  const std::shared_ptr<BranchContext> ctx = cov_mgr_->add_branch(
-      (void*)msg.addr, msg.id, msg.result != 0, msg.context, loop_latch, loop_exit);
+  // A check the runtime raised itself -- an `enum undefined_check_ids` value,
+  // which is why its cid falls in the range symsan::AFL_ID_BASE holds back --
+  // is not a branch in the program, and the coverage manager has nothing true
+  // to say about one:
+  //
+  // - There is no edge behind either direction, so the fuzzer's history cannot
+  //   have covered it and the branch map holds no entry.  Asking anyway lands
+  //   on the unmapped degrade path and counts there, which is worse than
+  //   useless: unmapped()/mapped() is the diagnostic for whether the map covers
+  //   the code being traced, and with solve_ub on there are enough UB checks to
+  //   swamp it.
+  // - Neither key identifies the site.  The cid is one of sixteen values shared
+  //   by every check of that kind in the program, and the address is
+  //   __builtin_return_address(0) taken inside __taint_union, so it names a
+  //   line of the runtime rather than of the target.  Recording either would
+  //   collapse every UB check in the program into one bucket.
+  // - The question is not novelty but reachability -- can this input be made to
+  //   divide by zero here? -- and the answer does not get less interesting for
+  //   having been asked before.  So it is always solved, which is what the
+  //   backend's F_ADD_CONS-derived always_solve already said for it; saying it
+  //   here too means the session no longer depends on that coincidence.
+  //
+  // The manager keeping no record of them is also the right answer for
+  // input_taint()'s later re-ask: a check that never fired has nothing marking
+  // it covered, so is_target_uncovered() says uncovered and its bytes stay open.
+  const bool runtime_check = symsan::is_runtime_check_id(msg.id);
+
+  std::shared_ptr<BranchContext> ctx;
+  if (runtime_check) {
+    ctx = std::make_shared<BranchContext>();
+    ctx->addr = (void*)msg.addr;
+    ctx->direction = msg.result != 0;
+    ctx->id = msg.id;
+  } else {
+    ctx = cov_mgr_->add_branch((void*)msg.addr, msg.id, msg.result != 0,
+                               msg.context, loop_latch, loop_exit);
+  }
 
   std::shared_ptr<BranchContext> neg_ctx = std::make_shared<BranchContext>();
   *neg_ctx = *ctx;
   neg_ctx->direction = !ctx->direction;
 
-  bool interesting = cov_mgr_->is_branch_interesting(neg_ctx);
+  bool interesting = runtime_check || cov_mgr_->is_branch_interesting(neg_ctx);
   if (shared_cov_) {
     // the manager counts what it looked up; mirror it so that stats() is the
     // one place a front-end has to read
@@ -255,9 +298,17 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
   }
 
   if (interesting || always_solve) {
+    // A runtime check is never nested.  Its constraint is "could this operation
+    // be undefined", which is a question about this one expression, and adding
+    // the path constraints that led here would only make it harder to satisfy
+    // for no gain in what the answer means.  The fastgen backend already clears
+    // F_ADD_CONS for these (backend/fastgen.cpp), so this is belt and braces --
+    // but the flag comes over a pipe from a process we do not control, and the
+    // rule belongs to whoever builds the task.
+    bool add_nested = !runtime_check && (msg.flags & F_ADD_CONS) != 0;
     // parse the uniont table AST to solving tasks
     std::vector<uint64_t> tasks;
-    if (parser_->parse_cond(msg.label, ctx->direction, msg.flags & F_ADD_CONS, tasks) != 0) {
+    if (parser_->parse_cond(msg.label, ctx->direction, add_nested, tasks) != 0) {
       warn("failed to parse the condition %u\n", msg.label);
       // session_.terminate();
       return;

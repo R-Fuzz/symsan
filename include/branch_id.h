@@ -45,6 +45,23 @@ namespace symsan {
 /// See the TODO on Taint::getBranchId() in instrumentation/TaintPass.cpp.
 static const uint32_t AFL_ID_BASE = 4096;
 
+/// Does @p cid name a check the runtime raised rather than a branch in the
+/// program?
+///
+/// The reserved range above is what makes this answerable, and the answer
+/// changes how the check is treated: it has no edge behind either direction for
+/// the fuzzer's coverage to have covered, so it is not a coverage question at
+/// all -- see ConcolicSession::on_cond().
+///
+/// One-sided, and deliberately so.  In a build AFL++ never numbered every cid
+/// is a branch_cid() source hash, uniform over 2^32, so one in a million lands
+/// in the range and gets treated as a runtime check: it is then always solved
+/// and never nested, which costs a little work and loses nothing.  The converse
+/// error -- a runtime check mistaken for an edge -- cannot happen, which is the
+/// direction that matters, because that one would look the branch up in the
+/// coverage map and act on someone else's answer.
+inline bool is_runtime_check_id(uint32_t cid) { return cid < AFL_ID_BASE; }
+
 /// Daniel J. Bernstein's string hash -- byte for byte what llvm::djbHash()
 /// does.  Reimplemented rather than #include'd from "llvm/Support/DJB.h" so
 /// that the driver can compute a branch id without linking LLVM's support

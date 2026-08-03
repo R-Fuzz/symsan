@@ -274,6 +274,23 @@ struct Opt {
     #[arg(long = "symsan-z3", default_value = "false")]
     symsan_z3: bool,
 
+    /// Also solve for undefined behaviour: division by zero, shift past the
+    /// width, signed overflow, a truncation or sign change that loses data, an
+    /// out-of-bounds index. These are not coverage -- nothing in the fuzzer's
+    /// map moves when one is satisfied -- so they are solved for their own
+    /// sake, and an input that satisfies one is kept only if the target then
+    /// does something the fuzzer notices. Off by default because the check
+    /// rides along with every tainted arithmetic operation, not with every
+    /// branch, so it is the one switch here that changes what a trace costs by
+    /// an order of magnitude rather than a fraction.
+    ///
+    /// Implies allocation-bounds tracking. Note that the *bounds* checks
+    /// additionally need the target built with `-mllvm -taint-solve-ub=true`
+    /// (`KO_SOLVE_UB=1`), which emits the calls this flag then enables; the
+    /// arithmetic ones are raised by the runtime and need no such rebuild.
+    #[arg(long = "symsan-solve-ub", default_value = "false")]
+    symsan_solve_ub: bool,
+
     /// Show the target's stdout and stderr.
     #[arg(short = 'd', long = "debug-child", default_value = "false")]
     debug_child: bool,
@@ -450,6 +467,7 @@ pub fn main() -> Result<(), libafl::Error> {
                 .i2s(!opt.symsan_no_i2s)
                 .jigsaw(!opt.symsan_no_jigsaw)
                 .z3(opt.symsan_z3)
+                .solve_ub(opt.symsan_solve_ub)
                 .cmplog_filter(cmplog_filter);
             if let Some(map) = &branch_map {
                 // The observer above is named "shared_mem", which is also the
@@ -503,6 +521,12 @@ pub fn main() -> Result<(), libafl::Error> {
                 println!("symsan: no solver enabled; tracing only");
             } else {
                 println!("symsan: solvers {}", ladder.join(" -> "));
+            }
+            if opt.symsan_solve_ub {
+                // Same reason as the ladder line: this one changes both what a
+                // trace costs and what it solves for, so a log without it is
+                // indistinguishable from a log with it.
+                println!("symsan: also solving for undefined behaviour");
             }
             Some(tuple_list!(CreditedStage::new("symsan", symsan)))
         }
