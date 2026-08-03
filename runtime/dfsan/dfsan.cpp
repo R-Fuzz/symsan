@@ -179,6 +179,19 @@ static inline bool is_kind_of_label(dfsan_label label, uint16_t kind) {
   return get_label_info(label)->op == kind;
 }
 
+// A label that carries allocation bounds in op1/op2 and no expression at all.
+// free() does not create a new label for the freed region -- it rewrites the
+// existing one's op from Alloca to Free in place, so that the address is not
+// reused and a later access can be reported as a use-after-free (see
+// __dfsw_free).  Everything that means "this is bounds, not a value" therefore
+// has to accept both, or it silently stops working the moment the buffer is
+// freed; the parsers already do (z3-ts.cpp's Alloca/Free cases, and parse_gep's
+// "due to async solving, we may have a Free op").
+static inline bool is_bounds_label(dfsan_label label) {
+  uint16_t op = get_label_info(label)->op;
+  return op == __dfsan::Alloca || op == __dfsan::Free;
+}
+
 static bool isZeroOrPowerOfTwo(uint16_t x) { return (x & (x - 1)) == 0; }
 
 static inline bool is_valid_op(uint16_t op) {
@@ -281,8 +294,8 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     return kInitializingLabel;
 
   // special handling for bounds
-  if (get_label_info(l1)->op == __dfsan::Alloca ||
-      (op != __dfsan::Load && get_label_info(l2)->op == __dfsan::Alloca)) {
+  if (is_bounds_label(l1) ||
+      (op != __dfsan::Load && is_bounds_label(l2))) {
     // propagate if it's casting op
     if (op == __dfsan::BitCast) return l1;
     if (op == __dfsan::PtrToInt) {AOUT("WARNING: ptrtoint %d\n", l1); return 0;}
@@ -653,7 +666,9 @@ dfsan_label __taint_gep_offset(dfsan_label label, char* result, char* base) {
   dfsan_label_info *info = get_label_info(label);
 
   // concrete ptrs, op == Alloca, just propagate bounds info
-  if (info->op == __dfsan::Alloca) {
+  // (Free too: a GEP off a freed pointer must keep carrying the bounds, or the
+  // access through it stops being reportable as a use-after-free)
+  if (is_bounds_label(label)) {
     return label;
   }
 
@@ -705,7 +720,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   if (label0 >= CONST_OFFSET) assert(get_label_info(label0)->size != 0);
 
   // fast path 1: constant and bounds
-  if (is_constant_label(label0) || is_kind_of_label(label0, Alloca)) {
+  if (is_constant_label(label0) || is_bounds_label(label0)) {
     bool same = true;
     for (uptr i = 1; i < n; i++) {
       if (ls[i] == kInitializingLabel) return kInitializingLabel;
@@ -827,7 +842,7 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
   }
 
   // fast path 1: constant and bounds
-  if (l == 0 || is_kind_of_label(l, Alloca)) {
+  if (l == 0 || is_bounds_label(l)) {
     for (uptr i = 0; i < n; ++i)
       ls[i] = l;
     return;
