@@ -49,6 +49,8 @@
 //! which forks a process per core -- each would get its own stage and its own
 //! session, and the per-pid shared-memory names already keep them apart.
 
+mod credit;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -88,6 +90,8 @@ use libafl_symsan::{
     SymSanColorizationStage, SymSanStage, symsan_cmplog_worthwhile,
     symsan_needs_stock_colorization,
 };
+
+use crate::credit::CreditedStage;
 use libafl_targets::{
     AflppCmpLogMap,
     cmps::{observers::AflppCmpLogObserver, stages::AflppCmplogTracingStage},
@@ -500,7 +504,7 @@ pub fn main() -> Result<(), libafl::Error> {
             } else {
                 println!("symsan: solvers {}", ladder.join(" -> "));
             }
-            Some(tuple_list!(symsan))
+            Some(tuple_list!(CreditedStage::new("symsan", symsan)))
         }
         None => {
             println!("symsan: disabled (pass --symsan <binary> to enable)");
@@ -616,13 +620,19 @@ pub fn main() -> Result<(), libafl::Error> {
                      (--no-symsan-cmplog-filter for the stock pipeline)"
                 );
             }
-            Some(tuple_list!(IfStage::new(
-                run_once_per_entry,
-                tuple_list!(
-                    OptionalStage::new(symsan_colorization),
-                    IfStage::new(needs_stock_colorization, tuple_list!(colorization)),
-                    tracing,
-                    rq
+            // Credited as one stage: of the four inside, only RedQueen can add
+            // anything, so the count is RedQueen's however the `IfStage` gates
+            // it.
+            Some(tuple_list!(CreditedStage::new(
+                "cmplog",
+                IfStage::new(
+                    run_once_per_entry,
+                    tuple_list!(
+                        OptionalStage::new(symsan_colorization),
+                        IfStage::new(needs_stock_colorization, tuple_list!(colorization)),
+                        tracing,
+                        rq
+                    )
                 )
             )))
         }
@@ -638,7 +648,7 @@ pub fn main() -> Result<(), libafl::Error> {
     let mut stages = tuple_list!(
         OptionalStage::new(symsan_stages),
         OptionalStage::new(cmplog_stages),
-        StdMutationalStage::new(mutator)
+        CreditedStage::new("havoc", StdMutationalStage::new(mutator))
     );
     fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
 
