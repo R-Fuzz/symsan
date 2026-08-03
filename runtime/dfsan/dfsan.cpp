@@ -338,8 +338,17 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   }
 
   // try simple simplifications, from qsym
+  //
+  // all-ones for this width.  Not (1 << size) - 1: at size == 64 that shifts a
+  // 64-bit value by 64, which is UB, and on x86 the count is masked to 6 bits so
+  // 1 << 64 == 1 and the test quietly degenerated into `op1 == 0` -- shadowed by
+  // op1_is_zero, so the two all-ones folds simply never fired on i64.  Left
+  // false above 64 bits, where op1 holds only the low half of the operand and
+  // says nothing about whether it is saturated.
+  const uint64_t width_mask =
+      size >= 64 ? ~(uint64_t)0 : (((uint64_t)1 << size) - 1);
   bool op1_is_zero = (l1 == 0 && op1 == 0);
-  bool op1_is_all_one = (l1 == 0 && op1 == ((uint64_t)1 << size) - 1);
+  bool op1_is_all_one = (l1 == 0 && size <= 64 && op1 == width_mask);
   bool op2_is_zero = (l2 == 0 && op2 == 0);
   if (op1_is_zero) {
     switch (op) {
@@ -362,6 +371,46 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     else if (op == __dfsan::Shl) return l1; // x << 0 = x
     else if (op == __dfsan::LShr) return l1; // x >> 0 = x
     else if (op == __dfsan::AShr) return l1; // x >> 0 = x
+  }
+  // A comparison against the extreme value of its own width is decided by the
+  // width alone: x <=u UINT64_MAX cannot be false and x <u 0 cannot be true, no
+  // matter what x is.  Not dead code the optimizer would have removed -- the
+  // usual source is a size guard against a bound that only becomes saturated
+  // once the operand is widened (a 32-bit count zero-extended to 64 and checked
+  // against a 64-bit maximum), where the source-level types do not say the
+  // answer is constant and -O0 keeps the branch.  Costs one comparison here to
+  // save a trace event, a serialize and a solver simplify that all end up at
+  // the same answer.
+  if ((op & 0xff) == __dfsan::ICmp && size <= 64 && (l1 == 0) != (l2 == 0)) {
+    // normalize to `symbolic <pred> constant`; ICmp is not commutative, so the
+    // swap above did not run and a zero label really is the constant side, but
+    // reading the predicate from the right requires swapping it
+    uint16_t pred = op >> 8;
+    uint64_t c = (l1 == 0) ? op1 : op2;
+    if (l1 == 0) {
+      switch (pred) {
+        case __dfsan::bvugt: pred = __dfsan::bvult; break;
+        case __dfsan::bvuge: pred = __dfsan::bvule; break;
+        case __dfsan::bvult: pred = __dfsan::bvugt; break;
+        case __dfsan::bvule: pred = __dfsan::bvuge; break;
+        case __dfsan::bvsgt: pred = __dfsan::bvslt; break;
+        case __dfsan::bvsge: pred = __dfsan::bvsle; break;
+        case __dfsan::bvslt: pred = __dfsan::bvsgt; break;
+        case __dfsan::bvsle: pred = __dfsan::bvsge; break;
+        default: break; // eq/ne are symmetric
+      }
+    }
+    // operand values arrive zero-extended to the width, which is the convention
+    // op1_is_all_one above already relies on
+    const uint64_t smin = (uint64_t)1 << (size - 1);
+    const uint64_t smax = smin - 1;
+    if ((c == 0          && (pred == __dfsan::bvuge || pred == __dfsan::bvult)) ||
+        (c == width_mask && (pred == __dfsan::bvule || pred == __dfsan::bvugt)) ||
+        (c == smin       && (pred == __dfsan::bvsge || pred == __dfsan::bvslt)) ||
+        (c == smax       && (pred == __dfsan::bvsle || pred == __dfsan::bvsgt))) {
+      AOUT("simplify saturated cmp: pred %d vs %#lx at %d bits\n", pred, c, size);
+      return 0;
+    }
   }
   // Simplify PtrToInt(string_op) - base_addr to just PtrToInt (the index)
   // This is the ptr2int+sub equivalent of what __taint_gep_offset does for GEP:
@@ -388,6 +437,22 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   } else if ((op == __dfsan::Xor || op == __dfsan::Sub) && l1 == l2) {
     // x ^ x = 0
     // x - x = 0
+    return 0;
+  } else if ((op & 0xff) == __dfsan::ICmp && l1 == l2 && l1 != 0) {
+    // x <pred> x, on the *same* label.  A label is hash-consed over its whole
+    // subtree, so the two sides are not merely equal-looking: they are one
+    // expression over one set of input bytes, and every integer predicate is
+    // then decided by the predicate alone (eq/ule/uge/sle/sge true, the rest
+    // false).  Returning 0 leaves the concrete result to flow, which is that
+    // same constant.
+    //
+    // Integers only.  FCmp is a separate opcode and is deliberately not folded
+    // here: x != x is *true* for NaN.
+    //
+    // Not a contrived shape: a self-check that recomputes a derived quantity
+    // and asserts it against the copy it stored earlier compares two copies of
+    // one expression, and each occurrence otherwise costs a trace event, a
+    // serialize and a solver simplify to reach the answer available here.
     return 0;
   }
 
