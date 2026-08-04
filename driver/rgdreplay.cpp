@@ -560,7 +560,12 @@ private:
     for (const auto &[offset, value] : task->inputs())
       if (offset > max_off) max_off = offset;
     size_t in_size = max_off + 1;
-    if (in_.size() < in_size) { in_.resize(in_size, 0); out_.resize(in_size, 0); }
+    // out_ gets room above in_size because a solver may answer with a longer
+    // input than it was handed -- a strlen satisfied by inserting bytes.
+    if (in_.size() < in_size) {
+      in_.resize(in_size, 0);
+      out_.resize(in_size + 4096, 0);
+    }
     size_t out_size = 0;
     switch (solver_->solve(task, in_.data(), in_size, out_.data(), out_size)) {
       case SOLVER_SAT: n_.sat++; break;

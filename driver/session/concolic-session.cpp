@@ -189,8 +189,13 @@ int ConcolicSession::init(const ConcolicConfig &config) {
   // the symptom (no inputs, ever) says nothing about the cause.
   if (solvers_.empty()) warn("no solver enabled; nothing will be solved\n");
 
-  // allocate output buffer
-  output_buf_.resize(config_.max_input_size + 1);
+  // allocate output buffer.  We hand this to solve() and then hand solve()'s
+  // answer straight out of next_solution() as the mutator's *out_buf, so it is
+  // ours to size -- and a solved input can be LONGER than the one it came from
+  // (i2s lengthens a strlen by inserting bytes, an atoi by writing more
+  // digits).  The input side of this is bounded by max_input_size, so the extra
+  // 4096 is what covers a grown answer; without it one runs off the end.
+  output_buf_.resize(config_.max_input_size + 4096 + 1);
 
   initialized_ = true;
   return 0;
