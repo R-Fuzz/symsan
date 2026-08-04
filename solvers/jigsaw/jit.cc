@@ -228,6 +228,23 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
     return itr->second;
   }
 
+  // A comparison (integer or FP) and Memcmp/MemcmpN write their operands to
+  // args[0]/args[1] for gd.cc's get_distance() and produce no value of their
+  // own -- they end with `ret = nullptr` below.  That is only meaningful at
+  // the ROOT of a constraint.  Nested under anything else -- `zext (icmp ..)`,
+  // which the dataflow graph really does produce -- the parent dereferences
+  // that nullptr and we segfault inside IRBuilder.  jigsaw's research
+  // prototype dropped such trees before codegen ever ran (analyzeExpr's
+  // zext_bool flag in ../jigsaw/rgd.cc); do it here instead, at the one place
+  // that can see the parent/child relationship, so addFunction() catches the
+  // invalid_argument, declines the task, and the chain falls back to z3.
+  for (uint32_t i = 0, n = node->children_size(); i < n; i++) {
+    uint16_t ck = node->children(i).kind();
+    if (isRelationalKind(ck) || isFPRelationalKind(ck) ||
+        ck == rgd::Memcmp || ck == rgd::MemcmpN)
+      throw std::invalid_argument("nested comparison has no value");
+  }
+
   llvm::Type *ArgTy = Builder.getInt64Ty();
   switch (node->kind()) {
     case rgd::Bool: {

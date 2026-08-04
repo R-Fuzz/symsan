@@ -8,13 +8,19 @@
 // us validate the RGD path deterministically on a single input, without the
 // noisy afl-fuzz search loop.
 //
-// Usage: afltest target input
+// Usage: afltest [--dump-constraints <dir>] target input
 //   TAINT_OPTIONS="taint_file=<file|stdin> output_dir=<dir>"
 //   SYMSAN_USE_JIGSAW=1  add the jigsaw JIT solver to the chain
 //   SYMSAN_USE_Z3=1      add the z3 solver to the chain (needed for FP)
 //   SYMSAN_USE_NESTED=1  enable nested constraint solving in the parser
 //   SYMSAN_NO_I2S=1      drop the i2s solver, which is otherwise always first;
 //                        the way to ask what one of the others can do alone
+//
+// --dump-constraints writes every distinct constraint of every task to
+// <dir>/c-<n>.rgdc in the flat binary format of rgd::Constraint::save(), and
+// round trips each one on the way out (reload, re-serialize, compare bytes and
+// ASTs).  That check is the point of the option as much as the files are: it is
+// what keeps the format from rotting the way the old NEED_OFFLINE path did.
 //
 // Solved inputs are written to <output_dir>/id-<inst>-<sess>-<idx>, one per
 // solved task, mirroring fgtest's output naming so the lit tests can reuse the
@@ -38,6 +44,7 @@ extern "C" {
 #include "session.h"
 
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #include <stdio.h>
@@ -71,6 +78,7 @@ static uint32_t __instance_id = 0;
 static uint32_t __session_id = 0;
 static uint32_t __current_index = 0;
 static int __enum_gep = 0;  // GEP enumeration disabled by default
+static const char* __dump_dir = nullptr;  // --dump-constraints, off by default
 
 // the mapped union table (shared with the launched target)
 static const size_t MAX_LABEL = uniontable_size / sizeof(dfsan_label_info);
@@ -107,11 +115,59 @@ static void generate_input(const uint8_t *buf, size_t size) {
   close(fd);
 }
 
+// serialize every distinct constraint of a task, and check the round trip.
+// Constraints are shared between tasks (the parser caches them by label), so
+// dedup by pointer -- otherwise a hot branch's constraint is written once per
+// task that reuses it.
+static void dump_constraints(rgd::task_t task) {
+  static std::unordered_set<const rgd::Constraint*> seen;
+  static uint32_t index = 0;
+
+  for (size_t i = 0; i < task->size(); i++) {
+    const auto &c = task->constraints(i);
+    if (!seen.insert(c.get()).second) continue;
+
+    std::vector<uint8_t> buf;
+    if (!c->save(buf)) {
+      AOUT("WARNING: failed to serialize constraint %p\n", (void*)c.get());
+      continue;
+    }
+
+    // reload and compare.  Byte equality of the re-serialization covers the
+    // scalar fields; isEqualAst covers the tree, which the bytes would also
+    // catch but only as an opaque mismatch.
+    auto rt = std::make_shared<rgd::Constraint>(0);
+    std::vector<uint8_t> rebuf;
+    if (!rt->load(buf.data(), buf.size())) {
+      AOUT("WARNING: failed to deserialize constraint %p\n", (void*)c.get());
+    } else if (!rt->save(rebuf) || rebuf != buf) {
+      AOUT("WARNING: constraint %p did not round trip byte-identically\n",
+           (void*)c.get());
+    } else if (!rgd::isEqualAst(*c->get_root(), *rt->get_root())) {
+      AOUT("WARNING: constraint %p round tripped to a different AST\n",
+           (void*)c.get());
+    }
+
+    char path[PATH_MAX];
+    snprintf(path, PATH_MAX, "%s/c-%d.rgdc", __dump_dir, index++);
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd == -1) {
+      AOUT("failed to open %s for write\n", path);
+      continue;
+    }
+    if (write(fd, buf.data(), buf.size()) == -1) {
+      AOUT("failed to write %s\n", path);
+    }
+    close(fd);
+  }
+}
+
 // run a solving task through the solver chain; on the first SAT result write
 // out the mutated input.  Mirrors the per-solver fall-through in aflpp's
 // afl_custom_fuzz (i2s -> jigsaw -> z3), but drives it synchronously.
 static void solve_task(rgd::task_t task, void *addr) {
   if (!task) return;
+  if (__dump_dir) dump_constraints(task);
   for (auto &solver : __solvers) {
     size_t new_size = 0;
     auto ret = solver->solve(task, (uint8_t*)input_buf, input_size,
@@ -168,13 +224,19 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
 
 int main(int argc, char* const argv[]) {
 
-  if (argc != 3) {
-    fprintf(stderr, "Usage: %s target input\n", argv[0]);
+  int optind = 1;
+  if (argc > 2 && strcmp(argv[1], "--dump-constraints") == 0) {
+    __dump_dir = argv[2];
+    optind = 3;
+  }
+
+  if (argc - optind != 2) {
+    fprintf(stderr, "Usage: %s [--dump-constraints <dir>] target input\n", argv[0]);
     exit(1);
   }
 
-  char *program = argv[1];
-  char *input = argv[2];
+  char *program = argv[optind];
+  char *input = argv[optind + 1];
 
   int is_stdin = 0;
   int debug = 0;

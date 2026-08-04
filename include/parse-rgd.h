@@ -81,6 +81,7 @@ private:
   std::unordered_map<dfsan_label, expr_t> root_expr_cache; // label -> root expr
   std::unordered_map<dfsan_label, constraint_t> constraint_cache; // label -> constraint
   std::vector<uint32_t> ast_size_cache; // label -> size of the AST
+  std::vector<uint32_t> arg_size_cache; // label -> upper bound on input_args slots
   std::vector<uint8_t> nested_cmp_cache; // label -> nested comparison
   std::unordered_map<dfsan_label, uint8_t> concretize_node; // label -> concretize node
 
@@ -112,6 +113,8 @@ private:
                                 std::unordered_set<dfsan_label> &visited);
   uint32_t map_arg(uint32_t input_id, uint32_t offset, uint32_t length,
                    constraint_t constraint);
+  [[nodiscard]] bool pack_const_bytes(const uint8_t *content, uint32_t size,
+                                      rgd::AstNode *node, constraint_t constraint);
 
   bool save_constraint(expr_t expr, bool result);
   inline void add_nested_constraint(task_t task, const clause_t &nested_caluse);

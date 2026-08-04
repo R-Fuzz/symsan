@@ -68,6 +68,20 @@ target_link_libraries(SMTTest PRIVATE
 )
 install (TARGETS SMTTest DESTINATION ${SYMSAN_BIN_DIR})
 
+## replay jigsaw's serialized constraint corpus (../jigsaw/tests/*_reload)
+## through the RGD solver, to measure the JIT function-cache hit rate
+add_executable(RGDReplay rgdreplay.cpp)
+set_target_properties(RGDReplay PROPERTIES OUTPUT_NAME "rgdreplay" CXX_STANDARD 17)
+target_include_directories(RGDReplay PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+)
+target_link_libraries(RGDReplay PRIVATE
+  rgd-solver
+  ${Z3_LIBRARY}
+  rt
+)
+install (TARGETS RGDReplay DESTINATION ${SYMSAN_BIN_DIR})
+
 if (DEFINED AFLPP_PATH)
     add_subdirectory(aflpp)
 endif()

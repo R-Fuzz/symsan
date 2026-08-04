@@ -390,12 +390,86 @@ namespace rgd {
     inline void set_label(uint32_t label) { label_ = label; }
     inline uint32_t hash() const { return hash_; }
     inline void set_hash(uint32_t hash) { hash_ = hash; }
+
+    // --- serialization --------------------------------------------------
+    // Flat POD image of one node: every field except root_, which is a
+    // pointer patched on load, and is_root_, which is implied by position.
+    // This layout is part of the on-disk format; see Constraint::save().
+    struct NodeRec {
+      uint32_t child0, child1;
+      uint32_t index;
+      uint32_t label, hash;
+      uint16_t kind, bits;
+      uint8_t  boolvalue;
+      uint8_t  reserved[3];
+    };
+
+    // Append this AST's image to @p out: the standalone root first, then the
+    // whole arena, so a child index c in any record refers to out[1 + c] --
+    // the arena's element 0 is the unused dummy the root constructor adds.
+    void serialize(std::vector<NodeRec> &out) const {
+      out.push_back(to_rec());
+      for (const auto &n : *root_) out.push_back(n.to_rec());
+    }
+
+    inline size_t serialized_nodes() const { return 1 + root_->size(); }
+
+    // Rebuild from what serialize() wrote.  Every child index is range
+    // checked first: a corrupt AST that loads without complaint is a wrong
+    // answer later, which is much worse than a rejected file here.
+    bool deserialize(const NodeRec *recs, size_t count) {
+      if (!is_root_ || count == 0) return false;
+      const size_t arena = count - 1;
+      for (size_t i = 0; i < count; ++i) {
+        if (recs[i].child0 >= arena || recs[i].child1 >= arena) return false;
+        if (recs[i].index >= (1u << 30)) return false; // index_ is 30 bits
+      }
+      root_->clear();
+      root_->reserve(arena);
+      for (size_t i = 1; i < count; ++i) {
+        root_->emplace_back(AstNode(root_));
+        root_->back().from_rec(recs[i]);
+      }
+      from_rec(recs[0]);
+      return true;
+    }
+
   private:
+    inline NodeRec to_rec() const {
+      NodeRec r{};
+      r.child0 = child0_; r.child1 = child1_;
+      r.index = index_; r.label = label_; r.hash = hash_;
+      r.kind = kind_; r.bits = bits_; r.boolvalue = boolvalue_;
+      return r;
+    }
+    inline void from_rec(const NodeRec &r) {
+      child0_ = r.child0; child1_ = r.child1;
+      index_ = r.index; label_ = r.label; hash_ = r.hash;
+      kind_ = r.kind; bits_ = r.bits; boolvalue_ = r.boolvalue & 1;
+    }
+
     std::vector<AstNode> *root_; // root of the AST
     uint32_t child0_;
     uint32_t child1_;
     uint16_t kind_;
     uint16_t bits_;
+    // index_ is multiplexed by kind_; there is no tag, the kind IS the tag.
+    // NOTE isEqualAstRecursive() does NOT compare index_, so a payload that is
+    // only reachable *through* index_ is invisible to the AST caches -- see
+    // THE HASHING INVARIANT below.
+    //
+    //   Read       input byte offset; jit.cc maps it through local_map
+    //   Extract    starting bit of the slice
+    //   Constant   base slot in Constraint::input_args.  One slot per 8 bytes:
+    //              a dfsan WideConst lowers to two, LOW half first, and a
+    //              memcmp/string target packs ceil(size/8) of them (the target
+    //              is a Constant *child* of the Memcmp node, so it is the
+    //              child that carries the index, not the Memcmp itself)
+    //   TLookup    base slot of the packed table: [0] = num_elems, then the
+    //              contents, 8 bytes per slot, little-endian
+    //   FpRound,
+    //   FP arith   rounding-mode selector (see FpRound above)
+    //   all others unused, 0
     uint32_t index_ : 30;  //used by read expr for index and extract expr
     uint8_t boolvalue_ : 1;  //used by bool expr
     uint8_t is_root_ : 1; // true if this is the root of the AST
@@ -432,8 +506,42 @@ namespace rgd {
     }
   };
 
+  // THE HASHING INVARIANT.  (hash(), isEqualAst) is the key of jigsaw's
+  // JIT'ed-function cache -- see fCache in solvers/jit-solver.cpp, whose
+  // myHash uses hash() as the bucket and isEqualAst as the comparator.  JIT
+  // compilation is jigsaw's dominant cost (jit-solver.cpp times process_time
+  // and jit_time separately, and counts cache_hits/cache_misses), so the AST
+  // is deliberately shaped to make one compiled function serve as many
+  // constraints as possible:
+  //
+  //   Anything the JIT'ed function reads at run time through args[] must be
+  //   EXCLUDED from the hash, so the function is reused across values.
+  //   Anything consumed out of band -- i.e. baked into the generated code, or
+  //   held on the side by the parser and read by a solver -- must be FOLDED
+  //   INTO the hash, or two different payloads collide on one function.
+  //
+  // The reuse direction is why constants are not in the AST at all: a
+  // Constant hashes as xxhash(size, Constant, arg_index) with the VALUE
+  // ABSENT, and the value travels in Constraint::input_args, from which jit.cc
+  // emits a load of args[index() + RET_OFFSET].  So `x == 5` and `x == 7` are
+  // one key and share one compiled function -- the generated code genuinely
+  // does not depend on which constant it is.
+  //
+  // The fold direction covers everything that does NOT have that property.
+  // Because isEqualAstRecursive below never compares index(), two nodes that
+  // differ only in a payload hung off index() are indistinguishable to this
+  // cache unless the payload is in hash().  TLookup folds its table contents
+  // for that reason (see the comment at its parser case), and FP arithmetic
+  // folds its rounding-mode selector, which jit.cc bakes into the emitted
+  // constrained intrinsic rather than reading from args[].
+  //
+  // A new node kind carrying a payload has to pick a side, and picking wrong
+  // is silent either way: fold and lose reuse, or omit and risk conflating two
+  // constraints.  The test is whether the compiled function's behaviour is
+  // independent of the payload.  For concrete bytes -- a memcmp target, a
+  // string needle -- it is, so they go in input_args and stay out of the hash.
   static bool isEqualAstRecursive(const AstNode& lhs, const AstNode& rhs) {
-    
+
     // number of operands and size of the operands must match
     const int children_size = lhs.children_size();
     if (children_size != rhs.children_size()) return false;

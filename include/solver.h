@@ -60,6 +60,13 @@ public:
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
   void print_stats(int fd) override;
+  // JIT every constraint in @p task that does not already carry a compiled
+  // function, consulting (and filling) the AST-keyed function cache.  solve()
+  // does this before searching; it is exposed so a driver that only wants to
+  // exercise the cache -- driver/rgdreplay.cpp -- can stop here rather than
+  // paying for a gradient-descent run it will not look at.  Returns false if
+  // codegen rejected a constraint, which fails the whole task.
+  bool jit_constraints(std::shared_ptr<SearchTask> task);
   // timing accessors (microseconds), cumulative across solve() calls:
   //   codegen  = AST -> LLVM IR (addFunction)
   //   jit      = LLVM IR -> native code (performJit)

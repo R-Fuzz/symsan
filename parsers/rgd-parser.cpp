@@ -30,8 +30,6 @@ using namespace rgd;
 //   } while (0)
 #endif
 
-#define NEED_OFFLINE 0
-
 #if defined(__GNUC__)
 static inline bool (likely)(bool x) { return __builtin_expect((x), true); }
 static inline bool (unlikely)(bool x) { return __builtin_expect((x), false); }
@@ -39,6 +37,24 @@ static inline bool (unlikely)(bool x) { return __builtin_expect((x), false); }
 static inline bool (likely)(bool x) { return x; }
 static inline bool (unlikely)(bool x) { return x; }
 #endif
+
+// Saturating add, for the size caches: they sum over children and so can
+// overflow on a wide DAG, where a wrapped (tiny) result would look like a
+// perfectly reasonable size.
+static inline uint32_t sat_add(uint32_t a, uint32_t b) {
+  uint32_t r = a + b;
+  return r < a ? UINT32_MAX : r;
+}
+
+// input_args slots a tlookup's packed table occupies, 8 bytes per slot.
+// Computed in 64 bits and clamped because num_elems comes straight off the
+// label; do_uta_rel checks the geometry against the cached table, this does
+// not (the table may not even have arrived yet).
+static inline uint32_t tlookup_arg_slots(const dfsan_label_info *info) {
+  uint64_t bytes = info->op2.i * (uint64_t)(info->size / 8);
+  uint64_t slots = (bytes + 7) / 8;
+  return slots > UINT32_MAX ? UINT32_MAX : (uint32_t)slots;
+}
 
 static const std::unordered_map<unsigned, std::pair<unsigned, const char*> > OP_MAP {
   {__dfsan::Extract, {rgd::Extract, "extract"}},
@@ -209,6 +225,7 @@ int RGDAstParser::restart(std::vector<symsan::input_t> &inputs, bool copy_input)
   root_expr_cache.clear();
   constraint_cache.clear();
   ast_size_cache.clear();
+  arg_size_cache.clear(); // filled in lockstep with ast_size_cache
   nested_cmp_cache.clear();
   concretize_node.clear();
   branch_to_inputs.clear();
@@ -253,6 +270,51 @@ uint32_t RGDAstParser::map_arg(uint32_t input_id, uint32_t offset, uint32_t leng
   return hash;
 }
 
+// Pack a concrete byte array into consecutive constant slots of @p constraint's
+// input_args and configure @p node as the rgd::Constant that points at them.
+//
+// A memcmp target -- and, for the string ops, a needle or a character set --
+// has nowhere else to live: AstNode has no blob field.  Putting the bytes in
+// input_args rather than in the node is what lets two comparisons against
+// different targets share one JIT'ed function, because the hash below excludes
+// the content; see THE HASHING INVARIANT in include/ast.h.
+bool RGDAstParser::pack_const_bytes(const uint8_t *content, uint32_t size,
+                                    rgd::AstNode *node, constraint_t constraint) {
+  // AstNode::bits_ is a uint16_t, so anything past 8191 bytes wraps to a wrong
+  // -- and much smaller -- width that every downstream solver would then trust.
+  // Fail the parse loudly instead of truncating.  (dfsan_label_info::size is
+  // itself only 16 bits and carries its own FIXME, see runtime/dfsan/dfsan.h.)
+  if (unlikely(size > UINT16_MAX / 8)) {
+    WARNF("constant content too wide: %u bytes\n", size);
+    return false;
+  }
+  node->set_kind(rgd::Constant);
+  node->set_bits((uint16_t)(size * 8));
+  node->set_label(0);
+  uint32_t arg_index = (uint32_t)constraint->input_args.size();
+  node->set_index(arg_index);
+  uint32_t chunks = size / 8;
+  uint32_t remain = size % 8;
+  uint64_t val = 0;
+  for (uint32_t i = 0; i < chunks; i++) {
+    val = *(uint64_t*)&content[i * 8];
+    constraint->input_args.push_back(std::make_pair(false, val));
+    constraint->const_num += 1;
+    DEBUGF("memcmp constant chunk %d = 0x%lx\n", i, val);
+  }
+  if (remain) {
+    val = 0;
+    for (uint32_t i = 0; i < remain; i++) {
+      val |= (uint64_t)content[chunks * 8 + i] << (i * 8);
+    }
+    constraint->input_args.push_back(std::make_pair(false, val));
+    constraint->const_num += 1;
+    DEBUGF("memcmp constant remain = %lu\n", val);
+  }
+  node->set_hash(rgd::xxhash(size, rgd::Constant, arg_index));
+  return true;
+}
+
 // this combines both AST construction and arg mapping
 [[gnu::hot]]
 bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
@@ -295,12 +357,6 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     // map arg
     uint32_t hash = map_arg(input_id, offset, 1, constraint);
     ret->set_hash(hash);
-#if NEED_OFFLINE
-    std::string val;
-    rgd::buf_to_hex_string(&buf[offset], 1, val);
-    ret->set_value(std::move(val));
-    ret->set_name("read");
-#endif
     return true;
   } else if (info->op == __dfsan::Load) {
     ret->set_kind(rgd::Read);
@@ -317,12 +373,6 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     // map arg
     uint32_t hash = map_arg(input_id, offset, info->l2, constraint);
     ret->set_hash(hash);
-#if NEED_OFFLINE
-    std::string val;
-    rgd::buf_to_hex_string(&buf[offset], info->l2, val);
-    ret->set_value(std::move(val));
-    ret->set_name("read");
-#endif
     return true;
   } else if (info->op == __dfsan::WideConst) {
     // A concrete operand of an operation wider than 64 bits, carried as a leaf
@@ -339,13 +389,6 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     constraint->const_num += 2;
     uint32_t hash = rgd::xxhash(info->size, rgd::Constant, arg_index);
     ret->set_hash(hash);
-#if NEED_OFFLINE
-    char hexbuf[40];
-    snprintf(hexbuf, sizeof(hexbuf), "0x%016lx%016lx",
-             (unsigned long)info->op2.i, (unsigned long)info->op1.i);
-    ret->set_value(hexbuf);
-    ret->set_name("constant");
-#endif
     return true;
   } else if (info->op == __dfsan::fmemcmp) {
     rgd::AstNode *s1 = ret->add_children();
@@ -360,43 +403,15 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       visited.insert(info->l1);
     } else {
       // s1 is a constant array
-      s1->set_kind(rgd::Constant);
-      s1->set_bits(info->size * 8);
-      s1->set_label(0);
       // use constant args to pass the array
       auto itr = memcmp_cache_.find(label);
       if (unlikely(itr == memcmp_cache_.end())) {
         WARNF("memcmp target not found for label %u\n", label);
         return false;
       }
-      uint32_t arg_index = (uint32_t)constraint->input_args.size();
-      s1->set_index(arg_index);
-      uint16_t chunks = info->size / 8;
-      uint16_t remain = info->size % 8;
-      uint64_t val = 0;
-      for (uint16_t i = 0; i < chunks; i++) {
-        val = *(uint64_t*)&(itr->second.get()[i * 8]);
-        constraint->input_args.push_back(std::make_pair(false, val));
-        constraint->const_num += 1;
-        DEBUGF("memcmp constant chunk %d = 0x%lx\n", i, val);
+      if (!pack_const_bytes(itr->second.get(), info->size, s1, constraint)) {
+        return false;
       }
-      if (remain) {
-        val = 0;
-        for (uint16_t i = 0; i < remain; i++) {
-          val |= (uint64_t)itr->second.get()[chunks * 8 + i] << (i * 8);
-        }
-        constraint->input_args.push_back(std::make_pair(false, val));
-        constraint->const_num += 1;
-        DEBUGF("memcmp constant remain = %lu\n", val);
-      }
-      uint32_t hash = rgd::xxhash(info->size, rgd::Constant, arg_index);
-      s1->set_hash(hash);
-#if NEED_OFFLINE
-      std::string val;
-      rgd::buf_to_hex_string(itr->second, info->size, val);
-      ret->set_value(std::move(val));
-      ret->set_name("constant");
-#endif
     }
     rgd::AstNode *s2 = ret->add_children();
     if (unlikely(s2 == nullptr)) {
@@ -412,9 +427,6 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_label(label);
     uint32_t hash = rgd::xxhash(s1->hash(), rgd::Memcmp, s2->hash());
     ret->set_hash(hash);
-#if NEED_OFFLINE
-    ret->set_name("memcmp");
-#endif
     return true;
   } else if (info->op == __dfsan::tlookup) {
     // A load from a read-only global table at a symbolic index.  The single
@@ -484,9 +496,6 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     // than the base address also keeps this stable across ASLR.
     ret->set_hash(rgd::xxhash(index->hash(),
                               (rgd::TLookup << 16) | info->size, thash));
-#if NEED_OFFLINE
-    ret->set_name("tlookup");
-#endif
     return true;
   } else if (info->op == __dfsan::fatoi) {
     if (unlikely(info->l1 != 0 || info->l2 < CONST_OFFSET)) {
@@ -548,9 +557,6 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       }
     }
     ret->set_hash(hash);
-#if NEED_OFFLINE
-    ret->set_name("atoi");
-#endif
     return true;
   } else if (info->op == __dfsan::fsize) {
     // do nothing now
@@ -578,9 +584,6 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   ret->set_kind(op_itr->second.first);
   ret->set_bits(info->size);
   ret->set_label(label);
-#if NEED_OFFLINE
-  ret->set_name(op_itr->second.second);
-#endif
 
   // record op
   constraint->ops[ret->kind()] = true;
@@ -633,10 +636,6 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     constraint->const_num += 1;
     uint32_t hash = rgd::xxhash(size, rgd::Constant, arg_index);
     left->set_hash(hash);
-#if NEED_OFFLINE
-    left->set_value(std::to_string(info->op1.i));
-    left->set_name("constant");
-#endif
   }
 
   // unary ops.  FP casts (FPToUI/FPToSI/UIToFP/SIToFP/FPTrunc/FPExt), FP
@@ -721,10 +720,6 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     constraint->const_num += 1;
     uint32_t hash = rgd::xxhash(size, rgd::Constant, arg_index);
     right->set_hash(hash);
-#if NEED_OFFLINE
-    right->set_value(std::to_string(info->op1.i));
-    right->set_name("constant");
-#endif
   }
 
   // record comparison operands.  These are the values the trace saw, extended
@@ -786,10 +781,25 @@ RGDAstParser::constraint_t RGDAstParser::parse_constraint(dfsan_label label) {
   }
   std::unordered_set<dfsan_label> visited;
   try {
-    constraint_t constraint = std::make_shared<rgd::Constraint>(size);
+    // arg_size_cache is filled in lockstep with ast_size_cache, so the bounds
+    // check above covers both
+    constraint_t constraint =
+        std::make_shared<rgd::Constraint>(size, arg_size_cache.at(label));
+#if DEBUG
+    size_t reserved = constraint->input_args.capacity();
+#endif
     if (!do_uta_rel(label, constraint->ast.get(), constraint, visited)) {
       return nullptr;
     }
+#if DEBUG
+    // scan_labels is supposed to bound this.  Growing is safe, but it means a
+    // node kind packs more slots than scan_labels accounts for -- worth
+    // knowing about when adding one.
+    if (constraint->input_args.size() > reserved) {
+      WARNF("input_args under-reserved for %u: %lu > %lu\n", label,
+            constraint->input_args.size(), reserved);
+    }
+#endif
     return constraint;
   } catch (std::bad_alloc &e) {
     WARNF("failed to allocate memory for constraint\n");
@@ -1385,6 +1395,7 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
   for (size_t i = ast_size_cache.size(); i <= label; i++) {
     if (i == 0) { // the constant label
       ast_size_cache.push_back(1); // constant takes one node too
+      arg_size_cache.push_back(1); // and one constant arg slot
       branch_to_inputs.emplace_back(input_dep_t(input_size_));
       nested_cmp_cache.push_back(0);
       continue;
@@ -1399,6 +1410,7 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
     if (info->op == 0) {
       // AST nodes
       ast_size_cache.push_back(1); // one Read node
+      arg_size_cache.push_back(1); // map_arg maps one byte
       // input deps
       uint32_t input_id = info->op2.i;
       uint32_t offset = info->op1.i;
@@ -1425,6 +1437,7 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
     } else if (info->op == __dfsan::Load) {
       // AST nodes
       ast_size_cache.push_back(1); // one Read node
+      arg_size_cache.push_back(info->l2); // map_arg maps l2 bytes
       // input deps
       uint32_t input_id = get_label_info(info->l1)->op2.i;
       uint32_t offset = get_label_info(info->l1)->op1.i;
@@ -1457,6 +1470,38 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
       uint32_t left  = info->l1 == 0 ? 1 : ast_size_cache[info->l1];
       uint32_t right = info->l2 == 0 ? 1 : ast_size_cache[info->l2];
       ast_size_cache.push_back(left + right + 1);
+      // input_args slots.  Mirrors do_uta_rel's packing, but only as an UPPER
+      // bound: it double counts a subtree reached twice (do_uta_rel expands it
+      // once, tracked by `visited`) and an input offset two reads share
+      // (map_arg dedups those through local_map).  Over-estimating only wastes
+      // capacity and under-estimating just falls back to growing the vector,
+      // so neither is a correctness concern -- unlike ast_size_cache, which
+      // AstNode::add_children() treats as a hard limit.
+      uint32_t largs = info->l1 == 0 ? 1 : arg_size_cache[info->l1];
+      uint32_t rargs = info->l2 == 0 ? 1 : arg_size_cache[info->l2];
+      uint32_t args;
+      switch (info->op) {
+        case __dfsan::WideConst:
+          // lowered to the two-slot rgd::Constant convention, low half first
+          args = 2;
+          break;
+        case __dfsan::fmemcmp:
+          // a concrete target is packed 8 bytes per slot; a symbolic one is
+          // just another subtree
+          args = sat_add(info->l1 == 0 ? (info->size + 7) / 8 : largs, rargs);
+          break;
+        case __dfsan::tlookup:
+          // num_elems, then the table contents, 8 bytes per slot
+          args = sat_add(largs, sat_add(1, tlookup_arg_slots(info)));
+          break;
+        case __dfsan::fatoi:
+          // the result is introduced as fake input bytes, one slot each
+          args = info->size / 8;
+          break;
+        default:
+          args = sat_add(largs, rargs);
+      }
+      arg_size_cache.push_back(args);
       // input deps
       branch_to_inputs.emplace_back(input_dep_t(input_size_));
       auto &itr = branch_to_inputs[i];
@@ -1907,7 +1952,10 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
   } else {
     // otherwise, parse the AST into a constraint
     std::unordered_set<dfsan_label> visited;
-    partial_constraint = std::make_shared<rgd::Constraint>(ast_size + 3); // leave extra one buffer?
+    // +1 arg slot for the placeholder constant node added just below
+    partial_constraint = std::make_shared<rgd::Constraint>(
+        ast_size + 3, // leave extra one buffer?
+        sat_add(arg_size_cache.at(index_label), 1));
 
     // add the constant node first
     auto const_node = partial_constraint->ast->add_children();
