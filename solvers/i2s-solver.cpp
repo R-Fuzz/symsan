@@ -1457,6 +1457,32 @@ static bool i2s_str_len(i2s_ctx &ctx, const i2s_strbuf_t &s, size_t &len) {
   return false;
 }
 
+// Length of a SEARCH op's haystack, which is the one content that may legally
+// arrive without a terminator.
+//
+// When the haystack is concrete the runtime does not send a string, it sends a
+// measurement: runtime/dfsan/dfsan_custom.cpp:524 calls strlen() and ships
+// exactly that many bytes, so the payload is the whole string and stops where
+// the string stops.  There is no zero byte in it and none is needed -- the
+// length is the size.  i2s_str_len's rule is about a SYMBOLIC haystack, where
+// the content is input bytes and the terminator is the only thing that says
+// which of them are in the string.
+//
+// The scan runs first rather than instead, because one source line reaches this
+// through two wrappers: clang folds strchr() over a literal into memchr() at -O1
+// and up, and __dfsw_memchr (:2346) sizes the payload by the caller's n, which
+// for that fold is strlen+1.  So the optimized build's payload DOES carry the
+// terminator, the scan finds it, and both builds report the same length.  Going
+// scan-first also leaves an embedded NUL -- which only the explicit-n form can
+// have -- meaning what it means.
+static bool i2s_str_haystack_len(i2s_ctx &ctx, const AstNode &hn,
+                                 const i2s_strbuf_t &hay, size_t &len) {
+  if (i2s_str_len(ctx, hay, len)) return true;
+  if (hn.kind() != rgd::Constant) return false;
+  len = hay.size();
+  return true;
+}
+
 static bool i2s_str_content(i2s_ctx &ctx, const AstNode &content,
                             size_t &bytes, size_t &len) {
   i2s_strbuf_t s;
@@ -1640,6 +1666,89 @@ static bool i2s_str_plant(i2s_ctx &ctx, uint16_t kind, const i2s_strbuf_t &hay,
     }
   }
   return true;
+}
+
+// Drive a symbolic needle expression to the character `b`.
+//
+// Only the LOW BYTE of that expression is the character: solvers/z3-ts.cpp:1355
+// extracts bits 7:0 and reads them unsigned before handing them to
+// Z3_mk_string_from_code, which is C's own rule -- strchr converts its int
+// argument to char.  So any value whose low byte is `b` is a correct answer,
+// and the two tried here are the two an 8-bit input byte can produce.  The
+// second is not a fallback for the sake of it: a `char` needle arrives as
+// SExt(Read i8), and i2s_invert rejects a bare 0xe9 there as unrepresentable in
+// the i8 child while accepting the sign-extended 0xffffffe9 that means the same
+// character.  Trying only the first would silently lose every needle >= 0x80.
+static bool i2s_str_set_needle(i2s_ctx &ctx, const AstNode &nn, uint8_t b) {
+  if (i2s_invert(ctx, nn, b, 0)) return true;
+  uint64_t s = (uint64_t)(int64_t)(int8_t)b;
+  return s != b && i2s_invert(ctx, nn, s, 0);
+}
+
+// The mirror image of i2s_str_plant: the haystack is what it is and the NEEDLE
+// is the symbolic side, as in concrete_haystack.c's strchr("deadbeef",
+// input[0]).  Nothing can be planted -- there is no writable byte in the
+// haystack to plant into -- so the move is to choose a character instead, and
+// the choice is exact rather than heuristic: a forward or backward scan finds
+// something iff the character occurs in [0, len), so "found" wants a byte the
+// haystack has and "not found" wants one it does not.
+//
+// Candidates are tried nearest-first from the byte already there, the same
+// preference i2s_str_plant applies to its own choices: the fewer bits that
+// move, the more likely a sibling constraint over the same byte survives.
+//
+// Zero is never a candidate, in either direction.  strchr(s, 0) returns a
+// pointer to the terminator rather than NULL, which is a match at index len
+// that neither i2s_str_index nor the [0, len) scan here models -- and it is the
+// same exclusion solvers/z3-ts.cpp:1361 makes with its `code != 0` aux
+// constraint, so the two arms agree about which answers exist.
+//
+// On success `needle` holds the chosen byte, so the caller's verify runs over
+// it unchanged.
+static bool i2s_str_needle(i2s_ctx &ctx, uint16_t kind, const AstNode &nn,
+                           const AstNode &hn, const i2s_strbuf_t &hay,
+                           size_t len, bool want_found,
+                           std::vector<uint8_t> &needle) {
+  uint64_t cur64 = 0;
+  if (!i2s_eval_int(ctx, nn, cur64, 0)) return false;
+  uint8_t cur = (uint8_t)cur64;
+
+  // Which bytes the haystack holds, read through any pending assignment -- the
+  // needle write below can land on a byte this haystack also reads, and then
+  // the membership that picked the candidate would be stale.  Recomputing per
+  // candidate is what the verify below does; this is only the candidate order.
+  bool in_hay[256] = {false};
+  for (size_t i = 0; i < len; ++i) {
+    uint8_t v = 0;
+    if (!i2s_str_get(ctx, hay[i], v)) return false;
+    in_hay[v] = true;
+  }
+
+  const size_t mark = ctx.assign.size();
+  for (int d = 0; d < 256; ++d) {
+    for (int s = 0; s < 2; ++s) {
+      if (d == 0 && s) break; // +0 and -0 are the same candidate
+      int b = s ? (int)cur - d : (int)cur + d;
+      if (b <= 0 || b > 255) continue;
+      if (in_hay[b] != want_found) continue;
+      ctx.assign.resize(mark);
+      if (!i2s_str_set_needle(ctx, nn, (uint8_t)b)) continue;
+      // Verify this candidate rather than trusting in_hay, and move on to the
+      // next one if it does not hold.  The needle expression may share input
+      // bytes with the haystack, in which case writing it changed the very
+      // string being searched.
+      needle.assign(1, (uint8_t)b);
+      size_t len2 = 0;
+      int64_t idx = -1;
+      if (i2s_str_haystack_len(ctx, hn, hay, len2) &&
+          i2s_str_index(ctx, kind, hay, len2, needle.data(), 1, idx) &&
+          (idx >= 0) == want_found)
+        return true;
+      needle.clear();
+    }
+  }
+  ctx.assign.resize(mark);
+  return false;
 }
 
 // Split a search node into the two things every path below needs: its haystack,
@@ -2762,31 +2871,60 @@ I2SSolver::solve_string(std::shared_ptr<const Constraint> const& c,
       return SOLVER_TIMEOUT;
     if (c->input_args[kn->index()].second != 0) return SOLVER_TIMEOUT;
 
+    if (unlikely(sn->children_size() != 2)) return SOLVER_TIMEOUT;
+    const AstNode *nn = i2s_resolve(ctx, sn->children(1));
+    const AstNode *hn = i2s_resolve(ctx, sn->children(0));
+    if (unlikely(nn == nullptr || hn == nullptr)) return SOLVER_TIMEOUT;
+    bool want_found = (comparison == rgd::Distinct);
+
     i2s_strbuf_t hay;
     std::vector<uint8_t> needle;
-    if (!i2s_str_operands(ctx, *sn, hay, needle)) return SOLVER_TIMEOUT;
-    size_t len = 0;
-    if (!i2s_str_len(ctx, hay, len)) return SOLVER_TIMEOUT;
-
-    bool want_found = (comparison == rgd::Distinct);
-    DEBUGF("i2s: try string search, kind %u, %zu-byte needle, len %zu, want %s\n",
-           sn->kind(), needle.size(), len, want_found ? "found" : "not found");
-
-    if (want_found) {
-      if (!i2s_str_plant(ctx, sn->kind(), hay, len, needle.data(), needle.size(),
-                         /*want_index=*/-1))
+    if (nn->kind() != rgd::Constant) {
+      // The needle is the symbolic side.  Only for the two ops whose second
+      // operand really is a character: StrStr and StrPbrk take a string
+      // pointer, so a non-Constant there is a symbolic *string* -- a whole
+      // content subtree -- and choosing one byte for it would be answering a
+      // different question.  concrete_haystack.c has both shapes, and its
+      // strstr/strpbrk pair also arrives wrapped in a SubStr.
+      if (sn->kind() != rgd::StrChr && sn->kind() != rgd::StrRChr)
+        return SOLVER_TIMEOUT;
+      // No i2s_str_operands here: its whole job is to pull concrete bytes out
+      // of a Constant needle, which is the operand that is symbolic in this
+      // shape.  The haystack still has to flatten, and there still has to be a
+      // [0, len) to search.
+      if (!i2s_str_flatten(ctx, *hn, hay, 0) || hay.empty())
+        return SOLVER_TIMEOUT;
+      size_t len = 0;
+      if (!i2s_str_haystack_len(ctx, *hn, hay, len)) return SOLVER_TIMEOUT;
+      DEBUGF("i2s: try symbolic needle, kind %u, len %zu, want %s\n",
+             sn->kind(), len, want_found ? "found" : "not found");
+      if (!i2s_str_needle(ctx, sn->kind(), *nn, *hn, hay, len, want_found,
+                          needle))
         return SOLVER_TIMEOUT;
     } else {
-      if (!i2s_str_clear(ctx, sn->kind(), hay, len, needle.data(), needle.size(),
-                         0, len))
-        return SOLVER_TIMEOUT;
+      if (!i2s_str_operands(ctx, *sn, hay, needle)) return SOLVER_TIMEOUT;
+      size_t len = 0;
+      if (!i2s_str_len(ctx, hay, len)) return SOLVER_TIMEOUT;
+
+      DEBUGF("i2s: try string search, kind %u, %zu-byte needle, len %zu, want %s\n",
+             sn->kind(), needle.size(), len, want_found ? "found" : "not found");
+
+      if (want_found) {
+        if (!i2s_str_plant(ctx, sn->kind(), hay, len, needle.data(),
+                           needle.size(), /*want_index=*/-1))
+          return SOLVER_TIMEOUT;
+      } else {
+        if (!i2s_str_clear(ctx, sn->kind(), hay, len, needle.data(),
+                           needle.size(), 0, len))
+          return SOLVER_TIMEOUT;
+      }
     }
 
     // Verify.  Re-derive the length first: a content byte backed by an
     // expression rather than a plain Read is written through i2s_invert, which
     // is free to move bytes this content also reads, the terminator included.
     size_t len2 = 0;
-    if (!i2s_str_len(ctx, hay, len2)) return SOLVER_TIMEOUT;
+    if (!i2s_str_haystack_len(ctx, *hn, hay, len2)) return SOLVER_TIMEOUT;
     int64_t idx = -1;
     if (!i2s_str_index(ctx, sn->kind(), hay, len2, needle.data(), needle.size(),
                        idx))
