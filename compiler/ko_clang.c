@@ -208,6 +208,18 @@ static void add_runtime() {
     cc_params[cc_par_cnt++] = alloc_printf("%s/libc++.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/libc++abi.a", obj_path);
     cc_params[cc_par_cnt++] = alloc_printf("%s/libunwind.a", obj_path);
+    // ...and nothing else.  -stdlib=libc++ (added below for the headers) also
+    // makes clang's own driver append -lc++ -lc++abi to the end of the link
+    // line, which with the -Wl,--no-as-needed below records a DT_NEEDED on the
+    // *uninstrumented* shared libc++.so.1 even though the static archives above
+    // already resolved every std::__1 symbol.  Two libc++ copies in one process
+    // is an ODR violation that bites in both directions: the executable exports
+    // its instrumented std::__1::cout, so libc++.so.1's ios_base::Init binds to
+    // it and flushes it from libc++.so.1's finalizer -- and _dl_fini finalizes
+    // the executable first, so that flush runs instrumented code after the
+    // runtime's own atexit handler has already been through.  -nostdlib++ keeps
+    // the headers and drops the driver's implicit link.
+    cc_params[cc_par_cnt++] = "-nostdlib++";
   } else {
     // System static libc++ for C builds (avoids shared lib dependency)
     cc_params[cc_par_cnt++] = "-l:libc++.a";

@@ -2015,12 +2015,25 @@ static void dfsan_fini() {
     dfsan_dump_labels(fd);
     CloseFile(fd);
   }
-  if (tainted.buf) {
-    UnmapOrDie(tainted.buf, tainted.buf_size);
-  }
-  if (flags().shm_fd != -1 || internal_strcmp(flags().shm_name, "") != 0) {
-    internal_munmap((void *)UnionTableAddr(), uniontable_size);
-  }
+  // Deliberately no teardown of the union table or of the input mapping here.
+  // dfsan_fini runs from the main executable's __cxa_finalize, and _dl_fini
+  // finalizes the executable *before* the shared libraries it depends on -- so
+  // instrumented code reached from a library destructor still runs after this
+  // point.  How this was found: every C++ target used to link a stray shared
+  // libc++.so.1 next to the instrumented static one (fixed in
+  // compiler/ko_clang.c), and that library's ios_base::Init destructor flushed
+  // std::cout into the statically linked instrumented __stdoutbuf<char>::sync,
+  // whose alloca reaches __taint_trace_alloca and writes a label into the union
+  // table.  Unmapping the table here made that a SIGSEGV on the topmost alloca
+  // slot -- silent, because it happens after the program has produced all of
+  // its output, so the tests that tripped it (tests/symsan/cpp_fstream.cpp,
+  // cpp_string.cpp) still passed and only the kernel log showed it.  The link
+  // fix removes that particular caller; any target that links a C++ library of
+  // its own brings it straight back, so the rule stands on its own.
+  //
+  // Neither mapping needs releasing anyway: the kernel reclaims both at exit,
+  // and the shm object behind the union table belongs to the launcher, which
+  // close()s and shm_unlink()s it itself (driver/launcher/launch.c).
 }
 
 static bool dfsan_initialized;
