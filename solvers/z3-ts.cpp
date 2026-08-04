@@ -2863,13 +2863,18 @@ void Z3AstParser::mark_expr_type(dfsan_label label, input_dep_set_t &inputs) {
 }
 
 void Z3AstParser::save_constraint(z3::expr expr, input_dep_set_t &inputs) {
+  // Once for the whole loop rather than once per offset: this is the only z3
+  // API call left on the dependency-bookkeeping path.
+  const unsigned eid = expr.id();
   for (auto off : inputs) {
     auto c = get_branch_dep(off);
     if (c == nullptr) {
       throw z3::exception("branch_dep not found for input byte");
     }
     c->input_deps.insert(inputs.begin(), inputs.end());
-    c->expr_deps.insert(expr);
+    // try_emplace, not emplace: the expr is only copied (and refcounted) when
+    // this offset has not already recorded it.
+    c->expr_deps.try_emplace(eid, expr);
   }
 }
 
@@ -2892,7 +2897,10 @@ void Z3AstParser::collect_more_deps(input_dep_set_t &inputs) {
 }
 
 size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, z3_task_t *task) {
-  expr_set_t added;
+  // Dedup on the AST id alone.  The scan below is the parser's hottest loop --
+  // every offset's whole expr_deps, for every offset in the transitive closure
+  // -- so it must not touch the z3 C API; see expr_set_t in parse-z3.h.
+  std::unordered_set<unsigned> added;
   std::vector<offset_t> need_linking;
 
   for (auto &off : inputs) {
@@ -2906,9 +2914,9 @@ size_t Z3AstParser::add_nested_constraints(input_dep_set_t &inputs, z3_task_t *t
       }
 
       for (auto &expr : deps->expr_deps) {
-        if (added.insert(expr).second) {
-          // fprintf(stderr, "adding expr: %s\n", expr.to_string().c_str());
-          task->push_back(expr);
+        if (added.insert(expr.first).second) {
+          // fprintf(stderr, "adding expr: %s\n", expr.second.to_string().c_str());
+          task->push_back(expr.second);
         }
       }
     }

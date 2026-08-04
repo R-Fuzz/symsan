@@ -127,17 +127,18 @@ private:
   std::vector<bool> is_label_seq_;  // involves string/seq variables (str-X-Y-Z)
 
   // dependencies
-  struct expr_hash {
-    std::size_t operator()(const z3::expr &expr) const {
-      return expr.hash();
-    }
-  };
-  struct expr_equal {
-    bool operator()(const z3::expr &lhs, const z3::expr &rhs) const {
-      return lhs.id() == rhs.id();
-    }
-  };
-  using expr_set_t = std::unordered_set<z3::expr, expr_hash, expr_equal>;
+  //
+  // Keyed on the z3 AST id, with the expr carried as the value.  This used to be
+  // an unordered_set<z3::expr> hashing on expr.hash() and comparing on
+  // lhs.id() == rhs.id(), which is the same identity -- but it re-fetched both
+  // over the C API on every probe.  Each of those calls opens with a LOCK'd
+  // exchange on z3's g_z3_log_enabled (the logging guard, paid whether or not
+  // logging is on: it *is* the enabled check, see z3's z3_log_ctx), and
+  // add_nested_constraints probes once per expr per input offset.  On the
+  // 811-seed libpng corpus Z3_get_ast_hash/Z3_get_ast_id and the
+  // Z3_get_error_code shadowing each of them were two thirds of the parser's
+  // whole runtime.  The id is computed once, where the expr is saved.
+  using expr_set_t = std::unordered_map<unsigned, z3::expr>;
   // Comparison info stored for Int mirroring of BV nested constraints
   struct cmp_info_t {
     dfsan_label l1;      // left operand label
