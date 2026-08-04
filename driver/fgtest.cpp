@@ -33,8 +33,29 @@ using namespace __dfsan;
 
 #define OPTIMISTIC 1
 
+// SYMSAN_VERBOSE: the per-event trace.
+//
+// AOUT fires once per branch, per GEP and per solution byte, which is what you
+// want when you are staring at one seed and is unusable the moment fgtest is
+// pointed at a corpus -- the 811-seed libpng sweep is millions of lines, and
+// writing them costs more than the parse. Off by default; set SYMSAN_VERBOSE
+// to get it back, no rebuild needed.
+//
+// What is *not* under it: the "generate #N output" line, which is a result
+// rather than a trace (tests/fuzzing/branch_map_join.c checks for it), and the
+// fprintf(stderr) failures, which have no other channel. Rejected parses lose
+// their prose here but keep last_error(), which parse-only mode buckets into
+// PARSE-REASON.
+static int __verbose = 0;
+
 #undef AOUT
 # define AOUT(...)                                      \
+  do {                                                  \
+    if (__verbose) printf(__VA_ARGS__);                 \
+  } while(false)
+
+// A result line, always printed.
+# define ROUT(...)                                      \
   do {                                                  \
     printf(__VA_ARGS__);                                \
   } while(false)
@@ -66,8 +87,10 @@ symsan::Z3ParserSolver *__z3_parser = nullptr;
 // Solving dominates the wall clock of a trace and is also where most of the
 // noise lives, so a sweep meant to answer "which branches does the parser
 // refuse, and why" runs an order of magnitude faster -- and produces countable
-// output -- with the solvers out of the picture.  The per-event chatter goes
-// too, replaced by a machine-readable summary on exit; see report_parse_stats.
+// output -- with the solvers out of the picture.  What it prints instead is a
+// machine-readable summary on exit; see report_parse_stats.  The per-event
+// trace is separate and off by default either way -- see SYMSAN_VERBOSE, which
+// still works here if you want to read a rejection in context.
 static int __parse_only = 0;
 
 namespace {
@@ -207,15 +230,15 @@ static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
            __instance_id, __session_id, __current_index++);
   int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
   if (fd == -1) {
-    AOUT("failed to open new input file for write");
+    ROUT("failed to open new input file for write");
     return;
   }
 
-  AOUT("generate #%d output (size: %zu -> %zu)\n",
+  ROUT("generate #%d output (size: %zu -> %zu)\n",
        __current_index - 1, input_size, new_input.size());
 
   if (write(fd, new_input.data(), new_input.size()) == -1) {
-    AOUT("failed to write new input\n");
+    ROUT("failed to write new input\n");
   }
 
   close(fd);
@@ -223,8 +246,7 @@ static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
 
 static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *addr) {
 
-  if (!__parse_only)
-    AOUT("solving label %d = %d, add_nested: %d\n", label, r, add_nested);
+  AOUT("solving label %d = %d, add_nested: %d\n", label, r, add_nested);
   if (__parse_only && label == 0) {
     // A loop-exit notification, not a condition -- there is no AST to build and
     // no branch to flip, so it is neither a success nor a failure.
@@ -269,9 +291,8 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
                          uint64_t num_elems, uint64_t elem_size,
                          int64_t current_offset, void* addr) {
 
-  if (!__parse_only)
-    AOUT("tainted GEP index: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
-        index, index_label, num_elems, elem_size, current_offset);
+  AOUT("tainted GEP index: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
+      index, index_label, num_elems, elem_size, current_offset);
 
   std::vector<uint64_t> tasks;
   int failed = __z3_parser->parse_gep(ptr_label, ptr, index_label, index, num_elems,
@@ -529,6 +550,7 @@ int main(int argc, char* const argv[]) {
   int solve_ub = 0;
   int debug = 0;
   __parse_only = getenv("SYMSAN_PARSE_ONLY") != nullptr;
+  __verbose = getenv("SYMSAN_VERBOSE") != nullptr;
   char *options = getenv("TAINT_OPTIONS");
   if (options) {
     // setup output dir
