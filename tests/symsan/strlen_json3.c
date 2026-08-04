@@ -20,14 +20,18 @@
 // program prints "Malformed JSON" without ever reaching the branch.  Deleting the
 // six characters instead leaves the quote where it was, one field shorter.
 //
-// id-0-0-0 is a different branch (the strstr, answered by breaking the key), so
-// the length answer is id-0-0-1.
+// The length answer is id-0-0-2; the two before it are the other two branches on
+// the way in, both answered correctly.  id-0-0-0 breaks the key so the strstr
+// misses ("Field not found").  id-0-0-1 clears every quote at or after the key so
+// the strchr misses ("Malformed JSON - no closing quote") -- that haystack is a
+// SLICE of the buffer rather than a string of its own, which i2s used to decline,
+// so this input is why the index here is 2 and not 1.
 // CHECK-RGD-FILE: {"name":"HELLO","age":25}
 // RUN: rm -rf %t.rgd.out
 // RUN: mkdir -p %t.rgd.out
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.rgd.out" %afltest %t.fg %t.bin
-// RUN: %t.uninstrumented %t.rgd.out/id-0-0-1 | FileCheck --check-prefix=CHECK-GEN %s
-// RUN: FileCheck --check-prefix=CHECK-RGD-FILE %s < %t.rgd.out/id-0-0-1
+// RUN: %t.uninstrumented %t.rgd.out/id-0-0-2 | FileCheck --check-prefix=CHECK-GEN %s
+// RUN: FileCheck --check-prefix=CHECK-RGD-FILE %s < %t.rgd.out/id-0-0-2
 
 #include <string.h>
 #include <stdio.h>

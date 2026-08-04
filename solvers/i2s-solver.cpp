@@ -584,6 +584,15 @@ struct i2s_ctx {
   i2s_node_map_t nodes;
   i2s_assignment_t assign;
   uint32_t steps;
+  // Did the last flatten pass through a slice whose bound is not a constant?
+  // Such a bound is an expression over input bytes, so an edit can move it, and
+  // then the string is a different SET of bytes rather than the same bytes read
+  // differently.  Every path that verifies by re-flattening (i2s_str_reread)
+  // sees that for itself and needs no flag; this exists for the one path that
+  // cannot re-measure at all, the splice below.  Set by i2s_str_flatten, so it
+  // describes whatever was flattened last -- clear it immediately before the
+  // flatten being judged.
+  bool sliced;
   // At most one LENGTH-CHANGING edit, on top of the byte assignments above.
   // Only the string paths set it, and only solve_string's StrLen rule does so
   // far: the length of a field in a delimited format is not set by a
@@ -1374,6 +1383,15 @@ static bool i2s_const_bytes(const i2s_ctx &ctx, const AstNode &node,
   return true;
 }
 
+// Flattening a SubStr needs its bound, and the bound of a chained slice is a
+// search position, which is computed by searching.  Hence the cycle:
+// flatten -> pos -> index -> flatten.  It terminates on the AST, which is a
+// DAG, and is bounded anyway by `depth` and by ctx.steps.
+static bool i2s_str_flatten(i2s_ctx &ctx, const AstNode &n_, i2s_strbuf_t &out,
+                            uint32_t depth);
+static bool i2s_str_pos(i2s_ctx &ctx, const AstNode &n_, int64_t &pos,
+                        uint32_t depth);
+
 // Flatten a content subtree into one entry per byte.
 static bool i2s_str_flatten(i2s_ctx &ctx, const AstNode &n_, i2s_strbuf_t &out,
                             uint32_t depth) {
@@ -1388,6 +1406,57 @@ static bool i2s_str_flatten(i2s_ctx &ctx, const AstNode &n_, i2s_strbuf_t &out,
     // address -- the same order i2s_walk_wide walks the spine in.
     return i2s_str_flatten(ctx, node.children(0), out, depth + 1) &&
            i2s_str_flatten(ctx, node.children(1), out, depth + 1);
+  }
+  // strcat(dest, src): the content is one then the other.  Both children come
+  // from add_str_operand (parsers/rgd-parser.cpp), so a concrete side is a
+  // packed Constant and falls through to the generic case below, exactly as a
+  // concrete haystack already does.
+  if (node.kind() == rgd::StrCat) {
+    if (unlikely(node.children_size() != 2)) return false;
+    return i2s_str_flatten(ctx, node.children(0), out, depth + 1) &&
+           i2s_str_flatten(ctx, node.children(1), out, depth + 1);
+  }
+  // A slice of another content, which is how a chained parse arrives:
+  // strchr(t1 + 1, ':') traces as StrChr(SubStr(content, StrOff(StrChr(..), 1)),
+  // ':').  Getting through this is what makes chaining solvable at all, and
+  // chaining is the normal shape of a string-format parser -- find a delimiter,
+  // parse what follows, find the next one.
+  //
+  // Slicing a FLATTENED list is exact, which is the reason this is cheap rather
+  // than a new model: an i2s_strbyte names its leaf node and byte offset, not a
+  // position in some string, so dropping entries changes which bytes the string
+  // HAS and nothing about what any one of them is.  Writability survives, and
+  // so does the aliasing that matters most here -- two content ops over the
+  // same input byte flatten to the same entry, so a write through one is
+  // already visible to the other.  That is the consistency a nested constraint
+  // needs, and it comes from the representation rather than from a solver.
+  //
+  // children(1) is the bound: a Constant when the program's was concrete, the
+  // position subtree when it was not.  index() picks the mode, 0 = prefix
+  // (keep [0, k)), 1 = suffix (keep [k, end)) -- see rgd-parser.cpp's SubStr
+  // case and solvers/z3-ts.cpp:1628-1712, which build the same two shapes.
+  //
+  // A symbolic bound is evaluated at its value on THIS trace.  That is the i2s
+  // reading of it, not an approximation of a better one: the slice is where the
+  // program actually sliced, and asking where it might have sliced is the
+  // question z3 is for.  A write can move it, so the caller re-flattens from
+  // the AST in its verify rather than reusing the list built here.
+  if (node.kind() == rgd::SubStr) {
+    if (unlikely(node.children_size() != 2)) return false;
+    i2s_strbuf_t inner;
+    if (!i2s_str_flatten(ctx, node.children(0), inner, depth + 1)) return false;
+    const AstNode *bn = i2s_resolve(ctx, node.children(1));
+    if (unlikely(bn == nullptr)) return false;
+    if (bn->kind() != rgd::Constant) ctx.sliced = true;
+    int64_t k = 0;
+    if (!i2s_str_pos(ctx, *bn, k, depth + 1)) return false;
+    if (unlikely(k < 0)) return false;
+    size_t cut = (size_t)k < inner.size() ? (size_t)k : inner.size();
+    size_t lo = node.index() == 0 ? 0 : cut;
+    size_t hi = node.index() == 0 ? cut : inner.size();
+    if (unlikely(out.size() + (hi - lo) > kI2SMaxStrLen)) return false;
+    out.insert(out.end(), inner.begin() + lo, inner.begin() + hi);
+    return true;
   }
   size_t n = node.bits() / 8;
   if (unlikely(out.size() + n > kI2SMaxStrLen)) return false;
@@ -1475,11 +1544,51 @@ static bool i2s_str_len(i2s_ctx &ctx, const i2s_strbuf_t &s, size_t &len) {
 // terminator, the scan finds it, and both builds report the same length.  Going
 // scan-first also leaves an embedded NUL -- which only the explicit-n form can
 // have -- meaning what it means.
+// A slice and a concatenation get the same fallback for the same reason.  A
+// prefix slice -- strncpy(dst, buf, n) -- holds exactly the n bytes the program
+// asked for and usually no zero among them, because the program writes the
+// terminator itself, afterwards, into a buffer this content does not describe.
+// Its extent comes from the SubStr bound, which is in the AST, so it is known
+// here without a terminator; the same is true of a StrCat, whose extent is the
+// sum of two known ones.  What is NOT allowed the fallback is a bare content
+// subtree, where the bytes are input and the terminator really is the only
+// delimiter there is.
 static bool i2s_str_haystack_len(i2s_ctx &ctx, const AstNode &hn,
                                  const i2s_strbuf_t &hay, size_t &len) {
   if (i2s_str_len(ctx, hay, len)) return true;
-  if (hn.kind() != rgd::Constant) return false;
+  if (hn.kind() != rgd::Constant && hn.kind() != rgd::SubStr &&
+      hn.kind() != rgd::StrCat)
+    return false;
   len = hay.size();
+  return true;
+}
+
+// Re-derive a haystack from the AST, for a verify that runs after the writes.
+// This is strictly more than re-measuring the list the search was planned over,
+// and the difference is the whole reason a chained slice is safe: a SubStr bound
+// is an expression over input bytes too, so a plant can MOVE it, and then the
+// right answer is a different SET of bytes rather than the same bytes with the
+// terminator somewhere else.  i2s_str_pos evaluates the bound through
+// i2s_peek, which reads the pending assignment, so flattening again is what
+// sees the move; nothing else does.
+//
+// The rebuilt list goes in the caller's own buffer, never over the one the
+// search is still walking: a verify that fails has to leave the next candidate
+// or the next position looking at the extent it planned against.
+static bool i2s_str_reread(i2s_ctx &ctx, const AstNode &hn, i2s_strbuf_t &hay,
+                           size_t &len) {
+  hay.clear();
+  if (!i2s_str_flatten(ctx, hn, hay, 0) || hay.empty()) return false;
+  return i2s_str_haystack_len(ctx, hn, hay, len);
+}
+
+// Do two flattenings describe the same bytes?  Compared by leaf and offset, not
+// by value: the question is whether the string still COVERS what it did, which
+// only a moved slice bound changes.
+static bool i2s_str_same_extent(const i2s_strbuf_t &a, const i2s_strbuf_t &b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i)
+    if (a[i].node != b[i].node || a[i].byte != b[i].byte) return false;
   return true;
 }
 
@@ -1668,6 +1777,25 @@ static bool i2s_str_plant(i2s_ctx &ctx, uint16_t kind, const i2s_strbuf_t &hay,
   return true;
 }
 
+// Most positions a plant will be moved to before giving up.  See the retry loop
+// in solve_string's NULL rule for why a small number is the right one.
+static const size_t kI2SMaxStrPlant = 64;
+
+// Does the search hold, on the string as it is NOW?  The one check every path
+// in the NULL rule ends with, and the reason it re-flattens rather than
+// re-measuring is in the comment on i2s_str_reread.
+static bool i2s_str_search_holds(i2s_ctx &ctx, const AstNode &hn, uint16_t kind,
+                                 const std::vector<uint8_t> &needle,
+                                 bool want_found) {
+  i2s_strbuf_t hay;
+  size_t len = 0;
+  if (!i2s_str_reread(ctx, hn, hay, len)) return false;
+  int64_t idx = -1;
+  if (!i2s_str_index(ctx, kind, hay, len, needle.data(), needle.size(), idx))
+    return false;
+  return (idx >= 0) == want_found;
+}
+
 // Drive a symbolic needle expression to the character `b`.
 //
 // Only the LOW BYTE of that expression is the character: solvers/z3-ts.cpp:1355
@@ -1738,10 +1866,11 @@ static bool i2s_str_needle(i2s_ctx &ctx, uint16_t kind, const AstNode &nn,
       // bytes with the haystack, in which case writing it changed the very
       // string being searched.
       needle.assign(1, (uint8_t)b);
+      i2s_strbuf_t hay2;
       size_t len2 = 0;
       int64_t idx = -1;
-      if (i2s_str_haystack_len(ctx, hn, hay, len2) &&
-          i2s_str_index(ctx, kind, hay, len2, needle.data(), 1, idx) &&
+      if (i2s_str_reread(ctx, hn, hay2, len2) &&
+          i2s_str_index(ctx, kind, hay2, len2, needle.data(), 1, idx) &&
           (idx >= 0) == want_found)
         return true;
       needle.clear();
@@ -1774,6 +1903,65 @@ static bool i2s_str_operands(i2s_ctx &ctx, const AstNode &sn,
     if (unlikely(needle[i] == 0)) return false;
   if (!i2s_str_flatten(ctx, *hn, hay, 0)) return false;
   return !hay.empty();
+}
+
+// Evaluate a SubStr bound under the current bytes.  Three things can be one:
+//
+//  * an ordinary integer -- a Constant length, or a length computed from input
+//    bytes -- which i2s_eval_int already handles;
+//  * a search position, which is not an integer i2s_eval_int can reach.  The
+//    index ops deliberately have no case there (see the comment on
+//    i2s_eval_int's StrLen case) precisely because their value is not carried
+//    in the traced operands; it has to be recomputed by searching, which is
+//    what i2s_str_index does;
+//  * StrOff, a search position shifted by a constant -- `t1 + 1`.  This is the
+//    only place StrOff is understood, and it is understood as arithmetic on a
+//    position rather than as a position of its own.
+//
+// A search that finds nothing gives -1, and -1 + 1 = 0 is not the slice the
+// program took: strchr returned NULL and the program never sliced at all.  So a
+// negative base fails here rather than propagating, and the caller declines.
+static bool i2s_str_pos(i2s_ctx &ctx, const AstNode &n_, int64_t &pos,
+                        uint32_t depth) {
+  if (unlikely(depth > kI2SMaxWideDepth || ctx.steps == 0)) return false;
+  ctx.steps--;
+  const AstNode *np = i2s_resolve(ctx, n_);
+  if (unlikely(np == nullptr)) return false;
+  auto const& node = *np;
+
+  if (node.kind() == rgd::StrOff) {
+    if (unlikely(node.children_size() != 2)) return false;
+    int64_t base = 0;
+    if (!i2s_str_pos(ctx, node.children(0), base, depth + 1)) return false;
+    if (unlikely(base < 0)) return false;
+    // The offset rides in input_args as a signed 64-bit scalar
+    // (pack_const_scalar in parsers/rgd-parser.cpp's StrOff case).
+    const AstNode *on = i2s_resolve(ctx, node.children(1));
+    if (unlikely(on == nullptr || on->kind() != rgd::Constant)) return false;
+    if (unlikely((size_t)on->index() >= ctx.c->input_args.size())) return false;
+    int64_t off = (int64_t)ctx.c->input_args[on->index()].second;
+    if (unlikely(off < 0 && base < -off)) return false;
+    pos = base + off;
+    return true;
+  }
+
+  if (isIndexOfStringKind(node.kind())) { // StrOff is handled above
+    i2s_strbuf_t hay;
+    std::vector<uint8_t> needle;
+    if (!i2s_str_operands(ctx, node, hay, needle)) return false;
+    const AstNode *hn = i2s_resolve(ctx, node.children(0));
+    if (unlikely(hn == nullptr)) return false;
+    size_t len = 0;
+    if (!i2s_str_haystack_len(ctx, *hn, hay, len)) return false;
+    return i2s_str_index(ctx, node.kind(), hay, len, needle.data(),
+                         needle.size(), pos);
+  }
+
+  uint64_t v = 0;
+  if (!i2s_eval_int(ctx, node, v, 0)) return false;
+  if (unlikely(v > (uint64_t)kI2SMaxStrLen)) return false;
+  pos = (int64_t)v;
+  return true;
 }
 
 // Commit a pending assignment, following the convention the other paths use:
@@ -2549,7 +2737,7 @@ I2SSolver::solve_ast(std::shared_ptr<const Constraint> const& c,
 
   DEBUGF("i2s: try ast, comparison = %u, bits = %u\n", comparison, bits);
 
-  i2s_ctx ctx{c, in_buf, in_size, {}, {}, kI2SMaxSteps, 0, 0, 0};
+  i2s_ctx ctx{c, in_buf, in_size, {}, {}, kI2SMaxSteps, false, 0, 0, 0};
   i2s_index_nodes(root, ctx.nodes, 0);
   // Try each side as the one to rewrite: pin the other at the value it takes
   // under the current input, aim for whatever makes the comparison hold, and
@@ -2619,7 +2807,7 @@ I2SSolver::solve_memcmp_ast(std::shared_ptr<const Constraint> const& c,
     want[i] = (uint8_t)(c->input_args[arg].second >> ((i % 8) * 8));
   }
 
-  i2s_ctx ctx{c, in_buf, in_size, {}, {}, kI2SMaxSteps, 0, 0, 0};
+  i2s_ctx ctx{c, in_buf, in_size, {}, {}, kI2SMaxSteps, false, 0, 0, 0};
   i2s_index_nodes(root, ctx.nodes, 0);
   if (!i2s_walk_wide(ctx, sym, want.data(), nbytes, 0, /*invert=*/true, 0))
     return SOLVER_TIMEOUT;
@@ -2827,7 +3015,7 @@ I2SSolver::solve_string(std::shared_ptr<const Constraint> const& c,
   // task is the contract anyway.
   if (cur_size != in_size) return SOLVER_TIMEOUT;
 
-  i2s_ctx ctx{c, cur_buf, cur_size, {}, {}, kI2SMaxSteps, 0, 0, 0};
+  i2s_ctx ctx{c, cur_buf, cur_size, {}, {}, kI2SMaxSteps, false, 0, 0, 0};
   i2s_index_nodes(root, ctx.nodes, 0);
   const AstNode *lhs = i2s_resolve(ctx, root.children(0));
   const AstNode *rhs = i2s_resolve(ctx, root.children(1));
@@ -2910,9 +3098,39 @@ I2SSolver::solve_string(std::shared_ptr<const Constraint> const& c,
              sn->kind(), needle.size(), len, want_found ? "found" : "not found");
 
       if (want_found) {
-        if (!i2s_str_plant(ctx, sn->kind(), hay, len, needle.data(),
-                           needle.size(), /*want_index=*/-1))
-          return SOLVER_TIMEOUT;
+        // Plant, verify, and plant somewhere ELSE if the verify says no.
+        //
+        // i2s_str_plant picks the position needing the fewest writes, which is
+        // right nearly always and wrong in exactly one way: the byte it writes
+        // can be a byte the constraint itself depends on.  A chained parse is
+        // where that stops being hypothetical --
+        // `t1 = strrchr(buf, ':'); strchr(t1, ';')` searches a slice that
+        // STARTS at the colon, so a semicolon planted over the colon deletes
+        // the slice it was planted in.  The nearest other position is fine, and
+        // there is nothing clever to say about which: the plant already ordered
+        // them by cost, so this walks them in position order and takes the
+        // first that survives its own verify.
+        //
+        // The retry is bounded because a plant that has to move is moving away
+        // from something local -- the bound of the slice it sits in, a sibling
+        // byte -- and if a few dozen positions all fail, position 200 will too.
+        size_t mlen = i2s_str_match_len(sn->kind(), needle.size());
+        if (mlen == 0 || mlen > len) return SOLVER_TIMEOUT;
+        size_t nslots = len - mlen + 1;
+        if (nslots > kI2SMaxStrPlant) nslots = kI2SMaxStrPlant;
+        const size_t mark = ctx.assign.size();
+        bool solved = false;
+        for (size_t k = 0; !solved && k <= nslots; ++k) {
+          ctx.assign.resize(mark);
+          // k == 0 is the plant's own choice, which is the cheapest write and
+          // therefore the one to try first; after that, explicit positions.
+          int64_t at = (k == 0) ? -1 : (int64_t)(k - 1);
+          if (!i2s_str_plant(ctx, sn->kind(), hay, len, needle.data(),
+                             needle.size(), at))
+            continue;
+          solved = i2s_str_search_holds(ctx, *hn, sn->kind(), needle, true);
+        }
+        if (!solved) return SOLVER_TIMEOUT;
       } else {
         if (!i2s_str_clear(ctx, sn->kind(), hay, len, needle.data(),
                            needle.size(), 0, len))
@@ -2920,16 +3138,12 @@ I2SSolver::solve_string(std::shared_ptr<const Constraint> const& c,
       }
     }
 
-    // Verify.  Re-derive the length first: a content byte backed by an
-    // expression rather than a plain Read is written through i2s_invert, which
-    // is free to move bytes this content also reads, the terminator included.
-    size_t len2 = 0;
-    if (!i2s_str_haystack_len(ctx, *hn, hay, len2)) return SOLVER_TIMEOUT;
-    int64_t idx = -1;
-    if (!i2s_str_index(ctx, sn->kind(), hay, len2, needle.data(), needle.size(),
-                       idx))
+    // Verify.  Already done per-candidate on the two paths that search, and
+    // repeating it costs one more flatten; it stays because the clear path does
+    // NOT verify itself and because a rule this easy to extend should not have
+    // a way out that skips the check.
+    if (!i2s_str_search_holds(ctx, *hn, sn->kind(), needle, want_found))
       return SOLVER_TIMEOUT;
-    if ((idx >= 0) != want_found) return SOLVER_TIMEOUT;
 
     matches++;
     i2s_str_emit(ctx, in_buf, in_size, out_buf, out_size);
@@ -2974,6 +3188,8 @@ I2SSolver::solve_string(std::shared_ptr<const Constraint> const& c,
     i2s_strbuf_t hay;
     std::vector<uint8_t> needle;
     if (!i2s_str_operands(ctx, *pn, hay, needle)) return SOLVER_TIMEOUT;
+    const AstNode *hn = i2s_resolve(ctx, pn->children(0));
+    if (unlikely(hn == nullptr)) return SOLVER_TIMEOUT;
 
     //=== the base ===//
     // StrPtrToInt is a pointer difference; this model counts from the start of
@@ -3057,10 +3273,17 @@ I2SSolver::solve_string(std::shared_ptr<const Constraint> const& c,
       // p, out of bytes the clear has no way to touch without undoing the
       // plant.  Then the search reports that earlier position and this check
       // fails, which is the right outcome -- an answer, not a guess.
+      i2s_strbuf_t hay2;
       size_t len2 = 0;
       int64_t idx = -1;
-      if (!i2s_str_len(ctx, hay, len2)) continue;
-      if (!i2s_str_index(ctx, pn->kind(), hay, len2, needle.data(),
+      if (!i2s_str_reread(ctx, *hn, hay2, len2)) continue;
+      // And the haystack has to still START where `base` was measured against.
+      // The NULL rule can absorb a moved slice -- it re-runs the search over
+      // whatever the string now is and asks only found or not-found.  This one
+      // cannot: its answer is `base + idx`, so a slice that moved would have it
+      // report a position in a string that no longer exists.
+      if (!i2s_str_same_extent(hay, hay2)) continue;
+      if (!i2s_str_index(ctx, pn->kind(), hay2, len2, needle.data(),
                          needle.size(), idx))
         continue;
       if (idx < 0) continue; // a miss is the one outcome this model cannot read
@@ -3129,9 +3352,11 @@ I2SSolver::solve_string(std::shared_ptr<const Constraint> const& c,
     bool str_on_left = (sn == lhs);
 
     i2s_strbuf_t content;
+    ctx.sliced = false;
     if (!i2s_str_flatten(ctx, sn->children(0), content, 0))
       return SOLVER_TIMEOUT;
     if (unlikely(content.empty())) return SOLVER_TIMEOUT;
+    const bool sliced = ctx.sliced;
     // The same cross-check i2s_eval_int's StrLen case makes, for the same
     // reason: child 1 is the length the trace observed and the content includes
     // the terminator, so bytes must be obs + 1 or this content is not the
@@ -3178,8 +3403,20 @@ I2SSolver::solve_string(std::shared_ptr<const Constraint> const& c,
 
       // The splice first, per the note above: it is the edit that keeps a
       // delimited document well-formed, and it is the only one that can grow.
+      //
+      // Not for a slice with a computed bound, though.  A splice is a FILE edit
+      // that the content model does not describe -- the comment on
+      // i2s_str_splice_len says as much: there is nothing to re-measure
+      // afterwards, because i2s_peek knows about byte assignments and nothing
+      // about inserted or deleted bytes.  For an ordinary string that is fine,
+      // since the length after the edit is L by construction.  For
+      // `strlen(substr(s, 0, strchr(s, ':') - s))` it is not: deleting bytes
+      // inside the slice moves the delimiter that decides where the slice ENDS,
+      // so the length afterwards is not the L that was asked for and no check
+      // here would catch it.  The in-place write below is still available, and
+      // it re-measures.
       ctx.splice_at = ctx.splice_del = ctx.splice_ins = 0;
-      if (i2s_str_splice_len(ctx, content, len, L)) {
+      if (!sliced && i2s_str_splice_len(ctx, content, len, L)) {
         matches++;
         i2s_str_emit(ctx, in_buf, in_size, out_buf, out_size);
         return SOLVER_SAT;
@@ -3219,7 +3456,16 @@ I2SSolver::solve_string(std::shared_ptr<const Constraint> const& c,
       // their search.  Not redundant with the loop: two content bytes can be
       // expressions over the SAME input bytes, so a later i2s_str_set can undo
       // an earlier one, and each individual call still succeeded.
+      //
+      // Re-derive the extent first, for the same reason and one more: writing
+      // the terminator can move a slice bound, and then the string whose length
+      // was just set is not the string this loop indexed.  Unlike the search
+      // rules there is nothing to re-run over the new extent -- `L` was chosen
+      // against the old one -- so a move is a decline rather than a retry.
+      i2s_strbuf_t content2;
       size_t len2 = 0;
+      if (!i2s_str_flatten(ctx, sn->children(0), content2, 0)) continue;
+      if (!i2s_str_same_extent(content, content2)) continue;
       if (!i2s_str_len(ctx, content, len2)) continue;
       uint64_t got = (uint64_t)len2 & i2s_mask(bits);
       if (!i2s_eval_icmp(comparison, str_on_left ? got : rhs_val,
