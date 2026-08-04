@@ -7,6 +7,23 @@
 // RUN: env KO_USE_FASTGEN=1 %ko-clang -o %t.fg %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg %t.bin
 // RUN: %t.uninstrumented %t.out/id-0-0-0 | FileCheck --check-prefix=CHECK-GEN %s
+//
+// The RGD path is a separate solver stack -- afltest runs i2s/jigsaw/z3 over
+// parsers/rgd-parser.cpp, fgtest runs solvers/z3-ts.cpp -- and only the RGD one
+// is what a fuzzer executes.  Its arm asserts WHICH bytes went, which is what
+// the hex dump this test already prints is for: the six characters between the
+// new end and the old one are DELETED, so the buffer is "HELLO" and nothing
+// else.  Writing a NUL over the space instead would satisfy strlen just as well
+// and leave "WORLD" sitting behind it, which is the right answer only if the
+// bytes after a string are positional; for the delimited formats string solving
+// is actually for, it corrupts the document -- see strlen_json3.c, where that
+// edit destroys the closing quote the field needs.
+// CHECK-RGD: contents (hex): 48 45 4c 4c 4f{{ *$}}
+// RUN: rm -rf %t.rgd.out
+// RUN: mkdir -p %t.rgd.out
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.rgd.out" %afltest %t.fg %t.bin
+// RUN: %t.uninstrumented %t.rgd.out/id-0-0-0 | FileCheck --check-prefix=CHECK-GEN %s
+// RUN: %t.uninstrumented %t.rgd.out/id-0-0-0 | FileCheck --check-prefix=CHECK-RGD %s
 
 #include <string.h>
 #include <stdio.h>

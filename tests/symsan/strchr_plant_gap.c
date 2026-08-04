@@ -19,6 +19,23 @@
 // RUN: env KO_USE_FASTGEN=1 %ko-clang -o %t.fg %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg %t.bin
 // RUN: %t.uninstrumented %t.out/id-0-0-0 | FileCheck --check-prefix=CHECK-GEN %s
+//
+// Negative arm for the RGD path (afltest = i2s/jigsaw/z3 over
+// parsers/rgd-parser.cpp; the %fgtest arm above is solvers/z3-ts.cpp).  i2s
+// solves a string search by rewriting bytes it can see, and every byte it can
+// see is inside the traced content, which stops at the terminator.  planting past an early NUL
+// needs the opposite -- writing PAST the NUL, into an object extent nothing in
+// the AST describes -- so it must produce nothing here.
+//
+// This asserts a decline, not an impossibility: z3-ts does solve it.  If the
+// RGD path ever learns the extent, replace this with the CHECK-GEN arm above
+// and prove it lands on the right offset -- do not just delete the check,
+// because a bogus byte written past the NUL would still show up as "an input
+// was generated".
+// RUN: rm -rf %t.rgd.out
+// RUN: mkdir -p %t.rgd.out
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.rgd.out" %afltest %t.fg %t.bin
+// RUN: ls %t.rgd.out | count 0
 
 #include <stdint.h>
 #include <stdio.h>

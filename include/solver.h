@@ -23,6 +23,12 @@ enum solver_result_t {
 class Solver {
 public:
   virtual ~Solver() {};
+  // out_buf belongs to the caller and out_size is the length written, which is
+  // not necessarily in_size: an answer may be shorter than the input (a strlen
+  // satisfied by deleting bytes) or longer (inserting them, or an atoi answered
+  // with more digits).  Same shape as AFL++'s custom-mutator afl_custom_fuzz,
+  // which is what driver/aflpp/symsan.cpp forwards this to -- whoever owns the
+  // buffer sizes it for a grown answer.
   virtual solver_result_t solve(std::shared_ptr<SearchTask> task,
                                 const uint8_t *in_buf, size_t in_size,
                                 uint8_t *out_buf, size_t &out_size) = 0;
@@ -157,6 +163,17 @@ private:
   solver_result_t solve_memcmp_ast(std::shared_ptr<const Constraint> const& c,
                                    const uint8_t *in_buf, size_t in_size,
                                    uint8_t *out_buf, size_t &out_size);
+  // The only path allowed to touch a constraint that string_op_mask matched.
+  // It works entirely off the AST -- the string content is in there, byte by
+  // byte -- and takes no ConsMeta: i2s_candidates records where a *compared
+  // value* appears in the input, and the value compared here is a match
+  // position or a length, which is not in the input at all.  Every answer is
+  // checked by re-running the string operation over the rewritten bytes, so a
+  // shape this does not really understand declines instead of guessing.
+  solver_result_t solve_string(std::shared_ptr<const Constraint> const& c,
+                               uint32_t comparison,
+                               const uint8_t *in_buf, size_t in_size,
+                               uint8_t *out_buf, size_t &out_size);
 };
 
 }; // namespace rgd
