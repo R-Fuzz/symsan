@@ -115,6 +115,14 @@ private:
                    constraint_t constraint);
   [[nodiscard]] bool pack_const_bytes(const uint8_t *content, uint32_t size,
                                       rgd::AstNode *node, constraint_t constraint);
+  [[nodiscard]] bool add_str_operand(dfsan_label label, dfsan_label operand,
+                                     uint32_t content_size, rgd::AstNode *child,
+                                     constraint_t constraint,
+                                     std::unordered_set<dfsan_label> &visited);
+  [[nodiscard]] bool do_uta_str(dfsan_label label, dfsan_label_info *info,
+                                uint16_t kind, rgd::AstNode *ret,
+                                constraint_t constraint,
+                                std::unordered_set<dfsan_label> &visited);
 
   bool save_constraint(expr_t expr, bool result);
   inline void add_nested_constraint(task_t task, const clause_t &nested_caluse);

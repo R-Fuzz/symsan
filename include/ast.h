@@ -133,6 +133,51 @@ namespace rgd {
     // unary, and the integer solvers dispatch on that.
     BitReverse, // 84
 
+    // String theory: the dfsan ops 77-88 (dfsan.h), plus PtrToInt applied to a
+    // string op.  Appended here rather than grouped next to the FP ops so that
+    // no existing kind is renumbered -- the same reason TLookup and BitReverse
+    // sit where they do.  The cost is that this enum no longer mirrors
+    // dfsan.h's ordering, where the string ops (74-88) come *before* the FP
+    // ops (89+); the gain is that no persisted hash, cached AST or
+    // AstKindName[] entry shifts.
+    //
+    // One kind per dfsan op, rather than one kind plus a sort field, because
+    // z3's string theory indexes with Int and not BV.  The sort has to be
+    // recoverable from the node alone, and with distinct kinds it is --
+    // see stringKindSort() below.
+    //
+    // Concrete content -- haystacks, needles, character sets, GEP offsets --
+    // is NOT stored in the node.  It is packed into Constraint::input_args as
+    // an rgd::Constant child, exactly the way fmemcmp's target is, and hashed
+    // value-free.  So strstr(s, "abc") and strstr(s, "xyz") share one AST and
+    // one JIT'ed function; see THE HASHING INVARIANT below.
+    //
+    // None of these is boolean-valued -- every one sits under an ICmp -- so
+    // isRelationalKind() and the parser's root / nested-comparison handling
+    // are unaffected.  Mind the polarity: StrCmp is 0-on-match, while
+    // PrefixOf and SuffixOf are 1-on-match.
+    StrLen,      // 85 <- fstrlen   77: opaque symbolic length over the content
+    StrChr,      // 86 <- fstrchr   78: index of the first occurrence, or -1
+    StrRChr,     // 87 <- fstrrchr  79: index of the last occurrence, or -1
+    StrStr,      // 88 <- fstrstr   80: index of the first substring match, -1
+    StrPbrk,     // 89 <- fstrpbrk  81: index of the first char from a set, -1
+    StrOff,      // 90 <- fstr_off  82: a string index plus a constant offset
+    SubStr,      // 91 <- fsubstr   83: slice; nested for 3-operand slices
+    StrCat,      // 92 <- fstrcat   84: concatenation
+    StrCmp,      // 93 <- fstrcmp   85: 0 when equal, non-zero otherwise
+    PrefixOf,    // 94 <- fprefixof 86: 1 when str starts with prefix, else 0
+    SuffixOf,    // 95 <- fsuffixof 87: 1 when str ends with suffix, else 0
+    StrLength,   // 96 <- flength   88: sequence length of a string expression
+    // PtrToInt over a string op.  Not a passthrough: the index a search op
+    // returns is relative to its haystack, while a pointer difference is
+    // absolute, so the haystack's offset within the input has to be added
+    // (compare solvers/z3-ts.cpp's PtrToInt case).  Unlike every other payload
+    // here that offset is NOT a Constant child: z3-ts.cpp reads it from its
+    // string_info_cache_, which the RGD parser does not keep, and it is anyway
+    // recoverable from the node -- it is the index() of the leftmost Read under
+    // the haystack subtree.  A solver that needs it walks there.
+    StrPtrToInt, // 97
+
     // Last
     LastOp
   };
@@ -223,6 +268,19 @@ namespace rgd {
     "FUne",
     "TLookup",
     "BitReverse",
+    "StrLen",
+    "StrChr",
+    "StrRChr",
+    "StrStr",
+    "StrPbrk",
+    "StrOff",
+    "SubStr",
+    "StrCat",
+    "StrCmp",
+    "PrefixOf",
+    "SuffixOf",
+    "StrLength",
+    "StrPtrToInt",
   };
 
   static inline bool isRelationalKind(uint16_t kind) {
@@ -277,6 +335,100 @@ namespace rgd {
       return true;
     else
       return false;
+  }
+
+  // Every string-theory kind lives contiguously in [StrLen, StrPtrToInt].  Like
+  // isFloatingPointKind above, this is what a solver that cannot reason about
+  // these tests its ops bitset against before declining: the i2s solver in
+  // particular works off the *enclosing* comparison's traced operand values and
+  // can emit a byte assignment without ever walking the string subtree, so an
+  // unsound SAT is what silence buys.  jigsaw's JIT and both z3 backends reject
+  // an unknown kind through their default: case already.
+  static inline bool isStringKind(uint16_t kind) {
+    if (kind >= StrLen && kind <= StrPtrToInt)
+      return true;
+    else
+      return false;
+  }
+
+  // The three predicates below are the AST-kind twins of the dfsan-op ones in
+  // runtime/dfsan/dfsan.h:391-405 (copied verbatim into solvers/z3-ts.cpp:144-157,
+  // which cannot include the runtime header).  They translate only because the
+  // string kinds were appended in dfsan.h's own relative order, so a range test
+  // on ops carries over to a range test on kinds; that ordering is therefore an
+  // invariant, not an accident.
+  static_assert(StrChr == StrLen + 1 && StrRChr == StrChr + 1 &&
+                    StrStr == StrRChr + 1 && StrPbrk == StrStr + 1 &&
+                    StrOff == StrPbrk + 1 && SubStr == StrOff + 1 &&
+                    StrCat == SubStr + 1 && StrCmp == StrCat + 1 &&
+                    PrefixOf == StrCmp + 1 && SuffixOf == PrefixOf + 1 &&
+                    StrLength == SuffixOf + 1 && StrPtrToInt == StrLength + 1,
+                "string kinds must keep dfsan.h's relative order (fstrlen..flength, "
+                "+8); the range predicates below depend on it");
+
+  // A node that evaluates to a string, or to a position within one -- the twin of
+  // __dfsan::is_string_op, whose [fstr_op_start, fstr_op_end) range is fstrchr
+  // through fstrcat.
+  //
+  // NOT the same set as isStringKind above, and the difference is the whole point
+  // of having both.  isStringKind is the decline gate: every kind a solver without
+  // string support must refuse.  This one is the narrower "is my operand a string
+  // expression?" question -- it excludes StrLen (an opaque bitvector length),
+  // StrCmp/PrefixOf/SuffixOf (predicates *over* strings, not strings), StrLength
+  // and StrPtrToInt (Ints derived from one).  dfsan_custom.cpp:628-687 asks
+  // exactly this to decide whether a memcmp of two labels is really an fstrcmp.
+  static inline bool isStringOpKind(uint16_t kind) {
+    if (kind >= StrChr && kind <= StrCat)
+      return true;
+    else
+      return false;
+  }
+
+  // An indexOf-type node: one that returns a position rather than content, and -1
+  // for "no match".  The twin of __dfsan::is_indexof_op (fstrchr..fstr_off).
+  // StrOff is in the range because an offset applied to a position is still a
+  // position -- which is what lets z3-ts.cpp walk a chain of them back to the
+  // underlying haystack (z3-ts.cpp:1324).
+  //
+  // A subset of the Int-sorted kinds, not all of them: StrLength and StrPtrToInt
+  // are Ints too but are not positions into a haystack.
+  static inline bool isIndexOfStringKind(uint16_t kind) {
+    if (kind >= StrChr && kind <= StrOff)
+      return true;
+    else
+      return false;
+  }
+
+  // A node that evaluates to string content, as opposed to a position or a
+  // predicate.  The twin of __dfsan::is_content_string_op (fsubstr, fstrcat).
+  // Coincides exactly with the StrSortString bucket below.
+  static inline bool isContentStringKind(uint16_t kind) {
+    return kind == SubStr || kind == StrCat;
+  }
+
+  // The z3 sort a string-theory node evaluates to.  There is no sort field on
+  // AstNode; the kind IS the sort tag, which is the whole reason the thirteen
+  // dfsan string ops get thirteen kinds instead of one parameterised kind.  A
+  // search op returns an Int position into a string, not a bitvector, and
+  // handing z3 the wrong one is a sort error raised at assert time -- far from
+  // the parse that caused it.
+  enum StringSort {
+    StrSortBV,      // an ordinary bitvector; the width is in bits()
+    StrSortInt,     // z3 Int: a position within a string, or -1 for "no match"
+    StrSortString,  // z3 String (a sequence of characters)
+  };
+
+  // Only meaningful when isStringKind(kind); other kinds are bitvectors anyway.
+  static inline StringSort stringKindSort(uint16_t kind) {
+    // positions, arithmetic on positions, and the two other Int-sorted kinds:
+    // StrPtrToInt is a pointer difference, and flength is Z3_mk_seq_length --
+    // Int-sorted too, unlike the BV that fstrlen's opaque length produces
+    if (isIndexOfStringKind(kind) || kind == StrPtrToInt || kind == StrLength)
+      return StrSortInt;
+    if (isContentStringKind(kind))
+      return StrSortString;
+    // StrLen, StrCmp, PrefixOf, SuffixOf
+    return StrSortBV;
   }
 
   static inline uint16_t negate_cmp(uint16_t kind) {
@@ -469,6 +621,18 @@ namespace rgd {
     //              contents, 8 bytes per slot, little-endian
     //   FpRound,
     //   FP arith   rounding-mode selector (see FpRound above)
+    //   StrLen     1 when the terminating NUL is itself an input byte
+    //              (dfsan's null_from_input), else 0
+    //   SubStr     slice mode: 0 = prefix, 1 = suffix
+    //   other
+    //   string ops unused, 0.  Every *value* a string kind needs -- content,
+    //              needle, character set, GEP offset, observed length -- rides
+    //              in a Constant child and is indexed there instead, so that it
+    //              stays out of the hash and two constraints differing only in
+    //              it share one JIT'ed function.  The two selectors above are
+    //              structural rather than values: nothing reads them from
+    //              args[], so they must be folded into the hash by hand, the
+    //              way FpRound's is (parsers/rgd-parser.cpp)
     //   all others unused, 0
     uint32_t index_ : 30;  //used by read expr for index and extract expr
     uint8_t boolvalue_ : 1;  //used by bool expr

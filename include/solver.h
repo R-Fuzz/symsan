@@ -110,6 +110,14 @@ private:
   // log1p) that solve_fcmp reverses via the numeric libm inverse (log for exp,
   // ...) and verifies.  Also kept out of fp_ops_mask so they reach solve_fcmp.
   std::bitset<rgd::LastOp> fp_trans_mask;
+  // bits for every string-theory kind.  Unlike jigsaw and the two z3 backends,
+  // which reject an unknown kind through a default: case while walking the
+  // tree, i2s works off the *enclosing* comparison's traced operand values and
+  // its i2s_candidates -- so it can emit a byte assignment without ever
+  // visiting the string subtree, and silence here would be an unsound SAT
+  // rather than a decline.  Nothing solves these yet; see the string kinds in
+  // include/ast.h.
+  std::bitset<rgd::LastOp> string_op_mask;
 
   solver_result_t solve_icmp(std::shared_ptr<const Constraint> const& c,
                              std::unique_ptr<ConsMeta> const& cm,

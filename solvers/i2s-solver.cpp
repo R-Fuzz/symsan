@@ -1321,6 +1321,12 @@ I2SSolver::I2SSolver(): matches(0), mismatches(0) {
   // Invertible unary FP transcendentals handled by solve_fcmp: [FpExp, FpPow).
   for (uint16_t k = rgd::FpExp; k < rgd::FpPow; ++k)
     fp_trans_mask.set(k);
+
+  // Every string kind, [StrLen, StrPtrToInt].  See the declaration in
+  // include/solver.h for why i2s needs an explicit gate where the other
+  // solvers get one for free.
+  for (uint16_t k = rgd::StrLen; k < rgd::LastOp; ++k)
+    string_op_mask.set(k);
 }
 
 solver_result_t
@@ -2159,6 +2165,14 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
     // below by solve_fcmp.
     if (unlikely((c->ops & fp_ops_mask).any())) {
       DEBUGF("i2s: skip FP-derived constraint\n");
+      mismatches++;
+      continue;
+    }
+    // Same argument for the string ops: parsers/rgd-parser.cpp now builds
+    // them, but nothing inverts them yet, and the bytes reaching a comparison
+    // through strchr()/strcmp() do not appear literally in the compared value.
+    if (unlikely((c->ops & string_op_mask).any())) {
+      DEBUGF("i2s: skip string-derived constraint\n");
       mismatches++;
       continue;
     }

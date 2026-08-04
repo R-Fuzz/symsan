@@ -78,8 +78,14 @@ struct Constraint {
 
   static constexpr uint32_t kMagic = 0x43444752u; // "RGDC", little-endian
   // Bump on ANY layout change below -- and also when rgd::LastOp moves, because
-  // the ops bitset is written as bit-per-kind.
-  static constexpr uint32_t kVersion = 1u;
+  // the ops bitset is written as bit-per-kind.  Appending kinds keeps every
+  // existing bit position valid, so an OLD file still loads correctly, but a
+  // NEW file with a high bit set read by an old binary would have that bit
+  // silently dropped by its shorter loop.  The ops_words check below does not
+  // catch it: 85 and 98 kinds both pack into two words.
+  //   v1  LastOp = 85 (through BitReverse)
+  //   v2  LastOp = 98 (the string kinds, StrLen..StrPtrToInt)
+  static constexpr uint32_t kVersion = 2u;
 
   // Laid out so every field is naturally aligned and sizeof() has no implicit
   // padding -- the static_asserts below hold the format to that.

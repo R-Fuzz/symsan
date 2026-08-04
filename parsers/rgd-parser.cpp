@@ -142,6 +142,50 @@ static const std::unordered_map<unsigned, std::pair<unsigned, const char*> > OP_
 #undef RELATIONAL_FCMP
 };
 
+// The string-theory ops (dfsan.h 77-88).  Kept out of OP_MAP because none of
+// them goes through the generic child walk below: their operands are not
+// uniformly "l1 and l2 as subtrees, concrete side from op1/op2" -- the concrete
+// side is a byte array that arrived out of band, and several carry a structural
+// selector.  do_uta_str() handles all of them.
+//
+// PtrToInt is deliberately absent: it is only a string op when its operand is
+// one, which takes a look at the operand's label.  See do_uta_rel().
+static const std::unordered_map<unsigned, unsigned> STR_OP_MAP {
+  {__dfsan::fstrlen,   rgd::StrLen},
+  {__dfsan::fstrchr,   rgd::StrChr},
+  {__dfsan::fstrrchr,  rgd::StrRChr},
+  {__dfsan::fstrstr,   rgd::StrStr},
+  {__dfsan::fstrpbrk,  rgd::StrPbrk},
+  {__dfsan::fstr_off,  rgd::StrOff},
+  {__dfsan::fsubstr,   rgd::SubStr},
+  {__dfsan::fstrcat,   rgd::StrCat},
+  {__dfsan::fstrcmp,   rgd::StrCmp},
+  {__dfsan::fprefixof, rgd::PrefixOf},
+  {__dfsan::fsuffixof, rgd::SuffixOf},
+  {__dfsan::flength,   rgd::StrLength},
+};
+
+// True when the concrete side of a string op is packed from memcmp_cache_
+// rather than read out of op1/op2.  These are the ops backend/fastgen.cpp
+// ships content for: exactly one of l1/l2 is CONST_LABEL and info->size is
+// that side's byte count.  fstrchr/fstrrchr are here for their haystack; their
+// needle is a single char in op2 and is handled separately.
+static inline bool str_op_has_content(uint16_t op) {
+  switch (op) {
+    case __dfsan::fstrchr:
+    case __dfsan::fstrrchr:
+    case __dfsan::fstrstr:
+    case __dfsan::fstrpbrk:
+    case __dfsan::fstrcat:
+    case __dfsan::fstrcmp:
+    case __dfsan::fprefixof:
+    case __dfsan::fsuffixof:
+      return true;
+    default:
+      return false;
+  }
+}
+
 static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
   return ((op & 0xff) == __dfsan::ICmp) && ((op >> 8) == pred);
 }
@@ -312,6 +356,225 @@ bool RGDAstParser::pack_const_bytes(const uint8_t *content, uint32_t size,
     DEBUGF("memcmp constant remain = %lu\n", val);
   }
   node->set_hash(rgd::xxhash(size, rgd::Constant, arg_index));
+  return true;
+}
+
+// A single concrete scalar operand -- a needle character, a GEP offset, an
+// observed length.  Same convention as pack_const_bytes, one slot wide: the
+// value goes to input_args and stays out of the hash, so two constraints that
+// differ only in it share a JIT'ed function.
+static void pack_const_scalar(uint64_t value, uint16_t bits,
+                              rgd::AstNode *node,
+                              std::shared_ptr<rgd::Constraint> constraint) {
+  node->set_kind(rgd::Constant);
+  node->set_bits(bits);
+  node->set_label(0);
+  uint32_t arg_index = (uint32_t)constraint->input_args.size();
+  node->set_index(arg_index);
+  constraint->input_args.push_back(std::make_pair(false, value));
+  constraint->const_num += 1;
+  node->set_hash(rgd::xxhash(bits, rgd::Constant, arg_index));
+}
+
+// One operand of a string op: a subtree when it is symbolic, otherwise the
+// concrete bytes that arrived out of band.  backend/fastgen.cpp ships exactly
+// one side of a content-carrying string op -- op1's buffer when l1 is
+// CONST_LABEL, else op2's -- and info->size is that side's byte count, so
+// looking the content up by the *op's* label (not the operand's, which is 0)
+// is right for whichever side asks.
+bool RGDAstParser::add_str_operand(dfsan_label label, dfsan_label operand,
+                                   uint32_t content_size, rgd::AstNode *child,
+                                   constraint_t constraint,
+                                   std::unordered_set<dfsan_label> &visited) {
+  if (operand >= CONST_OFFSET) {
+    if (!do_uta_rel(operand, child, constraint, visited)) {
+      return false;
+    }
+    visited.insert(operand);
+    return true;
+  }
+  if (unlikely(!str_op_has_content(get_label_info(label)->op))) {
+    // a caller wired an op fastgen.cpp does not ship bytes for to this path;
+    // memcmp_cache_ would simply miss below, but say which mistake it was
+    WARNF("string op %u carries no content for its concrete operand\n", label);
+    return false;
+  }
+  if (unlikely(content_size == 0)) {
+    // both sides symbolic (fastgen.cpp sends nothing then), or a concrete side
+    // whose length the runtime could not determine
+    WARNF("string op %u has a concrete operand with no length\n", label);
+    return false;
+  }
+  auto itr = memcmp_cache_.find(label);
+  if (unlikely(itr == memcmp_cache_.end())) {
+    WARNF("string content not found for label %u\n", label);
+    return false;
+  }
+  return pack_const_bytes(itr->second.get(), content_size, child, constraint);
+}
+
+// Lower one of the dfsan string ops into @p ret.  Parse only: no solver
+// reasons about these kinds yet -- jigsaw's JIT and both z3 backends reject an
+// unknown kind through their default: case, and i2s is gated on
+// string_op_mask.  What building the node buys today is that the op is no
+// longer an "invalid op" that fails do_uta_rel outright, so the rest of the
+// clause survives and the sweep can show which ops actually occur; what it
+// buys next is somewhere for an i2s string solver to hang off.
+bool RGDAstParser::do_uta_str(dfsan_label label, dfsan_label_info *info,
+                              uint16_t kind, rgd::AstNode *ret,
+                              constraint_t constraint,
+                              std::unordered_set<dfsan_label> &visited) {
+  ret->set_kind(kind);
+  ret->set_label(label);
+  constraint->ops[kind] = true;
+
+  // bits() is set per kind, never from info->size, which for most of these is a
+  // content byte count and not a result width.  An Int- or String-sorted node
+  // (see stringKindSort in include/ast.h) has no bitvector width at all, so it
+  // gets the machine word -- what the position or pointer would occupy if it
+  // were materialised -- and the kind carries the real sort.
+  switch (kind) {
+    case rgd::StrLen:
+      ret->set_bits(info->size); // sizeof(size_t) * 8; a genuine BV width
+      break;
+    case rgd::StrCmp:
+    case rgd::PrefixOf:
+    case rgd::SuffixOf:
+      ret->set_bits(32); // 0/1 in an i32, the way solvers/z3-ts.cpp builds it
+      break;
+    default:
+      ret->set_bits(64);
+      break;
+  }
+
+  rgd::AstNode *c0 = ret->add_children();
+  if (unlikely(c0 == nullptr)) {
+    WARNF("failed to add children\n");
+    return false;
+  }
+  rgd::AstNode *c1 = nullptr;
+  bool unary = (kind == rgd::StrLength);
+  if (!unary) {
+    c1 = ret->add_children();
+    if (unlikely(c1 == nullptr)) {
+      WARNF("failed to add children\n");
+      return false;
+    }
+  }
+
+  switch (kind) {
+    case rgd::StrLen: {
+      // l1 is 0 by construction (dfsan_custom.cpp follows the fsize/fatoi
+      // pattern to dodge the Alloca rejection), l2 is the content.
+      if (unlikely(info->l2 < CONST_OFFSET)) {
+        WARNF("strlen over concrete content, label %u\n", label);
+        return false;
+      }
+      if (!do_uta_rel(info->l2, c0, constraint, visited)) return false;
+      visited.insert(info->l2);
+      // the observed length; a value, so it rides in input_args
+      pack_const_scalar(info->op2.i, 64, c1, constraint);
+      // ...but whether the null terminator came from the input is structural:
+      // it decides whether the length is even symbolic.  Stash it in index()
+      // and fold it into the hash below, since isEqualAstRecursive ignores
+      // index() (THE HASHING INVARIANT, include/ast.h).
+      ret->set_index((uint32_t)info->op1.i);
+      break;
+    }
+    case rgd::StrChr:
+    case rgd::StrRChr: {
+      // l1 = haystack (0 when concrete, content in memcmp_cache_ under this
+      // label), l2 = needle char label (0 when concrete, char in op2's low
+      // byte).  op2's high 32 bits hold the haystack base-pointer label under
+      // USE_UCSAN_CUSTOM only (encode_strchr_op2); on the fuzzing path it is 0
+      // and there is nothing to carry.
+      if (!add_str_operand(label, info->l1, info->size, c0, constraint, visited))
+        return false;
+      if (info->l2 >= CONST_OFFSET) {
+        if (!do_uta_rel(info->l2, c1, constraint, visited)) return false;
+        visited.insert(info->l2);
+      } else {
+        pack_const_scalar(info->op2.i & 0xff, 8, c1, constraint);
+      }
+      break;
+    }
+    case rgd::StrStr:
+    case rgd::StrPbrk:
+    case rgd::StrCat:
+    case rgd::StrCmp:
+    case rgd::PrefixOf:
+    case rgd::SuffixOf: {
+      // Exactly one side is concrete and info->size is that side's byte count,
+      // so both operands ask add_str_operand with the same size and only the
+      // concrete one uses it.  Order is preserved: of these only fstrcmp is in
+      // is_commutative(), and there the swap already put the concrete side in
+      // l1, which is where fmemcmp expects it too.
+      if (!add_str_operand(label, info->l1, info->size, c0, constraint, visited))
+        return false;
+      if (!add_str_operand(label, info->l2, info->size, c1, constraint, visited))
+        return false;
+      break;
+    }
+    case rgd::StrOff: {
+      // l1 = the string op whose result was GEP'd, op2 = the signed byte offset
+      if (unlikely(info->l1 < CONST_OFFSET)) {
+        WARNF("str_off over a concrete position, label %u\n", label);
+        return false;
+      }
+      if (!do_uta_rel(info->l1, c0, constraint, visited)) return false;
+      visited.insert(info->l1);
+      pack_const_scalar(info->op2.i, 64, c1, constraint);
+      break;
+    }
+    case rgd::SubStr: {
+      // l1 = the string, l2 = the position or length (0 when concrete, the
+      // value then in op1).  Unlike the ops above, fsubstr never calls
+      // __taint_trace_memcmp, so a concrete l1 means the bytes are simply not
+      // on the wire and there is nothing to build.
+      if (unlikely(info->l1 < CONST_OFFSET)) {
+        WARNF("substr of a string with no content, label %u\n", label);
+        return false;
+      }
+      if (!do_uta_rel(info->l1, c0, constraint, visited)) return false;
+      visited.insert(info->l1);
+      if (info->l2 >= CONST_OFFSET) {
+        if (!do_uta_rel(info->l2, c1, constraint, visited)) return false;
+        visited.insert(info->l2);
+      } else {
+        pack_const_scalar(info->op1.i, 64, c1, constraint);
+      }
+      // op2 picks prefix (0) or suffix (1) mode -- two different operations,
+      // not two values -- so it goes in index() and into the hash.
+      ret->set_index((uint32_t)info->op2.i);
+      break;
+    }
+    case rgd::StrLength: {
+      // Unary.  No producer creates flength today (only solvers/z3-ts.cpp
+      // consumes it), so this arm is defensive; keep it faithful anyway.
+      if (unlikely(info->l1 < CONST_OFFSET)) {
+        WARNF("length of a concrete string, label %u\n", label);
+        return false;
+      }
+      if (!do_uta_rel(info->l1, c0, constraint, visited)) return false;
+      visited.insert(info->l1);
+      break;
+    }
+    default:
+      WARNF("unhandled string kind %u\n", kind);
+      return false;
+  }
+
+  uint32_t hash;
+  if (unary) {
+    hash = rgd::xxhash(ret->bits(), kind, c0->hash());
+  } else {
+    hash = rgd::xxhash(c0->hash(), (kind << 16) | ret->bits(), c1->hash());
+  }
+  // Fold the structural selectors in; see the set_index() calls above.
+  if (kind == rgd::StrLen || kind == rgd::SubStr) {
+    hash = rgd::xxhash(hash, ret->index(), kind);
+  }
+  ret->set_hash(hash);
   return true;
 }
 
@@ -562,6 +825,41 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     // do nothing now
     WARNF("fsize not supported yet\n");
     return false;
+  } else if (info->op == __dfsan::PtrToInt) {
+    // PtrToInt is a string op only when its operand is one: the position a
+    // search op returns is relative to its haystack, while a pointer
+    // difference is absolute, so the two differ by the haystack's offset in
+    // the input.  That offset is not precomputed here the way
+    // solvers/z3-ts.cpp precomputes it from string_info_cache_ -- it is
+    // reachable from the AST, as the index() of the leftmost Read under the
+    // haystack subtree, and a solver that needs it can walk there.
+    //
+    // A PtrToInt over anything else still falls through to the OP_MAP lookup
+    // and is rejected; passing those through would be a separate change.
+    if (info->l1 >= CONST_OFFSET &&
+        __dfsan::is_string_op(get_label_info(info->l1)->op)) {
+      ret->set_kind(rgd::StrPtrToInt);
+      ret->set_bits(info->size); // a real pointer width here
+      ret->set_label(label);
+      constraint->ops[rgd::StrPtrToInt] = true;
+      rgd::AstNode *c0 = ret->add_children();
+      if (unlikely(c0 == nullptr)) {
+        WARNF("failed to add children\n");
+        return false;
+      }
+      if (!do_uta_rel(info->l1, c0, constraint, visited)) {
+        return false;
+      }
+      visited.insert(info->l1);
+      ret->set_hash(rgd::xxhash(info->size, rgd::StrPtrToInt, c0->hash()));
+      return true;
+    }
+  } else {
+    auto str_itr = STR_OP_MAP.find(info->op);
+    if (str_itr != STR_OP_MAP.end()) {
+      return do_uta_str(label, info, (uint16_t)str_itr->second, ret,
+                        constraint, visited);
+    }
   }
 
   // common ops, make sure no special ops.
@@ -1497,6 +1795,24 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
         case __dfsan::fatoi:
           // the result is introduced as fake input bytes, one slot each
           args = info->size / 8;
+          break;
+        case __dfsan::fstrchr:
+        case __dfsan::fstrrchr:
+          // a concrete haystack is packed 8 bytes per slot; the needle is a
+          // single char out of op2, one slot
+          args = sat_add(info->l1 == 0 ? (info->size + 7) / 8 : largs,
+                         info->l2 == 0 ? 1 : rargs);
+          break;
+        case __dfsan::fstrstr:
+        case __dfsan::fstrpbrk:
+        case __dfsan::fstrcat:
+        case __dfsan::fstrcmp:
+        case __dfsan::fprefixof:
+        case __dfsan::fsuffixof:
+          // exactly one side is concrete and info->size is THAT side's byte
+          // count, so only one of these two terms uses the packed figure
+          args = sat_add(info->l1 == 0 ? (info->size + 7) / 8 : largs,
+                         info->l2 == 0 ? (info->size + 7) / 8 : rargs);
           break;
         default:
           args = sat_add(largs, rargs);
