@@ -35,13 +35,41 @@
 //! `fuzzer.evaluate_*`, part-way through it.  So the line announcing a find
 //! still carries the count from before that find, and the next line carries it.
 //! Nothing is lost, but the two disagree by one for a line at a time.
+//!
+//! # The provenance log
+//!
+//! The counts above are enough for "how much did each stage earn", and the
+//! order of the `[Testcase]` events in the monitor log even recovers *which*
+//! entry each stage earned.  What neither gives is the entry's **identity**:
+//! the corpus file is named after a hash of its contents, its metadata records
+//! `executions: 0`, and its mtime has one-second resolution -- so an entry on
+//! disk cannot be matched back to a line in the log, and the edge sets in
+//! `.<name>_1.metadata` stay unattributed.  That is the whole reason "which
+//! stage first covered edge E" was unanswerable for a finished campaign.
+//!
+//! So write the join down while it is still known: one `<stage>\t<corpus |
+//! solution>\t<filename>` line per find, appended to `<out>/stage_origin.log`.
+//! Together with the novelties the map feedback records per entry, that makes
+//! the attribution a direct read rather than a reconstruction.
+//!
+//! Unbuffered on purpose.  A Magma campaign ends by killing the fuzzer, so
+//! anything still sitting in a `BufWriter` at the timeout would be exactly the
+//! tail of the run -- the part worth having.
+//!
+//! Off when the corpus is in memory (`--in-memory-corpus`): entries have no
+//! filename then, and there would be nothing to join to.
 
 use core::marker::PhantomData;
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    fs::{File, OpenOptions},
+    io::Write,
+    path::Path,
+};
 
 use libafl::{
     Error,
-    corpus::Corpus,
+    corpus::{Corpus, CorpusId},
     events::{Event, EventFirer, EventWithStats},
     monitors::stats::{AggregatorOps, UserStats, UserStatsValue},
     stages::{Restartable, Stage},
@@ -62,22 +90,57 @@ pub struct CreditedStage<I, St> {
     /// `finds_symsan` in the line" is ambiguous between "found nothing" and
     /// "not running", which is exactly the confusion this module exists to end.
     published: bool,
+    /// The bare stage name, as it appears in the provenance log.
+    name: &'static str,
+    /// Append handle on `<out>/stage_origin.log`, or `None` when there is
+    /// nothing to join to. See the module docs.
+    log: Option<File>,
     phantom: PhantomData<I>,
 }
 
 impl<I, St> CreditedStage<I, St> {
     /// `name` is the stage as a human would name it: `symsan`, `cmplog`,
-    /// `havoc`.
-    pub fn new(name: &'static str, inner: St) -> Self {
+    /// `havoc`. `log` is the provenance log to append finds to; pass `None` to
+    /// record only the counts.
+    pub fn new(name: &'static str, inner: St, log: Option<&Path>) -> Self {
+        // A provenance log that cannot be opened is worth a word but not a
+        // failed campaign: the counts, which are what the monitor line needs,
+        // do not depend on it.
+        let log = log.and_then(|path| {
+            match OpenOptions::new().create(true).append(true).open(path) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    log::warn!("cannot open the provenance log {}: {e}", path.display());
+                    None
+                }
+            }
+        });
         Self {
             inner,
             key: Cow::Owned(format!("finds_{name}")),
             corpus_finds: 0,
             solution_finds: 0,
             published: false,
+            name,
+            log,
             phantom: PhantomData,
         }
     }
+}
+
+/// The ids added after `after`, in insertion order. `None` means "from the
+/// start", which is what an empty corpus reports before the first find.
+fn ids_after<I, C: Corpus<I>>(corpus: &C, after: Option<CorpusId>) -> Vec<CorpusId> {
+    let mut out = Vec::new();
+    let mut cur = match after {
+        Some(id) => corpus.next(id),
+        None => corpus.first(),
+    };
+    while let Some(id) = cur {
+        out.push(id);
+        cur = corpus.next(id);
+    }
+    out
 }
 
 impl<E, EM, I, S, St, Z> Stage<E, EM, S, Z> for CreditedStage<I, St>
@@ -95,6 +158,10 @@ where
     ) -> Result<(), Error> {
         let before_corpus = state.corpus().count();
         let before_solutions = state.solutions().count();
+        // Ids, not just counts, so the new entries can be named afterwards.
+        // Read even without a log: two cheap `Option<CorpusId>` reads.
+        let last_corpus = state.corpus().last();
+        let last_solution = state.solutions().last();
 
         // The inner stage's error is returned as-is, but only after the counts
         // are folded in: a stage that found something and *then* failed still
@@ -106,6 +173,48 @@ where
         let found_solutions = state.solutions().count().saturating_sub(before_solutions) as u64;
         self.corpus_finds += found_corpus;
         self.solution_finds += found_solutions;
+
+        if self.log.is_some() && (found_corpus > 0 || found_solutions > 0) {
+            let mut line = String::new();
+            for (kind, id) in ids_after(state.corpus(), last_corpus)
+                .into_iter()
+                .map(|id| ("corpus", id))
+                .chain(
+                    ids_after(state.solutions(), last_solution)
+                        .into_iter()
+                        .map(|id| ("solution", id)),
+                )
+            {
+                // An entry with no filename is an in-memory one, which the
+                // module docs already exclude -- but a mixed configuration
+                // (on-disk corpus, in-memory solutions) is legal, so skip
+                // rather than assume.
+                let cell = if kind == "corpus" {
+                    state.corpus().get(id)
+                } else {
+                    state.solutions().get(id)
+                };
+                let Ok(cell) = cell else { continue };
+                let tc = cell.borrow();
+                if let Some(name) = tc.filename() {
+                    line.push_str(self.name);
+                    line.push('\t');
+                    line.push_str(kind);
+                    line.push('\t');
+                    line.push_str(name);
+                    line.push('\n');
+                }
+            }
+            // One write for the whole batch: the file is opened O_APPEND, so a
+            // single write is a single atomic extend even if a second process
+            // ever shares it.
+            if let Some(f) = self.log.as_mut() {
+                if let Err(e) = f.write_all(line.as_bytes()) {
+                    log::warn!("cannot append to the provenance log: {e}");
+                    self.log = None;
+                }
+            }
+        }
 
         if found_corpus > 0 || found_solutions > 0 || !self.published {
             self.published = true;

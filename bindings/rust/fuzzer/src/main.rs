@@ -374,9 +374,20 @@ pub fn main() -> Result<(), libafl::Error> {
     // map again when it is sharing coverage.
     let edges_observer_name = "shared_mem";
     // SAFETY: the map outlives the observer -- `shmem` is alive for all of main.
+    //
+    // `track_novelties` on top of `track_indices` because the two answer
+    // different questions and only the first was being asked. Indices are
+    // everything the entry covered -- on libpng that medians 411 of a 1298-edge
+    // total, so it says almost nothing about what the entry *contributed*.
+    // Novelties are the edges that were new when it was added, which is what
+    // "this stage found this edge" means, and they cannot be recovered
+    // afterwards: it would need the corpus in insertion order, and nothing on
+    // disk records that. Costs one extra `Vec<usize>` per interesting
+    // execution, written into the entry's metadata file.
     let edges_observer = unsafe {
         HitcountsMapObserver::new(StdMapObserver::new(edges_observer_name, shmem_buf))
             .track_indices()
+            .track_novelties()
     };
     let time_observer = TimeObserver::new("time");
 
@@ -395,6 +406,11 @@ pub fn main() -> Result<(), libafl::Error> {
     );
 
     std::fs::create_dir_all(&opt.out_dir)?;
+
+    // Where each stage writes the entries it found. Only meaningful next to an
+    // on-disk corpus -- see the `credit` module docs for what it is for and why
+    // it cannot be reconstructed after the fact.
+    let provenance = (!opt.in_memory_corpus).then(|| opt.out_dir.join("stage_origin.log"));
 
     // On disk by default, in AFL's spelling, because an in-memory corpus cannot
     // be debugged after the fact: the interesting question about a campaign is
@@ -576,7 +592,11 @@ pub fn main() -> Result<(), libafl::Error> {
                 // indistinguishable from a log with it.
                 println!("symsan: also solving for undefined behaviour");
             }
-            Some(tuple_list!(CreditedStage::new("symsan", symsan)))
+            Some(tuple_list!(CreditedStage::new(
+                "symsan",
+                symsan,
+                provenance.as_deref()
+            )))
         }
         None => {
             println!("symsan: disabled (pass --symsan <binary> to enable)");
@@ -705,7 +725,8 @@ pub fn main() -> Result<(), libafl::Error> {
                         tracing,
                         rq
                     )
-                )
+                ),
+                provenance.as_deref()
             )))
         }
         None => {
@@ -720,7 +741,11 @@ pub fn main() -> Result<(), libafl::Error> {
     let mut stages = tuple_list!(
         OptionalStage::new(symsan_stages),
         OptionalStage::new(cmplog_stages),
-        CreditedStage::new("havoc", StdMutationalStage::new(mutator))
+        CreditedStage::new(
+            "havoc",
+            StdMutationalStage::new(mutator),
+            provenance.as_deref()
+        )
     );
     fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
 
