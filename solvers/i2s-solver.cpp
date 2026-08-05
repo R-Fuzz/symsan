@@ -1530,20 +1530,26 @@ static bool i2s_str_len(i2s_ctx &ctx, const i2s_strbuf_t &s, size_t &len) {
 // arrive without a terminator.
 //
 // When the haystack is concrete the runtime does not send a string, it sends a
-// measurement: runtime/dfsan/dfsan_custom.cpp:524 calls strlen() and ships
-// exactly that many bytes, so the payload is the whole string and stops where
-// the string stops.  There is no zero byte in it and none is needed -- the
-// length is the size.  i2s_str_len's rule is about a SYMBOLIC haystack, where
-// the content is input bytes and the terminator is the only thing that says
-// which of them are in the string.
+// measurement: str_content_len() in runtime/dfsan/dfsan_custom.cpp ships
+// exactly the bytes the call SEARCHES, so the payload's extent is its size and
+// a zero byte is not required to find the end.  i2s_str_len's rule is about a
+// SYMBOLIC haystack, where the content is input bytes and the terminator is the
+// only thing that says which of them are in the string.
 //
-// The scan runs first rather than instead, because one source line reaches this
-// through two wrappers: clang folds strchr() over a literal into memchr() at -O1
-// and up, and __dfsw_memchr (:2346) sizes the payload by the caller's n, which
-// for that fold is strlen+1.  So the optimized build's payload DOES carry the
-// terminator, the scan finds it, and both builds report the same length.  Going
-// scan-first also leaves an embedded NUL -- which only the explicit-n form can
-// have -- meaning what it means.
+// How much that searched extent is depends on the wrapper, and the producer is
+// where the difference lives so that only one layer has to know it: strchr and
+// strrchr ship strlen + 1, because C11 7.24.5.2 counts the terminator as part
+// of the string they search; memchr and memrchr ship the caller's n verbatim;
+// strstr and strpbrk ship strlen, because neither can match a terminator.
+//
+// The scan runs first rather than instead.  For the strchr pair the payload now
+// carries its terminator, so the scan is what finds the length and the fallback
+// never runs -- and that is also what makes clang's -O1 fold of strchr() over a
+// literal into memchr(@.str, c, strlen+1) report the same length as the -O0
+// build, since the two now ship the same bytes.  For the rest the scan finds
+// nothing and the fallback is the answer.  Going scan-first also leaves an
+// embedded NUL -- which only the explicit-n form can have -- meaning what it
+// means.
 // A slice and a concatenation get the same fallback for the same reason.  A
 // prefix slice -- strncpy(dst, buf, n) -- holds exactly the n bytes the program
 // asked for and usually no zero among them, because the program writes the

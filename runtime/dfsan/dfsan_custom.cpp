@@ -373,6 +373,27 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_check_bounds(dfsan_label addr_label, uptr addr,
                           dfsan_label size_label, uint64_t size);
 
+// Narrow a shipped-content byte count to the label's 16-bit size field.
+//
+// The convention every content-shipping wrapper below follows: content_len is
+// the number of bytes the call ACTUALLY SEARCHES, so a consumer can take the
+// extent straight from the node and never has to scan the payload to find out
+// where it ends.  Per the C standard that is not the same rule for every
+// function -- strchr/strrchr search the terminator (C11 7.24.5.2, 7.24.5.5:
+// "The terminating null character is considered to be part of the string"), so
+// they ship strlen + 1; memchr/memrchr search exactly the n they were given;
+// strstr/strpbrk do not match the terminator, so they ship strlen.
+//
+// The clamp is here because these counts became able to exceed the string
+// length: at exactly UINT16_MAX a bare (uint16_t)(len + 1) wraps to 0, which
+// reads as "no content" and would silently drop the payload.  Over-long
+// haystacks were already being truncated by the cast; saturating is closer to
+// the truth than truncating mod 65536, and the byte count still describes the
+// prefix backend/fastgen.cpp copies.
+static inline uint16_t str_content_len(size_t n) {
+  return n > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)n;
+}
+
 // Encode the haystack base-pointer label into the high 32 bits of a string
 // search op's op2 (whose low 8 bits hold the needle char). Under UC the search
 // result is base+index; the solver needs the base pointer's label so it can
@@ -522,13 +543,16 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
   if (src_label != 0 || c_label != 0) {
     // Determine which operand is concrete and set size accordingly
     size_t haystack_len = strlen(s);
-    uint16_t content_len = (src_label == 0) ? (uint16_t)haystack_len : 0;
+    uint16_t content_len = (src_label == 0) ? str_content_len(haystack_len + 1) : 0;
 
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = c_label (target char - may be symbolic!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = char value
-    // size = haystack length if concrete, else 0
+    // size = searched extent if concrete, else 0.  strlen + 1, not strlen:
+    // C11 7.24.5.2 says the terminating null character is considered part of
+    // the string for strchr, so the region this call actually searches is
+    // [0, strlen] and strchr(s, '\0') returns a pointer into it.
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
                              content_len,
                              (uint64_t)s,
@@ -568,16 +592,20 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
     size_t haystack_len = strlen(s);
     uint16_t content_len = 0;
     if (src_label == 0) {
-      content_len = (uint16_t)haystack_len;
+      content_len = str_content_len(haystack_len);
     } else if (real_accept_label == 0) {
-      content_len = (uint16_t)accept_len;
+      content_len = str_content_len(accept_len);
     }
 
     // l1 = src_label (source content)
     // l2 = accept_label (character set - may be symbolic)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = accept pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else accept length if accept concrete, else 0
+    // size = haystack length if haystack concrete, else accept length if accept
+    // concrete, else 0.  strlen, not strlen + 1, for either: C11 7.24.5.4 says
+    // strpbrk locates a character that occurs in the *set* s2, and the
+    // terminator is not one of that set's characters, so neither string's
+    // searched extent includes it.
     dfsan_label label = dfsan_union(src_label, real_accept_label, __dfsan::fstrpbrk,
                                     content_len,
                                     (uint64_t)s,
@@ -2343,13 +2371,19 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     }
 
     // Determine which operand is concrete and set size accordingly
-    uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
+    // n, with no adjustment: memchr searches exactly the n bytes it was given
+    // (C11 7.24.5.1) and does not stop at a terminator, so the extent is n even
+    // when the buffer holds a shorter C string.  This is the one place where
+    // the shipped count can exceed the string length, and it is the truth --
+    // the fstrchr node built here is indistinguishable from __dfsw_strchr's, so
+    // a consumer that wants the string length has to derive it from the bytes.
+    uint16_t content_len = (src_label == 0) ? str_content_len(n) : 0;
 
     // l1 = bounded_src (haystack content, bounded by n when symbolic)
     // l2 = c_label (character to find)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = character value
-    // size = haystack length if haystack concrete, else 0
+    // size = searched extent if haystack concrete, else 0
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrchr,
                              content_len,
                              (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
@@ -2381,13 +2415,15 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
   if (src_label != 0 || c_label != 0) {
     // Determine which operand is concrete and set size accordingly
     size_t haystack_len = strlen(s);
-    uint16_t content_len = (src_label == 0) ? (uint16_t)haystack_len : 0;
+    uint16_t content_len = (src_label == 0) ? str_content_len(haystack_len + 1) : 0;
 
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = c_label (target char - may be symbolic!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = char value
-    // size = haystack length if concrete, else 0
+    // size = searched extent if concrete, else 0.  strlen + 1 for the same
+    // reason as strchr: C11 7.24.5.5 makes the terminator part of the string
+    // strrchr searches, and it is where strrchr(s, '\0') matches.
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
                              content_len,
                              (uint64_t)s,
@@ -2435,13 +2471,14 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
     }
 
     // Determine which operand is concrete and set size accordingly
-    uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
+    // n, with no adjustment, for the same reason as __dfsw_memchr above.
+    uint16_t content_len = (src_label == 0) ? str_content_len(n) : 0;
 
     // l1 = bounded_src (haystack content, bounded by n when symbolic)
     // l2 = c_label (character to find)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = character value
-    // size = haystack length if haystack concrete, else 0
+    // size = searched extent if haystack concrete, else 0
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrrchr,
                              content_len,
                              (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
@@ -2477,16 +2514,19 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
     size_t needle_len = strlen(needle);
     uint16_t content_len = 0;
     if (src_label == 0) {
-      content_len = (uint16_t)haystack_len;
+      content_len = str_content_len(haystack_len);
     } else if (real_needle_label == 0) {
-      content_len = (uint16_t)needle_len;
+      content_len = str_content_len(needle_len);
     }
 
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = real_needle_label (may be symbolic string!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = needle pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
+    // size = haystack length if haystack concrete, else needle length if needle
+    // concrete, else 0.  strlen, not strlen + 1, for either: C11 7.24.5.7 has
+    // strstr locate the first occurrence of the needle's characters "excluding
+    // the terminating null character", so neither searched extent includes it.
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     content_len,
                                     (uint64_t)haystack,
@@ -2546,16 +2586,18 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strnstr(char *haystack, char *needle,
     size_t needle_len = strlen(needle);
     uint16_t content_len = 0;
     if (src_label == 0) {
-      content_len = (uint16_t)haystack_len;
+      content_len = str_content_len(haystack_len);
     } else if (real_needle_label == 0) {
-      content_len = (uint16_t)needle_len;
+      content_len = str_content_len(needle_len);
     }
 
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = real_needle_label (may be symbolic string!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = needle pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
+    // size = haystack length if haystack concrete, else needle length if needle
+    // concrete, else 0.  Same rule as __dfsw_strstr, and strnlen already stops
+    // at the terminator, so the haystack extent is min(strlen, len) either way.
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     content_len,
                                     (uint64_t)haystack,
@@ -2612,16 +2654,19 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
     // Determine which operand is concrete and set size accordingly
     uint16_t content_len = 0;
     if (src_label == 0) {
-      content_len = (uint16_t)haystacklen;
+      content_len = str_content_len(haystacklen);
     } else if (real_needle_label == 0) {
-      content_len = (uint16_t)needlelen;
+      content_len = str_content_len(needlelen);
     }
 
     // l1 = src_label (haystack content)
     // l2 = real_needle_label (needle content - may be symbolic!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = needle pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
+    // size = haystack length if haystack concrete, else needle length if needle
+    // concrete, else 0.  The caller's lengths verbatim, like __dfsw_memchr:
+    // memmem searches exactly the bytes it is handed and has no terminator to
+    // include or exclude.
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     content_len,
                                     (uint64_t)haystack, (uint64_t)needle);
