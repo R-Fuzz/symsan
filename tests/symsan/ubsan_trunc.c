@@ -4,10 +4,20 @@
 // RUN: clang -fsanitize=implicit-integer-truncation -o %t.ubsan %s
 // RUN: env KO_DONT_OPTIMIZE=1 KO_USE_FASTGEN=1 KO_SOLVE_UB=1 %ko-clang -o %t.fg %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out solve_ub=1" %fgtest %t.fg %t.bin
-// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-0 2>&1 FileCheck %s --check-prefix=CHECK-V0
-// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-3 2>&1 FileCheck %s --check-prefix=CHECK-V1
-// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-4 2>&1 FileCheck %s --check-prefix=CHECK-V2
-// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-7 2>&1 FileCheck %s --check-prefix=CHECK-V3
+// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-0 2>&1 | FileCheck %s --check-prefix=CHECK-V0
+// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-3 2>&1 | FileCheck %s --check-prefix=CHECK-V1
+// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-6 2>&1 | FileCheck %s --check-prefix=CHECK-V2
+// RUN: not env UBSAN_OPTIONS="halt_on_error=1" %t.ubsan %t.out/id-0-0-9 2>&1 | FileCheck %s --check-prefix=CHECK-V3
+//
+// The four RUN lines above used to be missing the `|` before FileCheck, so the
+// patterns below were parsed and never run -- `not %t.ubsan <input> FileCheck
+// %s --check-prefix=...` just handed FileCheck's arguments to the target as
+// extra argv and asserted it exited non-zero, which a missing input file also
+// does.  With the pipe restored the ids have to be right, and they were not:
+// each of the four truncating conversions emits three checks (cids 13, 14 and
+// 15 -- unsigned truncation, signed truncation, sign change) and every one of
+// them solves, so the inputs come in blocks of three per conversion.  Take the
+// first of each block.
 
 #include <stdint.h>
 #include <stdio.h>

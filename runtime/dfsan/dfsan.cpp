@@ -512,10 +512,43 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           AOUT("WARNING: division by zero\n");
           __taint_trace_event_addr(l2, EVENT_DIV_BY_ZERO, 0, __builtin_return_address(0), 0);
         }
+        // -fsanitize=signed-integer-overflow also covers INT_MIN / -1, which
+        // traps exactly like a division by zero and was not modelled here at
+        // all.  clang emits both checks from one place
+        // (EmitUndefinedBehaviorIntegerDivAndRemCheck, CGExprScalar.cpp), where
+        // the *valid* condition is `op1 != INT_MIN || op2 != -1` -- so the UB to
+        // ask the solver for is the conjunction of the two equalities.  Unlike
+        // Add/Sub/Mul the signedness is in the opcode, so there is nothing to
+        // infer: SDiv/SRem only.
+        if ((op & 0xff) == __dfsan::SDiv || (op & 0xff) == __dfsan::SRem) {
+          const uint64_t dmask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL : (1UL << size) - 1;
+          const uint64_t smin = 1ULL << (size - 1);
+          const bool op1_min = (orig_op1 & dmask) == smin;
+          const bool op2_neg1 = (orig_op2 & dmask) == dmask;
+          if (op1_min && op2_neg1) {
+            AOUT("WARNING: signed division overflow\n");
+            __taint_trace_event_addr(l1 ? l1 : l2, EVENT_INT_OVERFLOW, 0,
+                                     __builtin_return_address(0), 0);
+          } else if (l1 || op1_min) {
+            // with a concrete dividend that is not INT_MIN the conjunction is
+            // unsatisfiable, so there is nothing to hand the solver; with a
+            // concrete dividend that *is* INT_MIN only the divisor half is left
+            dfsan_label c2 = do_taint_union(l2, 0, (bveq << 8) | __dfsan::ICmp,
+                                            size, orig_op2, dmask);
+            if (l1) {
+              dfsan_label c1 = do_taint_union(l1, 0, (bveq << 8) | __dfsan::ICmp,
+                                              size, orig_op1, smin);
+              cond = do_taint_union(c1, c2, __dfsan::And, 1, op1_min, op2_neg1);
+            } else {
+              cond = c2;
+            }
+            __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+          }
+        }
         break;
       case __dfsan::Shl:
       case __dfsan::LShr:
-      case __dfsan::AShr:
+      case __dfsan::AShr: {
         // -fsanitize=shift-exponent
         // check for too large value: exponent > size
         if (orig_op2 < size) {
@@ -523,29 +556,61 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                op_size, orig_op2, size);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
         }
-        if ((int64_t)orig_op2 >= 0) {
-          // check for negative value
-          cond = do_taint_union(l2, 0, (bvslt << 8) | __dfsan::ICmp,
-                                op_size, orig_op2, 0);
-          __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
+        // There used to be a second exponent check here, `op2 <s 0`, for a
+        // negative exponent.  It was guarded on `(int64_t)orig_op2 >= 0`, and
+        // orig_op2 is an op_size-bit value zero-extended into a uint64_t, so
+        // that reading is its *unsigned* one and is never negative for an
+        // operand narrower than 64 bits -- the guard was always taken, and the
+        // comparison it emitted is built at op_size, where the exponent may
+        // already be negative.  That is the F1 width bug.
+        //
+        // Fixing the width is not enough: the check is redundant outright.  For
+        // any width n >= 2 a value with its sign bit set is >= 2^(n-1) >= n as
+        // an unsigned number, so every model of `op2 <s 0` already satisfies
+        // `op2 >=u size` above.  Same cid, same UB, second task.  clang gets
+        // both from the one unsigned compare -- `RHS <=u width-1` in EmitShl
+        // (CGExprScalar.cpp) -- and so do we now.
+        //
+        // valid_exp is that same compare in its positive form, for the base
+        // checks below.
+        dfsan_label valid_exp = 0;
+        if ((op & 0xff) == __dfsan::Shl) {
+          valid_exp = do_taint_union(l2, 0, (bvult << 8) | __dfsan::ICmp,
+                                     op_size, orig_op2, size);
         }
-        if (op == __dfsan::Shl && orig_op1 != 0 &&
+        // Both base checks have to be conjoined with valid_exp.  clang emits
+        // them under a branch on the exponent being in range and phis in `true`
+        // otherwise (EmitShl's CheckShiftBase block), because with an
+        // out-of-range exponent the shift is already UB and "which bits were
+        // shifted off" is not a meaningful question.  Ungated, the solver can
+        // answer a shift-base task with an input whose exponent is out of range
+        // -- real UB, but not the one the cid names, and the condition it came
+        // from has nothing to do with it.
+        if ((op & 0xff) == __dfsan::Shl && orig_op1 != 0 &&
             orig_op2 <= __builtin_clzl(orig_op1) - (64 - size)) {
           // check for shift overflow
           // op2 > leading zero bits in op1
           cond = do_taint_union(l2, 0, (bvugt << 8) | __dfsan::ICmp, op_size,
                                 orig_op2, __builtin_clzl(orig_op1) - (64 - size));
+          cond = do_taint_union(cond, valid_exp, __dfsan::And, 1, 0,
+                                orig_op2 < size);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_overflow);
         }
-        if (l1 && (int64_t)orig_op1 >= 0) {
+        // same width bug as the negative-exponent guard above: the sign has to
+        // be read at the base's own width, not at 64.
+        if ((op & 0xff) == __dfsan::Shl && l1 &&
+            (orig_op1 & (1ULL << (get_label_info(l1)->size - 1))) == 0) {
           // check for negative base
           // -fsanitize=shift-base
           // op1 < 0
           cond = do_taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
                                 get_label_info(l1)->size, orig_op1, 0);
+          cond = do_taint_union(cond, valid_exp, __dfsan::And, 1, 0,
+                                orig_op2 < size);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_base);
         }
         break;
+      }
       default:
         break;
     }
@@ -567,13 +632,47 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         __taint_trace_cond(loss, 0, UndefinedCheck, ub_unsigned_integer_truncation);
       }
       // -fsanitize=implicit-signed-integer-truncation
-      // old_value < signed(1 << (size - 1))
-      int64_t target = (int64_t)((0xFFFFFFFFFFFFFFFFUL >> (size-1)) << (size-1));
-      if ((int64_t)orig_op1 >= target) {
-        uint16_t old_size = get_label_info(l1)->size;
-        if (old_size < 64) target &= ~(1UL << old_size);
-        dfsan_label loss = do_taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
-                                          old_size, orig_op1, target);
+      //
+      // clang's form is one comparison that covers the whole range:
+      // sext(trunc(x)) == x is *valid*, so the truncation is lossy iff they
+      // differ (EmitIntegerTruncationCheckHelper, CGExprScalar.cpp -- it
+      // re-extends by the destination's signedness and equality-compares).
+      //
+      // What was here instead was `old_value < signed(1 << (size - 1))`, i.e.
+      // `x <s INT_MIN(new)`, which is only the below-minimum half.  It never
+      // asked for the other one: (int8_t)300 is signed-truncation UB, and with
+      // x == 300 the guard below passes, so the solver was handed the
+      // below-minimum question and the above-maximum one was never posed.
+      //
+      // Two earlier notes on that check, kept because they are what the shape
+      // has to get right and the new shape still does:
+      //   - orig_op1 holds an old_size-bit value zero-extended into a uint64_t,
+      //     so (int64_t)orig_op1 is never negative for old_size < 64 and the
+      //     guard was always true.  Sign-extend from old_size before comparing,
+      //     or a value already out of range is asked to go out of range --
+      //     already true, and z3-ts rejects it as `value mismatch for cond`.
+      //   - the comparison is built at old_size, so any constant in it has to
+      //     be at that width; the old `target &= ~(1UL << old_size)` cleared a
+      //     single bit above the width instead of masking, and only came out
+      //     right because every consumer truncates to the node width anyway.
+      // The re-extend form has no constant at all, so the second one is moot.
+      uint16_t old_size = get_label_info(l1)->size;
+      const uint64_t old_mask = old_size == 64 ? 0xFFFFFFFFFFFFFFFFUL :
+                                                 (1UL << old_size) - 1;
+      const uint64_t trunc_mask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL :
+                                               (1UL << size) - 1;
+      const uint64_t truncated = orig_op1 & trunc_mask;
+      // sign-extend the truncated value back to old_size, concretely, so the
+      // guard reads the same question the symbolic form asks
+      const uint64_t re_ext =
+          (size >= 64 ? truncated
+                      : (uint64_t)(((int64_t)(truncated << (64 - size))) >> (64 - size)))
+          & old_mask;
+      if (re_ext == (orig_op1 & old_mask)) {
+        dfsan_label se = do_taint_union(label, 0, __dfsan::SExt, old_size,
+                                        truncated, 0);
+        dfsan_label loss = do_taint_union(se, l1, (bvneq << 8) | __dfsan::ICmp,
+                                          old_size, re_ext, orig_op1 & old_mask);
         __taint_trace_cond(loss, 0, UndefinedCheck, ub_signed_integer_truncation);
       }
 
@@ -645,35 +744,54 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       // For multiplication, overflow is harder to detect symbolically
       // Use the approach: if a != 0, then overflow iff result / a != b
       // But we approximate with sign-based check similar to addition
-      uint64_t xor1 = (orig_op1 ^ result) & mask;
-      uint64_t xor2 = (orig_op2 ^ result) & mask;
-      uint64_t overflow_check = xor1 & xor2;
-      uint64_t sign_bit = 1ULL << (size - 1);
-
-      // For signed multiplication: check if signs are inconsistent
-      // Product of same signs should be positive, different signs should be negative
-      // This is an approximation - full check would need wider multiplication
-      bool has_signed_overflow = (overflow_check & sign_bit) != 0;
-
-      if (!has_signed_overflow && (orig_op1 != 0 || l1 != 0) && (orig_op2 != 0 || l2 != 0)) {
-        dfsan_label xor_l1 = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
-        dfsan_label xor_l2 = do_taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
-        dfsan_label and_xors = do_taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
-        dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
-                                          size, overflow_check, 0);
-        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
-      } else {
-        AOUT("WARNING: signed integer overflow\n");
-        __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
-      }
-
-      // Unsigned overflow: for multiplication, check if result / op1 != op2 (when op1 != 0)
-      // When orig_op1 == 0, no overflow possible concretely (0 * x = 0), but if symbolic, still check
-      bool no_unsigned_overflow = (orig_op1 == 0 || result / orig_op1 == orig_op2);
-      if (no_unsigned_overflow && (orig_op1 > 1 || l1 != 0) && (orig_op2 > 1 || l2 != 0)) {
-          dfsan_label cond = do_taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
-                                            size, result, orig_op1);
+      //
+      // Both of the old formulas were the addition ones, and neither describes
+      // multiplication.  The sign-based one above is the approximation its own
+      // comment admits to; the unsigned one was `result <u op1`, which is
+      // neither necessary (2 * 0x80000001 wraps to 2 at 32 bits, and 2 <u 2 is
+      // false) nor sufficient (op2 == 0 gives 0 <u op1 with no overflow at all,
+      // so the solver was asked to satisfy something already true and would
+      // have "found" a non-overflowing input).  Do the multiplication at twice
+      // the width instead and ask whether the product fits, which is exact for
+      // both signednesses.  `size * 2` has to stay inside the 64-bit concrete
+      // value we can carry, so wider multiplies get no check rather than a
+      // wrong one -- see task #58 for the same tradeoff at 128 bits.
+      const uint16_t wide_size = size * 2;
+      const uint64_t a = orig_op1 & mask, b = orig_op2 & mask;
+      if (size <= 32 && (a > 1 || l1 != 0) && (b > 1 || l2 != 0)) {
+        // signed: sext(op1) * sext(op2) != sext(result).  size <= 32 here, so
+        // the shift pair below is always a real sign extension.
+        const unsigned pad = 64 - size;
+        int64_t sa = (int64_t)(a << pad) >> pad;
+        int64_t sb = (int64_t)(b << pad) >> pad;
+        int64_t sr = (int64_t)(result << pad) >> pad;
+        int64_t swide = sa * sb;
+        const uint64_t wide_mask =
+            wide_size >= 64 ? 0xFFFFFFFFFFFFFFFFUL : (1ULL << wide_size) - 1;
+        if (swide == sr) {
+          dfsan_label s1 = l1 ? do_taint_union(l1, 0, __dfsan::SExt, wide_size, orig_op1, 0) : 0;
+          dfsan_label s2 = l2 ? do_taint_union(l2, 0, __dfsan::SExt, wide_size, orig_op2, 0) : 0;
+          dfsan_label smul = do_taint_union(s1, s2, __dfsan::Mul, wide_size,
+                                            sa & wide_mask, sb & wide_mask);
+          dfsan_label sres = do_taint_union(label, 0, __dfsan::SExt, wide_size, result, 0);
+          dfsan_label cond = do_taint_union(smul, sres, (bvneq << 8) | __dfsan::ICmp,
+                                            wide_size, swide & wide_mask, sr & wide_mask);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+        } else {
+          AOUT("WARNING: signed integer overflow\n");
+          __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
+        }
+
+        // unsigned: zext(op1) * zext(op2) >u mask
+        uint64_t uwide = a * b;
+        if (uwide <= mask) {
+          dfsan_label z1 = l1 ? do_taint_union(l1, 0, __dfsan::ZExt, wide_size, orig_op1, 0) : 0;
+          dfsan_label z2 = l2 ? do_taint_union(l2, 0, __dfsan::ZExt, wide_size, orig_op2, 0) : 0;
+          dfsan_label umul = do_taint_union(z1, z2, __dfsan::Mul, wide_size, a, b);
+          dfsan_label cond = do_taint_union(umul, 0, (bvugt << 8) | __dfsan::ICmp,
+                                            wide_size, uwide, mask);
+          __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+        }
       }
     } else if (op == __dfsan::Sub) {
       // check for integer overflow (underflow for subtraction)
@@ -708,7 +826,10 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
 
       // Unsigned underflow: result > op1 when op2 > 0
       // When subtracting, if a < b, result wraps around to large value (result > a)
-      if (result <= orig_op1 && orig_op2 != 0) {
+      // `orig_op2 != 0` alone skips a symbolic subtrahend that happens to be 0
+      // right now, which is exactly the one worth solving for; Add's twin
+      // guard already has the `|| l2 != 0` arm.
+      if (result <= orig_op1 && (orig_op2 != 0 || l2 != 0)) {
         dfsan_label cond = do_taint_union(label, l1, (bvugt << 8) | __dfsan::ICmp,
                                           size, result, orig_op1);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
@@ -1141,7 +1262,12 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
             do_taint_union(index_label, 0, Mul, 64, index, elem_size);
         uint64_t size = index * elem_size;
         uint64_t offset = current_offset + ptr - bounds_info->op1.i;
-        size_label = offset == 0 ? size :
+        // offset == 0 means there is nothing to add, so the label stays as it
+        // is.  It must not become `size`: that is a uint64_t value, and
+        // assigning it into a dfsan_label names an unrelated label whose id
+        // happens to equal the size, which builds the comparison below over
+        // someone else's expression.
+        size_label = offset == 0 ? size_label :
             do_taint_union(size_label, 0, Add, 64, size, offset);
         size += offset;
         uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
@@ -1211,10 +1337,20 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
         // check underflow: ptr + size < lower_bound (wrap around)
         // => size < lower_bound - ptr (when lower_bound > ptr, but this shouldn't happen in valid code)
         // or equivalently, check that ptr < lower_bound (shouldn't happen)
-        uint64_t min_size = bounds_info->op1.i - ptr;
-        dfsan_label underflow = do_taint_union(size_label, 0, (bvult << 8) | ICmp,
-                                               64, size, min_size);
-        __taint_trace_cond(underflow, 0, UndefinedCheck, ub_size_underflow);
+        //
+        // The parenthetical is the whole check: any pointer that came from this
+        // allocation has ptr >= lower_bound, so `lower_bound - ptr` wraps to a
+        // huge uint64_t and `size <u min_size` is true for every size -- an
+        // already-true condition handed to a solver told to make it true, on
+        // every interior pointer.  At ptr == lower_bound it is `size <u 0`,
+        // false for every size and equally unsolvable.  So only emit it in the
+        // case the comment says shouldn't happen, where it means something.
+        if (ptr < bounds_info->op1.i) {
+          uint64_t min_size = bounds_info->op1.i - ptr;
+          dfsan_label underflow = do_taint_union(size_label, 0, (bvult << 8) | ICmp,
+                                                 64, size, min_size);
+          __taint_trace_cond(underflow, 0, UndefinedCheck, ub_size_underflow);
+        }
 
         // check overflow: ptr + size > upper_bound
         // => size > upper_bound - ptr
