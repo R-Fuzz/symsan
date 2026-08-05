@@ -9,6 +9,7 @@ extern "C" {
 }
 
 #include "parse-z3.h"
+#include "sweep.h"
 
 #include <algorithm>
 #include <map>
@@ -95,88 +96,12 @@ static int __parse_only = 0;
 
 namespace {
 
-struct parse_stats {
-  uint64_t conds = 0;         // cond messages seen
-  uint64_t cond_tasks = 0;    // tasks the parser built from them
-  uint64_t cond_ok = 0;       // parsed, at least one task
-  uint64_t cond_empty = 0;    // parsed, no task -- a silent drop
-  uint64_t cond_failed = 0;   // parse_cond returned -1
-  // Loop-exit notifications carrying no condition.  The runtime forwards a
-  // cond message with label 0 when a loop leaves by a concrete test (see
-  // __taint_trace_cond), because the backend wants to know the loop ended even
-  // though there is nothing to solve.  Counting those as parse failures put
-  // 38600 phantom "invalid label" rejections in the first sweep, all of them at
-  // loop latches, so they get their own line rather than a reason bucket.
-  uint64_t loop_exits = 0;
-  uint64_t geps = 0;
-  uint64_t gep_tasks = 0;
-  uint64_t gep_ok = 0;
-  uint64_t gep_empty = 0;
-  uint64_t gep_failed = 0;
-  // GEPs parse_gep declined on the strength of enum_index alone.  Its own line
-  // rather than a reason bucket, because the answer is the same for every GEP
-  // in the trace and it is our own argument coming back: with enum_gep=0 it is
-  // simply the whole gep count, and the reason histogram would say nothing
-  // except that we passed 0.  Kept as a count so that a run still reports how
-  // many GEPs it walked past.
-  uint64_t gep_skipped = 0;
-  // Why a GEP was not enumerable, by the shape of what the runtime sent: the
-  // parser needs either an array extent (num_elems) or a bounds label on the
-  // pointer, and "neither" is a different problem from "the index would not
-  // parse".  Indexed by (num_elems != 0) * 2 + (ptr_label != 0).
-  uint64_t gep_shape[4] = {0, 0, 0, 0};
-  // reason -> count, over both the -1 returns and the parsed-but-empty ones.
-  // Ordered so that two runs of the sweep diff cleanly.
-  std::map<std::string, uint64_t> reasons;
-  // (call site, reason) -> count.  A whole-corpus reason histogram says what the
-  // parser refuses but not where, and "where" is what decides whether a
-  // rejection is a parser bug or a property of the target -- a mismatch under an
-  // uninstrumented library looks exactly like one under a broken AST until the
-  // address is symbolized.  The site is the runtime return address the trace
-  // event carried; the binary is non-PIE, so addr2line resolves it directly.
-  std::map<std::pair<uint64_t, std::string>, uint64_t> sites;
-};
+// The counters, the bucketing and the report now live in driver/sweep.h, so
+// that afltest reports the same shape over the same corpus and the two parsers
+// can be read side by side.
+using symsan::sweep::parse_stats;
 
 parse_stats __stats;
-
-// Attribute one parse. `reason` is the parser's own account of why it stopped;
-// an empty one on an empty result means the parser had nothing to say, which is
-// itself worth a bucket rather than being silently dropped.
-void note_parse(bool failed, size_t produced, const std::string &reason,
-                void *addr, uint64_t &ok, uint64_t &empty, uint64_t &fail) {
-  const char *bucket = nullptr;
-  if (failed) {
-    fail++;
-    bucket = reason.empty() ? "(unreported)" : reason.c_str();
-  } else if (produced == 0) {
-    empty++;
-    bucket = reason.empty() ? "(no task, unreported)" : reason.c_str();
-  } else {
-    ok++;
-    return;
-  }
-  __stats.reasons[bucket]++;
-  __stats.sites[{(uint64_t)addr, bucket}]++;
-}
-
-void report_parse_stats() {
-  const auto &s = __stats;
-  printf("PARSE-SUMMARY conds=%lu ok=%lu empty=%lu failed=%lu tasks=%lu loop_exits=%lu\n",
-         s.conds, s.cond_ok, s.cond_empty, s.cond_failed, s.cond_tasks,
-         s.loop_exits);
-  printf("PARSE-SUMMARY geps=%lu ok=%lu empty=%lu failed=%lu tasks=%lu skipped=%lu\n",
-         s.geps, s.gep_ok, s.gep_empty, s.gep_failed, s.gep_tasks,
-         s.gep_skipped);
-  printf("PARSE-GEPSHAPE none=%lu ptr_only=%lu elems_only=%lu both=%lu\n",
-         s.gep_shape[0], s.gep_shape[1], s.gep_shape[2], s.gep_shape[3]);
-  for (const auto &kv : s.reasons) {
-    printf("PARSE-REASON %lu\t%s\n", kv.second, kv.first.c_str());
-  }
-  for (const auto &kv : s.sites) {
-    printf("PARSE-SITE %lu\t0x%lx\t%s\n", kv.second, kv.first.first,
-           kv.first.second.c_str());
-  }
-}
 
 } // namespace
 
@@ -244,7 +169,11 @@ static void generate_input(symsan::Z3ParserSolver::solution_t &solutions) {
   close(fd);
 }
 
-static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *addr) {
+// `cid` is the branch id the trace event carried.  Under the two-stage build it
+// is the AFL edge id, which is the only key that joins a parse outcome to the
+// fuzzer's coverage map; it is otherwise unused here.
+static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *addr,
+                         uint32_t cid) {
 
   AOUT("solving label %d = %d, add_nested: %d\n", label, r, add_nested);
   if (__parse_only && label == 0) {
@@ -259,8 +188,8 @@ static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *ad
   if (__parse_only) {
     __stats.conds++;
     __stats.cond_tasks += tasks.size();
-    note_parse(failed != 0, tasks.size(), __z3_parser->last_error(), addr,
-               __stats.cond_ok, __stats.cond_empty, __stats.cond_failed);
+    __stats.note(failed != 0, tasks.size(), __z3_parser->last_error(), addr,
+                 __stats.cond_ok, __stats.cond_empty, __stats.cond_failed, cid);
     // Drop the tasks: retrieve_task hands over ownership, so without this the
     // parser's task table grows for the whole trace.
     for (auto id : tasks) __z3_parser->retrieve_task(id);
@@ -309,8 +238,8 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
       __stats.gep_skipped++;
       __stats.gep_empty++;
     } else {
-      note_parse(failed != 0, tasks.size(), __z3_parser->last_error(), addr,
-                 __stats.gep_ok, __stats.gep_empty, __stats.gep_failed);
+      __stats.note(failed != 0, tasks.size(), __z3_parser->last_error(), addr,
+                   __stats.gep_ok, __stats.gep_empty, __stats.gep_failed);
     }
     for (auto id : tasks) __z3_parser->retrieve_task(id);
     return;
@@ -334,38 +263,10 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
 }
 
 // Where the target is pointed for every run of a corpus sweep, and the fd we
-// keep open on it.  Null in the single-input case, which still runs the seed
-// where it lies.
-//
-// A fork server can only be told the input path once -- the launcher bakes it
-// into the server's environment at spawn time, and every forked child re-reads
-// that same path -- so serving a corpus means one fixed path whose *contents*
-// change per seed.  That is what AFL does, and the reason the file lives in
-// /dev/shm: it is rewritten once per seed and read once per seed, and there is
-// no reason for any of that to reach a disk.
-static const char *__staged_path = nullptr;
-static int __staged_fd = -1;
-
-static void staged_cleanup(void) {
-  if (__staged_fd != -1) close(__staged_fd);
-  if (__staged_path) unlink(__staged_path);
-}
-
-// Point the fixed input file at this seed's bytes.  Truncate first: a short
-// seed after a long one would otherwise be read with the tail of its
-// predecessor still attached.
-static int stage_bytes(const char *buf, size_t size) {
-  if (ftruncate(__staged_fd, 0) != 0) return -1;
-  size_t done = 0;
-  while (done < size) {
-    ssize_t w = pwrite(__staged_fd, buf + done, size - done, done);
-    if (w > 0) done += (size_t)w;
-    else if (w < 0 && errno == EINTR) continue;
-    else return -1;
-  }
-  if (lseek(__staged_fd, 0, SEEK_SET) == (off_t)-1) return -1;
-  return 0;
-}
+// keep open on it.  path() is null in the single-input case, which still runs
+// the seed where it lies.  See driver/sweep.h for why a corpus needs one fixed
+// path whose contents change per seed.
+static symsan::sweep::input_stager __staged;
 
 // Trace one input end to end: run the target, then drain and parse the event
 // stream it produces.  Split out of main() so that one process can walk a whole
@@ -398,22 +299,22 @@ static int run_one(char *program, char *input, int is_stdin) {
     return -1;
   }
 
-  if (__staged_path) {
+  if (__staged.path()) {
     // input path and args were set once, before the server was spawned; only
     // the contents change
-    if (stage_bytes(input_buf, input_size) != 0) {
+    if (__staged.stage(input_buf, input_size) != 0) {
       fprintf(stderr, "Failed to stage %s: %s\n", input, strerror(errno));
       goto fail;
     }
     close(input_fd);
-    input_fd = __staged_fd;
+    input_fd = __staged.fd();
   } else if (symsan_set_input(is_stdin ? "stdin" : input) != 0) {
     fprintf(stderr, "Failed to set input\n");
     goto fail;
   }
 
   {
-    if (!__staged_path) {
+    if (!__staged.path()) {
       char* args[3];
       args[0] = program;
       args[1] = input;
@@ -433,7 +334,7 @@ static int run_one(char *program, char *input, int is_stdin) {
       fprintf(stderr, "SymSan launch error %d\n", ret);
       goto fail;
     }
-    if (input_fd != __staged_fd) close(input_fd);
+    if (input_fd != __staged.fd()) close(input_fd);
     input_fd = -1;
 
     std::vector<symsan::input_t> inputs;
@@ -450,10 +351,15 @@ static int run_one(char *program, char *input, int is_stdin) {
     table_msg *tmsg = nullptr;
 
     while (symsan_read_event(&msg, sizeof(msg), 0) > 0) {
+      // Every message type, not just the ones that parse: this is the "did the
+      // target trace anything at all" number, and a sweep that cannot separate
+      // that from "the parser accepted everything" is unreadable.
+      __stats.events++;
       // solve constraints
       switch (msg.msg_type) {
         case cond_type:
-          __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr);
+          __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr,
+                       msg.id);
           break;
         case gep_type:
           if (symsan_read_event(&gmsg, sizeof(gmsg), 0) != sizeof(gmsg)) {
@@ -533,7 +439,7 @@ static int run_one(char *program, char *input, int is_stdin) {
 fail:
   munmap(input_buf, input_size);
   input_buf = nullptr;
-  if (input_fd != -1 && input_fd != __staged_fd) close(input_fd);
+  if (input_fd != -1 && input_fd != __staged.fd()) close(input_fd);
   return -1;
 }
 
@@ -545,6 +451,15 @@ int main(int argc, char* const argv[]) {
   }
 
   char *program = argv[1];
+
+  // A target that cannot be exec'd is not an error anywhere below: the launcher
+  // forks, execv fails in the child, and every read comes back empty -- so the
+  // run reports zero events and exits 0, which over a corpus reads exactly like
+  // a target that parses cleanly.  Say so here instead.
+  if (access(program, X_OK) != 0) {
+    fprintf(stderr, "Cannot execute %s: %s\n", program, strerror(errno));
+    exit(1);
+  }
 
   int is_stdin = 0;
   int solve_ub = 0;
@@ -626,28 +541,17 @@ int main(int argc, char* const argv[]) {
 
   // More than one input: serve them all from one fork server, which skips
   // execv, dynamic linking and the shadow and union table setup per seed.  That
-  // needs a single fixed input path (see __staged_path), so it is only on for a
+  // needs a single fixed input path (see __staged.path()), so it is only on for a
   // corpus -- a lone input keeps running where it lies, which is what every
   // existing caller and lit test expects.  A stdin target is excluded because
   // its fd has to be wired up per run, which cannot be done from out here.
   const bool many = (argc > 3);
   if (many && !is_stdin) {
-    static char path[PATH_MAX];
-    // /dev/shm if it will have us, since this is written and read once per seed
-    // and never needs to survive the process
-    const char *dirs[] = {"/dev/shm", getenv("TMPDIR"), "/tmp"};
-    for (const char *dir : dirs) {
-      if (!dir) continue;
-      snprintf(path, sizeof(path), "%s/fgtest-%d.input", dir, getpid());
-      __staged_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-      if (__staged_fd != -1) break;
-    }
-    if (__staged_fd == -1) {
+    if (!__staged.open_staging("fgtest")) {
       fprintf(stderr, "Failed to create staging file: %s\n", strerror(errno));
       exit(1);
     }
-    __staged_path = path;
-    atexit(staged_cleanup);
+    char *path = (char *)__staged.path();
 
     char *args[3];
     args[0] = program;
@@ -682,7 +586,7 @@ int main(int argc, char* const argv[]) {
       failures++;
       continue;
     }
-    if (__parse_only) report_parse_stats();
+    if (__parse_only) __stats.report();
   }
 
   symsan_destroy();

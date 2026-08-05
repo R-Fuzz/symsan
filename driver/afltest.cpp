@@ -8,13 +8,19 @@
 // us validate the RGD path deterministically on a single input, without the
 // noisy afl-fuzz search loop.
 //
-// Usage: afltest [--dump-constraints <dir>] target input
+// Usage: afltest [--dump-constraints <dir>] target input [input...]
 //   TAINT_OPTIONS="taint_file=<file|stdin> output_dir=<dir>"
 //   SYMSAN_USE_JIGSAW=1  add the jigsaw JIT solver to the chain
 //   SYMSAN_USE_Z3=1      add the z3 solver to the chain (needed for FP)
 //   SYMSAN_USE_NESTED=1  enable nested constraint solving in the parser
 //   SYMSAN_NO_I2S=1      drop the i2s solver, which is otherwise always first;
 //                        the way to ask what one of the others can do alone
+//   SYMSAN_PARSE_ONLY=1  build the SearchTasks and drop them; report why the
+//                        parser refused the rest.  See below.
+//   SYMSAN_VERBOSE=1     the per-event trace, off by default
+//
+// More than one input sweeps a corpus in one process, sharing the fork server
+// and the parser across seeds -- see run_one and the loop in main.
 //
 // --dump-constraints writes every distinct constraint of every task to
 // <dir>/c-<n>.rgdc in the flat binary format of rgd::Constraint::save(), and
@@ -42,8 +48,10 @@ extern "C" {
 
 #include "parse-rgd.h"
 #include "session.h"
+#include "sweep.h"
 
 #include <memory>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -62,11 +70,46 @@ using namespace __dfsan;
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
+// SYMSAN_VERBOSE: the per-event trace.
+//
+// AOUT fires once per branch and once per GEP, which is what you want when you
+// are staring at one seed and is unusable the moment afltest is pointed at a
+// corpus.  Off by default; set SYMSAN_VERBOSE to get it back, no rebuild
+// needed.  Same switch and same reasoning as fgtest.
+//
+// What is *not* under it: the "generate #N output" line and the constraint
+// round-trip warnings, which are results rather than trace, and the
+// fprintf(stderr) failures, which have no other channel.  Rejected parses lose
+// their prose here but keep last_error(), which parse-only mode buckets into
+// PARSE-REASON.
+static int __verbose = 0;
+
 #undef AOUT
 # define AOUT(...)                                      \
   do {                                                  \
+    if (__verbose) printf(__VA_ARGS__);                 \
+  } while(false)
+
+// A result line, always printed.
+# define ROUT(...)                                      \
+  do {                                                  \
     printf(__VA_ARGS__);                                \
   } while(false)
+
+// SYMSAN_PARSE_ONLY: build the SearchTasks but never solve them.
+//
+// construct_task() is what parse_cond and parse_gep already do; this mode just
+// drops the result instead of handing it to the solver chain.  Solving
+// dominates the wall clock of a trace and is also where most of the noise
+// lives, so a sweep meant to answer "which branches does the RGD parser refuse,
+// and why" runs an order of magnitude faster -- and produces countable output
+// -- with i2s, jigsaw and z3 out of the picture.  What it prints instead is a
+// machine-readable summary per input; see sweep.h.
+//
+// This is deliberately the *parser* question only.  A task that gets built and
+// then declined by jigsaw's codegen is a different finding, counted elsewhere
+// (see the parse-vs-jit split in tools/magma/results.sh).
+static int __parse_only = 0;
 
 // for input
 static char *input_buf;
@@ -79,6 +122,14 @@ static uint32_t __session_id = 0;
 static uint32_t __current_index = 0;
 static int __enum_gep = 0;  // GEP enumeration disabled by default
 static const char* __dump_dir = nullptr;  // --dump-constraints, off by default
+
+// the parse-reason counters, shared in shape with fgtest so that the two
+// parsers can be swept over one corpus and read side by side
+static symsan::sweep::parse_stats __stats;
+
+// Where the target is pointed for every run of a corpus sweep.  path() is null
+// in the single-input case, which still runs the seed where it lies.
+static symsan::sweep::input_stager __staged;
 
 // the mapped union table (shared with the launched target)
 static const size_t MAX_LABEL = uniontable_size / sizeof(dfsan_label_info);
@@ -101,15 +152,15 @@ static void generate_input(const uint8_t *buf, size_t size) {
            __instance_id, __session_id, __current_index++);
   int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
   if (fd == -1) {
-    AOUT("failed to open new input file for write\n");
+    ROUT("failed to open new input file for write\n");
     return;
   }
 
-  AOUT("generate #%d output (size: %zu -> %zu)\n",
+  ROUT("generate #%d output (size: %zu -> %zu)\n",
        __current_index - 1, input_size, size);
 
   if (write(fd, buf, size) == -1) {
-    AOUT("failed to write new input\n");
+    ROUT("failed to write new input\n");
   }
 
   close(fd);
@@ -129,7 +180,7 @@ static void dump_constraints(rgd::task_t task) {
 
     std::vector<uint8_t> buf;
     if (!c->save(buf)) {
-      AOUT("WARNING: failed to serialize constraint %p\n", (void*)c.get());
+      ROUT("WARNING: failed to serialize constraint %p\n", (void*)c.get());
       continue;
     }
 
@@ -139,12 +190,12 @@ static void dump_constraints(rgd::task_t task) {
     auto rt = std::make_shared<rgd::Constraint>(0);
     std::vector<uint8_t> rebuf;
     if (!rt->load(buf.data(), buf.size())) {
-      AOUT("WARNING: failed to deserialize constraint %p\n", (void*)c.get());
+      ROUT("WARNING: failed to deserialize constraint %p\n", (void*)c.get());
     } else if (!rt->save(rebuf) || rebuf != buf) {
-      AOUT("WARNING: constraint %p did not round trip byte-identically\n",
+      ROUT("WARNING: constraint %p did not round trip byte-identically\n",
            (void*)c.get());
     } else if (!rgd::isEqualAst(*c->get_root(), *rt->get_root())) {
-      AOUT("WARNING: constraint %p round tripped to a different AST\n",
+      ROUT("WARNING: constraint %p round tripped to a different AST\n",
            (void*)c.get());
     }
 
@@ -152,11 +203,11 @@ static void dump_constraints(rgd::task_t task) {
     snprintf(path, PATH_MAX, "%s/c-%d.rgdc", __dump_dir, index++);
     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
     if (fd == -1) {
-      AOUT("failed to open %s for write\n", path);
+      ROUT("failed to open %s for write\n", path);
       continue;
     }
     if (write(fd, buf.data(), buf.size()) == -1) {
-      AOUT("failed to write %s\n", path);
+      ROUT("failed to write %s\n", path);
     }
     close(fd);
   }
@@ -186,11 +237,37 @@ static void solve_task(rgd::task_t task, void *addr) {
   AOUT("task not solved @%p\n", addr);
 }
 
-static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *addr) {
+// `cid` is the branch id the trace event carried.  Under the two-stage build it
+// is the AFL edge id, which is the only key that joins a parse outcome to the
+// fuzzer's coverage map; it is otherwise unused here.
+static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *addr,
+                         uint32_t cid) {
 
   AOUT("solving label %d = %d, add_nested: %d\n", label, r, add_nested);
+  if (__parse_only && label == 0) {
+    // A loop-exit notification, not a condition -- there is no AST to build and
+    // no branch to flip, so it is neither a success nor a failure.  parse_cond
+    // does reject label 0 with "invalid label", but the caller is what decides
+    // whether that counts: on a loop-heavy target this is tens of thousands of
+    // events, and bucketing them as rejections is what put 38600 phantom
+    // entries in fgtest's first sweep.
+    __stats.conds++;
+    __stats.loop_exits++;
+    return;
+  }
   std::vector<uint64_t> tasks;
-  if (__parser->parse_cond(label, r != 0, add_nested, tasks)) {
+  int failed = __parser->parse_cond(label, r != 0, add_nested, tasks);
+  if (__parse_only) {
+    __stats.conds++;
+    __stats.cond_tasks += tasks.size();
+    __stats.note(failed != 0, tasks.size(), __parser->last_error(), addr,
+                 __stats.cond_ok, __stats.cond_empty, __stats.cond_failed, cid);
+    // Drop the tasks: retrieve_task hands over ownership, so without this the
+    // parser's task table grows for the whole trace.
+    for (auto id : tasks) __parser->retrieve_task(id);
+    return;
+  }
+  if (failed) {
     AOUT("WARNING: failed to parse condition %d @%p\n", label, addr);
     return;
   }
@@ -210,8 +287,27 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
       index, index_label, num_elems, elem_size, current_offset);
 
   std::vector<uint64_t> tasks;
-  if (__parser->parse_gep(ptr_label, ptr, index_label, index, num_elems,
-                          elem_size, current_offset, __enum_gep, tasks)) {
+  int failed = __parser->parse_gep(ptr_label, ptr, index_label, index, num_elems,
+                                   elem_size, current_offset, __enum_gep, tasks);
+  if (__parse_only) {
+    __stats.geps++;
+    __stats.gep_tasks += tasks.size();
+    __stats.gep_shape[(num_elems != 0) * 2 + (ptr_label != 0)]++;
+    // A GEP the parser only declined because we did not ask it to enumerate is
+    // not a rejection to attribute -- see gep_skipped.  It still has to have
+    // reached that early return: a -1 here is a label the parser refused before
+    // ever looking at enum_index, and that is a real failure.
+    if (!__enum_gep && failed == 0) {
+      __stats.gep_skipped++;
+      __stats.gep_empty++;
+    } else {
+      __stats.note(failed != 0, tasks.size(), __parser->last_error(), addr,
+                   __stats.gep_ok, __stats.gep_empty, __stats.gep_failed);
+    }
+    for (auto id : tasks) __parser->retrieve_task(id);
+    return;
+  }
+  if (failed) {
     AOUT("WARNING: failed to parse gep %d @%p\n", index_label, addr);
     return;
   }
@@ -222,6 +318,195 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
   }
 }
 
+// Trace one input end to end: run the target, then drain and parse the event
+// stream it produces.  Split out of main() so that one process can walk a whole
+// corpus -- see the loop at the bottom.  Everything that can be kept across
+// inputs is: symsan_init maps the union table once, the fork server is spawned
+// once, and the parser is reset with restart() rather than rebuilt, which is
+// what restart() is for.
+//
+// Returns 0 on success, -1 if this input could not be traced.  A failure is per
+// input rather than fatal, so that one unreadable seed does not end a sweep.
+static int run_one(char *program, char *input, int is_stdin) {
+  // load input file
+  struct stat st;
+  int input_fd = open(input, O_RDONLY);
+  if (input_fd == -1) {
+    fprintf(stderr, "Failed to open input file %s: %s\n", input, strerror(errno));
+    return -1;
+  }
+  fstat(input_fd, &st);
+  input_size = st.st_size;
+  // mmap of a zero-length file fails; an empty seed is a thing a corpus has, and
+  // it is not worth ending the run over
+  input_buf = input_size ? (char *)mmap(NULL, input_size, PROT_READ, MAP_PRIVATE,
+                                        input_fd, 0)
+                         : (char *)MAP_FAILED;
+  if (input_buf == MAP_FAILED) {
+    fprintf(stderr, "Failed to map input file %s: %s\n", input,
+            input_size ? strerror(errno) : "empty file");
+    close(input_fd);
+    return -1;
+  }
+
+  // grow the output buffer if this seed is longer than any before it.  RGD
+  // solvers write the full (possibly grown) input; give some headroom for
+  // INSERT-style solutions.
+  if (input_size + 4096 > __output_buf_size) {
+    size_t want = input_size + 4096;
+    uint8_t *grown = (uint8_t *)realloc(__output_buf, want);
+    if (!grown) {
+      fprintf(stderr, "Failed to alloc output buffer\n");
+      goto fail;
+    }
+    __output_buf = grown;
+    __output_buf_size = want;
+  }
+
+  if (__staged.path()) {
+    // input path and args were set once, before the server was spawned; only
+    // the contents change
+    if (__staged.stage(input_buf, input_size) != 0) {
+      fprintf(stderr, "Failed to stage %s: %s\n", input, strerror(errno));
+      goto fail;
+    }
+    close(input_fd);
+    input_fd = __staged.fd();
+  } else if (symsan_set_input(is_stdin ? "stdin" : input) != 0) {
+    fprintf(stderr, "Failed to set input\n");
+    goto fail;
+  }
+
+  {
+    if (!__staged.path()) {
+      char* args[3];
+      args[0] = program;
+      args[1] = input;
+      args[2] = NULL;
+      if (symsan_set_args(2, args) != 0) {
+        fprintf(stderr, "Failed to set args\n");
+        goto fail;
+      }
+    }
+
+    // launch the target
+    int ret = symsan_run(input_fd);
+    if (ret < 0) {
+      fprintf(stderr, "Failed to launch target: %s\n", strerror(errno));
+      goto fail;
+    } else if (ret > 0) {
+      fprintf(stderr, "SymSan launch error %d\n", ret);
+      goto fail;
+    }
+    if (input_fd != __staged.fd()) close(input_fd);
+    input_fd = -1;
+
+    std::vector<symsan::input_t> inputs;
+    inputs.push_back({(uint8_t*)input_buf, input_size});
+    if (__parser->restart(inputs) != 0) {
+      fprintf(stderr, "Failed to restart parser\n");
+      goto fail;
+    }
+
+    pipe_msg msg;
+    gep_msg gmsg;
+    dfsan_label_info *info;
+    size_t msg_size;
+    memcmp_msg *mmsg = nullptr;
+    table_msg *tmsg = nullptr;
+
+    while (symsan_read_event(&msg, sizeof(msg), 0) > 0) {
+      // Every message type, not just the ones that parse: this is the "did the
+      // target trace anything at all" number, and a sweep that cannot separate
+      // that from "the parser accepted everything" is unreadable.  #115 is an
+      // open bug where afltest reads zero events under a concurrent lit run,
+      // which without this line a sweep would report as a clean result.
+      __stats.events++;
+      // solve constraints
+      switch (msg.msg_type) {
+        case cond_type:
+          __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr,
+                       msg.id);
+          break;
+        case gep_type:
+          if (symsan_read_event(&gmsg, sizeof(gmsg), 0) != sizeof(gmsg)) {
+            fprintf(stderr, "Failed to receive gep msg: %s\n", strerror(errno));
+            break;
+          }
+          // double check
+          if (msg.label != gmsg.index_label) {
+            fprintf(stderr, "Incorrect gep msg: %d vs %d\n", msg.label, gmsg.index_label);
+            break;
+          }
+          __handle_gep(gmsg.ptr_label, gmsg.ptr, gmsg.index_label, gmsg.index,
+                       gmsg.num_elems, gmsg.elem_size, gmsg.current_offset, (void*)msg.addr);
+          break;
+        case memcmp_type:
+          if (msg.label == 0 || msg.label >= MAX_LABEL) {
+            fprintf(stderr, "Invalid memcmp label: %d\n", msg.label);
+            break;
+          }
+          info = get_label_info(msg.label);
+          // if both operands are symbolic, no content to be read
+          if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
+            break;
+          msg_size = sizeof(memcmp_msg) + msg.result;
+          mmsg = (memcmp_msg*)malloc(msg_size);
+          if (symsan_read_event(mmsg, msg_size, 0) != msg_size) {
+            fprintf(stderr, "Failed to receive memcmp msg: %s\n", strerror(errno));
+            free(mmsg);
+            break;
+          }
+          // double check
+          if (msg.label != mmsg->label) {
+            fprintf(stderr, "Incorrect memcmp msg: %d vs %d\n", msg.label, mmsg->label);
+            free(mmsg);
+            break;
+          }
+          // save the content
+          __parser->record_memcmp(msg.label, mmsg->content, msg.result);
+          free(mmsg);
+          break;
+        case table_type:
+          // always carries a payload, so drain it before validating anything
+          msg_size = sizeof(table_msg) + msg.result;
+          tmsg = (table_msg*)malloc(msg_size);
+          if (symsan_read_event(tmsg, msg_size, 0) != msg_size) {
+            fprintf(stderr, "Failed to receive table msg: %s\n", strerror(errno));
+            free(tmsg);
+            break;
+          }
+          // double check
+          if (tmsg->num_elems * tmsg->elem_size != msg.result) {
+            fprintf(stderr, "Incorrect table msg: %lu x %lu vs %lu\n",
+                    tmsg->num_elems, tmsg->elem_size, msg.result);
+            free(tmsg);
+            break;
+          }
+          // save the content
+          __parser->record_table(tmsg->ptr, tmsg->content, msg.result);
+          free(tmsg);
+          break;
+        case add_constraint_type:
+          __parser->add_constraints(msg.label, msg.result);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  munmap(input_buf, input_size);
+  input_buf = nullptr;
+  return 0;
+
+fail:
+  munmap(input_buf, input_size);
+  input_buf = nullptr;
+  if (input_fd != -1 && input_fd != __staged.fd()) close(input_fd);
+  return -1;
+}
+
 int main(int argc, char* const argv[]) {
 
   int optind = 1;
@@ -230,16 +515,28 @@ int main(int argc, char* const argv[]) {
     optind = 3;
   }
 
-  if (argc - optind != 2) {
-    fprintf(stderr, "Usage: %s [--dump-constraints <dir>] target input\n", argv[0]);
+  if (argc - optind < 2) {
+    fprintf(stderr, "Usage: %s [--dump-constraints <dir>] target input [input...]\n",
+            argv[0]);
     exit(1);
   }
 
   char *program = argv[optind];
-  char *input = argv[optind + 1];
+  const int first_input = optind + 1;
+
+  // A target that cannot be exec'd is not an error anywhere below: the launcher
+  // forks, execv fails in the child, and every read comes back empty -- so the
+  // run reports zero events and exits 0, which over a corpus reads exactly like
+  // a target that parses cleanly.  Say so here instead.
+  if (access(program, X_OK) != 0) {
+    fprintf(stderr, "Cannot execute %s: %s\n", program, strerror(errno));
+    exit(1);
+  }
 
   int is_stdin = 0;
   int debug = 0;
+  __parse_only = getenv("SYMSAN_PARSE_ONLY") != nullptr;
+  __verbose = getenv("SYMSAN_VERBOSE") != nullptr;
   char *options = getenv("TAINT_OPTIONS");
   if (options) {
     // setup output dir
@@ -275,30 +572,6 @@ int main(int argc, char* const argv[]) {
   // enable nested solving in the parser?
   bool nested = getenv("SYMSAN_USE_NESTED") != nullptr;
 
-  // load input file
-  struct stat st;
-  int input_fd = open(input, O_RDONLY);
-  if (input_fd == -1) {
-    fprintf(stderr, "Failed to open input file: %s\n", strerror(errno));
-    exit(1);
-  }
-  fstat(input_fd, &st);
-  input_size = st.st_size;
-  input_buf = (char *)mmap(NULL, input_size, PROT_READ, MAP_PRIVATE, input_fd, 0);
-  if (input_buf == (void *)-1) {
-    fprintf(stderr, "Failed to map input file: %s\n", strerror(errno));
-    exit(1);
-  }
-
-  // allocate the output buffer.  RGD solvers write the full (possibly grown)
-  // input; give some headroom for INSERT-style solutions.
-  __output_buf_size = input_size + 4096;
-  __output_buf = (uint8_t *)malloc(__output_buf_size);
-  if (!__output_buf) {
-    fprintf(stderr, "Failed to alloc output buffer\n");
-    exit(1);
-  }
-
   // setup launcher
   void *shm_base = symsan_init(program, uniontable_size);
   if (shm_base == (void *)-1) {
@@ -307,129 +580,73 @@ int main(int argc, char* const argv[]) {
   }
   symsan::set_label_info_base(shm_base, uniontable_size);
 
-  if (symsan_set_input(is_stdin ? "stdin" : input) != 0) {
-    fprintf(stderr, "Failed to set input\n");
-    exit(1);
-  }
-
-  char* args[3];
-  args[0] = program;
-  args[1] = input;
-  args[2] = NULL;
-  if (symsan_set_args(2, args) != 0) {
-    fprintf(stderr, "Failed to set args\n");
-    exit(1);
-  }
-
   symsan_set_debug(debug);
   symsan_set_bounds_check(1);
 
-  // launch the target
-  int ret = symsan_run(input_fd);
-  if (ret < 0) {
-    fprintf(stderr, "Failed to launch target: %s\n", strerror(errno));
-    exit(1);
-  } else if (ret > 0) {
-    fprintf(stderr, "SymSan launch error %d\n", ret);
-    exit(1);
-  }
-  close(input_fd);
-
-  // setup the RGD parser and the solver chain (matching driver/aflpp)
+  // setup the RGD parser and the solver chain (matching driver/aflpp).  One
+  // parser for the whole corpus: restart() per input is what it is for.
   __parser = new rgd::RGDAstParser(shm_base, uniontable_size, nested);
-  std::vector<symsan::input_t> inputs;
-  inputs.push_back({(uint8_t*)input_buf, input_size});
-  if (__parser->restart(inputs) != 0) {
-    fprintf(stderr, "Failed to restart parser\n");
-    exit(1);
+
+  // the simple i2s solver first, unless it is the thing being measured out.
+  // Skipped entirely in parse-only mode -- building a JIT or a z3 context we
+  // will never call is the cost that mode exists to avoid.
+  if (!__parse_only) {
+    if (!getenv("SYMSAN_NO_I2S"))
+      __solvers.emplace_back(std::make_shared<rgd::I2SSolver>());
+    if (getenv("SYMSAN_USE_JIGSAW"))
+      __solvers.emplace_back(std::make_shared<rgd::JITSolver>());
+    if (getenv("SYMSAN_USE_Z3"))
+      __solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
   }
 
-  // the simple i2s solver first, unless it is the thing being measured out
-  if (!getenv("SYMSAN_NO_I2S"))
-    __solvers.emplace_back(std::make_shared<rgd::I2SSolver>());
-  if (getenv("SYMSAN_USE_JIGSAW"))
-    __solvers.emplace_back(std::make_shared<rgd::JITSolver>());
-  if (getenv("SYMSAN_USE_Z3"))
-    __solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
-
-  pipe_msg msg;
-  gep_msg gmsg;
-  dfsan_label_info *info;
-  size_t msg_size;
-  memcmp_msg *mmsg = nullptr;
-  table_msg *tmsg = nullptr;
-
-  while (symsan_read_event(&msg, sizeof(msg), 0) > 0) {
-    // solve constraints
-    switch (msg.msg_type) {
-      case cond_type:
-        __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, (void*)msg.addr);
-        break;
-      case gep_type:
-        if (symsan_read_event(&gmsg, sizeof(gmsg), 0) != sizeof(gmsg)) {
-          fprintf(stderr, "Failed to receive gep msg: %s\n", strerror(errno));
-          break;
-        }
-        // double check
-        if (msg.label != gmsg.index_label) {
-          fprintf(stderr, "Incorrect gep msg: %d vs %d\n", msg.label, gmsg.index_label);
-          break;
-        }
-        __handle_gep(gmsg.ptr_label, gmsg.ptr, gmsg.index_label, gmsg.index,
-                     gmsg.num_elems, gmsg.elem_size, gmsg.current_offset, (void*)msg.addr);
-        break;
-      case memcmp_type:
-        if (msg.label == 0 || msg.label >= MAX_LABEL) {
-          fprintf(stderr, "Invalid memcmp label: %d\n", msg.label);
-          break;
-        }
-        info = get_label_info(msg.label);
-        // if both operands are symbolic, no content to be read
-        if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
-          break;
-        msg_size = sizeof(memcmp_msg) + msg.result;
-        mmsg = (memcmp_msg*)malloc(msg_size);
-        if (symsan_read_event(mmsg, msg_size, 0) != msg_size) {
-          fprintf(stderr, "Failed to receive memcmp msg: %s\n", strerror(errno));
-          free(mmsg);
-          break;
-        }
-        // double check
-        if (msg.label != mmsg->label) {
-          fprintf(stderr, "Incorrect memcmp msg: %d vs %d\n", msg.label, mmsg->label);
-          free(mmsg);
-          break;
-        }
-        // save the content
-        __parser->record_memcmp(msg.label, mmsg->content, msg.result);
-        free(mmsg);
-        break;
-      case table_type:
-        // always carries a payload, so drain it before validating anything
-        msg_size = sizeof(table_msg) + msg.result;
-        tmsg = (table_msg*)malloc(msg_size);
-        if (symsan_read_event(tmsg, msg_size, 0) != msg_size) {
-          fprintf(stderr, "Failed to receive table msg: %s\n", strerror(errno));
-          free(tmsg);
-          break;
-        }
-        // double check
-        if (tmsg->num_elems * tmsg->elem_size != msg.result) {
-          fprintf(stderr, "Incorrect table msg: %lu x %lu vs %lu\n",
-                  tmsg->num_elems, tmsg->elem_size, msg.result);
-          free(tmsg);
-          break;
-        }
-        // save the content
-        __parser->record_table(tmsg->ptr, tmsg->content, msg.result);
-        free(tmsg);
-        break;
-      case add_constraint_type:
-        __parser->add_constraints(msg.label, msg.result);
-        break;
-      default:
-        break;
+  // More than one input: serve them all from one fork server, which skips
+  // execv, dynamic linking and the shadow and union table setup per seed.  That
+  // needs a single fixed input path (see sweep.h), so it is only on for a
+  // corpus -- a lone input keeps running where it lies, which is what every
+  // existing caller and lit test expects.  A stdin target is excluded because
+  // its fd has to be wired up per run, which cannot be done from out here.
+  const bool many = (argc - first_input > 1);
+  if (many && !is_stdin) {
+    if (!__staged.open_staging("afltest")) {
+      fprintf(stderr, "Failed to create staging file: %s\n", strerror(errno));
+      exit(1);
     }
+    char *path = (char *)__staged.path();
+
+    char *args[3];
+    args[0] = program;
+    args[1] = path;
+    args[2] = NULL;
+    if (symsan_set_input(path) != 0 || symsan_set_args(2, args) != 0) {
+      fprintf(stderr, "Failed to set input\n");
+      exit(1);
+    }
+    // A no-op against a target whose backend has no server: the launcher falls
+    // back to exec per run, which still reads the staged file.
+    symsan_set_forkserver(1);
+  }
+
+  const uint32_t session_base = __session_id;
+  int failures = 0;
+  for (int i = first_input; i < argc; i++) {
+    if (many) {
+      // Generated inputs are named id-<instance>-<session>-<index>, so give each
+      // seed its own session: without it a corpus run's output is one flat
+      // sequence with nothing saying which seed produced what.  Counted from
+      // whatever TAINT_OPTIONS asked for, so setting session_id still means
+      // something.  __current_index stays monotonic, so nothing collides either
+      // way.
+      __session_id = session_base + (uint32_t)(i - first_input);
+      // per input, so that a corpus run says as much as the same seeds run one
+      // at a time; a consumer wanting the total can sum the blocks
+      __stats = symsan::sweep::parse_stats();
+      if (__parse_only) printf("PARSE-INPUT %s\n", argv[i]);
+    }
+    if (run_one(program, argv[i], is_stdin) != 0) {
+      failures++;
+      continue;
+    }
+    if (__parse_only) __stats.report();
   }
 
   // destroy the solvers (and their z3 solver members) here, while the global
@@ -438,5 +655,6 @@ int main(int argc, char* const argv[]) {
   __solvers.clear();
 
   symsan_destroy();
-  exit(0);
+  exit(failures ? 1 : 0);
 }
+
