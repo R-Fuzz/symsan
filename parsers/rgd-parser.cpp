@@ -30,6 +30,33 @@ using namespace rgd;
 //   } while (0)
 #endif
 
+// REJECT: the WARNF prose, plus a short stable bucket key for the same event.
+// The prose carries labels and addresses and is what you read when staring at
+// one branch; the key must not, so that two occurrences of one cause land in
+// one histogram bucket.  See ASTParser::last_error (include/parse.h).
+#define REJECT(_reason, _str...) do { set_error(_reason); WARNF(_str); } while (0)
+
+// REJECT_IF_UNSET: for an outer layer reporting that an *inner* parse failed.
+// The inner site already named the cause and is the more specific bucket, so
+// this only fills in when nothing did.  Innermost wins -- otherwise a wrapper
+// message like "failed to construct task for clause" would overwrite
+// "unsupported op strlen (77)" on every single occurrence, which is exactly the
+// finding it is there to surface.
+#define REJECT_IF_UNSET(_reason, _str...) do {                                 \
+    if (last_error().empty()) set_error(_reason);                              \
+    WARNF(_str);                                                               \
+  } while (0)
+
+// REJECT_OP: same, keyed by opcode.  At the two catch-all sites the op *is* the
+// finding, and it is bounded (< LastOp), so it belongs in the key.
+#define REJECT_OP(_prefix, _op, _str...) do {                                  \
+    char _key[64];                                                             \
+    snprintf(_key, sizeof(_key), _prefix " %s (%u)", dfsan_op_name(_op),       \
+             (unsigned)((_op) & 0xff));                                        \
+    set_error(_key);                                                           \
+    WARNF(_str);                                                               \
+  } while (0)
+
 #if defined(__GNUC__)
 static inline bool (likely)(bool x) { return __builtin_expect((x), true); }
 static inline bool (unlikely)(bool x) { return __builtin_expect((x), false); }
@@ -164,6 +191,75 @@ static const std::unordered_map<unsigned, unsigned> STR_OP_MAP {
   {__dfsan::fsuffixof, rgd::SuffixOf},
   {__dfsan::flength,   rgd::StrLength},
 };
+
+// The dfsan opcode as a short name, for the rejection reasons.  Only the low
+// byte is looked up: the high byte carries the icmp predicate and the FP
+// rounding mode, which would otherwise split one cause across a dozen buckets.
+//
+// Not folded into OP_MAP above, which is a *supported*-op table -- these two
+// callers are the catch-alls for the ops that are not in it.  The LLVM half is
+// built from Instruction.def exactly the way runtime/dfsan/dfsan.h builds the
+// enum, so the two cannot drift, and a duplicate opcode would fail to compile
+// rather than silently shadow.
+static const char *dfsan_op_name(uint16_t op) {
+  switch (op & 0xff) {
+    case __dfsan::Not: return "not";
+    case __dfsan::Neg: return "neg";
+#define HANDLE_BINARY_INST(num, opcode, Class) case num: return #opcode;
+#define HANDLE_MEMORY_INST(num, opcode, Class) case num: return #opcode;
+#define HANDLE_CAST_INST(num, opcode, Class) case num: return #opcode;
+#define HANDLE_OTHER_INST(num, opcode, Class) case num: return #opcode;
+#include "llvm/IR/Instruction.def"
+#undef HANDLE_BINARY_INST
+#undef HANDLE_MEMORY_INST
+#undef HANDLE_CAST_INST
+#undef HANDLE_OTHER_INST
+    // self-defined (dfsan.h 70-110).  Free and Arg never reach the parser, but
+    // naming them costs a line and means an unexpected one reads as itself.
+    case __dfsan::Free:         return "free";
+    case __dfsan::Extract:      return "extract";
+    case __dfsan::Concat:       return "concat";
+    case __dfsan::Arg:          return "arg";
+    case __dfsan::fmemcmp:      return "memcmp";
+    case __dfsan::fsize:        return "fsize";
+    case __dfsan::fatoi:        return "atoi";
+    case __dfsan::fstrlen:      return "strlen";
+    case __dfsan::fstrchr:      return "strchr";
+    case __dfsan::fstrrchr:     return "strrchr";
+    case __dfsan::fstrstr:      return "strstr";
+    case __dfsan::fstrpbrk:     return "strpbrk";
+    case __dfsan::fstr_off:     return "str_off";
+    case __dfsan::fsubstr:      return "substr";
+    case __dfsan::fstrcat:      return "strcat";
+    case __dfsan::fstrcmp:      return "strcmp";
+    case __dfsan::fprefixof:    return "prefixof";
+    case __dfsan::fsuffixof:    return "suffixof";
+    case __dfsan::flength:      return "length";
+    case __dfsan::fp_neg:       return "fneg";
+    case __dfsan::fp_fabs:      return "fabs";
+    case __dfsan::fp_sqrt:      return "sqrt";
+    case __dfsan::fp_round:     return "fround";
+    case __dfsan::fp_min:       return "fmin";
+    case __dfsan::fp_max:       return "fmax";
+    case __dfsan::fp_copysign:  return "copysign";
+    case __dfsan::fp_is_nan:    return "isnan";
+    case __dfsan::fp_is_inf:    return "isinf";
+    case __dfsan::fp_is_finite: return "isfinite";
+    case __dfsan::fp_signbit:   return "signbit";
+    case __dfsan::fp_lrint:     return "lrint";
+    case __dfsan::fp_exp:       return "exp";
+    case __dfsan::fp_exp2:      return "exp2";
+    case __dfsan::fp_log:       return "log";
+    case __dfsan::fp_log2:      return "log2";
+    case __dfsan::fp_log10:     return "log10";
+    case __dfsan::fp_log1p:     return "log1p";
+    case __dfsan::fp_pow:       return "pow";
+    case __dfsan::tlookup:      return "tlookup";
+    case __dfsan::bitreverse:   return "bitreverse";
+    case __dfsan::WideConst:    return "wideconst";
+    default:                    return "unknown";
+  }
+}
 
 // True when the concrete side of a string op is packed from memcmp_cache_
 // rather than read out of op1/op2.  These are the ops backend/fastgen.cpp
@@ -329,7 +425,7 @@ bool RGDAstParser::pack_const_bytes(const uint8_t *content, uint32_t size,
   // Fail the parse loudly instead of truncating.  (dfsan_label_info::size is
   // itself only 16 bits and carries its own FIXME, see runtime/dfsan/dfsan.h.)
   if (unlikely(size > UINT16_MAX / 8)) {
-    WARNF("constant content too wide: %u bytes\n", size);
+    REJECT("constant content too wide", "constant content too wide: %u bytes\n", size);
     return false;
   }
   node->set_kind(rgd::Constant);
@@ -396,18 +492,20 @@ bool RGDAstParser::add_str_operand(dfsan_label label, dfsan_label operand,
   if (unlikely(!str_op_has_content(get_label_info(label)->op))) {
     // a caller wired an op fastgen.cpp does not ship bytes for to this path;
     // memcmp_cache_ would simply miss below, but say which mistake it was
-    WARNF("string op %u carries no content for its concrete operand\n", label);
+    REJECT("string op ships no content",
+           "string op %u carries no content for its concrete operand\n", label);
     return false;
   }
   if (unlikely(content_size == 0)) {
     // both sides symbolic (fastgen.cpp sends nothing then), or a concrete side
     // whose length the runtime could not determine
-    WARNF("string op %u has a concrete operand with no length\n", label);
+    REJECT("string operand has no length",
+           "string op %u has a concrete operand with no length\n", label);
     return false;
   }
   auto itr = memcmp_cache_.find(label);
   if (unlikely(itr == memcmp_cache_.end())) {
-    WARNF("string content not found for label %u\n", label);
+    REJECT("string content missing", "string content not found for label %u\n", label);
     return false;
   }
   return pack_const_bytes(itr->second.get(), content_size, child, constraint);
@@ -449,7 +547,7 @@ bool RGDAstParser::do_uta_str(dfsan_label label, dfsan_label_info *info,
 
   rgd::AstNode *c0 = ret->add_children();
   if (unlikely(c0 == nullptr)) {
-    WARNF("failed to add children\n");
+    REJECT("ast arena full", "failed to add children\n");
     return false;
   }
   rgd::AstNode *c1 = nullptr;
@@ -457,7 +555,7 @@ bool RGDAstParser::do_uta_str(dfsan_label label, dfsan_label_info *info,
   if (!unary) {
     c1 = ret->add_children();
     if (unlikely(c1 == nullptr)) {
-      WARNF("failed to add children\n");
+      REJECT("ast arena full", "failed to add children\n");
       return false;
     }
   }
@@ -467,7 +565,7 @@ bool RGDAstParser::do_uta_str(dfsan_label label, dfsan_label_info *info,
       // l1 is 0 by construction (dfsan_custom.cpp follows the fsize/fatoi
       // pattern to dodge the Alloca rejection), l2 is the content.
       if (unlikely(info->l2 < CONST_OFFSET)) {
-        WARNF("strlen over concrete content, label %u\n", label);
+        REJECT("concrete string operand", "strlen over concrete content, label %u\n", label);
         return false;
       }
       if (!do_uta_rel(info->l2, c0, constraint, visited)) return false;
@@ -518,7 +616,7 @@ bool RGDAstParser::do_uta_str(dfsan_label label, dfsan_label_info *info,
     case rgd::StrOff: {
       // l1 = the string op whose result was GEP'd, op2 = the signed byte offset
       if (unlikely(info->l1 < CONST_OFFSET)) {
-        WARNF("str_off over a concrete position, label %u\n", label);
+        REJECT("concrete string operand", "str_off over a concrete position, label %u\n", label);
         return false;
       }
       if (!do_uta_rel(info->l1, c0, constraint, visited)) return false;
@@ -532,7 +630,7 @@ bool RGDAstParser::do_uta_str(dfsan_label label, dfsan_label_info *info,
       // __taint_trace_memcmp, so a concrete l1 means the bytes are simply not
       // on the wire and there is nothing to build.
       if (unlikely(info->l1 < CONST_OFFSET)) {
-        WARNF("substr of a string with no content, label %u\n", label);
+        REJECT("concrete string operand", "substr of a string with no content, label %u\n", label);
         return false;
       }
       if (!do_uta_rel(info->l1, c0, constraint, visited)) return false;
@@ -552,7 +650,7 @@ bool RGDAstParser::do_uta_str(dfsan_label label, dfsan_label_info *info,
       // Unary.  No producer creates flength today (only solvers/z3-ts.cpp
       // consumes it), so this arm is defensive; keep it faithful anyway.
       if (unlikely(info->l1 < CONST_OFFSET)) {
-        WARNF("length of a concrete string, label %u\n", label);
+        REJECT("concrete string operand", "length of a concrete string, label %u\n", label);
         return false;
       }
       if (!do_uta_rel(info->l1, c0, constraint, visited)) return false;
@@ -560,7 +658,7 @@ bool RGDAstParser::do_uta_str(dfsan_label label, dfsan_label_info *info,
       break;
     }
     default:
-      WARNF("unhandled string kind %u\n", kind);
+      REJECT("unhandled string kind", "unhandled string kind %u\n", kind);
       return false;
   }
 
@@ -586,7 +684,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
 
   // needed for recursion?
   if (unlikely(label < CONST_OFFSET || label == __dfsan::kInitializingLabel)) {
-    WARNF("invalid label: %d\n", label);
+    REJECT("invalid label", "invalid label: %d\n", label);
     return false;
   }
 
@@ -656,7 +754,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   } else if (info->op == __dfsan::fmemcmp) {
     rgd::AstNode *s1 = ret->add_children();
     if (unlikely(s1 == nullptr)) {
-      WARNF("failed to add children\n");
+      REJECT("ast arena full", "failed to add children\n");
       return false;
     }
     if (info->l1 >= CONST_OFFSET) {
@@ -669,7 +767,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       // use constant args to pass the array
       auto itr = memcmp_cache_.find(label);
       if (unlikely(itr == memcmp_cache_.end())) {
-        WARNF("memcmp target not found for label %u\n", label);
+        REJECT("memcmp target missing", "memcmp target not found for label %u\n", label);
         return false;
       }
       if (!pack_const_bytes(itr->second.get(), info->size, s1, constraint)) {
@@ -678,7 +776,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     }
     rgd::AstNode *s2 = ret->add_children();
     if (unlikely(s2 == nullptr)) {
-      WARNF("failed to add children\n");
+      REJECT("ast arena full", "failed to add children\n");
       return false;
     }
     if (!do_uta_rel(info->l2, s2, constraint, visited)) {
@@ -706,25 +804,27 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     // consumer.  jigsaw and z3 decline this kind.
     auto itr = table_cache_.find(info->op1.i);
     if (unlikely(itr == table_cache_.end())) {
-      WARNF("table contents not found for %#lx (label %u)\n", info->op1.i, label);
+      REJECT("table contents missing",
+             "table contents not found for %#lx (label %u)\n", info->op1.i, label);
       return false;
     }
     uint64_t num_elems = info->op2.i;
     size_t tbl_size = itr->second.size;
     if (unlikely(info->size == 0 || info->size % 8 != 0 ||
                  num_elems * (info->size / 8) != tbl_size)) {
-      WARNF("table geometry mismatch for label %u: %lu x %u vs %lu bytes\n",
+      REJECT("table geometry mismatch",
+             "table geometry mismatch for label %u: %lu x %u vs %lu bytes\n",
             label, num_elems, info->size / 8, tbl_size);
       return false;
     }
     rgd::AstNode *index = ret->add_children();
     if (unlikely(index == nullptr)) {
-      WARNF("failed to add children\n");
+      REJECT("ast arena full", "failed to add children\n");
       return false;
     }
     if (unlikely(info->l1 < CONST_OFFSET)) {
       // a concrete index would have left the load concrete in the first place
-      WARNF("table lookup with concrete index, label %u\n", label);
+      REJECT("concrete tlookup index", "table lookup with concrete index, label %u\n", label);
       return false;
     }
     if (!do_uta_rel(info->l1, index, constraint, visited)) {
@@ -762,7 +862,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     return true;
   } else if (info->op == __dfsan::fatoi) {
     if (unlikely(info->l1 != 0 || info->l2 < CONST_OFFSET)) {
-      WARNF("invalid atoi label %u\n", label);
+      REJECT("invalid atoi label", "invalid atoi label %u\n", label);
       return false;
     }
     dfsan_label_info *src = get_label_info(info->l2);
@@ -775,7 +875,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     } else if (src->op == 0) {
       byte = src;
     } else {
-      WARNF("invalid atoi source label %u, op = %u\n", info->l2, src->op);
+      REJECT("invalid atoi source", "invalid atoi source label %u, op = %u\n", info->l2, src->op);
       return false;
     }
     visited.insert(info->l2);
@@ -796,7 +896,8 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_kind(rgd::Read);
     auto itr = constraint->local_map.find(offset); // FIXME: support input_id
     if (itr != constraint->local_map.end()) {
-      WARNF("atoi inputs should not be involved in other constraints\n");
+      REJECT("atoi input reused elsewhere",
+             "atoi inputs should not be involved in other constraints\n");
       return false;
     }
     uint32_t hash = 0;
@@ -823,7 +924,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     return true;
   } else if (info->op == __dfsan::fsize) {
     // do nothing now
-    WARNF("fsize not supported yet\n");
+    REJECT("fsize unsupported", "fsize not supported yet\n");
     return false;
   } else if (info->op == __dfsan::PtrToInt) {
     // PtrToInt is a string op only when its operand is one: the position a
@@ -844,7 +945,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       constraint->ops[rgd::StrPtrToInt] = true;
       rgd::AstNode *c0 = ret->add_children();
       if (unlikely(c0 == nullptr)) {
-        WARNF("failed to add children\n");
+        REJECT("ast arena full", "failed to add children\n");
         return false;
       }
       if (!do_uta_rel(info->l1, c0, constraint, visited)) {
@@ -876,7 +977,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   uint16_t lookup_op = is_fp_arith_rm ? op_lo : info->op;
   auto op_itr = OP_MAP.find(lookup_op);
   if (op_itr == OP_MAP.end()) {
-    WARNF("invalid op: %u\n", info->op);
+    REJECT_OP("unsupported op", info->op, "invalid op: %u\n", info->op);
     return false;
   }
   ret->set_kind(op_itr->second.first);
@@ -896,7 +997,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
   // now we visit the children
   rgd::AstNode *left = ret->add_children();
   if (unlikely(left == nullptr)) {
-    WARNF("failed to add children\n");
+    REJECT("ast arena full", "failed to add children\n");
     return false;
   }
   if (likely(needs_concretization != 1) && (info->l1 >= CONST_OFFSET)) {
@@ -908,7 +1009,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     if (unlikely(needs_concretization)) {
       if (unlikely(!rgd::isRelationalKind(ret->kind()) &&
                    !rgd::isFPRelationalKind(ret->kind()))) {
-        WARNF("invalid kind for concretization %u\n", ret->kind());
+        REJECT("invalid concretization kind", "invalid kind for concretization %u\n", ret->kind());
         return false;
       }
     }
@@ -921,7 +1022,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     // of the other operand
     if (info->op == __dfsan::Concat) {
       if (unlikely(info->l2 == 0)) {
-        WARNF("invalid concat node %u\n", info->l2);
+        REJECT("invalid concat node", "invalid concat node %u\n", info->l2);
         return false;
       }
       size -= get_label_info(info->l2)->size;
@@ -980,7 +1081,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
 
   rgd::AstNode *right = ret->add_children();
   if (unlikely(right == nullptr)) {
-    WARNF("failed to add children\n");
+    REJECT("ast arena full", "failed to add children\n");
     return false;
   }
   if (likely(needs_concretization != 2) && (info->l2 >= CONST_OFFSET)) {
@@ -992,7 +1093,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     if (unlikely(needs_concretization)) {
       if (unlikely(!rgd::isRelationalKind(ret->kind()) &&
                    !rgd::isFPRelationalKind(ret->kind()))) {
-        WARNF("invalid kind for concretization %u\n", ret->kind());
+        REJECT("invalid concretization kind", "invalid kind for concretization %u\n", ret->kind());
         return false;
       }
     }
@@ -1005,7 +1106,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     // of the other operand
     if (info->op == __dfsan::Concat) {
       if (unlikely(info->l1 == 0)) {
-        WARNF("invalid concat node %u\n", info->l1);
+        REJECT("invalid concat node", "invalid concat node %u\n", info->l1);
         return false;
       }
       size -= get_label_info(info->l1)->size;
@@ -1063,18 +1164,20 @@ RGDAstParser::constraint_t RGDAstParser::parse_constraint(dfsan_label label) {
   if (unlikely(((info->op & 0xff) != __dfsan::ICmp) &&
                ((info->op & 0xff) != __dfsan::FCmp) &&
                (info->op != __dfsan::fmemcmp))) {
-    WARNF("invalid root node %u, non-comparison root op: %u\n", label, info->op);
+    REJECT("non-comparison root",
+           "invalid root node %u, non-comparison root op: %u\n", label, info->op);
     return nullptr;
   }
 
   // retrieve the ast size
   if (unlikely(ast_size_cache.size() <= label)) {
-    WARNF("invalid label %u, larger than ast_size_cache: %lu\n", label, ast_size_cache.size());
+    REJECT("label beyond ast size cache",
+           "invalid label %u, larger than ast_size_cache: %lu\n", label, ast_size_cache.size());
     return nullptr;
   }
   auto size = ast_size_cache.at(label);
   if (unlikely(size == 0)) {
-    WARNF("invalid label %u, ast_size_cache is 0\n", label);
+    REJECT("ast size zero", "invalid label %u, ast_size_cache is 0\n", label);
     return nullptr;
   }
   std::unordered_set<dfsan_label> visited;
@@ -1100,10 +1203,10 @@ RGDAstParser::constraint_t RGDAstParser::parse_constraint(dfsan_label label) {
 #endif
     return constraint;
   } catch (std::bad_alloc &e) {
-    WARNF("failed to allocate memory for constraint\n");
+    REJECT("out of memory", "failed to allocate memory for constraint\n");
     return nullptr;
   } catch (std::out_of_range &e) {
-    WARNF("AST %u goes out of range at %s\n", label, e.what());
+    REJECT("ast out of range", "AST %u goes out of range at %s\n", label, e.what());
     return nullptr;
   }
 }
@@ -1131,6 +1234,10 @@ task_t RGDAstParser::construct_task(const clause_t &clause) {
     task->finalize();
     return task;
   }
+  // every constraint in the clause failed to parse.  Each parse_constraint()
+  // above already named its own cause and that is the more useful bucket, so
+  // only speak up if the clause was empty to begin with.
+  if (last_error().empty()) set_error("empty clause");
   return nullptr;
 }
 
@@ -1194,7 +1301,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
           // create a child node before going down
           root_node = root_node->add_children();
           if (unlikely(root_node == nullptr)) {
-            WARNF("failed to add children\n");
+            REJECT("ast arena full", "failed to add children\n");
             return INVALID_NODE;
           }
         }
@@ -1210,7 +1317,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
         root = zsl2;
         root_node = node_stack.back()->add_children();
         if (unlikely(root_node == nullptr)) {
-          WARNF("failed to add children\n");
+          REJECT("ast arena full", "failed to add children\n");
           return INVALID_NODE;
         }
       } else {
@@ -1222,11 +1329,11 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
         if (info->op == __dfsan::Not) {
           DEBUGF("simplify not: %d, %d\n", info->l2, info->size);
           if (unlikely(node->children_size() != 1)) {
-            WARNF("child node size != 1\n");
+            REJECT("bool child width", "child node size != 1\n");
             return INVALID_NODE;
           }
           if (unlikely(info->size != 1)) {
-            WARNF("info size != 1\n");
+            REJECT("bool node width", "info size != 1\n");
             return INVALID_NODE;
           }
           rgd::AstNode *child = node->mutable_children(0);
@@ -1242,11 +1349,11 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
           // if And apprears, it must be LAnd, try to simplify
           DEBUGF("simplify land: %d LAnd %d, %d\n", info->l1, info->l2, info->size);
           if (unlikely(node->children_size() == 0)) {
-            WARNF("child node size == 0\n");
+            REJECT("empty child", "child node size == 0\n");
             return INVALID_NODE;
           }
           if (unlikely(info->size != 1)) {
-            WARNF("info size != 1\n");
+            REJECT("bool node width", "info size != 1\n");
             return INVALID_NODE;
           }
           uint32_t child = 0;
@@ -1269,21 +1376,21 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
               node->clear_children();
             } else if (info->op1.i == 1) { // 1 LAnd x = x
               if (unlikely(right == nullptr)) {
-                WARNF("right child is null\n");
+                REJECT("null child", "right child is null\n");
                 return INVALID_NODE;
               }
               node->CopyFrom(*right);
             } else {
-              WARNF("invalid constant %ld\n", info->op1.i);
+              REJECT("invalid constant", "invalid constant %ld\n", info->op1.i);
               return INVALID_NODE;
             }
           } else {
             if (unlikely(left == nullptr)) {
-              WARNF("left child is null\n");
+              REJECT("null child", "left child is null\n");
               return INVALID_NODE;
             }
             if (unlikely(right == nullptr)) {
-              WARNF("right child is null\n");
+              REJECT("null child", "right child is null\n");
               return INVALID_NODE;
             }
             // check for constant
@@ -1319,11 +1426,11 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
         } else if (info->op == __dfsan::Or) {
           DEBUGF("simplify lor: %d LOr %d, %d\n", info->l1, info->l2, info->size);
           if (unlikely(node->children_size() == 0)) {
-            WARNF("child node size == 0\n");
+            REJECT("empty child", "child node size == 0\n");
             return INVALID_NODE;
           }
           if (unlikely(info->size != 1)) {
-            WARNF("info size != 1\n");
+            REJECT("bool node width", "info size != 1\n");
             return INVALID_NODE;
           }
           uint32_t child = 0;
@@ -1346,21 +1453,21 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
               node->clear_children();
             } else if (info->op1.i == 0) { // 0 LOr x = x
               if (unlikely(right == nullptr)) {
-                WARNF("right child is null\n");
+                REJECT("null child", "right child is null\n");
                 return INVALID_NODE;
               }
               node->CopyFrom(*right);
             } else {
-              WARNF("invalid constant %ld\n", info->op1.i);
+              REJECT("invalid constant", "invalid constant %ld\n", info->op1.i);
               return INVALID_NODE;
             }
           } else {
             if (unlikely(left == nullptr)) {
-              WARNF("left child is null\n");
+              REJECT("null child", "left child is null\n");
               return INVALID_NODE;
             }
             if (unlikely(right == nullptr)) {
-              WARNF("right child is null\n");
+              REJECT("null child", "right child is null\n");
               return INVALID_NODE;
             }
             // check for constant
@@ -1395,11 +1502,11 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
         } else if (info->op == __dfsan::Xor) {
           DEBUGF("simplify lxor: %d LXOr %d, %d\n", info->l1, info->l2, info->size);
           if (unlikely(node->children_size() == 0)) {
-            WARNF("child node size == 0\n");
+            REJECT("empty child", "child node size == 0\n");
             return INVALID_NODE;
           }
           if (unlikely(info->size != 1)) {
-            WARNF("info size != 1\n");
+            REJECT("bool node width", "info size != 1\n");
             return INVALID_NODE;
           }
           uint32_t child = 0;
@@ -1417,7 +1524,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
           if (likely(info->l1 == 0)) {
             // lhs is a constant
             if (unlikely(right == nullptr)) {
-              WARNF("right child is null\n");
+              REJECT("null child", "right child is null\n");
               return INVALID_NODE;
             }
             if (unlikely(right->kind() == rgd::Bool)) {
@@ -1435,11 +1542,11 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
             }
           } else {
             if (unlikely(left == nullptr)) {
-              WARNF("left child is null\n");
+              REJECT("null child", "left child is null\n");
               return INVALID_NODE;
             }
             if (unlikely(right == nullptr)) {
-              WARNF("right child is null\n");
+              REJECT("null child", "right child is null\n");
               return INVALID_NODE;
             }
             // check for constant
@@ -1509,7 +1616,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
             } else {
               auto itr = OP_MAP.find(info->op);
               if (unlikely(itr == OP_MAP.end())) {
-                WARNF("invalid icmp op: %d\n", info->op);
+                REJECT("invalid icmp predicate", "invalid icmp op: %d\n", info->op);
                 return INVALID_NODE;
               }
               node->set_kind(itr->second.first);
@@ -1521,7 +1628,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
           } else if (node->children_size() == 1) {
             // one side has another icmp, must be simplifiable
             if (!is_rel_cmp(info->op, __dfsan::bveq) && !is_rel_cmp(info->op, __dfsan::bvneq)) {
-              WARNF("unexpected icmp: %d\n", info->op);
+              REJECT("unexpected icmp", "unexpected icmp: %d\n", info->op);
               // unexpected icmp, set as a constant boolean
               node->set_kind(rgd::Bool);
               node->set_boolvalue(eval_icmp(info->op, info->op1.i, info->op2.i));
@@ -1530,7 +1637,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
                 // nested icmp in the lhs
                 rgd::AstNode *left = node->mutable_children(0);
                 if (unlikely(left->bits() != 1)) {
-                  WARNF("nested icmp lhs bits != 1\n");
+                  REJECT("nested icmp lhs width", "nested icmp lhs bits != 1\n");
                   return INVALID_NODE;
                 }
                 if (likely(info->l2 == 0)) {
@@ -1549,7 +1656,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
                   }
                 } else {
                   // l2 != 0, bool icmp bool ?!
-                  WARNF("bool icmp bool ?!\n");
+                  REJECT("bool icmp bool", "bool icmp bool ?!\n");
                   node->set_kind(rgd::Bool);
                   node->set_boolvalue(0);
                   node->clear_children();
@@ -1558,7 +1665,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
                 // nested icmp in the rhs
                 rgd::AstNode *right = node->mutable_children(0);
                 if (unlikely(right->bits() != 1)) {
-                  WARNF("nested icmp rhs bits != 1\n");
+                  REJECT("nested icmp rhs width", "nested icmp rhs bits != 1\n");
                   return INVALID_NODE;
                 }
                 if (likely(info->l1 == 0)) {
@@ -1577,13 +1684,13 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
                   }
                 } else {
                   // l1 != 0, bool icmp bool ?!
-                  WARNF("bool icmp bool ?!\n");
+                  REJECT("bool icmp bool", "bool icmp bool ?!\n");
                   node->set_kind(rgd::Bool);
                   node->set_boolvalue(0);
                   node->clear_children();
                 }
               } else {
-                WARNF("icmp with child yet no nested icmp?!\n");
+                REJECT("icmp without nested icmp", "icmp with child yet no nested icmp?!\n");
                 return INVALID_NODE;
               }
             }
@@ -1633,7 +1740,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
             } else {
               auto itr = OP_MAP.find(info->op);
               if (unlikely(itr == OP_MAP.end())) {
-                WARNF("invalid fcmp op: %d\n", info->op);
+                REJECT("invalid fcmp predicate", "invalid fcmp op: %d\n", info->op);
                 return INVALID_NODE;
               }
               node->set_kind(itr->second.first);
@@ -1647,7 +1754,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
             uint32_t opw = 64;
             if (info->l1 != 0) opw = get_label_info(info->l1)->size;
             else if (info->l2 != 0) opw = get_label_info(info->l2)->size;
-            WARNF("unexpected nested cmp under fcmp: %d\n", info->op);
+            REJECT("nested cmp under fcmp", "unexpected nested cmp under fcmp: %d\n", info->op);
             node->set_kind(rgd::Bool);
             node->set_boolvalue(eval_fcmp(info->op >> 8, info->op1.i, info->op2.i, opw));
             node->clear_children();
@@ -1655,7 +1762,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
         } else if (info->op == __dfsan::fmemcmp) {
           // memcmp is also considered as a root node (relational comparison)
           if (unlikely(node->children_size() != 0)) {
-            WARNF("memcmp should not have additional icmp");
+            REJECT("nested icmp under memcmp", "memcmp should not have additional icmp");
             return INVALID_NODE;
           }
           node->set_bits(1); // XXX: treat memcmp as a boolean
@@ -1665,7 +1772,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
           subroots.insert(curr);
 #endif
         } else {
-          WARNF("Invalid AST node: op = %d\n", info->op);
+          REJECT_OP("invalid root op", info->op, "Invalid AST node: op = %d\n", info->op);
           return INVALID_NODE;
         }
 
@@ -1678,7 +1785,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
     }
   }
   } catch (std::out_of_range &e) {
-    WARNF("AST %u goes out of range at %s\n", label, e.what());
+    REJECT("ast out of range", "AST %u goes out of range at %s\n", label, e.what());
     return INVALID_NODE;
   }
 
@@ -1702,7 +1809,7 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
     // conservatively check validity of labels
     // so following parsing will not throw exceptions
     if (unlikely(info->l1 >= size_ || info->l2 >= size_)) {
-      WARNF("invalid label: %lu, l1=%u, l2=%u\n", i, info->l1, info->l2);
+      REJECT("invalid label", "invalid label: %lu, l1=%u, l2=%u\n", i, info->l1, info->l2);
       return false;
     }
     if (info->op == 0) {
@@ -1714,12 +1821,12 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
       uint32_t offset = info->op1.i;
       // skip if invalid
       if (unlikely(input_id >= inputs_cache.size())) {
-        WARNF("invalid input id: %u\n", input_id);
+        REJECT("invalid input id", "invalid input id: %u\n", input_id);
         return false;
       }
       size_t buf_size = inputs_cache[input_id].second;
       if (unlikely(offset >= buf_size)) {
-        WARNF("invalid input offset: %u >= %lu\n", offset, buf_size);
+        REJECT("invalid input offset", "invalid input offset: %u >= %lu\n", offset, buf_size);
         return false;
       }
       branch_to_inputs.emplace_back(input_dep_t(input_size_));
@@ -1741,12 +1848,13 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
       uint32_t offset = get_label_info(info->l1)->op1.i;
       // skip if invalid
       if (unlikely(input_id >= inputs_cache.size())) {
-        WARNF("invalid input id: %u\n", input_id);
+        REJECT("invalid input id", "invalid input id: %u\n", input_id);
         return false;
       }
       size_t buf_size = inputs_cache[input_id].second;
       if (unlikely(offset + info->l2 > buf_size)) {
-        WARNF("invalid input offset: %u + %u > %lu\n", offset, info->l2, buf_size);
+        REJECT("invalid input offset",
+               "invalid input offset: %u + %u > %lu\n", offset, info->l2, buf_size);
         return false;
       }
       branch_to_inputs.emplace_back(input_dep_t(input_size_));
@@ -1848,6 +1956,7 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
 
 bool RGDAstParser::note_deps(dfsan_label label, input_dep_t &acc) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
+    set_error("invalid label");
     return false;
   }
   // usually a no-op: the cache is filled linearly, so any earlier parse_cond()
@@ -1864,6 +1973,11 @@ bool RGDAstParser::note_deps(dfsan_label label, input_dep_t &acc) {
 
 RGDAstParser::expr_t RGDAstParser::get_root_expr(dfsan_label label) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
+    // label 0 lands here on every loop that exits by a concrete test: the
+    // runtime forwards the cond message anyway.  It is still a "no task", and
+    // the caller is what decides whether to count it -- see the loop-exit
+    // carve-out in driver/fgtest.cpp.
+    set_error("invalid label");
     return nullptr;
   }
 
@@ -1905,7 +2019,7 @@ int RGDAstParser::to_nnf(bool expected_r, rgd::AstNode *node) {
     if (node->kind() == rgd::LNot) {
       // double negation
       if (unlikely(node->children_size() != 1)) {
-        WARNF("LNot expect a singple child\n");
+        REJECT("malformed LNot", "LNot expect a singple child\n");
         return INVALID_NODE;
       }
       rgd::AstNode *child = node->mutable_children(0);
@@ -1916,7 +2030,7 @@ int RGDAstParser::to_nnf(bool expected_r, rgd::AstNode *node) {
     } else if (node->kind() == rgd::LAnd) {
       // De Morgan's law
       if (unlikely(node->children_size() != 2)) {
-        WARNF("LAnd expect two children\n");
+        REJECT("malformed LAnd", "LAnd expect two children\n");
         return INVALID_NODE;
       }
       node->set_kind(rgd::LOr);
@@ -1927,7 +2041,7 @@ int RGDAstParser::to_nnf(bool expected_r, rgd::AstNode *node) {
     } else if (node->kind() == rgd::LOr) {
       // De Morgan's law
       if (unlikely(node->children_size() != 2)) {
-        WARNF("LOr expect two children\n");
+        REJECT("malformed LOr", "LOr expect two children\n");
         return INVALID_NODE;
       }
       node->set_kind(rgd::LAnd);
@@ -1945,7 +2059,7 @@ int RGDAstParser::to_nnf(bool expected_r, rgd::AstNode *node) {
         // memcmp == 0 actually means s1 == s2
         // so we don't need to negate it
       } else {
-        WARNF("Unexpected node kind %d\n", node->kind());
+        REJECT("unexpected node kind", "Unexpected node kind %d\n", node->kind());
         return INVALID_NODE;
       }
     }
@@ -1953,7 +2067,7 @@ int RGDAstParser::to_nnf(bool expected_r, rgd::AstNode *node) {
     // we're looking for a true formula
     if (node->kind() == rgd::LNot) {
       if (unlikely(node->children_size() != 1)) {
-        WARNF("LNot expect a singple child\n");
+        REJECT("malformed LNot", "LNot expect a singple child\n");
         return INVALID_NODE;
       }
       rgd::AstNode *child = node->mutable_children(0);
@@ -2007,17 +2121,24 @@ void RGDAstParser::to_dnf(const rgd::AstNode *node, formula_t &formula) {
 
 int RGDAstParser::parse_cond(dfsan_label label, bool result, bool add_nested,
                              std::vector<uint64_t> &tasks) {
+  // a reason left over from the previous call would otherwise be attributed to
+  // this one, silently, on any path that comes back empty without setting one
+  clear_error();
 
   // given a condition, we want to parse them into a DNF form of
   // relational sub-expressions, where each sub-expression only contains
   // one relational operator at the root
   expr_t orig_root = get_root_expr(label);
   if (orig_root == nullptr) {
-    WARNF("failed to get root expr for label %u\n", label);
+    REJECT_IF_UNSET("no root expr", "failed to get root expr for label %u\n", label);
     return -1;
   } else if (orig_root->kind() == rgd::Bool) {
     // if the simplified formula is a boolean constant, nothing to do
     DEBUGF("cond simplified to be a constant\n");
+    // no task, and worth saying so: this is the single largest source of
+    // branches we never attempt on a real target, and roughly half of it is
+    // our own folding rather than the program's own dead test
+    set_error("cond folded to constant");
     return 0;
   }
 
@@ -2029,7 +2150,7 @@ int RGDAstParser::parse_cond(dfsan_label label, bool result, bool add_nested,
   // if we are looking for a false formula
   bool target_direction = !result;
   if (to_nnf(target_direction, root.get()) != 0) {
-    WARNF("failed to convert to NNF\n");
+    REJECT_IF_UNSET("nnf conversion failed", "failed to convert to NNF\n");
     return -1;
   }
 #if DEBUG
@@ -2045,7 +2166,7 @@ int RGDAstParser::parse_cond(dfsan_label label, bool result, bool add_nested,
     if (task != nullptr) {
       tasks.push_back(save_task(task));
     } else {
-      WARNF("failed to construct task for clause\n");
+      REJECT_IF_UNSET("no parsable constraint in clause", "failed to construct task for clause\n");
       continue; // skip the nested task if the current task is invalid
     }
 
@@ -2175,7 +2296,7 @@ bool RGDAstParser::save_constraint(expr_t expr, bool result) {
 #endif
         root = data_flow_deps.merge(root, input);
         if (unlikely(root == rgd::UnionFind::INVALID)) {
-          WARNF("invalid input to union find\n");
+          REJECT("union find failed", "invalid input to union find\n");
           return false;
         }
       }
@@ -2214,9 +2335,13 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
                             uint64_t num_elems, uint64_t elem_size,
                             int64_t current_offset, bool enum_index,
                             std::vector<uint64_t> &tasks) {
+  // see parse_cond: a stale reason would be read as this call's
+  clear_error();
+
   // check validity of the labels
   if (index_label < CONST_OFFSET || index_label == __dfsan::kInitializingLabel
       || index_label >= size_) {
+    set_error("invalid label");
     return -1;
   }
 
@@ -2228,20 +2353,26 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
 
   // sanity checks
   if (unlikely(ast_size_cache.size() <= index_label)) {
-    WARNF("invalid label %u, larger than ast_size_cache: %lu\n", index_label, ast_size_cache.size());
+    REJECT("label beyond ast size cache",
+           "invalid label %u, larger than ast_size_cache: %lu\n",
+           index_label, ast_size_cache.size());
     return -1;
   }
   if (unlikely(nested_cmp_cache.at(index_label) > 0)) {
-    WARNF("unexpected nested cmp in parse_gep for %u, skip\n", index_label);
+    REJECT("nested cmp in gep index",
+           "unexpected nested cmp in parse_gep for %u, skip\n", index_label);
     return -1;
   }
 
   auto ast_size = ast_size_cache.at(index_label);
   if (unlikely(ast_size == 0)) {
-    WARNF("invalid label %u, ast_size_cache is 0\n", index_label);
+    REJECT("ast size zero", "invalid label %u, ast_size_cache is 0\n", index_label);
     return 0;
   } else if (unlikely(ast_size > max_ast_size_)) {
     DEBUGF("skip large AST (%lu) in parse_gep for %u\n", ast_size, index_label);
+    // DEBUGF, so silent in a release build -- but it still costs a branch, and
+    // the sweep should be able to see how many
+    set_error("ast too large");
     return 0; // not an error, just skip
   }
 
@@ -2291,14 +2422,14 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
     auto index_node = partial_constraint->ast->add_children();
     try {
       if (!do_uta_rel(index_label, index_node, partial_constraint, visited)) {
-        WARNF("failed to parse index_label %u\n", index_label);
+        REJECT_IF_UNSET("gep index parse failed", "failed to parse index_label %u\n", index_label);
         return -1;
       }
     } catch (std::bad_alloc &e) {
-      WARNF("failed to allocate memory for gep constraint\n");
+      REJECT("out of memory", "failed to allocate memory for gep constraint\n");
       return -1;
     } catch (std::out_of_range &e) {
-      WARNF("AST %u goes out of range at %s\n", index_label, e.what());
+      REJECT("ast out of range", "AST %u goes out of range at %s\n", index_label, e.what());
       return -1;
     }
 
@@ -2316,7 +2447,7 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
   }
 
   if (unlikely(partial_constraint == nullptr)) {
-    WARNF("failed to parse index_label %u\n", index_label);
+    REJECT_IF_UNSET("gep index parse failed", "failed to parse index_label %u\n", index_label);
     return -1;
   }
 
@@ -2365,14 +2496,18 @@ int RGDAstParser::add_constraints(dfsan_label label, uint64_t result) {
     // only matters in nested mode
     return 0;
   }
+  // see parse_cond: a stale reason would be read as this call's
+  clear_error();
 
   // check validity of the label
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
+    set_error("invalid label");
     return -1;
   }
   // check validity of the result
   if (result != 1) {
-    WARNF("unexpected result in add_constraints: %lu\n", result);
+    REJECT("unexpected offset constraint result",
+           "unexpected result in add_constraints: %lu\n", result);
     return -1;
   }
 
@@ -2390,23 +2525,27 @@ int RGDAstParser::add_constraints(dfsan_label label, uint64_t result) {
   // other sanitity checks
   // 1. there shouldn't be any nested cmp
   if (nested_cmp_cache[label] > 0) {
-    WARNF("unexpected nested cmp in add_constraints for %u\n", label);
+    REJECT("nested cmp in offset constraint",
+           "unexpected nested cmp in add_constraints for %u\n", label);
     return -1;
   }
   dfsan_label_info *info = get_label_info(label);
   // 2. the label should be a bveq one
   if (!is_rel_cmp(info->op, __dfsan::bveq)) {
-    WARNF("unexpected cmp op (%d) in add_constraints for %u\n", info->op, label);
+    REJECT("non-eq offset constraint",
+           "unexpected cmp op (%d) in add_constraints for %u\n", info->op, label);
     return -1;
   }
   // 3. one operand should be a constant
   if (info->l1 != 0) {
-    WARNF("unexpected non-constant operand1 (%u) in add_constraints for %u\n", info->l1, label);
+    REJECT("non-constant offset operand",
+           "unexpected non-constant operand1 (%u) in add_constraints for %u\n", info->l1, label);
     return -1;
   }
   // check for ast size
   if (ast_size_cache[info->l2] > max_ast_size_) {
     DEBUGF("skip large AST (%lu) in add_constraints for %u\n", ast_size_cache[label], label);
+    set_error("ast too large"); // see parse_gep: DEBUGF, so otherwise invisible
     return 0; // not an error, just skip
   }
   // setup node
