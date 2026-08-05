@@ -337,6 +337,23 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     if (l2 >= CONST_OFFSET) op2 = 0;
   }
 
+  // All the ubsan modeling below is 64-bit arithmetic: it builds masks as
+  // (1UL << size) - 1 and sign bits as 1ULL << (size - 1).  Once an operand can
+  // be wider than 64 bits those shifts are undefined, and on x86 the shift count
+  // is masked -- so a 128-bit Add computes mask 0 and sign_bit 1ULL << 63, and
+  // every overflow ICmp derived from them is garbage.  That garbage is not a
+  // missing check: it is handed straight to __taint_trace_cond as a real branch
+  // constraint, i.e. a formula that does not describe the program.  Skip the
+  // checks when any width involved exceeds 64 bits.  The operand widths matter
+  // as well as the result's -- a Trunc from i128 to i64 has size == 64 but still
+  // evaluates 1UL << size on a value it only holds the low half of.
+  //
+  // Computed up here, ahead of the folds, because one of them has to know
+  // whether a check is coming before it can decide to skip it -- see Shl below.
+  const bool ub_width_ok = size <= 64 &&
+                           (l1 == 0 || get_label_info(l1)->size <= 64) &&
+                           (l2 == 0 || get_label_info(l2)->size <= 64);
+
   // try simple simplifications, from qsym
   //
   // all-ones for this width.  Not (1 << size) - 1: at size == 64 that shifts a
@@ -354,8 +371,27 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     switch (op) {
       case __dfsan::And: // 0 & x = 0
       case __dfsan::Mul: // 0 * x = 0
-      case __dfsan::Shl: // 0 << x = 0
         return 0;
+      case __dfsan::Shl:  // 0 << x = 0
+      case __dfsan::LShr: // 0 >>u x = 0
+      case __dfsan::AShr: // 0 >>s x = 0, the sign bit being shifted in is 0 too
+        // The result is 0 whatever the exponent is, but the exponent is what
+        // the shift-exponent check below is *about*, and x is symbolic here:
+        // shifting by >= the width is undefined no matter what is being
+        // shifted, so `0 << 64` on an i32 is still UB.  Returning early would
+        // skip a check that is otherwise due -- the check's own gate needs a
+        // symbolic l2, which is exactly what this fold has.  It is the only
+        // check the two right shifts have (shift-base and shift-overflow are
+        // Shl-only), and the only one Shl has left once the base is zero.
+        //
+        // So fold only when no check is coming.  Falling through instead
+        // builds a node, which costs one union-table entry per distinct
+        // exponent and keeps the once-per-unique-expression dedup the checks
+        // are designed around; emitting the check here instead would re-fire
+        // it on every execution, since a folded result has no node to dedup
+        // on.  Every solver simplifies a shift of 0 to 0 anyway.
+        if (!flags().solve_ub || !ub_width_ok) return 0;
+        break;
       case __dfsan::Or: // 0 | x = x
       case __dfsan::Xor: // 0 ^ x = x
       case __dfsan::Add: // 0 + x = x
@@ -408,7 +444,11 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         (c == width_mask && (pred == __dfsan::bvule || pred == __dfsan::bvugt)) ||
         (c == smin       && (pred == __dfsan::bvsge || pred == __dfsan::bvslt)) ||
         (c == smax       && (pred == __dfsan::bvsle || pred == __dfsan::bvsgt))) {
-      AOUT("simplify saturated cmp: pred %d vs %#lx at %d bits\n", pred, c, size);
+      // 0x%lx and not %#lx: AOUT goes to the sanitizer's own Printf, whose
+      // grammar is %([0-9]*)?(z|l|ll)?{d,u,x,X} plus %p/%s/%c -- it has no '#'
+      // flag, and an unsupported directive is a Die(), not a bad line.  So this
+      // aborted the process every time a saturated compare fired under debug=1.
+      AOUT("simplify saturated cmp: pred %d vs 0x%lx at %d bits\n", pred, c, size);
       return 0;
     }
   }
@@ -473,20 +513,6 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     AOUT("%u found\n", label);
     return label;
   }
-
-  // All the ubsan modeling below is 64-bit arithmetic: it builds masks as
-  // (1UL << size) - 1 and sign bits as 1ULL << (size - 1).  Once an operand can
-  // be wider than 64 bits those shifts are undefined, and on x86 the shift count
-  // is masked -- so a 128-bit Add computes mask 0 and sign_bit 1ULL << 63, and
-  // every overflow ICmp derived from them is garbage.  That garbage is not a
-  // missing check: it is handed straight to __taint_trace_cond as a real branch
-  // constraint, i.e. a formula that does not describe the program.  Skip the
-  // checks when any width involved exceeds 64 bits.  The operand widths matter
-  // as well as the result's -- a Trunc from i128 to i64 has size == 64 but still
-  // evaluates 1UL << size on a value it only holds the low half of.
-  const bool ub_width_ok = size <= 64 &&
-                           (l1 == 0 || get_label_info(l1)->size <= 64) &&
-                           (l2 == 0 || get_label_info(l2)->size <= 64);
 
   // ubsan checks, after dedup, so we don't do redundant checks
   if (l2 && flags().solve_ub && ub_width_ok) {
