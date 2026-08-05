@@ -668,6 +668,35 @@ impl JoinReport {
     }
 }
 
+/// Where a [`Target`]'s asked-for direction lands in the fuzzer's coverage map.
+///
+/// The three cases are not degrees of the same thing: only `Edge` supports the
+/// inference "the branch did not flip".  For the other two nothing was ever
+/// going to light up, so a miss says nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TargetEdge {
+    /// The edge id that direction records.  Present in the coverage of a run
+    /// iff the branch went that way.
+    Edge(u32),
+    /// AFL++ numbered no edge for this side, because reaching the block behind
+    /// it is implied by coverage it does record.
+    Pruned,
+    /// The branch map has never heard of this branch: code AFL++ never
+    /// instrumented, one of SymSan's own checks, or the false side of a switch.
+    Unmapped,
+}
+
+/// The branch a solution was solved for -- see [`Session::current_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Target {
+    /// The branch's id, which under the two-stage build is its AFL++ edge id.
+    pub cid: u32,
+    /// The direction asked for: the one the traced input did not take.
+    pub direction: bool,
+    /// The edge that direction would record.
+    pub dest_edge: TargetEdge,
+}
+
 /// What [`Session::input_taint`] says about one input offset.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaintClass {
@@ -838,6 +867,43 @@ impl Session {
             return None;
         }
         Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Which branch the outstanding solution was solved for, or `None` when
+    /// there is no outstanding solution.
+    ///
+    /// This is how a solve gets *checked* rather than assumed.
+    /// [`report_result`](Session::report_result) is told whether the run was
+    /// interesting, and new coverage anywhere makes it so -- so a solution that
+    /// never moved the branch it was solved for is indistinguishable from one
+    /// that did.  Where the AST is wrong, which is what an uninstrumented
+    /// library produces (it writes bytes without labels, and the shadow keeps
+    /// the previous occupant's), that is exactly the difference worth knowing.
+    ///
+    /// The ids are shared with the fuzzer's build, so checking costs no extra
+    /// execution: run the solution, then look for
+    /// [`dest_edge`](Target::dest_edge) in the coverage recorded for it.
+    ///
+    /// `None` also whenever the session was built without
+    /// [`Config::export_taint`], which is what records the task-to-branch link.
+    pub fn current_target(&self) -> Option<Target> {
+        let mut out = sys::symsan_target_t {
+            cid: 0,
+            direction: 0,
+            dest_edge: 0,
+        };
+        // SAFETY: valid handle; `out` is a valid out-pointer we own.
+        let st = unsafe { sys::symsan_session_current_target(self.raw.as_ptr(), &mut out) };
+        check(st).ok()?;
+        Some(Target {
+            cid: out.cid,
+            direction: out.direction != 0,
+            dest_edge: match out.dest_edge {
+                0 => TargetEdge::Unmapped,
+                u32::MAX => TargetEdge::Pruned,
+                e => TargetEdge::Edge(e),
+            },
+        })
     }
 
     /// Tell the session whether the last solution was interesting.

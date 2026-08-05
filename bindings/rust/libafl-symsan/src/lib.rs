@@ -72,14 +72,16 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
 use std::hash::Hash;
+use std::io::Write;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use libafl::{
     Error, HasMetadata, HasNamedMetadata,
-    corpus::{CorpusId, HasCurrentCorpusId},
+    corpus::{Corpus, CorpusId, HasCurrentCorpusId},
     events::EventFirer,
     executors::{Executor, HasObservers},
     feedbacks::{MapFeedbackMetadata, MapIndexesMetadata},
@@ -96,7 +98,7 @@ use libafl_bolts::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use symsan::{Config, JoinReport, Session, Stats, TaintClass};
+pub use symsan::{Config, JoinReport, Session, Stats, TaintClass, Target, TargetEdge};
 
 /// Default name, used to key the stage's restart metadata in the state.
 pub const SYMSAN_STAGE_NAME: &str = "symsan";
@@ -152,6 +154,7 @@ pub struct SymSanStageBuilder {
     max_solutions_per_input: usize,
     forkserver: bool,
     cmplog_filter: bool,
+    flip_log: Option<PathBuf>,
 }
 
 impl SymSanStageBuilder {
@@ -377,6 +380,33 @@ impl SymSanStageBuilder {
         self
     }
 
+    /// Check every solution against the branch it was solved for, and append
+    /// the verdict to @p path as `<cid> <direction> <dest edge> <outcome>`.
+    ///
+    /// Without this the stage reports `solved` -- solutions the fuzzer found
+    /// interesting -- and that is not the same question. A solved input is run
+    /// on the coverage build, where new coverage *anywhere* makes it
+    /// interesting, including coverage the mutated bytes reached nowhere near
+    /// the branch they were solved for. So a target whose ASTs are wrong can
+    /// report a healthy solve rate indefinitely: the arithmetic is unsound, the
+    /// solver is SAT on it anyway, and the resulting input still stumbles into
+    /// something new. The classic source is an uninstrumented library --
+    /// zlib's inflate writes decompressed bytes with no labels, so the shadow
+    /// still describes whatever occupied that memory before.
+    ///
+    /// Needs a [`branch_map`](Self::branch_map) to know which edge to look for;
+    /// without one every verdict is [`Flip::Unknown`]. The task-to-branch link
+    /// it reads comes from `export_taint`, which this switches on by itself --
+    /// no [`cmplog_filter`](Self::cmplog_filter) required.
+    ///
+    /// Costs no execution: the ids are shared between the two builds, so the
+    /// coverage the fuzzer already recorded for the solution is the answer.
+    #[must_use]
+    pub fn flip_log(mut self, path: impl Into<PathBuf>) -> Self {
+        self.flip_log = Some(path.into());
+        self
+    }
+
     /// Create the session and the stage.
     ///
     /// Fails if `target` was not set, if a session already exists in this
@@ -418,7 +448,11 @@ impl SymSanStageBuilder {
             .solve_ub(self.solve_ub)
             .debug(self.debug)
             .forkserver(self.forkserver)
-            .export_taint(self.cmplog_filter);
+            // What export_taint buys is the per-task record of which branch a
+            // solution was solved for. The cmplog filter reads it to decide
+            // what to hand cmplog; the flip log reads it to name the branch it
+            // is judging. Either one alone is reason enough to pay for it.
+            .export_taint(self.cmplog_filter || self.flip_log.is_some());
         if let Some(ms) = self.timeout_ms {
             config = config.timeout_ms(ms);
         }
@@ -451,6 +485,24 @@ impl SymSanStageBuilder {
             (None, None) => None,
         };
 
+        // Opened before the session, so a bad path fails the build rather than
+        // leaving a live session behind.
+        let flip_log = match &self.flip_log {
+            Some(path) => Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|e| {
+                        Error::illegal_argument(format!(
+                            "cannot open the flip log {}: {e}",
+                            path.display()
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+
         let mut session = Session::new().map_err(to_libafl)?;
         session.init(&config).map_err(to_libafl)?;
 
@@ -468,6 +520,8 @@ impl SymSanStageBuilder {
             solutions: 0,
             solved: 0,
             cmplog_filter: self.cmplog_filter,
+            flip_log,
+            flips: [0; 4],
         })
     }
 }
@@ -528,6 +582,33 @@ pub struct SymSanStage {
     /// Publish a [`SymSanTaintMetadata`] per traced entry. See
     /// [`SymSanStageBuilder::cmplog_filter`].
     cmplog_filter: bool,
+    /// Where to append one line per solution saying whether the branch it was
+    /// solved for actually flipped, or `None` to not check at all. See
+    /// [`SymSanStageBuilder::flip_log`].
+    flip_log: Option<File>,
+    /// Flip outcomes so far, indexed by [`Flip`] as `usize`.
+    flips: [u64; 4],
+}
+
+/// What became of the branch a solution was solved for.
+///
+/// The two "cannot tell" cases are kept apart from the answer rather than
+/// folded into it: a rate computed over them would drift with how much of the
+/// map the run has already covered, which has nothing to do with solver
+/// quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flip {
+    /// The run took the branch the way it was solved to go. The solve worked.
+    Flipped = 0,
+    /// The run did not take it, and would have been noticed if it had. The
+    /// solver returned SAT on an AST that does not describe the program.
+    Missed = 1,
+    /// Something else had already covered that edge, so this run taking it
+    /// would have gone unremarked. No conclusion either way.
+    AlreadyCovered = 2,
+    /// No edge to look for: the direction is pruned or unmapped, the branch map
+    /// is absent, or the input was filtered out before it ever ran.
+    Unknown = 3,
 }
 
 impl SymSanStage {
@@ -585,6 +666,121 @@ impl SymSanStage {
     /// each solver's own numbers -- to a file descriptor. `2` is stderr.
     pub fn print_stats(&self, fd: i32) {
         self.session.print_stats(fd);
+    }
+
+    /// How many solutions fell into each [`Flip`] class.
+    ///
+    /// All zero unless [`SymSanStageBuilder::flip_log`] is set. `Flipped`
+    /// against `Flipped + Missed` is the rate worth quoting -- the other two
+    /// classes are "could not tell", and folding them in would make the number
+    /// move with how much of the map is already covered.
+    #[must_use]
+    pub fn flips(&self) -> [u64; 4] {
+        self.flips
+    }
+
+    /// Is edge @p edge already set in the fuzzer's history map?
+    ///
+    /// `None` when there is no history map to read, which is a different answer
+    /// from `Some(false)` and must not collapse into it.
+    fn edge_covered<S>(&self, state: &S, edge: u32) -> Option<bool>
+    where
+        S: HasNamedMetadata,
+    {
+        let name = self.coverage_map_name.as_ref()?;
+        let meta = state.named_metadata::<MapFeedbackMetadata<u8>>(name).ok()?;
+        meta.history_map.get(edge as usize).map(|&v| v != 0)
+    }
+
+    /// Did the branch @p target was solved for actually go the other way?
+    ///
+    /// @p was_covered is [`edge_covered`](Self::edge_covered) read *before* the
+    /// run, @p result the fuzzer's verdict on it, and @p added the corpus entry
+    /// the run produced, if any.
+    ///
+    /// Two independent pieces of evidence, because neither covers every case.
+    /// When the solution was added to the corpus its tracked indices are the
+    /// exact edge set of that execution, and membership settles it outright.
+    /// When it was not added there are no indices -- but not being added is
+    /// itself informative: had the run taken a previously-uncovered edge, that
+    /// is new coverage, and it would have been added. So an uncovered target
+    /// edge plus a *rejected* input means the branch did not move.
+    ///
+    /// Rejected is the load-bearing word, and why @p result is here at all: an
+    /// input that crashes is filed as an objective, which also leaves @p added
+    /// empty. Reading that as "did not move" would score every crashing
+    /// solution as a miss -- exactly the solutions most likely to have moved
+    /// something.
+    fn judge_flip<S>(
+        &self,
+        state: &S,
+        target: Target,
+        was_covered: Option<bool>,
+        result: ExecuteInputResult,
+        added: Option<CorpusId>,
+    ) -> Flip
+    where
+        S: HasCorpus<BytesInput> + HasNamedMetadata,
+    {
+        // Nothing to look for: pruned means AFL++ numbered no edge for this
+        // side, unmapped means the branch map never heard of the branch. In
+        // both cases the branch may well have flipped and left no trace, so
+        // this is "cannot tell", not "no".
+        let TargetEdge::Edge(edge) = target.dest_edge else {
+            return Flip::Unknown;
+        };
+
+        if let Some(id) = added {
+            if let Ok(tc) = state.corpus().get(id) {
+                let took = tc
+                    .borrow()
+                    .metadata::<MapIndexesMetadata>()
+                    .ok()
+                    .map(|m| m.list.iter().any(|&i| i as u32 == edge));
+                if let Some(took) = took {
+                    return if took { Flip::Flipped } else { Flip::Missed };
+                }
+            }
+        }
+
+        match was_covered {
+            // Already covered before the run, and no indices to check against:
+            // taking it again would have looked like nothing happened.
+            Some(true) => Flip::AlreadyCovered,
+            // Not covered before, and the fuzzer found nothing in it at all --
+            // so the run did not take it.
+            Some(false) if result == ExecuteInputResult::None => Flip::Missed,
+            // Interesting, but with no corpus entry to inspect: an objective.
+            // It may well have flipped on its way to crashing.
+            Some(false) => Flip::Unknown,
+            // No history map at all.
+            None => Flip::Unknown,
+        }
+    }
+
+    /// Append one verdict to the flip log. Failures are silent by design: a
+    /// full disk must not take the fuzzer down over a measurement.
+    fn record_flip(&mut self, target: Target, flip: Flip) {
+        let Some(log) = self.flip_log.as_mut() else {
+            return;
+        };
+        let dest = match target.dest_edge {
+            TargetEdge::Edge(e) => e.to_string(),
+            TargetEdge::Pruned => "pruned".to_owned(),
+            TargetEdge::Unmapped => "unmapped".to_owned(),
+        };
+        let outcome = match flip {
+            Flip::Flipped => "flipped",
+            Flip::Missed => "missed",
+            Flip::AlreadyCovered => "already-covered",
+            Flip::Unknown => "unknown",
+        };
+        let _ = writeln!(
+            log,
+            "{}\t{}\t{dest}\t{outcome}",
+            target.cid,
+            u8::from(target.direction)
+        );
     }
 
     /// Attach this entry's byte classification to its testcase, for the cmplog
@@ -802,25 +998,51 @@ where
         // this path is already reached" is the single most useful answer the
         // taint export can give -- it is what lets the cmplog group be skipped
         // outright. So fall through to publish it.
+        // Logged unconditionally, including the zero: a stage that traces every
+        // entry and solves nothing looks exactly like a stage that never ran,
+        // and the two have completely different causes.
+        log::debug!("symsan: corpus entry {corpus_id} produced {tasks} tasks");
         if tasks != 0 {
-            log::debug!("symsan: corpus entry {corpus_id} produced {tasks} tasks");
 
             let mut produced = 0usize;
             while let Some(solution) = self.session.next_solution() {
                 self.solutions += 1;
                 produced += 1;
 
+                // Before the run, while the solution is still outstanding:
+                // report_result() below retires the task, and after that the
+                // session no longer knows what this input was for.
+                let target = if self.flip_log.is_some() {
+                    self.session.current_target()
+                } else {
+                    None
+                };
+                // Whether the edge we are about to look for was *already*
+                // covered. Has to be read before the run, because the run is
+                // what would add it -- and if it was already there, finding it
+                // afterwards proves nothing.
+                let was_covered = target.and_then(|t| match t.dest_edge {
+                    TargetEdge::Edge(e) => self.edge_covered(state, e),
+                    _ => None,
+                });
+
                 // Hand the solved input to the fuzzer exactly as a mutational
                 // stage would: it runs it on the *coverage-instrumented* build,
                 // applies the feedbacks, and adds it to the corpus if it is
                 // interesting. `evaluate_filtered` honours the fuzzer's input
                 // filter, so an input we have already seen is not re-run.
-                let (result, _) =
+                let (result, added) =
                     fuzzer.evaluate_filtered(state, executor, manager, &BytesInput::new(solution))?;
 
                 let interesting = result != ExecuteInputResult::None;
                 if interesting {
                     self.solved += 1;
+                }
+
+                if let Some(target) = target {
+                    let flip = self.judge_flip(state, target, was_covered, result, added);
+                    self.flips[flip as usize] += 1;
+                    self.record_flip(target, flip);
                 }
                 // The honest answer. `false` makes the session escalate this
                 // task to the next solver in the ladder; `true` retires it.

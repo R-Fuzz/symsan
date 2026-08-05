@@ -339,6 +339,48 @@ int symsan_session_trace(symsan_session_t *s, const uint8_t *buf, size_t size);
  */
 const uint8_t *symsan_session_next_solution(symsan_session_t *s, size_t *size);
 
+/** The branch the outstanding solution was solved for. */
+typedef struct {
+  /** the branch's id, which under the two-stage build is also its AFL++ edge
+   *  id -- so it indexes the fuzzer's coverage map directly */
+  uint32_t cid;
+  /** the direction the solution asked for: the one the traced input did not
+   *  take.  0 or 1. */
+  uint8_t direction;
+  /** the edge id that direction records, which is what a coverage map has to
+   *  show for the branch to have actually flipped.  #SYMSAN_EDGE_PRUNED when
+   *  AFL++ numbered no edge for that side, and 0 when the branch map has never
+   *  heard of the branch; in neither case does a miss mean the flip failed. */
+  uint32_t dest_edge;
+} symsan_target_t;
+
+/** dest_edge for a direction AFL++ deliberately left unnumbered, because
+ *  reaching the block behind it is implied by coverage it does record.  Matches
+ *  BranchMap::kPruned. */
+#define SYMSAN_EDGE_PRUNED UINT32_MAX
+
+/** Which branch the last symsan_session_next_solution() was solving for.
+ *
+ *  This is how a caller checks a solve instead of assuming it.  The solution is
+ *  run on the *coverage* build, and symsan_session_report_result() is told only
+ *  whether that run was interesting -- but new coverage anywhere counts, so an
+ *  input that never moved the branch it was solved for is reported exactly like
+ *  one that did.  On a target where the AST is wrong (bytes written by an
+ *  uninstrumented library, whose shadow still holds the labels of whatever
+ *  occupied them before) that difference is the whole question, and coverage
+ *  alone cannot answer it.
+ *
+ *  With the two-stage build the ids are shared, so the check needs no second
+ *  execution: run the solution, then look for `dest_edge` in the coverage the
+ *  fuzzer just recorded for it.
+ *
+ *  @return #SYMSAN_OK, or #SYMSAN_ERR_NOT_READY when no solution is outstanding
+ *          or the task carries no branch.  The latter is every task unless
+ *          export_taint was set at init(), since that is what records them.
+ */
+symsan_status_t symsan_session_current_target(const symsan_session_t *s,
+                                              symsan_target_t *out);
+
 /** Tell the session whether the last solution turned out to be interesting.
  *
  *  On non-zero, the branch counts as solved and the remaining solvers in the

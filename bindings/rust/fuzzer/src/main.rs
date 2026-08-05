@@ -270,6 +270,25 @@ struct Opt {
     #[arg(long = "validate-branch-map", default_value = "false")]
     validate_branch_map: bool,
 
+    /// Log, for every solution SymSan produces, whether the branch it was
+    /// solved for actually flipped when the fuzzer ran it. Written to
+    /// `<output>/flips.log`.
+    ///
+    /// Worth having because "interesting" is not "flipped": a solution is run
+    /// on the coverage build and *any* new coverage keeps it, including
+    /// coverage the mutated bytes reached by accident, nowhere near the branch
+    /// in question. So a target whose ASTs are wrong -- bytes an uninstrumented
+    /// library wrote, where the shadow still holds the previous occupant's
+    /// labels -- looks like a steady stream of successful solves. This is what
+    /// tells the two apart, and it needs no second execution: under the
+    /// two-stage build the branch id *is* the AFL++ edge id, so the coverage
+    /// the fuzzer already recorded answers the question.
+    ///
+    /// Needs `--branch-map` -- that is what turns a branch id into the edge to
+    /// look for -- and is ignored without one.
+    #[arg(long = "flip-log", default_value = "false")]
+    flip_log: bool,
+
     /// Exec the SymSan target once per trace instead of forking it from a
     /// long-lived server. Slower, but the way out if the target keeps state
     /// across `main()` that a fork would wrongly share.
@@ -553,6 +572,11 @@ pub fn main() -> Result<(), libafl::Error> {
                     // set the audit needs -- nothing is re-executed for it.
                     println!("symsan: auditing the branch map (RUST_LOG=error to see verdicts)");
                 }
+                if opt.flip_log {
+                    let path = opt.out_dir.join("flips.log");
+                    println!("symsan: recording flip outcomes to {}", path.display());
+                    builder = builder.flip_log(path);
+                }
             } else {
                 // Say which coverage is deciding what to solve, always. An
                 // A/B that accidentally ran without the map is otherwise
@@ -563,6 +587,13 @@ pub fn main() -> Result<(), libafl::Error> {
                 );
                 if opt.validate_branch_map {
                     println!("symsan: --validate-branch-map ignored without a branch map");
+                }
+                if opt.flip_log {
+                    // The map is what turns a branch id into the edge to look
+                    // for; without it every verdict would be `unknown`, and a
+                    // log of nothing but `unknown` reads at analysis time like
+                    // a target nothing flips on.
+                    println!("symsan: --flip-log ignored without a branch map");
                 }
             }
             let symsan = builder.build()?;

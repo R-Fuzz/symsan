@@ -157,6 +157,32 @@ public:
   ///         next_solution() or trace(); nullptr when no tasks remain
   const uint8_t *next_solution(size_t *size);
 
+  /// Which branch the last next_solution() was solving for, and the edge that
+  /// would light up in the fuzzer's map if it flipped.
+  ///
+  /// The point of this is that "interesting" is not "flipped".  A solution is
+  /// run on the *coverage* build, and new coverage anywhere is enough to make
+  /// it interesting -- including coverage the mutation reached by accident,
+  /// nowhere near the branch it was solved for.  That distinction is invisible
+  /// to report_result() and to anything downstream of it, so a target whose
+  /// AST is wrong (bytes an uninstrumented library wrote, where the shadow
+  /// still holds the previous occupant's labels) can look like a steady stream
+  /// of successful solves.  Comparing @p dest against the coverage of the run
+  /// is what tells the two apart.
+  ///
+  /// @param cid  the branch's id, which under the two-stage build is also the
+  ///             AFL++ edge id
+  /// @param direction  the direction the solution asked for, i.e. the one the
+  ///             traced input did not take
+  /// @param dest  the edge id reaching that side records, BranchMap::kPruned
+  ///             when AFL++ numbered no edge for it (the side is implied by
+  ///             other coverage, so nothing will ever light up), or 0 when the
+  ///             branch map has never heard of this branch
+  /// @return 0 on success; -1 when no solution is outstanding, or when the
+  ///         task carries no branch -- which is also the case for every task
+  ///         when export_taint is off, since that is what records them
+  int current_target(uint32_t *cid, bool *direction, uint32_t *dest) const;
+
   /// Tell the session whether the last solution from next_solution() turned out
   /// to be interesting (new coverage).  If it was, the underlying branch is
   /// considered solved and no further solver is tried for it.

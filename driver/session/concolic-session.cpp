@@ -529,6 +529,35 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
   }
 }
 
+int ConcolicSession::current_target(uint32_t *cid, bool *direction,
+                                    uint32_t *dest) const {
+  // Same guard report_result() uses: outside IN_VALIDATION there is no
+  // outstanding solution for cur_task_, so whatever it points at is either
+  // stale or not yet attempted, and answering would name the wrong branch.
+  if (mutation_state_ != MUTATION_IN_VALIDATION || !cur_task_) {
+    return -1;
+  }
+  auto itr = task_branch_.find(cur_task_.get());
+  if (itr == task_branch_.end()) {
+    return -1;
+  }
+  const auto &branch = traced_branches_[itr->second];
+  if (cid) *cid = branch.id;
+  if (direction) *direction = branch.neg_direction;
+  if (dest) {
+    // 0 for "the map cannot say", which is distinct from kPruned: kPruned is
+    // the map answering that this side has no edge of its own, and the caller
+    // must not read a miss there as a failure to flip.
+    *dest = 0;
+    if (branch_map_) {
+      const uint32_t *edge = branch_map_->lookup(branch.id,
+                                                 branch.neg_direction);
+      if (edge) *dest = *edge;
+    }
+  }
+  return 0;
+}
+
 void ConcolicSession::report_result(bool interesting) {
   if (mutation_state_ != MUTATION_IN_VALIDATION) {
     return;

@@ -487,6 +487,31 @@ const uint8_t *symsan_session_next_solution(symsan_session_t *s, size_t *size) {
                                 [&] { return s->session.next_solution(size); });
 }
 
+symsan_status_t symsan_session_current_target(const symsan_session_t *s,
+                                              symsan_target_t *out) {
+  if (!s || !out) {
+    set_error("symsan_session_current_target: session/out required");
+    return SYMSAN_ERR_INVALID;
+  }
+  if (!s->initialized) {
+    set_error("symsan_session_current_target: session not initialized");
+    return SYMSAN_ERR_NOT_READY;
+  }
+  return guard(SYMSAN_ERR_FAILED, [&] {
+    uint32_t cid = 0, dest = 0;
+    bool direction = false;
+    if (s->session.current_target(&cid, &direction, &dest) != 0) {
+      // Not an error worth a message: a caller polling after the last solution
+      // gets here on every loop exit.
+      return SYMSAN_ERR_NOT_READY;
+    }
+    out->cid = cid;
+    out->direction = direction ? 1 : 0;
+    out->dest_edge = dest;
+    return SYMSAN_OK;
+  });
+}
+
 void symsan_session_report_result(symsan_session_t *s, int interesting) {
   if (!s || !s->initialized) return;
   guard_void([&] { s->session.report_result(interesting != 0); });
