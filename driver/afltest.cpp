@@ -18,6 +18,17 @@
 //   SYMSAN_PARSE_ONLY=1  build the SearchTasks and drop them; report why the
 //                        parser refused the rest.  See below.
 //   SYMSAN_VERBOSE=1     the per-event trace, off by default
+//   SYMSAN_SOLVE_UB=1    also trace the runtime's own undefined-behaviour
+//                        checks, which arrive as conditions with cids in the
+//                        range reserved below the branch map base
+//   SYMSAN_ENUM_GEP=1    ask parse_gep to enumerate indices.  ConcolicSession
+//                        passes false unconditionally, so without this the
+//                        first line of parse_gep returns and the whole GEP
+//                        path is unreachable -- a sweep reports every GEP as
+//                        skipped and learns nothing about the parser.  It is
+//                        off by default here for the same reason it is off
+//                        there, so that a plain run matches what the fuzzer
+//                        does; turn it on to audit the path.
 //
 // More than one input sweeps a corpus in one process, sharing the fork server
 // and the parser across seeds -- see run_one and the loop in main.
@@ -537,6 +548,7 @@ int main(int argc, char* const argv[]) {
   int debug = 0;
   __parse_only = getenv("SYMSAN_PARSE_ONLY") != nullptr;
   __verbose = getenv("SYMSAN_VERBOSE") != nullptr;
+  __enum_gep = getenv("SYMSAN_ENUM_GEP") != nullptr;
   char *options = getenv("TAINT_OPTIONS");
   if (options) {
     // setup output dir
@@ -582,6 +594,11 @@ int main(int argc, char* const argv[]) {
 
   symsan_set_debug(debug);
   symsan_set_bounds_check(1);
+  // The runtime synthesises the UB checks itself, on arithmetic it already
+  // traces, and gives them cids in the range reserved below the branch map's
+  // base -- so this needs nothing from the target build.  Off by default to
+  // match the fuzzer's default and to keep a plain sweep comparable with one.
+  symsan_set_solve_ub(getenv("SYMSAN_SOLVE_UB") != nullptr);
 
   // setup the RGD parser and the solver chain (matching driver/aflpp).  One
   // parser for the whole corpus: restart() per input is what it is for.
