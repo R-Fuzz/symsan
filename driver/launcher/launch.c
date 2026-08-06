@@ -518,6 +518,13 @@ int symsan_set_forkserver(int enable) {
   return 0;
 }
 
+__attribute__((visibility("default")))
+int symsan_forkserver_active(void) {
+  // The request is not the answer: forksrv_active is set only once the
+  // handshake has come back, and is cleared again if the server dies.
+  return g_config.forksrv_active ? 1 : 0;
+}
+
 /* Read exactly n bytes, retrying on a short read.  Pipe reads of four bytes
    will not normally split, but a signal can still cut one short and the
    protocol has no way to resynchronize afterwards. */

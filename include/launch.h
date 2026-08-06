@@ -63,6 +63,21 @@ int symsan_set_force_stdin(int enable);
 /// wired up per run, which cannot be done from outside a running process.
 int symsan_set_forkserver(int enable);
 
+/// @brief is a fork server actually serving runs?
+///
+/// symsan_set_forkserver() is a request, not a promise: a stdin or network
+/// target, or one whose backend has no server in it, falls back to exec'ing per
+/// run and says nothing.  That silence is deliberate -- turning the fork server
+/// on is meant to be safe everywhere -- but it leaves a caller unable to tell
+/// which mode it is in, and the two differ in a way that matters: once the
+/// server is up, the input path and argv are fixed for the life of it, baked
+/// into the environment the server was spawned with.  Serving more than one
+/// input means rewriting the *contents* of that one path, the way AFL does.
+///
+/// @return 1 if the server is up and being used, 0 otherwise (including before
+///         the first symsan_run(), which is when it is spawned)
+int symsan_forkserver_active(void);
+
 /// @brief size the AFL++-compatible coverage map handed to the target
 ///
 /// The target's edge counters -- present when it was built the two-stage way,

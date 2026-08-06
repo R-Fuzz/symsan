@@ -13,6 +13,7 @@ extern "C" {
 #include <z3++.h>
 
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -67,18 +68,54 @@ static PyObject* SymSanInit(PyObject *self, PyObject *args, PyObject *keywds) {
   return PyCapsule_New(shm_base, "dfsan_label_info", NULL);
 }
 
+// Everything config() hands the target, kept so that a later call can be
+// compared against it.  All of it travels in TAINT_OPTIONS, which is built once
+// per spawned process -- so once a fork server is up, every field here is fixed
+// for its lifetime and setting a new value would change nothing.
+struct symsan_cfg_t {
+  std::string input;
+  std::vector<std::string> args;
+  bool have_args = false;   // args= omitted is not the same as args=[]
+  int debug = 0;
+  int bounds = 0;
+  int solve_ub = 0;
+  int forkserver = 0;
+};
+static symsan_cfg_t __cfg;
+
+// The launcher tried to start a fork server and the target did not have one, so
+// it fell back to exec'ing per run and cleared its own request flag
+// (launch.c:1172) precisely so it would not try again.  Re-asserting the
+// request on every config() would defeat that: each run would fork, exec, wait
+// out the handshake and only then exec again for real.  Remember the refusal
+// here and stop asking.
+static bool __forksrv_declined = false;
+
+// Which field of a live fork server's configuration this call would change, or
+// NULL if it would change nothing.
+static const char *__cfg_frozen_field(const symsan_cfg_t &want) {
+  if (__cfg.input != want.input) return "input";
+  if (__cfg.have_args != want.have_args || __cfg.args != want.args) return "args";
+  if (__cfg.debug != want.debug) return "debug";
+  if (__cfg.bounds != want.bounds) return "bounds";
+  if (__cfg.solve_ub != want.solve_ub) return "undefined";
+  if (__cfg.forkserver != want.forkserver) return "forkserver";
+  return NULL;
+}
+
 static PyObject* SymSanConfig(PyObject *self, PyObject *args, PyObject *keywds) {
   static const char *kwlist[]
-      = {"input", "args", "debug", "bounds", "undefined", NULL};
+      = {"input", "args", "debug", "bounds", "undefined", "forkserver", NULL};
   const char *input = NULL;
   PyObject *iargs = NULL;
   int debug = 0;
   int bounds = 0;
   int solve_ub = 0;
+  int forkserver = 0;
 
-  if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|O!iii",
+  if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|O!iiii",
       const_cast<char**>(kwlist), &input, &PyList_Type, &iargs,
-      &debug, &bounds, &solve_ub)) {
+      &debug, &bounds, &solve_ub, &forkserver)) {
     return NULL;
   }
 
@@ -87,14 +124,22 @@ static PyObject* SymSanConfig(PyObject *self, PyObject *args, PyObject *keywds) 
     return NULL;
   }
 
-  if (symsan_set_input(input) != 0) {
-    PyErr_SetString(PyExc_ValueError, "invalid input");
-    return NULL;
-  }
+  // Collect the whole request before applying any of it, so that the frozen
+  // check below sees the same picture the target would, and so that a bad
+  // element of args= cannot leave a half-applied configuration behind.
+  symsan_cfg_t want;
+  want.input = input;
+  want.debug = debug;
+  want.bounds = bounds;
+  want.solve_ub = solve_ub;
+  want.forkserver = !!forkserver;
 
-  if (args != NULL) {
+  // NB: `iargs`, not `args` -- `args` is the positional tuple and is never
+  // NULL, so this used to run the loop below on a NULL list whenever args= was
+  // omitted, which is documented as optional.
+  if (iargs != NULL) {
+    want.have_args = true;
     Py_ssize_t argc = PyList_Size(iargs);
-    char *argv[argc];
     for (Py_ssize_t i = 0; i < argc; i++) {
       PyObject *item = PyList_GetItem(iargs, i);
       if (item == NULL) {
@@ -105,7 +150,48 @@ static PyObject* SymSanConfig(PyObject *self, PyObject *args, PyObject *keywds) 
         PyErr_SetString(PyExc_TypeError, "args must be a list of strings");
         return NULL;
       }
-      argv[i] = const_cast<char*>(PyUnicode_AsUTF8(item));
+      const char *s = PyUnicode_AsUTF8(item);
+      if (s == NULL) {
+        return NULL;
+      }
+      want.args.push_back(s);
+    }
+  }
+
+  // Once the server is up, everything here is baked into the environment it was
+  // spawned with and every child re-reads the same input path.  Changing any of
+  // it would do nothing at all -- symsan_run() goes straight to forksrv_poke()
+  // and never looks -- so the loop a caller naturally writes, config(seed) then
+  // run() per seed, would trace the *first* seed over and over while reporting
+  // perfectly ordinary results.  Refuse it, and say what to do instead.
+  if (symsan_forkserver_active()) {
+    const char *field = __cfg_frozen_field(want);
+    if (field != NULL) {
+      PyErr_Format(PyExc_RuntimeError,
+                   "cannot change '%s' while the fork server is running: it was "
+                   "spawned on input '%s' and its whole configuration is fixed "
+                   "for its lifetime.  To serve more than one input, keep that "
+                   "one path and rewrite its *contents* before each run() -- "
+                   "which is what the fork server is for.  To change anything "
+                   "else, call destroy() and start over.",
+                   field, __cfg.input.c_str());
+      return NULL;
+    }
+    // Identical to what is already running: nothing to do, and re-applying it
+    // would only risk disagreeing with the server.
+    Py_RETURN_NONE;
+  }
+
+  if (symsan_set_input(input) != 0) {
+    PyErr_SetString(PyExc_ValueError, "invalid input");
+    return NULL;
+  }
+
+  if (want.have_args) {
+    Py_ssize_t argc = (Py_ssize_t)want.args.size();
+    char *argv[argc];
+    for (Py_ssize_t i = 0; i < argc; i++) {
+      argv[i] = const_cast<char*>(want.args[i].c_str());
     }
     if (symsan_set_args(argc, argv) != 0) {
       PyErr_SetString(PyExc_ValueError, "invalid args");
@@ -127,6 +213,16 @@ static PyObject* SymSanConfig(PyObject *self, PyObject *args, PyObject *keywds) 
     PyErr_SetString(PyExc_ValueError, "invalid solve_ub");
     return NULL;
   }
+
+  // Ask only while asking can still work: a stdin or network target has no fork
+  // server either, and the launcher decides that per run without telling us,
+  // but the wasted attempt there is free (it never spawns one).
+  if (symsan_set_forkserver(want.forkserver && !__forksrv_declined) != 0) {
+    PyErr_SetString(PyExc_ValueError, "invalid forkserver");
+    return NULL;
+  }
+
+  __cfg = want;
 
   Py_RETURN_NONE;
 }
@@ -153,13 +249,23 @@ static PyObject* SymSanRun(PyObject *self, PyObject *args, PyObject *keywds) {
   if (file) {
     close(fd);
   }
-  
+
   if (ret < 0) {
     PyErr_SetString(PyExc_ValueError, "failed to launch target");
     return NULL;
   }
 
+  // This run is where a requested fork server would have been spawned.  If it
+  // is not up now it never will be -- see __forksrv_declined.
+  if (__cfg.forkserver && !symsan_forkserver_active()) {
+    __forksrv_declined = true;
+  }
+
   Py_RETURN_NONE;
+}
+
+static PyObject* SymSanForkserverActive(PyObject *self) {
+  return PyBool_FromLong(symsan_forkserver_active());
 }
 
 static PyObject* SymSanReadEvent(PyObject *self, PyObject *args) {
@@ -223,6 +329,11 @@ static PyObject* SymSanDestroy(PyObject *self) {
     // Only call symsan_destroy if we used init (launcher mode)
     symsan_destroy();
   }
+
+  // Forget the configuration along with the launcher it belonged to: this is
+  // also the way back from a fork server that could not be started.
+  __cfg = symsan_cfg_t();
+  __forksrv_declined = false;
 
   Py_RETURN_NONE;
 }
@@ -508,6 +619,36 @@ static PyObject* RecordMemcmp(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject* RecordTable(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  // Keyed on the table's base address rather than a label: one table backs
+  // every tlookup over it, so the runtime ships the bytes once per trace.
+  uint64_t ptr = 0;
+  PyObject *buf = NULL;
+
+  if (!PyArg_ParseTuple(args, "KS", &ptr, &buf)) {
+    return NULL;
+  }
+
+  Py_ssize_t size;
+  char *data;
+  if (PyBytes_AsStringAndSize(buf, &data, &size) != 0) {
+    // exception should have been set?
+    return NULL;
+  }
+
+  if (__z3_parser->record_table(ptr, (uint8_t*)data, size) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "failed to record table");
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyObject* RecordMinimize(PyObject *self, PyObject *args) {
   if (__z3_parser == nullptr) {
     PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
@@ -608,11 +749,51 @@ static PyObject* ExportTaskSMT2(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static char SymSanConfigDoc[] =
+  "config(input, args=None, debug=0, bounds=0, undefined=0, forkserver=0)\n"
+  "\n"
+  "Configure the target.  `input` is \"stdin\", a file path, or\n"
+  "\"protocol@host:port\"; `args` is the full argv, including argv[0].\n"
+  "\n"
+  "forkserver=1 spawns the target once, on the first run(), and forks a child\n"
+  "per input thereafter -- skipping execv, dynamic linking and the shadow and\n"
+  "union table setup every time.  It is a request, not a promise: it needs a\n"
+  "file input and a target built with the Fastgen backend, and falls back to\n"
+  "exec-per-run otherwise.  Ask forkserver_active() which one you got.  If the\n"
+  "server could not be started this stops asking; destroy() tries again.\n"
+  "\n"
+  "The server's whole configuration -- input path, argv, debug, bounds,\n"
+  "undefined -- is fixed once it is running, because it travels in the\n"
+  "environment the server was spawned with.  Serving many inputs therefore\n"
+  "means rewriting the *contents* of one path, the way AFL does; a config()\n"
+  "that would change any of it raises RuntimeError rather than being ignored:\n"
+  "\n"
+  "    staged = '/dev/shm/symsan-%d.input' % os.getpid()\n"
+  "    open(staged, 'wb').close()\n"
+  "    symsan.config(staged, args=[prog, staged], forkserver=1)\n"
+  "    for buf in inputs:\n"
+  "        with open(staged, 'wb') as f: f.write(buf)   # truncates: see below\n"
+  "        symsan.run()\n"
+  "        ...read_event() until end of trace...\n"
+  "        symsan.terminate()      # ends the run, keeps the server\n"
+  "    symsan.destroy()            # tears the server down\n"
+  "\n"
+  "Truncating matters: a short input after a long one would otherwise be read\n"
+  "with the tail of its predecessor still attached.";
+
+static char SymSanForkserverActiveDoc[] =
+  "forkserver_active() -> bool\n"
+  "\n"
+  "True if a fork server is up and serving runs.  False before the first run(),\n"
+  "and after one if the target did not have a fork server to talk to -- see\n"
+  "config(forkserver=1), which is a request rather than a promise.";
+
 static PyMethodDef SymSanMethods[] = {
   {"init", (PyCFunction)SymSanInit, METH_VARARGS | METH_KEYWORDS, "initialize symsan target"},
-  {"config", (PyCFunction)SymSanConfig, METH_VARARGS | METH_KEYWORDS, "config symsan"},
+  {"config", (PyCFunction)SymSanConfig, METH_VARARGS | METH_KEYWORDS, SymSanConfigDoc},
   {"run", (PyCFunction)SymSanRun, METH_VARARGS | METH_KEYWORDS, "run symsan target, optional stdin=file"},
   {"read_event", SymSanReadEvent, METH_VARARGS, "read a symsan event"},
+  {"forkserver_active", (PyCFunction)SymSanForkserverActive, METH_NOARGS, SymSanForkserverActiveDoc},
   {"terminate", (PyCFunction)SymSanTerminate, METH_NOARGS, "terminate current symsan instance"},
   {"destroy", (PyCFunction)SymSanDestroy, METH_NOARGS, "destroy symsan target"},
   {"init_parser", InitParser, METH_VARARGS, "initialize parser from shared memory (name or address)"},
@@ -622,6 +803,7 @@ static PyMethodDef SymSanMethods[] = {
   {"parse_gep", ParseGEP, METH_VARARGS, "parse trace_gep event into solving tasks"},
   {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},
   {"record_memcmp", RecordMemcmp, METH_VARARGS, "record a memcmp event"},
+  {"record_table", RecordTable, METH_VARARGS, "record the contents of a read-only lookup table, keyed on its base address"},
   {"record_minimize", RecordMinimize, METH_VARARGS, "record a label to minimize during solving (e.g., malloc size)"},
   {"solve_task", SolveTask, METH_VARARGS, "solve a task"},
   {"export_task_smt2", ExportTaskSMT2, METH_VARARGS, "export a task as SMT-LIB v2 to a file"},
