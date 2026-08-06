@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/personality.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -2206,6 +2207,73 @@ static void dfsan_fini() {
 
 static bool dfsan_initialized;
 
+#ifndef MAP_FIXED_NOREPLACE
+// Linux 4.17.  Older kernels ignore the flag and pick some other address,
+// which the caller below detects from the address it gets back.
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+// Reserve [UnusedAddr(), AppAddr()) so the application can never be handed an
+// address with no shadow behind it.
+//
+// The guard at the call site asks whether *we* landed inside that region,
+// which for a non-PIE target is permanently no: the executable is linked at a
+// fixed 0x700000200000, above AppAddr().  What moves is the kernel's mmap
+// base, and that is randomized whether or not the executable is -- ld.so,
+// libc, and every mapping the loader makes hang off it.  mmap_base is
+// TASK_SIZE less the stack rlimit, the guard gap and the 16GB
+// stack-randomization pad, less a draw uniform over 16TB
+// (vm.mmap_rnd_bits=32), so the bottom 16GB of its range sit *below*
+// AppAddr(): one run in 2^10 puts the loader inside the region we are about to
+// reserve.  MAP_FIXED then unmapped ld.so out from under the executing
+// _dl_init, and the child died here before it could trace a single event --
+// measured at 3/3000 runs, which is exactly the rate of "a traced run read
+// zero events" that sent us looking at the event transport instead.
+//
+// So ask with MAP_FIXED_NOREPLACE and let the kernel refuse rather than
+// clobber.  The recovery is to re-exec with ASLR off, which pins the mmap base
+// back at the top of the address space, well clear of AppAddr(); the non-PIE
+// executable does not move either way.  ADDR_NO_RANDOMIZE survives execve, so
+// the flag already being set is its own guard against an exec loop.
+// (sanitizer_linux.cpp:2177 does the same dance for ppc64le, which cannot
+// tolerate ASLR at all.)
+static void ReserveUnusedRegion() {
+  const uptr size = AppAddr() - UnusedAddr();
+  uptr res = internal_mmap(
+      (void *)UnusedAddr(), size, PROT_NONE,
+      MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+  if (!internal_iserror(res) && res == UnusedAddr())
+    return;
+
+  // Occupied.  On a kernel predating MAP_FIXED_NOREPLACE the flag is ignored
+  // and we are handed a mapping somewhere else entirely; give that back.
+  if (!internal_iserror(res))
+    internal_munmap((void *)res, size);
+
+  int old = personality(0xffffffff);
+  if (old != -1 && (old & ADDR_NO_RANDOMIZE) == 0 &&
+      personality(old | ADDR_NO_RANDOMIZE) != -1) {
+    VReport(1,
+            "SymSan: the loader landed in [%p, %p); re-executing with ASLR "
+            "off\n",
+            (void *)UnusedAddr(), (void *)AppAddr());
+    ReExec();  // does not return
+  }
+  // Reaching here means the re-exec above is not available: either we have
+  // already taken it (ADDR_NO_RANDOMIZE survived the execve) and the region is
+  // still occupied, or personality() itself was refused.  The first case is
+  // reachable without any randomness at all -- a stack rlimit big enough drags
+  // the mmap base below AppAddr() on its own, ASLR or no ASLR -- so say which
+  // one it was rather than blaming ASLR for both.
+  Report("FATAL: cannot reserve [%p, %p): it is already mapped, %s\n",
+         (void *)UnusedAddr(), (void *)AppAddr(),
+         (old != -1 && (old & ADDR_NO_RANDOMIZE))
+             ? "and disabling ASLR did not move it -- check the stack rlimit, "
+               "which sets how far down the kernel puts the mmap base"
+             : "and ASLR could not be disabled to move it");
+  Die();
+}
+
 static void dfsan_init(int argc, char **argv, char **envp) {
   if (dfsan_initialized)
     return;
@@ -2272,7 +2340,7 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   // case by disabling memory protection when ASLR is disabled.
   uptr init_addr = (uptr)&dfsan_init;
   if (!(init_addr >= UnusedAddr() && init_addr < AppAddr()))
-    MmapFixedNoAccess(UnusedAddr(), AppAddr() - UnusedAddr());
+    ReserveUnusedRegion();
 
   InitializeInterceptors();
 

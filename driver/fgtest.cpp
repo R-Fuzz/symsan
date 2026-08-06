@@ -28,6 +28,7 @@ extern "C" {
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 
 using namespace __dfsan;
@@ -344,6 +345,7 @@ static int run_one(char *program, char *input, int is_stdin) {
       goto fail;
     }
 
+    const uint64_t events_before = __stats.events;
     pipe_msg msg;
     gep_msg gmsg;
     size_t msg_size;
@@ -428,6 +430,27 @@ static int run_one(char *program, char *input, int is_stdin) {
           break;
         default:
           break;
+      }
+    }
+
+    // A run that delivered nothing looks exactly like a target with no symbolic
+    // branches: zero of everything, and exit 0.  It is worth a line either way,
+    // and the one fact that tells the two apart is how the child ended -- a
+    // target that traced nothing exits normally, one that died before it could
+    // trace does not.  (#115: this happens to ~1 run in 700, transport
+    // independent, and it is the only place the cause is still visible.)
+    if (__stats.events == events_before) {
+      int status = 0;
+      int killed = symsan_get_exit_status(&status);
+      fprintf(stderr, "SYMSAN: no events from %s on %s (%s)\n", program, input,
+              killed             ? "killed by the launcher"
+              : WIFSIGNALED(status) ? strsignal(WTERMSIG(status))
+              : WIFEXITED(status)   ? (WEXITSTATUS(status) == 0
+                                           ? "child exited 0"
+                                           : "child exited nonzero")
+                                    : "child neither exited nor signalled");
+      if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "SYMSAN: exit status %d\n", WEXITSTATUS(status));
       }
     }
   }

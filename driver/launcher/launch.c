@@ -11,6 +11,7 @@
 
 #include <sys/ipc.h>
 #include <sys/mman.h>
+#include <sys/personality.h>
 #include <sys/select.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
@@ -644,6 +645,37 @@ static char *build_symsan_env(int use_forksrv) {
       g_config.trace_file_size, g_config.force_stdin, use_forksrv);
 }
 
+/* Turn ASLR off for the traced child.  Call between fork() and execv():
+   ADDR_NO_RANDOMIZE survives execve(), so setting it here is enough, and the
+   fork server's own children inherit it along with everything else.
+
+   This is about where the kernel puts the *mmap base*, not about the
+   executable, which is non-PIE and linked at a fixed 0x700000200000.  dfsan_init
+   reserves [UnusedAddr(), AppAddr()) so that no application allocation can ever
+   come back without shadow behind it, and mmap_base is TASK_SIZE less the stack
+   rlimit, the guard gap and the 16GB stack-randomization pad, less a draw
+   uniform over 16TB (vm.mmap_rnd_bits=32).  The bottom 16GB of that range sit
+   below AppAddr(), so one run in 2^10 dropped ld.so inside the region we were
+   about to reserve -- measured at 3/3000, which is exactly the rate of "a traced
+   run read zero events" we spent a while blaming on the event transport.  With
+   randomization off the base pins to the top of the address space, well clear.
+
+   The runtime detects the collision and recovers on its own (it re-execs with
+   this same flag), so this is not what makes the bug survivable -- doing it here
+   just means the recovery path stays unexercised on the paths we control, and
+   traced runs get a reproducible address space for free.  Note it does *not*
+   help under an unlimited stack rlimit: that flips the kernel to the legacy
+   bottom-up layout at TASK_SIZE/3, below AppAddr() and growing toward it, which
+   no personality bit can move.  The runtime names that case separately.
+
+   A failure here is not worth aborting the run over -- personality() can be
+   refused by seccomp, and all we lose is the 1-in-1024. */
+static void child_disable_aslr(void) {
+  int old = personality(0xffffffff);
+  if (old != -1 && (old & ADDR_NO_RANDOMIZE) == 0)
+    personality((unsigned long)old | ADDR_NO_RANDOMIZE);
+}
+
 /* Spawn the fork server itself.  Unlike the exec-per-run path this happens
    once, so the event pipe and the two protocol pipes all outlive a single
    traced input. */
@@ -676,6 +708,8 @@ static int forksrv_spawn(void) {
     struct rlimit limit;
     limit.rlim_cur = limit.rlim_max = 0;
     setrlimit(RLIMIT_CORE, &limit);
+
+    child_disable_aslr();
 
     close(g_config.pipefds[0]); // close the read fd
 
@@ -1195,6 +1229,8 @@ int symsan_run(int fd) {
     struct rlimit limit;
     limit.rlim_cur = limit.rlim_max = 0;
     setrlimit(RLIMIT_CORE, &limit);
+
+    child_disable_aslr();
 
     close(g_config.pipefds[0]); // close the read fd
     setenv("TAINT_OPTIONS", (char*)g_config.symsan_env, 1);
