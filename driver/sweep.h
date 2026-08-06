@@ -33,6 +33,69 @@
 namespace symsan {
 namespace sweep {
 
+// The per-condition log, and the join key it exists to write.
+//
+// Everything parse_stats counts is an aggregate: by reason, by call site, by
+// branch cid.  None of those names a *condition*.  A cid is one branch executed
+// thousands of times, a call site is coarser still, and two histograms that
+// agree on totals can disagree about every single branch underneath them.  The
+// key that does name one constraint is the pair **(input, label)**: the label
+// is the runtime's index into this run's union table, so replaying the same
+// seed through the same binary yields the same label for the same condition in
+// whatever process is reading the trace.
+//
+// That is what makes an RGD-vs-z3 comparison a join instead of two tables side
+// by side.  afltest and fgtest dump their outcome per (input, label); the pair
+// says which conditions the two parsers disagree about and lets a claim like
+// "if RGD folded it to a constant, z3 folded it too" be checked one condition
+// at a time.  Reading it off PARSE-REASON counts cannot do that -- z3 folds ~9x
+// more conditions than RGD on this corpus, and the totals alone leave open
+// whether RGD's are a subset.
+//
+// The ordered label sequence per input is also the denominator check, and a
+// much sharper one than matching conds=: if the two arms disagree about the
+// n-th label, the two traces were not the same trace and nothing downstream is
+// a comparison.  tools/cond-diff.py asserts that before it cross-tabulates.
+//
+// Off unless SYMSAN_DUMP_CONDS names a file: this is one line per condition,
+// 4.5M of them on the libpng corpus.
+inline FILE *&cond_log() {
+  static FILE *f = nullptr;
+  return f;
+}
+
+// @return false only if SYMSAN_DUMP_CONDS was set and the file would not open,
+//   which the caller should treat as fatal -- a sweep that silently dumps
+//   nothing is worse than one that refuses to start.  `tag` names the parser,
+//   and goes in the file so two dumps cannot be mixed up later.
+inline bool open_cond_log(const char *tag) {
+  const char *path = getenv("SYMSAN_DUMP_CONDS");
+  if (!path) return true;
+  FILE *f = fopen(path, "w");
+  if (!f) return false;
+  fprintf(f, "# parser %s\n", tag);
+  cond_log() = f;
+  return true;
+}
+
+// Start a new input's section.  The name is the corpus path as the driver was
+// given it; the join is by basename, since the two arms may be pointed at the
+// same seeds through different paths.
+inline void log_cond_input(const char *name) {
+  if (cond_log()) fprintf(cond_log(), "I %s\n", name);
+}
+
+// A cond event carrying no condition (label 0, a loop exit).  Logged rather
+// than skipped so that the two arms' line sequences line up event for event,
+// which is what lets the sequence check above be an equality.
+inline void log_cond_loop_exit() {
+  if (cond_log()) fprintf(cond_log(), "L\n");
+}
+
+inline void close_cond_log() {
+  if (cond_log()) { fclose(cond_log()); cond_log() = nullptr; }
+}
+
 struct parse_stats {
   // Trace events drained for this input, of every message type.  Not a parse
   // statistic, but it belongs in the same per-input block: without it a sweep
@@ -46,6 +109,15 @@ struct parse_stats {
   uint64_t cond_ok = 0;       // parsed, at least one task
   uint64_t cond_empty = 0;    // parsed, no task -- a silent drop
   uint64_t cond_failed = 0;   // parse_cond returned -1
+  // Clauses the parser handed out with a conjunct missing, i.e. tasks that are
+  // weaker than the branch condition and whose solutions need not flip it.
+  // Not a failure -- lenient mode does this on purpose (see construct_task) --
+  // but it belongs next to ok/empty/failed, because these are counted in ok=
+  // and a rise here is the difference between a solver that is missing and a
+  // task that was never going to flip.  Filled by the caller from the parser's
+  // own counter; the reason histogram cannot carry it, since note() only
+  // buckets a parse that failed or produced nothing.
+  uint64_t cond_weakened = 0;
   // Loop-exit notifications carrying no condition.  The runtime forwards a
   // cond message with label 0 when a loop leaves by a concrete test (see
   // __taint_trace_cond), because the backend wants to know the loop ended even
@@ -110,11 +182,25 @@ struct parse_stats {
     if (cid) cids[std::make_pair(cid, std::string(bucket))]++;
   }
 
+  // Attribute one condition to the per-condition log, if one is open.  Split
+  // from note() rather than folded into it because note() is also the GEP path,
+  // and a GEP has no label to key on -- see cond_log().
+  void log(uint32_t label, bool failed, size_t produced,
+           const std::string &reason, void *addr, uint32_t cid) const {
+    FILE *f = cond_log();
+    if (!f) return;
+    fprintf(f, "C %u %u 0x%lx %c %s\n", (unsigned)label, (unsigned)cid,
+            (unsigned long)(uintptr_t)addr,
+            failed ? 'f' : (produced == 0 ? 'e' : 'o'),
+            reason.empty() ? "-" : reason.c_str());
+  }
+
   void report() const {
-    printf("PARSE-SUMMARY conds=%lu ok=%lu empty=%lu failed=%lu tasks=%lu "
-           "loop_exits=%lu events=%lu\n",
+    printf("PARSE-SUMMARY conds=%lu ok=%lu empty=%lu failed=%lu weakened=%lu "
+           "tasks=%lu loop_exits=%lu events=%lu\n",
            (unsigned long)conds, (unsigned long)cond_ok,
            (unsigned long)cond_empty, (unsigned long)cond_failed,
+           (unsigned long)cond_weakened,
            (unsigned long)cond_tasks, (unsigned long)loop_exits,
            (unsigned long)events);
     printf("PARSE-SUMMARY geps=%lu ok=%lu empty=%lu failed=%lu tasks=%lu "

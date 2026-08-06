@@ -93,6 +93,12 @@ symsan::Z3ParserSolver *__z3_parser = nullptr;
 // machine-readable summary on exit; see report_parse_stats.  The per-event
 // trace is separate and off by default either way -- see SYMSAN_VERBOSE, which
 // still works here if you want to read a rejection in context.
+//
+// SYMSAN_DUMP_CONDS=<file> adds one line per condition on top of that summary,
+// keyed by (input, label), so that this driver's outcomes join against
+// afltest's over the same corpus rather than only being comparable in
+// aggregate -- see driver/sweep.h and tools/cond-diff.py.  Millions of lines on
+// a real corpus; off by default.
 static int __parse_only = 0;
 
 namespace {
@@ -182,6 +188,7 @@ static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *ad
     // no branch to flip, so it is neither a success nor a failure.
     __stats.conds++;
     __stats.loop_exits++;
+    symsan::sweep::log_cond_loop_exit();
     return;
   }
   std::vector<uint64_t> tasks;
@@ -191,6 +198,8 @@ static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *ad
     __stats.cond_tasks += tasks.size();
     __stats.note(failed != 0, tasks.size(), __z3_parser->last_error(), addr,
                  __stats.cond_ok, __stats.cond_empty, __stats.cond_failed, cid);
+    __stats.log(label, failed != 0, tasks.size(), __z3_parser->last_error(),
+                addr, cid);
     // Drop the tasks: retrieve_task hands over ownership, so without this the
     // parser's task table grows for the whole trace.
     for (auto id : tasks) __z3_parser->retrieve_task(id);
@@ -497,6 +506,11 @@ int main(int argc, char* const argv[]) {
   int solve_ub = 0;
   int debug = 0;
   __parse_only = getenv("SYMSAN_PARSE_ONLY") != nullptr;
+  if (!symsan::sweep::open_cond_log("z3")) {
+    fprintf(stderr, "Cannot open SYMSAN_DUMP_CONDS file: %s\n",
+            strerror(errno));
+    exit(1);
+  }
   __verbose = getenv("SYMSAN_VERBOSE") != nullptr;
   char *options = getenv("TAINT_OPTIONS");
   if (options) {
@@ -619,6 +633,10 @@ int main(int argc, char* const argv[]) {
       __stats = parse_stats();
       if (__parse_only) printf("PARSE-INPUT %s\n", argv[i]);
     }
+    // Outside the `many` guard: the per-condition dump is keyed by (input,
+    // label), so it needs the input named even for a single seed, where the
+    // PARSE-INPUT line above is deliberately not printed.
+    if (__parse_only) symsan::sweep::log_cond_input(argv[i]);
     if (run_one(program, argv[i], is_stdin) != 0) {
       failures++;
       continue;
@@ -626,6 +644,7 @@ int main(int argc, char* const argv[]) {
     if (__parse_only) __stats.report();
   }
 
+  symsan::sweep::close_cond_log();
   symsan_destroy();
   exit(failures ? 1 : 0);
 }

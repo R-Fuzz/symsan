@@ -13,10 +13,18 @@
 //   SYMSAN_USE_JIGSAW=1  add the jigsaw JIT solver to the chain
 //   SYMSAN_USE_Z3=1      add the z3 solver to the chain (needed for FP)
 //   SYMSAN_USE_NESTED=1  enable nested constraint solving in the parser
+//   SYMSAN_MAX_AST_SIZE=N the parser's AST size limit, default 200.  Raising it
+//                        is the control that tells a real constant fold apart
+//                        from a size-forced concretization.
 //   SYMSAN_NO_I2S=1      drop the i2s solver, which is otherwise always first;
 //                        the way to ask what one of the others can do alone
 //   SYMSAN_PARSE_ONLY=1  build the SearchTasks and drop them; report why the
 //                        parser refused the rest.  See below.
+//   SYMSAN_DUMP_CONDS=<f> under parse-only, also write one line per condition,
+//                        keyed by (input, label), so that this driver's
+//                        outcomes can be joined against fgtest's over the same
+//                        corpus -- see driver/sweep.h and tools/cond-diff.py.
+//                        Millions of lines on a real corpus; off by default.
 //   SYMSAN_VERBOSE=1     the per-event trace, off by default
 //   SYMSAN_NO_OUTPUT=1   solve, but do not write the solved inputs out.  The
 //                        fuzzer hands a solution back in memory
@@ -278,6 +286,7 @@ static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *ad
     // entries in fgtest's first sweep.
     __stats.conds++;
     __stats.loop_exits++;
+    symsan::sweep::log_cond_loop_exit();
     return;
   }
   std::vector<uint64_t> tasks;
@@ -287,6 +296,8 @@ static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *ad
     __stats.cond_tasks += tasks.size();
     __stats.note(failed != 0, tasks.size(), __parser->last_error(), addr,
                  __stats.cond_ok, __stats.cond_empty, __stats.cond_failed, cid);
+    __stats.log(label, failed != 0, tasks.size(), __parser->last_error(), addr,
+                cid);
     // Drop the tasks: retrieve_task hands over ownership, so without this the
     // parser's task table grows for the whole trace.
     for (auto id : tasks) __parser->retrieve_task(id);
@@ -561,6 +572,11 @@ int main(int argc, char* const argv[]) {
   int is_stdin = 0;
   int debug = 0;
   __parse_only = getenv("SYMSAN_PARSE_ONLY") != nullptr;
+  if (!symsan::sweep::open_cond_log("rgd")) {
+    fprintf(stderr, "Cannot open SYMSAN_DUMP_CONDS file: %s\n",
+            strerror(errno));
+    exit(1);
+  }
   __verbose = getenv("SYMSAN_VERBOSE") != nullptr;
   __enum_gep = getenv("SYMSAN_ENUM_GEP") != nullptr;
   __no_output = getenv("SYMSAN_NO_OUTPUT") != nullptr;
@@ -599,6 +615,23 @@ int main(int argc, char* const argv[]) {
   // enable nested solving in the parser?
   bool nested = getenv("SYMSAN_USE_NESTED") != nullptr;
 
+  // The parser's AST size limit, normally 200.  Exposed because "cond folded to
+  // constant" conflates two different things: a condition the program itself
+  // made constant, and one whose operands were *concretized because the AST was
+  // too big* (rgd-parser.cpp:1654 sets `concretize`, and the concrete_ops == 3
+  // arm then makes the same rgd::Bool a genuine fold would).  Raising the limit
+  // and re-running is the control that separates them -- whatever stops folding
+  // was never constant, it was only large.
+  // No "unlimited" spelling on purpose: ast_size_cache counts the AST as a
+  // *tree*, and on a libpng loop that is billions of nodes, so lifting the cap
+  // entirely throws std::length_error out of the arena reserve in ast.h:477.
+  // Raise it in steps instead and watch where the folding stops.
+  size_t max_ast_size = 200;
+  if (const char *m = getenv("SYMSAN_MAX_AST_SIZE")) {
+    size_t v = strtoull(m, nullptr, 0);
+    if (v) max_ast_size = v;
+  }
+
   // setup launcher
   void *shm_base = symsan_init(program, uniontable_size);
   if (shm_base == (void *)-1) {
@@ -617,7 +650,8 @@ int main(int argc, char* const argv[]) {
 
   // setup the RGD parser and the solver chain (matching driver/aflpp).  One
   // parser for the whole corpus: restart() per input is what it is for.
-  __parser = new rgd::RGDAstParser(shm_base, uniontable_size, nested);
+  __parser = new rgd::RGDAstParser(shm_base, uniontable_size, nested,
+                                   max_ast_size);
 
   // the simple i2s solver first, unless it is the thing being measured out.
   // Skipped entirely in parse-only mode -- building a JIT or a z3 context we
@@ -674,11 +708,23 @@ int main(int argc, char* const argv[]) {
       __stats = symsan::sweep::parse_stats();
       if (__parse_only) printf("PARSE-INPUT %s\n", argv[i]);
     }
+    // Outside the `many` guard: the per-condition dump is keyed by (input,
+    // label), so it needs the input named even for a single seed, where the
+    // PARSE-INPUT line above is deliberately not printed.
+    if (__parse_only) symsan::sweep::log_cond_input(argv[i]);
     if (run_one(program, argv[i], is_stdin) != 0) {
       failures++;
       continue;
     }
-    if (__parse_only) __stats.report();
+    if (__parse_only) {
+      // the parser's counter is cumulative over the corpus; the sweep reports
+      // per input, so hand it the delta
+      static uint64_t weakened_base = 0;
+      const uint64_t weakened = __parser->weakened_clauses();
+      __stats.cond_weakened = weakened - weakened_base;
+      weakened_base = weakened;
+      __stats.report();
+    }
   }
 
   // destroy the solvers (and their z3 solver members) here, while the global
@@ -686,6 +732,7 @@ int main(int argc, char* const argv[]) {
   // order across translation units would free the context first and crash.
   __solvers.clear();
 
+  symsan::sweep::close_cond_log();
   symsan_destroy();
   exit(failures ? 1 : 0);
 }
