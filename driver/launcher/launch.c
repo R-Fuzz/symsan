@@ -2,6 +2,7 @@
 #include "debug.h"
 #include "version.h"
 #include "launch.h"
+#include "symsan_ring.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +14,9 @@
 #include <sys/select.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
@@ -64,6 +67,15 @@ struct symsan_config {
   uint8_t *cov_map;
   size_t cov_map_size;
 
+  // The trace event ring (include/symsan_ring.h).  pipefds is still here and
+  // still open: with the ring up it carries the wake-up doorbell instead of the
+  // events, and on the exec-per-run path its EOF is still how we learn the
+  // child is gone.  ring == NULL means we could not get one and everything
+  // below falls back to the old one-write-per-event protocol.
+  int ring_fd;
+  struct symsan_ring_hdr *ring;
+  size_t ring_size;
+
   int exit_status;
   int is_killed;
 
@@ -82,6 +94,251 @@ struct symsan_config {
 #define FORKSRV_FD 198
 
 static struct symsan_config g_config;
+
+/* ---------------------------------------------------------------------------
+   The trace event ring.  See include/symsan_ring.h for the layout and for why
+   the events left the pipe; what stays here is our half of the protocol.
+
+   The consumer's contract does not change: symsan_read_event(buf, size,
+   timeout) still returns `size` on an event, 0 at end of trace and -1 on a
+   timeout or error, so none of the four callers know this happened.
+   --------------------------------------------------------------------------*/
+
+/* Spin this many times before telling the producer we are going to sleep.
+   PAUSE is anywhere from ~10 to ~140 cycles depending on the part, so this is
+   roughly a microsecond on current hardware -- enough to cover the gap between
+   two events the target emits back to back, and short enough that a target
+   which has wandered off into non-symbolic code does not cost us much.  Not
+   tuned against a measurement yet; the profile in step 7 of the plan is where
+   to revisit it. */
+#define RING_SPINS 64
+
+/* The longest the consumer will stay in one FUTEX_WAIT.  Nothing depends on
+   waking up this often: the producer wakes us when it commits and the fork
+   server wakes us when the run ends, so in normal operation this expiry never
+   fires.  What it is for is the case neither of those covers -- the fork server
+   itself dying, which used to show up immediately as fd 199 going readable at
+   EOF and now has nobody to report it.  Each expiry costs one zero-timeout
+   select() to ask that question; see forksrv_ring_read_event(). */
+#define RING_WAIT_SLICE_NSEC (250 * 1000 * 1000L)
+
+static uint64_t now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* Wake a producer that is blocked on a full ring.  Rare -- it needs the target
+   to outrun us by a whole ring -- but the futex wait on the other side is
+   bounded and gives up eventually, so missing this would cost a trace. */
+static void ring_wake_producer(void) {
+  /* Clearing the bit is part of the wake-up, not bookkeeping after it: a
+     producer that reaches FUTEX_WAIT a moment from now must not find the word
+     in the state it expected.  Our advance already changed it, so strictly this
+     is redundant for that producer -- what it prevents is the *next* advance
+     finding a stale bit and paying a syscall for a producer that is long since
+     running. */
+  symsan_ring_disarm(&g_config.ring->tail);
+  syscall(SYS_futex, symsan_ring_futex_word(&g_config.ring->tail),
+          SYMSAN_FUTEX_WAKE, 1, NULL, NULL, 0);
+}
+
+/* Take exactly `size` bytes if that many are queued.  1 on success, and no
+   syscall on the way -- this is the path that replaces select() + read(). */
+static int ring_take(void *buf, size_t size) {
+  struct symsan_ring_hdr *ring = g_config.ring;
+  uint64_t tail = symsan_ring_load_own(&ring->tail);
+
+  if (symsan_ring_used(symsan_ring_load_head_acq(ring), tail) < size) {
+    return 0;
+  }
+
+  symsan_ring_get(ring, tail, buf, size);
+  // Publishing the new tail is what frees the space, so it has to happen after
+  // the copy out.  One `lock xadd`, and the word it returns says whether a
+  // producer is blocked waiting for exactly this space -- no second load, and
+  // no window between freeing the space and learning who wanted it.
+  uint64_t prev = symsan_ring_advance(&ring->tail, size);
+  if (prev & SYMSAN_RING_WAITING) {
+    ring_wake_producer();
+  }
+  return 1;
+}
+
+/* Take whatever is left, up to `size`.  Only ever called once the writer is
+   known to be dead -- child reaped on the fork-server path, pipe at EOF on the
+   exec path -- where a short count means a genuinely truncated record rather
+   than one that has not arrived yet.  The callers already treat a return
+   other than `size` as a desync and skip the event, which is what they do with
+   a short pipe read today.
+
+   No wake-up here, and that is not an omission: the only process that could be
+   waiting on tail is the one we already know is gone. */
+static size_t ring_take_partial(void *buf, size_t size) {
+  struct symsan_ring_hdr *ring = g_config.ring;
+  uint64_t tail = symsan_ring_load_own(&ring->tail);
+  uint64_t avail = symsan_ring_used(symsan_ring_load_head_acq(ring), tail);
+
+  size_t n = avail < size ? (size_t)avail : size;
+  if (n == 0) {
+    return 0;
+  }
+  symsan_ring_get(ring, tail, buf, n);
+  symsan_ring_advance(&ring->tail, n);
+  return n;
+}
+
+/* Spin waiting for `size` bytes.  1 if they turned up, so the caller can return
+   without ever touching the kernel; this is the path that replaces select() +
+   read() and it is the one almost every event takes. */
+static int ring_spin(void *buf, size_t size) {
+  for (int i = 0; i < RING_SPINS; i++) {
+    if (ring_take(buf, size)) {
+      return 1;
+    }
+    SYMSAN_RING_PAUSE();
+  }
+  return 0;
+}
+
+/* Claim the waiting bit in the head cursor and hand back the word that claim
+   returned.  Everything the caller decides next -- are the bytes here after
+   all, has the run ended, what value do I pass to FUTEX_WAIT -- comes out of
+   this one word, which is what makes the decision race-free: the producer and
+   the fork server both learn we are waiting through the same atomic that
+   publishes whatever they were about to tell us.
+
+   The caller must clear the bit again on every path out, including the one
+   where it never sleeps.  Leaving it set is not a correctness bug -- the peer
+   just wakes someone who is already awake -- but it is a syscall per event
+   afterwards, which is the cost this whole file exists to avoid. */
+static uint64_t ring_arm_head(void) {
+  return symsan_ring_arm(&g_config.ring->head) | SYMSAN_RING_WAITING;
+}
+
+static void ring_disarm_head(void) {
+  symsan_ring_disarm(&g_config.ring->head);
+}
+
+/* Sleep on the head cursor until it changes away from `expect`, or the slice
+   runs out.  Returns nothing: every caller re-derives its state from the ring
+   afterwards rather than trusting why it woke, because a futex wait can return
+   for reasons that mean nothing (a spurious wake, an EAGAIN from a peer that
+   moved between our arm and this call, a signal). */
+static void ring_futex_wait_head(uint32_t expect, long nsec) {
+  struct timespec ts;
+  ts.tv_sec = nsec / 1000000000L;
+  ts.tv_nsec = nsec % 1000000000L;
+  syscall(SYS_futex, symsan_ring_futex_word(&g_config.ring->head),
+          SYMSAN_FUTEX_WAIT, expect, &ts, NULL, 0);
+}
+
+/* Set when this run has taken bytes off the pipe; see ring_check_target(). */
+static int ring_saw_pipe_bytes;
+
+/* Swallow doorbell bytes.  They carry nothing -- the producer writes one only
+   to break us out of select() -- so all that matters is emptying the pipe, or
+   the next select() returns on the same byte forever.  Returns the read()
+   result, because 0 still means EOF and that is how the exec path learns the
+   child is gone. */
+static ssize_t ring_drain_doorbell(void) {
+  char scratch[256];
+  ssize_t n = read(g_config.pipefds[0], scratch, sizeof(scratch));
+  if (n > 0) {
+    ring_saw_pipe_bytes = 1;
+  }
+  return n;
+}
+
+/* Called at end of trace, and the reason it exists: a target built before the
+   ring writes its events down the pipe, and dfsan's flag parser ignores the
+   ring_fd it does not know about rather than refusing to start.  We would then
+   read those events as doorbells, throw them away, and hand the caller an
+   empty trace with no error anywhere -- which is the single worst way for this
+   change to fail, and indistinguishable from #115.
+
+   A ring-aware target that produced anything has moved head; one that produced
+   nothing wrote no doorbells either, since the producer only rings after a
+   commit.  So "the pipe had bytes and head never moved" is exactly this case
+   and nothing else.  Once per process is enough to name it. */
+static void ring_check_target(void) {
+  static int warned;
+
+  if (!warned && ring_saw_pipe_bytes &&
+      symsan_ring_bytes(symsan_ring_load_head_acq(g_config.ring)) == 0) {
+    warned = 1;
+    WARNF("%s wrote trace events to the pipe instead of the event ring, so "
+          "this trace is empty. It was built against a SymSan runtime from "
+          "before the ring; rebuild it, or set SYMSAN_NO_RING=1.",
+          g_config.symsan_bin != NULL ? g_config.symsan_bin : "the target");
+  }
+  ring_saw_pipe_bytes = 0;
+}
+
+/* Create the segment.  Unlinked the moment it is mapped: the fd is what the
+   child gets (through ring_fd in TAINT_OPTIONS, like shm_fd for the union
+   table), the mapping keeps it alive, and a crash leaves nothing behind in
+   /dev/shm for the next run to trip over.
+
+   Not fatal if it fails.  Every path below checks g_config.ring and falls back
+   to the pipe, which is also what SYMSAN_NO_RING=1 selects -- that is the A/B
+   switch, and the escape hatch if this turns out to have a bug in the field. */
+static void ring_create(void) {
+  if (getenv("SYMSAN_NO_RING") != NULL) {
+    return;
+  }
+
+  size_t capacity = SYMSAN_RING_DEFAULT_CAPACITY;
+  const char *env = getenv("SYMSAN_RING_SIZE");
+  if (env != NULL) {
+    size_t want = (size_t)strtoull(env, NULL, 0);
+    if (!symsan_ring_size_ok(want)) {
+      WARNF("SYMSAN_RING_SIZE=%s is not a power of two >= 4096, ignoring", env);
+    } else {
+      capacity = want;
+    }
+  }
+
+  char *name = alloc_printf("/symsan-event-ring-%d", getpid());
+  if (name == NULL) {
+    return;
+  }
+
+  int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+  if (fd == -1) {
+    WARNF("cannot create the event ring (%s), falling back to the pipe",
+          strerror(errno));
+    free(name);
+    return;
+  }
+  shm_unlink(name);
+  free(name);
+
+  size_t total = symsan_ring_total_size(capacity);
+  if (ftruncate(fd, total) == -1) {
+    WARNF("cannot size the event ring (%s), falling back to the pipe",
+          strerror(errno));
+    close(fd);
+    return;
+  }
+
+  void *base = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (base == MAP_FAILED) {
+    WARNF("cannot map the event ring (%s), falling back to the pipe",
+          strerror(errno));
+    close(fd);
+    return;
+  }
+
+  // The child inherits this across execv(), so it must survive it.
+  fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) & ~FD_CLOEXEC);
+
+  symsan_ring_init((struct symsan_ring_hdr *)base, capacity);
+
+  g_config.ring_fd = fd;
+  g_config.ring = (struct symsan_ring_hdr *)base;
+  g_config.ring_size = total;
+}
 
 __attribute__((visibility("default")))
 void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
@@ -114,6 +371,9 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   g_config.cov_shm_id = -1;
   g_config.cov_map = NULL;
   g_config.cov_map_size = 0;
+  g_config.ring_fd = -1;
+  g_config.ring = NULL;
+  g_config.ring_size = 0;
   g_config.exit_status = 0;
   g_config.is_killed = 0;
   g_config.forksrv_requested = 0;
@@ -147,6 +407,8 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   // mmap the shm
   g_config.label_info = mmap(NULL, uniontable_size, PROT_READ, MAP_SHARED,
       g_config.shm_fd, 0);
+
+  ring_create();
 
   return g_config.label_info;
 }
@@ -360,11 +622,16 @@ static void cov_map_export(void) {
    fork server fallback has to build it a second time with forksrv turned back
    off. */
 static char *build_symsan_env(int use_forksrv) {
+  // ring_fd=-1 is the "no ring, keep writing events down the pipe" case, which
+  // is exactly the flag's default, so this needs no conditional spelling.
   return alloc_printf(
-      "taint_file=\"%s\":shm_fd=%d:pipe_fd=%d:debug=%d:trace_bounds=%d:"
+      "taint_file=\"%s\":shm_fd=%d:pipe_fd=%d:ring_fd=%d:ring_size=%zu:"
+      "debug=%d:trace_bounds=%d:"
       "solve_ub=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d:"
       "forksrv=%d",
       g_config.input_file, g_config.shm_fd, g_config.pipefds[1],
+      g_config.ring_fd,
+      g_config.ring != NULL ? (size_t)g_config.ring->capacity : (size_t)0,
       g_config.enable_debug, g_config.enable_bounds_check,
       g_config.enable_solve_ub, g_config.exit_on_memerror,
       g_config.trace_file_size, g_config.force_stdin, use_forksrv);
@@ -509,6 +776,21 @@ static int forksrv_nfds(void) {
   return hi + 1;
 }
 
+/* Is there something to read on fd 199?  Zero timeout, so this is a question
+   and not a wait.  Only the ring path asks it, and only as a liveness check --
+   see forksrv_ring_read_event. */
+static int forksrv_status_ready(void) {
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(g_config.forksrv_st_fd, &rfds);
+
+  struct timeval tv;
+  tv.tv_sec = 0;
+  tv.tv_usec = 0;
+
+  return select(g_config.forksrv_st_fd + 1, &rfds, NULL, NULL, &tv) > 0;
+}
+
 /* Collect the finished child's wait status, throwing away anything it left in
    the event pipe.  Called once per run, whether the run ended by itself or we
    killed it: leftover bytes would otherwise turn up as phantom events at the
@@ -553,7 +835,110 @@ static void forksrv_reap(void) {
   g_config.symsan_pid = -1;
 }
 
-/* One event, fork-server flavoured.
+/* Give up on the current run: kill the child, mark it, and still collect the
+   status so the next run starts on clean pipes.  Never kills the server. */
+static ssize_t forksrv_kill_run(void) {
+  if (g_config.symsan_pid > 0) {
+    kill(g_config.symsan_pid, SIGKILL);
+  }
+  g_config.is_killed = 1;
+  forksrv_reap();
+  return -1;
+}
+
+/* Everything the ring still holds once the run is over, then end of file.
+   Reached from the EOR bit; the child is reaped by then, so a record that is
+   short is short for good. */
+static ssize_t forksrv_ring_finish(void *buf, size_t size) {
+  // Events can land between any check above and getting here, so look once
+  // more before calling it the end.  EOR stays set and the next call comes
+  // straight back, which is why this returns without reaping.
+  if (ring_take(buf, size)) {
+    return (ssize_t)size;
+  }
+  size_t partial = ring_take_partial(buf, size);
+  if (partial > 0) {
+    // A record the child was cut off in the middle of.  Same shape as a short
+    // pipe read, and the callers already treat it as a desync.
+    forksrv_reap();
+    return (ssize_t)partial;
+  }
+  ring_check_target();
+  forksrv_reap();
+  return 0; // end of this run's trace
+}
+
+/* One event, fork server plus ring: no fd is involved at all while the run is
+   in flight.
+
+   Both of the things that can end a wait here now arrive as a change to the
+   head cursor -- the producer's commit, and the fork server's end-of-run bit
+   after waitpid() (backend/forkserver.cpp).  So the wait is a FUTEX_WAIT on
+   that one word, and the value we hand the kernel is the word our own arm
+   returned, which is what makes it impossible to sleep through either of them:
+   if the change landed first, the compare fails and we come back immediately.
+
+   The status on fd 199 is still what a run ended with and still what
+   forksrv_reap() collects.  What the bit replaces is only the select() that
+   used to be how we noticed, and the doorbell byte that used to be how the
+   producer got our attention. */
+static ssize_t forksrv_ring_read_event(void *buf, size_t size,
+                                       unsigned int timeout) {
+  uint64_t deadline = timeout ? now_ms() + timeout : 0;
+
+  while (1) {
+    // The whole point: when the target is keeping up this returns and we make
+    // no syscall at all, so everything below runs once per drained queue rather
+    // than once per event -- 151 times against 150,149 events on libpng.
+    if (ring_spin(buf, size)) {
+      return (ssize_t)size;
+    }
+
+    uint64_t head = ring_arm_head();
+    if (symsan_ring_used(head, symsan_ring_load_own(&g_config.ring->tail)) >=
+        size) {
+      ring_disarm_head();
+      continue; // it arrived while we were arming; take it on the next pass
+    }
+    if (head & SYMSAN_RING_EOR) {
+      ring_disarm_head();
+      return forksrv_ring_finish(buf, size);
+    }
+
+    long slice = RING_WAIT_SLICE_NSEC;
+    if (deadline) {
+      uint64_t now = now_ms();
+      if (now >= deadline) {
+        ring_disarm_head();
+        return forksrv_kill_run();
+      }
+      uint64_t left = deadline - now;
+      if ((long)left * 1000000L < slice) {
+        slice = (long)left * 1000000L;
+      }
+    }
+
+    ring_futex_wait_head(symsan_ring_futex_expect(head), slice);
+    ring_disarm_head();
+
+    if (deadline && now_ms() >= deadline) {
+      return forksrv_kill_run();
+    }
+
+    // The one thing neither wake-up covers: the fork server itself dying.  That
+    // used to surface instantly as fd 199 going readable at EOF, and with
+    // nobody left to set the end-of-run bit it would otherwise be a hang.  So
+    // every slice expiry asks the question directly.  It costs one syscall per
+    // 250ms of genuine idling and none at all when a wake-up is what brought us
+    // here, because then the loop above has already returned.
+    if (forksrv_status_ready()) {
+      return forksrv_ring_finish(buf, size);
+    }
+  }
+}
+
+/* One event, fork server on the pipe -- the fallback when no ring was mapped
+   (SYMSAN_NO_RING=1, or a shm_open that failed).
 
    The event pipe's write end lives in the fork server rather than in the child,
    so it never reaches EOF and cannot mark the end of a run the way it does on
@@ -562,18 +947,8 @@ static void forksrv_reap(void) {
    child, every event the child produced is already in the pipe by then.  So we
    watch both, drain the pipe first, and report "pipe empty and status ready" to
    the caller as this run's end of file. */
-static ssize_t forksrv_read_event(void *buf, size_t size,
-                                  unsigned int timeout) {
-  // The run this call belongs to is already over and the next one has not been
-  // asked for.  On the exec path the closed pipe reports that by itself; here
-  // the pipe is still open and shared with the server, so a select() would
-  // simply block on a child that is not coming.  Callers that read a message
-  // header and then go back for its payload can land here after an error, so
-  // this is not just belt and braces.
-  if (g_config.symsan_pid < 0) {
-    return 0;
-  }
-
+static ssize_t forksrv_pipe_read_event(void *buf, size_t size,
+                                       unsigned int timeout) {
   while (1) {
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -597,12 +972,7 @@ static ssize_t forksrv_read_event(void *buf, size_t size,
     if (ret == 0) {
       // Timed out.  Kill the run, not the server -- then still wait for the
       // status, so the next run starts on clean pipes.
-      if (g_config.symsan_pid > 0) {
-        kill(g_config.symsan_pid, SIGKILL);
-      }
-      g_config.is_killed = 1;
-      forksrv_reap();
-      return -1;
+      return forksrv_kill_run();
     }
 
     if (FD_ISSET(g_config.pipefds[0], &rfds)) {
@@ -622,6 +992,24 @@ static ssize_t forksrv_read_event(void *buf, size_t size,
     forksrv_reap();
     return 0; // end of this run's trace
   }
+}
+
+static ssize_t forksrv_read_event(void *buf, size_t size,
+                                  unsigned int timeout) {
+  // The run this call belongs to is already over and the next one has not been
+  // asked for.  On the exec path the closed pipe reports that by itself; here
+  // the pipe is still open and shared with the server, so a select() would
+  // simply block on a child that is not coming.  Callers that read a message
+  // header and then go back for its payload can land here after an error, so
+  // this is not just belt and braces.
+  if (g_config.symsan_pid < 0) {
+    return 0;
+  }
+
+  if (g_config.ring != NULL) {
+    return forksrv_ring_read_event(buf, size, timeout);
+  }
+  return forksrv_pipe_read_event(buf, size, timeout);
 }
 
 /* Shut the fork server itself down.  Closing the control pipe is its cue: the
@@ -704,6 +1092,17 @@ int symsan_run(int fd) {
     }
   } else {
     memset(g_config.cov_map, 0, g_config.cov_map_size);
+  }
+
+  // Same idea, and the same one-call-per-input property, for the event ring:
+  // rewind both cursors rather than letting them run for the life of the
+  // campaign.  What that buys is that a caller who abandons a trace half-read
+  // -- on a timeout, or because it found what it wanted -- cannot leave the
+  // leftovers at the head of the next run's stream.  It is the ring's version
+  // of the pipe drain forksrv_reap() already does, and it has the same
+  // precondition as the memset above: the previous child is finished with.
+  if (g_config.ring != NULL) {
+    symsan_ring_reset(g_config.ring);
   }
 
   // Fork server already up: everything below has been done once already, and
@@ -823,6 +1222,107 @@ int symsan_run(int fd) {
   return 0;
 }
 
+/* Close out an exec-path run: reap the child and close the read end, so that
+   the next call short-circuits on pipefds[0] < 0.  Lifted out of the tail of
+   symsan_read_event() so the ring path below can end a run the same way rather
+   than growing a second version of it. */
+static void exec_run_teardown(void) {
+  if (g_config.symsan_pid > 0) {
+    waitpid(g_config.symsan_pid, &g_config.exit_status, 0);
+    g_config.symsan_pid = -1;
+  }
+  if (g_config.pipefds[0] >= 0) {
+    close(g_config.pipefds[0]); // close the read fd
+    g_config.pipefds[0] = -1;
+  }
+}
+
+/* One event on the exec-per-run path, with the ring up.
+
+   Here the pipe's write end really is in the traced child, so its EOF still
+   means "the child is gone" -- which is the one control signal this path has
+   and the reason we keep select()ing on it.  Everything the child wrote is
+   committed to the ring by the time we see that EOF, so the ring is drained
+   after it and not before.
+
+   So this is the one path that still wakes on the pipe: a futex cannot wait on
+   a file descriptor, and here the end of a run *is* a file descriptor event.
+   The producer sees that in flags().forksrv and sends a doorbell byte instead
+   of a FUTEX_WAKE -- but it still only sends one when the head cursor says we
+   are waiting, so arming is what we do before the select() either way. */
+static ssize_t ring_read_event(void *buf, size_t size, unsigned int timeout) {
+  while (1) {
+    if (ring_spin(buf, size)) {
+      return (ssize_t)size;
+    }
+
+    uint64_t head = ring_arm_head();
+    if (symsan_ring_used(head, symsan_ring_load_own(&g_config.ring->tail)) >=
+        size) {
+      ring_disarm_head();
+      continue; // it arrived while we were arming; take it on the next pass
+    }
+
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(g_config.pipefds[0], &rfds);
+
+    struct timeval tv;
+    struct timeval *ptv = NULL;
+    if (timeout) {
+      tv.tv_sec = (timeout / 1000);
+      tv.tv_usec = (timeout % 1000) * 1000;
+      ptv = &tv;
+    }
+
+    // Unlike the pipe path, timeout == 0 blocks here rather than falling
+    // straight into read(): the blocking used to be the read()'s job and now
+    // there is nothing else to do it.
+    int ret = select(g_config.pipefds[0] + 1, &rfds, NULL, NULL, ptv);
+    ring_disarm_head();
+
+    if (ret < 0 && errno == EINTR) {
+      continue;
+    }
+
+    if (ret <= 0) {
+      // Timed out, or select() failed.  Same handling as the pipe path: kill
+      // the run, mark it, and close it out.
+      if (g_config.symsan_pid > 0) {
+        kill(g_config.symsan_pid, SIGKILL);
+      }
+      g_config.is_killed = 1;
+      exec_run_teardown();
+      return -1;
+    }
+
+    ssize_t n = ring_drain_doorbell();
+    if (n > 0) {
+      continue; // a doorbell; the payload is in the ring
+    }
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      exec_run_teardown();
+      return -1;
+    }
+
+    // EOF: the child has exited, so no further commit is coming.  Take what is
+    // there before ending the run -- events can land between the check at the
+    // top of this iteration and select() returning.
+    if (ring_take(buf, size)) {
+      return (ssize_t)size; // more may follow; the EOF is still there next call
+    }
+    size_t partial = ring_take_partial(buf, size);
+    if (partial == 0) {
+      ring_check_target();
+    }
+    exec_run_teardown();
+    return (ssize_t)partial; // 0 is end of trace, short is a truncated record
+  }
+}
+
 __attribute__((visibility("default")))
 ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
   if (size == 0) {
@@ -839,6 +1339,10 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
   // of -1 to kill -- and kill(-1) is every process this uid owns.
   if (g_config.pipefds[0] < 0) {
     return 0;
+  }
+
+  if (g_config.ring != NULL) {
+    return ring_read_event(buf, size, timeout);
   }
 
   int ret = 1;
@@ -944,6 +1448,18 @@ void symsan_destroy() {
   // After forksrv_shutdown() above, so that nothing is still attached to the
   // segment when it goes.
   cov_map_destroy();
+
+  // Likewise for the event ring.  Nothing to unlink -- ring_create() did that
+  // as soon as it had the mapping.
+  if (g_config.ring != NULL) {
+    munmap(g_config.ring, g_config.ring_size);
+    g_config.ring = NULL;
+    g_config.ring_size = 0;
+  }
+  if (g_config.ring_fd != -1) {
+    close(g_config.ring_fd);
+    g_config.ring_fd = -1;
+  }
 
   if (g_config.shm_fd != -1) {
     close(g_config.shm_fd);

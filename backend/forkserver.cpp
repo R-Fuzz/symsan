@@ -36,6 +36,16 @@
   drains events first, and treats "pipe empty, status ready" as end of trace.
   Nothing extra goes into the event stream, which keeps this protocol exactly
   AFL's.
+
+  With the event ring up (include/symsan_ring.h) the driver no longer watches
+  fds at all while a run is in flight -- it sleeps on the ring's head cursor,
+  because that is where the events are and a syscall per event is what the ring
+  exists to remove.  A futex cannot wait on a file descriptor, so a run that
+  ends without another event would leave it asleep with the status sitting
+  unread on 199.  __taint_ring_end_of_run() is the one extra thing this file
+  does about that: it sets a bit in that same cursor, which is an edge and not a
+  message.  fd 199 still carries the status, the driver still reaps it there,
+  and the protocol on the wire is still exactly AFL's.
 */
 
 #include "solver_common.h"
@@ -108,6 +118,16 @@ extern "C" void InitializeSymSanForkServer() {
     // Order matters: the child is reaped, so its trace events are all in the
     // solver pipe ahead of this.  The driver can safely read this as "that was
     // the whole trace".
+    //
+    // The ring's end-of-run bit goes first, and that order is the whole reason
+    // it is a separate call rather than something the driver infers from the
+    // status.  Set it afterwards instead and the driver could read the status,
+    // reap, and start the next run -- resetting the ring on its way -- before
+    // this process got there, and the bit would land on the following run's
+    // cursor and end that trace at zero events.  Ahead of the write there is no
+    // such window: the driver has nothing to act on until the status arrives.
+    __taint_ring_end_of_run();
+
     if (internal_write(kForksrvStatusFd, &status, sizeof(status)) !=
         sizeof(status))
       internal__exit(0);

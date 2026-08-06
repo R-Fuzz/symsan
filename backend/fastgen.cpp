@@ -36,9 +36,7 @@ static inline void __send_ubi(dfsan_label label, uint64_t result,
     .result = result
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 }
 
 static struct switch_true_case {
@@ -239,9 +237,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
     .result = (uint64_t)index
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   gep_msg gmsg = {
     .ptr_label = ptr_label,
@@ -254,9 +250,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
   };
 
   // FIXME: assuming single writer so msg will arrive in the same order
-  if (internal_write(__pipe_fd, &gmsg, sizeof(gmsg)) < 0) {
-    Die();
-  }
+  __taint_emit(&gmsg, sizeof(gmsg));
 
   return;
 }
@@ -318,9 +312,7 @@ __taint_table_lookup(dfsan_label index_label, int64_t index,
       .result = content_size
     };
 
-    if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-      Die();
-    }
+    __taint_emit(&msg, sizeof(msg));
 
     size_t msg_size = sizeof(table_msg) + content_size;
     table_msg *tmsg = (table_msg*)__builtin_alloca(msg_size);
@@ -330,9 +322,7 @@ __taint_table_lookup(dfsan_label index_label, int64_t index,
     internal_memcpy(tmsg->content, (void*)table_ptr, content_size);
 
     // FIXME: assuming single writer so msg will arrive in the same order
-    if (internal_write(__pipe_fd, tmsg, msg_size) < 0) {
-      Die();
-    }
+    __taint_emit(tmsg, msg_size);
   }
 
   return dfsan_union(index_label, 0, __dfsan::tlookup,
@@ -363,9 +353,7 @@ __taint_trace_offset(dfsan_label offset_label, s64 offset, unsigned size) {
     .result = (uint64_t)offset
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -392,9 +380,7 @@ __taint_add_constraint(dfsan_label label, uint8_t result) {
     .result = (uint64_t)result
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -429,9 +415,7 @@ __taint_minimize_label(dfsan_label label, u64 size, dfsan_label bounds) {
     .result = 0
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   if (!flags().allow_zero_size_alloc && size == 0) {
     // Emit this after the minimize message so the manager records the hint
@@ -481,9 +465,7 @@ __taint_trace_memcmp(dfsan_label label) {
     .result = (uint64_t)info->size
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   if (!has_content)
     return;
@@ -497,9 +479,7 @@ __taint_trace_memcmp(dfsan_label label) {
   AOUT("sending memcmp content for label %d, size %u, msg_size=%lu\n", label, info->size, msg_size);
 
   // FIXME: assuming single writer so msg will arrive in the same order
-  if (internal_write(__pipe_fd, mmsg, msg_size) < 0) {
-    Die();
-  }
+  __taint_emit(mmsg, msg_size);
 
   return;
 }
@@ -532,9 +512,7 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
     .result = r
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 }
 
 extern "C" void InitializeSymSanSolver() {

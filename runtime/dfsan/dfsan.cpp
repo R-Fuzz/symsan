@@ -2133,6 +2133,7 @@ extern "C" dfsan_label taint_get_base_input_label(dfsan_label label) {
 // information is passed implicitly through flags()
 extern "C" void InitializeSymSanSolver();
 extern "C" void InitializeSymSanForkServer();
+extern "C" void InitializeSymSanEventRing();
 
 static void InitializeFlags() {
   SetCommonFlagsDefaults();
@@ -2278,6 +2279,14 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   // and the only way the counts reach the fuzzer at all.
   InitializeAflCoverage();
 
+  // Same reasoning for the trace event ring (include/symsan_ring.h): it is
+  // shared memory the driver owns for the whole campaign, so map it once here
+  // and let every child inherit the MAP_SHARED mapping.  It cannot ride along
+  // in InitializeSymSanSolver() below, which is on the other side of the fork
+  // point and would remap it per run.  A no-op unless the driver passed
+  // ring_fd.
+  InitializeSymSanEventRing();
+
   // The fork server, if one was asked for, has to sit exactly here.  Everything
   // above is input-independent -- the shadow and union mappings, the hashtable
   // allocator, the interceptors -- and is what we want to pay for once and
@@ -2318,6 +2327,9 @@ SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanSolver, void) {}
 
 // Backends that do not implement a fork server just run once, as before.
 SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanForkServer, void) {}
+
+// Backends with no event channel at all have no ring to map.
+SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanEventRing, void) {}
 
 // Default empty implementations (weak) for hooks
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,

@@ -37,6 +37,18 @@ target_link_libraries(AFLTest PRIVATE
 )
 install (TARGETS AFLTest DESTINATION ${SYMSAN_BIN_DIR})
 
+## the event channel's death paths -- traced child hangs, fork server killed,
+## consumer stops reading -- which every other driver reaches only by accident.
+## Launcher only: it never looks at what was traced, just at whether the call
+## comes back.
+add_executable(DeathTest deathtest.c)
+set_target_properties(DeathTest PROPERTIES OUTPUT_NAME "deathtest")
+target_link_libraries(DeathTest PRIVATE
+  launcher
+  rt
+)
+install (TARGETS DeathTest DESTINATION ${SYMSAN_BIN_DIR})
+
 ## offline check that the branch map joins SymSan branches to the *right* AFL++
 ## edges, against an afl-showmap run as ground truth
 add_executable(CovCheck covcheck.cpp)

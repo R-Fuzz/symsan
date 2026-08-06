@@ -38,6 +38,12 @@ DFSAN_FLAG(int, shm_fd, -1, "shared union table.")
 DFSAN_FLAG(const char *, shm_name, "", "shared union table by key.")
 DFSAN_FLAG(size_t, shm_size, 0, "shared union table size.")
 DFSAN_FLAG(int, pipe_fd, -1, "communication pipe fd.")
+DFSAN_FLAG(int, ring_fd, -1, "shared-memory event ring fd. When set, trace "
+                             "events go on the ring and the pipe carries only "
+                             "the wake-up doorbell; -1 keeps the old "
+                             "one-write-per-event pipe protocol.")
+DFSAN_FLAG(size_t, ring_size, 0, "event ring capacity in bytes, a power of two "
+                                 "of at least 4096. 0 takes the default.")
 DFSAN_FLAG(const char *, pipe_name, "", "communication pipe filename.")
 DFSAN_FLAG(int, control_pipe_fd, -1, "control pipe fd.")
 DFSAN_FLAG(const char *, control_pipe_name, "", "control pipe filename.")
