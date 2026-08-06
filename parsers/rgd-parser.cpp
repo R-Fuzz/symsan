@@ -286,6 +286,27 @@ static inline bool is_rel_cmp(uint16_t op, __dfsan::predicate pred) {
   return ((op & 0xff) == __dfsan::ICmp) && ((op >> 8) == pred);
 }
 
+// Negate a boolean node in place, given the child that carries its value.
+//
+// A child that has already folded to rgd::Bool has to be folded again rather
+// than wrapped: nothing above find_roots can read an LNot over a Bool.  to_nnf
+// stops at what it takes to be a leaf, does not recognize the kind, and refuses
+// the whole condition with "unexpected node kind" (#130).  Every other arm in
+// find_roots -- Not, And, Or, Xor -- already collapses a Bool child, so the
+// tree it hands up holds no Bool below the root; these were the sites that
+// leaked one.
+static inline void negate_bool_node(rgd::AstNode *node,
+                                    const rgd::AstNode *child) {
+  if (unlikely(child->kind() == rgd::Bool)) {
+    const uint32_t v = !child->boolvalue();
+    node->set_kind(rgd::Bool);
+    node->set_boolvalue(v); // computed before clear_children invalidates child
+    node->clear_children();
+  } else {
+    node->set_kind(rgd::LNot);
+  }
+}
+
 static inline bool eval_icmp(uint16_t op, uint64_t op1, uint64_t op2) {
   if ((op & 0xff) == __dfsan::ICmp) {
     switch (op >> 8) {
@@ -1214,6 +1235,7 @@ RGDAstParser::constraint_t RGDAstParser::parse_constraint(dfsan_label label) {
 [[gnu::hot]]
 task_t RGDAstParser::construct_task(const clause_t &clause) {
   task_t task = std::make_shared<rgd::SearchTask>();
+  bool weakened = false;
   for (auto const& node: clause) {
     auto itr = constraint_cache.find(node->label());
     if (itr != constraint_cache.end()) {
@@ -1225,19 +1247,59 @@ task_t RGDAstParser::construct_task(const clause_t &clause) {
     constraint_t constraint = parse_constraint(node->label());
     // to maximize the resuability of the AST, the relational operator
     // is recorded elsewhere
-    if (likely(constraint != nullptr)) {
-      task->add_constraint(constraint, node->kind());
-      constraint_cache.insert({node->label(), constraint});
+    if (unlikely(constraint == nullptr)) {
+      // A clause is a *conjunction*, so a task built from only the conjuncts
+      // that parsed is weaker than the clause it came from: a solution to it
+      // need not reach the target direction at all.  Which of the two things to
+      // do about that is a policy question, not a correctness one, and it is
+      // strict_clauses_:
+      //
+      //   lenient (default) -- keep going and hand out the weaker task.  We are
+      //     generating candidate inputs for a fuzzer, not proving anything.  A
+      //     candidate that does not flip the branch costs one execution and may
+      //     still reach new coverage, so trying beats not trying.  It is
+      //     counted, because "solved but never flipped" otherwise looks like a
+      //     solver failure in the flip log (see --flip-log) rather than a task
+      //     that was never going to flip.
+      //   strict -- drop the whole clause.  Exact: the other disjuncts still
+      //     flip the branch, so this only loses solutions.  For a consumer that
+      //     must be able to trust a task.
+      //
+      // Measured, on the leaky parser that made this reachable at all (#130):
+      // normtest --cases 5000 --const-pct 50 reports 7-9 unsound outcomes
+      // across three seeds under lenient, and 0 unsound / 5-7 lossy under
+      // strict.  With the leak fixed nothing in the matrix reaches here under
+      // either policy, which is the real fix; this arm is about what happens
+      // the next time some conjunct will not parse -- on a real target that is
+      // "ast arena full" (16 in 4.47M libpng conditions) or an unsupported op.
+      weakened = true;
+      WARNF("weakening clause: conjunct %u would not parse\n", node->label());
+      if (strict_clauses_) {
+        REJECT_IF_UNSET("unparsable conjunct",
+                        "dropping clause: strict_clauses is set\n");
+        return nullptr;
+      }
+      continue;
     }
+    task->add_constraint(constraint, node->kind());
+    constraint_cache.insert({node->label(), constraint});
   }
   if (!task->empty()) {
+    // Counted here rather than at the skip: what matters is how many tasks went
+    // out that cannot flip their branch, and a clause that lost *every*
+    // conjunct produced no task at all.  On libpng those are the only kind --
+    // 28 conjunct skips, all of them in clauses that ended up empty, so this
+    // stays 0 and empty= carries them instead.
+    if (unlikely(weakened)) weakened_clauses_++;
     task->finalize();
     return task;
   }
-  // every constraint in the clause failed to parse.  Each parse_constraint()
-  // above already named its own cause and that is the more useful bucket, so
-  // only speak up if the clause was empty to begin with.
-  if (last_error().empty()) set_error("empty clause");
+  // Nothing survived.  In lenient mode that means every conjunct was skipped
+  // above, which is a real path; parse_constraint already named the cause of
+  // the last one, and REJECT_IF_UNSET keeps that more specific bucket.  A
+  // genuinely empty clause is not reachable -- to_dnf's base case always pushes
+  // a node -- so the fallback below is a guard.
+  REJECT_IF_UNSET("empty clause", "no conjunct of the clause parsed\n");
   return nullptr;
 }
 
@@ -1650,13 +1712,13 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
                     if (info->op2.i == 1) { // checking bool == true
                       node->CopyFrom(*left);
                     } else { // checking bool == false
-                      node->set_kind(rgd::LNot);
+                      negate_bool_node(node, left);
                     }
                   } else { // bvneq
                     if (info->op2.i == 0) { // checking bool != false
                       node->CopyFrom(*left);
                     } else { // checking bool != true
-                      node->set_kind(rgd::LNot);
+                      negate_bool_node(node, left);
                     }
                   }
                 } else {
@@ -1678,13 +1740,13 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
                     if (info->op1.i == 1) { // checking true == bool
                       node->CopyFrom(*right);
                     } else { // checking false == bool
-                      node->set_kind(rgd::LNot);
+                      negate_bool_node(node, right);
                     }
                   } else { // bvneq
                     if (info->op1.i == 0) { // checking false != bool
                       node->CopyFrom(*right);
                     } else { // checking true != bool
-                      node->set_kind(rgd::LNot);
+                      negate_bool_node(node, right);
                     }
                   }
                 } else {
@@ -2242,8 +2304,41 @@ int RGDAstParser::parse_cond(dfsan_label label, bool result, bool add_nested,
     // if the simplified formula is a boolean constant, nothing to do
     DEBUGF("cond simplified to be a constant\n");
     // no task, and worth saying so: this is the single largest source of
-    // branches we never attempt on a real target, and roughly half of it is
-    // our own folding rather than the program's own dead test
+    // branches we never attempt on a real target.
+    //
+    // The name reads as the program's own dead test, and most of what lands
+    // here is not that.  It is the concretization heuristic at :1654 -- an
+    // operand whose AST is too complex to solve stops being symbolic, on
+    // purpose -- reaching `concrete_ops == 3` and taking the same
+    // set_kind(rgd::Bool) path a genuinely constant comparison does.  The two
+    // are indistinguishable from here down, and how the count splits between
+    // them is a property of the target, not of this code -- on the one it has
+    // been measured on the cap accounted for nearly all of it.  So do not read
+    // this number as the program's dead branches without first re-running with
+    // afltest's SYMSAN_MAX_AST_SIZE raised; tools/cond-diff.py splits it per
+    // condition.
+    //
+    // Before refusing, check the fold against reality.  This is the soundness
+    // guard for this path, and note that "did z3 fold it too" is *not*: a
+    // disagreement with z3 is a capability difference (it kept a condition we
+    // concretized, or simplified one we did not), and neither direction of it
+    // can produce a wrong answer.  What can is folding to a constant the
+    // program contradicts.  Every route to rgd::Bool here ends in eval_icmp on
+    // the concrete operand values the runtime traced, so the folded value must
+    // equal `result`, the direction the branch actually took -- unless the
+    // shadow those operands came from is stale, or a fold rule is wrong.  Both
+    // are silent otherwise: we return 0 either way and the branch just never
+    // gets attempted.
+    //
+    // This is the cheap, local half of what z3-ts does by recomputing every
+    // operand (FILTER_WRONG_AST, "value mismatch for cond"); the general
+    // version for RGD is #126.  Free here -- one comparison on a path that
+    // already returns early.
+    if (unlikely(orig_root->boolvalue() != (uint8_t)result)) {
+      REJECT("cond folded against the branch", "label %u folded to %u but the "
+             "branch went %u\n", label, orig_root->boolvalue(), (unsigned)result);
+      return 0;
+    }
     set_error("cond folded to constant");
     return 0;
   }

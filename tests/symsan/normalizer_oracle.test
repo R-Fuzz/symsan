@@ -15,11 +15,38 @@
 #   shallow + many leaves wide DNFs and a bigger truth table per formula
 #   high --boolcmp-pct    the `bool ==/!= 0/1` arm of find_roots' icmp case,
 #                         which is a connective (copy or LNot), not a fold
+#   --const-pct           an rgd::Bool below the root, which every arm of
+#                         find_roots has to fold rather than wrap (#130)
 #
-# --const-pct stays at its default 0.  That shape -- a constant operand to a
-# boolean connective -- fails, but __taint_union() folds every one of them away
-# before a label exists, so it cannot occur on a trace; it is filed, and
-# normtest still generates it on request.  See gen_term() in the driver.
+# The --const-pct runs need the last one spelled out, because the shape they
+# generate -- a constant operand to a boolean connective -- is one
+# __taint_union() folds away before a label exists, so it cannot arrive from a
+# trace.  The Bool node it produces can: find_roots concretizes an ICmp leaf
+# whose operand subtrees exceed max_ast_size into exactly that.  This is the
+# only way we generate it, and it caught a real bug -- the bool-icmp arm wrapped
+# such a child in LNot instead of folding it, which to_nnf then refused
+# ("unexpected node kind") or construct_task quietly dropped, the latter
+# producing tasks weaker than the clause they came from.  Before the fix these
+# three runs reported unsound=3/8/9, lossy=2/4/5 and incomplete=36/92/182.  See
+# gen_term() in the driver.
+#
+# unsound= and lossy= are asserted separately because only one of the two can
+# mislead a solver.  unsound means the DNF admits an assignment that does not
+# reach the target direction, so a solution to it need not flip the branch;
+# lossy means solutions were dropped.  Both fail the run -- the parser owes
+# exact equivalence -- but a regression in the first is a wrong answer and one
+# in the second is lost coverage, and one counter cannot say which.
+#
+# The last three runs add --strict, which is construct_task's other policy for
+# a conjunct that will not parse: drop the whole clause rather than hand out
+# the weakened one.  Lenient is what the fuzzer runs -- a candidate input that
+# does not flip the branch costs one execution and may still find coverage, so
+# trying beats not trying -- and strict is for a consumer that has to trust a
+# task.  Both are run because the same defect surfaces differently under them,
+# which is also how the two halves of the #130 fix were shown to be
+# independent: with the leak restored, these configurations report unsound=9/7/8
+# under lenient and unsound=0 lossy=5/7/6 under --strict.  Either way the run
+# fails; the counter that moves says which policy was in force.
 #
 # checked= is asserted non-zero on purpose: every other outcome (folded,
 # arena_full) is a legitimate refusal that the driver counts rather than fails,
@@ -30,7 +57,13 @@
 # RUN: %normtest --seed 3 --cases 2000 --depth 6 --leaves 6 2>/dev/null | FileCheck %s
 # RUN: %normtest --seed 4 --cases 5000 --depth 2 --leaves 8 --boolcmp-pct 40 2>/dev/null | FileCheck %s
 # RUN: %normtest --seed 5 --cases 5000 --depth 4 --leaves 5 --boolcmp-pct 60 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 1 --cases 5000 --depth 5 --const-pct 10 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 1 --cases 5000 --depth 5 --const-pct 25 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 1 --cases 5000 --depth 5 --const-pct 50 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 1 --cases 5000 --depth 5 --const-pct 50 --strict 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 2 --cases 5000 --depth 5 --const-pct 50 --strict 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 3 --cases 5000 --depth 5 --const-pct 50 --strict 2>/dev/null | FileCheck %s
 #
 # CHECK: NORM-SUMMARY cases={{[0-9]+}} checked={{[1-9][0-9]*}}
-# CHECK-SAME: unsound=0 incomplete=0 harness=0
+# CHECK-SAME: unsound=0 lossy=0 incomplete=0 harness=0
 # CHECK: NORM-RESULT PASS

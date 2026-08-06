@@ -252,8 +252,9 @@ struct GenConfig {
   uint32_t nleaves = 4;
   uint32_t depth = 3;
   // Off by default, and see gen_term() for why: the shape cannot occur on a
-  // real trace, and with it on the parser fails -- which is a finding, not a
-  // reason to leave the suite red.
+  // real trace.  It was added because the *node* it produces can, and with it
+  // on the parser failed -- fixed since (#130), and the suite now runs three
+  // --const-pct configurations to keep it fixed.
   uint32_t const_pct = 0;     // chance a binary connective takes a constant lhs
   uint32_t boolcmp_pct = 15;  // chance of a `bool ==/!= 0/1` layer
 };
@@ -350,30 +351,52 @@ private:
     // find_roots' arms are written to that invariant and reject ("null child")
     // if the constant shows up on the right.
     //
-    // OFF by default (--const-pct 0), because these shapes are dead on a real
-    // trace: __taint_union() folds every constant boolean connective away
+    // OFF by default (--const-pct 0) because a trace cannot carry this exact
+    // shape: __taint_union() folds every constant boolean connective away
     // before it ever builds a label -- 0&x, 0|x, 0^x, 1&x, 1|x, and 1^x, which
     // becomes Not.  All six, so nothing gets through.
     //
-    // Turn them on and the parser fails, consistently and in two ways.  Both
-    // start with find_roots folding the connective to an rgd::Bool, which
-    // nothing above it expects:
+    // What it does reproduce is the *node* those connectives fold to, an
+    // rgd::Bool sitting below the root of find_roots' output, and that one is
+    // reachable: an ICmp leaf whose two operand subtrees both exceed
+    // max_ast_size gets concretized to a Bool carrying the value the run
+    // observed (see the concrete_ops == 3 arm), and so does the icmp arm with a
+    // nested comparison on both sides.  It measured 0 times in 4.47M libpng
+    // conditions -- rare, not impossible -- so this generator is how the
+    // property gets tested at all.
     //
-    //   --const-pct 10 --depth 5: unsound=3 incomplete=21 over 3000 formulas
+    // Both failure modes below were real, and both came from one leak (#130):
+    // the bool-icmp arm wrapped a Bool child in LNot instead of folding it,
+    // which is the one arm of find_roots that did not maintain "no Bool below
+    // the root".
+    //
+    //   --const-pct 10 --depth 5 --cases 5000 --seed 1:
+    //   unsound=3 lossy=2 incomplete=36
     //
     //   INCOMPLETE  `(bcmp-not (and false L0))` -- the bool-icmp arm rewrites
-    //               its parent to LNot over a Bool child, and the whole
-    //               condition is refused with "unexpected node kind".
-    //   UNSOUND     `(or (bcmp (not ...)) (bcmp-not (and false L1)))` -- the
-    //               clause holding the Bool is dropped as "non-comparison
-    //               root" while the rest are kept, so parse_cond reports
-    //               success with a DNF that is missing a disjunct.  Here the
-    //               formula is constantly true, the branch cannot flip, and
-    //               the parser still hands the solver five clauses.
+    //               its parent to LNot over a Bool child, and to_nnf refuses
+    //               the whole condition with "unexpected node kind".
+    //   LOSSY       every conjunct of some clause hits the same refusal, so
+    //               construct_task builds nothing and the clause is dropped.
+    //               A DNF missing a disjunct is *narrower* than the formula:
+    //               its solutions still flip the branch, there are just fewer
+    //               of them.  Same class as refusing the condition outright.
+    //   UNSOUND     `(or (bcmp-not (not (bcmp-not (and false L0))))
+    //                    (not (not (not (xor L3 L1)))))` -- both clauses
+    //               produce a task, but one of them lost the conjunct holding
+    //               the Bool to "non-comparison root".  A clause is a
+    //               conjunction, so dropping one conjunct *widens* it, and the
+    //               task admits assignment 0x2, which does not reach the
+    //               target direction.  The solver returns it and every
+    //               consumer believes the branch flipped.
     //
-    // That is a real inconsistency (a fold that its own consumers cannot read)
-    // but it is unreachable, so it is filed rather than fixed -- and left
-    // generatable so the fix has something to prove itself against.
+    // The two directions come from two different sites, which is why both were
+    // fixed: the Bool folds at the four negation sites stop the leak, and
+    // construct_task's all-or-nothing arm contains the next one.  Measured
+    // separately -- with the leak still in and only that arm, these runs give
+    // unsound=0 with lossy=3/6/5, i.e. the widening route is gone and only the
+    // narrowing one is left.  normalizer_oracle.test runs three --const-pct
+    // configurations to keep both at zero.
     int lhs;
     if (pct(cfg_.const_pct)) {
       Term c;
@@ -423,7 +446,19 @@ bool dnf_eval(const Dnf &dnf, uint32_t mask) {
 
 struct Stats {
   uint64_t checked = 0;
+  // The two directions a DNF can disagree with the formula, split because they
+  // are not equally bad and a single counter cannot answer "is this dangerous".
+  //   unsound: the DNF admits an assignment the target rejects.  The solver can
+  //            hand back an input that does NOT flip the branch, and every
+  //            consumer believes it.  This is the one that must be zero.
+  //   lossy:   the DNF rejects an assignment the target admits, i.e. solutions
+  //            were dropped.  Coverage lost, nothing wrong believed -- the same
+  //            class as refusing the condition outright, only silent about it.
+  // Both fail the run: the parser should be exactly equivalent, and a lossy DNF
+  // is still a defect worth a name.  Keeping them apart is what tells a missing
+  // disjunct (a dropped clause) from a missing conjunct (a weakened clause).
   uint64_t unsound = 0;
+  uint64_t lossy = 0;
   uint64_t incomplete = 0;
   uint64_t folded = 0;      // parser says the whole condition is a constant
   uint64_t arena_full = 0;  // refused because the rewrite did not fit
@@ -439,7 +474,7 @@ struct Stats {
 bool check_one(const Formula &f, Store &store,
                const std::map<dfsan_label, int> &label_to_leaf,
                dfsan_label root_label, bool result, uint64_t seed, uint32_t idx,
-               Stats &st, bool verbose) {
+               Stats &st, bool verbose, bool strict) {
   std::vector<uint8_t> buf(f.nleaves ? f.nleaves : 1, 0);
   std::vector<symsan::input_t> inputs{{buf.data(), buf.size()}};
 
@@ -447,7 +482,14 @@ bool check_one(const Formula &f, Store &store,
   // ast_size_cache) are keyed by label, every case reuses labels from 1, and
   // restart() does not clear them -- so a shared parser would answer from the
   // previous case's table.
-  RGDAstParser parser(store.base(), store.bytes(), /*solve_nested=*/false);
+  // strict picks construct_task's policy for a conjunct that will not parse.
+  // Both are worth running the oracle against, because they fail differently:
+  // lenient hands out the weakened clause, so a regression shows as unsound=,
+  // while strict drops it and the same regression shows as lossy=.  Neither is
+  // exercised at all once find_roots stops leaking a Bool -- nothing in this
+  // matrix reaches that arm -- so this is a guard for the next such leak.
+  RGDAstParser parser(store.base(), store.bytes(), /*solve_nested=*/false,
+                      /*max_ast_size=*/200, /*strict_clauses=*/strict);
   if (parser.restart(inputs) != 0) {
     printf("[case %u/%d] restart failed\n", idx, (int)result);
     st.harness++;
@@ -477,13 +519,12 @@ bool check_one(const Formula &f, Store &store,
   };
 
   if (task_ids.empty()) {
-    if (reason == "cond folded to constant") {
-      // Legitimate only if the condition really is constant.  A wrong fold at
-      // the ROOT is all this can see -- parse_cond returns 0 either way and
-      // never says which constant -- but a wrong fold in a SUBTERM propagates
-      // into the surviving formula and is caught by the equivalence check
-      // below.  That is the case that matters: it is the shape the
-      // set_boolvalue bug took (#127).
+    if (reason == "cond folded to constant" ||
+        reason == "cond folded against the branch") {
+      // Legitimate only if the condition really is constant.  A wrong fold in a
+      // SUBTERM propagates into the surviving formula and is caught by the
+      // equivalence check below.  That is the case that matters: it is the
+      // shape the set_boolvalue bug took (#127).
       bool v0 = f.eval(0);
       for (uint32_t m = 1; m < nmask; m++) {
         if (f.eval(m) != v0) {
@@ -492,6 +533,30 @@ bool check_one(const Formula &f, Store &store,
           st.unsound++;
           return false;
         }
+      }
+      // A wrong fold at the ROOT used to be invisible here -- parse_cond
+      // returned 0 either way and never said which constant.  The two reasons
+      // now say: parse_cond checks the folded value against `result`, the
+      // direction the branch took, and renames the refusal when they disagree.
+      // So the reason pins boolvalue(), and this matrix knows v0, and the two
+      // must line up.  Either way round means the parser folded to the wrong
+      // constant: "to constant" with v0 != result says it folded to `result`
+      // when the formula says otherwise, and "against the branch" with
+      // v0 == result says it folded away from a value the formula agrees with.
+      //
+      // Note this matrix enumerates BOTH truth values of `result` for every
+      // formula, so for a constant formula one of the two pairs is a branch no
+      // real program can produce -- which makes those cases free coverage of
+      // the guard rather than something to skip.
+      const bool contradicts = (v0 != result);
+      if (contradicts != (reason == "cond folded against the branch")) {
+        report("UNSOUND FOLD", contradicts
+               ? "parser folded to the branch's direction, but the formula is "
+                 "constant the other way"
+               : "parser refused the fold as contradicting the branch, but the "
+                 "formula's constant value agrees with it");
+        st.unsound++;
+        return false;
       }
       st.folded++;
       return true;
@@ -568,7 +633,10 @@ bool check_one(const Formula &f, Store &store,
              "assignment 0x%x: formula=%d target=%d, but the DNF says %d\n"
              "  (%zu clause(s) from %zu task(s))",
              mask, (int)f.eval(mask), (int)want, (int)got, dnf.size(), task_ids.size());
-    report("UNSOUND", detail);
+    // got=1, want=0 is the dangerous direction: a solution to this DNF need not
+    // flip the branch.  got=0, want=1 only means solutions were dropped.
+    report(got ? "UNSOUND (DNF admits a non-flipping assignment)"
+               : "LOSSY (DNF drops a flipping assignment)", detail);
     if (verbose) {
       for (size_t c = 0; c < dnf.size(); c++) {
         printf("    clause %zu:", c);
@@ -576,7 +644,7 @@ bool check_one(const Formula &f, Store &store,
         printf("\n");
       }
     }
-    st.unsound++;
+    if (got) st.unsound++; else st.lossy++;
     return false;
   }
 
@@ -592,8 +660,14 @@ void usage(const char *argv0) {
       "  --leaves N      distinct relational leaves per formula, <= 16 (default 4)\n"
       "  --depth N       max formula depth (default 3)\n"
       "  --const-pct N   chance a connective takes a constant lhs (default 0;\n"
-      "                  a known-failing dead shape, see gen_term)\n"
+      "                  a shape __taint_union folds away before it reaches a\n"
+      "                  label, kept because it reproduces the Bool node that\n"
+      "                  concretization also produces -- see gen_term)\n"
       "  --boolcmp-pct N chance of a `bool ==/!= 0/1` layer (default 15)\n"
+      "  --strict        drop a whole DNF clause when one conjunct will not\n"
+      "                  parse, instead of handing out the weakened clause\n"
+      "                  (construct_task's strict_clauses; default is lenient,\n"
+      "                  which is what the fuzzer runs)\n"
       "  --stop-first    exit on the first failure\n"
       "  -v              dump the DNF on a soundness failure\n",
       argv0);
@@ -607,6 +681,7 @@ int main(int argc, char **argv) {
   GenConfig cfg;
   bool verbose = false;
   bool stop_first = false;
+  bool strict = false;
 
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -620,6 +695,7 @@ int main(int argc, char **argv) {
     else if (a == "--depth") cfg.depth = (uint32_t)strtoul(next(), nullptr, 0);
     else if (a == "--const-pct") cfg.const_pct = (uint32_t)strtoul(next(), nullptr, 0);
     else if (a == "--boolcmp-pct") cfg.boolcmp_pct = (uint32_t)strtoul(next(), nullptr, 0);
+    else if (a == "--strict") strict = true;
     else if (a == "--stop-first") stop_first = true;
     else if (a == "-v") verbose = true;
     else { usage(argv[0]); return 2; }
@@ -647,7 +723,8 @@ int main(int argc, char **argv) {
 
     bool ok = true;
     for (bool result : {false, true}) {
-      if (!check_one(f, store, label_to_leaf, root_label, result, seed, c, st, verbose)) {
+      if (!check_one(f, store, label_to_leaf, root_label, result, seed, c, st, verbose,
+                     strict)) {
         ok = false;
         if (stop_first) { failed_cases++; goto done; }
       }
@@ -657,12 +734,15 @@ int main(int argc, char **argv) {
 done:
 
   printf("NORM-SUMMARY cases=%u checked=%" PRIu64 " folded=%" PRIu64
-         " arena_full=%" PRIu64 " unsound=%" PRIu64 " incomplete=%" PRIu64
-         " harness=%" PRIu64 "\n",
-         cases, st.checked, st.folded, st.arena_full, st.unsound, st.incomplete,
-         st.harness);
+         " arena_full=%" PRIu64 " unsound=%" PRIu64 " lossy=%" PRIu64
+         " incomplete=%" PRIu64 " harness=%" PRIu64 "\n",
+         cases, st.checked, st.folded, st.arena_full, st.unsound, st.lossy,
+         st.incomplete, st.harness);
 
-  uint64_t bad = st.unsound + st.incomplete + st.harness;
+  // lossy counts as a failure too -- the parser owes exact equivalence, and a
+  // silently narrowed DNF is a defect even though it cannot mislead a solver.
+  // It is separate from unsound so that a regression here says which kind it is.
+  uint64_t bad = st.unsound + st.lossy + st.incomplete + st.harness;
   if (bad) {
     printf("NORM-RESULT FAIL (%" PRIu64 " bad outcome(s) over %" PRIu64 " failing case(s))\n",
            bad, failed_cases);

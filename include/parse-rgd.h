@@ -12,10 +12,24 @@ namespace rgd {
 class RGDAstParser : public symsan::ASTParser<SearchTask> {
 public:
   RGDAstParser() = delete;
-  RGDAstParser(void *base, size_t size, bool solve_nested = false, size_t max_ast_size = 200)
+  /// @param strict_clauses  what to do when one conjunct of a DNF clause will
+  ///   not parse.  Default (false) keeps the rest of the clause and builds a
+  ///   task from it: that task is *weaker* than the clause, so a solution to it
+  ///   need not flip the branch, which for hybrid fuzzing costs one execution
+  ///   and buys a chance at coverage.  True drops the whole clause instead,
+  ///   which is exact -- the surviving disjuncts still flip the branch -- and is
+  ///   what a consumer that must trust a task wants.  See construct_task().
+  RGDAstParser(void *base, size_t size, bool solve_nested = false, size_t max_ast_size = 200,
+               bool strict_clauses = false)
     : symsan::ASTParser<SearchTask>(base, size),
-      solve_nested_(solve_nested), max_ast_size_(max_ast_size) {}
+      solve_nested_(solve_nested), max_ast_size_(max_ast_size),
+      strict_clauses_(strict_clauses) {}
   ~RGDAstParser() {}
+
+  /// Clauses handed out with a conjunct missing (lenient mode only).  Counted
+  /// rather than only warned because stderr is /dev/null in a campaign, and a
+  /// task that cannot flip its branch is worth knowing the rate of.
+  uint64_t weakened_clauses() const { return weakened_clauses_; }
 
   int restart(std::vector<symsan::input_t> &inputs, bool copy_input = false) override;
   int parse_cond(dfsan_label label, bool result, bool add_nested,
@@ -62,6 +76,8 @@ public:
 protected:
   const bool solve_nested_;
   const size_t max_ast_size_;
+  const bool strict_clauses_;
+  uint64_t weakened_clauses_ = 0;
 
 private:
   enum ast_node_t {
