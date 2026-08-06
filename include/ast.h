@@ -527,7 +527,7 @@ namespace rgd {
     inline void clear_children(uint32_t i) {
       if (i >= 2) throw std::out_of_range("children index out of range");
       if (i == 1) child1_ = 0;
-      else child0_ = child1_; // pop child1 to child0
+      else { child0_ = child1_; child1_ = 0; } // pop child1 to child0
     }
 
     inline uint16_t kind() const { return kind_; }
@@ -537,7 +537,13 @@ namespace rgd {
     inline uint32_t index() const { return index_; }
     inline void set_index(uint32_t index) { index_ = index; }
     inline uint8_t boolvalue() const { return boolvalue_; }
-    inline void set_boolvalue(uint8_t value) { boolvalue_ = value ? 0 : 1; }
+    // Stores the value as given.  This used to store its complement, which
+    // nothing was written against: every caller in find_roots() sets it from
+    // the value it means (eval_icmp's answer, `!child->boolvalue()` for a Not)
+    // and every reader -- find_roots' own constant folding, jit.cc,
+    // z3-solver.cpp -- reads the raw bit back, so the two disagreed and each
+    // fold that inspected a folded operand took the wrong arm.
+    inline void set_boolvalue(uint8_t value) { boolvalue_ = value ? 1 : 0; }
     inline uint32_t label() const { return label_; }
     inline void set_label(uint32_t label) { label_ = label; }
     inline uint32_t hash() const { return hash_; }

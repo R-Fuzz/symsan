@@ -346,12 +346,11 @@ bool lower_node(const ProtoAst &n, const std::shared_ptr<Constraint> &c,
     // INVARIANT it has to be folded into the hash, or true and false share one
     // compiled function.
     //
-    // set_boolvalue() stores the complement of what it is given (ast.h:388)
-    // while boolvalue() and both readers (jit.cc, z3-solver.cpp) return the raw
-    // bit, so pass the complement to get the corpus's bit back out.  Noted
-    // rather than fixed here: find_roots has ~20 call sites written against the
-    // current behaviour.
-    out->set_boolvalue(!n.boolvalue);
+    // set_boolvalue() used to store the complement of what it was given, so
+    // this passed the complement to get the corpus's bit back out.  That is
+    // fixed in ast.h now -- the setter and boolvalue()'s readers (jit.cc,
+    // z3-solver.cpp) agree -- so hand it the bit itself.
+    out->set_boolvalue(n.boolvalue);
     out->set_hash(xxhash(n.bits, Bool, n.boolvalue));
     return true;
   }

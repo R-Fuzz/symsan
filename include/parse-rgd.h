@@ -105,6 +105,7 @@ private:
                                std::unordered_set<dfsan_label> &subroots);
   inline dfsan_label strip_zext(dfsan_label label);
   [[nodiscard]] int to_nnf(bool expected_r, rgd::AstNode *node);
+  [[nodiscard]] int expand_bool_xor(bool expected_r, rgd::AstNode *node);
   void to_dnf(const rgd::AstNode *node, formula_t &formula);
   [[nodiscard]] task_t construct_task(const clause_t &clause);
   [[nodiscard]] constraint_t parse_constraint(dfsan_label label);

@@ -1560,6 +1560,10 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
                 node->CopyFrom(*right);
               } else { // 1 LXor x = LNot x
                 node->set_kind(rgd::LNot);
+                // the folded constant is child 0 and the operand child 1, so
+                // drop child 0: an LNot with two children is malformed and
+                // to_nnf would (correctly) refuse the whole clause
+                node->clear_children(0);
               }
             } else if (unlikely(right->kind() == rgd::Bool)) {
               // rhs is constant, lhs is not
@@ -1567,6 +1571,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
                 node->CopyFrom(*left);
               } else { // x LXor 1 = LNot x
                 node->set_kind(rgd::LNot);
+                node->clear_children(1); // drop the folded constant, as above
               }
             } else {
               // both sides are symbolic
@@ -2011,6 +2016,90 @@ RGDAstParser::expr_t RGDAstParser::get_root_expr(dfsan_label label) {
   return root;
 }
 
+// Deep-copy @p src onto @p dst.  Both must live in the SAME arena, which is
+// exactly the case AstNode::CopyFrom() does NOT handle: sharing an arena, it
+// takes the shallow path and copies the child *indices*, so the "copy" aliases
+// the original's subtree and rewriting one rewrites both.  The cross-arena
+// path is no help either -- RecursiveCopyFrom() grows the arena with an
+// unchecked emplace_back, and a reallocation there dangles every AstNode* the
+// caller is holding.  add_children() refuses at capacity instead of
+// reallocating, so this walk is the safe one; false means the arena is full.
+static bool clone_subtree(rgd::AstNode *dst, const rgd::AstNode *src) {
+  dst->clear_children();
+  dst->set_kind(src->kind());
+  dst->set_bits(src->bits());
+  dst->set_index(src->index());
+  dst->set_boolvalue(src->boolvalue());
+  dst->set_label(src->label());
+  dst->set_hash(src->hash());
+  for (uint32_t i = 0; i < src->children_size(); i++) {
+    rgd::AstNode *child = dst->add_children();
+    if (unlikely(child == nullptr)) return false;
+    // add_children() only appends, so src and everything under it stay put
+    if (!clone_subtree(child, &src->children(i))) return false;
+  }
+  return true;
+}
+
+// Rewrite a boolean `a ^ b` into the connectives NNF/DNF can handle:
+//
+//     a ^ b   ==  (a && !b) || (!a && b)
+//   !(a ^ b)  ==  (a &&  b) || (!a && !b)
+//
+// Without this the whole clause is lost: Xor is not a relational kind, so the
+// clause root fails parse_constraint()'s comparison check ("non-comparison
+// root").  The runtime builds ub_integer_sign_change that way (dfsan.cpp,
+// Xor of two icmps), but so does any source-level `^` or `!=` between two
+// predicates -- nothing here is specific to a UB check.
+//
+// Both operands are duplicated because the two conjuncts negate opposite
+// sides, so the copies have to be independently rewritable.  That is also the
+// cost: an AST that is all xors grows exponentially.  The bound is the arena,
+// which never grows (see clone_subtree) -- a rewrite that does not fit is
+// refused by name rather than half-applied.
+int RGDAstParser::expand_bool_xor(bool expected_r, rgd::AstNode *node) {
+  if (unlikely(node->children_size() != 2)) {
+    REJECT("malformed Xor", "boolean Xor expects two children\n");
+    return INVALID_NODE;
+  }
+  // the originals stay in the arena, just unreferenced, while we clone them
+  const rgd::AstNode *a = node->mutable_children(0);
+  const rgd::AstNode *b = node->mutable_children(1);
+  node->clear_children();
+  rgd::AstNode *conj[2] = { node->add_children(), node->add_children() };
+  if (unlikely(conj[0] == nullptr || conj[1] == nullptr)) {
+    REJECT("ast arena full", "failed to add children\n");
+    return INVALID_NODE;
+  }
+  rgd::AstNode *operand[2][2];
+  for (int i = 0; i < 2; i++) {
+    conj[i]->set_kind(rgd::LAnd);
+    conj[i]->set_bits(1);
+    operand[i][0] = conj[i]->add_children();
+    operand[i][1] = conj[i]->add_children();
+    if (unlikely(operand[i][0] == nullptr || operand[i][1] == nullptr)) {
+      REJECT("ast arena full", "failed to add children\n");
+      return INVALID_NODE;
+    }
+    if (unlikely(!clone_subtree(operand[i][0], a) ||
+                 !clone_subtree(operand[i][1], b))) {
+      REJECT("ast arena full", "failed to clone Xor operand\n");
+      return INVALID_NODE;
+    }
+  }
+  node->set_kind(rgd::LOr);
+  node->set_bits(1);
+  // first conjunct takes a as-is, second negates it; b follows expected_r
+  const bool polarity[2][2] = { { true, !expected_r }, { false, expected_r } };
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 2; j++) {
+      int ret = to_nnf(polarity[i][j], operand[i][j]);
+      if (unlikely(ret != 0)) { return ret; }
+    }
+  }
+  return 0;
+}
+
 [[gnu::hot]]
 int RGDAstParser::to_nnf(bool expected_r, rgd::AstNode *node) {
   int ret = 0;
@@ -2049,6 +2138,10 @@ int RGDAstParser::to_nnf(bool expected_r, rgd::AstNode *node) {
       if (unlikely(ret != 0)) { return ret; }
       ret = to_nnf(false, node->mutable_children(1));
       if (unlikely(ret != 0)) { return ret; }
+    } else if (node->kind() == rgd::Xor) {
+      // !(a ^ b) == (a && b) || (!a && !b)
+      ret = expand_bool_xor(false, node);
+      if (unlikely(ret != 0)) { return ret; }
     } else {
       // leaf node
       if (rgd::isRelationalKind(node->kind()) ||
@@ -2080,11 +2173,24 @@ int RGDAstParser::to_nnf(bool expected_r, rgd::AstNode *node) {
       // memcmp == 1 actually means s1 != s2
       // so we negate it
       node->set_kind(rgd::MemcmpN);
-    } else {
-      for (int i = 0; i < node->children_size(); i++) {
+    } else if (node->kind() == rgd::LAnd || node->kind() == rgd::LOr) {
+      // the NNF of a conjunction or a disjunction is the NNF of both operands
+      for (uint32_t i = 0; i < node->children_size(); i++) {
         ret = to_nnf(expected_r, node->mutable_children(i));
         if (unlikely(ret != 0)) { return ret; }
       }
+    } else if (node->kind() == rgd::Xor) {
+      // a ^ b == (a && !b) || (!a && b)
+      ret = expand_bool_xor(true, node);
+      if (unlikely(ret != 0)) { return ret; }
+    } else {
+      // leaf node, nothing to do -- a relational kind is already what we want
+      // and anything else stays for construct_task to judge.  This used to
+      // recurse into the children of whatever it did not recognize, which
+      // walked *out* of the boolean skeleton and into the arithmetic operands
+      // of the relational leaves: down there rgd::Xor is a bitvector xor, not
+      // a connective, and rewriting one would change the value being compared.
+      // The negated branch above has always stopped at the leaves; this agrees.
     }
   }
 
@@ -2481,6 +2587,12 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
   // finally, we are ready to construct GEP tasks
   //
 
+  // Left unbuilt on purpose: index enumeration is too expensive for what it
+  // returns, so this parser emits no GEP tasks and ConcolicSession passes
+  // enum_index=false to match (concolic-session.cpp).  Reading the TODO below
+  // as unfinished work costs an audit: a parse-only sweep of libpng shows
+  // 878666 GEP events over 682 inputs -- 30% of everything traced -- all
+  // yielding nothing, which looks exactly like a bug and is not one.
   if (enum_index) {
     // TODO:
   }
