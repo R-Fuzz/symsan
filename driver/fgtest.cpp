@@ -443,6 +443,15 @@ fail:
   return -1;
 }
 
+// Does a TAINT_OPTIONS value start with `want` and end there?  Options are
+// separated by ':' or ' ', so a value runs to the first of either, and a plain
+// strcmp() against the rest of the string would only ever match the last one.
+static bool opt_is(const char *val, const char *want) {
+  size_t n = strlen(want);
+  return strncmp(val, want, n) == 0 &&
+         (val[n] == '\0' || val[n] == ':' || val[n] == ' ');
+}
+
 int main(int argc, char* const argv[]) {
 
   if (argc < 3) {
@@ -493,7 +502,11 @@ int main(int argc, char* const argv[]) {
     char *debug_opt = strstr(options, "debug=");
     if (debug_opt) {
       debug_opt += strlen("debug="); // skip "debug="
-      if (strcmp(debug_opt, "1") == 0 || strcmp(debug_opt, "true") == 0)
+      // Terminated at the separator, like output_dir= and taint_file= above:
+      // strcmp() here would run to the end of the whole option string, so
+      // debug= would be honoured only when nothing followed it -- and be
+      // silently ignored anywhere else in the line.
+      if (opt_is(debug_opt, "1") || opt_is(debug_opt, "true"))
         debug = 1;
     }
 
@@ -508,7 +521,8 @@ int main(int argc, char* const argv[]) {
     char *solve_ub_opt = strstr(options, "solve_ub=");
     if (solve_ub_opt) {
       solve_ub_opt += strlen("solve_ub="); // skip "solve_ub="
-      if (strcmp(solve_ub_opt, "1") == 0 || strcmp(solve_ub_opt, "true") == 0)
+      // see the note on debug= above
+      if (opt_is(solve_ub_opt, "1") || opt_is(solve_ub_opt, "true"))
         solve_ub = 1;
     }
 
