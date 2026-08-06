@@ -71,7 +71,11 @@ struct taint_socket __dfsan::tainted_socket;
 // Hash table
 static const uptr hashtable_size = (1ULL << 32);
 static const size_t hashtable_buckets = (1ULL << 20);
-static __taint::union_hashtable __union_table(hashtable_buckets);
+// Default-constructed on purpose, so it lands in .bss with no dynamic
+// initializer; dfsan_init calls init() above the fork point.  See the comment
+// on the class -- a sized constructor here would be an .init_array entry, which
+// runs after .preinit_array and so after the fork, i.e. once per child.
+static __taint::union_hashtable __union_table;
 
 Flags __dfsan::flags_data;
 bool print_debug;
@@ -2328,6 +2332,13 @@ static void dfsan_init(int argc, char **argv, char **envp) {
 
   // init hashtable allocator
   __taint::allocator_init(HashTableAddr(), HashTableAddr() + hashtable_size);
+
+  // ... and the hashtable itself, which draws its buckets from that allocator.
+  // Here rather than in a constructor: a static object with a nontrivial
+  // constructor gets an .init_array entry, and .init_array runs after all of
+  // .preinit_array -- i.e. after the fork point below -- so every forked child
+  // would build its own table, faulting in the 8MB of buckets each time.
+  __union_table.init(hashtable_buckets);
 
   // init main thread
   auto num_of_labels = uniontable_size / sizeof(dfsan_label_info);
