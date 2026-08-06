@@ -49,6 +49,22 @@ target_link_libraries(DeathTest PRIVATE
 )
 install (TARGETS DeathTest DESTINATION ${SYMSAN_BIN_DIR})
 
+## truth-table oracle for the RGD parser's normalizer, all four stages at once
+## (find_roots -> to_nnf -> to_dnf -> construct_task).  Synthesizes union tables
+## in memory, so no launcher and no instrumented target.
+add_executable(NormTest normtest.cpp)
+set_target_properties(NormTest PROPERTIES OUTPUT_NAME "normtest" CXX_STANDARD 17)
+target_include_directories(NormTest PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+)
+target_link_libraries(NormTest PRIVATE
+  rgd-parser
+  rgd-solver
+  ${Z3_LIBRARY}
+  rt
+)
+install (TARGETS NormTest DESTINATION ${SYMSAN_BIN_DIR})
+
 ## offline check that the branch map joins SymSan branches to the *right* AFL++
 ## edges, against an afl-showmap run as ground truth
 add_executable(CovCheck covcheck.cpp)

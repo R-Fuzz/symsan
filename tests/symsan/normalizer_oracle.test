@@ -1,0 +1,36 @@
+# The RGD parser's normalizer, checked against a truth table.
+#
+# driver/normtest.cpp synthesizes a union table for a random boolean formula
+# over independent relational leaves, runs it through
+# find_roots -> to_nnf -> to_dnf -> construct_task, reads the DNF back out of
+# the tasks, and compares the two over every assignment.  Nothing here needs a
+# compiler or an instrumented target -- the label store is built in memory --
+# so the whole file runs in well under a second.
+#
+# Four configurations rather than one long run, because they stress different
+# parts of the pipeline and a single shape would leave the others at zero:
+#
+#   deep + few leaves     the xor expansion, which doubles the tree, and the
+#                         arena bound that stops it (see arena_full=)
+#   shallow + many leaves wide DNFs and a bigger truth table per formula
+#   high --boolcmp-pct    the `bool ==/!= 0/1` arm of find_roots' icmp case,
+#                         which is a connective (copy or LNot), not a fold
+#
+# --const-pct stays at its default 0.  That shape -- a constant operand to a
+# boolean connective -- fails, but __taint_union() folds every one of them away
+# before a label exists, so it cannot occur on a trace; it is filed, and
+# normtest still generates it on request.  See gen_term() in the driver.
+#
+# checked= is asserted non-zero on purpose: every other outcome (folded,
+# arena_full) is a legitimate refusal that the driver counts rather than fails,
+# so a regression that refused *everything* would otherwise report PASS.
+#
+# RUN: %normtest --seed 1 --cases 5000 --depth 3 --leaves 4 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 2 --cases 5000 --depth 5 --leaves 3 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 3 --cases 2000 --depth 6 --leaves 6 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 4 --cases 5000 --depth 2 --leaves 8 --boolcmp-pct 40 2>/dev/null | FileCheck %s
+# RUN: %normtest --seed 5 --cases 5000 --depth 4 --leaves 5 --boolcmp-pct 60 2>/dev/null | FileCheck %s
+#
+# CHECK: NORM-SUMMARY cases={{[0-9]+}} checked={{[1-9][0-9]*}}
+# CHECK-SAME: unsound=0 incomplete=0 harness=0
+# CHECK: NORM-RESULT PASS
