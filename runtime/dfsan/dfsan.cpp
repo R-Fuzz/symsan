@@ -268,6 +268,11 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   if (l1 == 0 && l2 < CONST_OFFSET &&
       op != fsize && op != __dfsan::Alloca && op != __dfsan::WideConst)
     return 0;
+  // Both guards below are about an operand too wide to fit in op1/op2, so they
+  // have to read `size` as a bit width -- and for the memory-comparison ops it
+  // is a byte count instead (op_size_is_byte_count).  memcmp'ing 65 bytes is
+  // not a 65-bit operation and must not be declined as one.
+  const bool wide = size > 64 && !op_size_is_byte_count(op);
   // Operations wider than 64 bits can only be represented when every value
   // operand has a real label: op1/op2 hold 64 bits each and combineShadows
   // truncates into them, so a concrete wide operand arriving as a zero label is
@@ -277,7 +282,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   // zero label at this point comes from a caller that has no high half to offer
   // -- dfsan_union, a libc wrapper -- and there is nothing to do but drop the
   // shadow rather than lie about it.
-  if (size > 64 && wide_op_reads_op2(op) && (l1 == 0 || l2 == 0))
+  if (wide && wide_op_reads_op2(op) && (l1 == 0 || l2 == 0))
     return 0;
   // ...and every value operand having a real label is now weaker than having
   // symbolic content, since __taint_get_wide hands out a label for a concrete
@@ -287,7 +292,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   // literal.  Untainted wide arithmetic is common enough -- program startup,
   // any instrumented i128 that never meets input -- that skipping this would
   // fill the union table with nodes that constrain nothing.
-  if (size > 64 && is_wide_const(l1) &&
+  if (wide && is_wide_const(l1) &&
       (!wide_op_reads_op2(op) || is_wide_const(l2)))
     return 0;
   if (l1 == kInitializingLabel || l2 == kInitializingLabel)

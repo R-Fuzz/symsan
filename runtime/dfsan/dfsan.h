@@ -331,6 +331,37 @@ static inline uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predic
   return 0;
 }
 
+// Is this op's `size` field a byte count rather than a bit width?
+//
+// dfsan_label_info::size is overloaded: for everything the instrumentation
+// emits it is the operand's width in bits, but the libc wrappers in
+// dfsan_custom.cpp put a *byte* count there for the ops that compare or search
+// memory -- the extent that was compared, which the solver needs and which has
+// no bit width to speak of.  __taint_union's wide-operand guards read `size`
+// unconditionally as a width, so without this every memcmp/strstr of more than
+// 64 bytes was silently declined; a 65-byte memcmp and a 168-character strchr
+// haystack are both entirely ordinary.
+//
+// Written as a list of the ops that ARE byte counts, so a new op is treated as
+// a width by default -- which is the safe way round: a width that is really a
+// byte count only ever declines a shadow, while the reverse would take a real
+// 128-bit operand through a guard meant to catch it.
+static inline bool op_size_is_byte_count(uint16_t op) {
+  switch (op & 0xff) {
+    // the extent memcmp/bcmp compared
+    case fmemcmp:
+    // str_content_len() of the haystack, saturated at 0xffff
+    case fstrchr: case fstrrchr: case fstrstr: case fstrpbrk:
+    // the compared or concatenated length
+    case fstrcmp: case fprefixof: case fsuffixof: case fstrcat:
+      return true;
+    // fsize/fatoi/fstrlen/fstr_off/fsubstr are deliberately absent: they carry
+    // the bit width of the integer or pointer they produce, not a length.
+    default:
+      return false;
+  }
+}
+
 // For an operation wider than 64 bits, does op2 carry a value operand?  A
 // concrete value operand cannot be represented at that width -- op1/op2 are 64
 // bits each and the instrumentation truncates into them -- so a zero l2 on such

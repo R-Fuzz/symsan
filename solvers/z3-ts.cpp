@@ -621,7 +621,14 @@ static bool wide_value_unknown(const dfsan_label_info *info,
   auto is_unknown = [&unknown](dfsan_label l) {
     return l >= CONST_OFFSET && l < unknown.size() && unknown[l];
   };
-  if (info->size > 64) return true;
+  // ...but only where `size` is a width.  For the memory-comparison ops it is
+  // the compared byte count, and a memcmp of 200 bytes is not a 200-bit value:
+  // its result is the 0/1 this records.  Reachable only since the runtime
+  // stopped declining those (op_size_is_byte_count in dfsan.h) -- before that
+  // no such label existed, so marking them unknown here would have silently
+  // switched the consistency check off on exactly the path that just started
+  // working.
+  if (info->size > 64 && !__dfsan::op_size_is_byte_count(info->op)) return true;
   // These are the only ops that can yield <= 64 bits while reading a wider
   // operand: LLVM integer arithmetic is same-width, so anything else with a
   // wide operand also has a wide result and is caught by the size test above.
