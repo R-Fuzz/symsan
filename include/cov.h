@@ -160,10 +160,21 @@ private:
   std::shared_ptr<BranchContext> _ctx;
 
   const BranchMap *map_;
-  /// The fuzzer's history map as of the last set_coverage(); empty means "no
-  /// idea", which reads as "nothing covered".  Already hit-count classed --
-  /// that is what LibAFL's HitcountsMapObserver hands MaxMapFeedback.
-  std::vector<uint8_t> host_;
+  /// The fuzzer's history map; empty means "no idea", which reads as "nothing
+  /// covered".  Already hit-count classed -- that is what LibAFL's
+  /// HitcountsMapObserver hands MaxMapFeedback.
+  ///
+  /// A *borrowed* pointer when set_coverage_shared() published one, and the
+  /// distinction matters: the fuzzer runs each solved input as we hand it back,
+  /// inside the same solution loop, so its history moves while we are still
+  /// solving this entry's tasks.  A snapshot taken before the trace is already
+  /// out of date by the second solution, and re-solving a target our own
+  /// previous answer just covered was 47% of the solutions in a libpng
+  /// campaign.  set_coverage() keeps the copying behaviour for callers with no
+  /// buffer to lend; host_owned_ backs it and host_ then points into it.
+  const uint8_t *host_ = nullptr;
+  size_t host_len_ = 0;
+  std::vector<uint8_t> host_owned_;
   /// How many times this trace has taken each branch, keyed on the cid.  Keying
   /// on the cid is safe here where it is not for `branches` above, because only
   /// the mapped path reads it and a cid the map answers for is an AFL++ edge
@@ -211,7 +222,7 @@ private:
   /// binary's id range says nothing about the ids it does not reach and
   /// "unknown" has to read as "worth solving".
   uint8_t host_at(uint32_t edge) const {
-    return edge < host_.size() ? host_[edge] : 0;
+    return edge < host_len_ ? host_[edge] : 0;
   }
 
 public:
@@ -276,9 +287,38 @@ public:
 
   /// Replace the coverage snapshot.  Cheap enough to do once per traced input;
   /// the map is tens of kilobytes and tracing a target costs milliseconds.
+  ///
+  /// A copy, and therefore frozen at the moment of the call -- prefer
+  /// set_coverage_shared() from a front-end that can lend its map for the
+  /// duration.  This one is for callers that cannot: a corpus sweep reading a
+  /// map off disk, or a test.
   void set_coverage(const uint8_t *map, size_t len) {
-    if (map == nullptr || len == 0) host_.clear();
-    else host_.assign(map, map + len);
+    host_ = nullptr;
+    host_len_ = 0;
+    if (map == nullptr || len == 0) {
+      host_owned_.clear();
+      return;
+    }
+    host_owned_.assign(map, map + len);
+    host_ = host_owned_.data();
+    host_len_ = host_owned_.size();
+  }
+
+  /// Read the fuzzer's history map in place, for as long as it stays where it
+  /// is.  The caller keeps ownership and must re-publish (or pass nullptr)
+  /// before the buffer moves or dies.
+  ///
+  /// This is the one that makes the answer current rather than merely recent:
+  /// the fuzzer folds each solved input into its history as we hand it over, so
+  /// with a copy every task after the first in a batch is judged against a map
+  /// from before the trace.  See host_.
+  void set_coverage_shared(const uint8_t *map, size_t len) {
+    // Drop the copy first: nothing may point into it once it is gone, and a
+    // front-end that switches to lending has no use for the old bytes.
+    host_owned_.clear();
+    host_owned_.shrink_to_fit();
+    host_ = (map == nullptr || len == 0) ? nullptr : map;
+    host_len_ = host_ ? len : 0;
   }
 
   /// How many branch directions we could and could not get an edge for.  The
@@ -357,11 +397,17 @@ private:
       auto hit = trace_hits_.find(context->id);
       uint8_t want = count_class(hit == trace_hits_.end() ? 1 : hit->second);
       // Only the fuzzer's history answers the other half.  Nothing of ours is
-      // folded in: it refreshes host_ before every traced entry
+      // folded in: it publishes host_ before every traced entry
       // (bindings/rust/libafl-symsan/src/lib.rs), so a session-lifetime record
       // would only duplicate it -- except when it did not, and then it would be
       // our bookkeeping vetoing the fuzzer's, which is the failure this class
       // exists to undo.
+      //
+      // "Before every traced entry" understated it, and the understatement was
+      // the bug: what it publishes is now the live map, not a copy of it, so
+      // this reads the fuzzer's history as of *this call* rather than as of the
+      // start of the entry.  That is what lets next_solution() ask again, of
+      // fresher data, after our own earlier answers have been run.
       uint8_t have = host_at(*edge);
       // The map answered, so it decides.  `branches` is keyed on address and
       // lives as long as the session, which makes it wrong in exactly the case

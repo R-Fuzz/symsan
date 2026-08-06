@@ -207,6 +207,12 @@ int ConcolicSession::set_coverage(const uint8_t *map, size_t len) {
   return 0;
 }
 
+int ConcolicSession::set_coverage_shared(const uint8_t *map, size_t len) {
+  if (!shared_cov_) return -1;
+  shared_cov_->set_coverage_shared(map, len);
+  return 0;
+}
+
 int ConcolicSession::check_coverage(const uint32_t *covered, size_t n,
                                     JoinReport *out) const {
   if (!shared_cov_ || !out) return -1;
@@ -476,7 +482,7 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
     // try to get a task if we don't already have one
     // or if we've find a valid solution from the previous mutation
     if (!cur_task_ || mutation_state_ == MUTATION_VALIDATED) {
-      cur_task_ = task_mgr_->get_next_task();
+      cur_task_ = next_pending_task();
       if (!cur_task_) {
         mutation_state_ = MUTATION_INVALID;
         return nullptr;
@@ -489,7 +495,7 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
       cur_solver_index_++;
       if (cur_solver_index_ >= solvers_.size()) {
         // if reached the max solver, move on to the next task
-        cur_task_ = task_mgr_->get_next_task();
+        cur_task_ = next_pending_task();
         if (!cur_task_) {
           mutation_state_ = MUTATION_INVALID;
           return nullptr;
@@ -582,17 +588,66 @@ void ConcolicSession::report_result(bool interesting) {
 
 size_t ConcolicSession::note_branch(dfsan_label label, void *addr, uint32_t id,
                                     bool neg_direction) {
-  if (!config_.export_taint) {
-    return SIZE_MAX;
-  }
-  // note_deps() is a linear fill up to label, so this is free for any label an
-  // earlier call already reached -- which, labels being handed out in order, is
-  // most of them
-  if (!parser_->note_deps(label, traced_taint_)) {
-    return SIZE_MAX;
+  // The record itself is unconditional.  It used to be export_taint's alone,
+  // but next_pending_task() needs to know what target a task is for in order to
+  // re-ask about it, and that is not a taint-export question -- nor are
+  // report_result()'s `flipped` and current_target()'s answer to --flip-log,
+  // both of which reach traced_branches_ through task_branch_ and were
+  // silently empty without the export.  Only the dependency scan below is
+  // export_taint's, and that is the part the flag was justified by: it makes
+  // every branch pay, including the ones that never become a task.
+  if (config_.export_taint) {
+    // note_deps() is a linear fill up to label, so this is free for any label an
+    // earlier call already reached -- which, labels being handed out in order, is
+    // most of them
+    if (!parser_->note_deps(label, traced_taint_)) {
+      return SIZE_MAX;
+    }
   }
   traced_branches_.push_back({label, addr, id, neg_direction, false});
   return traced_branches_.size() - 1;
+}
+
+task_t ConcolicSession::next_pending_task() {
+  auto ctx = std::make_shared<BranchContext>();
+  for (;;) {
+    auto task = task_mgr_->get_next_task();
+    if (!task) return nullptr;
+
+    // No recorded target: a task from a trace where note_deps() bailed, or one
+    // whose branch we chose not to record.  Nothing to ask about, so solve it.
+    auto itr = task_branch_.find(task.get());
+    if (itr == task_branch_.end()) return task;
+    const auto &branch = traced_branches_[itr->second];
+
+    // Already answered, and the fuzzer took the answer.  report_result() sets
+    // this, and the sibling tasks built for the same branch are still queued
+    // behind it.
+    if (branch.flipped) {
+      stats_.stale_tasks += 1;
+      continue;
+    }
+
+    // The question is_branch_interesting() asked at parse time, asked again now
+    // that solving is about to cost something.  Two things have changed since:
+    // the trace took later branches, and -- the expensive one -- every solution
+    // already produced for this entry has been run by the fuzzer, because
+    // next_solution() hands them over one at a time and the front-end evaluates
+    // each before asking for the next.  So a target one of our own earlier
+    // answers reached still looks open to a filter that ran before the trace.
+    //
+    // Deliberately the same question and not a coarser one.  "Is this edge
+    // covered at all" would be easy here and would be wrong: is_target_uncovered
+    // compares hit-count *classes*, which is what makes iteration k of a loop a
+    // distinct target from iteration k-1, and a covered-bit test would refuse
+    // every loop branch after the first.  The counters must not move, which is
+    // why this is is_target_uncovered() and not is_branch_interesting().
+    ctx->addr = branch.addr;
+    ctx->direction = branch.neg_direction;
+    ctx->id = branch.id;
+    if (cov_mgr_->is_target_uncovered(ctx)) return task;
+    stats_.stale_tasks += 1;
+  }
 }
 
 int ConcolicSession::input_taint(uint8_t *out, size_t len) {
@@ -671,9 +726,11 @@ void ConcolicSession::print_stats(int fd) const {
     "Total branches: %lu,\n"
     "Total tasks: %lu,\n"
     "Solved tasks: %lu,\n"
+    "Stale tasks: %lu,\n"
     "Solved branches: %lu\n",
     (unsigned long)stats_.total_branches, (unsigned long)stats_.total_tasks,
-    (unsigned long)stats_.solved_tasks, (unsigned long)stats_.solved_branches);
+    (unsigned long)stats_.solved_tasks, (unsigned long)stats_.stale_tasks,
+    (unsigned long)stats_.solved_branches);
   if (branch_map_) {
     dprintf(fd,
       "Branch map: %lu entries, %lu mapped, %lu unmapped\n",

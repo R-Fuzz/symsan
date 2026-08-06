@@ -408,6 +408,23 @@ void symsan_session_report_result(symsan_session_t *s, int interesting);
 symsan_status_t symsan_session_set_coverage(symsan_session_t *s,
                                             const uint8_t *map, size_t len);
 
+/** symsan_session_set_coverage() without the copy: the session reads @p map
+ *  where it lies, for as long as it lies there.
+ *
+ *  Prefer this when the caller owns the fuzzer's history map, because it makes
+ *  the answer live rather than merely recent.  next_solution() re-asks about a
+ *  task's target before solving it, and the fuzzer will have run every solution
+ *  handed over so far -- so with a copy, the session keeps solving for targets
+ *  its own earlier answers already covered.
+ *
+ *  The caller keeps ownership.  @p map must stay valid, and stay at that
+ *  address, until the next call; re-publish it if the buffer can move.  Pass
+ *  NULL to forget it.  Same branch_map requirement as above.
+ */
+symsan_status_t symsan_session_set_coverage_shared(symsan_session_t *s,
+                                                   const uint8_t *map,
+                                                   size_t len);
+
 /** What symsan_session_check_coverage() found.  See include/cov.h. */
 typedef struct {
   /** distinct branch directions the last trace took */
@@ -481,6 +498,9 @@ typedef struct {
   uint64_t branches_to_solve;
   uint64_t total_tasks;
   uint64_t solved_tasks;
+  /** tasks dropped unsolved because their target was covered by the time a
+   *  solver would have run, usually by one of the same batch's earlier answers */
+  uint64_t stale_tasks;
   uint64_t solved_branches;
   /** branch directions the branch map could and could not resolve to fuzzer
    *  edge ids; both 0 when no branch map is in use */

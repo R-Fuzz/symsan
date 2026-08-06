@@ -536,6 +536,26 @@ symsan_status_t symsan_session_set_coverage(symsan_session_t *s,
   });
 }
 
+symsan_status_t symsan_session_set_coverage_shared(symsan_session_t *s,
+                                                   const uint8_t *map,
+                                                   size_t len) {
+  if (!s || (!map && len)) {
+    set_error("symsan_session_set_coverage_shared: session/map required");
+    return SYMSAN_ERR_INVALID;
+  }
+  if (!s->initialized) {
+    set_error("symsan_session_set_coverage_shared: session not initialized");
+    return SYMSAN_ERR_NOT_READY;
+  }
+  return guard(SYMSAN_ERR_FAILED, [&] {
+    if (s->session.set_coverage_shared(map, len) != 0) {
+      set_error("symsan_session_set_coverage_shared: session has no branch map");
+      return SYMSAN_ERR_INVALID;
+    }
+    return SYMSAN_OK;
+  });
+}
+
 symsan_status_t symsan_session_check_coverage(const symsan_session_t *s,
                                               const uint32_t *covered,
                                               size_t n,
@@ -597,6 +617,7 @@ symsan_status_t symsan_session_stats(const symsan_session_t *s,
   out->branches_to_solve = st.branches_to_solve;
   out->total_tasks = st.total_tasks;
   out->solved_tasks = st.solved_tasks;
+  out->stale_tasks = st.stale_tasks;
   out->solved_branches = st.solved_branches;
   out->mapped_branches = st.mapped_branches;
   out->unmapped_branches = st.unmapped_branches;

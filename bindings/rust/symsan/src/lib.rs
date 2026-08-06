@@ -626,6 +626,13 @@ pub struct Stats {
     pub total_tasks: u64,
     /// Tasks a solver satisfied.
     pub solved_tasks: u64,
+    /// Tasks dropped unsolved because their target had already been covered by
+    /// the time a solver would have run -- most often by an earlier answer from
+    /// the same batch, which the parse-time filter could not have foreseen.
+    ///
+    /// Only moves when [`set_coverage_shared`](Session::set_coverage_shared) is
+    /// publishing a live map; against a copy the session cannot tell.
+    pub stale_tasks: u64,
     /// Branches a solution actually flipped, as reported by the front-end
     /// through [`Session::report_result`].
     pub solved_branches: u64,
@@ -941,6 +948,34 @@ impl Session {
         })
     }
 
+    /// [`set_coverage`](Session::set_coverage) without the copy: the session
+    /// reads the map where it lies, so its answers stay current.
+    ///
+    /// This is what makes the filter work inside a batch.  The fuzzer folds
+    /// each solved input into its history map as
+    /// [`next_solution`](Session::next_solution) hands it over, and the session
+    /// re-asks about a task's target before spending a solver on it -- so with
+    /// a copy it keeps solving for targets its own earlier answers reached.
+    /// [`Stats::stale_tasks`] counts what that saves.
+    ///
+    /// # Safety
+    ///
+    /// `map` must point to `len` readable bytes, and must stay valid *and stay
+    /// at that address* until the next call to this or
+    /// [`set_coverage`](Session::set_coverage), or until the session is
+    /// dropped.  A `Vec` that can be reallocated (LibAFL's
+    /// `MapFeedbackMetadata::history_map` grows once, on its first
+    /// `is_interesting`) must be re-published whenever its pointer or length
+    /// changes.  Pass a null pointer and zero to forget the map.
+    ///
+    /// The session only ever reads these bytes, and only from the thread that
+    /// drives it, so a fuzzer updating the same buffer between calls is fine;
+    /// concurrent mutation from another thread is not.
+    pub unsafe fn set_coverage_shared(&mut self, map: *const u8, len: usize) -> Result<(), Error> {
+        // SAFETY: valid handle; the caller guarantees `map`/`len` above.
+        check(unsafe { sys::symsan_session_set_coverage_shared(self.raw.as_ptr(), map, len) })
+    }
+
     /// Hold the branch map against ground truth for the input just traced.
     ///
     /// Where [`set_coverage`](Session::set_coverage) *uses* the map, this
@@ -1028,6 +1063,7 @@ impl Session {
             branches_to_solve: 0,
             total_tasks: 0,
             solved_tasks: 0,
+            stale_tasks: 0,
             solved_branches: 0,
             mapped_branches: 0,
             unmapped_branches: 0,
@@ -1041,6 +1077,7 @@ impl Session {
             branches_to_solve: raw.branches_to_solve,
             total_tasks: raw.total_tasks,
             solved_tasks: raw.solved_tasks,
+            stale_tasks: raw.stale_tasks,
             solved_branches: raw.solved_branches,
             mapped_branches: raw.mapped_branches,
             unmapped_branches: raw.unmapped_branches,

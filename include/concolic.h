@@ -114,6 +114,10 @@ struct ConcolicStats {
   uint64_t branches_to_solve = 0;
   uint64_t total_tasks = 0;
   uint64_t solved_tasks = 0;
+  /// Tasks dropped unsolved because their target had been covered by the time
+  /// a solver would have run -- usually by one of this batch's own earlier
+  /// answers.  The parse-time filter cannot see those; see next_pending_task().
+  uint64_t stale_tasks = 0;
   uint64_t solved_branches = 0;
   /// Branch directions the BranchMap could and could not resolve to fuzzer edge
   /// ids.  Both stay 0 without a map; with one, the ratio is the diagnostic for
@@ -202,6 +206,20 @@ public:
   /// @return 0 on success, -1 if no branch map is in use
   int set_coverage(const uint8_t *map, size_t len);
 
+  /// set_coverage() without the copy: the session reads @p map in place.
+  ///
+  /// Prefer this from a front-end that owns the fuzzer's history map, because
+  /// it makes the answer live.  The fuzzer runs each solved input as
+  /// next_solution() hands it over, which updates that map -- so a copy taken
+  /// before trace() has the session re-solving targets its own earlier answers
+  /// already covered.
+  ///
+  /// @p map must stay valid and stay put until the next call.  Re-publish if
+  /// it can be reallocated (LibAFL's MapFeedbackMetadata::history_map is a Vec
+  /// and grows once, on the first is_interesting); pass nullptr to forget it.
+  /// @return 0 on success, -1 if no branch map is in use
+  int set_coverage_shared(const uint8_t *map, size_t len);
+
   /// Check the branch map against ground truth for the input just traced.
   ///
   /// @p covered is the set of AFL++ edge ids the *fuzzer's* build of the same
@@ -280,10 +298,18 @@ private:
     bool neg_direction; ///< the direction we did *not* take
     bool flipped;       ///< a solution for it came back interesting
   };
-  /// Record @p label and the direction not taken, for input_taint().  No-op
-  /// unless export_taint is set.  @return the index, or SIZE_MAX
+  /// Record @p label and the direction not taken, for input_taint() and for
+  /// next_pending_task().  @return the index, or SIZE_MAX
   size_t note_branch(dfsan_label label, void *addr, uint32_t id,
                      bool neg_direction);
+
+  /// The next queued task whose target is still worth solving, or null.
+  ///
+  /// Re-asks the coverage manager about each task before returning it, which
+  /// is not the same question is_branch_interesting() answered when the task
+  /// was built: that ran while the trace was still arriving, before any of this
+  /// batch's own answers existed.  See the definition.
+  task_t next_pending_task();
 
   ConcolicConfig config_;
   symsan::TraceSession session_;

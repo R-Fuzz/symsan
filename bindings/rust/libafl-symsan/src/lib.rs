@@ -82,14 +82,15 @@ use std::path::{Path, PathBuf};
 use libafl::{
     Error, HasMetadata, HasNamedMetadata,
     corpus::{Corpus, CorpusId, HasCurrentCorpusId},
-    events::EventFirer,
+    events::{Event, EventFirer, EventWithStats},
     executors::{Executor, HasObservers},
     feedbacks::{MapFeedbackMetadata, MapIndexesMetadata},
     fuzzer::{Evaluator, ExecuteInputResult},
     inputs::{BytesInput, HasMutatorBytes},
+    monitors::stats::{AggregatorOps, UserStats, UserStatsValue},
     observers::ObserversTuple,
     stages::{Restartable, RetryCountRestartHelper, Stage, TaintMetadata},
-    state::{HasCorpus, HasCurrentTestcase, HasRand},
+    state::{HasCorpus, HasCurrentTestcase, HasExecutions, HasRand},
 };
 use libafl_bolts::{
     Named, generic_hash_std, nonzero,
@@ -396,8 +397,8 @@ impl SymSanStageBuilder {
     ///
     /// Needs a [`branch_map`](Self::branch_map) to know which edge to look for;
     /// without one every verdict is [`Flip::Unknown`]. The task-to-branch link
-    /// it reads comes from `export_taint`, which this switches on by itself --
-    /// no [`cmplog_filter`](Self::cmplog_filter) required.
+    /// it reads is recorded unconditionally, so this needs neither
+    /// `export_taint` nor [`cmplog_filter`](Self::cmplog_filter).
     ///
     /// Costs no execution: the ids are shared between the two builds, so the
     /// coverage the fuzzer already recorded for the solution is the answer.
@@ -448,11 +449,12 @@ impl SymSanStageBuilder {
             .solve_ub(self.solve_ub)
             .debug(self.debug)
             .forkserver(self.forkserver)
-            // What export_taint buys is the per-task record of which branch a
-            // solution was solved for. The cmplog filter reads it to decide
-            // what to hand cmplog; the flip log reads it to name the branch it
-            // is judging. Either one alone is reason enough to pay for it.
-            .export_taint(self.cmplog_filter || self.flip_log.is_some());
+            // What export_taint buys is the per-branch record of which input
+            // offsets it read, which is what input_taint() answers from and
+            // what the cmplog filter needs to decide what to hand cmplog. The
+            // task-to-branch link the flip log reads is recorded regardless, so
+            // the flip log alone is no longer a reason to pay for the scan.
+            .export_taint(self.cmplog_filter);
         if let Some(ms) = self.timeout_ms {
             config = config.timeout_ms(ms);
         }
@@ -513,6 +515,10 @@ impl SymSanStageBuilder {
             max_solutions_per_input: self.max_solutions_per_input,
             coverage_map_name,
             coverage_warned: false,
+            published_coverage: None,
+            // Not `(0, 0, 0)`: a session that queues nothing at all should
+            // still say so once, rather than leave the field missing.
+            published_stats: (u64::MAX, u64::MAX, u64::MAX),
             validate_coverage: self.validate_coverage,
             validate_warned: false,
             join: JoinReport::default(),
@@ -567,6 +573,14 @@ pub struct SymSanStage {
     /// Whether the "could not read the history map" warning has already been
     /// issued. It would otherwise repeat once per corpus entry.
     coverage_warned: bool,
+    /// The `(address, len)` of the history map the session is currently reading
+    /// through, so `publish_coverage` can tell a moved buffer from a settled
+    /// one. `usize` rather than `*const u8` only so the stage stays `Send`.
+    published_coverage: Option<(usize, usize)>,
+    /// The `(queued, solved, stale)` triple last sent to the monitor, so the
+    /// stage only fires an event when one of them moved. Without that it would
+    /// reprint the whole monitor line once per corpus entry.
+    published_stats: (u64, u64, u64),
     /// Audit the branch map against each entry's tracked edge indices. See
     /// [`SymSanStageBuilder::validate_coverage`].
     validate_coverage: bool,
@@ -677,6 +691,124 @@ impl SymSanStage {
     #[must_use]
     pub fn flips(&self) -> [u64; 4] {
         self.flips
+    }
+
+    /// Point the session at the fuzzer's history map, re-publishing it if the
+    /// buffer has moved since last time.
+    ///
+    /// The session reads the map in place instead of copying it, which is the
+    /// whole point: it re-asks whether a task's target is still uncovered right
+    /// before spending a solver on it, and by then the fuzzer has run every
+    /// solution handed over so far -- runs that update this very map. A copy
+    /// taken once per corpus entry answers as of before the trace, so the
+    /// session keeps solving for targets its own earlier answers reached.
+    ///
+    /// Called again after every solution, not just once per entry, and that is
+    /// a safety requirement rather than a freshness one: `history_map` is a
+    /// `Vec` that `MapFeedback::is_interesting` resizes if the observer's map
+    /// turns out to be longer than the metadata's (`feedbacks/map.rs`), and the
+    /// reallocation would leave the session reading freed memory. Comparing
+    /// `(address, len)` is two loads against the eight-kilobyte copy it
+    /// replaces, so doing it per solution is cheaper than the old per-entry
+    /// `memcpy`.
+    fn publish_coverage<S>(&mut self, state: &S)
+    where
+        S: HasNamedMetadata,
+    {
+        // Resolved in its own scope so the borrow of `self.coverage_map_name`
+        // ends before the warning flags below are written.
+        let resolved = {
+            let Some(map_name) = self.coverage_map_name.as_ref() else {
+                return;
+            };
+            state
+                .named_metadata::<MapFeedbackMetadata<u8>>(map_name)
+                .map(|meta| (meta.history_map.as_ptr() as usize, meta.history_map.len()))
+                // Wrong observer name, or a fuzzer whose map is not u8. Not
+                // fatal -- without one the session simply falls back to its own
+                // view, which is what it did before.
+                .map_err(|e| format!("no u8 coverage map named {map_name:?} in the state ({e})"))
+        };
+        let (addr, len) = match resolved {
+            Ok(v) => v,
+            Err(msg) => {
+                if !self.coverage_warned {
+                    log::warn!("symsan: {msg}; running without shared coverage");
+                    self.coverage_warned = true;
+                }
+                return;
+            }
+        };
+        if self.published_coverage == Some((addr, len)) {
+            return;
+        }
+        // SAFETY: the metadata lives in the fuzzer state, which outlives this
+        // stage; the map is only ever read by the session, from this thread;
+        // and the check above re-publishes whenever the `Vec` moves or grows,
+        // so the pointer the session holds is never stale when it is read.
+        //
+        // "When it is read" is the load-bearing part. Between two `perform()`
+        // calls the other stages are running and can reallocate `history_map`
+        // out from under the pointer the session is holding -- but nothing
+        // reads it there. Every read is inside `perform()`, in `trace()`,
+        // `next_solution()` or `publish_taint()`, and `perform()` re-publishes
+        // before the first of them. The invariant to keep is therefore that no
+        // session call that consults coverage precedes a `publish_coverage()`
+        // in this method.
+        let published = unsafe { self.session.set_coverage_shared(addr as *const u8, len) };
+        match published {
+            Ok(()) => self.published_coverage = Some((addr, len)),
+            Err(e) => {
+                // Leave `published_coverage` alone: the session kept whatever it
+                // had, and claiming the new buffer would make the next call skip
+                // a re-publish it still owes.
+                if !self.coverage_warned {
+                    log::warn!("symsan: cannot share coverage: {e}");
+                    self.coverage_warned = true;
+                }
+            }
+        }
+    }
+
+    /// Put the session's cumulative solver counters on the monitor line, as one
+    /// `symsan_tasks` field next to `corpus:` and `objectives:`.
+    ///
+    /// These are the only numbers a finished campaign has about what the
+    /// concolic stage was actually doing -- the fuzzer's own fields count
+    /// findings, not work. `dropped stale` in particular is the pre-solve
+    /// re-ask reporting for itself: a total that stays at zero means either the
+    /// targets really are all still open or the coverage behind the re-ask is
+    /// not the fuzzer's, and there is no other way to tell those apart from
+    /// outside the process.
+    fn publish_solver_stats<EM, S>(&mut self, state: &mut S, manager: &mut EM) -> Result<(), Error>
+    where
+        S: HasExecutions,
+        EM: EventFirer<BytesInput, S>,
+    {
+        let stats = self.session.stats();
+        let current = (stats.total_tasks, stats.solved_tasks, stats.stale_tasks);
+        if current == self.published_stats {
+            return Ok(());
+        }
+        self.published_stats = current;
+        let (queued, solved, stale) = current;
+        let executions = *state.executions();
+        manager.fire(
+            state,
+            EventWithStats::with_current_time(
+                Event::UpdateUserStats {
+                    name: Cow::Borrowed("symsan_tasks"),
+                    value: UserStats::new(
+                        UserStatsValue::String(Cow::Owned(format!(
+                            "{queued} queued, {solved} solved, {stale} dropped stale"
+                        ))),
+                        AggregatorOps::None,
+                    ),
+                    phantom: PhantomData,
+                },
+                executions,
+            ),
+        )
     }
 
     /// Is edge @p edge already set in the fuzzer's history map?
@@ -845,11 +977,17 @@ where
     // which is what branch_map() needs to read; `Restartable` requires it of
     // `S` anyway, so it costs a stage nothing. `HasMetadata` is where
     // cmplog_filter() publishes its answer.
+    // `HasExecutions` and the `EventFirer` below are only for the solver
+    // counters the stage publishes to the monitor line: an event carries the
+    // execution count, and a campaign that cannot see those counters cannot
+    // tell "the solvers found nothing" from "the stage never ran".
     S: HasCorpus<BytesInput>
         + HasCurrentCorpusId
         + HasCurrentTestcase<BytesInput>
+        + HasExecutions
         + HasMetadata
         + HasNamedMetadata,
+    EM: EventFirer<BytesInput, S>,
     // ...and the fuzzer must be able to run and judge an input for us. This is
     // the bound that makes honest reporting possible.
     Z: Evaluator<E, EM, BytesInput, S>,
@@ -910,30 +1048,12 @@ where
         // spend the whole trace solving for branches that were won hours ago.
         // Done per entry rather than once: the history map only grows, and a
         // stale snapshot would just mean redundant work, not wrong answers.
-        if let Some(map_name) = &self.coverage_map_name {
-            match state.named_metadata::<MapFeedbackMetadata<u8>>(map_name) {
-                Ok(meta) => {
-                    if let Err(e) = self.session.set_coverage(&meta.history_map) {
-                        if !self.coverage_warned {
-                            log::warn!("symsan: cannot share coverage: {e}");
-                            self.coverage_warned = true;
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Wrong observer name, or a fuzzer whose map is not u8.
-                    // Not fatal -- without a snapshot the session simply falls
-                    // back to its own view, which is what it did before.
-                    if !self.coverage_warned {
-                        log::warn!(
-                            "symsan: no u8 coverage map named {map_name:?} in the state ({e}); \
-                             running without shared coverage"
-                        );
-                        self.coverage_warned = true;
-                    }
-                }
-            }
-        }
+        //
+        // It is no longer a snapshot -- see `publish_coverage`. The redundant
+        // work turned out to be most of the work: 47% of a libpng campaign's
+        // solutions were for a target already in the history map, and a copy
+        // taken here cannot see the ones this very batch is about to cover.
+        self.publish_coverage(state);
 
         let tasks = match self.session.trace(&bytes) {
             Ok(n) => n,
@@ -1034,6 +1154,11 @@ where
                 let (result, added) =
                     fuzzer.evaluate_filtered(state, executor, manager, &BytesInput::new(solution))?;
 
+                // That run just moved the fuzzer's history map, and may have
+                // reallocated it. The session reads it in place, so re-check
+                // before the next `next_solution()` sends a task to a solver.
+                self.publish_coverage(state);
+
                 let interesting = result != ExecuteInputResult::None;
                 if interesting {
                     self.solved += 1;
@@ -1059,6 +1184,8 @@ where
                 }
             }
         }
+
+        self.publish_solver_stats(state, manager)?;
 
         // Last, because a target only counts as reached once report_result()
         // has said its solution was interesting.
