@@ -18,6 +18,14 @@
 //   SYMSAN_PARSE_ONLY=1  build the SearchTasks and drop them; report why the
 //                        parser refused the rest.  See below.
 //   SYMSAN_VERBOSE=1     the per-event trace, off by default
+//   SYMSAN_NO_OUTPUT=1   solve, but do not write the solved inputs out.  The
+//                        fuzzer hands a solution back in memory
+//                        (ConcolicSession::next_solution); only this driver
+//                        turns each one into a file plus a result line.  On a
+//                        corpus sweep that is millions of open/write/close
+//                        triples and tens of megabytes of stdout, which is the
+//                        wrong thing to be measuring when profiling the
+//                        parser or the solvers.
 //   SYMSAN_SOLVE_UB=1    also trace the runtime's own undefined-behaviour
 //                        checks, which arrive as conditions with cids in the
 //                        range reserved below the branch map base
@@ -133,6 +141,9 @@ static uint32_t __session_id = 0;
 static uint32_t __current_index = 0;
 static int __enum_gep = 0;  // GEP enumeration disabled by default
 static const char* __dump_dir = nullptr;  // --dump-constraints, off by default
+// SYMSAN_NO_OUTPUT: still solve, still count, just skip generate_input.  See
+// the option list at the top of the file.
+static int __no_output = 0;
 
 // the parse-reason counters, shared in shape with fgtest so that the two
 // parsers can be swept over one corpus and read side by side
@@ -158,6 +169,9 @@ static size_t __output_buf_size = 0;
 // (see symsan::set_label_info_base below)
 
 static void generate_input(const uint8_t *buf, size_t size) {
+  // count it either way, so the index keeps meaning "how many were solved"
+  if (__no_output) { __current_index++; return; }
+
   char path[PATH_MAX];
   snprintf(path, PATH_MAX, "%s/id-%d-%d-%d", __output_dir,
            __instance_id, __session_id, __current_index++);
@@ -549,6 +563,7 @@ int main(int argc, char* const argv[]) {
   __parse_only = getenv("SYMSAN_PARSE_ONLY") != nullptr;
   __verbose = getenv("SYMSAN_VERBOSE") != nullptr;
   __enum_gep = getenv("SYMSAN_ENUM_GEP") != nullptr;
+  __no_output = getenv("SYMSAN_NO_OUTPUT") != nullptr;
   char *options = getenv("TAINT_OPTIONS");
   if (options) {
     // setup output dir
