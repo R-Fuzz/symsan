@@ -17,24 +17,36 @@ import symsan
 
 ### Initialization & Configuration
 
-#### `symsan.init(program_path, [uniontable_size])`
+#### `symsan.init(program_path, [shm_size], [init_solver])`
 Initialize SymSan target with the instrumented binary.
 
 **Parameters:**
 - `program_path` (str): Path to the instrumented binary
-- `uniontable_size` (int, optional): Size of union table (default: from defs.h)
+- `shm_size` (int, optional): Size of union table (default: from defs.h)
+- `init_solver` (bool, optional): Build the parser/solver too (default: True).
+  Pass `0` to trace without solving -- the event stream still works, but
+  `parse_cond`, `parse_gep` and `solve_task` are unavailable.
 
 **Returns:** Capsule containing dfsan_label_info pointer
 
-#### `symsan.config(input_file, args=[], debug=0, bounds=0, undefined=0)`
+#### `symsan.config(input_file, args=[], debug=0, bounds=0, undefined=0, forkserver=0)`
 Configure SymSan runtime options.
 
 **Parameters:**
-- `input_file` (str): Path to input file or "stdin"
-- `args` (list[str], optional): Command-line arguments for target
+- `input_file` (str): Path to input file, "stdin", or "protocol@host:port"
+- `args` (list[str], optional): Command-line arguments for target, including argv[0]
 - `debug` (int, optional): Enable debug output (0 or 1)
 - `bounds` (int, optional): Enable bounds checking (0 or 1)
 - `undefined` (int, optional): Enable undefined behavior solving (0 or 1)
+- `forkserver` (int, optional): Ask the target to serve runs from a fork server
+  (0 or 1). A request, not a promise -- `forkserver_active()` says what happened.
+
+Everything here reaches the target through the environment it is spawned with,
+so **once a fork server is up none of it can change**. `config()` raises
+`RuntimeError` if you try; re-stating the identical configuration is a no-op.
+To feed a running server a second input, rewrite the contents of the one path
+it was configured with (truncating, or a short input reads its predecessor's
+tail).
 
 ### Execution
 
@@ -53,8 +65,21 @@ Read a symbolic execution event from the target.
 
 **Returns:** bytes containing the event data
 
+Events are a byte stream, not a message stream: ask for exactly the number of
+bytes the record you are reading occupies. Several event types are followed by
+a variable-length payload (memcmp content, table contents) that **must be read
+even if you do not use it** -- leaving it on the stream misaligns every event
+after it, and the run still ends normally. `test.py` is the worked example.
+
+#### `symsan.forkserver_active()`
+Whether a fork server is up and serving runs.
+
+**Returns:** bool. False before the first `run()`, and after one if the target
+had no fork server to talk to.
+
 #### `symsan.terminate()`
-Terminate the target process.
+End the current run. Keeps a fork server alive for the next `run()`; use
+`destroy()` to tear it down.
 
 **Returns:** Tuple of (exit_status, is_killed)
 
@@ -101,6 +126,19 @@ Record a memcmp operation for constraint solving.
 - `label` (int): DFSan label ID
 - `content` (bytes): Concrete content being compared
 
+#### `symsan.record_table(ptr, content)`
+Record the contents of a read-only lookup table, keyed on its base address.
+
+**Parameters:**
+- `ptr` (int): Base address of the table in the traced process
+- `content` (bytes): The table's bytes
+
+#### `symsan.record_minimize(label)`
+Record a label to minimize during solving (e.g. an allocation size).
+
+**Parameters:**
+- `label` (int): DFSan label ID
+
 #### `symsan.add_constraint(label, val)`
 Add an explicit constraint.
 
@@ -118,6 +156,14 @@ Solve a constraint task and return solutions.
 **Returns:** Tuple of (status, solutions)
 - `status` (int): Solving status code
 - `solutions` (list[dict]): List of solution dictionaries
+
+#### `symsan.export_task_smt2(task_id, path)`
+Write a task out as SMT-LIB v2, for solving or inspecting outside the binding.
+
+#### `symsan.init_parser(name_or_address)` / `symsan.update_input(input_list)`
+Attach a parser to a union table someone else owns, and refresh the input cache
+without clearing the dependency sets. For drivers that share a table across
+processes; `init()` plus `reset_input()` is what a standalone script wants.
 
 **Status Codes:**
 - `1` - invalid_task
@@ -183,7 +229,20 @@ symsan.OpType.DELETE  # 2 - Delete bytes
 
 ## Example Usage
 
-See `test.py`
+`test.py` is `driver/fgtest.cpp` written against this binding: same command
+line, same `TAINT_OPTIONS`, same generated-input names, and
+`tests/symsan/python_fgtest.c` asserts the two write byte-identical outputs.
+So it is both the worked example -- the event loop there is the whole
+protocol, payload draining included -- and the coverage: anything the C driver
+can do and it cannot is a gap in the wrapper.
+
+```
+PYTHONPATH=symsan_python_path \
+TAINT_OPTIONS="taint_file=seed:output_dir=out" python3 test.py ./target seed...
+```
+
+`test_forkserver.py` is the smaller one: it traces a corpus with and without
+`config(forkserver=1)` and checks the two event streams agree.
 
 ## Notes
 
