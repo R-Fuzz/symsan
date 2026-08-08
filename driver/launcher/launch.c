@@ -705,8 +705,17 @@ static int forksrv_spawn(void) {
     sigprocmask(SIG_SETMASK, &set, NULL);
 
     // disable core dump as shadow mem is toooooo large
+    //
+    // 1, not 0, and the difference is not cosmetic: the kernel only compares
+    // RLIMIT_CORE against the dump size when core_pattern names a *file*.  When
+    // it starts with '|' -- Ubuntu ships `|/usr/share/apport/apport ...` -- that
+    // check is skipped and a limit of 0 dumps anyway; 1 is the value do_coredump
+    // treats as "abort the core" for pipes (its recursive-crash guard).  With 0,
+    // a target that abort()s walks its ~114 TB of shadow VMAs inside
+    // do_coredump, at 100% system time, and SIGKILL does not land while
+    // PF_DUMPCORE is set -- so the launcher's timeout kill cannot reclaim it.
     struct rlimit limit;
-    limit.rlim_cur = limit.rlim_max = 0;
+    limit.rlim_cur = limit.rlim_max = 1;
     setrlimit(RLIMIT_CORE, &limit);
 
     child_disable_aslr();
@@ -1226,8 +1235,17 @@ int symsan_run(int fd) {
     sigprocmask(SIG_SETMASK, &set, NULL);
 
     // disable core dump as shadow mem is toooooo large
+    //
+    // 1, not 0, and the difference is not cosmetic: the kernel only compares
+    // RLIMIT_CORE against the dump size when core_pattern names a *file*.  When
+    // it starts with '|' -- Ubuntu ships `|/usr/share/apport/apport ...` -- that
+    // check is skipped and a limit of 0 dumps anyway; 1 is the value do_coredump
+    // treats as "abort the core" for pipes (its recursive-crash guard).  With 0,
+    // a target that abort()s walks its ~114 TB of shadow VMAs inside
+    // do_coredump, at 100% system time, and SIGKILL does not land while
+    // PF_DUMPCORE is set -- so the launcher's timeout kill cannot reclaim it.
     struct rlimit limit;
-    limit.rlim_cur = limit.rlim_max = 0;
+    limit.rlim_cur = limit.rlim_max = 1;
     setrlimit(RLIMIT_CORE, &limit);
 
     child_disable_aslr();
