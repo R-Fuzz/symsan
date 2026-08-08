@@ -431,7 +431,18 @@ private:
   std::vector<std::shared_ptr<Solver>> solvers_;
 
   /// the input trace() was last called with; the solvers mutate a copy of it
-  std::vector<uint8_t> input_;
+  ///
+  /// Held by shared_ptr and replaced -- not overwritten -- on every trace,
+  /// because every task built from a trace keeps a reference to the bytes it
+  /// was traced against (SearchTask::input).  Solving a task against some later
+  /// trace's seed is not a worse answer, it is an answer to a different
+  /// question: the task's Reads are offsets into *these* bytes.  The cost of
+  /// that guarantee is that a corpus entry's bytes stay resident while any of
+  /// its tasks is still queued, which is the same lifetime the tasks have.
+  /// Never null: input_taint() and the like may be asked before the first
+  /// trace, and an empty buffer is the answer they used to get.
+  std::shared_ptr<std::vector<uint8_t>> input_ =
+      std::make_shared<std::vector<uint8_t>>();
   std::vector<uint8_t> output_buf_;
   int input_fd_;
   bool initialized_;

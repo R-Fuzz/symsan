@@ -403,6 +403,20 @@ public:
   /// it null and nothing asks.
   std::shared_ptr<TaskTarget> target;
 
+  /// The bytes this task's Reads are offsets into, or null if nobody said.
+  ///
+  /// A task is "these constraints over *these* bytes", and the two halves used
+  /// to be separated: the solvers were handed whatever the session had traced
+  /// most recently.  While the queue was drained to exhaustion inside the trace
+  /// that filled it those were the same bytes; with a budget they are not, and
+  /// a task solved against another seed does not give a worse answer, it
+  /// answers a different question.
+  ///
+  /// Shared with every other task from the same trace, so the cost is one copy
+  /// of the seed per traced entry, not per task.  A caller that solves tasks
+  /// straight through (afltest, fgtest) leaves it null and passes the buffer.
+  std::shared_ptr<const std::vector<uint8_t>> input;
+
   void finalize() {
     // aggregate the contraints, map each input byte to a constraint to
     // an index in the "global" input array (i.e., the scratch_args)

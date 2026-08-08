@@ -342,6 +342,9 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
     for (auto const& task_id : tasks) {
       auto task = parser_->retrieve_task(task_id);
       task->target = target;
+      // the bytes this task's Reads index into, so it stays solvable after the
+      // session has moved on to another seed
+      task->input = input_;
       task_mgr_->add_task(target, task);
       task_size_dist_[task->size()] += 1;
     }
@@ -386,6 +389,7 @@ void ConcolicSession::on_gep(const symsan::pipe_msg &msg, const symsan::gep_msg 
   for (auto const& task_id : tasks) {
     auto task = parser_->retrieve_task(task_id);
     task->target = target;
+    task->input = input_;
     task_mgr_->add_task(target, task);
     task_size_dist_[task->size()] += 1;
   }
@@ -447,11 +451,16 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
 
   // keep our own copy: the solvers need the original bytes to build a mutated
   // buffer, and they are called long after trace() returns
-  input_.assign(buf, buf + buf_size);
+  //
+  // A fresh buffer rather than assigning over the old one, because the tasks
+  // built by the last trace hold a reference to it (SearchTask::input) and may
+  // still be queued.  Overwriting would silently re-point their Reads at
+  // another seed's bytes.
+  input_ = std::make_shared<std::vector<uint8_t>>(buf, buf + buf_size);
 
   // clear all caches
   std::vector<symsan::input_t> inputs;
-  inputs.push_back({input_.data(), input_.size()});
+  inputs.push_back({input_->data(), input_->size()});
   parser_->restart(inputs);
   local_counter_.clear();
   local_index_filter_.clear();
@@ -466,7 +475,7 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   // them, so a task still queued from an earlier trace keeps its own.
   traced_branches_.clear();
   traced_taint_.clear();
-  traced_taint_.resize(input_.size());
+  traced_taint_.resize(input_->size());
 
   size_t tasks_before = task_mgr_->get_num_tasks();
   symsan::trace_result_t ret = session_.run(input_fd_, *this);
@@ -549,7 +558,13 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
 
     size_t new_buf_size = 0;
     auto &solver = solvers_[cur_solver_index_];
-    auto ret = solver->solve(cur_task_, input_.data(), input_.size(),
+    // The task's own bytes, not the last trace's: a task's Reads are offsets
+    // into the input it was traced against, so once the queue outlives the
+    // trace that filled it, whatever was traced most recently is a different
+    // question, not a worse-conditioned version of this one.  Falls back to the
+    // current input for a task nobody labelled.
+    const auto &in = cur_task_->input ? *cur_task_->input : *input_;
+    auto ret = solver->solve(cur_task_, in.data(), in.size(),
                              output_buf_.data(), new_buf_size);
     if (SYMSAN_LIKELY(ret == SOLVER_SAT)) {
       mutation_state_ = MUTATION_IN_VALIDATION;
@@ -735,7 +750,7 @@ int ConcolicSession::input_taint(uint8_t *out, size_t len) {
     return -1;
   }
 
-  const size_t size = input_.size();
+  const size_t size = input_->size();
   // offsets some target still depends on.  Asked now rather than reusing what
   // on_cond() computed: add_branch() marks the direction taken as covered as it
   // goes, so a branch the trace later took the other way answers "covered" here
