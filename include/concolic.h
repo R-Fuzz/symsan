@@ -111,6 +111,16 @@ struct ConcolicConfig {
   /// is diluted by size, not slowed by it -- a token mutator picks one at
   /// random, so every junk entry costs a draw -- which is why this is small.
   size_t max_tokens = 4096;
+  /// how many tasks the queue may hold before it starts throwing work away; 0
+  /// leaves it unbounded, which is what it has always been.  The queue outlives
+  /// the trace that filled it, so under a budget it is the whole campaign's
+  /// backlog and grows without one (see #168).
+  size_t max_queue_tasks = 0;             // SYMSAN_MAX_TASKS
+  /// Drain the queue best-first rather than in arrival order, ranking each task
+  /// by how new its destination is (enum TargetNovelty).  Off by default: with
+  /// no bound and a queue drained to exhaustion the order is only latency, and
+  /// this is the arm of an A/B, not a default anyone has earned yet.
+  bool priority_tasks = false;            // SYMSAN_TASK_PRIORITY
 
   /// Populate from the SYMSAN_* environment variables.  Fields not covered by
   /// an environment variable (input_file, args, use_stdin) are left untouched.
@@ -128,6 +138,11 @@ struct ConcolicStats {
   /// a solver would have run -- usually by one of this batch's own earlier
   /// answers.  The parse-time filter cannot see those; see next_pending_task().
   uint64_t stale_tasks = 0;
+  /// Tasks the queue refused or discarded to stay under max_queue_tasks.  Stays
+  /// 0 without a bound; with one it is the measurement that says whether the
+  /// bound is costing solvable work or only trimming a backlog nothing would
+  /// have reached.
+  uint64_t evicted_tasks = 0;
   uint64_t solved_branches = 0;
   /// Branch directions the BranchMap could and could not resolve to fuzzer edge
   /// ids.  Both stay 0 without a map; with one, the ratio is the diagnostic for
@@ -421,8 +436,16 @@ private:
   ConcolicConfig config_;
   symsan::TraceSession session_;
   std::unique_ptr<RGDAstParser> parser_;
-  std::unique_ptr<TaskManager> task_mgr_;
+  /// Before task_mgr_ on purpose: PriorityTaskManager borrows the coverage
+  /// manager to score with, and members are destroyed in reverse declaration
+  /// order, so the borrower must outlive nothing -- it must die first.
   std::unique_ptr<CovManager> cov_mgr_;
+  std::unique_ptr<TaskManager> task_mgr_;
+  /// Tasks add_task() accepted, over the life of the session.  trace() reports
+  /// the difference across a run, which the queue's own size no longer answers:
+  /// a bounded manager can evict more than the trace queued, so the size can
+  /// fall over a trace that produced plenty of work.
+  uint64_t queued_ = 0;
   std::unique_ptr<BranchMap> branch_map_;
   /// cov_mgr_ again when it is a SharedMapCovManager, so that set_coverage()
   /// and the join-rate counters do not have to go through a dynamic_cast on

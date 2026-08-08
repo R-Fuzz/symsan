@@ -232,6 +232,8 @@ pub struct Config {
     export_taint: bool,
     collect_tokens: bool,
     max_tokens: usize,
+    max_queue_tasks: usize,
+    priority_tasks: bool,
 }
 
 /// Convert to a `CString`, replacing any interior NUL by truncating at it.
@@ -292,6 +294,8 @@ impl Config {
             export_taint: raw.export_taint != 0,
             collect_tokens: raw.collect_tokens != 0,
             max_tokens: raw.max_tokens,
+            max_queue_tasks: raw.max_queue_tasks,
+            priority_tasks: raw.priority_tasks != 0,
         }
     }
 
@@ -361,6 +365,8 @@ impl Config {
             export_taint: raw.export_taint != 0,
             collect_tokens: raw.collect_tokens != 0,
             max_tokens: raw.max_tokens,
+            max_queue_tasks: raw.max_queue_tasks,
+            priority_tasks: raw.priority_tasks != 0,
         })
     }
 
@@ -586,6 +592,31 @@ impl Config {
         self
     }
 
+    /// How many tasks the queue may hold before it throws work away. 0, the
+    /// default, leaves it unbounded.
+    ///
+    /// The queue belongs to the session, not to the trace: a front-end that
+    /// gives the stage a budget and moves on leaves the remainder queued, and
+    /// across a campaign that is unbounded growth. [`Stats::evicted_tasks`]
+    /// says what a bound is costing.
+    #[must_use]
+    pub fn max_queue_tasks(mut self, max: usize) -> Self {
+        self.max_queue_tasks = max;
+        self
+    }
+
+    /// Drain the queue best-first rather than in arrival order.
+    ///
+    /// Tasks are ranked by how new their destination is -- never-walked edge,
+    /// new hit-count class, or already covered -- read from the fuzzer's own
+    /// history map at the moment the task is queued. Ties break oldest-first,
+    /// so this is exactly FIFO when nothing can be told apart.
+    #[must_use]
+    pub fn priority_tasks(mut self, enable: bool) -> Self {
+        self.priority_tasks = enable;
+        self
+    }
+
     /// The scratch file inputs are staged into.
     pub fn input_file_path(&self) -> PathBuf {
         PathBuf::from(self.input_file.to_string_lossy().into_owned())
@@ -640,6 +671,8 @@ impl Config {
         raw.export_taint = self.export_taint.into();
         raw.collect_tokens = self.collect_tokens.into();
         raw.max_tokens = self.max_tokens;
+        raw.max_queue_tasks = self.max_queue_tasks;
+        raw.priority_tasks = self.priority_tasks.into();
 
         (raw, argv)
     }
@@ -667,6 +700,13 @@ pub struct Stats {
     /// Only moves when [`set_coverage_shared`](Session::set_coverage_shared) is
     /// publishing a live map; against a copy the session cannot tell.
     pub stale_tasks: u64,
+    /// Tasks the queue refused or discarded to stay under
+    /// [`Config::max_queue_tasks`].
+    ///
+    /// Zero without a bound. With one it is what says whether the bound is
+    /// costing solvable work or only trimming a backlog nothing would have
+    /// reached before the campaign ended.
+    pub evicted_tasks: u64,
     /// Branches a solution actually flipped, as reported by the front-end
     /// through [`Session::report_result`].
     pub solved_branches: u64,
@@ -1204,6 +1244,7 @@ impl Session {
             total_tasks: 0,
             solved_tasks: 0,
             stale_tasks: 0,
+            evicted_tasks: 0,
             solved_branches: 0,
             mapped_branches: 0,
             unmapped_branches: 0,
@@ -1218,6 +1259,7 @@ impl Session {
             total_tasks: raw.total_tasks,
             solved_tasks: raw.solved_tasks,
             stale_tasks: raw.stale_tasks,
+            evicted_tasks: raw.evicted_tasks,
             solved_branches: raw.solved_branches,
             mapped_branches: raw.mapped_branches,
             unmapped_branches: raw.unmapped_branches,

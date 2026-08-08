@@ -71,6 +71,30 @@ struct TaskTarget : public ContextAwareBranchContext {
   bool flipped;
 };
 
+/// How new the direction a task exists to reach would be, graded rather than
+/// answered yes/no.
+///
+/// A bool has no variance where it is needed.  A task is only ever built for a
+/// target is_branch_interesting() already said yes about (on_cond builds none
+/// otherwise, because every ordinary condition sets F_ADD_CONS), so "is the
+/// destination uncovered" is true for every task in the queue and orders
+/// nothing.  These grades are the distinctions the fuzzer's history map can
+/// actually make -- it stores hit-count *classes*, not bits -- so this is the
+/// same question at the granularity the data has, not a different one.
+///
+/// Ordered by value, low to high: a manager may return any of them and a
+/// scheduler may compare them, but nothing should switch on the count.
+enum TargetNovelty {
+  /// the fuzzer's history already holds this direction at the class one more
+  /// traversal would land in, so a solution here is one it would discard
+  kTargetCovered = 0,
+  /// walked before, but the next traversal crosses into a new hit-count class:
+  /// new to MaxMapFeedback, and not new code
+  kTargetNewClass = 1,
+  /// never walked -- no hit at all on the edge behind it
+  kTargetNewEdge = 2,
+};
+
 class CovManager {
 public:
   virtual ~CovManager() {}
@@ -78,6 +102,17 @@ public:
     add_branch(void *addr, uint32_t id, bool direction, uint32_t context, bool is_loop_header, bool is_loop_exit) = 0;
   virtual bool
     is_branch_interesting(const std::shared_ptr<BranchContext> context) = 0;
+
+  /// is_target_uncovered()'s answer, graded -- see enum TargetNovelty.
+  ///
+  /// Same contract as is_target_uncovered(): asked after the trace, must not
+  /// move the counters, and `kTargetCovered` exactly when that returns false.
+  /// Defaulted to the two-valued answer, so a manager that only knows whether
+  /// it has seen a direction needs no override; it just cannot rank.
+  virtual int
+    target_novelty(const std::shared_ptr<BranchContext> context) {
+      return is_target_uncovered(context) ? kTargetNewEdge : kTargetCovered;
+    }
 
   /// The same question is_branch_interesting() answers -- is this target still
   /// unreached? -- but without the bookkeeping.
@@ -387,10 +422,18 @@ public:
     return uncovered(context, /*count=*/false);
   }
 
+  int target_novelty(const std::shared_ptr<BranchContext> context) override {
+    return novelty(context, /*count=*/false);
+  }
+
 private:
+  bool uncovered(const std::shared_ptr<BranchContext> context, bool count) {
+    return novelty(context, count) != kTargetCovered;
+  }
+
   /// @p count is what separates the two entry points above: the counters are a
   /// census of the branches the trace saw, so a re-ask must not add to them.
-  bool uncovered(const std::shared_ptr<BranchContext> context, bool count) {
+  int novelty(const std::shared_ptr<BranchContext> context, bool count) {
     // Consult the fuzzer first, and unconditionally, so the counters describe
     // every branch we saw rather than only the ones that got past the local
     // check below.
@@ -470,7 +513,14 @@ private:
       // branch inside a loop is worth solving at every depth.  Letting it veto
       // is what kept test-crc32 stuck -- the fuzzer would happily have taken
       // the input, and we never built the task.
-      return have < want;
+      //
+      // `have < want` is still the whole answer to "uncovered?"; the grade only
+      // splits the yes.  An edge the fuzzer has never walked is new code, and
+      // one it has walked but not this often is a new hit-count class on code
+      // it already reaches -- the same difference MaxMapFeedback would see, and
+      // the only ranking signal the history map holds.
+      if (have >= want) return kTargetCovered;
+      return have == 0 ? kTargetNewEdge : kTargetNewClass;
     }
 
     if (count) unmapped_ += 1;
@@ -483,9 +533,14 @@ private:
     // ...except when is_target_uncovered() asks: it also asks about symbolic
     // array indices, and on_gep() does not call add_branch().  Something we
     // have no record of reaching is unreached.
-    if (itr == branches.end()) return true;
-    return context->direction ? itr->second.first == false
-                              : itr->second.second == false;
+    //
+    // Two grades only, never kTargetNewClass: `branches` holds a bit per
+    // direction, so it cannot say how often -- and the honest answer for a
+    // direction with no record is the optimistic one, the same way the bool
+    // above returned true rather than false.
+    if (itr == branches.end()) return kTargetNewEdge;
+    bool taken = context->direction ? itr->second.first : itr->second.second;
+    return taken ? kTargetCovered : kTargetNewEdge;
   }
 };
 

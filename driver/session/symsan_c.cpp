@@ -339,6 +339,8 @@ void symsan_config_init(symsan_config_t *cfg) {
   cfg->max_local_branch_counter = def.max_local_branch_counter;
   cfg->max_input_size = def.max_input_size;
   cfg->max_tokens = def.max_tokens;
+  cfg->max_queue_tasks = def.max_queue_tasks;
+  cfg->priority_tasks = def.priority_tasks;
 }
 
 symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
@@ -373,6 +375,8 @@ symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
     cfg->validate_coverage = c.validate_coverage;
     cfg->export_taint = c.export_taint;
     cfg->collect_tokens = c.collect_tokens;
+    cfg->max_queue_tasks = c.max_queue_tasks;
+    cfg->priority_tasks = c.priority_tasks;
     return SYMSAN_OK;
   });
 }
@@ -441,6 +445,10 @@ symsan_status_t symsan_session_init(symsan_session_t *s,
     }
     if (cfg->max_input_size) c.max_input_size = cfg->max_input_size;
     if (cfg->max_tokens) c.max_tokens = cfg->max_tokens;
+    // No `if`: 0 is a meaningful value here (unbounded) and also the default,
+    // so there is nothing to protect and nothing to guess.
+    c.max_queue_tasks = cfg->max_queue_tasks;
+    c.priority_tasks = cfg->priority_tasks != 0;
 
     if (s->session.init(c) != 0) {
       set_error("ConcolicSession::init failed");
@@ -676,6 +684,7 @@ symsan_status_t symsan_session_stats(const symsan_session_t *s,
   out->total_tasks = st.total_tasks;
   out->solved_tasks = st.solved_tasks;
   out->stale_tasks = st.stale_tasks;
+  out->evicted_tasks = st.evicted_tasks;
   out->solved_branches = st.solved_branches;
   out->mapped_branches = st.mapped_branches;
   out->unmapped_branches = st.unmapped_branches;

@@ -279,6 +279,16 @@ typedef struct {
    *  dictionary is diluted by its size rather than slowed by it, which is why
    *  this is small. */
   size_t max_tokens;
+
+  /** How many tasks the queue may hold before it starts throwing work away.
+   *  0 leaves it unbounded, which is what it has always been.  The queue
+   *  outlives the trace that filled it, so a front-end that gives the stage a
+   *  budget and moves on is accumulating a campaign-long backlog without
+   *  this. */
+  size_t max_queue_tasks;
+  /** Drain the queue best-first rather than in arrival order, ranking each
+   *  task by how new its destination is.  Off by default. */
+  int priority_tasks;
 } symsan_config_t;
 
 /** Fill @p cfg with the defaults.  Always call this first. */
@@ -582,6 +592,9 @@ typedef struct {
   /** tasks dropped unsolved because their target was covered by the time a
    *  solver would have run, usually by one of the same batch's earlier answers */
   uint64_t stale_tasks;
+  /** tasks the queue refused or discarded to stay under max_queue_tasks; 0
+   *  without a bound */
+  uint64_t evicted_tasks;
   uint64_t solved_branches;
   /** branch directions the branch map could and could not resolve to fuzzer
    *  edge ids; both 0 when no branch map is in use */

@@ -86,6 +86,10 @@ int ConcolicConfig::from_env() {
   if (getenv("SYMSAN_EXPORT_TAINT")) export_taint = true;
   // hand the front-end the concrete bytes the target compared against?
   if (getenv("SYMSAN_TOKENS")) collect_tokens = true;
+  // bound the task backlog, and order it by how new each destination is
+  const char *max_tasks = getenv("SYMSAN_MAX_TASKS");
+  if (max_tasks) max_queue_tasks = (size_t)strtoull(max_tasks, nullptr, 10);
+  if (getenv("SYMSAN_TASK_PRIORITY")) priority_tasks = true;
 
   return 0;
 }
@@ -174,7 +178,6 @@ int ConcolicSession::init(const ConcolicConfig &config) {
   // parser: a condition the parser refuses is exactly the one whose constants
   // are worth handing to a mutator.  See include/tokens.h.
   tokens_.init(shm_base, uniontable_size, config_.max_tokens);
-  task_mgr_.reset(new FIFOTaskManager());
 
   if (branch_map_) {
     auto *shared = new SharedMapCovManager(branch_map_.get());
@@ -183,6 +186,17 @@ int ConcolicSession::init(const ConcolicConfig &config) {
     cov_mgr_.reset(shared);
   } else {
     cov_mgr_.reset(new EdgeCovManager());
+  }
+
+  // After the coverage manager, which the priority queue scores against and
+  // therefore borrows.  Both are owned here and destroyed in reverse
+  // declaration order, so the borrow is safe as long as task_mgr_ is declared
+  // after cov_mgr_ (it is; see include/concolic.h).
+  if (config_.priority_tasks) {
+    task_mgr_.reset(
+        new PriorityTaskManager(cov_mgr_.get(), config_.max_queue_tasks));
+  } else {
+    task_mgr_.reset(new FIFOTaskManager(config_.max_queue_tasks));
   }
 
   // the simpler i2s solver first, then the expensive ones in cost order
@@ -345,7 +359,7 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
       // the bytes this task's Reads index into, so it stays solvable after the
       // session has moved on to another seed
       task->input = input_;
-      task_mgr_->add_task(target, task);
+      if (task_mgr_->add_task(target, task)) queued_ += 1;
       task_size_dist_[task->size()] += 1;
     }
 
@@ -390,7 +404,7 @@ void ConcolicSession::on_gep(const symsan::pipe_msg &msg, const symsan::gep_msg 
     auto task = parser_->retrieve_task(task_id);
     task->target = target;
     task->input = input_;
-    task_mgr_->add_task(target, task);
+    if (task_mgr_->add_task(target, task)) queued_ += 1;
     task_size_dist_[task->size()] += 1;
   }
 
@@ -477,7 +491,11 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   traced_taint_.clear();
   traced_taint_.resize(input_->size());
 
-  size_t tasks_before = task_mgr_->get_num_tasks();
+  // What the queue accepted, not how much longer it got: with a bound the two
+  // differ, and a trace that filled the queue and then evicted its way past its
+  // own contribution would otherwise report a negative number of tasks -- which
+  // is this function's error code.
+  uint64_t queued_before = queued_;
   symsan::trace_result_t ret = session_.run(input_fd_, *this);
   // Labels, not tokens: the dictionary is deliberately cumulative, but a label
   // only names the same AST within one run of the target.
@@ -497,7 +515,11 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   cur_solver_index_ = 0;
   mutation_state_ = MUTATION_INVALID;
 
-  return (int)(task_mgr_->get_num_tasks() - tasks_before);
+  // The manager keeps the running total; mirror it so a front-end reading
+  // stats() does not need to know which manager it got.
+  stats_.evicted_tasks = task_mgr_->evicted();
+
+  return (int)(queued_ - queued_before);
 }
 
 const uint8_t *ConcolicSession::next_solution(size_t *size) {
@@ -831,6 +853,15 @@ void ConcolicSession::print_stats(int fd) const {
     (unsigned long)stats_.total_branches, (unsigned long)stats_.total_tasks,
     (unsigned long)stats_.solved_tasks, (unsigned long)stats_.stale_tasks,
     (unsigned long)stats_.solved_branches);
+  // Only with a bound, which is off by default: a line of zeroes in every
+  // stats dump reads as a thing that failed rather than a thing not asked for.
+  if (config_.max_queue_tasks) {
+    dprintf(fd, "Task queue: %lu of %lu held, %lu evicted, %s order\n",
+            (unsigned long)task_mgr_->get_num_tasks(),
+            (unsigned long)config_.max_queue_tasks,
+            (unsigned long)task_mgr_->evicted(),
+            config_.priority_tasks ? "priority" : "FIFO");
+  }
   if (branch_map_) {
     dprintf(fd,
       "Branch map: %lu entries, %lu mapped, %lu unmapped\n",

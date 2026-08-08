@@ -65,6 +65,25 @@ target_link_libraries(NormTest PRIVATE
 )
 install (TARGETS NormTest DESTINATION ${SYMSAN_BIN_DIR})
 
+## unit tests for the search-task queue and the novelty grade it orders by.
+## Both need the coverage manager driven to states a real trace cannot be made
+## to produce on demand, so the manager is scripted and the branch map is
+## synthesized -- no launcher, no instrumented target.  symsan-session is here
+## only for BranchMap::load().
+add_executable(QueueTest queuetest.cpp)
+set_target_properties(QueueTest PROPERTIES OUTPUT_NAME "queuetest" CXX_STANDARD 17)
+target_include_directories(QueueTest PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+)
+target_link_libraries(QueueTest PRIVATE
+  symsan-session
+  rgd-parser
+  rgd-solver
+  ${Z3_LIBRARY}
+  rt
+)
+install (TARGETS QueueTest DESTINATION ${SYMSAN_BIN_DIR})
+
 ## offline check that the branch map joins SymSan branches to the *right* AFL++
 ## edges, against an afl-showmap run as ground truth
 add_executable(CovCheck covcheck.cpp)
