@@ -625,6 +625,7 @@ impl SymSanStageBuilder {
             duplicates: 0,
             tokens: self.tokens,
             max_queue_tasks: self.max_queue_tasks,
+            priority_tasks: self.priority_tasks,
             tokens_added: 0,
             tokens_warned: false,
         })
@@ -722,6 +723,10 @@ pub struct SymSanStage {
     /// line should carry an eviction count at all. See
     /// [`SymSanStageBuilder::max_queue_tasks`].
     max_queue_tasks: usize,
+    /// Whether the session got the ranking queue, so the monitor line can carry
+    /// the novelty split -- which is 0/0/0 from a FIFO and would read as "every
+    /// destination is already covered" rather than "nobody scored them".
+    priority_tasks: bool,
     /// Tokens actually added to the dictionary, for the monitor line. Not the
     /// same as the session's count: the state may not have a [`Tokens`] to add
     /// them to, and this is what says so.
@@ -973,6 +978,18 @@ impl SymSanStage {
         } else {
             String::new()
         };
+        // What the ranking had to rank. Not in the change-detection tuple above
+        // because it moves with `queued` and cannot move without it: every task
+        // offered is both counted here and counted there.
+        let novelty = if self.priority_tasks {
+            let n = stats.queued_novelty;
+            format!(
+                ", targets {}/{}/{} new-edge/new-class/covered",
+                n[2], n[1], n[0]
+            )
+        } else {
+            String::new()
+        };
         let executions = *state.executions();
         manager.fire(
             state,
@@ -982,7 +999,7 @@ impl SymSanStage {
                     value: UserStats::new(
                         UserStatsValue::String(Cow::Owned(format!(
                             "{queued} queued, {solved} solved, {stale} dropped stale, \
-                             {duplicate} duplicate{tokens}{evicted}"
+                             {duplicate} duplicate{tokens}{evicted}{novelty}"
                         ))),
                         AggregatorOps::None,
                     ),

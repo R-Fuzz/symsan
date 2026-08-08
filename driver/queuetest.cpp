@@ -187,6 +187,26 @@ void test_priority_drains_best_first() {
   check(evicted == 0, "an unbounded priority queue evicts nothing");
 }
 
+void test_the_histogram_counts_what_was_offered() {
+  // The number the A/B is read against: it says whether the queue had anything
+  // to rank at all.  Over tasks *offered*, so a bound cannot make a run look
+  // like it saw only the work it kept.
+  Fixture f(/*priority=*/true, /*capacity=*/2);
+  for (int s : {2, 0, 1, 0, 2}) f.add(s);
+  const uint64_t *h = f.mgr->novelty_histogram();
+  check(h != nullptr, "the priority queue reports a histogram");
+  if (h) {
+    check(h[kTargetNewEdge] == 2 && h[kTargetNewClass] == 1 &&
+              h[kTargetCovered] == 2,
+          "the histogram counts every task offered, not the three kept");
+  }
+
+  Fixture g(/*priority=*/false, /*capacity=*/0);
+  g.add(2);
+  check(g.mgr->novelty_histogram() == nullptr,
+        "a FIFO reports no histogram rather than a histogram of zeroes");
+}
+
 void test_priority_with_equal_scores_is_fifo() {
   // The property the A/B rests on: with nothing to tell tasks apart the two
   // managers must be the same queue, or a difference in a campaign could be the
@@ -410,6 +430,7 @@ int main(int argc, char **argv) {
 
   test_fifo_ignores_the_score();
   test_priority_drains_best_first();
+  test_the_histogram_counts_what_was_offered();
   test_priority_with_equal_scores_is_fifo();
   test_bound_evicts_the_worst();
   test_fifo_bound_drops_the_newcomer();

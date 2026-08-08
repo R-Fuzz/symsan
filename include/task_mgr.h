@@ -27,6 +27,16 @@ public:
   /// that never evicts is a queue whose capacity is not the constraint.
   uint64_t evicted() const { return evicted_; }
 
+  /// How the tasks offered to this manager scored, indexed by TargetNovelty,
+  /// or null from a manager that does not score.
+  ///
+  /// The diagnostic the ranking cannot be read without: if every task scores
+  /// the same, a priority queue *is* a FIFO, and an A/B that measures no
+  /// difference has measured nothing rather than measured a tie.  Counted over
+  /// tasks offered, not tasks kept -- it describes the population the order is
+  /// chosen from.
+  virtual const uint64_t *novelty_histogram() const { return nullptr; }
+
 protected:
   uint64_t evicted_ = 0;
 };
@@ -102,6 +112,7 @@ public:
     // about a branch it has no record of -- the optimistic answer is the one
     // that cannot silently drop solvable work.
     int score = (cov_ && ctx) ? cov_->target_novelty(ctx) : kTargetNewEdge;
+    if (score >= 0 && score < kTargetNoveltyCount) graded_[score] += 1;
     Key key{score, seq_++};
 
     if (capacity_ && tasks_.size() >= capacity_) {
@@ -129,6 +140,8 @@ public:
     return tasks_.size();
   }
 
+  const uint64_t *novelty_histogram() const override { return graded_; }
+
 private:
   /// Best first, then oldest first, so begin() is the task to solve and the
   /// last element is the one to throw away.  A single ordering serving both
@@ -149,6 +162,8 @@ private:
   /// restarting it per trace would make an old task look newer than a fresh one.
   uint64_t seq_ = 0;
   std::map<Key, task_t> tasks_;
+  /// Every task ever offered, by the score it got.  See novelty_histogram().
+  uint64_t graded_[kTargetNoveltyCount] = {0};
 };
 
 };  // namespace rgd

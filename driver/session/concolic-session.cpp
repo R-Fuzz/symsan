@@ -515,9 +515,13 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   cur_solver_index_ = 0;
   mutation_state_ = MUTATION_INVALID;
 
-  // The manager keeps the running total; mirror it so a front-end reading
+  // The manager keeps the running totals; mirror them so a front-end reading
   // stats() does not need to know which manager it got.
   stats_.evicted_tasks = task_mgr_->evicted();
+  if (const uint64_t *graded = task_mgr_->novelty_histogram()) {
+    for (int i = 0; i < kTargetNoveltyCount; i++)
+      stats_.queued_novelty[i] = graded[i];
+  }
 
   return (int)(queued_ - queued_before);
 }
@@ -861,6 +865,14 @@ void ConcolicSession::print_stats(int fd) const {
             (unsigned long)config_.max_queue_tasks,
             (unsigned long)task_mgr_->evicted(),
             config_.priority_tasks ? "priority" : "FIFO");
+  }
+  // Whether the ranking had anything to rank, which is not the same question as
+  // whether it helped -- and the only one that can be answered from one arm.
+  if (const uint64_t *graded = task_mgr_->novelty_histogram()) {
+    dprintf(fd, "Task novelty: %lu new edge, %lu new class, %lu covered\n",
+            (unsigned long)graded[kTargetNewEdge],
+            (unsigned long)graded[kTargetNewClass],
+            (unsigned long)graded[kTargetCovered]);
   }
   if (branch_map_) {
     dprintf(fd,

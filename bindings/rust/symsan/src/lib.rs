@@ -707,6 +707,14 @@ pub struct Stats {
     /// costing solvable work or only trimming a backlog nothing would have
     /// reached before the campaign ended.
     pub evicted_tasks: u64,
+    /// Tasks offered to the queue by how new their destination was, as
+    /// `[covered, new hit-count class, never-walked edge]`.
+    ///
+    /// All zero unless [`Config::priority_tasks`] is on -- a FIFO does not
+    /// score. It says whether the ranking had anything to rank: a run whose
+    /// tasks all land in one bucket is one where best-first and oldest-first
+    /// are the same queue, and a measurement over it has measured nothing.
+    pub queued_novelty: [u64; 3],
     /// Branches a solution actually flipped, as reported by the front-end
     /// through [`Session::report_result`].
     pub solved_branches: u64,
@@ -1245,6 +1253,7 @@ impl Session {
             solved_tasks: 0,
             stale_tasks: 0,
             evicted_tasks: 0,
+            queued_novelty: [0; 3],
             solved_branches: 0,
             mapped_branches: 0,
             unmapped_branches: 0,
@@ -1260,6 +1269,7 @@ impl Session {
             solved_tasks: raw.solved_tasks,
             stale_tasks: raw.stale_tasks,
             evicted_tasks: raw.evicted_tasks,
+            queued_novelty: raw.queued_novelty,
             solved_branches: raw.solved_branches,
             mapped_branches: raw.mapped_branches,
             unmapped_branches: raw.unmapped_branches,

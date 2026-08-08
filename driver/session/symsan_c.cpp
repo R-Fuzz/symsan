@@ -685,6 +685,8 @@ symsan_status_t symsan_session_stats(const symsan_session_t *s,
   out->solved_tasks = st.solved_tasks;
   out->stale_tasks = st.stale_tasks;
   out->evicted_tasks = st.evicted_tasks;
+  for (int i = 0; i < rgd::kTargetNoveltyCount; i++)
+    out->queued_novelty[i] = st.queued_novelty[i];
   out->solved_branches = st.solved_branches;
   out->mapped_branches = st.mapped_branches;
   out->unmapped_branches = st.unmapped_branches;

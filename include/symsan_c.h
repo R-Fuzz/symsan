@@ -595,6 +595,11 @@ typedef struct {
   /** tasks the queue refused or discarded to stay under max_queue_tasks; 0
    *  without a bound */
   uint64_t evicted_tasks;
+  /** tasks offered to the queue by how new their destination was, indexed as
+   *  {covered, new hit-count class, never-walked edge}; all 0 unless the queue
+   *  is the ranking one, since a FIFO does not score.  Says whether the ranking
+   *  had anything to rank */
+  uint64_t queued_novelty[3];
   uint64_t solved_branches;
   /** branch directions the branch map could and could not resolve to fuzzer
    *  edge ids; both 0 when no branch map is in use */

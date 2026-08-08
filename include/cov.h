@@ -95,6 +95,11 @@ enum TargetNovelty {
   kTargetNewEdge = 2,
 };
 
+/// How many grades there are, for sizing a histogram of them.  Not a member of
+/// the enum: a value that is not a grade has no business being returned by
+/// target_novelty() or compared against one.
+static const int kTargetNoveltyCount = 3;
+
 class CovManager {
 public:
   virtual ~CovManager() {}

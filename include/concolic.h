@@ -143,6 +143,12 @@ struct ConcolicStats {
   /// bound is costing solvable work or only trimming a backlog nothing would
   /// have reached.
   uint64_t evicted_tasks = 0;
+  /// Tasks offered to the queue, by how new their destination was (indexed by
+  /// enum TargetNovelty).  All 0 unless the queue is the ranking one, which is
+  /// the only one that scores.  This is what says whether the ranking has
+  /// anything to rank: a run whose tasks all land in one bucket is one where
+  /// best-first and oldest-first are the same queue.
+  uint64_t queued_novelty[3] = {0, 0, 0};
   uint64_t solved_branches = 0;
   /// Branch directions the BranchMap could and could not resolve to fuzzer edge
   /// ids.  Both stay 0 without a map; with one, the ratio is the diagnostic for
