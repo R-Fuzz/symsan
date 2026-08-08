@@ -175,10 +175,10 @@ private:
   const uint8_t *host_ = nullptr;
   size_t host_len_ = 0;
   std::vector<uint8_t> host_owned_;
-  /// How many times this trace has taken each branch, keyed on the cid.  Keying
-  /// on the cid is safe here where it is not for `branches` above, because only
-  /// the mapped path reads it and a cid the map answers for is an AFL++ edge
-  /// id, unique to its branch.
+  /// How many times this trace has taken each branch *direction*, keyed on
+  /// (cid << 1) | direction.  Keying on the cid is safe here where it is not
+  /// for `branches` above, because only the mapped path reads it and a cid the
+  /// map answers for is an AFL++ edge id, unique to its branch.
   ///
   /// This is what the target's own AFL++ counters cannot supply, for all that
   /// they are real counts over every edge rather than only the tainted ones.
@@ -188,7 +188,15 @@ private:
   /// finished the loop, so the map reads the same -- final -- number at every
   /// iteration.  Measured: it collapses the graduated classes below to one
   /// value and makes every iteration look equally new.
-  std::unordered_map<uint32_t, uint32_t> trace_hits_;
+  ///
+  /// It was keyed on the cid alone, which is the same number only for a branch
+  /// outside a loop.  See uncovered() for why that made every loop branch
+  /// permanently solvable.
+  std::unordered_map<uint64_t, uint32_t> trace_hits_;
+  /// (cid, direction) as trace_hits_ keys it.
+  static uint64_t dir_key(uint32_t id, bool direction) {
+    return ((uint64_t)id << 1) | (direction ? 1 : 0);
+  }
   uint64_t mapped_ = 0;
   uint64_t unmapped_ = 0;
 
@@ -334,7 +342,7 @@ public:
     auto &itr = branches[addr];
     itr.first |= direction? true : false;
     itr.second |= direction? false : true;
-    trace_hits_[id] += 1;
+    trace_hits_[dir_key(id, direction)] += 1;
     // Here rather than in is_branch_interesting(), which is handed the
     // *negated* context: this is the only place the direction actually taken
     // is in hand, and that is the one the fuzzer's map can be checked against.
@@ -394,8 +402,29 @@ private:
       // trace, which we would have to run to know -- and it errs towards
       // solving, which is the right way to err for a stage that is gated to
       // once per corpus entry anyway.
-      auto hit = trace_hits_.find(context->id);
-      uint8_t want = count_class(hit == trace_hits_.end() ? 1 : hit->second);
+      //
+      // That estimate was wrong, and not by a little: it counted hits on the
+      // *branch* while `have` is the history class of the *flipped edge*, and
+      // for anything inside a loop those two are unrelated.  A `for` header
+      // reached 200 times has want = class(200) = 128, but the loop-exit edge
+      // is taken exactly once however the input is rewritten, so have = 1 --
+      // and `have < want` stays true at every iteration, on this trace and on
+      // every later one.  No solution can ever close it, because the quantity
+      // it demands is not one a solution produces.  Measured on libpng: ~19
+      // branch ids absorbed 67-71% of all solutions for 30 of ~410 flips.
+      //
+      // What the flipped edge would actually land in is one more traversal of
+      // the direction we are solving *toward* -- context is the negated one,
+      // so that is exactly context->direction.  Boundaries: a side never taken
+      // gives class(1), unchanged from before for a branch outside a loop; a
+      // side taken 31 times gives class(32) = 64 against have = 32, so the
+      // traversal that crosses into a new class is still solved; taken 50
+      // gives class(51) = 64 = have, refused, because a 51st traversal is not
+      // new coverage.  Still an estimate, and still erring towards solving --
+      // but now a satisfiable one.
+      auto hit = trace_hits_.find(dir_key(context->id, context->direction));
+      uint32_t taken = hit == trace_hits_.end() ? 0 : hit->second;
+      uint8_t want = count_class(taken + 1);
       // Only the fuzzer's history answers the other half.  Nothing of ours is
       // folded in: it publishes host_ before every traced entry
       // (bindings/rust/libafl-symsan/src/lib.rs), so a session-lifetime record
