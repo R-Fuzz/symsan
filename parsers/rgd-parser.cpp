@@ -402,7 +402,76 @@ int RGDAstParser::restart(std::vector<symsan::input_t> &inputs, bool copy_input)
   }
   input_to_branches.resize(input_size_);
 
+  // The dep pool sizes its entries from input_size_, so it can only be rebuilt
+  // once that is known.  Slot 0 is the empty set and every constant, every
+  // zero-length Load and every concretized operand shares it, so it is worth
+  // having unconditionally rather than as a special case at each use.
+  dep_pool.clear();
+  dep_pool.emplace_back(input_size_);
+  dep_range_memo.clear();
+  dep_union_memo.clear();
+  // kNoDep rather than 0, because 0 is the empty set -- a real answer here.
+  dep_single_memo.assign(input_size_, kNoDep);
+
   return 0;
+}
+
+// The three interning entry points.  Each one is a memo lookup on how the set is
+// DERIVED, which is O(1) and needs no pass over the bits; only a miss builds a
+// set, and only a miss that is not already in the pool costs an entry.
+
+uint32_t RGDAstParser::dep_intern_single(size_t idx) {
+  uint32_t &slot = dep_single_memo[idx];
+  if (slot == kNoDep) {
+    slot = (uint32_t)dep_pool.size();
+    dep_pool.emplace_back(input_size_);
+    dep_pool.back().set(idx);
+  }
+  return slot;
+}
+
+uint32_t RGDAstParser::dep_intern_range(size_t idx, size_t len) {
+  if (len == 0) return 0; // the empty set, as the old per-byte loop produced
+  if (len == 1) return dep_intern_single(idx);
+  const uint64_t key = ((uint64_t)idx << 32) | (uint32_t)len;
+  auto itr = dep_range_memo.find(key);
+  if (itr != dep_range_memo.end()) return itr->second;
+  const uint32_t slot = (uint32_t)dep_pool.size();
+  dep_pool.emplace_back(input_size_);
+  auto &bits = dep_pool.back();
+  for (size_t n = 0; n < len; ++n) bits.set(idx + n);
+  dep_range_memo.emplace(key, slot);
+  return slot;
+}
+
+uint32_t RGDAstParser::dep_intern_union(uint32_t a, uint32_t b) {
+  // The three cheap answers, and between them they are the common case: a unary
+  // op, an op with a constant operand, and an op whose two operands read the
+  // same bytes all reuse an existing entry without touching a memo.
+  if (a == b) return a;
+  if (a == 0) return b;
+  if (b == 0) return a;
+  if (a > b) std::swap(a, b); // union is commutative, so order the key
+  const uint64_t key = ((uint64_t)a << 32) | b;
+  auto itr = dep_union_memo.find(key);
+  if (itr != dep_union_memo.end()) return itr->second;
+  uint32_t slot;
+  // A union with a subset is the superset itself.  is_subset_of is one pass over
+  // the words, but the memo above means each distinct pair pays it once -- and
+  // when it hits, every union derived from this one later shares the entry too.
+  if (dep_pool[a].is_subset_of(dep_pool[b])) {
+    slot = b;
+  } else if (dep_pool[b].is_subset_of(dep_pool[a])) {
+    slot = a;
+  } else {
+    // The temporary is fully built before push_back runs, so a reallocation
+    // here cannot invalidate the operands it was built from.
+    input_dep_t merged = dep_pool[a] | dep_pool[b];
+    slot = (uint32_t)dep_pool.size();
+    dep_pool.push_back(std::move(merged));
+  }
+  dep_union_memo.emplace(key, slot);
+  return slot;
 }
 
 uint32_t RGDAstParser::map_arg(uint32_t input_id, uint32_t offset, uint32_t length,
@@ -1868,7 +1937,7 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
     if (i == 0) { // the constant label
       ast_size_cache.push_back(1); // constant takes one node too
       arg_size_cache.push_back(1); // and one constant arg slot
-      branch_to_inputs.emplace_back(input_dep_t(input_size_));
+      branch_to_inputs.push_back(0); // the empty set
       nested_cmp_cache.push_back(0);
       continue;
     }
@@ -1896,13 +1965,11 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
         REJECT("invalid input offset", "invalid input offset: %u >= %lu\n", offset, buf_size);
         return false;
       }
-      branch_to_inputs.emplace_back(input_dep_t(input_size_));
       // get flattened index
       size_t idx = input_to_dep_idx(input_id, offset);
-      auto &itr = branch_to_inputs[i];
-      itr.set(idx); // flattened location
+      branch_to_inputs.push_back(dep_intern_single(idx)); // flattened location
 #if DEBUG
-      assert(branch_to_inputs[i].find_first() == idx);
+      assert(deps_of(i).find_first() == idx);
 #endif
       // nested cmp?
       nested_cmp_cache.push_back(0);
@@ -1924,17 +1991,13 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
                "invalid input offset: %u + %u > %lu\n", offset, info->l2, buf_size);
         return false;
       }
-      branch_to_inputs.emplace_back(input_dep_t(input_size_));
       // get flattened index
       size_t idx = input_to_dep_idx(input_id, offset);
-      auto &itr = branch_to_inputs[i];
-      for (size_t n = 0; n < info->l2; ++n) {
-        // DEBUGF("adding input: %lu <- %lu\n", i, offset + n);
-        itr.set(idx + n); // input offsets
-      }
+      // DEBUGF("adding input: %lu <- %lu..%lu\n", i, offset, offset + info->l2);
+      branch_to_inputs.push_back(dep_intern_range(idx, info->l2)); // input offsets
 #if DEBUG
       if (likely(info->l2 > 0))
-        assert(branch_to_inputs[i].find_first() == idx);
+        assert(deps_of(i).find_first() == idx);
 #endif
       // nested cmp?
       nested_cmp_cache.push_back(0);
@@ -1994,10 +2057,9 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
       }
       arg_size_cache.push_back(args);
       // input deps
-      branch_to_inputs.emplace_back(input_dep_t(input_size_));
-      auto &itr = branch_to_inputs[i];
-      if (info->l1 != 0) itr |= branch_to_inputs[info->l1];
-      if (info->l2 != 0) itr |= branch_to_inputs[info->l2];
+      branch_to_inputs.push_back(dep_intern_union(
+          info->l1 == 0 ? 0 : branch_to_inputs[info->l1],
+          info->l2 == 0 ? 0 : branch_to_inputs[info->l2]));
       // nested cmp?
       uint8_t nested = 0;
       nested += info->l1 == 0 ? 0 : nested_cmp_cache[info->l1];
@@ -2011,7 +2073,7 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
 #if DEBUG
   DEBUGF("ast_size: %d = %u\n", label, ast_size_cache[label]);
   DEBUGF("input deps %d:", label);
-  auto &itr = branch_to_inputs[label];
+  auto &itr = deps_of(label);
   for (auto i = itr.find_first(); i != input_dep_t::npos; i = itr.find_next(i)) {
     DEBUGF("%lu ", i);
   }
@@ -2034,7 +2096,7 @@ bool RGDAstParser::note_deps(dfsan_label label, input_dep_t &acc) {
   if (acc.size() != input_size_) {
     acc.resize(input_size_);
   }
-  acc |= branch_to_inputs[label];
+  acc |= deps_of(label);
   return true;
 }
 
@@ -2383,18 +2445,21 @@ int RGDAstParser::parse_cond(dfsan_label label, bool result, bool add_nested,
       for (auto const& var: clause) {
         const dfsan_label l = var->label();
         // assert(branch_to_inputs.size() > l);
-        auto &itr = branch_to_inputs[l];
         auto citr = concretize_node.find(l);
         if (unlikely(citr != concretize_node.end())) {
-          // skip dependencies if the operand is concretized
+          // skip dependencies if the operand is concretized.  Rewriting the
+          // cache entry rather than a local is what the bitset version did too;
+          // with an interned pool it is a whole-set reassignment, so it aliases
+          // the child's entry instead of copying its bits.
           if (citr->second == 1) {
             // if the lhs is concretized, use the rhs deps only
-            itr = branch_to_inputs[get_label_info(l)->l2];
+            branch_to_inputs[l] = branch_to_inputs[get_label_info(l)->l2];
           } else if (citr->second == 2) {
             // if the rhs is concretized, use the lhs deps only
-            itr = branch_to_inputs[get_label_info(l)->l1];
+            branch_to_inputs[l] = branch_to_inputs[get_label_info(l)->l1];
           }
         }
+        auto &itr = deps_of(l);
         if (unlikely(itr.find_first() == input_dep_t::npos)) {
           // not actual input dependency, skip
           continue;
@@ -2472,17 +2537,17 @@ bool RGDAstParser::save_constraint(expr_t expr, bool result) {
 #if DEBUG
       assert(branch_to_inputs.size() > l);
 #endif
-      auto &itr = branch_to_inputs[l];
       auto citr = concretize_node.find(l);
       if (unlikely(citr != concretize_node.end())) {
         if (citr->second == 1) {
           // if the lhs is concretized, use the rhs deps only
-          itr = branch_to_inputs[get_label_info(l)->l2];
+          branch_to_inputs[l] = branch_to_inputs[get_label_info(l)->l2];
         } else if (citr->second == 2) {
           // if the rhs is concretized, use the lhs deps only
-          itr = branch_to_inputs[get_label_info(l)->l1];
+          branch_to_inputs[l] = branch_to_inputs[get_label_info(l)->l1];
         }
       }
+      auto &itr = deps_of(l);
       auto root = itr.find_first();
       if (root == input_dep_t::npos) {
         // not actual input dependency, skip
@@ -2655,7 +2720,7 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
   // next, retrive nested constraints if needed
   clause_t nested_caluse;
   if (solve_nested_) {
-    auto &itr = branch_to_inputs[index_label];
+    auto &itr = deps_of(index_label);
     if (unlikely(itr.find_first() != input_dep_t::npos)) {
       // use union find to add additional related input bytes
       std::unordered_set<size_t> related_inputs;

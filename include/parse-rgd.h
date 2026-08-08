@@ -103,7 +103,33 @@ private:
 
   // dependencies tracking
   size_t input_size_; // record the whole input size
-  std::vector<input_dep_t> branch_to_inputs; // label -> flattened input dependencies
+  // The dependency sets are interned, not stored per label.  One dense
+  // input_size_-bit bitset per label costs labels x input_size bits, which on a
+  // 23 KB libxml2 seed with 869k labels measured 2.6 GB steady (4.2 GB peak) and
+  // 26 GB on the same seed padded to 95 KB -- the product, not either factor, is
+  // what grows.  The sets themselves repeat heavily: a hot loop re-traced tens of
+  // thousands of times yields the same dependency set every iteration, and every
+  // unary op and every op with a constant operand has exactly its child's set.
+  // So a label holds a pool index and the pool holds each distinct set once.
+  std::vector<uint32_t> branch_to_inputs; // label -> dep_pool index
+  std::vector<input_dep_t> dep_pool; // slot 0 is always the empty set
+  // Memos for the three ways an entry is derived, so an equal set is never built
+  // twice.  Interning is only worth its keep if the lookup is cheaper than the
+  // union it replaces, hence a flat vector for the single-byte case (there are at
+  // most input_size_ of those) and hash maps keyed on the derivation, not on the
+  // set contents -- hashing a 3 KB bitset per label would cost more than it saves.
+  static constexpr uint32_t kNoDep = UINT32_MAX; // "not interned yet"
+  std::vector<uint32_t> dep_single_memo; // flattened offset -> pool index
+  std::unordered_map<uint64_t, uint32_t> dep_range_memo; // (idx<<32|len) -> pool
+  std::unordered_map<uint64_t, uint32_t> dep_union_memo; // (lo<<32|hi) -> pool
+  [[nodiscard]] uint32_t dep_intern_single(size_t idx);
+  [[nodiscard]] uint32_t dep_intern_range(size_t idx, size_t len);
+  [[nodiscard]] uint32_t dep_intern_union(uint32_t a, uint32_t b);
+  /// The set of input offsets @p label depends on.  Only valid once scan_labels()
+  /// has reached @p label.
+  inline const input_dep_t &deps_of(dfsan_label label) const {
+    return dep_pool[branch_to_inputs[label]];
+  }
   // <input_id, offset> will be flattened to bit \sigma_{i=0}^{input_id}{size_of(input_i)} + offset
   inline size_t input_to_dep_idx(uint32_t input_id, uint32_t offset) {
     size_t idx = 0;
