@@ -8,8 +8,15 @@
 // us validate the RGD path deterministically on a single input, without the
 // noisy afl-fuzz search loop.
 //
-// Usage: afltest [--dump-constraints <dir>] target input [input...]
+// Usage: afltest [--dump-constraints <dir>] [--target-args "<args>"]
+//                target input [input...]
 //   TAINT_OPTIONS="taint_file=<file|stdin> output_dir=<dir>"
+//   --target-args  extra argv for the target, split on whitespace, with `@@`
+//                  where the input path goes (appended if there is no `@@`).
+//                  A campaign's flags are part of what it traced: Magma runs
+//                  `xmllint --valid --oldxml10 --push --memory @@`, and without
+//                  --memory the seed never reaches an instrumented read, so the
+//                  same corpus through the same binary traces nothing symbolic.
 //   SYMSAN_USE_JIGSAW=1  add the jigsaw JIT solver to the chain
 //   SYMSAN_USE_Z3=1      add the z3 solver to the chain (needed for FP)
 //   SYMSAN_USE_NESTED=1  enable nested constraint solving in the parser
@@ -25,6 +32,12 @@
 //                        outcomes can be joined against fgtest's over the same
 //                        corpus -- see driver/sweep.h and tools/cond-diff.py.
 //                        Millions of lines on a real corpus; off by default.
+//   SYMSAN_ONLY_CIDS=a,b,c  solve only these branch ids (AFL edge ids under the
+//                        two-stage build).  Everything is still parsed, so the
+//                        parser sees the same trace; only the solver chain and
+//                        the output are skipped.  The way to ask one frontier
+//                        branch a question on a seed whose full solve does not
+//                        finish.
 //   SYMSAN_VERBOSE=1     the per-event trace, off by default
 //   SYMSAN_NO_OUTPUT=1   solve, but do not write the solved inputs out.  The
 //                        fuzzer hands a solution back in memory
@@ -153,6 +166,19 @@ static const char* __dump_dir = nullptr;  // --dump-constraints, off by default
 // the option list at the top of the file.
 static int __no_output = 0;
 
+// SYMSAN_ONLY_CIDS: solve only these branch ids, empty for all of them.
+//
+// The filter is on *solving*, not on parsing: every condition is still parsed,
+// so the parser's branch history and its constraint cache see the whole trace
+// and a filtered run asks the same question of the same task a full run would.
+// Only the solver chain and the output are skipped.
+//
+// This is what makes a frontier branch answerable one branch at a time.  A
+// libxml2 seed traces 728854 conditions and a full solve writes a solution per
+// task; picking the twelve that never flipped out of that is not a filter you
+// can apply afterwards, because the run does not finish.
+static std::unordered_set<uint32_t> __only_cids;
+
 // the parse-reason counters, shared in shape with fgtest so that the two
 // parsers can be swept over one corpus and read side by side
 static symsan::sweep::parse_stats __stats;
@@ -160,6 +186,41 @@ static symsan::sweep::parse_stats __stats;
 // Where the target is pointed for every run of a corpus sweep.  path() is null
 // in the single-input case, which still runs the seed where it lies.
 static symsan::sweep::input_stager __staged;
+
+// --target-args, tokenized.  Empty unless asked for, in which case the child's
+// argv is program + these, with `@@` standing for the input path exactly as
+// AFL++ spells it; without an `@@` the path is appended, which is what every
+// caller before this option got.
+//
+// This exists because a target's flags decide which code the trace even covers.
+// Magma runs xmllint as `--valid --oldxml10 --push --memory @@`, and without
+// --memory the file never reaches an instrumented read, so a sweep of the same
+// corpus through the same binary sees 28 concrete conditions and reads like a
+// target with no symbolic input at all.  Reproducing a campaign's frontier off
+// line is not possible without the campaign's argv.
+static std::vector<std::string> __target_args;
+
+// Build the child argv into @p out (which owns nothing; the strings belong to
+// __target_args, @p program and @p input).  Always NULL terminated, and the
+// count returned excludes that terminator, matching symsan_set_args.
+static int build_target_argv(char *program, const char *input,
+                             std::vector<char *> &out) {
+  out.clear();
+  out.push_back(program);
+  bool saw_placeholder = false;
+  for (auto &a : __target_args) {
+    if (a == "@@") {
+      out.push_back((char *)input);
+      saw_placeholder = true;
+    } else {
+      out.push_back((char *)a.c_str());
+    }
+  }
+  if (!saw_placeholder) out.push_back((char *)input);
+  const int argc = (int)out.size();
+  out.push_back(nullptr);
+  return argc;
+}
 
 // the mapped union table (shared with the launched target)
 static const size_t MAX_LABEL = uniontable_size / sizeof(dfsan_label_info);
@@ -276,7 +337,12 @@ static void solve_task(rgd::task_t task, void *addr) {
 static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *addr,
                          uint32_t cid) {
 
-  AOUT("solving label %d = %d, add_nested: %d\n", label, r, add_nested);
+  // cid is in the line so that an offline reader can tell which branch each
+  // "generate #N output" belongs to: the two lines interleave in trace order,
+  // and the index in the second is the id-<inst>-<sess>-<index> file name.
+  // Without it a solved input cannot be joined back to a coverage map edge.
+  AOUT("solving label %d = %d, cid %u, add_nested: %d\n", label, r, cid,
+       add_nested);
   if (__parse_only && label == 0) {
     // A loop-exit notification, not a condition -- there is no AST to build and
     // no branch to flip, so it is neither a success nor a failure.  parse_cond
@@ -310,6 +376,10 @@ static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *ad
 
   for (auto id : tasks) {
     auto task = __parser->retrieve_task(id);
+    // retrieve_task hands over ownership either way, so a filtered-out task is
+    // still taken out of the parser's table -- dropping it here is what keeps
+    // that table from growing for the whole trace.
+    if (!__only_cids.empty() && !__only_cids.count(cid)) continue;
     solve_task(task, addr);
   }
 }
@@ -415,11 +485,9 @@ static int run_one(char *program, char *input, int is_stdin) {
 
   {
     if (!__staged.path()) {
-      char* args[3];
-      args[0] = program;
-      args[1] = input;
-      args[2] = NULL;
-      if (symsan_set_args(2, args) != 0) {
+      std::vector<char *> args;
+      const int nargs = build_target_argv(program, input, args);
+      if (symsan_set_args(nargs, args.data()) != 0) {
         fprintf(stderr, "Failed to set args\n");
         goto fail;
       }
@@ -546,13 +614,30 @@ fail:
 int main(int argc, char* const argv[]) {
 
   int optind = 1;
-  if (argc > 2 && strcmp(argv[1], "--dump-constraints") == 0) {
-    __dump_dir = argv[2];
-    optind = 3;
+  while (argc - optind > 2) {
+    if (strcmp(argv[optind], "--dump-constraints") == 0) {
+      __dump_dir = argv[optind + 1];
+      optind += 2;
+    } else if (strcmp(argv[optind], "--target-args") == 0) {
+      // One shell-style word list, split on whitespace only: enough for every
+      // Magma command line, and quoting rules are not this driver's business.
+      const char *s = argv[optind + 1];
+      while (*s) {
+        while (*s == ' ' || *s == '\t') s++;
+        const char *b = s;
+        while (*s && *s != ' ' && *s != '\t') s++;
+        if (s > b) __target_args.emplace_back(b, (size_t)(s - b));
+      }
+      optind += 2;
+    } else {
+      break;
+    }
   }
 
   if (argc - optind < 2) {
-    fprintf(stderr, "Usage: %s [--dump-constraints <dir>] target input [input...]\n",
+    fprintf(stderr,
+            "Usage: %s [--dump-constraints <dir>] [--target-args \"<args>\"] "
+            "target input [input...]\n",
             argv[0]);
     exit(1);
   }
@@ -580,6 +665,16 @@ int main(int argc, char* const argv[]) {
   __verbose = getenv("SYMSAN_VERBOSE") != nullptr;
   __enum_gep = getenv("SYMSAN_ENUM_GEP") != nullptr;
   __no_output = getenv("SYMSAN_NO_OUTPUT") != nullptr;
+  if (const char *only = getenv("SYMSAN_ONLY_CIDS")) {
+    for (const char *p = only; *p;) {
+      char *end = nullptr;
+      unsigned long v = strtoul(p, &end, 0);
+      if (end == p) break;
+      __only_cids.insert((uint32_t)v);
+      p = (*end == ',' || *end == ' ') ? end + 1 : end;
+    }
+    fprintf(stderr, "solving only %zu cid(s)\n", __only_cids.size());
+  }
   char *options = getenv("TAINT_OPTIONS");
   if (options) {
     // setup output dir
@@ -679,11 +774,9 @@ int main(int argc, char* const argv[]) {
     }
     char *path = (char *)__staged.path();
 
-    char *args[3];
-    args[0] = program;
-    args[1] = path;
-    args[2] = NULL;
-    if (symsan_set_input(path) != 0 || symsan_set_args(2, args) != 0) {
+    std::vector<char *> args;
+    const int nargs = build_target_argv(program, path, args);
+    if (symsan_set_input(path) != 0 || symsan_set_args(nargs, args.data()) != 0) {
       fprintf(stderr, "Failed to set input\n");
       exit(1);
     }
