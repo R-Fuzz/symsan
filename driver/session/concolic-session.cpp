@@ -473,6 +473,24 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
     return nullptr;
   }
 
+  // A trace with no solver is a supported configuration -- init() warns about
+  // it rather than refusing, because it is how the cmplog measurement arm holds
+  // the tracing cost fixed while solving nothing -- but the loop below reaches
+  // solvers_[cur_solver_index_] before anything can bound-check it, so an empty
+  // vector is an out-of-bounds read followed by a call through the result.
+  //
+  // Drain rather than simply return: task_mgr_ belongs to the session, not to
+  // the trace (trace() only takes a before/after count), so a queue nobody pops
+  // grows for the whole campaign.  Popped straight off the manager and not via
+  // next_pending_task(), which would charge every one of them to stale_tasks --
+  // they were not stale, they were never asked about.
+  if (solvers_.empty()) {
+    while (task_mgr_->get_next_task() != nullptr) {}
+    cur_task_ = nullptr;
+    mutation_state_ = MUTATION_INVALID;
+    return nullptr;
+  }
+
   // NOTE: driver/aflpp/symsan.cpp made exactly one (task, solver) attempt per
   // call and returned an empty mutation when that attempt did not produce a
   // solution, relying on AFL++ to call it again.  We loop instead, so that a
