@@ -322,6 +322,31 @@ struct Opt {
     #[arg(long = "symsan-tokens", default_value = "false")]
     symsan_tokens: bool,
 
+    /// Cap the concolic stage's search-task backlog. 0, the default, leaves it
+    /// unbounded.
+    ///
+    /// The stage solves a fixed number of tasks per input and returns, so
+    /// whatever a trace queued beyond that budget stays queued for later --
+    /// which is the point, a task is worth solving whether or not the trace
+    /// that found it is still running. Unbounded, though, the backlog is the
+    /// campaign's memory footprint (see #168). With a bound the queue throws
+    /// away its worst task to make room, and the monitor line says how often.
+    #[arg(long = "symsan-max-tasks", default_value_t = 0)]
+    symsan_max_tasks: usize,
+
+    /// Drain the backlog best-first instead of oldest-first.
+    ///
+    /// "Best" is how new the direction the task exists to reach would be: an
+    /// edge the fuzzer has never walked outranks one it has walked but not this
+    /// often, which outranks one already covered at that hit-count class. Ties
+    /// break oldest-first, so with a queue whose tasks cannot be told apart
+    /// this is exactly FIFO.
+    ///
+    /// Only does anything under a bound or a budget -- a queue drained to
+    /// exhaustion solves the same tasks in either order.
+    #[arg(long = "symsan-task-priority", default_value = "false")]
+    symsan_task_priority: bool,
+
     /// Drop the input-to-state solver from the ladder. It is the cheapest rung
     /// and cracks most branches on its own, so this is for measuring what the
     /// others contribute, not for fuzzing.
@@ -583,7 +608,9 @@ pub fn main() -> Result<(), libafl::Error> {
                 .z3(opt.symsan_z3)
                 .solve_ub(opt.symsan_solve_ub)
                 .cmplog_filter(cmplog_filter)
-                .tokens(opt.symsan_tokens);
+                .tokens(opt.symsan_tokens)
+                .max_queue_tasks(opt.symsan_max_tasks)
+                .priority_tasks(opt.symsan_task_priority);
             if let Some(map) = &branch_map {
                 // The observer above is named "shared_mem", which is also the
                 // name MaxMapFeedback::new() inherits and files its history map
@@ -662,6 +689,18 @@ pub fn main() -> Result<(), libafl::Error> {
                     "symsan: contributing comparands to the dictionary \
                      ({autotokens} tokens from the target's autodict)"
                 );
+            }
+            if opt.symsan_max_tasks > 0 {
+                // The order only decides anything once the queue cannot hold
+                // everything, so the two are one line: a priority queue with no
+                // bound and no budget solves what a FIFO would.
+                println!(
+                    "symsan: task queue bounded at {}, drained {}-first",
+                    opt.symsan_max_tasks,
+                    if opt.symsan_task_priority { "best" } else { "oldest" }
+                );
+            } else if opt.symsan_task_priority {
+                println!("symsan: draining the task queue best-first (unbounded)");
             }
             Some(tuple_list!(CreditedStage::new(
                 "symsan",

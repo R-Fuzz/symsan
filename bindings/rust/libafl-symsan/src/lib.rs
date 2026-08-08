@@ -162,6 +162,8 @@ pub struct SymSanStageBuilder {
     dedup: bool,
     tokens: bool,
     max_tokens: usize,
+    max_queue_tasks: usize,
+    priority_tasks: bool,
 }
 
 impl SymSanStageBuilder {
@@ -466,6 +468,31 @@ impl SymSanStageBuilder {
         self
     }
 
+    /// Cap the search-task backlog at `max` tasks. 0, the default, leaves it
+    /// unbounded.
+    ///
+    /// The queue outlives the trace that filled it, and this stage hands the
+    /// fuzzer a fixed number of solutions per input and returns -- so whatever
+    /// a trace queued beyond that budget stays queued, and across a campaign
+    /// the backlog only grows. A bound makes the memory a constant; what it
+    /// costs is [`Stats::evicted_tasks`], reported in the monitor line.
+    #[must_use]
+    pub fn max_queue_tasks(mut self, max: usize) -> Self {
+        self.max_queue_tasks = max;
+        self
+    }
+
+    /// Drain the backlog best-first rather than oldest-first.
+    ///
+    /// Only matters together with a bound or a budget -- a queue drained to
+    /// exhaustion solves the same tasks in either order. Ties break
+    /// oldest-first, so with nothing to tell tasks apart this *is* FIFO.
+    #[must_use]
+    pub fn priority_tasks(mut self, yes: bool) -> Self {
+        self.priority_tasks = yes;
+        self
+    }
+
     /// Create the session and the stage.
     ///
     /// Fails if `target` was not set, if a session already exists in this
@@ -514,7 +541,9 @@ impl SymSanStageBuilder {
             // the flip log alone is no longer a reason to pay for the scan.
             .export_taint(self.cmplog_filter)
             .collect_tokens(self.tokens)
-            .max_tokens(self.max_tokens);
+            .max_tokens(self.max_tokens)
+            .max_queue_tasks(self.max_queue_tasks)
+            .priority_tasks(self.priority_tasks);
         if let Some(ms) = self.timeout_ms {
             config = config.timeout_ms(ms);
         }
@@ -578,7 +607,7 @@ impl SymSanStageBuilder {
             published_coverage: None,
             // Not `(0, 0, 0)`: a session that queues nothing at all should
             // still say so once, rather than leave the field missing.
-            published_stats: (u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+            published_stats: (u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
             validate_coverage: self.validate_coverage,
             validate_warned: false,
             join: JoinReport::default(),
@@ -595,6 +624,7 @@ impl SymSanStageBuilder {
             seen: self.dedup.then(|| BloomInputFilter::new(10_000_000, 1e-4)),
             duplicates: 0,
             tokens: self.tokens,
+            max_queue_tasks: self.max_queue_tasks,
             tokens_added: 0,
             tokens_warned: false,
         })
@@ -646,10 +676,11 @@ pub struct SymSanStage {
     /// through, so `publish_coverage` can tell a moved buffer from a settled
     /// one. `usize` rather than `*const u8` only so the stage stays `Send`.
     published_coverage: Option<(usize, usize)>,
-    /// The `(queued, solved, stale, duplicate)` tuple last sent to the monitor,
-    /// so the stage only fires an event when one of them moved. Without that it
-    /// would reprint the whole monitor line once per corpus entry.
-    published_stats: (u64, u64, u64, u64, u64),
+    /// The `(queued, solved, stale, duplicate, tokens, evicted)` tuple last
+    /// sent to the monitor, so the stage only fires an event when one of them
+    /// moved. Without that it would reprint the whole monitor line once per
+    /// corpus entry.
+    published_stats: (u64, u64, u64, u64, u64, u64),
     /// Audit the branch map against each entry's tracked edge indices. See
     /// [`SymSanStageBuilder::validate_coverage`].
     validate_coverage: bool,
@@ -687,6 +718,10 @@ pub struct SymSanStage {
     /// Drain the trace's comparands into the state's [`Tokens`] after each
     /// entry. See [`SymSanStageBuilder::tokens`].
     tokens: bool,
+    /// The bound the session was given, kept only to decide whether the monitor
+    /// line should carry an eviction count at all. See
+    /// [`SymSanStageBuilder::max_queue_tasks`].
+    max_queue_tasks: usize,
     /// Tokens actually added to the dictionary, for the monitor line. Not the
     /// same as the session's count: the state may not have a [`Tokens`] to add
     /// them to, and this is what says so.
@@ -917,16 +952,24 @@ impl SymSanStage {
             stats.stale_tasks,
             self.duplicates,
             self.tokens_added,
+            stats.evicted_tasks,
         );
         if current == self.published_stats {
             return Ok(());
         }
         self.published_stats = current;
-        let (queued, solved, stale, duplicate, tokens) = current;
+        let (queued, solved, stale, duplicate, tokens, evicted) = current;
         // Only when the collector is on: a constant `0 tokens` in every line of
         // every campaign that never asked for them is noise.
         let tokens = if self.tokens {
             format!(", {tokens} tokens")
+        } else {
+            String::new()
+        };
+        // Same rule, and the same reason the session only prints its queue line
+        // under a bound: without one this is 0 forever.
+        let evicted = if self.max_queue_tasks > 0 {
+            format!(", {evicted} evicted")
         } else {
             String::new()
         };
@@ -939,7 +982,7 @@ impl SymSanStage {
                     value: UserStats::new(
                         UserStatsValue::String(Cow::Owned(format!(
                             "{queued} queued, {solved} solved, {stale} dropped stale, \
-                             {duplicate} duplicate{tokens}"
+                             {duplicate} duplicate{tokens}{evicted}"
                         ))),
                         AggregatorOps::None,
                     ),
