@@ -529,6 +529,69 @@ __dfsw_lstat(const char *path, struct stat *buf, dfsan_label path_label,
   return ret;
 }
 
+// The `64` spellings of the stat family.  A target built with
+// _FILE_OFFSET_BITS=64 -- which is what autoconf's AC_SYS_LARGEFILE gives
+// almost every library, libxml2 among them -- does not call `stat` at all:
+// glibc redirects the declaration, so the call in the IR is to `stat64`, a
+// name the abilist did not know.  DFSan then leaves `buf` alone, the kernel
+// having written it behind the shadow's back, and the caller's first branch on
+// st_mode reads the uninitialized-stack poison.  That is fatal, not merely
+// imprecise: __taint_trace_cond Die()s on kInitializingLabel under the default
+// exit_on_memerror, so the whole trace ends at the target's first stat -- for
+// xmllint, 29 conditions in and before a byte of XML is parsed.
+//
+// Forwarding rather than repeating the body: on LP64 Linux `struct stat64` is
+// `struct stat` (both 144 bytes, same field offsets) and stat64() is stat(),
+// so there is nothing for these to do differently, and a second copy of the
+// shadow-clearing is a second place to forget it.
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_stat64(const char *path, struct stat *buf, dfsan_label path_label,
+              dfsan_label buf_label, dfsan_label *ret_label) {
+  return __dfsw_stat(path, buf, path_label, buf_label, ret_label);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_lstat64(const char *path, struct stat *buf, dfsan_label path_label,
+               dfsan_label buf_label, dfsan_label *ret_label) {
+  return __dfsw_lstat(path, buf, path_label, buf_label, ret_label);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_fstat64(int fd, struct stat *buf, dfsan_label fd_label,
+               dfsan_label buf_label, dfsan_label *ret_label) {
+  return __dfsw_fstat(fd, buf, fd_label, buf_label, ret_label);
+}
+
+// fstatat is the spelling the rest of the family is implemented in terms of,
+// and the one std::filesystem and newer code reach for directly.  It has no
+// wrapper of its own to forward to, so this is the body, with AT_SYMLINK_NOFOLLOW
+// deciding whether the name or the link is the file whose size we may taint.
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_fstatat(int dirfd, const char *path, struct stat *buf, int atflags,
+               dfsan_label dirfd_label, dfsan_label path_label,
+               dfsan_label buf_label, dfsan_label atflags_label,
+               dfsan_label *ret_label) {
+  int ret = fstatat(dirfd, path, buf, atflags);
+  if (ret == 0) {
+    dfsan_set_label(0, buf, sizeof(struct stat));
+    if (flags().trace_fsize && is_taint_file(path)) {
+      dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
+      dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    }
+  }
+  *ret_label = 0;
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_fstatat64(int dirfd, const char *path, struct stat *buf, int atflags,
+                 dfsan_label dirfd_label, dfsan_label path_label,
+                 dfsan_label buf_label, dfsan_label atflags_label,
+                 dfsan_label *ret_label) {
+  return __dfsw_fstatat(dirfd, path, buf, atflags, dirfd_label, path_label,
+                        buf_label, atflags_label, ret_label);
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
                                                   dfsan_label s_label,
                                                   dfsan_label c_label,
@@ -1923,6 +1986,17 @@ int __dfsw_getrlimit(int resource, struct rlimit *rlim,
   }
   *ret_label = 0;
   return ret;
+}
+
+// _FILE_OFFSET_BITS=64 redirects this one too, and `struct rlimit64` is
+// `struct rlimit` on LP64.  See the note above __dfsw_stat64 for why a missing
+// alias here is fatal rather than imprecise.
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw_getrlimit64(int resource, struct rlimit *rlim,
+                       dfsan_label resource_label, dfsan_label rlim_label,
+                       dfsan_label *ret_label) {
+  return __dfsw_getrlimit(resource, rlim, resource_label, rlim_label,
+                          ret_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
@@ -3481,6 +3555,43 @@ __dfsw_openat(int dirfd, const char *path, int oflags, dfsan_label dirfd_label,
   return fd;
 }
 
+// The `64` spellings, for a target built with _FILE_OFFSET_BITS=64.  These two
+// fail differently from the stat family (see the note above __dfsw_stat64):
+// nothing dies, the input file simply never gets registered as the taint
+// source, so the trace runs to completion over a program with no symbolic
+// bytes in it.  Written out rather than forwarded because the varargs cannot
+// be passed along; the bodies mirror their siblings above, quirk for quirk.
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_open64(const char *path, int oflags, dfsan_label path_label,
+              dfsan_label flag_label, dfsan_label *va_labels,
+              dfsan_label *ret_label, ...) {
+  va_list args;
+  va_start(args, ret_label);
+  int fd = open(path, oflags, args);
+  va_end(args);
+
+  if (fd)
+    taint_set_file(AT_FDCWD, path, fd);
+  *ret_label = 0;
+  return fd;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_openat64(int dirfd, const char *path, int oflags,
+                dfsan_label dirfd_label, dfsan_label path_label,
+                dfsan_label flag_label, dfsan_label *va_labels,
+                dfsan_label *ret_label, ...) {
+  va_list args;
+  va_start(args, ret_label);
+  int fd = openat(dirfd, path, oflags, args);
+  va_end(args);
+
+  if (fd)
+    taint_set_file(dirfd, path, fd);
+  *ret_label = 0;
+  return fd;
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE FILE *
 __dfsw_fopen(const char *filename, const char *mode,
              dfsan_label filename_label, dfsan_label mode_label,
@@ -3517,6 +3628,16 @@ __dfsw_freopen(const char *filename, const char *mode,
     taint_set_file(AT_FDCWD, filename, fileno(ret));
   *ret_label = 0;
   return ret;
+}
+
+// fopen64 has had an abilist entry all along; freopen64 is its missing twin.
+SANITIZER_INTERFACE_ATTRIBUTE FILE *
+__dfsw_freopen64(const char *filename, const char *mode,
+                 FILE *stream, dfsan_label filename_label,
+                 dfsan_label mode_label, dfsan_label stream_label,
+                 dfsan_label *ret_label) {
+  return __dfsw_freopen(filename, mode, stream, filename_label, mode_label,
+                        stream_label, ret_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
@@ -4394,6 +4515,21 @@ __dfsw_mmap(void *start, size_t length, int prot, int flags, int fd,
   }
   *ret_label = 0;
   return ret;
+}
+
+// The `64` spelling.  This one can fail both ways at once: a target that maps
+// its input misses the taint source, and one that maps anything else gets a
+// region whose shadow was never cleared -- so the poison branch is a stray
+// read away.  off64_t is off_t on LP64.
+SANITIZER_INTERFACE_ATTRIBUTE void *
+__dfsw_mmap64(void *start, size_t length, int prot, int flags, int fd,
+              off_t offset, dfsan_label start_label, dfsan_label len_label,
+              dfsan_label prot_label, dfsan_label flags_label,
+              dfsan_label fd_label, dfsan_label offset_label,
+              dfsan_label *ret_label) {
+  return __dfsw_mmap(start, length, prot, flags, fd, offset, start_label,
+                     len_label, prot_label, flags_label, fd_label,
+                     offset_label, ret_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
