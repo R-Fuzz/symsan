@@ -88,6 +88,7 @@ use libafl::{
     fuzzer::{BloomInputFilter, Evaluator, ExecuteInputResult, InputFilter},
     inputs::{BytesInput, HasMutatorBytes},
     monitors::stats::{AggregatorOps, UserStats, UserStatsValue},
+    mutators::Tokens,
     observers::ObserversTuple,
     stages::{Restartable, RetryCountRestartHelper, Stage, TaintMetadata},
     state::{HasCorpus, HasCurrentTestcase, HasExecutions, HasRand},
@@ -159,6 +160,8 @@ pub struct SymSanStageBuilder {
     cmplog_filter: bool,
     flip_log: Option<PathBuf>,
     dedup: bool,
+    tokens: bool,
+    max_tokens: usize,
 }
 
 impl SymSanStageBuilder {
@@ -430,6 +433,39 @@ impl SymSanStageBuilder {
         self
     }
 
+    /// Feed the comparands the trace saw into the fuzzer's [`Tokens`]
+    /// dictionary. Off by default.
+    ///
+    /// A concolic trace sees the concrete side of every comparison the target
+    /// made against its input, including the ones no solver will touch. An
+    /// AFL++ LTO autodict already has the compile-time literals -- it reads
+    /// them out of the binary -- so what this adds is the half that pass cannot
+    /// reach: a comparand computed at run time, and a byte-at-a-time keyword
+    /// test that exists in the binary only as a sequence of one-byte compares.
+    ///
+    /// Off by default because it is not free and not universally useful: it
+    /// walks the boolean skeleton of every condition, and a target with no
+    /// keyword syntax has nothing to contribute. It also needs the fuzzer to
+    /// have a [`Tokens`] dictionary in its state and a mutator that draws from
+    /// it; without both, the tokens go nowhere.
+    #[must_use]
+    pub fn tokens(mut self, yes: bool) -> Self {
+        self.tokens = yes;
+        self
+    }
+
+    /// Cap the dictionary at `max` distinct tokens. 0 keeps the default (4096).
+    ///
+    /// A cap rather than an eviction policy: the mutator draws one entry
+    /// uniformly at random, so a dictionary is diluted by size rather than
+    /// slowed by it, and the entries worth keeping are the early ones -- the
+    /// ones the seed corpus found, nearest the code already reached.
+    #[must_use]
+    pub fn max_tokens(mut self, max: usize) -> Self {
+        self.max_tokens = max;
+        self
+    }
+
     /// Create the session and the stage.
     ///
     /// Fails if `target` was not set, if a session already exists in this
@@ -476,7 +512,9 @@ impl SymSanStageBuilder {
             // what the cmplog filter needs to decide what to hand cmplog. The
             // task-to-branch link the flip log reads is recorded regardless, so
             // the flip log alone is no longer a reason to pay for the scan.
-            .export_taint(self.cmplog_filter);
+            .export_taint(self.cmplog_filter)
+            .collect_tokens(self.tokens)
+            .max_tokens(self.max_tokens);
         if let Some(ms) = self.timeout_ms {
             config = config.timeout_ms(ms);
         }
@@ -540,7 +578,7 @@ impl SymSanStageBuilder {
             published_coverage: None,
             // Not `(0, 0, 0)`: a session that queues nothing at all should
             // still say so once, rather than leave the field missing.
-            published_stats: (u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+            published_stats: (u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
             validate_coverage: self.validate_coverage,
             validate_warned: false,
             join: JoinReport::default(),
@@ -556,6 +594,9 @@ impl SymSanStageBuilder {
             // well under one finding per ten million.
             seen: self.dedup.then(|| BloomInputFilter::new(10_000_000, 1e-4)),
             duplicates: 0,
+            tokens: self.tokens,
+            tokens_added: 0,
+            tokens_warned: false,
         })
     }
 }
@@ -608,7 +649,7 @@ pub struct SymSanStage {
     /// The `(queued, solved, stale, duplicate)` tuple last sent to the monitor,
     /// so the stage only fires an event when one of them moved. Without that it
     /// would reprint the whole monitor line once per corpus entry.
-    published_stats: (u64, u64, u64, u64),
+    published_stats: (u64, u64, u64, u64, u64),
     /// Audit the branch map against each entry's tracked edge indices. See
     /// [`SymSanStageBuilder::validate_coverage`].
     validate_coverage: bool,
@@ -643,6 +684,15 @@ pub struct SymSanStage {
     seen: Option<BloomInputFilter>,
     /// Solutions skipped by `seen`.
     duplicates: u64,
+    /// Drain the trace's comparands into the state's [`Tokens`] after each
+    /// entry. See [`SymSanStageBuilder::tokens`].
+    tokens: bool,
+    /// Tokens actually added to the dictionary, for the monitor line. Not the
+    /// same as the session's count: the state may not have a [`Tokens`] to add
+    /// them to, and this is what says so.
+    tokens_added: u64,
+    /// Whether the "no Tokens metadata to add to" warning has been issued.
+    tokens_warned: bool,
 }
 
 /// What became of the branch a solution was solved for.
@@ -755,6 +805,13 @@ impl SymSanStage {
         self.duplicates
     }
 
+    /// Dictionary entries this stage added that the fuzzer did not already
+    /// have. The interesting number is this against the autodict's size: a
+    /// stage that only rediscovers compile-time literals reports near zero.
+    pub fn tokens_added(&self) -> u64 {
+        self.tokens_added
+    }
+
     /// Point the session at the fuzzer's history map, re-publishing it if the
     /// buffer has moved since last time.
     ///
@@ -859,12 +916,20 @@ impl SymSanStage {
             stats.solved_tasks,
             stats.stale_tasks,
             self.duplicates,
+            self.tokens_added,
         );
         if current == self.published_stats {
             return Ok(());
         }
         self.published_stats = current;
-        let (queued, solved, stale, duplicate) = current;
+        let (queued, solved, stale, duplicate, tokens) = current;
+        // Only when the collector is on: a constant `0 tokens` in every line of
+        // every campaign that never asked for them is noise.
+        let tokens = if self.tokens {
+            format!(", {tokens} tokens")
+        } else {
+            String::new()
+        };
         let executions = *state.executions();
         manager.fire(
             state,
@@ -874,7 +939,7 @@ impl SymSanStage {
                     value: UserStats::new(
                         UserStatsValue::String(Cow::Owned(format!(
                             "{queued} queued, {solved} solved, {stale} dropped stale, \
-                             {duplicate} duplicate"
+                             {duplicate} duplicate{tokens}"
                         ))),
                         AggregatorOps::None,
                     ),
@@ -883,6 +948,42 @@ impl SymSanStage {
                 executions,
             ),
         )
+    }
+
+    /// Move the comparands this trace found into the fuzzer's dictionary.
+    ///
+    /// The session hands each token over exactly once, so there is nothing to
+    /// deduplicate here beyond what [`Tokens::add_token`] already does -- it
+    /// returns 0 for one the fuzzer had already, which is how a token the LTO
+    /// autodict also found gets counted as what it is: nothing new.
+    ///
+    /// A state with no [`Tokens`] is a configuration mistake rather than an
+    /// error to propagate: the trace still happened and the solving still
+    /// works, so warn once and drop them. Draining regardless of whether there
+    /// is anywhere to put them keeps the session's buffer from growing without
+    /// bound in that case.
+    fn drain_tokens<S>(&mut self, state: &mut S)
+    where
+        S: HasMetadata,
+    {
+        let found = self.session.take_tokens();
+        if found.is_empty() {
+            return;
+        }
+        let Ok(dict) = state.metadata_mut::<Tokens>() else {
+            if !self.tokens_warned {
+                log::warn!(
+                    "symsan: tokens() is on but the state carries no Tokens dictionary; \
+                     add one with state.add_metadata(Tokens::new()) and give the mutator \
+                     a tokens stage to draw from it"
+                );
+                self.tokens_warned = true;
+            }
+            return;
+        };
+        for token in found {
+            self.tokens_added += dict.add_token(&token) as u64;
+        }
     }
 
     /// Is edge @p edge already set in the fuzzer's history map?
@@ -1186,6 +1287,15 @@ where
                     }
                 }
             }
+        }
+
+        // Before the `tasks == 0` fall-through below, and deliberately not
+        // gated on it: the comparands are worth having precisely when nothing
+        // could be solved. A condition the parser refused still says what byte
+        // string the target wanted to see there, and that is the one thing a
+        // dictionary can act on when the solver cannot.
+        if self.tokens {
+            self.drain_tokens(state);
         }
 
         // Not an early return, unlike every other bail-out above: an entry with

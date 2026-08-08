@@ -269,6 +269,16 @@ typedef struct {
    *  scan, even the ones that are never solved, and only a front-end running
    *  its own input-to-state pass has a use for the answer. */
   int export_taint;
+
+  /** Collect the concrete bytes the target compares its input against, for
+   *  symsan_session_take_tokens().  Off by default: it costs a walk of every
+   *  condition's boolean skeleton, and only a front-end with a token mutator
+   *  has anywhere to put the answer. */
+  int collect_tokens;
+  /** How many distinct tokens to keep.  0 means the default (4096).  A
+   *  dictionary is diluted by its size rather than slowed by it, which is why
+   *  this is small. */
+  size_t max_tokens;
 } symsan_config_t;
 
 /** Fill @p cfg with the defaults.  Always call this first. */
@@ -526,6 +536,42 @@ symsan_status_t symsan_session_check_coverage(const symsan_session_t *s,
 symsan_status_t symsan_session_input_taint(symsan_session_t *s,
                                            uint8_t *out, size_t len,
                                            size_t *size);
+
+/** A concrete byte string the target compared its input against. */
+typedef struct {
+  /** session-owned; stays valid until symsan_session_destroy() */
+  const uint8_t *data;
+  size_t size;
+} symsan_token_t;
+
+/** Drain the dictionary tokens found since the last call.
+ *
+ *  Two sources, both of them things a trace already carries: the concrete side
+ *  of a memcmp/strcmp, which the runtime ships verbatim, and the constant
+ *  operand of an integer comparison on a condition's boolean skeleton.
+ *
+ *  What these are for is the half an AFL++ LTO autodict cannot reach.  That
+ *  pass reads the constants in the binary, so it already has every compile-time
+ *  literal; what it cannot have is a comparand computed at run time -- a name
+ *  interned while parsing an earlier part of the input, a table entry, a length
+ *  derived from a header field.  Collection is also independent of whether the
+ *  branch became a solving task, so a condition the parser refuses still gives
+ *  up its constants, which is where a token mutator is most use.
+ *
+ *  Tokens are interned and never evicted: each pointer stays valid for the life
+ *  of the session, and a token is reported exactly once.  Anything past @p max
+ *  is kept for the next call, so a caller with a small buffer loses nothing.
+ *
+ *  Needs collect_tokens set at init().  Without it nothing is ever collected,
+ *  so this succeeds with a count of 0 rather than failing -- "no tokens" is
+ *  what a caller has to handle anyway.
+ */
+symsan_status_t symsan_session_take_tokens(symsan_session_t *s,
+                                           symsan_token_t *out, size_t max,
+                                           size_t *count);
+
+/** How many distinct tokens the session has interned so far. */
+size_t symsan_session_num_tokens(const symsan_session_t *s);
 
 /** Counters mirroring rgd::ConcolicStats. */
 typedef struct {

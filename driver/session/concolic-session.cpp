@@ -84,6 +84,8 @@ int ConcolicConfig::from_env() {
   if (getenv("SYMSAN_VALIDATE_COV")) validate_coverage = true;
   // tell the front-end which input bytes are still worth mutating?
   if (getenv("SYMSAN_EXPORT_TAINT")) export_taint = true;
+  // hand the front-end the concrete bytes the target compared against?
+  if (getenv("SYMSAN_TOKENS")) collect_tokens = true;
 
   return 0;
 }
@@ -168,6 +170,10 @@ int ConcolicSession::init(const ConcolicConfig &config) {
   // setup the parser
   parser_.reset(new RGDAstParser(shm_base, uniontable_size,
                                  config_.nested_solving, config_.max_ast_size));
+  // The token collector walks the same table, but deliberately not through the
+  // parser: a condition the parser refuses is exactly the one whose constants
+  // are worth handing to a mutator.  See include/tokens.h.
+  tokens_.init(shm_base, uniontable_size, config_.max_tokens);
   task_mgr_.reset(new FIFOTaskManager());
 
   if (branch_map_) {
@@ -252,6 +258,12 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
   } else {
     lc += 1;
   }
+
+  // Before the coverage and solving decisions below, and not gated on either.
+  // Whether a branch is worth *solving* is a question about novelty; whether
+  // its comparand is worth *mutating towards* is not, and the branches this
+  // session declines are exactly the ones a token mutator has to cover.
+  if (config_.collect_tokens) tokens_.scan_cond(msg.label);
 
   // prase flags
   bool always_solve = (msg.flags & F_ADD_CONS) == 0;
@@ -388,6 +400,10 @@ void ConcolicSession::on_memcmp(const symsan::pipe_msg &msg, const uint8_t *cont
   // either way there is nothing to record
   if (!content) return;
   parser_->record_memcmp(msg.label, const_cast<uint8_t*>(content), size);
+  // The best dictionary token there is: the target named the exact bytes it
+  // wanted, and the runtime shipped them.  Unlike the constants below there is
+  // nothing to guess about width or byte order.
+  if (config_.collect_tokens) tokens_.add_str(content, size);
 }
 
 void ConcolicSession::on_table(const symsan::pipe_msg &msg,
@@ -454,6 +470,15 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
 
   size_t tasks_before = task_mgr_->get_num_tasks();
   symsan::trace_result_t ret = session_.run(input_fd_, *this);
+  // Labels, not tokens: the dictionary is deliberately cumulative, but a label
+  // only names the same AST within one run of the target.
+  //
+  // After the run rather than with the cache clears above, because the run of
+  // byte comparisons the target was in the middle of is only complete once it
+  // has exited: flushing at the top of the next trace would hand the caller a
+  // token one trace late, and never hand it the last trace's at all.  Before
+  // the error return for the same reason.
+  tokens_.end_input();
   if (ret == symsan::TRACE_LAUNCH_ERROR) {
     return -1;
   }

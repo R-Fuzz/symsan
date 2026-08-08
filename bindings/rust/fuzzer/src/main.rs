@@ -309,6 +309,19 @@ struct Opt {
     #[arg(long = "symsan-no-dedup", default_value = "false")]
     symsan_no_dedup: bool,
 
+    /// Add the comparands the concolic stage saw to the havoc dictionary.
+    ///
+    /// The forkserver already loads the target's LTO autodict, which is every
+    /// byte string that appears as a literal in the binary. What a trace adds
+    /// is the part that pass cannot see: a comparand computed at run time, and
+    /// a keyword the target checks one character at a time, which exists in the
+    /// binary as a chain of one-byte compares and nowhere as a string.
+    ///
+    /// Off by default -- it walks every condition, including ones no solver
+    /// will be handed, and a target with no keyword syntax has nothing to say.
+    #[arg(long = "symsan-tokens", default_value = "false")]
+    symsan_tokens: bool,
+
     /// Drop the input-to-state solver from the ladder. It is the cheapest rung
     /// and cracks most branches on its own, so this is for measuring what the
     /// others contribute, not for fuzzing.
@@ -522,6 +535,9 @@ pub fn main() -> Result<(), libafl::Error> {
             });
         println!("imported {} inputs from disk", state.corpus().count());
     }
+    // Read before the move: this is the baseline the concolic stage's own
+    // contribution is only meaningful against.
+    let autotokens = tokens.len();
     state.add_metadata(tokens);
 
     // --- stages -------------------------------------------------------------
@@ -566,7 +582,8 @@ pub fn main() -> Result<(), libafl::Error> {
                 .jigsaw(!opt.symsan_no_jigsaw)
                 .z3(opt.symsan_z3)
                 .solve_ub(opt.symsan_solve_ub)
-                .cmplog_filter(cmplog_filter);
+                .cmplog_filter(cmplog_filter)
+                .tokens(opt.symsan_tokens);
             if let Some(map) = &branch_map {
                 // The observer above is named "shared_mem", which is also the
                 // name MaxMapFeedback::new() inherits and files its history map
@@ -637,6 +654,14 @@ pub fn main() -> Result<(), libafl::Error> {
                 // trace costs and what it solves for, so a log without it is
                 // indistinguishable from a log with it.
                 println!("symsan: also solving for undefined behaviour");
+            }
+            if opt.symsan_tokens {
+                // Against the autodict's size, so the log says what the trace
+                // is being asked to add to rather than just that it is adding.
+                println!(
+                    "symsan: contributing comparands to the dictionary \
+                     ({autotokens} tokens from the target's autodict)"
+                );
             }
             Some(tuple_list!(CreditedStage::new(
                 "symsan",

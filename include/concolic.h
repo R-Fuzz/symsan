@@ -26,6 +26,7 @@
 #include "solver.h"
 #include "task.h"
 #include "task_mgr.h"
+#include "tokens.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -91,6 +92,11 @@ struct ConcolicConfig {
   /// the ones that are never solved, and only a front-end running its own
   /// input-to-state pass has any use for the answer.
   bool export_taint = false;      // SYMSAN_EXPORT_TAINT
+  /// Collect the concrete bytes the target compares its input against, as
+  /// fuzzer dictionary tokens (SYMSAN_TOKENS).  Off by default: it costs a
+  /// walk of every condition's boolean skeleton, and only a front-end with a
+  /// token mutator has anywhere to put the answer.  See take_tokens().
+  bool collect_tokens = false;    // SYMSAN_TOKENS
   /// per-run timeout in milliseconds; also arms the deadloop guard
   unsigned timeout_ms = 50;       // MIN_TIMEOUT in driver/aflpp/symsan.cpp
 
@@ -101,6 +107,10 @@ struct ConcolicConfig {
   uint8_t max_local_branch_counter = 128; // MAX_LOCAL_BRANCH_COUNTER
   /// largest input the session will trace or emit
   size_t max_input_size = 1 * 1024 * 1024; // AFL++'s MAX_FILE
+  /// how many distinct dictionary tokens the session will keep.  A dictionary
+  /// is diluted by size, not slowed by it -- a token mutator picks one at
+  /// random, so every junk entry costs a draw -- which is why this is small.
+  size_t max_tokens = 4096;
 
   /// Populate from the SYMSAN_* environment variables.  Fields not covered by
   /// an environment variable (input_file, args, use_stdin) are left untouched.
@@ -285,6 +295,42 @@ public:
   ///         case only the first @p len offsets were written), or -1
   int input_taint(uint8_t *out, size_t len);
 
+  /// A concrete byte string the target compared its input against.
+  using Token = symsan::TokenCollector::Token;
+
+  /// Drain the dictionary tokens found since the last call.
+  ///
+  /// Two sources, both of them things the trace already carries and throws
+  /// away: the concrete side of a memcmp/strcmp (which the runtime ships
+  /// verbatim, so nothing has to be reconstructed), and the constant operand of
+  /// an integer comparison on the condition's boolean skeleton.
+  ///
+  /// What this is *for* is the half AFL++'s LTO autodict cannot reach.  That
+  /// pass reads the constants in the binary, so it already has every
+  /// compile-time literal; what it cannot have is a comparand computed at run
+  /// time -- a name interned while parsing an earlier part of the input, a
+  /// table entry, a length derived from a header field.  Those are most of what
+  /// a real parser compares against, and they only exist during a trace.
+  ///
+  /// The second reason is the branches we fail on.  A comparand is worth
+  /// handing to a token mutator precisely when the solver could not use it, and
+  /// this is collected independently of parse_cond() so that a condition the
+  /// parser refuses -- over max_ast_size, an op it has no node for -- still
+  /// gives up its constants.
+  ///
+  /// Tokens are interned and never evicted, so each returned pointer stays
+  /// valid for the life of the session and a token is only ever reported once.
+  /// Needs ConcolicConfig::collect_tokens.
+  ///
+  /// @param out  where to write up to @p max tokens
+  /// @param max  capacity of @p out; anything past it is kept for the next call
+  /// @return how many tokens were written
+  size_t take_tokens(Token *out, size_t max) {
+    return config_.collect_tokens ? tokens_.take(out, max) : 0;
+  }
+  /// How many distinct tokens the session has interned so far.
+  size_t num_tokens() const { return tokens_.size(); }
+
   const ConcolicStats &stats() const { return stats_; }
   /// Write the counters and each solver's own stats to @p fd.
   void print_stats(int fd) const;
@@ -377,6 +423,9 @@ private:
   std::unordered_map<const SearchTask *, size_t> task_branch_;
   /// every offset any branch on the path read
   RGDAstParser::input_dep_t traced_taint_;
+
+  /// dictionary tokens, only touched when config_.collect_tokens is set
+  symsan::TokenCollector tokens_;
 
   ConcolicStats stats_;
   std::map<uint64_t, uint64_t> task_size_dist_;

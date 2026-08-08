@@ -333,10 +333,12 @@ void symsan_config_init(symsan_config_t *cfg) {
   cfg->forkserver = def.forkserver;
   cfg->validate_coverage = def.validate_coverage;
   cfg->export_taint = def.export_taint;
+  cfg->collect_tokens = def.collect_tokens;
   cfg->timeout_ms = def.timeout_ms;
   cfg->max_ast_size = def.max_ast_size;
   cfg->max_local_branch_counter = def.max_local_branch_counter;
   cfg->max_input_size = def.max_input_size;
+  cfg->max_tokens = def.max_tokens;
 }
 
 symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
@@ -370,6 +372,7 @@ symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
     if (bmap) cfg->branch_map = bmap;
     cfg->validate_coverage = c.validate_coverage;
     cfg->export_taint = c.export_taint;
+    cfg->collect_tokens = c.collect_tokens;
     return SYMSAN_OK;
   });
 }
@@ -430,12 +433,14 @@ symsan_status_t symsan_session_init(symsan_session_t *s,
     if (cfg->branch_map) c.branch_map = cfg->branch_map;
     c.validate_coverage = cfg->validate_coverage != 0;
     c.export_taint = cfg->export_taint != 0;
+    c.collect_tokens = cfg->collect_tokens != 0;
     c.timeout_ms = cfg->timeout_ms;
     if (cfg->max_ast_size) c.max_ast_size = cfg->max_ast_size;
     if (cfg->max_local_branch_counter) {
       c.max_local_branch_counter = cfg->max_local_branch_counter;
     }
     if (cfg->max_input_size) c.max_input_size = cfg->max_input_size;
+    if (cfg->max_tokens) c.max_tokens = cfg->max_tokens;
 
     if (s->session.init(c) != 0) {
       set_error("ConcolicSession::init failed");
@@ -618,6 +623,45 @@ symsan_status_t symsan_session_input_taint(symsan_session_t *s,
     *size = (size_t)n;
     return SYMSAN_OK;
   });
+}
+
+symsan_status_t symsan_session_take_tokens(symsan_session_t *s,
+                                           symsan_token_t *out, size_t max,
+                                           size_t *count) {
+  if (!s || !count || (!out && max)) {
+    set_error("symsan_session_take_tokens: session/count required");
+    return SYMSAN_ERR_INVALID;
+  }
+  if (!s->initialized) {
+    set_error("symsan_session_take_tokens: session not initialized");
+    return SYMSAN_ERR_NOT_READY;
+  }
+  return guard(SYMSAN_ERR_FAILED, [&] {
+    // rgd::ConcolicSession::Token is layout-identical to symsan_token_t, but
+    // copy rather than reinterpret_cast: the two are declared in different
+    // headers, and nothing would tell us if one of them gained a field.
+    static_assert(sizeof(rgd::ConcolicSession::Token) == sizeof(symsan_token_t),
+                  "token structs out of step");
+    rgd::ConcolicSession::Token buf[64];
+    *count = 0;
+    while (*count < max) {
+      size_t want = max - *count;
+      if (want > 64) want = 64;
+      size_t got = s->session.take_tokens(buf, want);
+      if (got == 0) break;
+      for (size_t i = 0; i < got; ++i) {
+        out[*count + i].data = buf[i].data;
+        out[*count + i].size = buf[i].size;
+      }
+      *count += got;
+    }
+    return SYMSAN_OK;
+  });
+}
+
+size_t symsan_session_num_tokens(const symsan_session_t *s) {
+  if (!s || !s->initialized) return 0;
+  return s->session.num_tokens();
 }
 
 symsan_status_t symsan_session_stats(const symsan_session_t *s,

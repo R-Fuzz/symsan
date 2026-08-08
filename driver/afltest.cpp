@@ -8,9 +8,14 @@
 // us validate the RGD path deterministically on a single input, without the
 // noisy afl-fuzz search loop.
 //
-// Usage: afltest [--dump-constraints <dir>] [--target-args "<args>"]
-//                target input [input...]
+// Usage: afltest [--dump-constraints <dir>] [--dump-tokens <file>]
+//                [--target-args "<args>"] target input [input...]
 //   TAINT_OPTIONS="taint_file=<file|stdin> output_dir=<dir>"
+//   --dump-tokens  write the concrete bytes the target compared its input
+//                  against to <file>, in AFL dictionary format.  The offline
+//                  half of ConcolicSession::take_tokens(): the way to ask what
+//                  a corpus would contribute to a fuzzer's dictionary, and to
+//                  diff that against the target's own LTO autodict.
 //   --target-args  extra argv for the target, split on whitespace, with `@@`
 //                  where the input path goes (appended if there is no `@@`).
 //                  A campaign's flags are part of what it traced: Magma runs
@@ -89,12 +94,15 @@ extern "C" {
 #include "parse-rgd.h"
 #include "session.h"
 #include "sweep.h"
+#include "tokens.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -162,6 +170,15 @@ static uint32_t __session_id = 0;
 static uint32_t __current_index = 0;
 static int __enum_gep = 0;  // GEP enumeration disabled by default
 static const char* __dump_dir = nullptr;  // --dump-constraints, off by default
+
+// --dump-tokens <file>: the dictionary the trace could hand a token mutator.
+//
+// This is the offline half of ConcolicSession::take_tokens(): the same
+// collector, over the same events, written out in AFL's dictionary format so a
+// corpus sweep's answer can be diffed against the target's own autodict.  Null
+// unless the option is given, and the collector is then never fed.
+static const char* __token_file = nullptr;
+static symsan::TokenCollector __tokens;
 // SYMSAN_NO_OUTPUT: still solve, still count, just skip generate_input.  See
 // the option list at the top of the file.
 static int __no_output = 0;
@@ -343,6 +360,9 @@ static void __solve_cond(dfsan_label label, uint8_t r, bool add_nested, void *ad
   // Without it a solved input cannot be joined back to a coverage map edge.
   AOUT("solving label %d = %d, cid %u, add_nested: %d\n", label, r, cid,
        add_nested);
+  // Before parse_cond(), and not gated on what it says: a condition the parser
+  // refuses is exactly the one whose comparand a token mutator has to cover.
+  if (__token_file) __tokens.scan_cond(label);
   if (__parse_only && label == 0) {
     // A loop-exit notification, not a condition -- there is no AST to build and
     // no branch to flip, so it is neither a success nor a failure.  parse_cond
@@ -569,6 +589,10 @@ static int run_one(char *program, char *input, int is_stdin) {
           }
           // save the content
           __parser->record_memcmp(msg.label, mmsg->content, msg.result);
+          // The best dictionary token there is: the target named the exact
+          // bytes it wanted, and the runtime shipped them.  Unlike an ICmp
+          // constant there is nothing to guess about width or byte order.
+          if (__token_file) __tokens.add_str(mmsg->content, msg.result);
           free(mmsg);
           break;
         case table_type:
@@ -611,12 +635,43 @@ fail:
   return -1;
 }
 
+// Write the collected dictionary to @p path in AFL's format, one
+// `token_N="..."` per line, so that `afl-fuzz -x` and `libafl`'s Tokens::from_file
+// both read it and so that it can be diffed against the target's own autodict.
+//
+// Escaping is AFL's: everything outside printable ASCII, plus `"` and `\`, goes
+// out as \xNN.  Sorted, because the file's whole purpose here is to be diffed.
+static void dump_tokens(const char *path) {
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    fprintf(stderr, "Failed to open %s: %s\n", path, strerror(errno));
+    return;
+  }
+  std::vector<std::string> sorted(__tokens.all().begin(), __tokens.all().end());
+  std::sort(sorted.begin(), sorted.end());
+  size_t n = 0;
+  for (const std::string &t : sorted) {
+    fprintf(f, "token_%zu=\"", n++);
+    for (unsigned char c : t) {
+      if (c == '"' || c == '\\') fprintf(f, "\\%c", c);
+      else if (c >= 0x20 && c < 0x7f) fputc(c, f);
+      else fprintf(f, "\\x%02x", c);
+    }
+    fprintf(f, "\"\n");
+  }
+  fclose(f);
+  fprintf(stderr, "wrote %zu tokens to %s\n", n, path);
+}
+
 int main(int argc, char* const argv[]) {
 
   int optind = 1;
   while (argc - optind > 2) {
     if (strcmp(argv[optind], "--dump-constraints") == 0) {
       __dump_dir = argv[optind + 1];
+      optind += 2;
+    } else if (strcmp(argv[optind], "--dump-tokens") == 0) {
+      __token_file = argv[optind + 1];
       optind += 2;
     } else if (strcmp(argv[optind], "--target-args") == 0) {
       // One shell-style word list, split on whitespace only: enough for every
@@ -636,8 +691,8 @@ int main(int argc, char* const argv[]) {
 
   if (argc - optind < 2) {
     fprintf(stderr,
-            "Usage: %s [--dump-constraints <dir>] [--target-args \"<args>\"] "
-            "target input [input...]\n",
+            "Usage: %s [--dump-constraints <dir>] [--dump-tokens <file>] "
+            "[--target-args \"<args>\"] target input [input...]\n",
             argv[0]);
     exit(1);
   }
@@ -734,6 +789,10 @@ int main(int argc, char* const argv[]) {
     exit(1);
   }
   symsan::set_label_info_base(shm_base, uniontable_size);
+  // No cap: the point of a sweep is to see the whole dictionary a corpus
+  // yields, and deciding what to keep is the front-end's job (see
+  // ConcolicConfig::max_tokens).  Only fed when --dump-tokens was given.
+  if (__token_file) __tokens.init(shm_base, uniontable_size, SIZE_MAX);
 
   symsan_set_debug(debug);
   symsan_set_bounds_check(1);
@@ -805,7 +864,17 @@ int main(int argc, char* const argv[]) {
     // label), so it needs the input named even for a single seed, where the
     // PARSE-INPUT line above is deliberately not printed.
     if (__parse_only) symsan::sweep::log_cond_input(argv[i]);
-    if (run_one(program, argv[i], is_stdin) != 0) {
+    const int rc = run_one(program, argv[i], is_stdin);
+    // Labels, not tokens: the dictionary is cumulative over the corpus, which
+    // is the whole point of a sweep, but a label only names the same AST within
+    // one run of the target.
+    //
+    // After the run rather than before it, and outside the failure check: the
+    // byte-comparison run the target was in the middle of is only complete once
+    // it has exited, so flushing at the top of the next iteration would lose
+    // the last input's -- and on a single-seed run, lose it entirely.
+    if (__token_file) __tokens.end_input();
+    if (rc != 0) {
       failures++;
       continue;
     }
@@ -824,6 +893,8 @@ int main(int argc, char* const argv[]) {
   // z3 context in z3-solver.cpp is still alive -- relying on static destruction
   // order across translation units would free the context first and crash.
   __solvers.clear();
+
+  if (__token_file) dump_tokens(__token_file);
 
   symsan::sweep::close_cond_log();
   symsan_destroy();

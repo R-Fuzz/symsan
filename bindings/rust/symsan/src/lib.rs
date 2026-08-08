@@ -230,6 +230,8 @@ pub struct Config {
     forkserver: bool,
     validate_coverage: bool,
     export_taint: bool,
+    collect_tokens: bool,
+    max_tokens: usize,
 }
 
 /// Convert to a `CString`, replacing any interior NUL by truncating at it.
@@ -288,6 +290,8 @@ impl Config {
             forkserver: raw.forkserver != 0,
             validate_coverage: raw.validate_coverage != 0,
             export_taint: raw.export_taint != 0,
+            collect_tokens: raw.collect_tokens != 0,
+            max_tokens: raw.max_tokens,
         }
     }
 
@@ -297,7 +301,8 @@ impl Config {
     /// `SYMSAN_OUTPUT_DIR`, `SYMSAN_NO_I2S`, `SYMSAN_USE_JIGSAW`, `SYMSAN_USE_Z3`,
     /// `SYMSAN_USE_NESTED`, `SYMSAN_TRACE_BOUNDS`, `SYMSAN_SOLVE_UB`,
     /// `SYMSAN_DONT_EXIT_ON_MEMERROR`, `SYMSAN_FORCE_STDIN`,
-    /// `SYMSAN_SAVE_SOLVED`, `SYMSAN_FORKSRV`, `SYMSAN_BRANCH_MAP` -- by calling the same C++
+    /// `SYMSAN_SAVE_SOLVED`, `SYMSAN_FORKSRV`, `SYMSAN_BRANCH_MAP`,
+    /// `SYMSAN_TOKENS` -- by calling the same C++
     /// code, so the two front-ends cannot disagree about what a variable means.
     ///
     /// `input_file`, `args` and `use_stdin` are left alone; they are the
@@ -354,6 +359,8 @@ impl Config {
             forkserver: raw.forkserver != 0,
             validate_coverage: raw.validate_coverage != 0,
             export_taint: raw.export_taint != 0,
+            collect_tokens: raw.collect_tokens != 0,
+            max_tokens: raw.max_tokens,
         })
     }
 
@@ -554,6 +561,31 @@ impl Config {
         self
     }
 
+    /// Collect the concrete byte strings the target compared its input
+    /// against, for [`Session::take_tokens`].
+    ///
+    /// Off by default: it walks the boolean skeleton of every condition,
+    /// including the ones no solver will ever be handed, and only a front-end
+    /// with a token mutator has somewhere to put the answer.  That the walk
+    /// covers the refused conditions too is the point -- a comparison the
+    /// parser gives up on is one only a dictionary can cover.
+    #[must_use]
+    pub fn collect_tokens(mut self, enable: bool) -> Self {
+        self.collect_tokens = enable;
+        self
+    }
+
+    /// How many distinct tokens to keep. 0 leaves the C layer's default.
+    ///
+    /// A cap rather than an eviction policy, because a dictionary is diluted by
+    /// size rather than slowed by it: the mutator draws one entry uniformly, so
+    /// junk costs draws, not time.
+    #[must_use]
+    pub fn max_tokens(mut self, max: usize) -> Self {
+        self.max_tokens = max;
+        self
+    }
+
     /// The scratch file inputs are staged into.
     pub fn input_file_path(&self) -> PathBuf {
         PathBuf::from(self.input_file.to_string_lossy().into_owned())
@@ -606,6 +638,8 @@ impl Config {
         raw.forkserver = self.forkserver.into();
         raw.validate_coverage = self.validate_coverage.into();
         raw.export_taint = self.export_taint.into();
+        raw.collect_tokens = self.collect_tokens.into();
+        raw.max_tokens = self.max_tokens;
 
         (raw, argv)
     }
@@ -1103,6 +1137,63 @@ impl Session {
             sys::symsan_session_input_taint(self.raw.as_ptr(), out.as_mut_ptr(), size, &mut size)
         })?;
         Ok(out.into_iter().map(TaintClass::from_raw).collect())
+    }
+
+    /// Drain the dictionary tokens found since the last call.
+    ///
+    /// The concrete side of a comparison the target made against its input: a
+    /// memcmp/strcmp comparand, a chain of single-byte character tests at
+    /// consecutive offsets, or the constant operand of an integer compare.
+    /// What this adds to AFL++'s LTO autodict is the half that pass cannot
+    /// reach -- a comparand computed at run time rather than sitting in the
+    /// binary -- plus the constants of every condition the solver declined.
+    ///
+    /// Each token is returned exactly once over the life of the session, so a
+    /// caller can add them straight to its dictionary without deduplicating.
+    /// An empty `Vec` is the normal answer once the interesting comparisons
+    /// have been seen, and is also what a session built without
+    /// [`Config::collect_tokens`] always returns -- "no tokens" is the case a
+    /// caller has to handle either way, so it is not an error.
+    pub fn take_tokens(&mut self) -> Vec<Vec<u8>> {
+        const CHUNK: usize = 64;
+        let mut tokens = Vec::new();
+        loop {
+            let mut buf = [sys::symsan_token_t {
+                data: std::ptr::null(),
+                size: 0,
+            }; CHUNK];
+            let mut count = 0usize;
+            // SAFETY: valid handle; buf holds CHUNK writable entries.
+            let st = unsafe {
+                sys::symsan_session_take_tokens(
+                    self.raw.as_ptr(),
+                    buf.as_mut_ptr(),
+                    CHUNK,
+                    &mut count,
+                )
+            };
+            if check(st).is_err() || count == 0 {
+                break;
+            }
+            for t in &buf[..count] {
+                if t.data.is_null() || t.size == 0 {
+                    continue;
+                }
+                // SAFETY: the C layer documents these as session-owned and
+                // valid until destroy(); copied out here so they are not.
+                tokens.push(unsafe { std::slice::from_raw_parts(t.data, t.size) }.to_vec());
+            }
+            if count < CHUNK {
+                break;
+            }
+        }
+        tokens
+    }
+
+    /// How many distinct tokens this session has interned so far.
+    pub fn num_tokens(&self) -> usize {
+        // SAFETY: valid handle.
+        unsafe { sys::symsan_session_num_tokens(self.raw.as_ptr()) }
     }
 
     /// Counters for the whole session.
