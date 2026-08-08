@@ -392,6 +392,17 @@ public:
   std::shared_ptr<SearchTask> base_task;
   bool skip_next; // FIXME: an ugly hack to skip the next task
 
+  /// The branch this task was built to flip, or null if nobody said.
+  ///
+  /// Shared with the sibling tasks built for the same branch.  The session used
+  /// to hold this link in a SearchTask* -> index map alongside a vector it
+  /// cleared on every trace, which meant a task could not be solved outside the
+  /// trace that produced it: it lost its target, and next_pending_task() reads a
+  /// missing target as "solve it", so the loss was silent.  Whoever builds the
+  /// task sets it; a caller that solves tasks straight through (afltest) leaves
+  /// it null and nothing asks.
+  std::shared_ptr<TaskTarget> target;
+
   void finalize() {
     // aggregate the contraints, map each input byte to a constraint to
     // an index in the "global" input array (i.e., the scratch_args)

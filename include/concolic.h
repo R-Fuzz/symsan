@@ -368,17 +368,47 @@ private:
   /// Recorded for *every* branch, including the ones that never became a task
   /// -- whether a task was built is a solving decision, while the question
   /// input_taint() asks is a coverage one.
+  ///
+  /// `target` is the same object the tasks built for this branch hold, so
+  /// `target->flipped` here and on the task are the same bit -- but it is null
+  /// for the great majority of branches, which never get as far as a task.  The
+  /// scalars above it are what input_taint() needs for one of those, and are
+  /// why they are still here rather than being read off the target.
+  ///
+  /// Deliberately lazy: the local counter in on_cond() drops 84% (nvdcve_0.xml)
+  /// to 98% (docbook_0.xml) of a libxml2 trace's conditions, measured, and a
+  /// control block each for those is over a million allocations per trace on
+  /// the hottest path in the session.  A target is built where the old negated
+  /// context was, past the counter, so the allocation count is unchanged.
   struct TracedBranch {
     dfsan_label label;
     void *addr;
     uint32_t id;        ///< the branch's cid, for the re-ask in input_taint()
     bool neg_direction; ///< the direction we did *not* take
-    bool flipped;       ///< a solution for it came back interesting
+    std::shared_ptr<TaskTarget> target;
   };
   /// Record @p label and the direction not taken, for input_taint() and for
   /// next_pending_task().  @return the index, or SIZE_MAX
+  ///
+  /// The index is a within-trace one, read only by the caller a few lines later
+  /// to hang a target off the record.  It is not how a task finds its target --
+  /// that is SearchTask::target, which is why a task can now outlive the trace
+  /// that built it.
   size_t note_branch(dfsan_label label, void *addr, uint32_t id,
                      bool neg_direction);
+
+  /// The target for the branch on_cond()/on_gep() is currently handling, hung
+  /// off @p branch_idx if note_branch() recorded one.
+  ///
+  /// Every task built for the branch gets this same object, which is what makes
+  /// report_result() marking one of them retire the siblings still queued
+  /// behind it.  Never null, even when @p branch_idx is SIZE_MAX: a task that
+  /// reaches the queue with no target at all is one next_pending_task() will
+  /// solve without asking, and a dependency scan failing says nothing about
+  /// whether the branch is worth solving.
+  std::shared_ptr<TaskTarget> make_target(size_t branch_idx, void *addr,
+                                          uint32_t id, bool neg_direction,
+                                          uint32_t context);
 
   /// The next queued task whose target is still worth solving, or null.
   ///
@@ -417,10 +447,13 @@ private:
 
   // per-input taint export state, cleared by trace(); only touched when
   // config_.export_taint is set
+  //
+  // This is the list of *this trace's* branches, which is what input_taint()
+  // wants, and clearing it per trace is correct for that.  A task's own link to
+  // its target is no longer an index into here -- it is a shared_ptr on the task
+  // (SearchTask::target), so it survives the clear and a task can be solved
+  // after the trace that built it has gone.  The two point at the same objects.
   std::vector<TracedBranch> traced_branches_;
-  /// which TracedBranch a task came from.  The link has to live here because
-  /// FIFOTaskManager drops the context it is handed.
-  std::unordered_map<const SearchTask *, size_t> task_branch_;
   /// every offset any branch on the path read
   RGDAstParser::input_dep_t traced_taint_;
 

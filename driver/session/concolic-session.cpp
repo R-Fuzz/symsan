@@ -297,22 +297,23 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
   // it covered, so is_target_uncovered() says uncovered and its bytes stay open.
   const bool runtime_check = symsan::is_runtime_check_id(msg.id);
 
-  std::shared_ptr<BranchContext> ctx;
-  if (runtime_check) {
-    ctx = std::make_shared<BranchContext>();
-    ctx->addr = (void*)msg.addr;
-    ctx->direction = msg.result != 0;
-    ctx->id = msg.id;
-  } else {
-    ctx = cov_mgr_->add_branch((void*)msg.addr, msg.id, msg.result != 0,
-                               msg.context, loop_latch, loop_exit);
+  // Called for the side effects -- the covered bit, trace_hits_, and validate()'s
+  // census -- rather than for the context it returns, which every manager builds
+  // out of the three arguments it was just handed and reuses across calls.
+  if (!runtime_check) {
+    cov_mgr_->add_branch((void*)msg.addr, msg.id, msg.result != 0,
+                         msg.context, loop_latch, loop_exit);
   }
 
-  std::shared_ptr<BranchContext> neg_ctx = std::make_shared<BranchContext>();
-  *neg_ctx = *ctx;
-  neg_ctx->direction = !ctx->direction;
+  // The negated branch context every consumer below wants -- its direction is
+  // the one not taken -- and, being the same object the tasks will carry, also
+  // the session's record of the branch.  Built here, past the local counter,
+  // where the separate neg_ctx used to be: this is one allocation per branch on
+  // the hottest path there is, and the counter drops the great majority of them.
+  auto target = make_target(branch_idx, (void*)msg.addr, msg.id,
+                            msg.result == 0, msg.context);
 
-  bool interesting = runtime_check || cov_mgr_->is_branch_interesting(neg_ctx);
+  bool interesting = runtime_check || cov_mgr_->is_branch_interesting(target);
   if (shared_cov_) {
     // the manager counts what it looked up; mirror it so that stats() is the
     // one place a front-end has to read
@@ -331,7 +332,7 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
     bool add_nested = !runtime_check && (msg.flags & F_ADD_CONS) != 0;
     // parse the uniont table AST to solving tasks
     std::vector<uint64_t> tasks;
-    if (parser_->parse_cond(msg.label, ctx->direction, add_nested, tasks) != 0) {
+    if (parser_->parse_cond(msg.label, msg.result != 0, add_nested, tasks) != 0) {
       warn("failed to parse the condition %u\n", msg.label);
       // session_.terminate();
       return;
@@ -340,8 +341,8 @@ void ConcolicSession::on_cond(const symsan::pipe_msg &msg) {
     // add the tasks to the task manager
     for (auto const& task_id : tasks) {
       auto task = parser_->retrieve_task(task_id);
-      if (branch_idx != SIZE_MAX) task_branch_[task.get()] = branch_idx;
-      task_mgr_->add_task(neg_ctx, task);
+      task->target = target;
+      task_mgr_->add_task(target, task);
       task_size_dist_[task->size()] += 1;
     }
 
@@ -379,15 +380,13 @@ void ConcolicSession::on_gep(const symsan::pipe_msg &msg, const symsan::gep_msg 
     return;
   }
 
-  // add the tasks to the task manager, with a dummy context
-  std::shared_ptr<BranchContext> ctx = std::make_shared<BranchContext>();
-  ctx->addr = (void*)msg.addr;
-  ctx->direction = true;
-  ctx->id = 0;
+  // add the tasks to the task manager, with the dummy context described above
+  // -- cid 0 and direction true.  Past the index filter, like on_cond's.
+  auto target = make_target(branch_idx, (void*)msg.addr, 0, true, msg.context);
   for (auto const& task_id : tasks) {
     auto task = parser_->retrieve_task(task_id);
-    if (branch_idx != SIZE_MAX) task_branch_[task.get()] = branch_idx;
-    task_mgr_->add_task(ctx, task);
+    task->target = target;
+    task_mgr_->add_task(target, task);
     task_size_dist_[task->size()] += 1;
   }
 
@@ -462,9 +461,10 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   // and whatever else the manager keeps per trace rather than per session --
   // the hit counts that tell one loop iteration from the next.
   cov_mgr_->new_trace();
-  // likewise input_taint(): it describes the input being traced now
+  // likewise input_taint(): it describes the input being traced now.  Only the
+  // list goes; the targets themselves are held by whatever tasks were built for
+  // them, so a task still queued from an earlier trace keeps its own.
   traced_branches_.clear();
-  task_branch_.clear();
   traced_taint_.clear();
   traced_taint_.resize(input_.size());
 
@@ -586,21 +586,19 @@ int ConcolicSession::current_target(uint32_t *cid, bool *direction,
   if (mutation_state_ != MUTATION_IN_VALIDATION || !cur_task_) {
     return -1;
   }
-  auto itr = task_branch_.find(cur_task_.get());
-  if (itr == task_branch_.end()) {
+  const auto &target = cur_task_->target;
+  if (!target) {
     return -1;
   }
-  const auto &branch = traced_branches_[itr->second];
-  if (cid) *cid = branch.id;
-  if (direction) *direction = branch.neg_direction;
+  if (cid) *cid = target->id;
+  if (direction) *direction = target->direction;
   if (dest) {
     // 0 for "the map cannot say", which is distinct from kPruned: kPruned is
     // the map answering that this side has no edge of its own, and the caller
     // must not read a miss there as a failure to flip.
     *dest = 0;
     if (branch_map_) {
-      const uint32_t *edge = branch_map_->lookup(branch.id,
-                                                 branch.neg_direction);
+      const uint32_t *edge = branch_map_->lookup(target->id, target->direction);
       if (edge) *dest = *edge;
     }
   }
@@ -638,9 +636,11 @@ void ConcolicSession::report_result(bool interesting, TargetOutcome outcome) {
     // True on the Reached path too, and more accurately than before: a
     // solution that flipped the branch onto already-covered ground has reached
     // the target by any reading, and used to leave its bytes open forever.
-    auto itr = task_branch_.find(cur_task_.get());
-    if (itr != task_branch_.end()) {
-      traced_branches_[itr->second].flipped = true;
+    //
+    // Shared with the sibling tasks built for the same branch, which is what
+    // retires them in next_pending_task() below.
+    if (cur_task_->target) {
+      cur_task_->target->flipped = true;
     }
   }
 }
@@ -651,10 +651,13 @@ size_t ConcolicSession::note_branch(dfsan_label label, void *addr, uint32_t id,
   // but next_pending_task() needs to know what target a task is for in order to
   // re-ask about it, and that is not a taint-export question -- nor are
   // report_result()'s `flipped` and current_target()'s answer to --flip-log,
-  // both of which reach traced_branches_ through task_branch_ and were
-  // silently empty without the export.  Only the dependency scan below is
-  // export_taint's, and that is the part the flag was justified by: it makes
-  // every branch pay, including the ones that never become a task.
+  // all three of which used to reach traced_branches_ through a
+  // SearchTask* -> index map and so were silently empty without the export.
+  // (They now read SearchTask::target, so they no longer depend on this record
+  // at all; it is still unconditional because input_taint() reads it.)  Only
+  // the dependency scan below is export_taint's, and that is the part the flag
+  // was justified by: it makes every branch pay, including the ones that never
+  // become a task.
   if (config_.export_taint) {
     // note_deps() is a linear fill up to label, so this is free for any label an
     // earlier call already reached -- which, labels being handed out in order, is
@@ -663,26 +666,44 @@ size_t ConcolicSession::note_branch(dfsan_label label, void *addr, uint32_t id,
       return SIZE_MAX;
     }
   }
-  traced_branches_.push_back({label, addr, id, neg_direction, false});
+  traced_branches_.push_back({label, addr, id, neg_direction, nullptr});
   return traced_branches_.size() - 1;
 }
 
+std::shared_ptr<TaskTarget>
+ConcolicSession::make_target(size_t branch_idx, void *addr, uint32_t id,
+                             bool neg_direction, uint32_t context) {
+  auto target = std::make_shared<TaskTarget>();
+  target->addr = addr;
+  target->direction = neg_direction;
+  target->id = id;
+  target->context = context;
+  target->flipped = false;
+  // SIZE_MAX means note_branch()'s dependency scan bailed and there is no
+  // record to hang this off.  The target is still handed back: a task that
+  // reaches the queue with no target at all is one next_pending_task() will
+  // solve without asking, and a dependency scan failing says nothing about
+  // whether the branch is worth solving.
+  if (branch_idx != SIZE_MAX) traced_branches_[branch_idx].target = target;
+  return target;
+}
+
 task_t ConcolicSession::next_pending_task() {
-  auto ctx = std::make_shared<BranchContext>();
   for (;;) {
     auto task = task_mgr_->get_next_task();
     if (!task) return nullptr;
 
-    // No recorded target: a task from a trace where note_deps() bailed, or one
-    // whose branch we chose not to record.  Nothing to ask about, so solve it.
-    auto itr = task_branch_.find(task.get());
-    if (itr == task_branch_.end()) return task;
-    const auto &branch = traced_branches_[itr->second];
+    // No recorded target: nobody who built this task said what it was for.
+    // Nothing to ask about, so solve it.  note_branch() now always supplies one
+    // for a task this session built, so in-tree this is only reachable for a
+    // task some other producer queued.
+    const auto &branch = task->target;
+    if (!branch) return task;
 
     // Already answered, and the fuzzer took the answer.  report_result() sets
     // this, and the sibling tasks built for the same branch are still queued
-    // behind it.
-    if (branch.flipped) {
+    // behind it -- they share the target object, which is how they see it.
+    if (branch->flipped) {
       stats_.stale_tasks += 1;
       continue;
     }
@@ -701,10 +722,7 @@ task_t ConcolicSession::next_pending_task() {
     // distinct target from iteration k-1, and a covered-bit test would refuse
     // every loop branch after the first.  The counters must not move, which is
     // why this is is_target_uncovered() and not is_branch_interesting().
-    ctx->addr = branch.addr;
-    ctx->direction = branch.neg_direction;
-    ctx->id = branch.id;
-    if (cov_mgr_->is_target_uncovered(ctx)) return task;
+    if (cov_mgr_->is_target_uncovered(branch)) return task;
     stats_.stale_tasks += 1;
   }
 }
@@ -723,13 +741,21 @@ int ConcolicSession::input_taint(uint8_t *out, size_t len) {
   // goes, so a branch the trace later took the other way answers "covered" here
   // for free, and a solved-and-accepted one is skipped outright.
   RGDAstParser::input_dep_t open(size);
+  // For a branch with no target -- one the local counter dropped, which on a
+  // libxml2 trace is most of them -- there is nothing that could have flipped
+  // it, and one reused context answers the coverage question just as well.
+  // Only a branch that got as far as a task carries its own.
   auto ctx = std::make_shared<BranchContext>();
   for (auto const& b : traced_branches_) {
-    if (b.flipped) continue;
-    ctx->addr = b.addr;
-    ctx->direction = b.neg_direction;
-    ctx->id = b.id;
-    if (!cov_mgr_->is_target_uncovered(ctx)) continue;
+    if (b.target) {
+      if (b.target->flipped) continue;
+      if (!cov_mgr_->is_target_uncovered(b.target)) continue;
+    } else {
+      ctx->addr = b.addr;
+      ctx->direction = b.neg_direction;
+      ctx->id = b.id;
+      if (!cov_mgr_->is_target_uncovered(ctx)) continue;
+    }
     (void)parser_->note_deps(b.label, open);
   }
 

@@ -25,6 +25,10 @@ struct BranchContext {
   /// Carried here rather than in a derived struct so that it survives
   /// ConcolicSession::on_cond building the negated context by assigning through
   /// a BranchContext, which would slice a derived member straight back off.
+  /// (on_cond no longer copies one context onto another -- it builds the negated
+  /// context once, in note_branch(), and hands the same object to everyone -- so
+  /// the slicing hazard is gone.  The field stays in the base because every
+  /// manager and every caller reads it, not because of the copy.)
   uint32_t id;
 };
 
@@ -43,6 +47,28 @@ struct HistoryAwareBranchContext : public BranchContext {
 struct FullBranchContext : public ContextAwareBranchContext,
                           public LoopAwareBranchContext,
                           public HistoryAwareBranchContext {
+};
+
+/// The branch a search task exists to flip -- the direction the trace did *not*
+/// take -- carried by the task itself rather than by the session.
+///
+/// It is a ContextAwareBranchContext because whether a branch is flippable is a
+/// property of (branch, calling context) and not of the branch: the same cid
+/// under a different caller is a different question.  `context` is the
+/// instrumentation's call-stack hash (TaintPass::addContextRecording XORs
+/// djbHash(function name) in on entry and restores it on return), which the
+/// runtime has always shipped in pipe_msg.context and which nothing downstream
+/// used to keep.  Nothing reads it yet; it is here so that the flip statistics
+/// this will eventually be keyed on have somewhere to come from.
+///
+/// SHARED between the sibling tasks built for one branch, by shared_ptr, which
+/// is what makes `flipped` work: report_result() marking one task's target
+/// retires the siblings still queued behind it.  It also decides the lifetime --
+/// the target outlives the trace exactly as long as some task still refers to
+/// it, which is the property a queue that outlives the trace needs.
+struct TaskTarget : public ContextAwareBranchContext {
+  /// a solution for this target came back interesting, or at least reached it
+  bool flipped;
 };
 
 class CovManager {
