@@ -295,6 +295,20 @@ struct Opt {
     #[arg(long = "symsan-no-forkserver", default_value = "false")]
     symsan_no_forkserver: bool,
 
+    /// Run every solution, including bytes the concolic stage has already
+    /// handed to the fuzzer.
+    ///
+    /// By default the stage remembers what it produced and skips a repeat: a
+    /// duplicate cannot find anything the first copy did not, and running it is
+    /// the most expensive way to establish that. Repeats are common -- the
+    /// solver ladder asks several solvers the same question, and successive
+    /// tasks over the same few bytes tend to agree.
+    ///
+    /// Pass this to measure what the dedup is worth, or if a target is
+    /// nondeterministic enough that the same bytes really can do something new.
+    #[arg(long = "symsan-no-dedup", default_value = "false")]
+    symsan_no_dedup: bool,
+
     /// Drop the input-to-state solver from the ladder. It is the cheapest rung
     /// and cracks most branches on its own, so this is for measuring what the
     /// others contribute, not for fuzzing.
@@ -547,6 +561,7 @@ pub fn main() -> Result<(), libafl::Error> {
                 .timeout_ms(opt.symsan_timeout)
                 .max_solutions_per_input(opt.symsan_budget)
                 .forkserver(!opt.symsan_no_forkserver)
+                .dedup(!opt.symsan_no_dedup)
                 .i2s(!opt.symsan_no_i2s)
                 .jigsaw(!opt.symsan_no_jigsaw)
                 .z3(opt.symsan_z3)

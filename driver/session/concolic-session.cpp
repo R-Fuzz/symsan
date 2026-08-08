@@ -582,21 +582,37 @@ int ConcolicSession::current_target(uint32_t *cid, bool *direction,
   return 0;
 }
 
-void ConcolicSession::report_result(bool interesting) {
+void ConcolicSession::report_result(bool interesting, TargetOutcome outcome) {
   if (mutation_state_ != MUTATION_IN_VALIDATION) {
     return;
   }
-  if (!interesting) {
+  if (!interesting && outcome != TargetOutcome::Reached) {
     // leave the state at MUTATION_IN_VALIDATION so that next_solution() moves
     // on to the next solver for the same task
+    //
+    // NotReached and Unknown both land here, and they are not the same
+    // statement -- NotReached is evidence the assignment was wrong, Unknown is
+    // no evidence at all.  Escalating on Unknown is the old unconditional
+    // behaviour, kept because a front-end that cannot see its own coverage has
+    // nothing better to go on and because the ladder is bounded anyway.
     return;
   }
   mutation_state_ = MUTATION_VALIDATED;
   if (cur_task_) {
     cur_task_->skip_next = true;
-    stats_.solved_branches += 1;
+    // Only an interesting solution counts as a solved branch.  Reached-but-
+    // boring retires the task, because no other solver can do better than
+    // reach the target, but it did not find anything and saying it did would
+    // make the stat useless as a measure of what the stage contributes.
+    if (interesting) {
+      stats_.solved_branches += 1;
+    }
     // the target this task was for has now been reached, so input_taint() can
     // stop calling its bytes open
+    //
+    // True on the Reached path too, and more accurately than before: a
+    // solution that flipped the branch onto already-covered ground has reached
+    // the target by any reading, and used to leave its bytes open forever.
     auto itr = task_branch_.find(cur_task_.get());
     if (itr != task_branch_.end()) {
       traced_branches_[itr->second].flipped = true;

@@ -187,6 +187,22 @@ public:
   ///         when export_taint is off, since that is what records them
   int current_target(uint32_t *cid, bool *direction, uint32_t *dest) const;
 
+  /// Whether the last solution actually took the branch it was solved for, as
+  /// distinct from whether the fuzzer found it interesting.  See
+  /// report_result().
+  enum class TargetOutcome {
+    /// No way to tell: the direction is pruned or unmapped, there is no branch
+    /// map, or the front-end simply does not check.  The conservative answer.
+    Unknown = 0,
+    /// The run took the solved-for direction, or had already covered the edge
+    /// so that taking it again would have gone unremarked.  Either way there is
+    /// no evidence this solver failed.
+    Reached,
+    /// The run did not take it, and would have been noticed if it had.  The
+    /// solver returned SAT on an AST that does not describe the program.
+    NotReached,
+  };
+
   /// Tell the session whether the last solution from next_solution() turned out
   /// to be interesting (new coverage).  If it was, the underlying branch is
   /// considered solved and no further solver is tried for it.
@@ -194,7 +210,22 @@ public:
   /// This replaces the guess driver/aflpp/symsan.cpp had to make by comparing
   /// queue-entry filenames: a front-end that can observe its own execution
   /// result (a LibAFL stage sees ExecuteInputResult directly) reports the truth.
-  void report_result(bool interesting);
+  ///
+  /// @p outcome is what makes the *un*interesting case actionable, and it is
+  /// worth the second parameter because that case is the bulk of the traffic.
+  /// "Not interesting" was read as "try the next solver on this task", which
+  /// conflates two situations: the branch did not flip -- another solver's
+  /// assignment might, so escalating is right -- and the branch flipped onto
+  /// ground that turned out to be boring, where every remaining solver will
+  /// flip the same branch to the same edge and be boring in exactly the same
+  /// way.  Measured on libxml2, the ladder returned 1.70 answers per task, and
+  /// every answer costs the front-end a full execution.  So escalation now
+  /// wants evidence of failure rather than absence of success.
+  ///
+  /// Unknown keeps the old behaviour, which is what a front-end that cannot
+  /// check should get.
+  void report_result(bool interesting,
+                     TargetOutcome outcome = TargetOutcome::Unknown);
 
   /// Hand the session a snapshot of the fuzzer's coverage map, so that a branch
   /// the fuzzer already covered is not solved again.  Only has an effect when a

@@ -513,8 +513,22 @@ symsan_status_t symsan_session_current_target(const symsan_session_t *s,
 }
 
 void symsan_session_report_result(symsan_session_t *s, int interesting) {
+  symsan_session_report_target(s, interesting, SYMSAN_TARGET_UNKNOWN);
+}
+
+void symsan_session_report_target(symsan_session_t *s, int interesting,
+                                  symsan_target_outcome_t outcome) {
   if (!s || !s->initialized) return;
-  guard_void([&] { s->session.report_result(interesting != 0); });
+  using TargetOutcome = rgd::ConcolicSession::TargetOutcome;
+  TargetOutcome o;
+  switch (outcome) {
+    case SYMSAN_TARGET_REACHED: o = TargetOutcome::Reached; break;
+    case SYMSAN_TARGET_NOT_REACHED: o = TargetOutcome::NotReached; break;
+    // Anything the caller invented is Unknown, which is the safe reading: it
+    // escalates, i.e. it does what the one-argument form always did.
+    default: o = TargetOutcome::Unknown; break;
+  }
+  guard_void([&] { s->session.report_result(interesting != 0, o); });
 }
 
 symsan_status_t symsan_session_set_coverage(symsan_session_t *s,

@@ -390,8 +390,43 @@ symsan_status_t symsan_session_current_target(const symsan_session_t *s,
  *  Reporting honestly is the point of this call: the AFL++ mutator had to guess
  *  by comparing queue-entry filenames, whereas a front-end that can see its own
  *  execution result knows.
+ *
+ *  Equivalent to symsan_session_report_target() with #SYMSAN_TARGET_UNKNOWN.
  */
 void symsan_session_report_result(symsan_session_t *s, int interesting);
+
+/** Whether the solution took the branch it was solved for.  Matches
+ *  rgd::ConcolicSession::TargetOutcome. */
+typedef enum {
+  /** No way to tell -- pruned or unmapped direction, no branch map, or a
+   *  front-end that does not check.  The conservative answer. */
+  SYMSAN_TARGET_UNKNOWN = 0,
+  /** The run took the solved-for direction, or the edge was already covered so
+   *  that taking it again would have gone unremarked.  Either way there is no
+   *  evidence this solver failed. */
+  SYMSAN_TARGET_REACHED = 1,
+  /** The run did not take it, and would have been noticed if it had. */
+  SYMSAN_TARGET_NOT_REACHED = 2,
+} symsan_target_outcome_t;
+
+/** symsan_session_report_result() plus what symsan_session_current_target()
+ *  was for: whether the solution actually reached its target.
+ *
+ *  The extra argument is what makes an *un*interesting solution actionable,
+ *  and that is the bulk of the traffic.  "Not interesting" used to mean "try
+ *  the next solver on this task", which conflates two situations: the branch
+ *  did not flip -- another solver's assignment might, so escalating is right --
+ *  and the branch flipped onto ground that turned out to be boring, where
+ *  every remaining solver will flip the same branch to the same edge and be
+ *  boring in exactly the same way.  Measured on libxml2 the ladder returned
+ *  1.70 answers per task, and every answer costs the caller a full execution.
+ *
+ *  So #SYMSAN_TARGET_REACHED retires the task even when @p interesting is 0.
+ *  #SYMSAN_TARGET_NOT_REACHED and #SYMSAN_TARGET_UNKNOWN both escalate; they
+ *  are not the same statement, but only the first is evidence of anything.
+ */
+void symsan_session_report_target(symsan_session_t *s, int interesting,
+                                  symsan_target_outcome_t outcome);
 
 /** Give the session a snapshot of the fuzzer's coverage map, so that it stops
  *  solving for branches the fuzzer has already reached.

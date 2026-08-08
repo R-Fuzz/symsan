@@ -693,6 +693,28 @@ pub enum TargetEdge {
     Unmapped,
 }
 
+/// Whether a solution took the branch it was solved for -- see
+/// [`Session::report_target`].
+///
+/// Distinct from "was it interesting", which is about coverage anywhere in the
+/// run.  This is about the one edge the task named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TargetOutcome {
+    /// No way to tell: the direction is [`Pruned`](TargetEdge::Pruned) or
+    /// [`Unmapped`](TargetEdge::Unmapped), there is no branch map, or the
+    /// caller does not check.  Escalates, as reporting nothing always did.
+    #[default]
+    Unknown,
+    /// The run took the solved-for direction, or the edge was already covered
+    /// so that taking it again would have gone unremarked.  Either way there
+    /// is no evidence this solver failed, so the task is retired.
+    Reached,
+    /// The run did not take it, and would have been noticed if it had -- the
+    /// solver returned SAT on an AST that does not describe the program.  The
+    /// one case where another solver is worth a try.
+    NotReached,
+}
+
 /// The branch a solution was solved for -- see [`Session::current_target`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Target {
@@ -924,9 +946,36 @@ impl Session {
     /// whereas a stage sees its own `ExecuteInputResult` and can just say.
     ///
     /// Not reporting at all is equivalent to reporting `false`.
+    ///
+    /// Equivalent to [`report_target`](Session::report_target) with
+    /// [`TargetOutcome::Unknown`].
     pub fn report_result(&mut self, interesting: bool) {
+        self.report_target(interesting, TargetOutcome::Unknown);
+    }
+
+    /// [`report_result`](Session::report_result), plus whether the solution
+    /// actually took the branch it was solved for.
+    ///
+    /// The second answer is what makes an *un*interesting solution actionable,
+    /// and that is nearly all of them. "Not interesting" alone conflates the
+    /// branch not flipping -- where another solver's assignment might do
+    /// better -- with it flipping onto ground that turned out to be boring,
+    /// where every remaining solver will flip the same branch to the same edge
+    /// and be boring in exactly the same way. Measured on libxml2 the ladder
+    /// returned 1.70 answers per task, and every answer costs a full
+    /// execution.
+    ///
+    /// [`Reached`](TargetOutcome::Reached) therefore retires the task even
+    /// when `interesting` is false.
+    pub fn report_target(&mut self, interesting: bool, outcome: TargetOutcome) {
+        use sys::symsan_target_outcome_t as Outcome;
+        let raw = match outcome {
+            TargetOutcome::Unknown => Outcome::SYMSAN_TARGET_UNKNOWN,
+            TargetOutcome::Reached => Outcome::SYMSAN_TARGET_REACHED,
+            TargetOutcome::NotReached => Outcome::SYMSAN_TARGET_NOT_REACHED,
+        };
         // SAFETY: valid handle; the call cannot fail.
-        unsafe { sys::symsan_session_report_result(self.raw.as_ptr(), interesting.into()) }
+        unsafe { sys::symsan_session_report_target(self.raw.as_ptr(), interesting.into(), raw) }
     }
 
     /// Hand the session a snapshot of the fuzzer's coverage map, so it stops

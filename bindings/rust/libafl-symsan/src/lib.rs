@@ -85,7 +85,7 @@ use libafl::{
     events::{Event, EventFirer, EventWithStats},
     executors::{Executor, HasObservers},
     feedbacks::{MapFeedbackMetadata, MapIndexesMetadata},
-    fuzzer::{Evaluator, ExecuteInputResult},
+    fuzzer::{BloomInputFilter, Evaluator, ExecuteInputResult, InputFilter},
     inputs::{BytesInput, HasMutatorBytes},
     monitors::stats::{AggregatorOps, UserStats, UserStatsValue},
     observers::ObserversTuple,
@@ -99,7 +99,9 @@ use libafl_bolts::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use symsan::{Config, JoinReport, Session, Stats, TaintClass, Target, TargetEdge};
+pub use symsan::{
+    Config, JoinReport, Session, Stats, TaintClass, Target, TargetEdge, TargetOutcome,
+};
 
 /// Default name, used to key the stage's restart metadata in the state.
 pub const SYMSAN_STAGE_NAME: &str = "symsan";
@@ -156,6 +158,7 @@ pub struct SymSanStageBuilder {
     forkserver: bool,
     cmplog_filter: bool,
     flip_log: Option<PathBuf>,
+    dedup: bool,
 }
 
 impl SymSanStageBuilder {
@@ -177,6 +180,10 @@ impl SymSanStageBuilder {
             // spends a good fraction of its wall clock on process setup, and
             // the fallback when a target cannot be served this way is silent.
             forkserver: true,
+            // Re-running bytes we have already handed over cannot find
+            // anything, and a target execution is the most expensive way to
+            // learn that.
+            dedup: true,
             ..Default::default()
         }
     }
@@ -343,6 +350,21 @@ impl SymSanStageBuilder {
     #[must_use]
     pub fn max_solutions_per_input(mut self, n: usize) -> Self {
         self.max_solutions_per_input = n;
+        self
+    }
+
+    /// Skip a solution this stage has already handed to the fuzzer. On by
+    /// default.
+    ///
+    /// The ladder can return the same bytes from two different solvers for the
+    /// same task -- a single-byte equality has one answer -- and two tasks can
+    /// agree by accident. Running it again cannot produce a finding the first
+    /// run did not, and a full target execution is the most expensive possible
+    /// way to establish that. Off gives the honest baseline to measure it
+    /// against.
+    #[must_use]
+    pub fn dedup(mut self, on: bool) -> Self {
+        self.dedup = on;
         self
     }
 
@@ -518,7 +540,7 @@ impl SymSanStageBuilder {
             published_coverage: None,
             // Not `(0, 0, 0)`: a session that queues nothing at all should
             // still say so once, rather than leave the field missing.
-            published_stats: (u64::MAX, u64::MAX, u64::MAX),
+            published_stats: (u64::MAX, u64::MAX, u64::MAX, u64::MAX),
             validate_coverage: self.validate_coverage,
             validate_warned: false,
             join: JoinReport::default(),
@@ -527,7 +549,13 @@ impl SymSanStageBuilder {
             solved: 0,
             cmplog_filter: self.cmplog_filter,
             flip_log,
-            flips: [0; 4],
+            flips: [0; 5],
+            // 10M expected items at a 1e-4 false-positive rate, ~24 MB. A false
+            // positive drops a solution that was in fact new; at that rate, and
+            // against a measured 0.38% of solutions being interesting, it costs
+            // well under one finding per ten million.
+            seen: self.dedup.then(|| BloomInputFilter::new(10_000_000, 1e-4)),
+            duplicates: 0,
         })
     }
 }
@@ -577,10 +605,10 @@ pub struct SymSanStage {
     /// through, so `publish_coverage` can tell a moved buffer from a settled
     /// one. `usize` rather than `*const u8` only so the stage stays `Send`.
     published_coverage: Option<(usize, usize)>,
-    /// The `(queued, solved, stale)` triple last sent to the monitor, so the
-    /// stage only fires an event when one of them moved. Without that it would
-    /// reprint the whole monitor line once per corpus entry.
-    published_stats: (u64, u64, u64),
+    /// The `(queued, solved, stale, duplicate)` tuple last sent to the monitor,
+    /// so the stage only fires an event when one of them moved. Without that it
+    /// would reprint the whole monitor line once per corpus entry.
+    published_stats: (u64, u64, u64, u64),
     /// Audit the branch map against each entry's tracked edge indices. See
     /// [`SymSanStageBuilder::validate_coverage`].
     validate_coverage: bool,
@@ -601,7 +629,20 @@ pub struct SymSanStage {
     /// [`SymSanStageBuilder::flip_log`].
     flip_log: Option<File>,
     /// Flip outcomes so far, indexed by [`Flip`] as `usize`.
-    flips: [u64; 4],
+    flips: [u64; 5],
+    /// Solutions this stage has already handed to the fuzzer, so an identical
+    /// one is not run twice. `None` disables the check.
+    ///
+    /// Ours rather than the fuzzer's own input filter, which
+    /// [`StdFuzzer::new`](libafl::fuzzer::StdFuzzer::new) leaves as
+    /// `NopInputFilter` anyway: a filtered `evaluate_filtered` returns
+    /// `(ExecuteInputResult::None, None)`, which at this call site is
+    /// indistinguishable from "ran and was boring". Every duplicate would then
+    /// be logged as a `missed` flip and reported to the session as a failed
+    /// solve, which is the opposite of what we know about it.
+    seen: Option<BloomInputFilter>,
+    /// Solutions skipped by `seen`.
+    duplicates: u64,
 }
 
 /// What became of the branch a solution was solved for.
@@ -621,8 +662,16 @@ pub enum Flip {
     /// would have gone unremarked. No conclusion either way.
     AlreadyCovered = 2,
     /// No edge to look for: the direction is pruned or unmapped, the branch map
-    /// is absent, or the input was filtered out before it ever ran.
+    /// is absent, or the input crashed and left no corpus entry to read an edge
+    /// set off. (It used to also cover an input the fuzzer's filter dropped
+    /// before it ran; that is `Duplicate` now, and it is this stage that drops
+    /// it.)
     Unknown = 3,
+    /// A solution the stage had already handed to the fuzzer, so it was not run
+    /// a second time. Says nothing about the branch -- it is here so the log
+    /// stays a complete census of solutions rather than of executions, which
+    /// are no longer the same count.
+    Duplicate = 4,
 }
 
 impl SymSanStage {
@@ -638,7 +687,11 @@ impl SymSanStage {
         self.session.stats()
     }
 
-    /// How many solved inputs this stage has handed to the fuzzer.
+    /// How many solved inputs the solvers produced for this stage.
+    ///
+    /// Counts every answer, including the ones [`duplicates`](Self::duplicates)
+    /// then withheld, so `solutions - duplicates` is what the fuzzer actually
+    /// ran. The two used to be the same number.
     #[must_use]
     pub fn solutions(&self) -> u64 {
         self.solutions
@@ -684,13 +737,22 @@ impl SymSanStage {
 
     /// How many solutions fell into each [`Flip`] class.
     ///
-    /// All zero unless [`SymSanStageBuilder::flip_log`] is set. `Flipped`
-    /// against `Flipped + Missed` is the rate worth quoting -- the other two
-    /// classes are "could not tell", and folding them in would make the number
-    /// move with how much of the map is already covered.
+    /// `Flipped` against `Flipped + Missed` is the rate worth quoting -- the
+    /// other classes are "could not tell", and folding them in would make the
+    /// number move with how much of the map is already covered.
+    ///
+    /// Counted whether or not [`SymSanStageBuilder::flip_log`] is set: the
+    /// verdict now decides whether the solver ladder escalates, so it is
+    /// computed on every solution and the log is only where it is *written*.
     #[must_use]
-    pub fn flips(&self) -> [u64; 4] {
+    pub fn flips(&self) -> [u64; 5] {
         self.flips
+    }
+
+    /// Solutions skipped because this stage had already produced them.
+    #[must_use]
+    pub fn duplicates(&self) -> u64 {
+        self.duplicates
     }
 
     /// Point the session at the fuzzer's history map, re-publishing it if the
@@ -780,18 +842,29 @@ impl SymSanStage {
     /// targets really are all still open or the coverage behind the re-ask is
     /// not the fuzzer's, and there is no other way to tell those apart from
     /// outside the process.
+    ///
+    /// `duplicate` is the stage's own counter rather than the session's: it
+    /// counts solutions never run, and it is the only outside view of what the
+    /// dedup is doing. A campaign where it dwarfs the other three is one where
+    /// the solvers keep re-deriving the same answer, which is a solving
+    /// question rather than a fuzzing one.
     fn publish_solver_stats<EM, S>(&mut self, state: &mut S, manager: &mut EM) -> Result<(), Error>
     where
         S: HasExecutions,
         EM: EventFirer<BytesInput, S>,
     {
         let stats = self.session.stats();
-        let current = (stats.total_tasks, stats.solved_tasks, stats.stale_tasks);
+        let current = (
+            stats.total_tasks,
+            stats.solved_tasks,
+            stats.stale_tasks,
+            self.duplicates,
+        );
         if current == self.published_stats {
             return Ok(());
         }
         self.published_stats = current;
-        let (queued, solved, stale) = current;
+        let (queued, solved, stale, duplicate) = current;
         let executions = *state.executions();
         manager.fire(
             state,
@@ -800,7 +873,8 @@ impl SymSanStage {
                     name: Cow::Borrowed("symsan_tasks"),
                     value: UserStats::new(
                         UserStatsValue::String(Cow::Owned(format!(
-                            "{queued} queued, {solved} solved, {stale} dropped stale"
+                            "{queued} queued, {solved} solved, {stale} dropped stale, \
+                             {duplicate} duplicate"
                         ))),
                         AggregatorOps::None,
                     ),
@@ -906,6 +980,7 @@ impl SymSanStage {
             Flip::Missed => "missed",
             Flip::AlreadyCovered => "already-covered",
             Flip::Unknown => "unknown",
+            Flip::Duplicate => "duplicate",
         };
         let _ = writeln!(
             log,
@@ -1130,13 +1205,13 @@ where
                 produced += 1;
 
                 // Before the run, while the solution is still outstanding:
-                // report_result() below retires the task, and after that the
+                // report_target() below retires the task, and after that the
                 // session no longer knows what this input was for.
-                let target = if self.flip_log.is_some() {
-                    self.session.current_target()
-                } else {
-                    None
-                };
+                //
+                // Read whether or not there is a flip log to write it to: the
+                // verdict is now what decides whether the solver ladder
+                // escalates, so it is not a measurement any more.
+                let target = self.session.current_target();
                 // Whether the edge we are about to look for was *already*
                 // covered. Has to be read before the run, because the run is
                 // what would add it -- and if it was already there, finding it
@@ -1146,13 +1221,44 @@ where
                     _ => None,
                 });
 
+                let input = BytesInput::new(solution);
+
+                // Bytes this stage has already handed over cannot teach the
+                // fuzzer anything the second time, and a target execution is
+                // the most expensive way to find that out. Different solvers
+                // asked the same question tend to answer it the same way, and
+                // so do different tasks over the same few bytes, so this is
+                // not a rare case.
+                //
+                // Not evidence about the branch either way -- the run that
+                // would have produced the evidence did not happen -- so the
+                // task escalates exactly as if this solution had failed to
+                // decide anything.
+                if let Some(seen) = self.seen.as_mut() {
+                    if !seen.should_execute(&input, state, manager)? {
+                        self.duplicates += 1;
+                        if let Some(target) = target {
+                            self.flips[Flip::Duplicate as usize] += 1;
+                            self.record_flip(target, Flip::Duplicate);
+                        }
+                        self.session.report_target(false, TargetOutcome::Unknown);
+                        continue;
+                    }
+                }
+
                 // Hand the solved input to the fuzzer exactly as a mutational
                 // stage would: it runs it on the *coverage-instrumented* build,
                 // applies the feedbacks, and adds it to the corpus if it is
-                // interesting. `evaluate_filtered` honours the fuzzer's input
-                // filter, so an input we have already seen is not re-run.
-                let (result, added) =
-                    fuzzer.evaluate_filtered(state, executor, manager, &BytesInput::new(solution))?;
+                // interesting.
+                //
+                // `evaluate_filtered` honours the *fuzzer's* input filter,
+                // which for `StdFuzzer::new` is `NopInputFilter` -- it filters
+                // nothing. That is why the dedup above is here rather than left
+                // to the fuzzer: a filtered call returns `(None, None)`, which
+                // at this call site is indistinguishable from "ran and was
+                // boring", and every duplicate would be scored as a missed flip
+                // and reported as a failed solve.
+                let (result, added) = fuzzer.evaluate_filtered(state, executor, manager, &input)?;
 
                 // That run just moved the fuzzer's history map, and may have
                 // reallocated it. The session reads it in place, so re-check
@@ -1164,14 +1270,31 @@ where
                     self.solved += 1;
                 }
 
+                // What the run said about the *branch*, which is a different
+                // question from what the fuzzer's feedbacks said about the
+                // input, and the one escalation should turn on. Only `Missed`
+                // is evidence the assignment did not do what the solver claimed
+                // it would; a branch that flipped onto ground somebody else had
+                // already covered is not going to be flipped any harder by the
+                // next solver in the ladder.
+                let mut outcome = TargetOutcome::Unknown;
                 if let Some(target) = target {
                     let flip = self.judge_flip(state, target, was_covered, result, added);
                     self.flips[flip as usize] += 1;
                     self.record_flip(target, flip);
+                    outcome = match flip {
+                        Flip::Flipped | Flip::AlreadyCovered => TargetOutcome::Reached,
+                        Flip::Missed => TargetOutcome::NotReached,
+                        // No branch map, a pruned direction, or a crash with no
+                        // corpus entry to read the edge set off. Escalates, as
+                        // it always did.
+                        Flip::Unknown | Flip::Duplicate => TargetOutcome::Unknown,
+                    };
                 }
-                // The honest answer. `false` makes the session escalate this
-                // task to the next solver in the ladder; `true` retires it.
-                self.session.report_result(interesting);
+                // The honest answer. Anything short of `Reached` and
+                // uninteresting makes the session escalate this task to the
+                // next solver in the ladder.
+                self.session.report_target(interesting, outcome);
 
                 if self.max_solutions_per_input != 0 && produced >= self.max_solutions_per_input {
                     log::debug!(
