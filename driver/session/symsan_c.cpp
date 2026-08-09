@@ -705,6 +705,7 @@ symsan_status_t symsan_session_stats(const symsan_session_t *s,
     out->solver_sat[i] = st.solver_sat[i];
     out->solver_declined[i] = st.solver_declined[i];
     out->solver_unsat[i] = st.solver_unsat[i];
+    out->solver_retired[i] = st.solver_retired[i];
   }
   out->solved_branches = st.solved_branches;
   out->mapped_branches = st.mapped_branches;

@@ -625,6 +625,13 @@ typedef struct {
   uint64_t solver_sat[3];
   uint64_t solver_declined[3];
   uint64_t solver_unsat[3];
+  /** the subset of `sat` that RETIRED the task, i.e. the front-end reported the
+   *  answer back as interesting or as having reached the target.  sat says the
+   *  rung answered; this says the answer was kept.  sat - retired escalated to
+   *  the next rung after satisfying the recorded constraints without reaching a
+   *  target the queue had just re-checked as uncovered.  Not derivable from the
+   *  call counts for the LAST rung, which is the one it exists for */
+  uint64_t solver_retired[3];
   uint64_t solved_branches;
   /** branch directions the branch map could and could not resolve to fuzzer
    *  edge ids; both 0 when no branch map is in use */

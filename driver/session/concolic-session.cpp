@@ -718,6 +718,15 @@ void ConcolicSession::report_result(bool interesting, TargetOutcome outcome) {
   mutation_state_ = MUTATION_VALIDATED;
   if (cur_task_) {
     cur_task_->skip_next = true;
+    // Credit the rung that produced the answer, which is the one the task is
+    // still sitting on -- next_solution() only advances solver_index when it
+    // comes back here and finds the state unchanged.  Counted for Reached-but-
+    // boring as well as for interesting, because both retire the task and the
+    // question this answers is "did asking rung j finish the job", not "did it
+    // find something new"; solved_branches below is the narrower one.
+    if (cur_task_->solver_index < ConcolicStats::kMaxSolvers) {
+      stats_.solver_retired[cur_task_->solver_index] += 1;
+    }
     // Only an interesting solution counts as a solved branch.  Reached-but-
     // boring retires the task, because no other solver can do better than
     // reach the target, but it did not find anything and saying it did would
@@ -938,7 +947,10 @@ void ConcolicSession::print_stats(int fd) const {
   // everything that was none of those -- a search that ran out of budget, or an
   // error -- and it is the expensive column.  UNSAT is broken out of it because
   // it is a complete answer arrived at cheaply, which is the opposite of a
-  // timeout in both respects.
+  // timeout in both respects.  `retired` is the one that says the asking was
+  // worth it: sat counts answers, retired counts answers the fuzzer kept, and
+  // sat - retired is what escalated to the next rung having satisfied the
+  // recorded constraints without reaching the target.
   for (size_t i = 0; i < solvers_.size() && i < ConcolicStats::kMaxSolvers; ++i) {
     const uint64_t n = stats_.solver_calls[i];
     if (!n) continue;
@@ -946,11 +958,12 @@ void ConcolicSession::print_stats(int fd) const {
     const uint64_t uns = stats_.solver_unsat[i];
     dprintf(fd,
             "Solver %zu (%s): %lu calls, %lu us total, %.1f us/call, "
-            "%lu sat, %lu unsat, %lu declined, %lu other\n",
+            "%lu sat (%lu retired), %lu unsat, %lu declined, %lu other\n",
             i, solvers_[i]->name(), (unsigned long)n,
             (unsigned long)stats_.solver_usecs[i],
             (double)stats_.solver_usecs[i] / (double)n,
-            (unsigned long)sat, (unsigned long)uns, (unsigned long)dec,
+            (unsigned long)sat, (unsigned long)stats_.solver_retired[i],
+            (unsigned long)uns, (unsigned long)dec,
             (unsigned long)(n - sat - uns - dec));
   }
   dprintf(fd, "Task size distribution:\n");

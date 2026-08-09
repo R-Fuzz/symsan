@@ -762,6 +762,16 @@ pub struct Stats {
     /// the opposite on both counts. Together in one number, a shift from
     /// expensive failures to cheap answers is invisible.
     pub solver_unsat: [u64; 3],
+    /// Of the [`solver_sat`](Stats::solver_sat) answers, the ones the front-end
+    /// kept -- reported back as interesting, or as having reached the target.
+    ///
+    /// `sat` says a rung answered; this says the answer was worth something.
+    /// The gap between them is what escalated: an assignment that satisfied the
+    /// recorded constraints and did not reach a target the queue had just
+    /// re-checked as uncovered. For every rung but the last that gap is also
+    /// `calls[j] - calls[j+1]`; for the last rung there is no next call count to
+    /// difference against, which is why this counter exists.
+    pub solver_retired: [u64; 3],
     /// Branches a solution actually flipped, as reported by the front-end
     /// through [`Session::report_result`].
     pub solved_branches: u64,
@@ -1306,6 +1316,7 @@ impl Session {
             solver_sat: [0; 3],
             solver_declined: [0; 3],
             solver_unsat: [0; 3],
+            solver_retired: [0; 3],
             solved_branches: 0,
             mapped_branches: 0,
             unmapped_branches: 0,
@@ -1327,6 +1338,7 @@ impl Session {
             solver_sat: raw.solver_sat,
             solver_declined: raw.solver_declined,
             solver_unsat: raw.solver_unsat,
+            solver_retired: raw.solver_retired,
             solved_branches: raw.solved_branches,
             mapped_branches: raw.mapped_branches,
             unmapped_branches: raw.unmapped_branches,

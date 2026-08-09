@@ -1006,11 +1006,19 @@ impl SymSanStage {
             String::new()
         };
         // What each rung of the ladder cost and what it bought, as
-        // `name calls@us/call sat/unsat/declined/other`, where other is the
-        // residual: a search that spent its whole budget, or an error. Also not
-        // in the change-detection
+        // `name calls@us/call sat(retired)/unsat/declined/other`, where other is
+        // the residual: a search that spent its whole budget, or an error. Also
+        // not in the change-detection
         // tuple, for the same reason as `novelty`: no solve happens without a
         // task, and no task is solved without `solved` or `stale` moving.
+        //
+        // `retired` is the subset of `sat` the front-end kept: sat says the rung
+        // answered, retired says the answer finished the task. sat - retired is
+        // what escalated to the next rung having satisfied the recorded
+        // constraints without reaching a target the queue re-checked as
+        // uncovered at pop time. For every rung but the last that gap is also
+        // calls[j] - calls[j+1]; the last rung has no next call count, which is
+        // the reason the counter exists at all.
         //
         // Reported per rung rather than as one solver total because the two
         // things a scheduler needs are per rung: the mean cost of asking, and
@@ -1030,8 +1038,9 @@ impl SymSanStage {
                 stats.solver_unsat[j],
                 stats.solver_declined[j],
             );
+            let ret = stats.solver_retired[j];
             solvers.push_str(&format!(
-                ", {name} {calls}@{per:.0}us {sat}/{unsat}/{dec}/{}",
+                ", {name} {calls}@{per:.0}us {sat}({ret})/{unsat}/{dec}/{}",
                 calls - sat - unsat - dec
             ));
         }

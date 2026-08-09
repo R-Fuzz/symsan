@@ -197,6 +197,17 @@ struct ConcolicStats {
   /// timeout is the most expensive thing it can return.  Lumping them made
   /// "expensive failures went up" and "cheap answers went up" the same number.
   uint64_t solver_unsat[kMaxSolvers] = {};
+  /// Tasks rung j RETIRED: it returned SAT and report_result() promoted the
+  /// answer, i.e. the fuzzer kept the input or the target was reached.  This is
+  /// the only counter that says a rung accomplished something; solver_sat says
+  /// only that it answered.  The gap between them is the whole question, because
+  /// a SAT that does not retire the task escalates, and next_pending_task() has
+  /// already established the target is still uncovered by anybody -- so the
+  /// assignment satisfied the recorded constraints and did not do what they
+  /// claimed.  Without this, `sat` on the last rung cannot be checked at all:
+  /// every other rung's retirements are recoverable as calls[j] - calls[j+1],
+  /// and the top rung has no j+1 to difference against.
+  uint64_t solver_retired[kMaxSolvers] = {};
   uint64_t solved_branches = 0;
   /// Branch directions the BranchMap could and could not resolve to fuzzer edge
   /// ids.  Both stay 0 without a map; with one, the ratio is the diagnostic for
