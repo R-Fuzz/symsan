@@ -149,6 +149,25 @@ struct ConcolicStats {
   /// anything to rank: a run whose tasks all land in one bucket is one where
   /// best-first and oldest-first are the same queue.
   uint64_t queued_novelty[3] = {0, 0, 0};
+  /// Per-solver accounting, indexed by position in the ladder -- position j is
+  /// whatever ConcolicSession::solver_name(j) says, since which solvers are
+  /// enabled is a config question.  Kept here rather than inside each Solver
+  /// because two of the three keep no counters at all (Z3Solver and I2SSolver
+  /// have empty print_stats), and because what a scheduler needs is the cost of
+  /// *a call to rung j*, measured at the one place every call goes through.
+  ///
+  /// `usecs / calls` is the cost term: what it costs, on average, to ask rung j
+  /// about a task.  The outcome split is what says whether that cost bought
+  /// anything -- a rung with a large `usecs` and a `declined` count close to its
+  /// `calls` is spending its time deciding it has nothing to say, which is a
+  /// different problem from one that searches and fails.
+  static constexpr size_t kMaxSolvers = 3;
+  uint64_t solver_calls[kMaxSolvers] = {};
+  uint64_t solver_usecs[kMaxSolvers] = {};
+  uint64_t solver_sat[kMaxSolvers] = {};
+  /// SOLVER_DECLINE: the rung did not search.  Everything else that is neither
+  /// SAT nor a decline (timeout, unsat, error) is calls - sat - declined.
+  uint64_t solver_declined[kMaxSolvers] = {};
   uint64_t solved_branches = 0;
   /// Branch directions the BranchMap could and could not resolve to fuzzer edge
   /// ids.  Both stay 0 without a map; with one, the ratio is the diagnostic for
@@ -361,6 +380,13 @@ public:
   /// Length of the solver ladder; trace() times this is the largest number of
   /// next_solution() calls that can return a buffer.
   size_t num_solvers() const { return solvers_.size(); }
+  /// Name of the solver at ladder position @p index, or nullptr past the end.
+  /// The per-position counters in ConcolicStats are unreadable without this:
+  /// position 0 is i2s in a default run and jigsaw in one started with
+  /// --symsan-no-i2s.
+  const char *solver_name(size_t index) const {
+    return index < solvers_.size() ? solvers_[index]->name() : nullptr;
+  }
 
   /// The file trace() stages inputs into, so the front-end can wire it into argv.
   const std::string &input_file() const { return config_.input_file; }

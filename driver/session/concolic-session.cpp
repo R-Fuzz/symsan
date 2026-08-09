@@ -23,6 +23,7 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <fcntl.h>
 
 using namespace __dfsan;
@@ -39,6 +40,15 @@ void warn(const char *fmt, ...) {
   fprintf(stderr, "[symsan] ");
   vfprintf(stderr, fmt, args);
   va_end(args);
+}
+
+// Microseconds, monotonic enough for a difference taken across one solve()
+// call.  Same shape as jit-solver.cpp's getTimeStamp(), which is file-static
+// there; not worth a shared header for four lines.
+uint64_t solve_timestamp_us() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
 }
 
 } // namespace
@@ -590,8 +600,20 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
     // question, not a worse-conditioned version of this one.  Falls back to the
     // current input for a task nobody labelled.
     const auto &in = cur_task_->input ? *cur_task_->input : *input_;
+    // Timed here rather than inside each solver: JITSolver is the only one that
+    // keeps its own clocks, and its three (codegen/jit/search) answer a question
+    // about jigsaw's internals, not about what a call to rung j costs the
+    // scheduler.  gettimeofday is a vDSO read, and the thing being measured
+    // takes microseconds to milliseconds.
+    const uint64_t t0 = solve_timestamp_us();
     auto ret = solver->solve(cur_task_, in.data(), in.size(),
                              output_buf_.data(), new_buf_size);
+    if (cur_solver_index_ < ConcolicStats::kMaxSolvers) {
+      stats_.solver_calls[cur_solver_index_] += 1;
+      stats_.solver_usecs[cur_solver_index_] += solve_timestamp_us() - t0;
+      if (ret == SOLVER_SAT) stats_.solver_sat[cur_solver_index_] += 1;
+      else if (ret == SOLVER_DECLINE) stats_.solver_declined[cur_solver_index_] += 1;
+    }
     if (SYMSAN_LIKELY(ret == SOLVER_SAT)) {
       mutation_state_ = MUTATION_IN_VALIDATION;
       if (config_.save_solved) {
@@ -600,8 +622,15 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
       stats_.solved_tasks += 1;
       *size = new_buf_size;
       return output_buf_.data();
-    } else if (ret == SOLVER_TIMEOUT) {
+    } else if (ret == SOLVER_TIMEOUT || ret == SOLVER_DECLINE) {
       // if not solved, move on to next stage
+      //
+      // The two share an arm here on purpose: this is the behaviour that was
+      // measured, and splitting the enum is not supposed to change it.  They
+      // are told apart one level up, by whoever decides *when* the next rung
+      // runs -- a decline says "hand this to a more capable solver, it cost
+      // nothing to learn that", a timeout says "this one searched and failed,
+      // and the next may too".  Same action, different evidence.
       mutation_state_ = MUTATION_IN_VALIDATION;
     } else if (ret == SOLVER_UNSAT) {
       // at any stage if the task is deemed unsolvable, just skip it
@@ -879,6 +908,22 @@ void ConcolicSession::print_stats(int fd) const {
       "Branch map: %lu entries, %lu mapped, %lu unmapped\n",
       (unsigned long)branch_map_->size(), (unsigned long)stats_.mapped_branches,
       (unsigned long)stats_.unmapped_branches);
+  }
+  // Per rung: what it cost to ask, and what the asking produced.  `other` is
+  // everything that was neither an answer nor a refusal -- a search that ran out
+  // of budget, an UNSAT, an error -- and it is the expensive column.
+  for (size_t i = 0; i < solvers_.size() && i < ConcolicStats::kMaxSolvers; ++i) {
+    const uint64_t n = stats_.solver_calls[i];
+    if (!n) continue;
+    const uint64_t sat = stats_.solver_sat[i], dec = stats_.solver_declined[i];
+    dprintf(fd,
+            "Solver %zu (%s): %lu calls, %lu us total, %.1f us/call, "
+            "%lu sat, %lu declined, %lu other\n",
+            i, solvers_[i]->name(), (unsigned long)n,
+            (unsigned long)stats_.solver_usecs[i],
+            (double)stats_.solver_usecs[i] / (double)n,
+            (unsigned long)sat, (unsigned long)dec,
+            (unsigned long)(n - sat - dec));
   }
   dprintf(fd, "Task size distribution:\n");
   for (auto const& kv : task_size_dist_) {

@@ -133,8 +133,13 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
   // jigsaw is integer-only; a root it cannot compile returns TIMEOUT rather
   // than ERROR so the driver advances to the next (FP-aware z3) solver --
   // ERROR sets out_buf=NULL and stops the solver chain.
+  // (Now DECLINE, which the driver treats the same way and which distinguishes
+  // this from the gd_entry() failure below.  The two used to be one code and
+  // they mean opposite things: this one is codegen refusing a shape, near-free,
+  // and it is the case where the next rung is most likely to succeed; that one
+  // is a search that spent its entire budget.)
   if (!jit_constraints(task))
-    return SOLVER_TIMEOUT;
+    return SOLVER_DECLINE;
 
   // solve the task
   start = getTimeStamp();

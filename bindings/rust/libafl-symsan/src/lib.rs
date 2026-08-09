@@ -990,6 +990,29 @@ impl SymSanStage {
         } else {
             String::new()
         };
+        // What each rung of the ladder cost and what it bought, as
+        // `name calls@us/call sat/declined`. Also not in the change-detection
+        // tuple, for the same reason as `novelty`: no solve happens without a
+        // task, and no task is solved without `solved` or `stale` moving.
+        //
+        // Reported per rung rather than as one solver total because the two
+        // things a scheduler needs are per rung: the mean cost of asking, and
+        // whether the failures were refusals (near-free, and evidence the next
+        // rung should have it) or exhausted searches (expensive, and no such
+        // evidence). One aggregate number hides both.
+        let mut solvers = String::new();
+        for j in 0..stats.solver_calls.len() {
+            let calls = stats.solver_calls[j];
+            if calls == 0 {
+                continue;
+            }
+            let name = self.session.solver_name(j).unwrap_or("?");
+            let per = stats.solver_usecs[j] as f64 / calls as f64;
+            solvers.push_str(&format!(
+                ", {name} {calls}@{per:.0}us {}/{}",
+                stats.solver_sat[j], stats.solver_declined[j]
+            ));
+        }
         let executions = *state.executions();
         manager.fire(
             state,
@@ -999,7 +1022,7 @@ impl SymSanStage {
                     value: UserStats::new(
                         UserStatsValue::String(Cow::Owned(format!(
                             "{queued} queued, {solved} solved, {stale} dropped stale, \
-                             {duplicate} duplicate{tokens}{evicted}{novelty}"
+                             {duplicate} duplicate{tokens}{evicted}{novelty}{solvers}"
                         ))),
                         AggregatorOps::None,
                     ),

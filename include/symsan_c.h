@@ -600,6 +600,16 @@ typedef struct {
    *  is the ranking one, since a FIFO does not score.  Says whether the ranking
    *  had anything to rank */
   uint64_t queued_novelty[3];
+  /** per-solver accounting, indexed by ladder position -- position j is
+   *  whatever symsan_session_solver_name(s, j) says, since which solvers are
+   *  enabled is a config question.  usecs/calls is what it costs to ask rung j
+   *  about a task; `declined` is the subset where the rung did not search at
+   *  all, and calls - sat - declined is everything else (timeout, unsat,
+   *  error), which is the expensive part */
+  uint64_t solver_calls[3];
+  uint64_t solver_usecs[3];
+  uint64_t solver_sat[3];
+  uint64_t solver_declined[3];
   uint64_t solved_branches;
   /** branch directions the branch map could and could not resolve to fuzzer
    *  edge ids; both 0 when no branch map is in use */
@@ -620,6 +630,11 @@ size_t symsan_session_num_pending_tasks(const symsan_session_t *s);
 /** Length of the solver ladder.  trace() times this bounds how many times
  *  next_solution() can return a buffer. */
 size_t symsan_session_num_solvers(const symsan_session_t *s);
+
+/** Name of the solver at ladder position @p index ("i2s", "jigsaw", "z3"), or
+ *  NULL past the end.  Static storage; not owned by the caller.  This is what
+ *  makes symsan_stats_t's per-position solver counters readable. */
+const char *symsan_session_solver_name(const symsan_session_t *s, size_t index);
 
 /** The file trace() stages inputs into, so a front-end can wire it into argv.
  *  Owned by the session; NULL before init(). */

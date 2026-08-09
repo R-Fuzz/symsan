@@ -18,6 +18,21 @@ enum solver_result_t {
   SOLVER_SAT,
   SOLVER_UNSAT,
   SOLVER_TIMEOUT,
+  /// The solver did not search: the task is outside what it handles.
+  ///
+  /// Split off from SOLVER_TIMEOUT, which the ladder used to receive for both
+  /// of a solver's failure modes and so could not tell apart.  They are
+  /// opposite signals.  A decline is near-free and is POSITIVE evidence for the
+  /// next rung -- i2s refusing a nested task, or jigsaw refusing an FP root,
+  /// says nothing about difficulty, only that a strictly more capable solver
+  /// should have it.  A timeout is a search that ran its whole budget and came
+  /// back empty; it is expensive and it is weak evidence, because the next rung
+  /// may well spend just as long failing.  A scheduler that treats them alike
+  /// either pays search cost it did not need to or skips capability it did.
+  ///
+  /// Appended rather than inserted: the value crosses the C API as an int
+  /// (symsan_c.h), so the existing four must keep their numbering.
+  SOLVER_DECLINE,
 };
 
 class Solver {
@@ -33,6 +48,11 @@ public:
                                 const uint8_t *in_buf, size_t in_size,
                                 uint8_t *out_buf, size_t &out_size) = 0;
   virtual void print_stats(int fd) = 0;
+  // A stable short name, for accounting kept by ladder position.  Which solver
+  // sits at position j depends on which ones the config enabled, so a caller
+  // that reports per-position numbers cannot name them from the flags without
+  // repeating the ladder's construction order; it asks here instead.
+  virtual const char *name() const = 0;
 };
 
 class Z3Solver : public Solver {
@@ -42,6 +62,7 @@ public:
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
   void print_stats(int fd) override {} ;
+  const char *name() const override { return "z3"; }
 private:
   z3::expr serialize_rel(uint32_t comparison,
                          const AstNode* node,
@@ -66,6 +87,7 @@ public:
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
   void print_stats(int fd) override;
+  const char *name() const override { return "jigsaw"; }
   // JIT every constraint in @p task that does not already carry a compiled
   // function, consulting (and filling) the AST-keyed function cache.  solve()
   // does this before searching; it is exposed so a driver that only wants to
@@ -98,6 +120,7 @@ public:
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
   void print_stats(int fd) override {};
+  const char *name() const override { return "i2s"; }
 private:
   uint64_t matches;
   uint64_t mismatches;

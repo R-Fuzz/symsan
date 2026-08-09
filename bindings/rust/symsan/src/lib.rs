@@ -715,6 +715,24 @@ pub struct Stats {
     /// tasks all land in one bucket is one where best-first and oldest-first
     /// are the same queue, and a measurement over it has measured nothing.
     pub queued_novelty: [u64; 3],
+    /// Calls to the solver at each ladder position, indexed the same way
+    /// [`Session::solver_name`] is. Positions past
+    /// [`Session::num_solvers`] stay zero.
+    pub solver_calls: [u64; 3],
+    /// Microseconds spent inside those calls. `usecs / calls` is what it costs
+    /// to ask rung `j` about one task -- the number a scheduler needs if it is
+    /// going to weigh a task's value against what answering it will cost.
+    pub solver_usecs: [u64; 3],
+    /// Of those calls, the ones that produced an assignment.
+    pub solver_sat: [u64; 3],
+    /// Of those calls, the ones where the rung did not search at all because
+    /// the task was outside what it handles.
+    ///
+    /// The interesting quantity is `calls - sat - declined`: a search that ran
+    /// its whole budget and came back empty, an UNSAT, or an error. Declines
+    /// are near-free and say the next rung should have the task; the rest are
+    /// what a rung's time is actually spent on.
+    pub solver_declined: [u64; 3],
     /// Branches a solution actually flipped, as reported by the front-end
     /// through [`Session::report_result`].
     pub solved_branches: u64,
@@ -1254,6 +1272,10 @@ impl Session {
             stale_tasks: 0,
             evicted_tasks: 0,
             queued_novelty: [0; 3],
+            solver_calls: [0; 3],
+            solver_usecs: [0; 3],
+            solver_sat: [0; 3],
+            solver_declined: [0; 3],
             solved_branches: 0,
             mapped_branches: 0,
             unmapped_branches: 0,
@@ -1270,6 +1292,10 @@ impl Session {
             stale_tasks: raw.stale_tasks,
             evicted_tasks: raw.evicted_tasks,
             queued_novelty: raw.queued_novelty,
+            solver_calls: raw.solver_calls,
+            solver_usecs: raw.solver_usecs,
+            solver_sat: raw.solver_sat,
+            solver_declined: raw.solver_declined,
             solved_branches: raw.solved_branches,
             mapped_branches: raw.mapped_branches,
             unmapped_branches: raw.unmapped_branches,
@@ -1295,6 +1321,21 @@ impl Session {
     pub fn num_solvers(&self) -> usize {
         // SAFETY: valid handle.
         unsafe { sys::symsan_session_num_solvers(self.raw.as_ptr()) }
+    }
+
+    /// Name of the solver at ladder position `index`, or `None` past the end.
+    ///
+    /// The per-position arrays in [`Stats`] cannot be read without this: which
+    /// solver sits where depends on which ones the config enabled, so position
+    /// 0 is `i2s` in a default run and `jigsaw` in one built without it.
+    pub fn solver_name(&self, index: usize) -> Option<&'static str> {
+        // SAFETY: valid handle; the returned pointer is a string literal in the
+        // C++ solver, so it outlives everything here and is never freed.
+        let p = unsafe { sys::symsan_session_solver_name(self.raw.as_ptr(), index) };
+        if p.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(p) }.to_str().ok()
     }
 
     /// The scratch file [`trace`](Session::trace) stages inputs into.

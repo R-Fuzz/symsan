@@ -430,6 +430,11 @@ struct Counters {
   uint64_t unresolved_nested = 0, non_relational = 0, lower_failed = 0;
   uint64_t malformed = 0;
   uint64_t sat = 0, unsat = 0, timeout = 0, error = 0, jit_failed = 0;
+  // codegen refused the task outright, as opposed to `timeout`, where gradient
+  // descent ran its whole budget and came back empty.  In --solve mode this is
+  // the same population --jit-only counts as jit_failed, and it is the cheap
+  // half: it costs a walk of the AST, not MAX_EXEC_TIMES evaluations.
+  uint64_t declined = 0;
   uint64_t lower_reason[LF_MAX] = {};
   // kinds seen on a lowering failure, so an unsupported op shows up by name
   // rather than as a count
@@ -570,6 +575,7 @@ private:
       case SOLVER_SAT: n_.sat++; break;
       case SOLVER_UNSAT: n_.unsat++; break;
       case SOLVER_TIMEOUT: n_.timeout++; break;
+      case SOLVER_DECLINE: n_.declined++; break;
       default: n_.error++; break;
     }
   }
@@ -678,8 +684,8 @@ int main(int argc, char **argv) {
     }
   }
   if (opt.solve) {
-    printf("solve: sat %lu unsat %lu timeout %lu error %lu\n",
-           n.sat, n.unsat, n.timeout, n.error);
+    printf("solve: sat %lu unsat %lu timeout %lu declined %lu error %lu\n",
+           n.sat, n.unsat, n.timeout, n.declined, n.error);
   } else {
     printf("jit: %lu tasks rejected by codegen\n", n.jit_failed);
   }

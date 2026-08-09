@@ -302,8 +302,14 @@ symsan_solver_result_t symsan_rgd_solve_task(symsan_rgd_t *rgd, uint64_t task_id
       } else if (ret == rgd::SOLVER_UNSAT) {
         return SYMSAN_SOLVER_UNSAT;
       }
-      last = (ret == rgd::SOLVER_TIMEOUT) ? SYMSAN_SOLVER_TIMEOUT
-                                          : SYMSAN_SOLVER_ERROR;
+      // A decline folds into TIMEOUT here rather than getting a code of its
+      // own: symsan_solver_result_t's four values are ABI (the Rust bindings
+      // are generated from them), and the distinction only matters to whoever
+      // schedules the next rung -- which, on this entry point, is this loop,
+      // and it already tries them all.  ERROR would be a lie: nothing failed.
+      last = (ret == rgd::SOLVER_TIMEOUT || ret == rgd::SOLVER_DECLINE)
+                 ? SYMSAN_SOLVER_TIMEOUT
+                 : SYMSAN_SOLVER_ERROR;
     }
     return last;
   });
@@ -687,6 +693,15 @@ symsan_status_t symsan_session_stats(const symsan_session_t *s,
   out->evicted_tasks = st.evicted_tasks;
   for (int i = 0; i < rgd::kTargetNoveltyCount; i++)
     out->queued_novelty[i] = st.queued_novelty[i];
+  static_assert(rgd::ConcolicStats::kMaxSolvers ==
+                    sizeof(out->solver_calls) / sizeof(out->solver_calls[0]),
+                "symsan_stats_t solver arrays must match ConcolicStats");
+  for (size_t i = 0; i < rgd::ConcolicStats::kMaxSolvers; i++) {
+    out->solver_calls[i] = st.solver_calls[i];
+    out->solver_usecs[i] = st.solver_usecs[i];
+    out->solver_sat[i] = st.solver_sat[i];
+    out->solver_declined[i] = st.solver_declined[i];
+  }
   out->solved_branches = st.solved_branches;
   out->mapped_branches = st.mapped_branches;
   out->unmapped_branches = st.unmapped_branches;
@@ -706,6 +721,11 @@ size_t symsan_session_num_pending_tasks(const symsan_session_t *s) {
 size_t symsan_session_num_solvers(const symsan_session_t *s) {
   if (!s || !s->initialized) return 0;
   return s->session.num_solvers();
+}
+
+const char *symsan_session_solver_name(const symsan_session_t *s, size_t index) {
+  if (!s || !s->initialized) return nullptr;
+  return s->session.solver_name(index);
 }
 
 const char *symsan_session_input_file(const symsan_session_t *s) {

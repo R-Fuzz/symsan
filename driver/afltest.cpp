@@ -343,7 +343,10 @@ static void solve_task(rgd::task_t task, void *addr) {
       AOUT("task not solvable @%p\n", addr);
       return;
     }
-    // SOLVER_TIMEOUT / SOLVER_ERROR: fall through to the next solver
+    // SOLVER_TIMEOUT / SOLVER_DECLINE / SOLVER_ERROR: fall through to the next
+    // solver.  This driver tries the whole ladder unconditionally, so it has no
+    // use for the timeout-vs-decline split; the scheduler in
+    // ConcolicSession does.
   }
   AOUT("task not solved @%p\n", addr);
 }

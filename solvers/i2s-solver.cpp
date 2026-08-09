@@ -3505,9 +3505,11 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
   // SOLVER_TIMEOUT rather than SOLVER_UNSAT: UNSAT sets skip_next and drops the
   // task outright (ConcolicSession::next_solution), which would deny z3 the shot
   // this decline exists to hand it.
+  // (Now SOLVER_DECLINE, which says the same thing to the ladder and says it
+  // more precisely -- see the normalization at the bottom of this function.)
   if (task->base_task != nullptr) {
     DEBUGF("i2s: decline nested task\n");
-    return SOLVER_TIMEOUT;
+    return SOLVER_DECLINE;
   }
 
   solver_result_t ret = SOLVER_TIMEOUT;
@@ -3591,5 +3593,11 @@ I2SSolver::solve(std::shared_ptr<SearchTask> task,
     }
   }
 
-  return ret;
+  // Normalize at the funnel rather than at each of the ~60 internal exits.
+  // Every one of those is a shape test -- wrong node kind, wrong width, an op
+  // i2s cannot invert -- and i2s runs no search at all, so its only two honest
+  // answers are "here is the assignment" and "not my kind of task".  Rewriting
+  // each site would churn the comments that say WHY each shape is refused,
+  // which are the useful part; one conversion here says the same thing once.
+  return ret == SOLVER_SAT ? SOLVER_SAT : SOLVER_DECLINE;
 }
