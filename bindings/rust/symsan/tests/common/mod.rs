@@ -17,11 +17,17 @@
 //!
 //! A `common/mod.rs` rather than a `common.rs`, so cargo treats it as a module
 //! of each test binary and not as a test binary of its own.
+//!
+//! [`drive_ladder`] is here for a different reason: it is a whole scenario, not
+//! a build recipe, and it lives here because the two tests that run it differ
+//! only in one config flag and cannot share a process.
 
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use symsan::{Config, Session, Stats};
 
 /// Where AFL++ is told to start numbering edges: `symsan::AFL_ID_BASE`
 /// (`include/branch_id.h`). Everything below it is reserved for the branch ids
@@ -180,6 +186,33 @@ pub fn build(afl_clang_lto: &Path, out_dir: &Path, source: &Path, stem: &str, cf
     Target { afl, symsan, bmap }
 }
 
+/// Build @p source the concolic way only, with `ko-clang`.
+///
+/// No coverage arm and no branch map, so no AFL++ -- for tests that ask about
+/// the session's own bookkeeping (which rung ran, what it answered) rather than
+/// about what the fuzzer covered. [`build`] above is the one to use whenever
+/// the answer depends on an edge id.
+pub fn build_symsan(out_dir: &Path, source: &Path, stem: &str, cflags: &[&str]) -> PathBuf {
+    let out = out_dir.join(format!("{stem}.fg"));
+    let ko_clang = Path::new(symsan::BUILD_DIR).join("bin/ko-clang");
+    assert!(
+        ko_clang.is_file(),
+        "{} is missing; run `cd b4 && make -j && make install` first",
+        ko_clang.display()
+    );
+    run(
+        "ko-clang",
+        Command::new(&ko_clang)
+            .env("KO_CC", "clang-18")
+            .env("KO_USE_FASTGEN", "1")
+            .args(cflags)
+            .arg(source)
+            .arg("-o")
+            .arg(&out),
+    );
+    out
+}
+
 /// Build @p source with plain clang, as an oracle: run it on a solution and its
 /// exit code says how far the input got.
 pub fn build_oracle(out_dir: &Path, source: &Path, stem: &str) -> PathBuf {
@@ -199,4 +232,71 @@ pub fn oracle(bin: &Path, scratch: &Path, input: &[u8]) -> i32 {
         .status
         .code()
         .expect("oracle was killed by a signal")
+}
+
+/// One batch of tasks through the solver ladder, with every solution reported
+/// as uninteresting, and the per-rung counters that came out of it.
+///
+/// The two `ladder_*.rs` tests are this same scenario with
+/// [`Config::escalate_unkept_solutions`] flipped, and one `Session` per process
+/// means they have to be two test binaries -- so the scenario is written once
+/// here rather than copied into both.
+///
+/// `ladder.c` is the target because each of its four checks is an equality
+/// against a constant, which is exactly what the i2s rung is for: the first
+/// rung answers, so what the second rung does is entirely a question of policy
+/// rather than of capability.
+///
+/// Reporting `false` for every solution is the case the two arms disagree
+/// about. It is also what really happens: on libxml2 the front-end keeps 0.3%
+/// of i2s's answers.
+pub fn drive_ladder(tag: &str, escalate_unkept: bool) -> Stats {
+    let dir = scratch_dir(tag);
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/ladder.c");
+    // -O0 so the four checks stay four branches.
+    let target = build_symsan(&dir, &src, "ladder", &["-O0"]);
+    let input_file = dir.join("cur_input");
+    let input_file = input_file.to_str().unwrap();
+
+    // Two rungs, not three: the identity below is about what leaves rung 0, and
+    // a third rung only adds a second copy of the same question.
+    let config = Config::new(target.to_str().unwrap(), input_file)
+        .args([target.to_str().unwrap(), input_file])
+        .use_stdin(false)
+        .i2s(true)
+        .jigsaw(true)
+        .z3(false)
+        .timeout_ms(10_000)
+        .escalate_unkept_solutions(escalate_unkept);
+
+    let mut session = Session::new().expect("failed to create a session");
+    session.init(&config).expect("failed to initialize the session");
+
+    let seed = vec![b'A'; 32];
+    let tasks = session.trace(&seed).expect("trace failed");
+    assert!(tasks > 0, "the trace produced no tasks to run a ladder on");
+
+    let mut n = 0;
+    while session.next_solution().is_some() {
+        n += 1;
+        session.report_result(false);
+        // The ladder is finite, but a bug in the walk would spin here forever.
+        assert!(n < 1000, "next_solution() does not terminate");
+    }
+    assert!(n > 0, "{tasks} tasks produced no solutions at all");
+
+    let stats = session.stats();
+    assert!(
+        stats.solver_sat[0] > 0,
+        "the first rung answered nothing, so there are no unkept solutions \
+         here and the two arms would agree for the wrong reason"
+    );
+    assert_eq!(
+        stats.solver_retired[0], 0,
+        "every solution was reported uninteresting, so no rung should have \
+         retired a task"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    stats
 }
