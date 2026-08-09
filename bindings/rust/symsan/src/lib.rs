@@ -235,6 +235,7 @@ pub struct Config {
     max_queue_tasks: usize,
     priority_tasks: bool,
     requeue_tasks: bool,
+    escalate_unkept_solutions: bool,
 }
 
 /// Convert to a `CString`, replacing any interior NUL by truncating at it.
@@ -298,6 +299,7 @@ impl Config {
             max_queue_tasks: raw.max_queue_tasks,
             priority_tasks: raw.priority_tasks != 0,
             requeue_tasks: raw.requeue_tasks != 0,
+            escalate_unkept_solutions: raw.escalate_unkept_solutions != 0,
         }
     }
 
@@ -370,6 +372,7 @@ impl Config {
             max_queue_tasks: raw.max_queue_tasks,
             priority_tasks: raw.priority_tasks != 0,
             requeue_tasks: raw.requeue_tasks != 0,
+            escalate_unkept_solutions: raw.escalate_unkept_solutions != 0,
         })
     }
 
@@ -636,6 +639,24 @@ impl Config {
         self
     }
 
+    /// Climb the solver ladder after an answer the front-end did not keep, as
+    /// well as after a rung that produced no answer at all. Off by default.
+    ///
+    /// The next rung gets the *same* constraint set. If one satisfying
+    /// assignment did not flip the branch, a second will not either: the
+    /// constraints are stale or incomplete, the path changes under the new
+    /// bytes, or the direction is infeasible. Only a decline or a timeout means
+    /// an answer might still be found. Measured on libxml2, escalations after
+    /// an unkept SAT are 71.8% of all escalations and retire at 0.06%.
+    ///
+    /// Exists so the old unconditional behaviour can be A/B'd, not because it
+    /// is a policy to pick.
+    #[must_use]
+    pub fn escalate_unkept_solutions(mut self, enable: bool) -> Self {
+        self.escalate_unkept_solutions = enable;
+        self
+    }
+
     /// The scratch file inputs are staged into.
     pub fn input_file_path(&self) -> PathBuf {
         PathBuf::from(self.input_file.to_string_lossy().into_owned())
@@ -693,6 +714,7 @@ impl Config {
         raw.max_queue_tasks = self.max_queue_tasks;
         raw.priority_tasks = self.priority_tasks.into();
         raw.requeue_tasks = self.requeue_tasks.into();
+        raw.escalate_unkept_solutions = self.escalate_unkept_solutions.into();
 
         (raw, argv)
     }

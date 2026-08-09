@@ -165,6 +165,7 @@ pub struct SymSanStageBuilder {
     max_queue_tasks: usize,
     priority_tasks: bool,
     requeue_tasks: bool,
+    escalate_unkept_solutions: bool,
 }
 
 impl SymSanStageBuilder {
@@ -507,6 +508,21 @@ impl SymSanStageBuilder {
         self
     }
 
+    /// Climb the solver ladder after an answer the fuzzer did not keep, as well
+    /// as after a rung that produced no answer at all. Off by default.
+    ///
+    /// The next rung gets the same constraint set, so a second satisfying
+    /// assignment to a system whose first one did not flip the branch will not
+    /// flip it either. And in a hybrid fuzzer an input that did not flip is not
+    /// a failure to retry -- it went to the fuzzer, which is free to make
+    /// something of it. Only a decline or a timeout means an answer might still
+    /// be found. Here to A/B the old behaviour.
+    #[must_use]
+    pub fn escalate_unkept_solutions(mut self, yes: bool) -> Self {
+        self.escalate_unkept_solutions = yes;
+        self
+    }
+
     /// Create the session and the stage.
     ///
     /// Fails if `target` was not set, if a session already exists in this
@@ -558,7 +574,8 @@ impl SymSanStageBuilder {
             .max_tokens(self.max_tokens)
             .max_queue_tasks(self.max_queue_tasks)
             .priority_tasks(self.priority_tasks)
-            .requeue_tasks(self.requeue_tasks);
+            .requeue_tasks(self.requeue_tasks)
+            .escalate_unkept_solutions(self.escalate_unkept_solutions);
         if let Some(ms) = self.timeout_ms {
             config = config.timeout_ms(ms);
         }

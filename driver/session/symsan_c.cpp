@@ -348,6 +348,7 @@ void symsan_config_init(symsan_config_t *cfg) {
   cfg->max_queue_tasks = def.max_queue_tasks;
   cfg->priority_tasks = def.priority_tasks;
   cfg->requeue_tasks = def.requeue_tasks;
+  cfg->escalate_unkept_solutions = def.escalate_unkept_solutions;
 }
 
 symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
@@ -385,6 +386,7 @@ symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
     cfg->max_queue_tasks = c.max_queue_tasks;
     cfg->priority_tasks = c.priority_tasks;
     cfg->requeue_tasks = c.requeue_tasks;
+    cfg->escalate_unkept_solutions = c.escalate_unkept_solutions;
     return SYMSAN_OK;
   });
 }
@@ -458,6 +460,7 @@ symsan_status_t symsan_session_init(symsan_session_t *s,
     c.max_queue_tasks = cfg->max_queue_tasks;
     c.priority_tasks = cfg->priority_tasks != 0;
     c.requeue_tasks = cfg->requeue_tasks != 0;
+    c.escalate_unkept_solutions = cfg->escalate_unkept_solutions != 0;
 
     if (s->session.init(c) != 0) {
       set_error("ConcolicSession::init failed");

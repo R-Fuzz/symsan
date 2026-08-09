@@ -301,6 +301,16 @@ typedef struct {
    *  long.  Useful with priority_tasks, but independent of it -- with a FIFO it
    *  simply defers escalation to the back of the queue. */
   int requeue_tasks;
+  /** Climb the solver ladder after an answer the front-end did not keep, as
+   *  well as after a rung that produced no answer at all.  Off by default,
+   *  which is a change: this used to be unconditional.
+   *
+   *  The next rung is handed the SAME constraint set, so a second satisfying
+   *  assignment to a system whose first one did not flip the branch is not
+   *  going to flip it either -- the constraints are stale or incomplete, the
+   *  path changes under the new bytes, or the direction is infeasible.  Only a
+   *  decline or a timeout means an answer might still exist. */
+  int escalate_unkept_solutions;
 } symsan_config_t;
 
 /** Fill @p cfg with the defaults.  Always call this first. */

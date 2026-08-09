@@ -102,6 +102,8 @@ int ConcolicConfig::from_env() {
   if (getenv("SYMSAN_TASK_PRIORITY")) priority_tasks = true;
   // let the queue decide when the next rung of the solver ladder runs
   if (getenv("SYMSAN_REQUEUE_TASKS")) requeue_tasks = true;
+  // go back to climbing the ladder after an answer nobody kept
+  if (getenv("SYMSAN_ESCALATE_UNKEPT")) escalate_unkept_solutions = true;
 
   return 0;
 }
@@ -569,9 +571,33 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
   // nullptr means "no work left" and a caller can write a plain while loop.
   // The sequence of solutions produced is the same.
   for (;;) {
+    // Climb the ladder only when the rung produced nothing.
+    //
+    // A rung that ANSWERED is finished with this task whatever became of the
+    // answer, because the next rung would be handed the same constraint set: if
+    // one satisfying assignment did not flip the branch, a second one will not
+    // either.  What that says is that the constraints are stale or incomplete,
+    // that the path changes under the new bytes so the branch is not reached,
+    // or that the direction is infeasible -- none of which a more capable
+    // solver addresses.  And in a hybrid fuzzer a solution that did not flip is
+    // not a failure to retry: it went to the fuzzer, which is free to make
+    // something of it.  Not every input has to flip.
+    //
+    // A DECLINE or a TIMEOUT is the opposite: no answer exists yet, and the
+    // rungs above may be able to produce one where this one could not.  That is
+    // MUTATION_UNSOLVED, and it is the only state that escalates.
+    //
+    // escalate_unkept_solutions restores the old unconditional behaviour, which
+    // ran the whole ladder on 99.7% of tasks for a 0.06% retirement rate at the
+    // top rung (#174).  Kept so the two can be A/B'd, not because it is a
+    // policy anybody should pick.
+    const bool escalate =
+        mutation_state_ == MUTATION_UNSOLVED ||
+        (config_.escalate_unkept_solutions &&
+         mutation_state_ == MUTATION_IN_VALIDATION);
     // try to get a task if we don't already have one
     // or if we've find a valid solution from the previous mutation
-    if (!cur_task_ || mutation_state_ == MUTATION_VALIDATED) {
+    if (!cur_task_ || !escalate) {
       cur_task_ = next_pending_task();
       if (!cur_task_) {
         mutation_state_ = MUTATION_INVALID;
@@ -580,13 +606,14 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
       // reset the state.  The solver index is not reset: it lives on the task
       // now, and a task coming back out of the queue is resuming its ladder.
       mutation_state_ = MUTATION_INVALID;
-    } else if (mutation_state_ == MUTATION_IN_VALIDATION) {
+    } else {
       // oops, not solve, move on to next solver
       //
       // Two ways to get here: the solver returned something other than SAT, or
-      // it returned SAT and report_result() did not promote the answer.  Both
-      // mean this rung is finished with this task, and neither says anything
-      // about the rungs above it, so they escalate the same way.
+      // -- with escalate_unkept_solutions on -- it returned SAT and
+      // report_result() did not promote the answer.  Both mean this rung is
+      // finished with this task, and neither says anything about the rungs
+      // above it, so they escalate the same way.
       cur_task_->solver_index++;
       if (cur_task_->solver_index >= solvers_.size()) {
         // if reached the max solver, move on to the next task
@@ -656,7 +683,12 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
       // runs -- a decline says "hand this to a more capable solver, it cost
       // nothing to learn that", a timeout says "this one searched and failed,
       // and the next may too".  Same action, different evidence.
-      mutation_state_ = MUTATION_IN_VALIDATION;
+      //
+      // MUTATION_UNSOLVED rather than MUTATION_IN_VALIDATION, which is what
+      // this used to set: nothing went out to the front-end, so there is no
+      // validation to be in, and the loop above now needs to tell "produced
+      // nothing" apart from "produced something nobody kept".
+      mutation_state_ = MUTATION_UNSOLVED;
     } else if (ret == SOLVER_UNSAT) {
       // at any stage if the task is deemed unsolvable, just skip it
       cur_task_->skip_next = true;
@@ -713,6 +745,15 @@ void ConcolicSession::report_result(bool interesting, TargetOutcome outcome) {
     // no evidence at all.  Escalating on Unknown is the old unconditional
     // behaviour, kept because a front-end that cannot see its own coverage has
     // nothing better to go on and because the ladder is bounded anyway.
+    //
+    // UPDATE: the state is still left alone, but by default it no longer means
+    // escalate -- next_solution() now retires a task whose rung answered,
+    // whatever the verdict, and climbs only out of MUTATION_UNSOLVED.  So the
+    // distinction above no longer decides anything unless
+    // escalate_unkept_solutions is set, and neither does the difference between
+    // a front-end that reports a failure and one that reports nothing at all.
+    // What the verdict still does is decide `flipped` and solved_branches
+    // below.
     return;
   }
   mutation_state_ = MUTATION_VALIDATED;

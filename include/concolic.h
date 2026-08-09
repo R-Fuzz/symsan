@@ -142,6 +142,24 @@ struct ConcolicConfig {
   /// queue, which is a different policy again and worth being able to measure.
   bool requeue_tasks = false;             // SYMSAN_REQUEUE_TASKS
 
+  /// Climb the ladder after a solution the front-end did not keep, as well as
+  /// after a rung that produced no solution at all.  This was the old
+  /// unconditional behaviour; it is now off, and this exists to A/B it.
+  ///
+  /// The default is that a rung which *answered* is finished with the task,
+  /// whatever became of the answer, and only a decline or a timeout escalates.
+  /// The next rung would be handed the same constraint set, so if a satisfying
+  /// assignment did not flip the branch, a second satisfying assignment to the
+  /// same system is not going to either -- the constraints are stale or
+  /// incomplete, the path changes under the new bytes, or the direction is
+  /// infeasible.  Measured on libxml2: escalations after a kept-nothing SAT are
+  /// 71.8% of all escalations and retire at 0.06% (#174).
+  ///
+  /// This is also the hybrid-fuzzing reading of a solution.  An input that did
+  /// not flip its branch is not a failure to be retried; it went to the fuzzer,
+  /// which is free to make something of it.  Not every input has to flip.
+  bool escalate_unkept_solutions = false; // SYMSAN_ESCALATE_UNKEPT
+
   /// Populate from the SYMSAN_* environment variables.  Fields not covered by
   /// an environment variable (input_file, args, use_stdin) are left untouched.
   /// @return 0 on success, -1 if SYMSAN_TARGET is not set
@@ -441,11 +459,14 @@ public:
 
 private:
   /// tracks whether the solution we last handed out has been judged yet; the
-  /// same three-state machine driver/aflpp/symsan.cpp used
+  /// same three-state machine driver/aflpp/symsan.cpp used, plus a fourth that
+  /// separates "this rung produced nothing" from "this rung produced something
+  /// the front-end did not keep" -- the ladder now turns on that distinction.
   enum mutation_state_t {
     MUTATION_INVALID,       // no solution outstanding
     MUTATION_IN_VALIDATION, // a solution is out with the front-end
     MUTATION_VALIDATED,     // the front-end said it was interesting
+    MUTATION_UNSOLVED,      // the rung declined or timed out; nothing was sent
   };
 
   void save_solved_input(const uint8_t *buf, size_t size);

@@ -359,6 +359,19 @@ struct Opt {
     #[arg(long = "symsan-requeue-tasks", default_value = "false")]
     symsan_requeue_tasks: bool,
 
+    /// Climb the solver ladder after a solution the fuzzer did not keep, and
+    /// not only after a rung that produced no solution at all.
+    ///
+    /// This was the behaviour before; it is off now. The next rung is handed
+    /// the same constraint set, so if one satisfying assignment did not flip
+    /// the branch, a second one will not either -- what that says is that the
+    /// constraints are stale or incomplete, that the path changes under the new
+    /// bytes, or that the direction is infeasible. Measured on libxml2, those
+    /// escalations are 71.8% of all of them and retire at 0.06%. Here so the
+    /// two can be compared.
+    #[arg(long = "symsan-escalate-unkept", default_value = "false")]
+    symsan_escalate_unkept: bool,
+
     /// Drop the input-to-state solver from the ladder. It is the cheapest rung
     /// and cracks most branches on its own, so this is for measuring what the
     /// others contribute, not for fuzzing.
@@ -623,7 +636,8 @@ pub fn main() -> Result<(), libafl::Error> {
                 .tokens(opt.symsan_tokens)
                 .max_queue_tasks(opt.symsan_max_tasks)
                 .priority_tasks(opt.symsan_task_priority)
-                .requeue_tasks(opt.symsan_requeue_tasks);
+                .requeue_tasks(opt.symsan_requeue_tasks)
+                .escalate_unkept_solutions(opt.symsan_escalate_unkept);
             if let Some(map) = &branch_map {
                 // The observer above is named "shared_mem", which is also the
                 // name MaxMapFeedback::new() inherits and files its history map
@@ -718,6 +732,14 @@ pub fn main() -> Result<(), libafl::Error> {
             if opt.symsan_requeue_tasks {
                 println!("symsan: escalating through the solver ladder via the queue");
             }
+            println!(
+                "symsan: the ladder climbs on {}",
+                if opt.symsan_escalate_unkept {
+                    "a decline, a timeout, or an unkept solution"
+                } else {
+                    "a decline or a timeout only"
+                }
+            );
             Some(tuple_list!(CreditedStage::new(
                 "symsan",
                 symsan,
