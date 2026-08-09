@@ -347,6 +347,18 @@ struct Opt {
     #[arg(long = "symsan-task-priority", default_value = "false")]
     symsan_task_priority: bool,
 
+    /// Let the queue decide when a task moves to the next solver.
+    ///
+    /// Without this, a task that did not produce a kept solution is handed to
+    /// the next rung of the ladder on the spot: every task gets every solver
+    /// before the next task is looked at. With it, the task goes back into the
+    /// backlog with its position advanced, so its second attempt is ranked
+    /// against the tasks nobody has tried yet -- and under a bound it loses to
+    /// them. Escalation then happens when the backlog is short and is dropped
+    /// when it is long, which is the same rule the bound already applies.
+    #[arg(long = "symsan-requeue-tasks", default_value = "false")]
+    symsan_requeue_tasks: bool,
+
     /// Drop the input-to-state solver from the ladder. It is the cheapest rung
     /// and cracks most branches on its own, so this is for measuring what the
     /// others contribute, not for fuzzing.
@@ -610,7 +622,8 @@ pub fn main() -> Result<(), libafl::Error> {
                 .cmplog_filter(cmplog_filter)
                 .tokens(opt.symsan_tokens)
                 .max_queue_tasks(opt.symsan_max_tasks)
-                .priority_tasks(opt.symsan_task_priority);
+                .priority_tasks(opt.symsan_task_priority)
+                .requeue_tasks(opt.symsan_requeue_tasks);
             if let Some(map) = &branch_map {
                 // The observer above is named "shared_mem", which is also the
                 // name MaxMapFeedback::new() inherits and files its history map
@@ -701,6 +714,9 @@ pub fn main() -> Result<(), libafl::Error> {
                 );
             } else if opt.symsan_task_priority {
                 println!("symsan: draining the task queue best-first (unbounded)");
+            }
+            if opt.symsan_requeue_tasks {
+                println!("symsan: escalating through the solver ladder via the queue");
             }
             Some(tuple_list!(CreditedStage::new(
                 "symsan",

@@ -164,6 +164,7 @@ pub struct SymSanStageBuilder {
     max_tokens: usize,
     max_queue_tasks: usize,
     priority_tasks: bool,
+    requeue_tasks: bool,
 }
 
 impl SymSanStageBuilder {
@@ -493,6 +494,19 @@ impl SymSanStageBuilder {
         self
     }
 
+    /// Let the queue decide when a task moves to the next solver.
+    ///
+    /// A task whose attempt produced nothing the fuzzer kept goes back into the
+    /// backlog with its ladder position advanced, instead of being handed to the
+    /// next solver on the spot. It then competes with the untried tasks, and
+    /// under a bound it loses to them -- so escalation happens when there is
+    /// slack and is dropped when there is not, with no threshold to pick.
+    #[must_use]
+    pub fn requeue_tasks(mut self, yes: bool) -> Self {
+        self.requeue_tasks = yes;
+        self
+    }
+
     /// Create the session and the stage.
     ///
     /// Fails if `target` was not set, if a session already exists in this
@@ -543,7 +557,8 @@ impl SymSanStageBuilder {
             .collect_tokens(self.tokens)
             .max_tokens(self.max_tokens)
             .max_queue_tasks(self.max_queue_tasks)
-            .priority_tasks(self.priority_tasks);
+            .priority_tasks(self.priority_tasks)
+            .requeue_tasks(self.requeue_tasks);
         if let Some(ms) = self.timeout_ms {
             config = config.timeout_ms(ms);
         }
@@ -991,7 +1006,9 @@ impl SymSanStage {
             String::new()
         };
         // What each rung of the ladder cost and what it bought, as
-        // `name calls@us/call sat/declined`. Also not in the change-detection
+        // `name calls@us/call sat/unsat/declined/other`, where other is the
+        // residual: a search that spent its whole budget, or an error. Also not
+        // in the change-detection
         // tuple, for the same reason as `novelty`: no solve happens without a
         // task, and no task is solved without `solved` or `stale` moving.
         //
@@ -1008,9 +1025,14 @@ impl SymSanStage {
             }
             let name = self.session.solver_name(j).unwrap_or("?");
             let per = stats.solver_usecs[j] as f64 / calls as f64;
+            let (sat, unsat, dec) = (
+                stats.solver_sat[j],
+                stats.solver_unsat[j],
+                stats.solver_declined[j],
+            );
             solvers.push_str(&format!(
-                ", {name} {calls}@{per:.0}us {}/{}",
-                stats.solver_sat[j], stats.solver_declined[j]
+                ", {name} {calls}@{per:.0}us {sat}/{unsat}/{dec}/{}",
+                calls - sat - unsat - dec
             ));
         }
         let executions = *state.executions();

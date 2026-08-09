@@ -347,6 +347,7 @@ void symsan_config_init(symsan_config_t *cfg) {
   cfg->max_tokens = def.max_tokens;
   cfg->max_queue_tasks = def.max_queue_tasks;
   cfg->priority_tasks = def.priority_tasks;
+  cfg->requeue_tasks = def.requeue_tasks;
 }
 
 symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
@@ -383,6 +384,7 @@ symsan_status_t symsan_config_from_env(symsan_config_t *cfg) {
     cfg->collect_tokens = c.collect_tokens;
     cfg->max_queue_tasks = c.max_queue_tasks;
     cfg->priority_tasks = c.priority_tasks;
+    cfg->requeue_tasks = c.requeue_tasks;
     return SYMSAN_OK;
   });
 }
@@ -455,6 +457,7 @@ symsan_status_t symsan_session_init(symsan_session_t *s,
     // so there is nothing to protect and nothing to guess.
     c.max_queue_tasks = cfg->max_queue_tasks;
     c.priority_tasks = cfg->priority_tasks != 0;
+    c.requeue_tasks = cfg->requeue_tasks != 0;
 
     if (s->session.init(c) != 0) {
       set_error("ConcolicSession::init failed");
@@ -701,6 +704,7 @@ symsan_status_t symsan_session_stats(const symsan_session_t *s,
     out->solver_usecs[i] = st.solver_usecs[i];
     out->solver_sat[i] = st.solver_sat[i];
     out->solver_declined[i] = st.solver_declined[i];
+    out->solver_unsat[i] = st.solver_unsat[i];
   }
   out->solved_branches = st.solved_branches;
   out->mapped_branches = st.mapped_branches;

@@ -121,6 +121,26 @@ struct ConcolicConfig {
   /// no bound and a queue drained to exhaustion the order is only latency, and
   /// this is the arm of an A/B, not a default anyone has earned yet.
   bool priority_tasks = false;            // SYMSAN_TASK_PRIORITY
+  /// On an attempt that produced nothing the fuzzer kept, put the task back in
+  /// the queue with its ladder position advanced instead of running the next
+  /// solver on it right away.
+  ///
+  /// The ladder is a portfolio: i2s is fastest and least capable, z3 slowest
+  /// and most capable, and all three can be asked the same task.  Walking it
+  /// inline makes "when does the expensive solver run" a property of the loop
+  /// -- immediately, always, for whatever task happens to be in hand.  Handing
+  /// the task back makes it a property of the queue, which is the thing that
+  /// already knows what else is waiting: the second attempt competes with every
+  /// unattempted task, and under a bound it loses to them, so a saturated queue
+  /// spends its budget on breadth and an idle one escalates.
+  ///
+  /// There is no give-up threshold to tune, because eviction is the give-up:
+  /// a task nothing else outranks comes back, one everything outranks does not.
+  ///
+  /// Off by default and independent of priority_tasks so all four cells are
+  /// reachable -- with a FIFO this defers escalation to the back of the whole
+  /// queue, which is a different policy again and worth being able to measure.
+  bool requeue_tasks = false;             // SYMSAN_REQUEUE_TASKS
 
   /// Populate from the SYMSAN_* environment variables.  Fields not covered by
   /// an environment variable (input_file, args, use_stdin) are left untouched.
@@ -166,8 +186,17 @@ struct ConcolicStats {
   uint64_t solver_usecs[kMaxSolvers] = {};
   uint64_t solver_sat[kMaxSolvers] = {};
   /// SOLVER_DECLINE: the rung did not search.  Everything else that is neither
-  /// SAT nor a decline (timeout, unsat, error) is calls - sat - declined.
+  /// SAT, UNSAT nor a decline -- a search that ran its budget out, or an error
+  /// -- is calls - sat - unsat - declined.
   uint64_t solver_declined[kMaxSolvers] = {};
+  /// SOLVER_UNSAT: the rung says no assignment exists, which retires the task
+  /// for every rung above it too.  Counted apart from the timeouts it used to
+  /// share a residual with because the two are opposite outcomes -- an UNSAT is
+  /// a complete answer and is usually the *cheapest* thing a rung can return
+  /// (jigsaw's nested-task early exit is one, and never reaches the JIT), a
+  /// timeout is the most expensive thing it can return.  Lumping them made
+  /// "expensive failures went up" and "cheap answers went up" the same number.
+  uint64_t solver_unsat[kMaxSolvers] = {};
   uint64_t solved_branches = 0;
   /// Branch directions the BranchMap could and could not resolve to fuzzer edge
   /// ids.  Both stay 0 without a map; with one, the ratio is the diagnostic for
@@ -502,9 +531,11 @@ private:
   int input_fd_;
   bool initialized_;
 
-  // solving state, carried across next_solution() calls
+  // solving state, carried across next_solution() calls.  The ladder position
+  // is not here: it is SearchTask::solver_index, because with requeue_tasks a
+  // task can go back into the queue between two of its own attempts, and a
+  // position kept on the session would then belong to whatever came next.
   task_t cur_task_;
-  size_t cur_solver_index_;
   int mutation_state_;
 
   // per-input filters, cleared by trace()

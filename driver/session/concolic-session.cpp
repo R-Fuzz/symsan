@@ -100,13 +100,15 @@ int ConcolicConfig::from_env() {
   const char *max_tasks = getenv("SYMSAN_MAX_TASKS");
   if (max_tasks) max_queue_tasks = (size_t)strtoull(max_tasks, nullptr, 10);
   if (getenv("SYMSAN_TASK_PRIORITY")) priority_tasks = true;
+  // let the queue decide when the next rung of the solver ladder runs
+  if (getenv("SYMSAN_REQUEUE_TASKS")) requeue_tasks = true;
 
   return 0;
 }
 
 ConcolicSession::ConcolicSession()
     : input_fd_(-1), initialized_(false), cur_task_(nullptr),
-      cur_solver_index_(0), mutation_state_(MUTATION_INVALID) {}
+      mutation_state_(MUTATION_INVALID) {}
 
 ConcolicSession::~ConcolicSession() {
   if (input_fd_ >= 0) close(input_fd_);
@@ -520,9 +522,9 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
     return -1;
   }
 
-  // reinit solving state
+  // reinit solving state.  No solver index to reset: it belongs to the task,
+  // and a task that survives this trace keeps the ladder position it earned.
   cur_task_ = nullptr;
-  cur_solver_index_ = 0;
   mutation_state_ = MUTATION_INVALID;
 
   // The manager keeps the running totals; mirror them so a front-end reading
@@ -575,25 +577,47 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
         mutation_state_ = MUTATION_INVALID;
         return nullptr;
       }
-      // reset the solver and state
-      cur_solver_index_ = 0;
+      // reset the state.  The solver index is not reset: it lives on the task
+      // now, and a task coming back out of the queue is resuming its ladder.
       mutation_state_ = MUTATION_INVALID;
     } else if (mutation_state_ == MUTATION_IN_VALIDATION) {
       // oops, not solve, move on to next solver
-      cur_solver_index_++;
-      if (cur_solver_index_ >= solvers_.size()) {
+      //
+      // Two ways to get here: the solver returned something other than SAT, or
+      // it returned SAT and report_result() did not promote the answer.  Both
+      // mean this rung is finished with this task, and neither says anything
+      // about the rungs above it, so they escalate the same way.
+      cur_task_->solver_index++;
+      if (cur_task_->solver_index >= solvers_.size()) {
         // if reached the max solver, move on to the next task
+        cur_task_ = nullptr;
+      } else if (config_.requeue_tasks) {
+        // Hand the task back instead of asking the next rung right now.  The
+        // queue is the thing that knows what else is waiting: sorted and
+        // bounded, the second attempt competes with every task nobody has tried
+        // yet, and it carries the same score with a later seq_, so it loses to
+        // all of them.  A saturated queue therefore spends its budget on breadth
+        // and evicts the requeued task -- which is the give-up rule, with no
+        // threshold to pick -- while an idle one comes back to it and escalates.
+        //
+        // Not conditional on WHY the rung failed.  A decline is better evidence
+        // than a timeout, but that difference belongs in the score if it belongs
+        // anywhere; encoding it here would be a second scheduler.
+        task_mgr_->add_task(cur_task_->target, cur_task_);
+        cur_task_ = nullptr;
+      }
+      if (!cur_task_) {
         cur_task_ = next_pending_task();
         if (!cur_task_) {
           mutation_state_ = MUTATION_INVALID;
           return nullptr;
         }
-        cur_solver_index_ = 0; // reset solver index
       }
     }
 
     size_t new_buf_size = 0;
-    auto &solver = solvers_[cur_solver_index_];
+    const size_t rung = cur_task_->solver_index;
+    auto &solver = solvers_[rung];
     // The task's own bytes, not the last trace's: a task's Reads are offsets
     // into the input it was traced against, so once the queue outlives the
     // trace that filled it, whatever was traced most recently is a different
@@ -608,11 +632,12 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
     const uint64_t t0 = solve_timestamp_us();
     auto ret = solver->solve(cur_task_, in.data(), in.size(),
                              output_buf_.data(), new_buf_size);
-    if (cur_solver_index_ < ConcolicStats::kMaxSolvers) {
-      stats_.solver_calls[cur_solver_index_] += 1;
-      stats_.solver_usecs[cur_solver_index_] += solve_timestamp_us() - t0;
-      if (ret == SOLVER_SAT) stats_.solver_sat[cur_solver_index_] += 1;
-      else if (ret == SOLVER_DECLINE) stats_.solver_declined[cur_solver_index_] += 1;
+    if (rung < ConcolicStats::kMaxSolvers) {
+      stats_.solver_calls[rung] += 1;
+      stats_.solver_usecs[rung] += solve_timestamp_us() - t0;
+      if (ret == SOLVER_SAT) stats_.solver_sat[rung] += 1;
+      else if (ret == SOLVER_DECLINE) stats_.solver_declined[rung] += 1;
+      else if (ret == SOLVER_UNSAT) stats_.solver_unsat[rung] += 1;
     }
     if (SYMSAN_LIKELY(ret == SOLVER_SAT)) {
       mutation_state_ = MUTATION_IN_VALIDATION;
@@ -910,20 +935,23 @@ void ConcolicSession::print_stats(int fd) const {
       (unsigned long)stats_.unmapped_branches);
   }
   // Per rung: what it cost to ask, and what the asking produced.  `other` is
-  // everything that was neither an answer nor a refusal -- a search that ran out
-  // of budget, an UNSAT, an error -- and it is the expensive column.
+  // everything that was none of those -- a search that ran out of budget, or an
+  // error -- and it is the expensive column.  UNSAT is broken out of it because
+  // it is a complete answer arrived at cheaply, which is the opposite of a
+  // timeout in both respects.
   for (size_t i = 0; i < solvers_.size() && i < ConcolicStats::kMaxSolvers; ++i) {
     const uint64_t n = stats_.solver_calls[i];
     if (!n) continue;
     const uint64_t sat = stats_.solver_sat[i], dec = stats_.solver_declined[i];
+    const uint64_t uns = stats_.solver_unsat[i];
     dprintf(fd,
             "Solver %zu (%s): %lu calls, %lu us total, %.1f us/call, "
-            "%lu sat, %lu declined, %lu other\n",
+            "%lu sat, %lu unsat, %lu declined, %lu other\n",
             i, solvers_[i]->name(), (unsigned long)n,
             (unsigned long)stats_.solver_usecs[i],
             (double)stats_.solver_usecs[i] / (double)n,
-            (unsigned long)sat, (unsigned long)dec,
-            (unsigned long)(n - sat - dec));
+            (unsigned long)sat, (unsigned long)uns, (unsigned long)dec,
+            (unsigned long)(n - sat - uns - dec));
   }
   dprintf(fd, "Task size distribution:\n");
   for (auto const& kv : task_size_dist_) {

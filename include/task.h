@@ -417,6 +417,22 @@ public:
   /// straight through (afltest, fgtest) leaves it null and passes the buffer.
   std::shared_ptr<const std::vector<uint8_t>> input;
 
+  /// Which rung of the solver ladder gets this task next: an index into the
+  /// session's solver list, advanced by every attempt that did not end in an
+  /// accepted answer.  Past the end of the ladder means every solver has had
+  /// its turn and the task is finished.
+  ///
+  /// On the task rather than on the session because the ladder is a property of
+  /// the question, not of the loop asking it.  The session used to keep one
+  /// cur_solver_index_ and walk it inline, which is only correct while a task
+  /// stays in hand for its whole ladder; once a task can go back into the queue
+  /// between two of its own attempts, the session has no memory of how far this
+  /// one had got, and the position has to travel with it.
+  ///
+  /// Distinct from `attempts`, which is jigsaw's own gradient-descent counter
+  /// and moves inside a single solve() call.
+  uint8_t solver_index = 0;
+
   void finalize() {
     // aggregate the contraints, map each input byte to a constraint to
     // an index in the "global" input array (i.e., the scratch_args)

@@ -289,6 +289,18 @@ typedef struct {
   /** Drain the queue best-first rather than in arrival order, ranking each
    *  task by how new its destination is.  Off by default. */
   int priority_tasks;
+  /** When an attempt produces nothing the front-end keeps, put the task back in
+   *  the queue for its next solver instead of running that solver right away.
+   *  Off by default.
+   *
+   *  The solvers form a ladder -- fast and narrow to slow and general -- and
+   *  this decides who chooses when to climb it.  Off, the loop does: every task
+   *  gets every solver, back to back, before the next task is looked at.  On,
+   *  the queue does: the second attempt is ranked against everything still
+   *  waiting, so it happens when the backlog is short and is evicted when it is
+   *  long.  Useful with priority_tasks, but independent of it -- with a FIFO it
+   *  simply defers escalation to the back of the queue. */
+  int requeue_tasks;
 } symsan_config_t;
 
 /** Fill @p cfg with the defaults.  Always call this first. */
@@ -604,12 +616,15 @@ typedef struct {
    *  whatever symsan_session_solver_name(s, j) says, since which solvers are
    *  enabled is a config question.  usecs/calls is what it costs to ask rung j
    *  about a task; `declined` is the subset where the rung did not search at
-   *  all, and calls - sat - declined is everything else (timeout, unsat,
-   *  error), which is the expensive part */
+   *  all, `unsat` the subset it answered "no assignment exists" (a complete
+   *  answer, and usually the cheapest one), and calls - sat - unsat - declined
+   *  is everything else -- a search that ran out of budget, or an error --
+   *  which is the expensive part */
   uint64_t solver_calls[3];
   uint64_t solver_usecs[3];
   uint64_t solver_sat[3];
   uint64_t solver_declined[3];
+  uint64_t solver_unsat[3];
   uint64_t solved_branches;
   /** branch directions the branch map could and could not resolve to fuzzer
    *  edge ids; both 0 when no branch map is in use */

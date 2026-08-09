@@ -234,6 +234,7 @@ pub struct Config {
     max_tokens: usize,
     max_queue_tasks: usize,
     priority_tasks: bool,
+    requeue_tasks: bool,
 }
 
 /// Convert to a `CString`, replacing any interior NUL by truncating at it.
@@ -296,6 +297,7 @@ impl Config {
             max_tokens: raw.max_tokens,
             max_queue_tasks: raw.max_queue_tasks,
             priority_tasks: raw.priority_tasks != 0,
+            requeue_tasks: raw.requeue_tasks != 0,
         }
     }
 
@@ -367,6 +369,7 @@ impl Config {
             max_tokens: raw.max_tokens,
             max_queue_tasks: raw.max_queue_tasks,
             priority_tasks: raw.priority_tasks != 0,
+            requeue_tasks: raw.requeue_tasks != 0,
         })
     }
 
@@ -617,6 +620,22 @@ impl Config {
         self
     }
 
+    /// On an attempt that produced nothing the fuzzer kept, requeue the task for
+    /// its next solver instead of running that solver immediately.
+    ///
+    /// The solvers are a ladder -- i2s is fastest and least capable, z3 the
+    /// reverse -- and this moves the decision of when to climb it out of the
+    /// solving loop and into the queue. Off, a task gets the whole ladder before
+    /// the next task is looked at. On, its second attempt is ranked against
+    /// every task nobody has tried yet, and under a bound loses to them: a busy
+    /// queue spends its budget on breadth, an idle one escalates. Independent of
+    /// [`Config::priority_tasks`], though it is most meaningful with it.
+    #[must_use]
+    pub fn requeue_tasks(mut self, enable: bool) -> Self {
+        self.requeue_tasks = enable;
+        self
+    }
+
     /// The scratch file inputs are staged into.
     pub fn input_file_path(&self) -> PathBuf {
         PathBuf::from(self.input_file.to_string_lossy().into_owned())
@@ -673,6 +692,7 @@ impl Config {
         raw.max_tokens = self.max_tokens;
         raw.max_queue_tasks = self.max_queue_tasks;
         raw.priority_tasks = self.priority_tasks.into();
+        raw.requeue_tasks = self.requeue_tasks.into();
 
         (raw, argv)
     }
@@ -728,11 +748,20 @@ pub struct Stats {
     /// Of those calls, the ones where the rung did not search at all because
     /// the task was outside what it handles.
     ///
-    /// The interesting quantity is `calls - sat - declined`: a search that ran
-    /// its whole budget and came back empty, an UNSAT, or an error. Declines
-    /// are near-free and say the next rung should have the task; the rest are
-    /// what a rung's time is actually spent on.
+    /// The interesting quantity is `calls - sat - unsat - declined`: a search
+    /// that ran its whole budget and came back empty, or an error. Declines are
+    /// near-free and say the next rung should have the task; the rest are what
+    /// a rung's time is actually spent on.
     pub solver_declined: [u64; 3],
+    /// Of those calls, the ones that answered "no assignment exists", which
+    /// retires the task for the rungs above too.
+    ///
+    /// Broken out of the residual because it is a complete answer reached
+    /// cheaply -- jigsaw returns one without ever entering the JIT when a
+    /// nested task it depends on has already been settled -- and a timeout is
+    /// the opposite on both counts. Together in one number, a shift from
+    /// expensive failures to cheap answers is invisible.
+    pub solver_unsat: [u64; 3],
     /// Branches a solution actually flipped, as reported by the front-end
     /// through [`Session::report_result`].
     pub solved_branches: u64,
@@ -1276,6 +1305,7 @@ impl Session {
             solver_usecs: [0; 3],
             solver_sat: [0; 3],
             solver_declined: [0; 3],
+            solver_unsat: [0; 3],
             solved_branches: 0,
             mapped_branches: 0,
             unmapped_branches: 0,
@@ -1296,6 +1326,7 @@ impl Session {
             solver_usecs: raw.solver_usecs,
             solver_sat: raw.solver_sat,
             solver_declined: raw.solver_declined,
+            solver_unsat: raw.solver_unsat,
             solved_branches: raw.solved_branches,
             mapped_branches: raw.mapped_branches,
             unmapped_branches: raw.unmapped_branches,

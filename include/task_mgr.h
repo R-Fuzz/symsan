@@ -34,7 +34,9 @@ public:
   /// the same, a priority queue *is* a FIFO, and an A/B that measures no
   /// difference has measured nothing rather than measured a tie.  Counted over
   /// tasks offered, not tasks kept -- it describes the population the order is
-  /// chosen from.
+  /// chosen from.  So with ConcolicConfig::requeue_tasks a task escalating to
+  /// its next solver is counted again, at whatever it scores the second time;
+  /// the total is offers, and only equals distinct tasks when requeue is off.
   virtual const uint64_t *novelty_histogram() const { return nullptr; }
 
 protected:
@@ -97,6 +99,13 @@ private:
 /// Ties break oldest-first, so a queue whose scores are all equal drains in
 /// exactly FIFO order and evicts exactly what a bounded FIFO would.  That is
 /// what makes the A/B against FIFOTaskManager a one-variable comparison.
+///
+/// With ConcolicConfig::requeue_tasks the one path that does rescore is a task
+/// coming back for its next solver: it is scored again, now, so a destination
+/// something else reached in the meantime falls behind the fresh tasks -- and
+/// with a later seq_ it is behind everything it ties with anyway.  That is the
+/// whole escalation policy: whether the expensive solver runs is decided by how
+/// this task compares to the rest of the backlog, not by a rule in the loop.
 class PriorityTaskManager : public TaskManager {
 public:
   /// @p cov is borrowed and must outlive this manager -- ConcolicSession owns
