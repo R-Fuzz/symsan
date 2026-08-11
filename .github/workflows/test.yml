@@ -18,7 +18,7 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: install dependencies
-      run: sudo apt-get update && sudo apt-get install -y llvm-18 clang-18 libc++-18-dev libc++abi-18-dev libunwind-18-dev python3-minimal libgoogle-perftools-dev libboost-container-dev python3-dev libbsd-dev
+      run: sudo apt-get update && sudo apt-get install -y llvm-18 clang-18 libclang-18-dev libc++-18-dev libc++abi-18-dev libunwind-18-dev python3-minimal libgoogle-perftools-dev libboost-container-dev python3-dev libbsd-dev
 
     - name: Cache Z3
       id: cache-z3
@@ -70,3 +70,16 @@ jobs:
     - name: test
       run: lit --verbose tests/symsan
       working-directory: ${{ github.workspace }}/build
+
+    # Compile-check the Rust/LibAFL bindings so they cannot silently rot; build
+    # only, no `cargo test`, to keep the merge gate cheap. This reuses the
+    # libsymsan_c.so the install step just produced (SYMSAN_BUILD_DIR points the
+    # symsan crate's build.rs at the install prefix) and pulls LibAFL from the
+    # exact git rev recorded in Cargo.lock (`--locked`). GitHub's ubuntu runners
+    # ship a stable Rust toolchain, so cargo is already on PATH; bindgen needs
+    # libclang, hence libclang-18-dev above and LIBCLANG_PATH here.
+    - name: build rust bindings
+      run: SYMSAN_BUILD_DIR=${{ github.workspace }}/install cargo build --locked
+      working-directory: ${{ github.workspace }}/bindings/rust
+      env:
+        LIBCLANG_PATH: /usr/lib/llvm-18/lib

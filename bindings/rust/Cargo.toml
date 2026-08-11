@@ -24,11 +24,15 @@ license = "Apache-2.0"
 repository = "https://github.com/R-Fuzz/symsan"
 
 [workspace.dependencies]
-# Path dependencies on the LibAFL checkout next to this repo.  Override with
-# LIBAFL_PATH at build time if yours lives elsewhere.
-libafl = { path = "../../../libafl/crates/libafl" }
-libafl_bolts = { path = "../../../libafl/crates/libafl_bolts" }
-libafl_targets = { path = "../../../libafl/crates/libafl_targets" }
+# LibAFL is not published to crates.io at the version this integration targets
+# (0.16, still unreleased), so we depend on it straight from git.  Pinned to a
+# known-good revision on purpose: LibAFL's main branch drifts and its API is not
+# yet stable, so an unpinned dep would break on an unrelated upstream change.
+# To move to a newer LibAFL, bump `rev` here (all three must match) and run
+# `cargo update -p libafl` to refresh Cargo.lock.
+libafl = { git = "https://github.com/AFLplusplus/LibAFL", rev = "2120857eb6280bc28f4fd598f538942fa02ad4fa", version = "0.16.0" }
+libafl_bolts = { git = "https://github.com/AFLplusplus/LibAFL", rev = "2120857eb6280bc28f4fd598f538942fa02ad4fa", version = "0.16.0" }
+libafl_targets = { git = "https://github.com/AFLplusplus/LibAFL", rev = "2120857eb6280bc28f4fd598f538942fa02ad4fa", version = "0.16.0" }
 
 [profile.release]
 debug = true
