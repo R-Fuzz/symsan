@@ -12,10 +12,24 @@ namespace rgd {
 class RGDAstParser : public symsan::ASTParser<SearchTask> {
 public:
   RGDAstParser() = delete;
-  RGDAstParser(void *base, size_t size, bool solve_nested = false, size_t max_ast_size = 200)
+  /// @param strict_clauses  what to do when one conjunct of a DNF clause will
+  ///   not parse.  Default (false) keeps the rest of the clause and builds a
+  ///   task from it: that task is *weaker* than the clause, so a solution to it
+  ///   need not flip the branch, which for hybrid fuzzing costs one execution
+  ///   and buys a chance at coverage.  True drops the whole clause instead,
+  ///   which is exact -- the surviving disjuncts still flip the branch -- and is
+  ///   what a consumer that must trust a task wants.  See construct_task().
+  RGDAstParser(void *base, size_t size, bool solve_nested = false, size_t max_ast_size = 200,
+               bool strict_clauses = false)
     : symsan::ASTParser<SearchTask>(base, size),
-      solve_nested_(solve_nested), max_ast_size_(max_ast_size) {}
+      solve_nested_(solve_nested), max_ast_size_(max_ast_size),
+      strict_clauses_(strict_clauses) {}
   ~RGDAstParser() {}
+
+  /// Clauses handed out with a conjunct missing (lenient mode only).  Counted
+  /// rather than only warned because stderr is /dev/null in a campaign, and a
+  /// task that cannot flip its branch is worth knowing the rate of.
+  uint64_t weakened_clauses() const { return weakened_clauses_; }
 
   int restart(std::vector<symsan::input_t> &inputs, bool copy_input = false) override;
   int parse_cond(dfsan_label label, bool result, bool add_nested,
@@ -28,9 +42,42 @@ public:
 
   int add_constraints(dfsan_label label, uint64_t result) override;
 
+  // --- dependency queries ----------------------------------------------------
+  // The parser already computes which input offsets each label reads, and which
+  // offsets are coupled by data flow, as a side effect of parsing.  These expose
+  // that to a caller that wants to know which bytes are still worth mutating,
+  // without making it reach into the caches.
+
+  /// Set of input offsets, flattened across all inputs -- bit i is the offset
+  /// input_to_dep_idx() maps <input_id, offset> to.
+  using input_dep_t = boost::dynamic_bitset<>;
+
+  /// OR the input offsets @p label depends on into @p acc, growing @p acc to the
+  /// traced input's size if needed.
+  ///
+  /// Cheap enough to call for every branch, solved or not: scan_labels() fills
+  /// the cache linearly up to @p label, so a label the cache already reaches
+  /// costs nothing and the total across a trace is one pass over the labels.
+  ///
+  /// @return false if @p label is out of range or the union table held an
+  ///         invalid entry, in which case @p acc is untouched
+  [[nodiscard]] bool note_deps(dfsan_label label, input_dep_t &acc);
+
+  /// The data-flow group @p offset belongs to, named by a representative offset.
+  /// Offsets no task has coupled to anything are their own group.
+  size_t dep_group(size_t offset) { return data_flow_deps.find(offset); }
+
+  /// Every offset in @p offset's data-flow group, itself included.
+  /// @return the group size, or UnionFind::INVALID if @p offset is out of range
+  size_t dep_members(size_t offset, std::unordered_set<size_t> &out) {
+    return data_flow_deps.get_set(offset, out);
+  }
+
 protected:
   const bool solve_nested_;
   const size_t max_ast_size_;
+  const bool strict_clauses_;
+  uint64_t weakened_clauses_ = 0;
 
 private:
   enum ast_node_t {
@@ -50,13 +97,39 @@ private:
   std::unordered_map<dfsan_label, expr_t> root_expr_cache; // label -> root expr
   std::unordered_map<dfsan_label, constraint_t> constraint_cache; // label -> constraint
   std::vector<uint32_t> ast_size_cache; // label -> size of the AST
+  std::vector<uint32_t> arg_size_cache; // label -> upper bound on input_args slots
   std::vector<uint8_t> nested_cmp_cache; // label -> nested comparison
   std::unordered_map<dfsan_label, uint8_t> concretize_node; // label -> concretize node
 
   // dependencies tracking
   size_t input_size_; // record the whole input size
-  using input_dep_t = boost::dynamic_bitset<>;
-  std::vector<input_dep_t> branch_to_inputs; // label -> flattened input dependencies
+  // The dependency sets are interned, not stored per label.  One dense
+  // input_size_-bit bitset per label costs labels x input_size bits, which on a
+  // 23 KB libxml2 seed with 869k labels measured 2.6 GB steady (4.2 GB peak) and
+  // 26 GB on the same seed padded to 95 KB -- the product, not either factor, is
+  // what grows.  The sets themselves repeat heavily: a hot loop re-traced tens of
+  // thousands of times yields the same dependency set every iteration, and every
+  // unary op and every op with a constant operand has exactly its child's set.
+  // So a label holds a pool index and the pool holds each distinct set once.
+  std::vector<uint32_t> branch_to_inputs; // label -> dep_pool index
+  std::vector<input_dep_t> dep_pool; // slot 0 is always the empty set
+  // Memos for the three ways an entry is derived, so an equal set is never built
+  // twice.  Interning is only worth its keep if the lookup is cheaper than the
+  // union it replaces, hence a flat vector for the single-byte case (there are at
+  // most input_size_ of those) and hash maps keyed on the derivation, not on the
+  // set contents -- hashing a 3 KB bitset per label would cost more than it saves.
+  static constexpr uint32_t kNoDep = UINT32_MAX; // "not interned yet"
+  std::vector<uint32_t> dep_single_memo; // flattened offset -> pool index
+  std::unordered_map<uint64_t, uint32_t> dep_range_memo; // (idx<<32|len) -> pool
+  std::unordered_map<uint64_t, uint32_t> dep_union_memo; // (lo<<32|hi) -> pool
+  [[nodiscard]] uint32_t dep_intern_single(size_t idx);
+  [[nodiscard]] uint32_t dep_intern_range(size_t idx, size_t len);
+  [[nodiscard]] uint32_t dep_intern_union(uint32_t a, uint32_t b);
+  /// The set of input offsets @p label depends on.  Only valid once scan_labels()
+  /// has reached @p label.
+  inline const input_dep_t &deps_of(dfsan_label label) const {
+    return dep_pool[branch_to_inputs[label]];
+  }
   // <input_id, offset> will be flattened to bit \sigma_{i=0}^{input_id}{size_of(input_i)} + offset
   inline size_t input_to_dep_idx(uint32_t input_id, uint32_t offset) {
     size_t idx = 0;
@@ -74,6 +147,7 @@ private:
                                std::unordered_set<dfsan_label> &subroots);
   inline dfsan_label strip_zext(dfsan_label label);
   [[nodiscard]] int to_nnf(bool expected_r, rgd::AstNode *node);
+  [[nodiscard]] int expand_bool_xor(bool expected_r, rgd::AstNode *node);
   void to_dnf(const rgd::AstNode *node, formula_t &formula);
   [[nodiscard]] task_t construct_task(const clause_t &clause);
   [[nodiscard]] constraint_t parse_constraint(dfsan_label label);
@@ -82,6 +156,16 @@ private:
                                 std::unordered_set<dfsan_label> &visited);
   uint32_t map_arg(uint32_t input_id, uint32_t offset, uint32_t length,
                    constraint_t constraint);
+  [[nodiscard]] bool pack_const_bytes(const uint8_t *content, uint32_t size,
+                                      rgd::AstNode *node, constraint_t constraint);
+  [[nodiscard]] bool add_str_operand(dfsan_label label, dfsan_label operand,
+                                     uint32_t content_size, rgd::AstNode *child,
+                                     constraint_t constraint,
+                                     std::unordered_set<dfsan_label> &visited);
+  [[nodiscard]] bool do_uta_str(dfsan_label label, dfsan_label_info *info,
+                                uint16_t kind, rgd::AstNode *ret,
+                                constraint_t constraint,
+                                std::unordered_set<dfsan_label> &visited);
 
   bool save_constraint(expr_t expr, bool result);
   inline void add_nested_constraint(task_t task, const clause_t &nested_caluse);

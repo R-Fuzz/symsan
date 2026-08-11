@@ -18,15 +18,41 @@ enum solver_result_t {
   SOLVER_SAT,
   SOLVER_UNSAT,
   SOLVER_TIMEOUT,
+  /// The solver did not search: the task is outside what it handles.
+  ///
+  /// Split off from SOLVER_TIMEOUT, which the ladder used to receive for both
+  /// of a solver's failure modes and so could not tell apart.  They are
+  /// opposite signals.  A decline is near-free and is POSITIVE evidence for the
+  /// next rung -- i2s refusing a nested task, or jigsaw refusing an FP root,
+  /// says nothing about difficulty, only that a strictly more capable solver
+  /// should have it.  A timeout is a search that ran its whole budget and came
+  /// back empty; it is expensive and it is weak evidence, because the next rung
+  /// may well spend just as long failing.  A scheduler that treats them alike
+  /// either pays search cost it did not need to or skips capability it did.
+  ///
+  /// Appended rather than inserted: the value crosses the C API as an int
+  /// (symsan_c.h), so the existing four must keep their numbering.
+  SOLVER_DECLINE,
 };
 
 class Solver {
 public:
   virtual ~Solver() {};
+  // out_buf belongs to the caller and out_size is the length written, which is
+  // not necessarily in_size: an answer may be shorter than the input (a strlen
+  // satisfied by deleting bytes) or longer (inserting them, or an atoi answered
+  // with more digits).  Same shape as AFL++'s custom-mutator afl_custom_fuzz,
+  // which is what driver/aflpp/symsan.cpp forwards this to -- whoever owns the
+  // buffer sizes it for a grown answer.
   virtual solver_result_t solve(std::shared_ptr<SearchTask> task,
                                 const uint8_t *in_buf, size_t in_size,
                                 uint8_t *out_buf, size_t &out_size) = 0;
   virtual void print_stats(int fd) = 0;
+  // A stable short name, for accounting kept by ladder position.  Which solver
+  // sits at position j depends on which ones the config enabled, so a caller
+  // that reports per-position numbers cannot name them from the flags without
+  // repeating the ladder's construction order; it asks here instead.
+  virtual const char *name() const = 0;
 };
 
 class Z3Solver : public Solver {
@@ -36,6 +62,7 @@ public:
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
   void print_stats(int fd) override {} ;
+  const char *name() const override { return "z3"; }
 private:
   z3::expr serialize_rel(uint32_t comparison,
                          const AstNode* node,
@@ -60,6 +87,14 @@ public:
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
   void print_stats(int fd) override;
+  const char *name() const override { return "jigsaw"; }
+  // JIT every constraint in @p task that does not already carry a compiled
+  // function, consulting (and filling) the AST-keyed function cache.  solve()
+  // does this before searching; it is exposed so a driver that only wants to
+  // exercise the cache -- driver/rgdreplay.cpp -- can stop here rather than
+  // paying for a gradient-descent run it will not look at.  Returns false if
+  // codegen rejected a constraint, which fails the whole task.
+  bool jit_constraints(std::shared_ptr<SearchTask> task);
   // timing accessors (microseconds), cumulative across solve() calls:
   //   codegen  = AST -> LLVM IR (addFunction)
   //   jit      = LLVM IR -> native code (performJit)
@@ -85,6 +120,7 @@ public:
                         const uint8_t *in_buf, size_t in_size,
                         uint8_t *out_buf, size_t &out_size) override;
   void print_stats(int fd) override {};
+  const char *name() const override { return "i2s"; }
 private:
   uint64_t matches;
   uint64_t mismatches;
@@ -103,6 +139,14 @@ private:
   // log1p) that solve_fcmp reverses via the numeric libm inverse (log for exp,
   // ...) and verifies.  Also kept out of fp_ops_mask so they reach solve_fcmp.
   std::bitset<rgd::LastOp> fp_trans_mask;
+  // bits for every string-theory kind.  Unlike jigsaw and the two z3 backends,
+  // which reject an unknown kind through a default: case while walking the
+  // tree, i2s works off the *enclosing* comparison's traced operand values and
+  // its i2s_candidates -- so it can emit a byte assignment without ever
+  // visiting the string subtree, and silence here would be an unsound SAT
+  // rather than a decline.  Nothing solves these yet; see the string kinds in
+  // include/ast.h.
+  std::bitset<rgd::LastOp> string_op_mask;
 
   solver_result_t solve_icmp(std::shared_ptr<const Constraint> const& c,
                              std::unique_ptr<ConsMeta> const& cm,
@@ -114,8 +158,43 @@ private:
                              uint32_t comparison,
                              const uint8_t *in_buf, size_t in_size,
                              uint8_t *out_buf, size_t &out_size);
+  // x86_fp80, kept apart from solve_fcmp rather than folded into it.  The
+  // instrumentation admits fp80 for comparisons only, so there is no arith or
+  // transcendental node to invert and none of that machinery applies; and every
+  // value here is a `long double` rather than a uint64 bit pattern, which is
+  // what makes the format tractable at all.  See the header comment on
+  // fp80_decode in i2s-solver.cpp.
+  solver_result_t solve_fcmp80(std::shared_ptr<const Constraint> const& c,
+                               std::unique_ptr<ConsMeta> const& cm,
+                               uint32_t comparison,
+                               const uint8_t *in_buf, size_t in_size,
+                               uint8_t *out_buf, size_t &out_size);
   solver_result_t solve_memcmp(std::shared_ptr<const Constraint> const& c,
                                std::unique_ptr<ConsMeta> const& cm,
+                               const uint8_t *in_buf, size_t in_size,
+                               uint8_t *out_buf, size_t &out_size);
+  // AST-guided fallbacks, tried only where the value-based matching above has
+  // already given up.  They walk the constraint's AST instead of looking for
+  // the compared value in the input, which is the only way to reach a table
+  // lookup (whose output never appears in the input) or nested arithmetic with
+  // more than one operation.  Every candidate they produce is verified by
+  // re-evaluating the constraint before it is returned.
+  solver_result_t solve_ast(std::shared_ptr<const Constraint> const& c,
+                            uint32_t comparison,
+                            const uint8_t *in_buf, size_t in_size,
+                            uint8_t *out_buf, size_t &out_size);
+  solver_result_t solve_memcmp_ast(std::shared_ptr<const Constraint> const& c,
+                                   const uint8_t *in_buf, size_t in_size,
+                                   uint8_t *out_buf, size_t &out_size);
+  // The only path allowed to touch a constraint that string_op_mask matched.
+  // It works entirely off the AST -- the string content is in there, byte by
+  // byte -- and takes no ConsMeta: i2s_candidates records where a *compared
+  // value* appears in the input, and the value compared here is a match
+  // position or a length, which is not in the input at all.  Every answer is
+  // checked by re-running the string operation over the rewritten bytes, so a
+  // shape this does not really understand declines instead of guessing.
+  solver_result_t solve_string(std::shared_ptr<const Constraint> const& c,
+                               uint32_t comparison,
                                const uint8_t *in_buf, size_t in_size,
                                uint8_t *out_buf, size_t &out_size);
 };

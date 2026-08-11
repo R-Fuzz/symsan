@@ -230,6 +230,31 @@ static inline dfsan_label get_str_label(const char *s, dfsan_label s_label) {
   return get_str_label_n(s, s_label, len + 1, term_label);
 }
 
+// Same thing for the strn* family, which looks at *at most* n bytes.
+//
+// get_str_label() measures with strlen(), and for a buffer that is not
+// terminated inside the compared prefix that walks arbitrarily far past it: in
+// test-transform the strncmp of 5 bytes at buff+24 read 41, off the end of the
+// 64 bytes the harness had actually written into buff[100].  Two things go
+// wrong at once there.  The label describes 41 bytes when the comparison is
+// about 5, which is the width mismatch str_cmp_operands has to paper over; and
+// the read runs into the alloca's never-written tail, where __taint_union_load
+// finds kInitializingLabel.  So bound the read the way the comparison itself is
+// bounded -- up to the terminator, never past n.
+static inline dfsan_label get_strn_label(const char *s, dfsan_label s_label,
+                                         size_t n, dfsan_label n_label) {
+  size_t len = strnlen(s, n);
+  if (len < n) {
+    // the terminator is part of what strncmp looked at, and it may itself sit
+    // at a position an earlier strchr found -- the same recovery get_str_label
+    // does, only worth trying when we did not already get a length label.
+    if (n_label == 0)
+      n_label = taint_get_str_indexof_label(s + len);
+    len++;
+  }
+  return get_str_label_n(s, s_label, len, n_label);
+}
+
 static inline dfsan_label get_label_for(int fd, off_t offset) {
   // check if fd is stdin, if so, the label hasn't been pre-allocated
   if (is_stdin_taint() || (fd ==0 && flags().force_stdin))
@@ -281,6 +306,48 @@ static inline dfsan_label net16_label(dfsan_label label) {
 #endif
 }
 
+// Model a case fold (tolower = c | 0x20, toupper = c & 0x5f) over the label of
+// an argument that has already been promoted to int.
+//
+// tolower/toupper take an `int`, so the caller widens the byte before the call
+// and c_label is a 32-bit ZExt (or SExt, for a signed char) of the real 8-bit
+// value.  This used to build the mask node as
+//
+//   dfsan_union(0, c_label, Or, 8, 0x20, 0)
+//
+// whose declared size, 8, contradicts its operand's, 32.  Both solver front
+// ends happen to survive that -- they re-extend the operand and the mask fits
+// in 8 bits, so the value comes out right either way -- but it is a node that
+// does not describe a term, and nothing downstream is obliged to keep guessing
+// what was meant.
+//
+// So peel the promotion, apply the mask at the operand's own width, and put the
+// promotion back on top: every node then means what it says.  Re-wrapping
+// rather than leaving the 8-bit result bare is what keeps the common caller
+// working -- `c = tolower(c)` stores back into a char, the store truncates, and
+// __taint_union's Trunc(ZExt(x)) -> x rule folds the pair away to an exactly
+// 8-bit node, which is the width dfsan_read_label and cmp_label_fits want when
+// the bytes later reach a str*cmp.  A caller that keeps the full int is equally
+// well served, since ZExt32(Or8(x, 0x20)) and Or32(ZExt32(x), 0x20) denote the
+// same value.
+static inline dfsan_label case_fold_label(dfsan_label c_label, uint16_t op,
+                                          uint64_t mask) {
+  if (c_label == 0)
+    return 0;
+  dfsan_label_info *info = dfsan_get_label_info(c_label);
+  if ((info->op == __dfsan::ZExt || info->op == __dfsan::SExt) && info->l1) {
+    dfsan_label base = info->l1;
+    dfsan_label folded = dfsan_union(0, base, op,
+                                     dfsan_get_label_info(base)->size, mask, 0);
+    if (folded == 0)
+      return 0;
+    return dfsan_union(folded, 0, info->op, info->size, 0, 0);
+  }
+  // nothing to peel: a genuinely wide symbolic argument.  Still size the node
+  // to the operand rather than to a hardcoded 8.
+  return dfsan_union(0, c_label, op, info->size, mask, 0);
+}
+
 static inline dfsan_label net32_label(dfsan_label label) {
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
     __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -305,6 +372,27 @@ __taint_trace_memcmp(dfsan_label label);
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_check_bounds(dfsan_label addr_label, uptr addr,
                           dfsan_label size_label, uint64_t size);
+
+// Narrow a shipped-content byte count to the label's 16-bit size field.
+//
+// The convention every content-shipping wrapper below follows: content_len is
+// the number of bytes the call ACTUALLY SEARCHES, so a consumer can take the
+// extent straight from the node and never has to scan the payload to find out
+// where it ends.  Per the C standard that is not the same rule for every
+// function -- strchr/strrchr search the terminator (C11 7.24.5.2, 7.24.5.5:
+// "The terminating null character is considered to be part of the string"), so
+// they ship strlen + 1; memchr/memrchr search exactly the n they were given;
+// strstr/strpbrk do not match the terminator, so they ship strlen.
+//
+// The clamp is here because these counts became able to exceed the string
+// length: at exactly UINT16_MAX a bare (uint16_t)(len + 1) wraps to 0, which
+// reads as "no content" and would silently drop the payload.  Over-long
+// haystacks were already being truncated by the cast; saturating is closer to
+// the truth than truncating mod 65536, and the byte count still describes the
+// prefix backend/fastgen.cpp copies.
+static inline uint16_t str_content_len(size_t n) {
+  return n > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)n;
+}
 
 // Encode the haystack base-pointer label into the high 32 bits of a string
 // search op's op2 (whose low 8 bits hold the needle char). Under UC the search
@@ -441,6 +529,69 @@ __dfsw_lstat(const char *path, struct stat *buf, dfsan_label path_label,
   return ret;
 }
 
+// The `64` spellings of the stat family.  A target built with
+// _FILE_OFFSET_BITS=64 -- which is what autoconf's AC_SYS_LARGEFILE gives
+// almost every library, libxml2 among them -- does not call `stat` at all:
+// glibc redirects the declaration, so the call in the IR is to `stat64`, a
+// name the abilist did not know.  DFSan then leaves `buf` alone, the kernel
+// having written it behind the shadow's back, and the caller's first branch on
+// st_mode reads the uninitialized-stack poison.  That is fatal, not merely
+// imprecise: __taint_trace_cond Die()s on kInitializingLabel under the default
+// exit_on_memerror, so the whole trace ends at the target's first stat -- for
+// xmllint, 29 conditions in and before a byte of XML is parsed.
+//
+// Forwarding rather than repeating the body: on LP64 Linux `struct stat64` is
+// `struct stat` (both 144 bytes, same field offsets) and stat64() is stat(),
+// so there is nothing for these to do differently, and a second copy of the
+// shadow-clearing is a second place to forget it.
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_stat64(const char *path, struct stat *buf, dfsan_label path_label,
+              dfsan_label buf_label, dfsan_label *ret_label) {
+  return __dfsw_stat(path, buf, path_label, buf_label, ret_label);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_lstat64(const char *path, struct stat *buf, dfsan_label path_label,
+               dfsan_label buf_label, dfsan_label *ret_label) {
+  return __dfsw_lstat(path, buf, path_label, buf_label, ret_label);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_fstat64(int fd, struct stat *buf, dfsan_label fd_label,
+               dfsan_label buf_label, dfsan_label *ret_label) {
+  return __dfsw_fstat(fd, buf, fd_label, buf_label, ret_label);
+}
+
+// fstatat is the spelling the rest of the family is implemented in terms of,
+// and the one std::filesystem and newer code reach for directly.  It has no
+// wrapper of its own to forward to, so this is the body, with AT_SYMLINK_NOFOLLOW
+// deciding whether the name or the link is the file whose size we may taint.
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_fstatat(int dirfd, const char *path, struct stat *buf, int atflags,
+               dfsan_label dirfd_label, dfsan_label path_label,
+               dfsan_label buf_label, dfsan_label atflags_label,
+               dfsan_label *ret_label) {
+  int ret = fstatat(dirfd, path, buf, atflags);
+  if (ret == 0) {
+    dfsan_set_label(0, buf, sizeof(struct stat));
+    if (flags().trace_fsize && is_taint_file(path)) {
+      dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0);
+      dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size));
+    }
+  }
+  *ret_label = 0;
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_fstatat64(int dirfd, const char *path, struct stat *buf, int atflags,
+                 dfsan_label dirfd_label, dfsan_label path_label,
+                 dfsan_label buf_label, dfsan_label atflags_label,
+                 dfsan_label *ret_label) {
+  return __dfsw_fstatat(dirfd, path, buf, atflags, dirfd_label, path_label,
+                        buf_label, atflags_label, ret_label);
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
                                                   dfsan_label s_label,
                                                   dfsan_label c_label,
@@ -455,13 +606,16 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
   if (src_label != 0 || c_label != 0) {
     // Determine which operand is concrete and set size accordingly
     size_t haystack_len = strlen(s);
-    uint16_t content_len = (src_label == 0) ? (uint16_t)haystack_len : 0;
+    uint16_t content_len = (src_label == 0) ? str_content_len(haystack_len + 1) : 0;
 
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = c_label (target char - may be symbolic!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = char value
-    // size = haystack length if concrete, else 0
+    // size = searched extent if concrete, else 0.  strlen + 1, not strlen:
+    // C11 7.24.5.2 says the terminating null character is considered part of
+    // the string for strchr, so the region this call actually searches is
+    // [0, strlen] and strchr(s, '\0') returns a pointer into it.
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrchr,
                              content_len,
                              (uint64_t)s,
@@ -501,16 +655,20 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
     size_t haystack_len = strlen(s);
     uint16_t content_len = 0;
     if (src_label == 0) {
-      content_len = (uint16_t)haystack_len;
+      content_len = str_content_len(haystack_len);
     } else if (real_accept_label == 0) {
-      content_len = (uint16_t)accept_len;
+      content_len = str_content_len(accept_len);
     }
 
     // l1 = src_label (source content)
     // l2 = accept_label (character set - may be symbolic)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = accept pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else accept length if accept concrete, else 0
+    // size = haystack length if haystack concrete, else accept length if accept
+    // concrete, else 0.  strlen, not strlen + 1, for either: C11 7.24.5.4 says
+    // strpbrk locates a character that occurs in the *set* s2, and the
+    // terminator is not one of that set's characters, so neither string's
+    // searched extent includes it.
     dfsan_label label = dfsan_union(src_label, real_accept_label, __dfsan::fstrpbrk,
                                     content_len,
                                     (uint64_t)s,
@@ -599,6 +757,93 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   return ret;
 }
 
+// Which comparison op the str*cmp family should build, using the same rule
+// __dfsw_memcmp and __dfsw_bcmp above already apply: string theory is only
+// needed when an operand is itself the result of a string op (a substring, a
+// strchr position, ...).  "input bytes against a literal" is a fixed-length
+// byte comparison whichever libc function spelled it.
+//
+// This matters beyond tidiness.  parsers/rgd-parser.cpp understands fmemcmp
+// but has no fstrcmp case, so an fstrcmp label falls through to the OP_MAP
+// lookup and is rejected with "invalid op: 85" -- the task is never built and
+// the whole RGD ladder (i2s, jigsaw, and its z3) never sees the constraint.
+// Only solvers/z3-ts.cpp knows fstrcmp.  Tagging every str*cmp fstrcmp
+// therefore put the entire family out of reach of the fuzzing path, including
+// the common case that is plainly just a memcmp.
+static inline uint16_t str_cmp_op(dfsan_label l1, dfsan_label l2) {
+  bool l1_is_string_op =
+      (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
+  bool l2_is_string_op =
+      (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
+  return (l1_is_string_op || l2_is_string_op) ? __dfsan::fstrcmp
+                                              : __dfsan::fmemcmp;
+}
+
+// How wide an unbounded strcmp/strcasecmp is once it lowers to fmemcmp.  A
+// strcmp stops at the first terminator, so the width that says "these are the
+// same string" is the *concrete* side's length plus its NUL -- requiring that
+// terminator is what separates "equal" from "is a prefix of".  Measuring the
+// symbolic side instead, which is what the fstrcmp path does, would make the
+// constant content run off the end of the literal and constrain whatever
+// happens to follow it in .rodata.
+static inline size_t str_cmp_len(const char *s1, const char *s2, dfsan_label l1,
+                                 dfsan_label l2) {
+  size_t len1 = strlen(s1);
+  size_t len2 = strlen(s2);
+  if (l2 == 0) return len2 + 1;
+  if (l1 == 0) return len1 + 1;
+  // Both sides symbolic: neither length is fixed, so compare as far as they
+  // both go on this execution.
+  return (len1 < len2 ? len1 : len2) + 1;
+}
+
+// Pick that op *and* the operand labels to build it from, for a str*cmp that
+// compares n bytes.  Returns the op and updates l1/l2 in place; on entry they
+// must be the get_str_label() results, which is what decides whether string
+// theory is needed at all.
+//
+// An fmemcmp is a fixed-width comparison and its operands have to be exactly
+// that wide: parsers/rgd-parser.cpp builds the constant side at info->size * 8
+// bits and takes the symbolic side's width from the label itself, so the two
+// must describe the same n bytes.  get_str_label() does not promise that -- it
+// measures with strlen(), and for a buffer whose tainted bytes run past the
+// compared prefix (an unterminated read(2) buffer, say) or for a string whose
+// content label was stashed whole by strdup, the label it hands back is wider
+// than n.  The mismatch survives all the way into the solvers: z3 rejects the
+// term with "Sorts (_ BitVec 56) and (_ BitVec 176) are incompatible", and
+// jigsaw's JIT emits "icmp eq i64 %x, i512 %y" and dies in the IR verifier,
+// taking the fuzzer with it.  __dfsw_memcmp has never had the problem because
+// it reads exactly n bytes to begin with.
+//
+// So read exactly n bytes here too, and read them straight out of the shadow
+// rather than through get_str_label_n(): the whole point is to describe the n
+// bytes on the wire, and the fsubstr/str_map recovery get_str_label_n does is
+// what returns a wider label.  Nothing is lost by skipping it, because an
+// operand that really is a string term was already spotted above and left to
+// string theory, which is where its length belongs.
+//
+// If the read still does not line up -- it should not, but the operand widths
+// are the invariant the solvers segfault on -- keep the original labels and
+// fall back to fstrcmp, which is exactly what this code did before fmemcmp was
+// an option.
+static inline bool cmp_label_fits(dfsan_label l, size_t n) {
+  return l == 0 || dfsan_get_label_info(l)->size == n * 8;
+}
+
+static inline uint16_t str_cmp_operands(const char *s1, const char *s2, size_t n,
+                                        dfsan_label *l1, dfsan_label *l2) {
+  if (str_cmp_op(*l1, *l2) == __dfsan::fstrcmp) return __dfsan::fstrcmp;
+
+  dfsan_label b1 = dfsan_read_label(s1, n);
+  dfsan_label b2 = dfsan_read_label(s2, n);
+  if (!cmp_label_fits(b1, n) || !cmp_label_fits(b2, n))
+    return __dfsan::fstrcmp;
+
+  *l1 = b1;
+  *l2 = b2;
+  return __dfsan::fmemcmp;
+}
+
 DECLARE_WEAK_INTERCEPTOR_HOOK(dfsan_weak_hook_strcmp, uptr caller_pc,
                               const char *s1, const char *s2,
                               dfsan_label s1_label, dfsan_label s2_label)
@@ -627,10 +872,13 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
     dfsan_label s1_fsubstr = taint_get_str_content_label(s1);
     if (s1_fsubstr != 0)
       n = strlen(s2) + 1;  // use concrete side for length
+    else if (str_cmp_op(l1, l2) == __dfsan::fmemcmp)
+      n = str_cmp_len(s1, s2, l1, l2);
 
-    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
+    // the comparison op is commutative - dfsan_union will swap to put
+    // concrete in op1
+    uint16_t op = str_cmp_operands(s1, s2, n, &l1, &l2);
+    dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
   }
@@ -789,10 +1037,13 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
     dfsan_label s1_fsubstr = taint_get_str_content_label(s1);
     if (s1_fsubstr != 0)
       n = strlen(s2) + 1;
+    else if (str_cmp_op(l1, l2) == __dfsan::fmemcmp)
+      n = str_cmp_len(s1, s2, l1, l2);
 
-    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
+    // the comparison op is commutative - dfsan_union will swap to put
+    // concrete in op1
+    uint16_t op = str_cmp_operands(s1, s2, n, &l1, &l2);
+    dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
   }
@@ -819,9 +1070,9 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
 
   int ret = strncmp(s1, s2, n);
 
-  // Use unified get_str_label for fsubstr support
-  dfsan_label l1 = get_str_label(s1, s1_label);
-  dfsan_label l2 = get_str_label(s2, s2_label);
+  // Use unified get_str_label for fsubstr support, bounded by n
+  dfsan_label l1 = get_strn_label(s1, s1_label, n, n_label);
+  dfsan_label l2 = get_strn_label(s2, s2_label, n, n_label);
 
   if (l1 == 0 && l2 == 0) {
     *ret_label = 0;
@@ -832,8 +1083,8 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
     if (l2 == 0 && strlen(s2) < (n - 1))
       n = strlen(s2) + 1;
 
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
+    uint16_t op = str_cmp_operands(s1, s2, n, &l1, &l2);
+    dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
   }
@@ -851,9 +1102,9 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
 
   int ret = strncasecmp(s1, s2, n);
   // doing an optimistic solving here too, hoping the case can be the same
-  // Use unified get_str_label for fsubstr support
-  dfsan_label l1 = get_str_label(s1, s1_label);
-  dfsan_label l2 = get_str_label(s2, s2_label);
+  // Use unified get_str_label for fsubstr support, bounded by n
+  dfsan_label l1 = get_strn_label(s1, s1_label, n, n_label);
+  dfsan_label l2 = get_strn_label(s2, s2_label, n, n_label);
 
   if (l1 == 0 && l2 == 0) {
     *ret_label = 0;
@@ -864,8 +1115,8 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
     if (l2 == 0 && strlen(s2) < (n - 1))
       n = strlen(s2) + 1;
 
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
-                                   (uint64_t)s1, (uint64_t)s2);
+    uint16_t op = str_cmp_operands(s1, s2, n, &l1, &l2);
+    dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
   }
@@ -961,14 +1212,14 @@ void *__dfsw_memset(void *s, int c, size_t n,
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_tolower(int c, dfsan_label c_label, dfsan_label *ret_label) {
   int ret = tolower(c);
-  *ret_label = dfsan_union(0, c_label, __dfsan::Or, 8, 0x20, 0);
+  *ret_label = case_fold_label(c_label, __dfsan::Or, 0x20);
   return ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_toupper(int c, dfsan_label c_label, dfsan_label *ret_label) {
   int ret = toupper(c);
-  *ret_label = dfsan_union(0, c_label, __dfsan::And, 8, 0x5f, 0);
+  *ret_label = case_fold_label(c_label, __dfsan::And, 0x5f);
   return ret;
 }
 
@@ -1737,6 +1988,17 @@ int __dfsw_getrlimit(int resource, struct rlimit *rlim,
   return ret;
 }
 
+// _FILE_OFFSET_BITS=64 redirects this one too, and `struct rlimit64` is
+// `struct rlimit` on LP64.  See the note above __dfsw_stat64 for why a missing
+// alias here is fatal rather than imprecise.
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw_getrlimit64(int resource, struct rlimit *rlim,
+                       dfsan_label resource_label, dfsan_label rlim_label,
+                       dfsan_label *ret_label) {
+  return __dfsw_getrlimit(resource, rlim, resource_label, rlim_label,
+                          ret_label);
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_getrusage(int who, struct rusage *usage, dfsan_label who_label,
                      dfsan_label usage_label, dfsan_label *ret_label) {
@@ -2183,13 +2445,19 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     }
 
     // Determine which operand is concrete and set size accordingly
-    uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
+    // n, with no adjustment: memchr searches exactly the n bytes it was given
+    // (C11 7.24.5.1) and does not stop at a terminator, so the extent is n even
+    // when the buffer holds a shorter C string.  This is the one place where
+    // the shipped count can exceed the string length, and it is the truth --
+    // the fstrchr node built here is indistinguishable from __dfsw_strchr's, so
+    // a consumer that wants the string length has to derive it from the bytes.
+    uint16_t content_len = (src_label == 0) ? str_content_len(n) : 0;
 
     // l1 = bounded_src (haystack content, bounded by n when symbolic)
     // l2 = c_label (character to find)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = character value
-    // size = haystack length if haystack concrete, else 0
+    // size = searched extent if haystack concrete, else 0
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrchr,
                              content_len,
                              (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
@@ -2221,13 +2489,15 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
   if (src_label != 0 || c_label != 0) {
     // Determine which operand is concrete and set size accordingly
     size_t haystack_len = strlen(s);
-    uint16_t content_len = (src_label == 0) ? (uint16_t)haystack_len : 0;
+    uint16_t content_len = (src_label == 0) ? str_content_len(haystack_len + 1) : 0;
 
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = c_label (target char - may be symbolic!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = char value
-    // size = haystack length if concrete, else 0
+    // size = searched extent if concrete, else 0.  strlen + 1 for the same
+    // reason as strchr: C11 7.24.5.5 makes the terminator part of the string
+    // strrchr searches, and it is where strrchr(s, '\0') matches.
     *ret_label = dfsan_union(src_label, c_label, __dfsan::fstrrchr,
                              content_len,
                              (uint64_t)s,
@@ -2275,13 +2545,14 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
     }
 
     // Determine which operand is concrete and set size accordingly
-    uint16_t content_len = (src_label == 0) ? (uint16_t)n : 0;
+    // n, with no adjustment, for the same reason as __dfsw_memchr above.
+    uint16_t content_len = (src_label == 0) ? str_content_len(n) : 0;
 
     // l1 = bounded_src (haystack content, bounded by n when symbolic)
     // l2 = c_label (character to find)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = character value
-    // size = haystack length if haystack concrete, else 0
+    // size = searched extent if haystack concrete, else 0
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrrchr,
                              content_len,
                              (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
@@ -2317,16 +2588,19 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
     size_t needle_len = strlen(needle);
     uint16_t content_len = 0;
     if (src_label == 0) {
-      content_len = (uint16_t)haystack_len;
+      content_len = str_content_len(haystack_len);
     } else if (real_needle_label == 0) {
-      content_len = (uint16_t)needle_len;
+      content_len = str_content_len(needle_len);
     }
 
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = real_needle_label (may be symbolic string!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = needle pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
+    // size = haystack length if haystack concrete, else needle length if needle
+    // concrete, else 0.  strlen, not strlen + 1, for either: C11 7.24.5.7 has
+    // strstr locate the first occurrence of the needle's characters "excluding
+    // the terminating null character", so neither searched extent includes it.
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     content_len,
                                     (uint64_t)haystack,
@@ -2386,16 +2660,18 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strnstr(char *haystack, char *needle,
     size_t needle_len = strlen(needle);
     uint16_t content_len = 0;
     if (src_label == 0) {
-      content_len = (uint16_t)haystack_len;
+      content_len = str_content_len(haystack_len);
     } else if (real_needle_label == 0) {
-      content_len = (uint16_t)needle_len;
+      content_len = str_content_len(needle_len);
     }
 
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = real_needle_label (may be symbolic string!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = needle pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
+    // size = haystack length if haystack concrete, else needle length if needle
+    // concrete, else 0.  Same rule as __dfsw_strstr, and strnlen already stops
+    // at the terminator, so the haystack extent is min(strlen, len) either way.
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     content_len,
                                     (uint64_t)haystack,
@@ -2452,16 +2728,19 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
     // Determine which operand is concrete and set size accordingly
     uint16_t content_len = 0;
     if (src_label == 0) {
-      content_len = (uint16_t)haystacklen;
+      content_len = str_content_len(haystacklen);
     } else if (real_needle_label == 0) {
-      content_len = (uint16_t)needlelen;
+      content_len = str_content_len(needlelen);
     }
 
     // l1 = src_label (haystack content)
     // l2 = real_needle_label (needle content - may be symbolic!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = needle pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
+    // size = haystack length if haystack concrete, else needle length if needle
+    // concrete, else 0.  The caller's lengths verbatim, like __dfsw_memchr:
+    // memmem searches exactly the bytes it is handed and has no terminator to
+    // include or exclude.
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     content_len,
                                     (uint64_t)haystack, (uint64_t)needle);
@@ -3276,6 +3555,43 @@ __dfsw_openat(int dirfd, const char *path, int oflags, dfsan_label dirfd_label,
   return fd;
 }
 
+// The `64` spellings, for a target built with _FILE_OFFSET_BITS=64.  These two
+// fail differently from the stat family (see the note above __dfsw_stat64):
+// nothing dies, the input file simply never gets registered as the taint
+// source, so the trace runs to completion over a program with no symbolic
+// bytes in it.  Written out rather than forwarded because the varargs cannot
+// be passed along; the bodies mirror their siblings above, quirk for quirk.
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_open64(const char *path, int oflags, dfsan_label path_label,
+              dfsan_label flag_label, dfsan_label *va_labels,
+              dfsan_label *ret_label, ...) {
+  va_list args;
+  va_start(args, ret_label);
+  int fd = open(path, oflags, args);
+  va_end(args);
+
+  if (fd)
+    taint_set_file(AT_FDCWD, path, fd);
+  *ret_label = 0;
+  return fd;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_openat64(int dirfd, const char *path, int oflags,
+                dfsan_label dirfd_label, dfsan_label path_label,
+                dfsan_label flag_label, dfsan_label *va_labels,
+                dfsan_label *ret_label, ...) {
+  va_list args;
+  va_start(args, ret_label);
+  int fd = openat(dirfd, path, oflags, args);
+  va_end(args);
+
+  if (fd)
+    taint_set_file(dirfd, path, fd);
+  *ret_label = 0;
+  return fd;
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE FILE *
 __dfsw_fopen(const char *filename, const char *mode,
              dfsan_label filename_label, dfsan_label mode_label,
@@ -3312,6 +3628,16 @@ __dfsw_freopen(const char *filename, const char *mode,
     taint_set_file(AT_FDCWD, filename, fileno(ret));
   *ret_label = 0;
   return ret;
+}
+
+// fopen64 has had an abilist entry all along; freopen64 is its missing twin.
+SANITIZER_INTERFACE_ATTRIBUTE FILE *
+__dfsw_freopen64(const char *filename, const char *mode,
+                 FILE *stream, dfsan_label filename_label,
+                 dfsan_label mode_label, dfsan_label stream_label,
+                 dfsan_label *ret_label) {
+  return __dfsw_freopen(filename, mode, stream, filename_label, mode_label,
+                        stream_label, ret_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
@@ -4189,6 +4515,21 @@ __dfsw_mmap(void *start, size_t length, int prot, int flags, int fd,
   }
   *ret_label = 0;
   return ret;
+}
+
+// The `64` spelling.  This one can fail both ways at once: a target that maps
+// its input misses the taint source, and one that maps anything else gets a
+// region whose shadow was never cleared -- so the poison branch is a stray
+// read away.  off64_t is off_t on LP64.
+SANITIZER_INTERFACE_ATTRIBUTE void *
+__dfsw_mmap64(void *start, size_t length, int prot, int flags, int fd,
+              off_t offset, dfsan_label start_label, dfsan_label len_label,
+              dfsan_label prot_label, dfsan_label flags_label,
+              dfsan_label fd_label, dfsan_label offset_label,
+              dfsan_label *ret_label) {
+  return __dfsw_mmap(start, length, prot, flags, fd, offset, start_label,
+                     len_label, prot_label, flags_label, fd_label,
+                     offset_label, ret_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int

@@ -1,0 +1,113 @@
+diff --git a/instrumentation/SanitizerCoverageLTO.so.cc b/instrumentation/SanitizerCoverageLTO.so.cc
+index 508c02c7..debbf5ae 100644
+--- a/instrumentation/SanitizerCoverageLTO.so.cc
++++ b/instrumentation/SanitizerCoverageLTO.so.cc
+@@ -2668,8 +2668,106 @@ void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
+ 
+       unsigned long long int moduleID =
+           (((unsigned long long int)(rand() & 0xffffffff)) << 32) | getpid();
+-      dFile << "ModuleID=" << moduleID << " Function=" << F.getName().str()
+-            << " edgeID=" << afl_global_id << "\n";
++
++      /* Where this edge comes from, for consumers that have their own name for
++         the same branch -- a symbolic execution engine, say, which identifies
++         branches by source location rather than by edge id.  Function
++         granularity alone is not enough to join on.
++
++         SplitAllCriticalEdges() has already run, so both successors of a
++         conditional branch have that branch's block as their single
++         predecessor: if this block has one predecessor ending in a conditional
++         br, this block *is* one side of that branch, and which side is decided
++         by successor order.  Emitted last because a path may contain spaces and
++         colons; parse it from the right.  Requires -g.
++
++         The branch is not always the immediate predecessor, though, and
++         assuming it was left most edges on a real target undocumented.  Pruning
++         drops a block that fully dominates its successors, so wherever one side
++         of an `if` starts with a straight-line chain -- a `while (1) { ...;
++         return; }` bail macro, or a loop body that falls into its latch -- the
++         block that survives to be instrumented sits one or more *unconditional*
++         hops below the branch.  Walking those hops back up is exact, not a
++         guess: each step requires the child to be its parent's only successor
++         and the parent to be the child's only predecessor, so the two blocks
++         run under precisely the same condition and the edge means the same
++         thing either way.  Bounded because an unconditional cycle is
++         representable, if not reachable.
++
++         A switch is the same idea with a wider key.  The location alone names
++         the switch rather than any one case, so a case block is emitted as the
++         switch's location plus the case value, and always as dir=1: "take this
++         case" is this block, while "do not take it" is everywhere else the
++         switch could go and is not an edge at all.  Edge splitting normally
++         gives each case value a block to itself, so this usually writes one
++         line, but it declines unreachable destinations, and two values sharing
++         a block put the switch in the predecessor list twice -- hence a line
++         per matching value, and the *unique* predecessor rather than the single
++         one, which that duplicate would defeat. */
++
++      auto emitLine = [&](const std::string &Suffix) {
++
++        dFile << "ModuleID=" << moduleID << " Function=" << F.getName().str()
++              << " edgeID=" << afl_global_id << Suffix << "\n";
++
++      };
++
++      auto srcOf = [](const DebugLoc &DL) {
++
++        return " src=" + DL->getFilename().str() + ":" +
++               std::to_string(DL.getLine()) + ":" + std::to_string(DL.getCol());
++
++      };
++
++      const BasicBlock *Side = &BB;
++
++      for (unsigned Hop = 0; Hop < 16; ++Hop) {
++
++        const BasicBlock *P = Side->getSinglePredecessor();
++        if (!P || P == Side) break;
++        const BranchInst *UB = dyn_cast<BranchInst>(P->getTerminator());
++        if (!UB || UB->isConditional()) break;
++        Side = P;
++
++      }
++
++      const BasicBlock *SinglePred = Side->getSinglePredecessor();
++      const BasicBlock *UniquePred = Side->getUniquePredecessor();
++      const BranchInst *BI =
++          SinglePred ? dyn_cast<BranchInst>(SinglePred->getTerminator())
++                     : nullptr;
++      const SwitchInst *SI =
++          UniquePred ? dyn_cast<SwitchInst>(UniquePred->getTerminator())
++                     : nullptr;
++      bool documented = false;
++
++      if (BI && BI->isConditional() && BI->getDebugLoc()) {
++
++        emitLine(" dir=" + std::to_string(BI->getSuccessor(0) == Side ? 1 : 0) +
++                 srcOf(BI->getDebugLoc()));
++        documented = true;
++
++      } else if (SI && SI->getDebugLoc()) {
++
++        for (auto C : SI->cases()) {
++
++          if (C.getCaseSuccessor() != Side) continue;
++          /* Zero-extended to 64 bits because that is the form the consumer's
++             own instrumentation sees; both sides have to normalise alike. */
++          emitLine(" dir=1 case=" +
++                   std::to_string(
++                       C.getCaseValue()->getValue().zextOrTrunc(64).getZExtValue()) +
++                   srcOf(SI->getDebugLoc()));
++          documented = true;
++
++        }
++
++      }
++
++      /* Unconditional edges, function entries, the default destination of a
++         switch, and anything built without -g. */
++
++      if (!documented) emitLine("");
+ 
+     }
+ 

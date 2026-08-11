@@ -1,0 +1,17 @@
+[package]
+name = "libafl-symsan"
+description = "A LibAFL Stage that drives SymSan's concolic execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+symsan = { path = "../symsan" }
+libafl = { workspace = true, features = ["std", "derive"] }
+libafl_bolts = { workspace = true }
+log = "0.4"
+# Only for SymSanTaintMetadata: LibAFL's metadata map stores SerdeAny, so
+# anything published into it has to be (de)serializable.
+serde = { version = "1", features = ["derive"] }

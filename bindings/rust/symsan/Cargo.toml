@@ -1,0 +1,30 @@
+[package]
+name = "symsan"
+description = "Safe Rust bindings for the SymSan concolic execution engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The crate wraps a C library that has to be built first (see build.rs), so
+# `cargo publish` would not work anyway; keep it out of the registry.
+publish = false
+
+# Declares that this crate is the one linking libsymsan_c. Two effects:
+#   * cargo refuses a build graph where two packages claim the same native
+#     library, which would otherwise link it twice;
+#   * the `cargo:key=value` lines build.rs prints become DEP_SYMSAN_C_<KEY>
+#     environment variables in the build scripts of crates that depend on us.
+#     Downstream needs DEP_SYMSAN_C_LIB_DIR to set its own rpath, because
+#     cargo propagates `rustc-link-lib`/`-search` to dependents but not
+#     `rustc-link-arg`.
+links = "symsan_c"
+
+[dependencies]
+
+[build-dependencies]
+# Generates src/sys.rs equivalent at build time from include/symsan_c.h, so the
+# Rust declarations cannot drift from the C header.
+bindgen = "0.72"
+
+[dev-dependencies]

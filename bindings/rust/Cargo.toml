@@ -1,0 +1,39 @@
+# Cargo workspace for SymSan's Rust bindings.
+#
+# Deliberately separate from the CMake build: `make` never invokes cargo, so a
+# C++ user does not need a Rust toolchain.  Configure symsan with
+# -DSYMSAN_BUILD_RUST=ON to get a `rust` target that runs `cargo build` here.
+#
+#   symsan          safe binding over include/symsan_c.h.  No LibAFL dependency
+#                   -- it is a peer of bindings/python, usable on its own.
+#   libafl-symsan   the SymSanStage that plugs the above into a LibAFL fuzzer.
+#   fuzzer          an example front-end binary built from the two.
+
+[workspace]
+resolver = "2"
+members = [
+    "symsan",
+    "libafl-symsan",
+    "fuzzer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/R-Fuzz/symsan"
+
+[workspace.dependencies]
+# LibAFL is not published to crates.io at the version this integration targets
+# (0.16, still unreleased), so we depend on it straight from git.  Pinned to a
+# known-good revision on purpose: LibAFL's main branch drifts and its API is not
+# yet stable, so an unpinned dep would break on an unrelated upstream change.
+# To move to a newer LibAFL, bump `rev` here (all three must match) and run
+# `cargo update -p libafl` to refresh Cargo.lock.
+libafl = { git = "https://github.com/AFLplusplus/LibAFL", rev = "2120857eb6280bc28f4fd598f538942fa02ad4fa", version = "0.16.0" }
+libafl_bolts = { git = "https://github.com/AFLplusplus/LibAFL", rev = "2120857eb6280bc28f4fd598f538942fa02ad4fa", version = "0.16.0" }
+libafl_targets = { git = "https://github.com/AFLplusplus/LibAFL", rev = "2120857eb6280bc28f4fd598f538942fa02ad4fa", version = "0.16.0" }
+
+[profile.release]
+debug = true
+lto = "thin"

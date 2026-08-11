@@ -120,6 +120,13 @@ void taint_set_socket(const void *addr, unsigned addrlen, int fd);
 off_t taint_get_socket(int fd);
 void taint_update_socket_offset(int fd, size_t size);
 void taint_close_socket(int fd);
+
+// AFL++ coverage map, for a binary carrying AFL++'s edge counters; afl_compat.cpp.
+// Unlike InitializeSymSanSolver/InitializeSymSanForkServer this is not a weak
+// hook a backend may or may not fill in -- it lives in the same archive as its
+// caller and decides at run time whether it applies, because --whole-archive
+// links the object either way.
+void InitializeAflCoverage(void);
 }  // extern "C"
 
 template <typename T>
@@ -238,7 +245,41 @@ enum operators {
   fp_log10     = last_llvm_op + 38, // 105 log10
   fp_log1p     = last_llvm_op + 39, // 106 log1p/log1pf
   fp_pow       = last_llvm_op + 40, // 107 pow/powf
-  LastOp    = last_llvm_op + 41, // 108
+  // Load from a read-only global lookup table at a symbolic index.  Produced at
+  // the *load*, not the GEP, so the loaded value gets a real shadow instead of
+  // going concrete (shadow memory over globals is zero).  l1 is the index label,
+  // op1 the table base address, op2 the element count; size is elem_size * 8.
+  // The table contents are shipped separately (see table_type) because the
+  // solver runs in another process and cannot read the target's memory.
+  // Neither z3 nor jigsaw model this: only the i2s solver inverts it, by
+  // scanning the table for the wanted output and re-targeting the index.
+  tlookup      = last_llvm_op + 41, // 108
+  // llvm.bitreverse: reverse the bit order of the operand.  Unary, l1 is the
+  // operand; size is the operand width, which is also the result width.  Kept
+  // as one node rather than decomposed the way bswap is (into size Extracts and
+  // size-1 Concats): bswap costs 15 union-table entries for an i64, bit
+  // reversal would cost 127, and clang's idiom recognizer emits this for every
+  // byte of a CRC's reflection loop.  z3 expands it to a concat of one-bit
+  // extracts, jigsaw JITs the native LLVM intrinsic, and i2s inverts it by
+  // reversing the wanted value.
+  bitreverse   = last_llvm_op + 42, // 109
+  // A concrete operand of an operation wider than 64 bits, carried as a leaf
+  // label: l1 = l2 = 0, op1 = low 64 bits, op2 = high 64 bits, size = width.
+  // The traced-operand slots in dfsan_label_info are 64 bits each, so a wide
+  // concrete operand reaching __taint_union the normal way (as a zero label
+  // plus a value in op1/op2) would be TRUNCATED and embedded in the AST as a
+  // wrong constant -- silently, since a wrong constant is still a well-formed
+  // formula.  Giving it a real label instead moves the value into op1+op2
+  // together, which is exactly 128 bits, and costs one union-table entry per
+  // *distinct* constant for the whole trace: operator== in union_util.cpp
+  // compares both slots, so identical constants dedup and distinct ones do not
+  // collide.  Note this is needed even for small constants like the 64 in
+  // `(unsigned __int128)x >> 64` -- what matters is that the runtime can tell
+  // an exact value from a truncated one, and a zero label cannot say which it
+  // is.  The parser lowers it to a multi-slot rgd::Constant, the convention
+  // z3-solver.cpp and jit.cc already read.
+  WideConst = last_llvm_op + 43, // 110
+  LastOp    = last_llvm_op + 44, // 111
 };
 
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP
@@ -288,6 +329,70 @@ static inline uint8_t get_const_result(uint64_t c1, uint64_t c2, uint32_t predic
     default: break;
   }
   return 0;
+}
+
+// Is this op's `size` field a byte count rather than a bit width?
+//
+// dfsan_label_info::size is overloaded: for everything the instrumentation
+// emits it is the operand's width in bits, but the libc wrappers in
+// dfsan_custom.cpp put a *byte* count there for the ops that compare or search
+// memory -- the extent that was compared, which the solver needs and which has
+// no bit width to speak of.  __taint_union's wide-operand guards read `size`
+// unconditionally as a width, so without this every memcmp/strstr of more than
+// 64 bytes was silently declined; a 65-byte memcmp and a 168-character strchr
+// haystack are both entirely ordinary.
+//
+// Written as a list of the ops that ARE byte counts, so a new op is treated as
+// a width by default -- which is the safe way round: a width that is really a
+// byte count only ever declines a shadow, while the reverse would take a real
+// 128-bit operand through a guard meant to catch it.
+static inline bool op_size_is_byte_count(uint16_t op) {
+  switch (op & 0xff) {
+    // the extent memcmp/bcmp compared
+    case fmemcmp:
+    // str_content_len() of the haystack, saturated at 0xffff
+    case fstrchr: case fstrrchr: case fstrstr: case fstrpbrk:
+    // the compared or concatenated length
+    case fstrcmp: case fprefixof: case fsuffixof: case fstrcat:
+      return true;
+    // fsize/fatoi/fstrlen/fstr_off/fsubstr are deliberately absent: they carry
+    // the bit width of the integer or pointer they produce, not a length.
+    default:
+      return false;
+  }
+}
+
+// For an operation wider than 64 bits, does op2 carry a value operand?  A
+// concrete value operand cannot be represented at that width -- op1/op2 are 64
+// bits each and the instrumentation truncates into them -- so a zero l2 on such
+// an op has to be declined rather than embedded as a wrong constant.  See
+// WideConst, which is how a *constant* operand avoids this; a zero label
+// reaching here at >64 bits therefore means a runtime-untainted wide value.
+//
+// Written as a list of the ops that do NOT read op2 as a value, so anything not
+// considered here is declined: a miss rather than a wrong formula.
+static inline bool wide_op_reads_op2(uint16_t op) {
+  switch (op & 0xff) {
+    case Not: case Neg:
+    // every unary cast, which is the rule rather than a list of the ones that
+    // happen to be reachable wide today: `fptosi double to i128` is the one
+    // that is, and declining it would be a gratuitous miss.
+    case Trunc: case ZExt: case SExt: case BitCast:
+    case FPToUI: case FPToSI: case UIToFP: case SIToFP:
+    case FPTrunc: case FPExt: case PtrToInt: case IntToPtr:
+    case AddrSpaceCast:
+    case bitreverse:
+    // Extract does read op2, but it is the bit offset the instrumentation
+    // emitted, always < the operand width and so never truncated.
+    case Extract:
+    // Load keeps a byte count in l2, not a label.
+    case Load:
+    // the wide-constant leaf itself, whose whole purpose is to fill op1+op2
+    case WideConst:
+      return false;
+    default:
+      return true;
+  }
 }
 
 static inline bool is_commutative(uint16_t op) {
@@ -345,6 +450,9 @@ enum pipe_msg_type {
   event_type,
   gv_type,
   minimize_type,
+  // contents of a read-only global lookup table, sent once per table per trace
+  // so the out-of-process solver can invert a tlookup (see table_msg)
+  table_type,
 };
 
 static const uint8_t TrueBranchLoopLatch = 0x8;
@@ -409,6 +517,16 @@ struct gep_msg {
 // saving the memcmp target
 struct memcmp_msg {
   uint32_t label;
+  uint8_t content[0];
+} __attribute__((packed));
+
+// contents of a read-only lookup table, keyed on its base address (the same
+// value a tlookup label carries in op1).  Sent once per table per trace: the
+// solver runs in a different process and cannot read the target's memory.
+struct table_msg {
+  uptr ptr;
+  uint64_t num_elems;
+  uint64_t elem_size;
   uint8_t content[0];
 } __attribute__((packed));
 

@@ -1,0 +1,32 @@
+# The search-task queue, and the novelty grade it orders by.
+#
+# driver/queuetest.cpp drives rgd::FIFOTaskManager and rgd::PriorityTaskManager
+# against a CovManager that answers from a table, and drives
+# rgd::SharedMapCovManager against a synthetic branch map and a history map it
+# writes itself.  Nothing here compiles or runs a target, so the whole file
+# takes milliseconds.
+#
+# Both halves are scripted for the same reason: neither can be reached from a
+# real trace.
+#
+#   the order   a task is only built for a destination is_branch_interesting()
+#               already said yes about -- every ordinary condition sets
+#               F_ADD_CONS -- so every task a trace produces scores the same,
+#               and a queue that ignored the score entirely would pass any
+#               end-to-end test.
+#
+#   the grade   the three levels come out of the fuzzer's hit-count classes.
+#               Reaching kTargetNewClass from a target means arranging a
+#               particular history map, a particular loop depth and a
+#               particular branch map at once -- three moving parts to observe
+#               one function.  Here each is one assignment.
+#
+# The property that matters most is the one the A/B rests on: with equal scores
+# the priority queue must be *exactly* FIFO, bound and all.  Otherwise a
+# difference measured in a campaign could be the tiebreak rather than the
+# ranking.
+#
+# RUN: %queuetest --map %t.bmap | FileCheck %s
+#
+# CHECK: QUEUE-SUMMARY checks={{[0-9]+}} failures=0
+# CHECK: QUEUE-RESULT PASS

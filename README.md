@@ -68,15 +68,21 @@ adapted by [@insuyun](https://github.com/insuyun) to lit):
 ```
 $ pip install lit
 $ cd your_build_dir
-$ lit tests
+$ lit tests/symsan
 ```
+
+`tests/symsan` is symbolic execution and solving, and depends on nothing outside
+this tree; it is what CI runs. `tests/fuzzing` checks the integration with a
+real fuzzer and needs that fuzzer's toolchain built, so those tests announce
+what they need with `REQUIRES:` and are skipped where it is absent — configure
+with `-DAFLPP_PATH=<path to a built AFL++>` and run `lit tests` to include them.
 
 ### Environment Options
 
-* `KO_CC` specifies the clang to invoke, if the default version isn't clang-12,
+* `KO_CC` specifies the clang to invoke, if the default version isn't clang-18,
   set this variable to allow the compiler wrapper to find the correct clang.
 
-* `KO_CXX` specifies the clang++ to invoke, if the default version isn't clang++-12,
+* `KO_CXX` specifies the clang++ to invoke, if the default version isn't clang++-18,
   set this variable to allow the compiler wrapper to find the correct clang++.
 
 * `KO_USE_Z3` enables the in-process Z3-based solver. By default, it is disabled,
@@ -93,6 +99,11 @@ $ lit tests
 SymSan needs a driver to perform hybrid fuzzing, like [FastGen](https://github.com/R-Fuzz/fastgen).
 It could also be used as a custom mutator for [AFL++](https://github.com/AFLplusplus/AFLplusplus)
 (check the [plugin readme](driver/aflpp/README.md)).
+
+The recommended path is the LibAFL integration under `bindings/rust/`. See the
+[hybrid fuzzing how-to](bindings/rust/HYBRID_FUZZING.md) for an end-to-end
+walkthrough (build, run, scale, read results), and the
+[reference README](bindings/rust/README.md) for the details.
 
 Check out our integration with Magma to see how to compile and run targets:
 [aflplusplus_symsan](https://github.com/R-Fuzz/magma/tree/mazerunner/fuzzers/aflplusplus_symsan).

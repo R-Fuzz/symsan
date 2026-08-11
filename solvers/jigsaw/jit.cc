@@ -40,8 +40,21 @@ std::unique_ptr<GradJit> JIT;
 // an integer as the matching float/double so we can emit native FP ops, and
 // as_bits() reinterprets an FP result back to the integer bit-pattern that the
 // rest of codegen (and the value cache) expects.
+//
+// Only the two widths whose bit-pattern round-trips through a uint64 arg slot
+// are accepted.  This used to be `bits == 32 ? float : double`, which answered
+// "double" for every other width and so emitted `bitcast i80 -> double` once
+// x86_fp80 comparisons started being instrumented: invalid IR, and the caller
+// below discarded verifyFunction's verdict, so it reached the JIT anyway.
+// Declining here rather than at each FCmp case covers the arithmetic cases too,
+// and is the single point where jigsaw's format support is stated.  x86_fp80 in
+// particular can never work here: it has an explicit integer significand bit and
+// does not fit a uint64 slot at all -- i2s handles it natively instead (see
+// solve_fcmp80), which is why the decline must be by format and not by width.
 static inline llvm::Type* fp_type(llvm::IRBuilder<> &Builder, unsigned bits) {
-  return bits == 32 ? Builder.getFloatTy() : Builder.getDoubleTy();
+  if (bits == 32) return Builder.getFloatTy();
+  if (bits == 64) return Builder.getDoubleTy();
+  throw std::invalid_argument("unsupported floating-point width in jigsaw");
 }
 static inline llvm::Value* as_fp(llvm::IRBuilder<> &Builder, llvm::Value* v,
                                  unsigned bits) {
@@ -215,6 +228,23 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
     return itr->second;
   }
 
+  // A comparison (integer or FP) and Memcmp/MemcmpN write their operands to
+  // args[0]/args[1] for gd.cc's get_distance() and produce no value of their
+  // own -- they end with `ret = nullptr` below.  That is only meaningful at
+  // the ROOT of a constraint.  Nested under anything else -- `zext (icmp ..)`,
+  // which the dataflow graph really does produce -- the parent dereferences
+  // that nullptr and we segfault inside IRBuilder.  jigsaw's research
+  // prototype dropped such trees before codegen ever ran (analyzeExpr's
+  // zext_bool flag in ../jigsaw/rgd.cc); do it here instead, at the one place
+  // that can see the parent/child relationship, so addFunction() catches the
+  // invalid_argument, declines the task, and the chain falls back to z3.
+  for (uint32_t i = 0, n = node->children_size(); i < n; i++) {
+    uint16_t ck = node->children(i).kind();
+    if (isRelationalKind(ck) || isFPRelationalKind(ck) ||
+        ck == rgd::Memcmp || ck == rgd::MemcmpN)
+      throw std::invalid_argument("nested comparison has no value");
+  }
+
   llvm::Type *ArgTy = Builder.getInt64Ty();
   switch (node->kind()) {
     case rgd::Bool: {
@@ -237,7 +267,10 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       Type* CTy = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
       llvm::PointerType* CPTy = llvm::PointerType::getUnqual(CTy);
       ret = Builder.CreateBitCast(ret, CPTy);
-      ret = Builder.CreateLoad(CTy, ret); // load length bytes at once
+      // The args array is uint64_t, so it is only 8-byte aligned.  An i128 load
+      // would otherwise take LLVM's ABI alignment of 16 and be free to select a
+      // 16-byte-aligned instruction against an address that may not be.
+      ret = Builder.CreateAlignedLoad(CTy, ret, llvm::Align(sizeof(uint64_t)));
       break;
     }
     case rgd::Read: {
@@ -283,6 +316,18 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       ret = Builder.CreateTrunc(
           Builder.CreateLShr(c, node->index()),
           llvm::Type::getIntNTy(Builder.getContext(), node->bits()));
+      break;
+    }
+    case rgd::BitReverse: {
+      // Same width in as out, and LLVM has the intrinsic natively -- x86 has no
+      // bit-reverse instruction, but the backend's expansion is still a handful
+      // of shifts and masks, far cheaper than reconstructing it out of AST
+      // nodes.
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = codegen(Builder, rc, local_map, arg, value_cache);
+      llvm::Type* Ty = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
+      c = Builder.CreateZExtOrTrunc(c, Ty);
+      ret = Builder.CreateIntrinsic(llvm::Intrinsic::bitreverse, {Ty}, {c});
       break;
     }
     case rgd::ZExt: {
@@ -436,6 +481,16 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
     // we don't really care about the comparison, just need to save the operands
       const AstNode* rc1 = &node->children(0);
       const AstNode* rc2 = &node->children(1);
+      // The operands are stored into the args array below as i64 and compared
+      // there by get_distance, which is uint64 by construction.  An operand
+      // wider than that would be TRUNCATED by the extend below, and a distance
+      // of 0 computed over the low 64 bits alone is a false SAT -- jigsaw would
+      // hand back a model that does not satisfy the constraint.  Decline the
+      // whole task instead: the codegen caller catches invalid_argument and
+      // returns -1.  A wide sub-expression under a <=64-bit comparison is fine
+      // and still goes through -- only the comparison itself is limited.
+      if (rc1->bits() > 64 || rc2->bits() > 64)
+        throw std::invalid_argument("comparison operand wider than 64 bits");
       llvm::Value* c1 = codegen(Builder, rc1, local_map, arg, value_cache);
       llvm::Value* c2 = codegen(Builder, rc2, local_map, arg, value_cache);
       // extend to 64-bit to avoid overflow.  For SIGNED comparisons the operands
@@ -840,7 +895,15 @@ int rgd::addFunction(const AstNode* node,
   Builder.CreateRet(body);
 
   llvm::raw_ostream *stream = &llvm::outs();
-  llvm::verifyFunction(*fooFunc, stream);
+  // verifyFunction returns true when the function is BROKEN.  That verdict used
+  // to be dropped on the floor, so malformed IR was printed and then JITed
+  // anyway -- and a bad JIT is a wrong answer, not a missing one.  Decline
+  // instead; every legitimate formula verifies, so this only ever fires on a
+  // codegen bug.
+  if (llvm::verifyFunction(*fooFunc, stream)) {
+    std::cerr << "invalid JIT function, declining task\n";
+    return -1;
+  }
 #if DEBUG
   // TheModule->print(llvm::errs(), nullptr);
 #endif

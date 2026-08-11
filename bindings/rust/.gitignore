@@ -1,0 +1,7 @@
+/target
+
+# LibAFL's forkserver executor stages each testcase through
+# .cur_input_<pid>_<n> in the CWD when the target reads stdin (no `@@`), and
+# only unlinks it on a clean exit -- so every killed symsan-fuzz run leaves one
+# behind here.
+.cur_input_*

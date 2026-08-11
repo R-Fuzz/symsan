@@ -186,6 +186,17 @@ z3::expr Z3Solver::serialize(const AstNode* node,
                         c1.extract(node->index() + node->bits() - 1, node->index()),
                         expr_cache);
     }
+    // No bit-reversal primitive in z3: concat the single-bit extracts back in
+    // the opposite order.  concat's first argument becomes the high bits, so
+    // walking the operand upwards from bit 0 puts bit 0 at the MSB.
+    case rgd::BitReverse: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      uint32_t bits = node->bits();
+      z3::expr r = c1.extract(0, 0);
+      for (uint32_t i = 1; i < bits; ++i)
+        r = z3::concat(r, c1.extract(i, i));
+      return cache_expr(node->label(), r, expr_cache);
+    }
     case rgd::ZExt: {
       z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
       if (c1.is_bool())
@@ -470,6 +481,12 @@ z3::expr Z3Solver::serialize(const AstNode* node,
     case rgd::FpLog1p:
     case rgd::FpPow:
       throw z3::exception("unsupported FP transcendental (i2s-only)");
+      break;
+    // Table lookups are i2s-only too: modelling one in z3 means either a
+    // select over an array theory or an ite chain per element, neither of
+    // which this backend builds.  i2s inverts it by scanning the table.
+    case rgd::TLookup:
+      throw z3::exception("unsupported table lookup (i2s-only)");
       break;
     default:
       WARNF("unhandler expr: ");

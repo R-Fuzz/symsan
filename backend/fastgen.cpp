@@ -18,6 +18,8 @@
 
 #include "solver_common.h"
 
+#include "branch_id.h"
+
 static inline void __send_ubi(dfsan_label label, uint64_t result,
                               uint32_t cid, void *addr) {
   if (__pipe_fd < 0)
@@ -34,14 +36,16 @@ static inline void __send_ubi(dfsan_label label, uint64_t result,
     .result = result
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 }
 
 static struct switch_true_case {
   dfsan_label label;
   uint32_t cid;
+  // the case value that made this the true case.  Kept because cid now names
+  // the *case* rather than the switch, so it is the only thing left that ties
+  // the stash back to the switch whose end we are about to see.
+  uint64_t val;
 } __switch_true_case = {0};
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -80,6 +84,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
     // so the nested constraint will not affect other cases
     __switch_true_case.label = temp;
     __switch_true_case.cid = cid;
+    __switch_true_case.val = c2;
   } else {
     // solve without add_nested
     __taint_send_cond(temp, r, 0, 0, cid, addr);
@@ -90,19 +95,26 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_switch_end(uint32_t cid) {
   if (__switch_true_case.label == 0) {
     return;
-  } else if (__switch_true_case.cid != cid) {
-    AOUT("WARNING: switch end cid mismatch %u vs %u\n",
-         __switch_true_case.cid, cid);
+  }
+
+  // The cid handed to __taint_trace_cmp names a case; the one handed to us
+  // names the switch.  Recomputing the former from the latter and the stashed
+  // case value checks both that the stash belongs to this switch and that the
+  // two sides derive case ids the same way -- see include/branch_id.h.
+  uint32_t case_cid = symsan::switch_case_cid(cid, __switch_true_case.val);
+  if (__switch_true_case.cid != case_cid) {
+    AOUT("WARNING: switch end cid mismatch %u vs %u (switch 0x%x, case %lu)\n",
+         __switch_true_case.cid, case_cid, cid, __switch_true_case.val);
     return;
   }
 
   void *addr = __builtin_return_address(0);
 
   AOUT("solving switch end: %u 0x%x @%p\n",
-       __switch_true_case.label, cid, addr);
+       __switch_true_case.label, case_cid, addr);
 
   // solve the true case
-  __taint_send_cond(__switch_true_case.label, 1, 1, 0, cid, addr);
+  __taint_send_cond(__switch_true_case.label, 1, 1, 0, case_cid, addr);
   __switch_true_case.label = 0;
 }
 
@@ -225,9 +237,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
     .result = (uint64_t)index
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   gep_msg gmsg = {
     .ptr_label = ptr_label,
@@ -240,11 +250,83 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
   };
 
   // FIXME: assuming single writer so msg will arrive in the same order
-  if (internal_write(__pipe_fd, &gmsg, sizeof(gmsg)) < 0) {
-    Die();
-  }
+  __taint_emit(&gmsg, sizeof(gmsg));
 
   return;
+}
+
+// Lookup tables whose contents we have already shipped.  Each trace runs in a
+// freshly forked child, so this needs no explicit per-trace reset.  If a program
+// somehow exceeds the cap we simply resend, which costs bandwidth but stays
+// correct.
+static const unsigned kMaxTrackedTables = 64;
+static uptr __sent_tables[kMaxTrackedTables];
+static unsigned __num_sent_tables = 0;
+
+static bool __table_already_sent(uptr ptr) {
+  for (unsigned i = 0; i < __num_sent_tables; i++) {
+    if (__sent_tables[i] == ptr)
+      return true;
+  }
+  if (__num_sent_tables < kMaxTrackedTables)
+    __sent_tables[__num_sent_tables++] = ptr;
+  return false;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
+__taint_table_lookup(dfsan_label index_label, int64_t index,
+                     uint64_t table_ptr, uint64_t num_elems,
+                     uint64_t elem_size) {
+  if (index_label == 0)
+    return 0;
+
+  void *addr = __builtin_return_address(0);
+
+  if (index_label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", index_label, addr);
+    if (flags().exit_on_memerror) Die();
+    else return 0;
+  }
+
+  // Out-of-range index: the trace has already read past the table, so the value
+  // loaded is not something this op describes.  Leave it concrete rather than
+  // handing the solver a model that does not match what ran.
+  if (index < 0 || (uint64_t)index >= num_elems)
+    return 0;
+
+  AOUT("tainted table lookup: table %lx[%lld] = %d, ne: %lu, es: %lu\n",
+       table_ptr, index, index_label, num_elems, elem_size);
+
+  // The solver is in another process and cannot read the table, so ship its
+  // contents once.  Same two-part shape as the memcmp target above.
+  if (__pipe_fd >= 0 && !__table_already_sent((uptr)table_ptr)) {
+    uint64_t content_size = num_elems * elem_size;
+    pipe_msg msg = {
+      .msg_type = table_type,
+      .flags = 0,
+      .instance_id = __instance_id,
+      .addr = (uptr)addr,
+      .context = __taint_trace_callstack,
+      .label = index_label, // just in case
+      .result = content_size
+    };
+
+    __taint_emit(&msg, sizeof(msg));
+
+    size_t msg_size = sizeof(table_msg) + content_size;
+    table_msg *tmsg = (table_msg*)__builtin_alloca(msg_size);
+    tmsg->ptr = (uptr)table_ptr;
+    tmsg->num_elems = num_elems;
+    tmsg->elem_size = elem_size;
+    internal_memcpy(tmsg->content, (void*)table_ptr, content_size);
+
+    // FIXME: assuming single writer so msg will arrive in the same order
+    __taint_emit(tmsg, msg_size);
+  }
+
+  return dfsan_union(index_label, 0, __dfsan::tlookup,
+                     (uint16_t)(elem_size * 8), table_ptr, num_elems);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -271,9 +353,7 @@ __taint_trace_offset(dfsan_label offset_label, s64 offset, unsigned size) {
     .result = (uint64_t)offset
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -300,9 +380,7 @@ __taint_add_constraint(dfsan_label label, uint8_t result) {
     .result = (uint64_t)result
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -337,9 +415,7 @@ __taint_minimize_label(dfsan_label label, u64 size, dfsan_label bounds) {
     .result = 0
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   if (!flags().allow_zero_size_alloc && size == 0) {
     // Emit this after the minimize message so the manager records the hint
@@ -389,9 +465,7 @@ __taint_trace_memcmp(dfsan_label label) {
     .result = (uint64_t)info->size
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   if (!has_content)
     return;
@@ -405,9 +479,7 @@ __taint_trace_memcmp(dfsan_label label) {
   AOUT("sending memcmp content for label %d, size %u, msg_size=%lu\n", label, info->size, msg_size);
 
   // FIXME: assuming single writer so msg will arrive in the same order
-  if (internal_write(__pipe_fd, mmsg, msg_size) < 0) {
-    Die();
-  }
+  __taint_emit(mmsg, msg_size);
 
   return;
 }
@@ -440,9 +512,7 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
     .result = r
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 }
 
 extern "C" void InitializeSymSanSolver() {

@@ -1437,7 +1437,8 @@ int main(int argc, char **argv) {
         this_unsat = true; // this clause is unsat; try the next clause
         break;
       }
-      // SOLVER_TIMEOUT / SOLVER_ERROR: try the next solver for this clause
+      // SOLVER_TIMEOUT / SOLVER_DECLINE / SOLVER_ERROR: try the next solver for
+      // this clause
     }
     if (!this_unsat) all_unsat = false; // clause neither SAT nor proven UNSAT
   }

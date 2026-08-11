@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/personality.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -70,7 +71,11 @@ struct taint_socket __dfsan::tainted_socket;
 // Hash table
 static const uptr hashtable_size = (1ULL << 32);
 static const size_t hashtable_buckets = (1ULL << 20);
-static __taint::union_hashtable __union_table(hashtable_buckets);
+// Default-constructed on purpose, so it lands in .bss with no dynamic
+// initializer; dfsan_init calls init() above the fork point.  See the comment
+// on the class -- a sized constructor here would be an .init_array entry, which
+// runs after .preinit_array and so after the fork, i.e. once per child.
+static __taint::union_hashtable __union_table;
 
 Flags __dfsan::flags_data;
 bool print_debug;
@@ -179,6 +184,19 @@ static inline bool is_kind_of_label(dfsan_label label, uint16_t kind) {
   return get_label_info(label)->op == kind;
 }
 
+// A label that carries allocation bounds in op1/op2 and no expression at all.
+// free() does not create a new label for the freed region -- it rewrites the
+// existing one's op from Alloca to Free in place, so that the address is not
+// reused and a later access can be reported as a use-after-free (see
+// __dfsw_free).  Everything that means "this is bounds, not a value" therefore
+// has to accept both, or it silently stops working the moment the buffer is
+// freed; the parsers already do (z3-ts.cpp's Alloca/Free cases, and parse_gep's
+// "due to async solving, we may have a Free op").
+static inline bool is_bounds_label(dfsan_label label) {
+  uint16_t op = get_label_info(label)->op;
+  return op == __dfsan::Alloca || op == __dfsan::Free;
+}
+
 static bool isZeroOrPowerOfTwo(uint16_t x) { return (x & (x - 1)) == 0; }
 
 static inline bool is_valid_op(uint16_t op) {
@@ -234,6 +252,12 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_event_addr(uint32_t label, uint32_t event_id,
                               uint64_t info, void* addr, uint32_t info2);
 
+// A WideConst leaf is a constant that happens to need a real label to hold its
+// 128 bits, so it carries no more symbolic content than a small literal does.
+static inline bool is_wide_const(dfsan_label l) {
+  return l != 0 && get_label_info(l)->op == __dfsan::WideConst;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2) {
@@ -247,14 +271,41 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     Swap(op1, op2);
   }
   if (l1 == 0 && l2 < CONST_OFFSET &&
-      op != fsize && op != __dfsan::Alloca)
+      op != fsize && op != __dfsan::Alloca && op != __dfsan::WideConst)
+    return 0;
+  // Both guards below are about an operand too wide to fit in op1/op2, so they
+  // have to read `size` as a bit width -- and for the memory-comparison ops it
+  // is a byte count instead (op_size_is_byte_count).  memcmp'ing 65 bytes is
+  // not a 65-bit operation and must not be declined as one.
+  const bool wide = size > 64 && !op_size_is_byte_count(op);
+  // Operations wider than 64 bits can only be represented when every value
+  // operand has a real label: op1/op2 hold 64 bits each and combineShadows
+  // truncates into them, so a concrete wide operand arriving as a zero label is
+  // indistinguishable from an exact one and would be embedded as a wrong
+  // constant.  Instrumented code calls __taint_get_wide on each operand first,
+  // which turns a concrete one into a WideConst leaf before getting here, so a
+  // zero label at this point comes from a caller that has no high half to offer
+  // -- dfsan_union, a libc wrapper -- and there is nothing to do but drop the
+  // shadow rather than lie about it.
+  if (wide && wide_op_reads_op2(op) && (l1 == 0 || l2 == 0))
+    return 0;
+  // ...and every value operand having a real label is now weaker than having
+  // symbolic content, since __taint_get_wide hands out a label for a concrete
+  // operand too.  When it did so for all of them the result is concrete, which
+  // is what the l2 < CONST_OFFSET early-out above drops for narrow ops; it
+  // cannot see this case because a WideConst is a real label, not a small
+  // literal.  Untainted wide arithmetic is common enough -- program startup,
+  // any instrumented i128 that never meets input -- that skipping this would
+  // fill the union table with nodes that constrain nothing.
+  if (wide && is_wide_const(l1) &&
+      (!wide_op_reads_op2(op) || is_wide_const(l2)))
     return 0;
   if (l1 == kInitializingLabel || l2 == kInitializingLabel)
     return kInitializingLabel;
 
   // special handling for bounds
-  if (get_label_info(l1)->op == __dfsan::Alloca ||
-      (op != __dfsan::Load && get_label_info(l2)->op == __dfsan::Alloca)) {
+  if (is_bounds_label(l1) ||
+      (op != __dfsan::Load && is_bounds_label(l2))) {
     // propagate if it's casting op
     if (op == __dfsan::BitCast) return l1;
     if (op == __dfsan::PtrToInt) {AOUT("WARNING: ptrtoint %d\n", l1); return 0;}
@@ -296,16 +347,61 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     if (l2 >= CONST_OFFSET) op2 = 0;
   }
 
+  // All the ubsan modeling below is 64-bit arithmetic: it builds masks as
+  // (1UL << size) - 1 and sign bits as 1ULL << (size - 1).  Once an operand can
+  // be wider than 64 bits those shifts are undefined, and on x86 the shift count
+  // is masked -- so a 128-bit Add computes mask 0 and sign_bit 1ULL << 63, and
+  // every overflow ICmp derived from them is garbage.  That garbage is not a
+  // missing check: it is handed straight to __taint_trace_cond as a real branch
+  // constraint, i.e. a formula that does not describe the program.  Skip the
+  // checks when any width involved exceeds 64 bits.  The operand widths matter
+  // as well as the result's -- a Trunc from i128 to i64 has size == 64 but still
+  // evaluates 1UL << size on a value it only holds the low half of.
+  //
+  // Computed up here, ahead of the folds, because one of them has to know
+  // whether a check is coming before it can decide to skip it -- see Shl below.
+  const bool ub_width_ok = size <= 64 &&
+                           (l1 == 0 || get_label_info(l1)->size <= 64) &&
+                           (l2 == 0 || get_label_info(l2)->size <= 64);
+
   // try simple simplifications, from qsym
+  //
+  // all-ones for this width.  Not (1 << size) - 1: at size == 64 that shifts a
+  // 64-bit value by 64, which is UB, and on x86 the count is masked to 6 bits so
+  // 1 << 64 == 1 and the test quietly degenerated into `op1 == 0` -- shadowed by
+  // op1_is_zero, so the two all-ones folds simply never fired on i64.  Left
+  // false above 64 bits, where op1 holds only the low half of the operand and
+  // says nothing about whether it is saturated.
+  const uint64_t width_mask =
+      size >= 64 ? ~(uint64_t)0 : (((uint64_t)1 << size) - 1);
   bool op1_is_zero = (l1 == 0 && op1 == 0);
-  bool op1_is_all_one = (l1 == 0 && op1 == ((uint64_t)1 << size) - 1);
+  bool op1_is_all_one = (l1 == 0 && size <= 64 && op1 == width_mask);
   bool op2_is_zero = (l2 == 0 && op2 == 0);
   if (op1_is_zero) {
     switch (op) {
       case __dfsan::And: // 0 & x = 0
       case __dfsan::Mul: // 0 * x = 0
-      case __dfsan::Shl: // 0 << x = 0
         return 0;
+      case __dfsan::Shl:  // 0 << x = 0
+      case __dfsan::LShr: // 0 >>u x = 0
+      case __dfsan::AShr: // 0 >>s x = 0, the sign bit being shifted in is 0 too
+        // The result is 0 whatever the exponent is, but the exponent is what
+        // the shift-exponent check below is *about*, and x is symbolic here:
+        // shifting by >= the width is undefined no matter what is being
+        // shifted, so `0 << 64` on an i32 is still UB.  Returning early would
+        // skip a check that is otherwise due -- the check's own gate needs a
+        // symbolic l2, which is exactly what this fold has.  It is the only
+        // check the two right shifts have (shift-base and shift-overflow are
+        // Shl-only), and the only one Shl has left once the base is zero.
+        //
+        // So fold only when no check is coming.  Falling through instead
+        // builds a node, which costs one union-table entry per distinct
+        // exponent and keeps the once-per-unique-expression dedup the checks
+        // are designed around; emitting the check here instead would re-fire
+        // it on every execution, since a folded result has no node to dedup
+        // on.  Every solver simplifies a shift of 0 to 0 anyway.
+        if (!flags().solve_ub || !ub_width_ok) return 0;
+        break;
       case __dfsan::Or: // 0 | x = x
       case __dfsan::Xor: // 0 ^ x = x
       case __dfsan::Add: // 0 + x = x
@@ -321,6 +417,50 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     else if (op == __dfsan::Shl) return l1; // x << 0 = x
     else if (op == __dfsan::LShr) return l1; // x >> 0 = x
     else if (op == __dfsan::AShr) return l1; // x >> 0 = x
+  }
+  // A comparison against the extreme value of its own width is decided by the
+  // width alone: x <=u UINT64_MAX cannot be false and x <u 0 cannot be true, no
+  // matter what x is.  Not dead code the optimizer would have removed -- the
+  // usual source is a size guard against a bound that only becomes saturated
+  // once the operand is widened (a 32-bit count zero-extended to 64 and checked
+  // against a 64-bit maximum), where the source-level types do not say the
+  // answer is constant and -O0 keeps the branch.  Costs one comparison here to
+  // save a trace event, a serialize and a solver simplify that all end up at
+  // the same answer.
+  if ((op & 0xff) == __dfsan::ICmp && size <= 64 && (l1 == 0) != (l2 == 0)) {
+    // normalize to `symbolic <pred> constant`; ICmp is not commutative, so the
+    // swap above did not run and a zero label really is the constant side, but
+    // reading the predicate from the right requires swapping it
+    uint16_t pred = op >> 8;
+    uint64_t c = (l1 == 0) ? op1 : op2;
+    if (l1 == 0) {
+      switch (pred) {
+        case __dfsan::bvugt: pred = __dfsan::bvult; break;
+        case __dfsan::bvuge: pred = __dfsan::bvule; break;
+        case __dfsan::bvult: pred = __dfsan::bvugt; break;
+        case __dfsan::bvule: pred = __dfsan::bvuge; break;
+        case __dfsan::bvsgt: pred = __dfsan::bvslt; break;
+        case __dfsan::bvsge: pred = __dfsan::bvsle; break;
+        case __dfsan::bvslt: pred = __dfsan::bvsgt; break;
+        case __dfsan::bvsle: pred = __dfsan::bvsge; break;
+        default: break; // eq/ne are symmetric
+      }
+    }
+    // operand values arrive zero-extended to the width, which is the convention
+    // op1_is_all_one above already relies on
+    const uint64_t smin = (uint64_t)1 << (size - 1);
+    const uint64_t smax = smin - 1;
+    if ((c == 0          && (pred == __dfsan::bvuge || pred == __dfsan::bvult)) ||
+        (c == width_mask && (pred == __dfsan::bvule || pred == __dfsan::bvugt)) ||
+        (c == smin       && (pred == __dfsan::bvsge || pred == __dfsan::bvslt)) ||
+        (c == smax       && (pred == __dfsan::bvsle || pred == __dfsan::bvsgt))) {
+      // 0x%lx and not %#lx: AOUT goes to the sanitizer's own Printf, whose
+      // grammar is %([0-9]*)?(z|l|ll)?{d,u,x,X} plus %p/%s/%c -- it has no '#'
+      // flag, and an unsupported directive is a Die(), not a bad line.  So this
+      // aborted the process every time a saturated compare fired under debug=1.
+      AOUT("simplify saturated cmp: pred %d vs 0x%lx at %d bits\n", pred, c, size);
+      return 0;
+    }
   }
   // Simplify PtrToInt(string_op) - base_addr to just PtrToInt (the index)
   // This is the ptr2int+sub equivalent of what __taint_gep_offset does for GEP:
@@ -348,6 +488,22 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     // x ^ x = 0
     // x - x = 0
     return 0;
+  } else if ((op & 0xff) == __dfsan::ICmp && l1 == l2 && l1 != 0) {
+    // x <pred> x, on the *same* label.  A label is hash-consed over its whole
+    // subtree, so the two sides are not merely equal-looking: they are one
+    // expression over one set of input bytes, and every integer predicate is
+    // then decided by the predicate alone (eq/ule/uge/sle/sge true, the rest
+    // false).  Returning 0 leaves the concrete result to flow, which is that
+    // same constant.
+    //
+    // Integers only.  FCmp is a separate opcode and is deliberately not folded
+    // here: x != x is *true* for NaN.
+    //
+    // Not a contrived shape: a self-check that recomputes a derived quantity
+    // and asserts it against the copy it stored earlier compares two copies of
+    // one expression, and each occurrence otherwise costs a trace event, a
+    // serialize and a solver simplify to reach the answer available here.
+    return 0;
   }
 
   // setup a hash tree for dedup
@@ -369,7 +525,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   }
 
   // ubsan checks, after dedup, so we don't do redundant checks
-  if (l2 && flags().solve_ub) {
+  if (l2 && flags().solve_ub && ub_width_ok) {
     dfsan_label cond = 0;
     uint16_t op_size = get_label_info(l2)->size;
     switch(op & 0xff) {
@@ -392,10 +548,43 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           AOUT("WARNING: division by zero\n");
           __taint_trace_event_addr(l2, EVENT_DIV_BY_ZERO, 0, __builtin_return_address(0), 0);
         }
+        // -fsanitize=signed-integer-overflow also covers INT_MIN / -1, which
+        // traps exactly like a division by zero and was not modelled here at
+        // all.  clang emits both checks from one place
+        // (EmitUndefinedBehaviorIntegerDivAndRemCheck, CGExprScalar.cpp), where
+        // the *valid* condition is `op1 != INT_MIN || op2 != -1` -- so the UB to
+        // ask the solver for is the conjunction of the two equalities.  Unlike
+        // Add/Sub/Mul the signedness is in the opcode, so there is nothing to
+        // infer: SDiv/SRem only.
+        if ((op & 0xff) == __dfsan::SDiv || (op & 0xff) == __dfsan::SRem) {
+          const uint64_t dmask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL : (1UL << size) - 1;
+          const uint64_t smin = 1ULL << (size - 1);
+          const bool op1_min = (orig_op1 & dmask) == smin;
+          const bool op2_neg1 = (orig_op2 & dmask) == dmask;
+          if (op1_min && op2_neg1) {
+            AOUT("WARNING: signed division overflow\n");
+            __taint_trace_event_addr(l1 ? l1 : l2, EVENT_INT_OVERFLOW, 0,
+                                     __builtin_return_address(0), 0);
+          } else if (l1 || op1_min) {
+            // with a concrete dividend that is not INT_MIN the conjunction is
+            // unsatisfiable, so there is nothing to hand the solver; with a
+            // concrete dividend that *is* INT_MIN only the divisor half is left
+            dfsan_label c2 = do_taint_union(l2, 0, (bveq << 8) | __dfsan::ICmp,
+                                            size, orig_op2, dmask);
+            if (l1) {
+              dfsan_label c1 = do_taint_union(l1, 0, (bveq << 8) | __dfsan::ICmp,
+                                              size, orig_op1, smin);
+              cond = do_taint_union(c1, c2, __dfsan::And, 1, op1_min, op2_neg1);
+            } else {
+              cond = c2;
+            }
+            __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+          }
+        }
         break;
       case __dfsan::Shl:
       case __dfsan::LShr:
-      case __dfsan::AShr:
+      case __dfsan::AShr: {
         // -fsanitize=shift-exponent
         // check for too large value: exponent > size
         if (orig_op2 < size) {
@@ -403,29 +592,61 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                op_size, orig_op2, size);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
         }
-        if ((int64_t)orig_op2 >= 0) {
-          // check for negative value
-          cond = do_taint_union(l2, 0, (bvslt << 8) | __dfsan::ICmp,
-                                op_size, orig_op2, 0);
-          __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
+        // There used to be a second exponent check here, `op2 <s 0`, for a
+        // negative exponent.  It was guarded on `(int64_t)orig_op2 >= 0`, and
+        // orig_op2 is an op_size-bit value zero-extended into a uint64_t, so
+        // that reading is its *unsigned* one and is never negative for an
+        // operand narrower than 64 bits -- the guard was always taken, and the
+        // comparison it emitted is built at op_size, where the exponent may
+        // already be negative.  That is the F1 width bug.
+        //
+        // Fixing the width is not enough: the check is redundant outright.  For
+        // any width n >= 2 a value with its sign bit set is >= 2^(n-1) >= n as
+        // an unsigned number, so every model of `op2 <s 0` already satisfies
+        // `op2 >=u size` above.  Same cid, same UB, second task.  clang gets
+        // both from the one unsigned compare -- `RHS <=u width-1` in EmitShl
+        // (CGExprScalar.cpp) -- and so do we now.
+        //
+        // valid_exp is that same compare in its positive form, for the base
+        // checks below.
+        dfsan_label valid_exp = 0;
+        if ((op & 0xff) == __dfsan::Shl) {
+          valid_exp = do_taint_union(l2, 0, (bvult << 8) | __dfsan::ICmp,
+                                     op_size, orig_op2, size);
         }
-        if (op == __dfsan::Shl && orig_op1 != 0 &&
+        // Both base checks have to be conjoined with valid_exp.  clang emits
+        // them under a branch on the exponent being in range and phis in `true`
+        // otherwise (EmitShl's CheckShiftBase block), because with an
+        // out-of-range exponent the shift is already UB and "which bits were
+        // shifted off" is not a meaningful question.  Ungated, the solver can
+        // answer a shift-base task with an input whose exponent is out of range
+        // -- real UB, but not the one the cid names, and the condition it came
+        // from has nothing to do with it.
+        if ((op & 0xff) == __dfsan::Shl && orig_op1 != 0 &&
             orig_op2 <= __builtin_clzl(orig_op1) - (64 - size)) {
           // check for shift overflow
           // op2 > leading zero bits in op1
           cond = do_taint_union(l2, 0, (bvugt << 8) | __dfsan::ICmp, op_size,
                                 orig_op2, __builtin_clzl(orig_op1) - (64 - size));
+          cond = do_taint_union(cond, valid_exp, __dfsan::And, 1, 0,
+                                orig_op2 < size);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_overflow);
         }
-        if (l1 && (int64_t)orig_op1 >= 0) {
+        // same width bug as the negative-exponent guard above: the sign has to
+        // be read at the base's own width, not at 64.
+        if ((op & 0xff) == __dfsan::Shl && l1 &&
+            (orig_op1 & (1ULL << (get_label_info(l1)->size - 1))) == 0) {
           // check for negative base
           // -fsanitize=shift-base
           // op1 < 0
           cond = do_taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
                                 get_label_info(l1)->size, orig_op1, 0);
+          cond = do_taint_union(cond, valid_exp, __dfsan::And, 1, 0,
+                                orig_op2 < size);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_base);
         }
         break;
+      }
       default:
         break;
     }
@@ -434,7 +655,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   dfsan_label label = add_taint_info(&label_info);
   __union_table.insert(&__dfsan_label_info[label], label);
 
-  if (flags().solve_ub) {
+  if (flags().solve_ub && ub_width_ok) {
     if (op == __dfsan::Trunc && l1) {
       // check for data loss, after the new label is created
       // -fsanitize=implicit-unsigned-integer-truncation
@@ -447,13 +668,47 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         __taint_trace_cond(loss, 0, UndefinedCheck, ub_unsigned_integer_truncation);
       }
       // -fsanitize=implicit-signed-integer-truncation
-      // old_value < signed(1 << (size - 1))
-      int64_t target = (int64_t)((0xFFFFFFFFFFFFFFFFUL >> (size-1)) << (size-1));
-      if ((int64_t)orig_op1 >= target) {
-        uint16_t old_size = get_label_info(l1)->size;
-        if (old_size < 64) target &= ~(1UL << old_size);
-        dfsan_label loss = do_taint_union(l1, 0, (bvslt << 8) | __dfsan::ICmp,
-                                          old_size, orig_op1, target);
+      //
+      // clang's form is one comparison that covers the whole range:
+      // sext(trunc(x)) == x is *valid*, so the truncation is lossy iff they
+      // differ (EmitIntegerTruncationCheckHelper, CGExprScalar.cpp -- it
+      // re-extends by the destination's signedness and equality-compares).
+      //
+      // What was here instead was `old_value < signed(1 << (size - 1))`, i.e.
+      // `x <s INT_MIN(new)`, which is only the below-minimum half.  It never
+      // asked for the other one: (int8_t)300 is signed-truncation UB, and with
+      // x == 300 the guard below passes, so the solver was handed the
+      // below-minimum question and the above-maximum one was never posed.
+      //
+      // Two earlier notes on that check, kept because they are what the shape
+      // has to get right and the new shape still does:
+      //   - orig_op1 holds an old_size-bit value zero-extended into a uint64_t,
+      //     so (int64_t)orig_op1 is never negative for old_size < 64 and the
+      //     guard was always true.  Sign-extend from old_size before comparing,
+      //     or a value already out of range is asked to go out of range --
+      //     already true, and z3-ts rejects it as `value mismatch for cond`.
+      //   - the comparison is built at old_size, so any constant in it has to
+      //     be at that width; the old `target &= ~(1UL << old_size)` cleared a
+      //     single bit above the width instead of masking, and only came out
+      //     right because every consumer truncates to the node width anyway.
+      // The re-extend form has no constant at all, so the second one is moot.
+      uint16_t old_size = get_label_info(l1)->size;
+      const uint64_t old_mask = old_size == 64 ? 0xFFFFFFFFFFFFFFFFUL :
+                                                 (1UL << old_size) - 1;
+      const uint64_t trunc_mask = size == 64 ? 0xFFFFFFFFFFFFFFFFUL :
+                                               (1UL << size) - 1;
+      const uint64_t truncated = orig_op1 & trunc_mask;
+      // sign-extend the truncated value back to old_size, concretely, so the
+      // guard reads the same question the symbolic form asks
+      const uint64_t re_ext =
+          (size >= 64 ? truncated
+                      : (uint64_t)(((int64_t)(truncated << (64 - size))) >> (64 - size)))
+          & old_mask;
+      if (re_ext == (orig_op1 & old_mask)) {
+        dfsan_label se = do_taint_union(label, 0, __dfsan::SExt, old_size,
+                                        truncated, 0);
+        dfsan_label loss = do_taint_union(se, l1, (bvneq << 8) | __dfsan::ICmp,
+                                          old_size, re_ext, orig_op1 & old_mask);
         __taint_trace_cond(loss, 0, UndefinedCheck, ub_signed_integer_truncation);
       }
 
@@ -525,35 +780,54 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       // For multiplication, overflow is harder to detect symbolically
       // Use the approach: if a != 0, then overflow iff result / a != b
       // But we approximate with sign-based check similar to addition
-      uint64_t xor1 = (orig_op1 ^ result) & mask;
-      uint64_t xor2 = (orig_op2 ^ result) & mask;
-      uint64_t overflow_check = xor1 & xor2;
-      uint64_t sign_bit = 1ULL << (size - 1);
-
-      // For signed multiplication: check if signs are inconsistent
-      // Product of same signs should be positive, different signs should be negative
-      // This is an approximation - full check would need wider multiplication
-      bool has_signed_overflow = (overflow_check & sign_bit) != 0;
-
-      if (!has_signed_overflow && (orig_op1 != 0 || l1 != 0) && (orig_op2 != 0 || l2 != 0)) {
-        dfsan_label xor_l1 = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
-        dfsan_label xor_l2 = do_taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
-        dfsan_label and_xors = do_taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
-        dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
-                                          size, overflow_check, 0);
-        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
-      } else {
-        AOUT("WARNING: signed integer overflow\n");
-        __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
-      }
-
-      // Unsigned overflow: for multiplication, check if result / op1 != op2 (when op1 != 0)
-      // When orig_op1 == 0, no overflow possible concretely (0 * x = 0), but if symbolic, still check
-      bool no_unsigned_overflow = (orig_op1 == 0 || result / orig_op1 == orig_op2);
-      if (no_unsigned_overflow && (orig_op1 > 1 || l1 != 0) && (orig_op2 > 1 || l2 != 0)) {
-          dfsan_label cond = do_taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
-                                            size, result, orig_op1);
+      //
+      // Both of the old formulas were the addition ones, and neither describes
+      // multiplication.  The sign-based one above is the approximation its own
+      // comment admits to; the unsigned one was `result <u op1`, which is
+      // neither necessary (2 * 0x80000001 wraps to 2 at 32 bits, and 2 <u 2 is
+      // false) nor sufficient (op2 == 0 gives 0 <u op1 with no overflow at all,
+      // so the solver was asked to satisfy something already true and would
+      // have "found" a non-overflowing input).  Do the multiplication at twice
+      // the width instead and ask whether the product fits, which is exact for
+      // both signednesses.  `size * 2` has to stay inside the 64-bit concrete
+      // value we can carry, so wider multiplies get no check rather than a
+      // wrong one -- see task #58 for the same tradeoff at 128 bits.
+      const uint16_t wide_size = size * 2;
+      const uint64_t a = orig_op1 & mask, b = orig_op2 & mask;
+      if (size <= 32 && (a > 1 || l1 != 0) && (b > 1 || l2 != 0)) {
+        // signed: sext(op1) * sext(op2) != sext(result).  size <= 32 here, so
+        // the shift pair below is always a real sign extension.
+        const unsigned pad = 64 - size;
+        int64_t sa = (int64_t)(a << pad) >> pad;
+        int64_t sb = (int64_t)(b << pad) >> pad;
+        int64_t sr = (int64_t)(result << pad) >> pad;
+        int64_t swide = sa * sb;
+        const uint64_t wide_mask =
+            wide_size >= 64 ? 0xFFFFFFFFFFFFFFFFUL : (1ULL << wide_size) - 1;
+        if (swide == sr) {
+          dfsan_label s1 = l1 ? do_taint_union(l1, 0, __dfsan::SExt, wide_size, orig_op1, 0) : 0;
+          dfsan_label s2 = l2 ? do_taint_union(l2, 0, __dfsan::SExt, wide_size, orig_op2, 0) : 0;
+          dfsan_label smul = do_taint_union(s1, s2, __dfsan::Mul, wide_size,
+                                            sa & wide_mask, sb & wide_mask);
+          dfsan_label sres = do_taint_union(label, 0, __dfsan::SExt, wide_size, result, 0);
+          dfsan_label cond = do_taint_union(smul, sres, (bvneq << 8) | __dfsan::ICmp,
+                                            wide_size, swide & wide_mask, sr & wide_mask);
           __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+        } else {
+          AOUT("WARNING: signed integer overflow\n");
+          __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
+        }
+
+        // unsigned: zext(op1) * zext(op2) >u mask
+        uint64_t uwide = a * b;
+        if (uwide <= mask) {
+          dfsan_label z1 = l1 ? do_taint_union(l1, 0, __dfsan::ZExt, wide_size, orig_op1, 0) : 0;
+          dfsan_label z2 = l2 ? do_taint_union(l2, 0, __dfsan::ZExt, wide_size, orig_op2, 0) : 0;
+          dfsan_label umul = do_taint_union(z1, z2, __dfsan::Mul, wide_size, a, b);
+          dfsan_label cond = do_taint_union(umul, 0, (bvugt << 8) | __dfsan::ICmp,
+                                            wide_size, uwide, mask);
+          __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+        }
       }
     } else if (op == __dfsan::Sub) {
       // check for integer overflow (underflow for subtraction)
@@ -588,7 +862,10 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
 
       // Unsigned underflow: result > op1 when op2 > 0
       // When subtracting, if a < b, result wraps around to large value (result > a)
-      if (result <= orig_op1 && orig_op2 != 0) {
+      // `orig_op2 != 0` alone skips a symbolic subtrahend that happens to be 0
+      // right now, which is exactly the one worth solving for; Add's twin
+      // guard already has the `|| l2 != 0` arm.
+      if (result <= orig_op1 && (orig_op2 != 0 || l2 != 0)) {
         dfsan_label cond = do_taint_union(label, l1, (bvugt << 8) | __dfsan::ICmp,
                                           size, result, orig_op1);
         __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
@@ -611,7 +888,9 @@ dfsan_label __taint_gep_offset(dfsan_label label, char* result, char* base) {
   dfsan_label_info *info = get_label_info(label);
 
   // concrete ptrs, op == Alloca, just propagate bounds info
-  if (info->op == __dfsan::Alloca) {
+  // (Free too: a GEP off a freed pointer must keep carrying the bounds, or the
+  // access through it stops being reportable as a use-after-free)
+  if (is_bounds_label(label)) {
     return label;
   }
 
@@ -663,7 +942,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   if (label0 >= CONST_OFFSET) assert(get_label_info(label0)->size != 0);
 
   // fast path 1: constant and bounds
-  if (is_constant_label(label0) || is_kind_of_label(label0, Alloca)) {
+  if (is_constant_label(label0) || is_bounds_label(label0)) {
     bool same = true;
     for (uptr i = 1; i < n; i++) {
       if (ls[i] == kInitializingLabel) return kInitializingLabel;
@@ -785,7 +1064,7 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
   }
 
   // fast path 1: constant and bounds
-  if (l == 0 || is_kind_of_label(l, Alloca)) {
+  if (l == 0 || is_bounds_label(l)) {
     for (uptr i = 0; i < n; ++i)
       ls[i] = l;
     return;
@@ -1019,7 +1298,12 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
             do_taint_union(index_label, 0, Mul, 64, index, elem_size);
         uint64_t size = index * elem_size;
         uint64_t offset = current_offset + ptr - bounds_info->op1.i;
-        size_label = offset == 0 ? size :
+        // offset == 0 means there is nothing to add, so the label stays as it
+        // is.  It must not become `size`: that is a uint64_t value, and
+        // assigning it into a dfsan_label names an unrelated label whose id
+        // happens to equal the size, which builds the comparison below over
+        // someone else's expression.
+        size_label = offset == 0 ? size_label :
             do_taint_union(size_label, 0, Add, 64, size, offset);
         size += offset;
         uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
@@ -1089,10 +1373,20 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
         // check underflow: ptr + size < lower_bound (wrap around)
         // => size < lower_bound - ptr (when lower_bound > ptr, but this shouldn't happen in valid code)
         // or equivalently, check that ptr < lower_bound (shouldn't happen)
-        uint64_t min_size = bounds_info->op1.i - ptr;
-        dfsan_label underflow = do_taint_union(size_label, 0, (bvult << 8) | ICmp,
-                                               64, size, min_size);
-        __taint_trace_cond(underflow, 0, UndefinedCheck, ub_size_underflow);
+        //
+        // The parenthetical is the whole check: any pointer that came from this
+        // allocation has ptr >= lower_bound, so `lower_bound - ptr` wraps to a
+        // huge uint64_t and `size <u min_size` is true for every size -- an
+        // already-true condition handed to a solver told to make it true, on
+        // every interior pointer.  At ptr == lower_bound it is `size <u 0`,
+        // false for every size and equally unsolvable.  So only emit it in the
+        // case the comment says shouldn't happen, where it means something.
+        if (ptr < bounds_info->op1.i) {
+          uint64_t min_size = bounds_info->op1.i - ptr;
+          dfsan_label underflow = do_taint_union(size_label, 0, (bvult << 8) | ICmp,
+                                                 64, size, min_size);
+          __taint_trace_cond(underflow, 0, UndefinedCheck, ub_size_underflow);
+        }
 
         // check overflow: ptr + size > upper_bound
         // => size > upper_bound - ptr
@@ -1284,7 +1578,20 @@ SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
 dfsan_read_label(const void *addr, uptr size) {
   if (size == 0)
     return 0;
-  return __taint_union_load(shadow_for(addr), size, size * 8, sizeof(dfsan_label));
+  dfsan_label label =
+      __taint_union_load(shadow_for(addr), size, size * 8, sizeof(dfsan_label));
+  // __taint_union_load hands kInitializingLabel back to instrumented loads on
+  // purpose: it is the marker __taint_trace_alloca writes over an alloca's
+  // shadow, and propagating it is how a load of never-written stack memory
+  // stays flagged.  It is not a label, though, and this is the entry point the
+  // custom wrappers read shadow through.  They pass what they get straight to
+  // dfsan_get_label_info(), whose dfsan_check_label() reports
+  // "FATAL: Taint: out of labels" and Die()s -- losing the entire trace from
+  // there on, over a buffer that merely had an unwritten tail.  A range that
+  // includes uninitialized bytes has no label; say that instead.
+  if (label == kInitializingLabel)
+    return 0;
+  return label;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
@@ -1835,6 +2142,8 @@ extern "C" dfsan_label taint_get_base_input_label(dfsan_label label) {
 
 // information is passed implicitly through flags()
 extern "C" void InitializeSymSanSolver();
+extern "C" void InitializeSymSanForkServer();
+extern "C" void InitializeSymSanEventRing();
 
 static void InitializeFlags() {
   SetCommonFlagsDefaults();
@@ -1879,15 +2188,95 @@ static void dfsan_fini() {
     dfsan_dump_labels(fd);
     CloseFile(fd);
   }
-  if (tainted.buf) {
-    UnmapOrDie(tainted.buf, tainted.buf_size);
-  }
-  if (flags().shm_fd != -1 || internal_strcmp(flags().shm_name, "") != 0) {
-    internal_munmap((void *)UnionTableAddr(), uniontable_size);
-  }
+  // Deliberately no teardown of the union table or of the input mapping here.
+  // dfsan_fini runs from the main executable's __cxa_finalize, and _dl_fini
+  // finalizes the executable *before* the shared libraries it depends on -- so
+  // instrumented code reached from a library destructor still runs after this
+  // point.  How this was found: every C++ target used to link a stray shared
+  // libc++.so.1 next to the instrumented static one (fixed in
+  // compiler/ko_clang.c), and that library's ios_base::Init destructor flushed
+  // std::cout into the statically linked instrumented __stdoutbuf<char>::sync,
+  // whose alloca reaches __taint_trace_alloca and writes a label into the union
+  // table.  Unmapping the table here made that a SIGSEGV on the topmost alloca
+  // slot -- silent, because it happens after the program has produced all of
+  // its output, so the tests that tripped it (tests/symsan/cpp_fstream.cpp,
+  // cpp_string.cpp) still passed and only the kernel log showed it.  The link
+  // fix removes that particular caller; any target that links a C++ library of
+  // its own brings it straight back, so the rule stands on its own.
+  //
+  // Neither mapping needs releasing anyway: the kernel reclaims both at exit,
+  // and the shm object behind the union table belongs to the launcher, which
+  // close()s and shm_unlink()s it itself (driver/launcher/launch.c).
 }
 
 static bool dfsan_initialized;
+
+#ifndef MAP_FIXED_NOREPLACE
+// Linux 4.17.  Older kernels ignore the flag and pick some other address,
+// which the caller below detects from the address it gets back.
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+// Reserve [UnusedAddr(), AppAddr()) so the application can never be handed an
+// address with no shadow behind it.
+//
+// The guard at the call site asks whether *we* landed inside that region,
+// which for a non-PIE target is permanently no: the executable is linked at a
+// fixed 0x700000200000, above AppAddr().  What moves is the kernel's mmap
+// base, and that is randomized whether or not the executable is -- ld.so,
+// libc, and every mapping the loader makes hang off it.  mmap_base is
+// TASK_SIZE less the stack rlimit, the guard gap and the 16GB
+// stack-randomization pad, less a draw uniform over 16TB
+// (vm.mmap_rnd_bits=32), so the bottom 16GB of its range sit *below*
+// AppAddr(): one run in 2^10 puts the loader inside the region we are about to
+// reserve.  MAP_FIXED then unmapped ld.so out from under the executing
+// _dl_init, and the child died here before it could trace a single event --
+// measured at 3/3000 runs, which is exactly the rate of "a traced run read
+// zero events" that sent us looking at the event transport instead.
+//
+// So ask with MAP_FIXED_NOREPLACE and let the kernel refuse rather than
+// clobber.  The recovery is to re-exec with ASLR off, which pins the mmap base
+// back at the top of the address space, well clear of AppAddr(); the non-PIE
+// executable does not move either way.  ADDR_NO_RANDOMIZE survives execve, so
+// the flag already being set is its own guard against an exec loop.
+// (sanitizer_linux.cpp:2177 does the same dance for ppc64le, which cannot
+// tolerate ASLR at all.)
+static void ReserveUnusedRegion() {
+  const uptr size = AppAddr() - UnusedAddr();
+  uptr res = internal_mmap(
+      (void *)UnusedAddr(), size, PROT_NONE,
+      MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+  if (!internal_iserror(res) && res == UnusedAddr())
+    return;
+
+  // Occupied.  On a kernel predating MAP_FIXED_NOREPLACE the flag is ignored
+  // and we are handed a mapping somewhere else entirely; give that back.
+  if (!internal_iserror(res))
+    internal_munmap((void *)res, size);
+
+  int old = personality(0xffffffff);
+  if (old != -1 && (old & ADDR_NO_RANDOMIZE) == 0 &&
+      personality(old | ADDR_NO_RANDOMIZE) != -1) {
+    VReport(1,
+            "SymSan: the loader landed in [%p, %p); re-executing with ASLR "
+            "off\n",
+            (void *)UnusedAddr(), (void *)AppAddr());
+    ReExec();  // does not return
+  }
+  // Reaching here means the re-exec above is not available: either we have
+  // already taken it (ADDR_NO_RANDOMIZE survived the execve) and the region is
+  // still occupied, or personality() itself was refused.  The first case is
+  // reachable without any randomness at all -- a stack rlimit big enough drags
+  // the mmap base below AppAddr() on its own, ASLR or no ASLR -- so say which
+  // one it was rather than blaming ASLR for both.
+  Report("FATAL: cannot reserve [%p, %p): it is already mapped, %s\n",
+         (void *)UnusedAddr(), (void *)AppAddr(),
+         (old != -1 && (old & ADDR_NO_RANDOMIZE))
+             ? "and disabling ASLR did not move it -- check the stack rlimit, "
+               "which sets how far down the kernel puts the mmap base"
+             : "and ASLR could not be disabled to move it");
+  Die();
+}
 
 static void dfsan_init(int argc, char **argv, char **envp) {
   if (dfsan_initialized)
@@ -1944,6 +2333,13 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   // init hashtable allocator
   __taint::allocator_init(HashTableAddr(), HashTableAddr() + hashtable_size);
 
+  // ... and the hashtable itself, which draws its buckets from that allocator.
+  // Here rather than in a constructor: a static object with a nontrivial
+  // constructor gets an .init_array entry, and .init_array runs after all of
+  // .preinit_array -- i.e. after the fork point below -- so every forked child
+  // would build its own table, faulting in the 8MB of buckets each time.
+  __union_table.init(hashtable_buckets);
+
   // init main thread
   auto num_of_labels = uniontable_size / sizeof(dfsan_label_info);
   __alloca_stack_top = __alloca_stack_bottom = (dfsan_label)(num_of_labels - 2);
@@ -1955,9 +2351,34 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   // case by disabling memory protection when ASLR is disabled.
   uptr init_addr = (uptr)&dfsan_init;
   if (!(init_addr >= UnusedAddr() && init_addr < AppAddr()))
-    MmapFixedNoAccess(UnusedAddr(), AppAddr() - UnusedAddr());
+    ReserveUnusedRegion();
 
   InitializeInterceptors();
+
+  // Attach AFL++'s coverage map, if this binary carries AFL++'s edge counters
+  // (see afl_compat.cpp; a no-op when it does not).  Above the fork point along
+  // with everything else that is input-independent -- the map is shared memory
+  // the fuzzer owns for the whole campaign, not something staged per run, so
+  // attaching once and letting every child inherit the mapping is both cheaper
+  // and the only way the counts reach the fuzzer at all.
+  InitializeAflCoverage();
+
+  // Same reasoning for the trace event ring (include/symsan_ring.h): it is
+  // shared memory the driver owns for the whole campaign, so map it once here
+  // and let every child inherit the MAP_SHARED mapping.  It cannot ride along
+  // in InitializeSymSanSolver() below, which is on the other side of the fork
+  // point and would remap it per run.  A no-op unless the driver passed
+  // ring_fd.
+  InitializeSymSanEventRing();
+
+  // The fork server, if one was asked for, has to sit exactly here.  Everything
+  // above is input-independent -- the shadow and union mappings, the hashtable
+  // allocator, the interceptors -- and is what we want to pay for once and
+  // amortize over every run.  Everything below reads the input the driver
+  // staged for *this* run, so it has to happen again in each child.  (ucsan
+  // forks after its whole init instead, because thoroupy receives the input as
+  // a ticket payload rather than reading a file.)
+  InitializeSymSanForkServer();
 
   InitializeTaintFile();
 
@@ -1988,6 +2409,12 @@ void __dfsan_ensure_init(int argc, char **argv, char **envp) {
 
 SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanSolver, void) {}
 
+// Backends that do not implement a fork server just run once, as before.
+SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanForkServer, void) {}
+
+// Backends with no event channel at all have no ring to map.
+SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanEventRing, void) {}
+
 // Default empty implementations (weak) for hooks
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
                              uint32_t, uint32_t, uint64_t, uint64_t, uint32_t) {}
@@ -2004,6 +2431,8 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
                              dfsan_label, int64_t, uint64_t, uint64_t, int64_t,
                              uint32_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_table_lookup, dfsan_label,
+                             int64_t, uint64_t, uint64_t, uint64_t) {return 0;}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
                              unsigned) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
@@ -2140,6 +2569,40 @@ dfsan_label __taint_get_ptr_bounds_label(void *ptr, uint64_t lower, uint64_t upp
   AOUT("new ptr bounds label %d, lower = %p, upper = %p\n",
        bound, (void*)lower, (void*)upper);
   return bound;
+}
+
+// Materialize a concrete operand of an operation wider than 64 bits as a leaf
+// label, so it reaches the solver at full width instead of being truncated into
+// a single op slot.  Applies to small values too, like the 64 in
+// `(unsigned __int128)x >> 64`, because what a zero label cannot express is not
+// "large" but "exact".  dfsan_union dedups on (l1, l2, op, size, op1, op2), so
+// repeated uses of the same value collapse to one union-table entry for the
+// whole trace.
+SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_wide_const(uint64_t lo, uint64_t hi, uint16_t size) {
+  if (size <= 64 || size > 128) return 0;
+  dfsan_label label = dfsan_union(0, 0, __dfsan::WideConst, size, lo, hi);
+  AOUT("wide const label %d, size %u, lo = 0x%lx, hi = 0x%lx\n",
+       label, size, lo, hi);
+  return label;
+}
+
+// Give ONE operand of an operation wider than 64 bits a real label: a symbolic
+// operand already has one, a concrete operand gets a WideConst leaf built from
+// its full value.  Instrumented code calls this on each operand and then hands
+// the results to the ordinary __taint_union, so there is no wide variant of the
+// union itself to keep in step with it.
+//
+// The point of doing this in the runtime rather than in the instrumentation is
+// that only the runtime knows which operands are actually tainted.  Deciding at
+// compile time would mean recognising a ConstantInt operand, and at -O0 a
+// literal __int128 is not one -- clang keeps it in an alloca and loads it -- so
+// the whole shape would have worked only under optimization.
+SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_get_wide(dfsan_label label, uint64_t lo, uint64_t hi,
+                             uint16_t size) {
+  if (label) return label;
+  return __taint_wide_const(lo, hi, size);
 }
 
 // Weak stub for UCSan's event tracing

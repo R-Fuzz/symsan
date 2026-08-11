@@ -63,6 +63,45 @@ JITSolver::JITSolver(): uuid(0) {
   JIT = std::move(GradJit::Create().get());
 }
 
+bool JITSolver::jit_constraints(std::shared_ptr<SearchTask> task) {
+  uint64_t start;
+  for (size_t i = 0, n = task->size(); i < n; i++) {
+    auto &c = task->constraints(i);
+    DEBUGF("process constraint %d (fn=%p)\n", c->ast->label(), c->fn);
+    // jit the AST into a native function if haven't done so
+    if (c->fn == nullptr) {
+      struct myKV *res = fCache.find(c->ast);
+      if (res == nullptr) {
+        cache_misses++;
+        DEBUGF("jit constraint %d\n", c->ast->label());
+        uint64_t id = ++uuid;
+        start = getTimeStamp();
+        if (addFunction(c->get_root(), c->local_map, id) != 0) {
+          // jigsaw is integer-only and rejects unsupported (e.g. floating-point)
+          // roots by returning non-zero here.  The caller turns this into
+          // TIMEOUT rather than ERROR so the driver advances to the next
+          // (FP-aware z3) solver -- ERROR sets out_buf=NULL and stops the
+          // solver chain.
+          WARNF("failed to add function\n");
+          return false;
+        }
+        process_time += (getTimeStamp() - start);
+        start = getTimeStamp();
+        auto fn = performJit(id);
+        jit_time += (getTimeStamp() - start);
+        auto kv = new struct myKV(c->ast, fn);
+        if (!fCache.insert(kv))
+          delete kv;
+        const_cast<Constraint*>(c.get())->fn = fn; // XXX: workaround, no concurrent access
+      } else {
+        cache_hits++;
+        const_cast<Constraint*>(c.get())->fn = res->fn; // XXX: workaround
+      }
+    }
+  }
+  return true;
+}
+
 solver_result_t
 JITSolver::solve(std::shared_ptr<SearchTask> task,
                  const uint8_t *in_buf, size_t in_size,
@@ -91,39 +130,16 @@ JITSolver::solve(std::shared_ptr<SearchTask> task,
     base_task = base_task->base_task;
   }
 
-  for (size_t i = 0, n = task->size(); i < n; i++) {
-    auto &c = task->constraints(i);
-    DEBUGF("process constraint %d (fn=%p)\n", c->ast->label(), c->fn);
-    // jit the AST into a native function if haven't done so
-    if (c->fn == nullptr) {
-      struct myKV *res = fCache.find(c->ast);
-      if (res == nullptr) {
-        cache_misses++;
-        DEBUGF("jit constraint %d\n", c->ast->label());
-        uint64_t id = ++uuid;
-        start = getTimeStamp();
-        if (addFunction(c->get_root(), c->local_map, id) != 0) {
-          // jigsaw is integer-only and rejects unsupported (e.g. floating-point)
-          // roots by returning non-zero here.  Return TIMEOUT rather than ERROR
-          // so the driver advances to the next (FP-aware z3) solver -- ERROR sets
-          // out_buf=NULL and stops the solver chain.
-          WARNF("failed to add function\n");
-          return SOLVER_TIMEOUT;
-        }
-        process_time += (getTimeStamp() - start);
-        start = getTimeStamp();
-        auto fn = performJit(id);
-        jit_time += (getTimeStamp() - start);
-        auto kv = new struct myKV(c->ast, fn);
-        if (!fCache.insert(kv))
-          delete kv;
-        const_cast<Constraint*>(c.get())->fn = fn; // XXX: workaround, no concurrent access
-      } else {
-        cache_hits++;
-        const_cast<Constraint*>(c.get())->fn = res->fn; // XXX: workaround
-      }
-    }
-  }
+  // jigsaw is integer-only; a root it cannot compile returns TIMEOUT rather
+  // than ERROR so the driver advances to the next (FP-aware z3) solver --
+  // ERROR sets out_buf=NULL and stops the solver chain.
+  // (Now DECLINE, which the driver treats the same way and which distinguishes
+  // this from the gd_entry() failure below.  The two used to be one code and
+  // they mean opposite things: this one is codegen refusing a shape, near-free,
+  // and it is the case where the next rung is most likely to succeed; that one
+  // is a search that spent its entire budget.)
+  if (!jit_constraints(task))
+    return SOLVER_DECLINE;
 
   // solve the task
   start = getTimeStamp();

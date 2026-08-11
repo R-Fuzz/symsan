@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3 -Wno-format")
 
 # Fastgen backend (dfsan symbolic execution + out-of-process solving)
-add_library(Fastgen STATIC fastgen.cpp solver_common.cpp)
+add_library(Fastgen STATIC fastgen.cpp solver_common.cpp forkserver.cpp)
 target_include_directories(Fastgen PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
     ${CMAKE_CURRENT_SOURCE_DIR}

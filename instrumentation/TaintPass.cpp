@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 //#include "defs.h"
+#include "branch_id.h"
 #include "UCSanSummary.h"
 
 #include <optional>
@@ -30,6 +31,7 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Transforms/Utils/GlobalStatus.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/AttributeMask.h"
@@ -88,6 +90,14 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// for the SYMSAN_DOCUMENT_IDS dump, which several TUs of a parallel build
+// append to at once
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 using namespace llvm;
 
@@ -165,6 +175,23 @@ static cl::opt<bool> ClTraceGEPOffset(
     cl::desc("Trace GEP offset for solving."),
     cl::Hidden, cl::init(true));
 
+// Symbolize loads from read-only global lookup tables at a symbolic index.
+// Shadow memory over globals is zero, so hex[i] would otherwise produce a
+// concrete value and the comparison that consumes it never reaches the solver.
+// Only the i2s solver inverts the resulting tlookup op.
+static cl::opt<bool> ClTraceTableLookup(
+    "taint-trace-table-lookup",
+    cl::desc("Symbolize loads from read-only global tables at symbolic index."),
+    cl::Hidden, cl::init(true));
+
+// Upper bound on the byte size of a table we are willing to symbolize.  The
+// contents have to be shipped to the solver and packed into the constraint's
+// constant args, so a large table is paid for on every solve that touches it.
+static cl::opt<unsigned> ClMaxTableBytes(
+    "taint-max-table-bytes",
+    cl::desc("Maximum size in bytes of a symbolized lookup table."),
+    cl::Hidden, cl::init(4096));
+
 // Trace floating point operations (FP arithmetic, casts, FCmp, and common FP
 // intrinsics).  Reconstructed and solved by the z3 solver via the fpa theory.
 static cl::opt<bool> ClTraceFP(
@@ -183,6 +210,7 @@ enum {
   DfsanFpMin      = 93, // fp_min
   DfsanFpMax      = 94, // fp_max
   DfsanFpCopysign = 95, // fp_copysign
+  DfsanBitReverse = 109, // bitreverse (last_llvm_op + 42)
 };
 // Rounding-mode selector (must match __dfsan::fp_rounding_mode in dfsan.h).
 enum {
@@ -221,6 +249,77 @@ static cl::opt<bool> ClTraceAnnotatedBB(
     "taint-trace-annotated-bb",
     cl::desc("Only trace annotated basic blocks."),
     cl::Hidden, cl::init(false));
+
+// Whether branch ids come from AFL++'s edge numbering rather than from the
+// source location -- and with them the rest of that mode: no source-hash
+// fallback for a branch AFL++ numbered no side of, and a branch map to dump.
+//
+// Tri-state rather than a plain switch.  Unset looks for @__afl_area_ptr and
+// decides, which is what an ordinary build wants; BOU_TRUE demands that the
+// module really is AFL++-instrumented, so that a pipeline that quietly stops
+// producing one fails at build time instead of shipping a binary whose ids can
+// never be joined; BOU_FALSE runs an AFL++-instrumented module down the old
+// path, which is how the two are measured against each other on the same
+// module.
+//
+// This deliberately gates the whole mode and not just the skip: leaving the
+// unnumbered branches on the source hash would put two id spaces in one module,
+// and a djb hash is a uniform 32-bit value that can land inside AFL++'s edge
+// range and be looked up as some unrelated edge.
+static cl::opt<cl::boolOrDefault> ClWithAfl(
+    "taint-with-afl",
+    cl::desc("Take branch ids from AFL++'s link-time edge numbering "
+             "(default: whenever the module carries that instrumentation)."),
+    cl::Hidden, cl::init(cl::BOU_UNSET));
+
+// Turns the skip above off, and gives such a branch its source-hash id with bit
+// 31 forced on.
+//
+// It exists because the skip looked like a strict loss against the source-hash
+// scheme it replaced, where every branch was traced and a branch the map could
+// not name fell back to what the session had seen itself.  The argument for the
+// skip -- that a novelty judgement the fuzzer does not share only produces
+// inputs it discards -- assumes novelty has to come from the branch's own target
+// block, and it does not: an unnumbered branch still gates numbered code
+// downstream.
+//
+// Measured (task #85), and the loss is not there.  On zlib -O2 the skip drops 10
+// of 396 branches; recovering them produced zero extra solved branches, zero
+// extra generated inputs and the same 149 edges, for 17 more solver attempts.
+// Across all 14 fuzzer-challenges targets it drops three branches in two of
+// them -- `test-u128.c:28`, `test-transform.c:148` and `:165`, every one a
+// `for`-loop latch on an untainted induction variable, which reaches the runtime
+// with label 0 and returns immediately even when it is instrumented.  fgtest is
+// identical in both arms on all of them.  `test-crc32` drops nothing at either
+// -O0 or -O2, which is worth stating because the branch that once stalled it,
+// `test-crc32.c:68:9`, is the standing example of a branch going undecidable:
+// AFL++ numbers both of its directions (`C 4107 4107 4108`).
+//
+// So keep the skip, and keep this flag to re-measure -- the case it has not seen
+// is a C++ target linking separately-instrumented archives, where unnumbered
+// branches are plentiful rather than incidental.  That is the same population as
+// the TODO on getBranchId(), and this is its tag bit prototyped.  AFL++ edge ids are sequential from AFL_LLVM_LTO_STARTID and a
+// coverage map is a few hundred kilobytes at the very most, so every real edge
+// id is far below 2^31: a tagged cid can never match a key in the .bmap, which
+// holds edge ids only.  So the lookup misses, the branch takes the documented
+// degrade path, and nothing else in the pipeline has to know it is different.
+static cl::opt<bool> ClInstrumentUnnumbered(
+    "taint-instrument-unnumbered",
+    cl::desc("Trace branches AFL++ numbered no side of, under a tagged "
+             "source-hash id that the branch map can never match."),
+    cl::Hidden, cl::init(false));
+
+/// Bit 31, set on a branch id that is not an AFL++ edge id.
+static const uint32_t kNotAnEdgeTag = 1u << 31;
+
+// A -mllvm flag rather than an environment variable, unlike
+// SYMSAN_DOCUMENT_IDS: the map is written once, by the one `opt` invocation
+// that runs this pass over the merged post-LTO module, so it belongs on that
+// command line.  See writeBranchMap().
+static cl::opt<std::string> ClBranchMap(
+    "taint-branch-map",
+    cl::desc("Write the branch id -> reached edge id map to this file."),
+    cl::Hidden, cl::init(""));
 
 // SYMSAN specific flags, if runs with UCSan
 static cl::opt<bool> ClWithUCSan(
@@ -438,6 +537,7 @@ class Taint {
   Constant *ArgTLS;
   Constant *RetvalTLS;
   FunctionType *TaintUnionFnTy;
+  FunctionType *TaintGetWideFnTy;
   FunctionType *TaintUnionLoadFnTy;
   FunctionType *TaintUnionStoreFnTy;
   FunctionType *TaintGEPOffsetFnTy;
@@ -453,6 +553,7 @@ class Taint {
   FunctionType *TaintTraceSelectFnTy;
   FunctionType *TaintTraceIndirectCallFnTy;
   FunctionType *TaintTraceGEPFnTy;
+  FunctionType *TaintTableLookupFnTy;
   FunctionType *TaintPushStackFrameFnTy;
   FunctionType *TaintPopStackFrameFnTy;
   FunctionType *TaintTraceAllocaFnTy;
@@ -464,6 +565,7 @@ class Taint {
   FunctionType *TaintDebugFnTy;
   FunctionType *TaintMinimizeLabelFnTy;
   FunctionCallee TaintUnionFn;
+  FunctionCallee TaintGetWideFn;
   FunctionCallee TaintUnionLoadFn;
   FunctionCallee TaintUnionStoreFn;
   FunctionCallee TaintGEPOffsetFn;
@@ -479,6 +581,7 @@ class Taint {
   FunctionCallee TaintTraceSelectFn;
   FunctionCallee TaintTraceIndirectCallFn;
   FunctionCallee TaintTraceGEPFn;
+  FunctionCallee TaintTableLookupFn;
   FunctionCallee TaintPushStackFrameFn;
   FunctionCallee TaintPopStackFrameFn;
   FunctionCallee TaintTraceAllocaFn;
@@ -490,6 +593,12 @@ class Taint {
   FunctionCallee TaintDebugFn;
   FunctionCallee TaintMinimizeLabelFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
+  /// Read-only global arrays eligible to be treated as lookup tables, mapped to
+  /// {num_elements, element_size}.  Computed once, before anything is
+  /// instrumented, because the instrumentation itself passes globals to runtime
+  /// calls (see getShadowForGlobal) and GlobalStatus then reports them as
+  /// unanalyzable.  Populated by findReadOnlyTables().
+  DenseMap<const GlobalVariable *, std::pair<uint64_t, uint64_t>> ReadOnlyTables;
   Constant *CallStack;
   MDNode *ColdCallWeights;
   TaintABIList ABIList;
@@ -514,10 +623,55 @@ class Taint {
                                  GlobalValue::LinkageTypes NewFLink,
                                  FunctionType *NewFT);
 
+  void findReadOnlyTables(Module &M);
   void addContextRecording(Function &F);
   void addFrameTracing(Function &F);
   uint32_t getInstructionId(Instruction *Inst);
   const uint32_t InvalidInstructionId = -1;
+
+  /// @__afl_area_ptr, when the module has been through AFL++'s link-time
+  /// instrumentation, and null otherwise.  Its presence is what says "this
+  /// module carries edge ids"; looked up once in initializeModule(), before
+  /// addGlobalNameSuffix() has had any chance to rename things.
+  GlobalVariable *AflMapPtr = nullptr;
+  /// The index operand of an AFL++ coverage-counter GEP, or null when @p GEP
+  /// is not one.
+  const Value *aflCounterIndex(const GetElementPtrInst *GEP) const;
+  /// The AFL++ edge id of @p BB, or InvalidInstructionId when it has none.
+  uint32_t getAflBlockId(const BasicBlock *BB) const;
+  /// AFL++'s pair of edge ids for a select-lowered branch.
+  bool getAflSelectIds(const SelectInst *SI, uint32_t &TrueId,
+                       uint32_t &FalseId) const;
+  /// The edge ids reached by a branch, select or switch, in the order the
+  /// runtime names its directions: true then false, or default then each case.
+  /// False when this module carries no AFL++ instrumentation, or when any one
+  /// target is unnumbered.
+  bool getAflBranchTargets(Instruction *Inst,
+                           SmallVectorImpl<uint32_t> &Targets);
+  /// The id of a branch, select or switch: the one flavour of instruction id
+  /// that has to mean the same thing to the fuzzer as it does here.
+  uint32_t getBranchId(Instruction *Inst);
+  /// AFL++'s edge count, from __afl_final_loc.
+  uint32_t AflEdges = 0;
+  /// Whether the AFL_LLVM_LTO_STARTID complaint has already been made; it is a
+  /// property of the build, so once per module is enough.
+  bool WarnedLowAflId = false;
+
+  /// Record that @p Inst was instrumented with branch id @p cid, for
+  /// SYMSAN_DOCUMENT_IDS.  @p Kind is "br", "select", "switch" or
+  /// "switch-case"; see documentBranchId() for why the caller has to say, and
+  /// for what @p Extra is.
+  void documentBranchId(uint32_t cid, Instruction *Inst, const char *Kind,
+                        const std::string &Extra = std::string());
+  void flushDocumentedIds();
+  /// Write the -taint-branch-map file: which edge each branch reaches.
+  void writeBranchMap(Module &M);
+  /// Value of SYMSAN_DOCUMENT_IDS, or empty when the dump is off.
+  std::string DocumentIdsPath;
+  /// Lines accumulated by documentBranchId(), written out once per module so
+  /// that a parallel build takes the file lock once per TU rather than once
+  /// per branch.
+  std::vector<std::string> DocumentedIds;
 
   void initializeRuntimeFunctions(Module &M);
   void initializeCallbackFunctions(Module &M);
@@ -595,6 +749,19 @@ struct TaintFunction {
   /// BasicBlock like CachedShadows, but uses domination between values.
   DenseMap<Value *, Value *> CachedCollapsedShadows;
   DenseMap<Value *, std::set<Value *>> ShadowElements;
+
+  /// A GEP that indexes a read-only global table with a symbolic index.  Keyed
+  /// on the GEP itself so the load that consumes it can be given a real shadow
+  /// (see visitLoadInst); instructions are visited in order, so the GEP is
+  /// always recorded before its load.
+  struct TableGEPInfo {
+    Value *IndexShadow; // shadow of the symbolic index
+    Value *Index;       // the index, zext/trunc'd to i64
+    Value *TablePtr;    // base address of the global, as i64
+    uint64_t NumElements;
+    uint64_t ElemSize;
+  };
+  DenseMap<Value *, TableGEPInfo> TableGEPs;
 
   TaintFunction(Taint &TT, Function *F, bool IsNativeABI,
                 bool IsForceZeroLabels)
@@ -884,17 +1051,463 @@ uint32_t Taint::getInstructionId(Instruction *Inst) {
 
   // otherwise, fallback to hash
   static uint32_t unamed = 0;
-  auto SourceInfo = Mod->getSourceFileName();
   DILocation *Loc = Inst->getDebugLoc();
   if (Loc) {
     auto Line = Loc->getLine();
     auto Col = Loc->getColumn();
-    SourceInfo += ":" + std::to_string(Line) + ":" + std::to_string(Col);
-  } else {
-    SourceInfo += "unamed:" + std::to_string(unamed++);
+    // Hash the *debug location's* file, not Mod->getSourceFileName(): the two
+    // differ for anything the inliner moved, and only the former is a key
+    // AFL++'s link-time instrumentation can compute for the same branch.
+    // symsan::branch_cid is the single definition of that key; see
+    // include/branch_id.h.
+    return symsan::branch_cid(Loc->getFilename().str(), Line, Col);
   }
 
+  auto SourceInfo = Mod->getSourceFileName();
+  SourceInfo += "unamed:" + std::to_string(unamed++);
   return djbHash(SourceInfo);
+}
+
+// AFL++'s link-time instrumentation (SanitizerCoverageLTO.so.cc) numbers basic
+// blocks sequentially and bumps a counter at that index in every instrumented
+// block:
+//
+//   afl.entry:
+//     %p = load ptr, ptr @__afl_area_ptr           ; hoisted, once per function
+//   ...
+//     %g = getelementptr i8, ptr %p, i32 <edge id>
+//     %c = load i8, ptr %g                         ; or a single atomicrmw,
+//     store i8 (umax(%c + 1, 1)), ptr %g           ; under threadsafe counters
+//
+// The GEP is the part of that shape both counter modes share, so match on it.
+const Value *Taint::aflCounterIndex(const GetElementPtrInst *GEP) const {
+  if (!AflMapPtr || GEP->getNumIndices() != 1)
+    return nullptr;
+  const LoadInst *Base = dyn_cast<LoadInst>(GEP->getPointerOperand());
+  if (!Base || Base->getPointerOperand() != AflMapPtr)
+    return nullptr;
+  const Value *Idx = GEP->getOperand(1);
+  // AFL++ builds the index in i32 and the GEP may want it wider.
+  while (isa<ZExtInst>(Idx) || isa<SExtInst>(Idx) || isa<TruncInst>(Idx))
+    Idx = cast<CastInst>(Idx)->getOperand(0);
+  return Idx;
+}
+
+uint32_t Taint::getAflBlockId(const BasicBlock *BB) const {
+  if (!AflMapPtr)
+    return InvalidInstructionId;
+  // AFL++ skips a block that dominates all of its successors
+  // (shouldInstrumentBlock -> isFullDominator), having first split every
+  // critical edge, so a conditional branch's *own* block is normally left
+  // unnumbered while both of its successors are numbered.  What can still be
+  // missing is the id of a successor that only forwards -- an empty block a
+  // later SplitEdge() introduced, say.  Keep hopping down for as long as the
+  // edge is unconditional in both directions, which makes the two blocks run
+  // under precisely the same condition: the mirror image of the upward walk in
+  // patches/aflpp-document-ids.patch, and bounded the same way, since an
+  // unconditional cycle is representable even if it is not reachable.
+  for (unsigned Hop = 0; BB && Hop < 16; ++Hop) {
+    for (const Instruction &I : *BB) {
+      const auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+      if (!GEP)
+        continue;
+      const Value *Idx = aflCounterIndex(GEP);
+      // Only a constant index names *this* block: a select-lowered branch puts
+      // a select there instead (see getAflSelectIds), and a CTX/NGRAM or IJON
+      // build mixes in a runtime value, leaving no static id to recover.
+      if (Idx)
+        if (const auto *CI = dyn_cast<ConstantInt>(Idx))
+          return static_cast<uint32_t>(CI->getZExtValue());
+    }
+    const auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!BI || BI->isConditional())
+      break;
+    const BasicBlock *Succ = BI->getSuccessor(0);
+    if (Succ->getSinglePredecessor() != BB)
+      break;
+    BB = Succ;
+  }
+  return InvalidInstructionId;
+}
+
+// AFL++ instruments a select-lowered branch by inserting, right after it,
+//
+//   %f = freeze i1 %cond
+//   %i = select i1 %f, i32 <true id>, i32 <false id>
+//
+// and indexing the coverage map with %i (SanitizerCoverageLTO.so.cc:2278).
+// Matching through the map GEP rather than by looking for a select on the same
+// condition matters: user code is free to write `c ? 1 : 2` as well, and the
+// counter index is the only thing that tells the two apart.
+bool Taint::getAflSelectIds(const SelectInst *SI, uint32_t &TrueId,
+                            uint32_t &FalseId) const {
+  if (!AflMapPtr)
+    return false;
+  // Walking forward from the select rather than over the whole block is what
+  // keeps two selects on the *same* condition apart: AFL++ puts each one's
+  // counter immediately after it, so the first match below is this select's.
+  for (const Instruction *I = SI->getNextNode(); I; I = I->getNextNode()) {
+    const auto *GEP = dyn_cast<GetElementPtrInst>(I);
+    if (!GEP)
+      continue;
+    const Value *Idx = aflCounterIndex(GEP);
+    const auto *Sel = Idx ? dyn_cast<SelectInst>(Idx) : nullptr;
+    if (!Sel)
+      continue;
+    const Value *Cond = Sel->getCondition();
+    if (const auto *FI = dyn_cast<FreezeInst>(Cond))
+      Cond = FI->getOperand(0);
+    if (Cond != SI->getCondition())
+      continue;
+    const auto *T = dyn_cast<ConstantInt>(Sel->getTrueValue());
+    const auto *F = dyn_cast<ConstantInt>(Sel->getFalseValue());
+    if (!T || !F)
+      continue; // the vector path, which takes a pair of ids per element
+    TrueId = static_cast<uint32_t>(T->getZExtValue());
+    FalseId = static_cast<uint32_t>(F->getZExtValue());
+    return true;
+  }
+  return false;
+}
+
+// The edges a branch reaches, one per direction, InvalidInstructionId where
+// AFL++ numbered nothing.  False if it numbered none of them.
+//
+// AFL++ deliberately does not number every block.  shouldInstrumentBlock() drops
+// a block that dominates all of its successors -- reaching a successor already
+// implies reaching it, so its count is redundant -- and, symmetrically, a block
+// that post-dominates all of its predecessors and has more than one.  Having
+// split every critical edge first, the first rule prunes almost every
+// conditional branch's own block, and the second prunes the join block of an
+// `if` with no `else`, which is where such a branch's false side lands.
+//
+// A side with no id is a side SymSan cannot decide about: is_interest() asks
+// whether the edge on the other side of a branch has been covered, and the
+// answer lives in the fuzzer's map, which has no slot for a block AFL++ chose
+// not to count.  Instrumenting the block ourselves would produce an answer, but
+// not one worth having -- in hybrid fuzzing the fuzzer's own coverage is what
+// decides whether a generated input is kept, so a novelty judgement it does not
+// share only leads to inputs it discards.  And for the post-dominator case the
+// judgement would be "not novel" anyway: a join reached whichever way the branch
+// went is not new coverage, which is precisely why AFL++ dropped it.
+//
+// So an unnumbered side is reported as such and simply never solved for, while
+// the branch as a whole is abandoned only when *no* side is numbered.  Refusing
+// the whole branch instead would throw away the informative direction along with
+// the uninformative one, which on zlib -O2 is the difference between tracing 345
+// conditional branches and tracing 789 of them.
+bool Taint::getAflBranchTargets(Instruction *Inst,
+                                SmallVectorImpl<uint32_t> &Targets) {
+  // A UCSan annotation, where there is one, is the id the rest of the pipeline
+  // has already agreed on; getInstructionId() prefers it, and so must this.
+  if (!AflMapPtr || Inst->getMetadata("dfsan.bb"))
+    return false;
+
+  if (auto *SI = dyn_cast<SelectInst>(Inst)) {
+    uint32_t TrueId, FalseId;
+    if (!getAflSelectIds(SI, TrueId, FalseId))
+      return false;
+    Targets.push_back(TrueId);
+    Targets.push_back(FalseId);
+  } else if (auto *BI = dyn_cast<BranchInst>(Inst)) {
+    if (!BI->isConditional())
+      return false;
+    Targets.push_back(getAflBlockId(BI->getSuccessor(0)));
+    Targets.push_back(getAflBlockId(BI->getSuccessor(1)));
+  } else if (auto *SW = dyn_cast<SwitchInst>(Inst)) {
+    Targets.push_back(getAflBlockId(SW->getDefaultDest()));
+    for (auto C : SW->cases())
+      Targets.push_back(getAflBlockId(C.getCaseSuccessor()));
+  } else {
+    return false;
+  }
+
+  for (uint32_t Id : Targets)
+    if (Id != InvalidInstructionId)
+      return true;
+  Targets.clear();
+  return false;
+}
+
+// The id of a branch, which unlike every other instruction id has to mean the
+// same thing to the fuzzer as it does here: it is what the coverage join is
+// keyed on.  On a module that has been through AFL++'s link-time
+// instrumentation that is the AFL++ edge id, and the source-location hash --
+// with the lossy join it forces, see include/branch_map.h -- is not needed at
+// all.  Everywhere else this is just getInstructionId().
+//
+// GEP bounds, memcmp and loop ids stay on getInstructionId() and are free to
+// collide with an edge id, because nothing joins on them: the runtime feeds a
+// cond's id to ConcolicSession's per-input throttle and to the coverage map,
+// and ignores it everywhere else.
+//
+// TODO: code AFL++ does not instrument still reaches the coverage map with a
+// source hash.  ClWithAfl keeps the two id spaces apart *within* a module, but
+// not across separately-compiled ones, and an instrumented binary always has
+// some: lib/symsan/libc++.a, libc++abi.a and libunwind.a between them hold ~50
+// __taint_trace_cond call sites, and any archive built by a plain per-TU
+// ko-clang -- an instrumented zlib, say -- adds more.  None of them are in the
+// merged module AFL++ numbered, so AflMapPtr is null when they are compiled and
+// they fall through to getInstructionId() below.  A djb hash is uniform over
+// 32 bits, so each such id lands inside AFL++'s edge range with probability
+// edges/2^32 and is then looked up as some unrelated edge -- a wrong answer
+// from is_interest() rather than a crash, which is the bad kind.  Unlike the
+// undefined_check_ids above, a reserved low range cannot fix this, because a
+// hash cannot be made to avoid a range it does not know about.  The candidate
+// fix is a tag bit -- AFL++ edge ids are far below 2^31, so forcing bit 31 on
+// every non-edge cid makes "is this an edge?" a one-bit test that works across
+// archives.  Prototyped as kNotAnEdgeTag under -taint-instrument-unnumbered,
+// which needs it for the same reason; what is left for #84 is applying it to the
+// hash path taken when AflMapPtr is null, and teaching the reader to treat a
+// tagged cid as unjoinable rather than letting it miss by luck.  Left alone for
+// now; revisit once the pipeline has settled.
+uint32_t Taint::getBranchId(Instruction *Inst) {
+  if (AflMapPtr) {
+    SmallVector<uint32_t, 4> Targets;
+    if (!getAflBranchTargets(Inst, Targets)) {
+      // AFL++ numbered no side of this branch, so there is nothing the coverage
+      // map can be asked about it.  Do not fall back to the source hash: a hash
+      // cannot be looked up in that map either, and pretending otherwise is how
+      // the old join produced branches nobody could decide about.  Invalid
+      // means "leave this branch alone".
+      //
+      // That argument is about joining, not about solving -- the session's own
+      // record is keyed on the runtime return address and needs no id at all, so
+      // it would still have worked here.  What settles it is measurement rather
+      // than the argument: recovering these branches buys nothing on zlib or on
+      // any of the 14 fuzzer-challenges targets, because on a C target they come
+      // out to be loop latches over untainted counters.  See
+      // ClInstrumentUnnumbered for the numbers and for how to re-run it.
+      if (Inst->getMetadata("dfsan.bb"))
+        return getInstructionId(Inst);
+      if (!ClInstrumentUnnumbered)
+        return InvalidInstructionId;
+      uint32_t H = getInstructionId(Inst);
+      if (H == InvalidInstructionId)
+        return H;
+      H |= kNotAnEdgeTag;
+      // A hash whose low 31 bits are all ones would tag to InvalidInstructionId
+      // and be read as "leave this branch alone".  Move it rather than lose it.
+      if (H == InvalidInstructionId)
+        H ^= 1;
+      return H;
+    }
+    // Name the branch after the first of its targets AFL++ numbered: the block
+    // it reaches when the condition holds, or its default destination for a
+    // switch, falling back to the next direction when that one was pruned.
+    // Whichever it lands on is unique to this branch, because critical edges
+    // have been split and so a successor of a conditional terminator has this
+    // block as its only predecessor.
+    //
+    // The low ids belong to SymSan's own decision points -- UB checks, bounds
+    // checks, libc size constraints.  Those are not branches in the program and
+    // are not numbered here at all: the runtime passes an `enum
+    // undefined_check_ids` value (runtime/dfsan/dfsan.h) straight to
+    // __taint_trace_cond as the cid, so they occupy 1..16 and nothing else.
+    // symsan::AFL_ID_BASE holds that range clear with room to spare, but only as
+    // long as AFL++'s numbering really does start above it.  Nothing downstream
+    // can tell the two apart if it does not, so say so once and let the build be
+    // fixed rather than silently mis-joining.
+    uint32_t Id = InvalidInstructionId;
+    for (uint32_t T : Targets) {
+      if (T != InvalidInstructionId) {
+        Id = T;
+        break;
+      }
+    }
+    if (Id < symsan::AFL_ID_BASE && !WarnedLowAflId) {
+      WarnedLowAflId = true;
+      errs() << "SymSan: AFL++ edge id " << Id
+             << " falls inside the range reserved for SymSan's own branch ids; "
+                "build with AFL_LLVM_LTO_STARTID="
+             << symsan::AFL_ID_BASE << "\n";
+    }
+    return Id;
+  }
+  return getInstructionId(Inst);
+}
+
+// The counterpart of AFL++'s AFL_LLVM_DOCUMENT_IDS.  That one says which source
+// location each *edge id* came from; this one says which source location each
+// *branch id* came from.  Diffing the two tables answers "do the two builds
+// name the same branch the same way?" without running anything, and separates
+// the two ways the join can be thin: a location both sides emit but with
+// different columns means the two clangs disagree and the join is dead, while a
+// location only this side emits is AFL++ having pruned the block, which is
+// expected and merely costs opportunities.
+//
+// The line deliberately echoes AFL++'s: same ModuleID=/Function= lead-in, and
+// src= last because a path may contain spaces and colons, so it is parsed from
+// the right.
+//
+// Kind is passed in rather than sniffed from Inst because the interesting
+// distinction is not the LLVM opcode but whether the line can join at all.  A
+// "switch" line never can -- the switch as a whole is not an edge on the AFL++
+// side, only its individual cases are, and those come out as "switch-case"
+// lines with their own cid.  A "select" line cannot join either, though only
+// for want of a patch: AFL++ does allocate two edge ids per scalar select, it
+// just never writes them to its ids file.  Saying which is which here keeps a
+// line with no counterpart from being read as evidence of a broken build.
+//
+// Extra is anything belonging between kind= and src=; a switch case uses it to
+// carry the case value that, with the switch's location, makes up its id.
+void Taint::documentBranchId(uint32_t cid, Instruction *Inst,
+                             const char *Kind, const std::string &Extra) {
+  if (DocumentIdsPath.empty())
+    return;
+
+  std::string Line = "ModuleID=" + Mod->getSourceFileName();
+  if (const Function *F = Inst->getFunction())
+    Line += " Function=" + F->getName().str();
+  Line += " cid=" + std::to_string(cid);
+  Line += " kind=";
+  Line += Kind;
+  if (!Extra.empty())
+    Line += " " + Extra;
+  // No debug location means the id came from the "unamed:" counter, which is
+  // per-module state and not a key anything else can compute.  Emit the line
+  // anyway: a build accidentally missing -g shows up as every line lacking a
+  // src=, which is a much clearer diagnosis than an empty intersection.
+  if (const DILocation *Loc = Inst->getDebugLoc()) {
+    Line += " src=" + Loc->getFilename().str() + ":" +
+            std::to_string(Loc->getLine()) + ":" +
+            std::to_string(Loc->getColumn());
+  }
+  DocumentedIds.push_back(std::move(Line));
+}
+
+void Taint::flushDocumentedIds() {
+  if (DocumentIdsPath.empty() || DocumentedIds.empty())
+    return;
+
+  std::string Buf;
+  for (const auto &Line : DocumentedIds) {
+    Buf += Line;
+    Buf += '\n';
+  }
+  DocumentedIds.clear();
+
+  // Every TU of a parallel build appends to the same file, so take the lock
+  // rather than trusting one write() to be indivisible.  A failure here is
+  // reported and otherwise ignored: this is a diagnostic, and refusing to
+  // compile because it could not be written would be the wrong trade.
+  int Fd = open(DocumentIdsPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+  if (Fd < 0) {
+    errs() << "SymSan: cannot open SYMSAN_DOCUMENT_IDS file "
+           << DocumentIdsPath << ": " << strerror(errno) << "\n";
+    return;
+  }
+  if (flock(Fd, LOCK_EX) == 0) {
+    if (write(Fd, Buf.data(), Buf.size()) != (ssize_t)Buf.size())
+      errs() << "SymSan: short write to " << DocumentIdsPath << "\n";
+    flock(Fd, LOCK_UN);
+  }
+  close(Fd);
+}
+
+// Which edge does taking a branch one way or the other actually reach?  The
+// backend needs that to decide whether flipping a branch is worth solving --
+// "is the edge on the other side of this branch one we have never covered?" --
+// and it is not something either side can work out on its own: the branch id
+// and the edge ids around it live in the same numbering, but only the CFG says
+// how they are connected.
+//
+//   # symsan branch map v1 base=<reserved> edges=<count>
+//   C <cid> <true edge> <false edge>      conditional branch
+//   X <cid> <true edge> <false edge>      select-lowered branch
+//   D <cid> <default edge>                switch, no case matched
+//   S <cid> <case value> <case edge>      switch, one line per case
+//
+// One line per branch this build actually traces, and no others: a branch AFL++
+// numbered no side of gets no __taint_trace_cond call either (see
+// getAflBranchTargets), so there is nothing for the backend to look up.  An
+// individual direction AFL++ pruned is written as -1, which the backend reads as
+// "never interesting" -- the honest answer, since AFL++ prunes exactly the
+// blocks whose coverage is implied by something else's.
+//
+// The header says how the numbering is laid out -- base= the ids held back below
+// AFL++'s range for SymSan's own branches (symsan::AFL_ID_BASE), edges= how far
+// AFL++'s numbering went, which is also how big the coverage map has to be.
+//
+// The cid repeats whichever edge it was taken from, so the backend can look up
+// (cid, direction) uniformly rather than special-casing the direction the id
+// happens to name.
+//
+// Case values are printed the way TaintFunction::visitSwitchInst hands them to
+// the runtime, zero-extended to 64 bits, so that a reader can rebuild the
+// per-case id with symsan::switch_case_cid() and meet the runtime's own
+// derivation.  Written before any IR is touched, so what it describes is
+// exactly the module AFL++ numbered.
+void Taint::writeBranchMap(Module &M) {
+  if (ClBranchMap.empty())
+    return;
+  if (!AflMapPtr) {
+    errs() << "SymSan: -taint-branch-map given, but this module has no "
+              "AFL++ instrumentation to map against\n";
+    return;
+  }
+
+  std::string Buf = "# symsan branch map v1 base=" +
+                    std::to_string(symsan::AFL_ID_BASE) +
+                    " edges=" + std::to_string(AflEdges) + "\n";
+
+  auto EdgeStr = [this](uint32_t Id) {
+    return Id == InvalidInstructionId ? std::string("-1") : std::to_string(Id);
+  };
+
+  SmallVector<uint32_t, 8> Targets;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        // Every select with ids, not just the ones that end up traced: whether
+        // a condition carries a label is a runtime property, and the map has to
+        // be able to answer for any branch the trace reports.
+        auto *SI = dyn_cast<SelectInst>(&I);
+        if (!SI)
+          continue;
+        Targets.clear();
+        if (!getAflBranchTargets(SI, Targets))
+          continue;
+        Buf += "X " + std::to_string(getBranchId(SI)) + " " +
+               EdgeStr(Targets[0]) + " " + EdgeStr(Targets[1]) + "\n";
+      }
+
+      Instruction *Term = BB.getTerminator();
+      Targets.clear();
+      if (!getAflBranchTargets(Term, Targets))
+        continue;
+      uint32_t Cid = getBranchId(Term);
+      if (isa<BranchInst>(Term)) {
+        Buf += "C " + std::to_string(Cid) + " " + EdgeStr(Targets[0]) + " " +
+               EdgeStr(Targets[1]) + "\n";
+      } else {
+        // Targets is [default, case 0, case 1, ...], in cases() order.
+        auto *SW = cast<SwitchInst>(Term);
+        Buf += "D " + std::to_string(Cid) + " " + EdgeStr(Targets[0]) + "\n";
+        unsigned Idx = 1;
+        for (auto C : SW->cases()) {
+          uint64_t Value =
+              C.getCaseValue()->getValue().zextOrTrunc(64).getZExtValue();
+          Buf += "S " + std::to_string(Cid) + " " + std::to_string(Value) +
+                 " " + EdgeStr(Targets[Idx++]) + "\n";
+        }
+      }
+    }
+  }
+
+  // Truncating, not appending: one module, one writer, unlike
+  // flushDocumentedIds().  A failure is fatal here -- the backend silently
+  // loses every coverage decision if the map is missing, and a build that
+  // asked for one should not quietly produce a binary without it.
+  std::error_code EC;
+  raw_fd_ostream OS(ClBranchMap, EC, sys::fs::OF_Text);
+  if (EC) {
+    report_fatal_error(Twine("SymSan: cannot write -taint-branch-map file ") +
+                       ClBranchMap + ": " + EC.message());
+  }
+  OS << Buf;
 }
 
 void Taint::addContextRecording(Function &F) {
@@ -972,6 +1585,28 @@ bool Taint::initializeModule(Module &M) {
 
   Mod = &M;
   Ctx = &M.getContext();
+  // An environment variable rather than a -mllvm flag, to match how AFL++
+  // spells the same thing and so that a whole build can be documented by
+  // exporting one variable.
+  if (const char *P = getenv("SYMSAN_DOCUMENT_IDS"))
+    DocumentIdsPath = P;
+  // Left as an external declaration by AFL++'s link-time instrumentation, and
+  // absent from anything else, so it doubles as the "were we handed an
+  // AFL-instrumented module?" test.  See getBranchId() and ClWithAfl.
+  if (ClWithAfl != cl::BOU_FALSE)
+    AflMapPtr = M.getGlobalVariable("__afl_area_ptr", /*AllowInternal=*/true);
+  if (ClWithAfl == cl::BOU_TRUE && !AflMapPtr)
+    report_fatal_error("SymSan: -taint-with-afl given, but this module has no "
+                       "AFL++ link-time instrumentation (@__afl_area_ptr)");
+  // Unlike the map pointer, __afl_final_loc is *defined* by AFL++'s pass, with
+  // the edge count as its static initialiser, so how far the fuzzer's own
+  // numbering went can be read straight out of the module.
+  if (AflMapPtr) {
+    auto *FinalLoc = M.getGlobalVariable("__afl_final_loc", true);
+    if (FinalLoc && FinalLoc->hasInitializer())
+      if (auto *CI = dyn_cast<ConstantInt>(FinalLoc->getInitializer()))
+        AflEdges = (uint32_t)CI->getZExtValue();
+  }
   Int8Ty = IntegerType::get(*Ctx, 8);
   Int16Ty = IntegerType::get(*Ctx, 16);
   Int32Ty = IntegerType::get(*Ctx, 32);
@@ -995,6 +1630,15 @@ bool Taint::initializeModule(Module &M) {
       Int16Ty, Int16Ty, Int64Ty, Int64Ty};
   TaintUnionFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintUnionArgs, /*isVarArg=*/ false);
+  // Normalizes ONE operand of an operation wider than 64 bits to a real label,
+  // to be called before __taint_union rather than instead of it: a symbolic
+  // operand keeps its label, a concrete one becomes a WideConst leaf built from
+  // the full value.  Hence lo and hi -- op1/op2 in dfsan_label_info are 64 bits
+  // each, so a >64-bit concrete operand does not fit in one.
+  // args: label, lo, hi, size
+  Type *TaintGetWideArgs[4] = { PrimitiveShadowTy, Int64Ty, Int64Ty, Int16Ty };
+  TaintGetWideFnTy = FunctionType::get(
+      PrimitiveShadowTy, TaintGetWideArgs, /*isVarArg=*/ false);
   Type *TaintUnionLoadArgs[4] = { PrimitiveShadowPtrTy, IntptrTy, Int64Ty, Int64Ty };
   TaintUnionLoadFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintUnionLoadArgs, /*isVarArg=*/ false);
@@ -1042,6 +1686,12 @@ bool Taint::initializeModule(Module &M) {
       Int64Ty, Int64Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceGEPFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceGEPArgs, false);
+  // __taint_table_lookup(index_label, index, table_ptr, num_elems, elem_size)
+  // -> label for the loaded element
+  Type *TaintTableLookupArgs[5] =
+      { PrimitiveShadowTy, Int64Ty, Int64Ty, Int64Ty, Int64Ty };
+  TaintTableLookupFnTy = FunctionType::get(
+      PrimitiveShadowTy, TaintTableLookupArgs, false);
   TaintPushStackFrameFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), {}, false);
   TaintPopStackFrameFnTy = FunctionType::get(
@@ -1208,6 +1858,15 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
+    // only param 0 is a label; 1 and 2 are full i64 value halves
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    TaintGetWideFn =
+        Mod->getOrInsertFunction("__taint_get_wide", TaintGetWideFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
     TaintUnionLoadFn =
         Mod->getOrInsertFunction("__taint_union_load", TaintUnionLoadFnTy, AL);
   }
@@ -1262,6 +1921,8 @@ void Taint::initializeRuntimeFunctions(Module &M) {
 
   TaintRuntimeFunctions.insert(
       TaintUnionFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintGetWideFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintUnionLoadFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -1348,6 +2009,14 @@ void Taint::initializeCallbackFunctions(Module &M) {
   {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
+    TaintTableLookupFn =
+        Mod->getOrInsertFunction("__taint_table_lookup", TaintTableLookupFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     TaintPushStackFrameFn =
         Mod->getOrInsertFunction("__taint_push_stack_frame", TaintPushStackFrameFnTy, AL);
   }
@@ -1423,6 +2092,8 @@ void Taint::initializeCallbackFunctions(Module &M) {
   TaintRuntimeFunctions.insert(
       TaintTraceGEPFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
+      TaintTableLookupFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
       TaintPushStackFrameFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintPopStackFrameFn.getCallee()->stripPointerCasts());
@@ -1472,6 +2143,14 @@ bool Taint::runImpl(Module &M) {
 
   initializeCallbackFunctions(M);
   initializeRuntimeFunctions(M);
+
+  // Before touching any IR: see findReadOnlyTables().
+  findReadOnlyTables(M);
+  // Before instrumenting too, so that the CFG this walks is the one AFL++
+  // numbered -- TaintPass splits edges of its own later on -- and so that every
+  // branch id the visitor goes on to bake into a __taint_trace_cond call is one
+  // the map has a line for.
+  writeBranchMap(M);
 
   std::vector<Function *> FnsToInstrument;
   SmallPtrSet<Function *, 8> IFuncs;
@@ -1744,6 +2423,8 @@ bool Taint::runImpl(Module &M) {
       TF.hoistBoundsChecks();
   }
 
+  flushDocumentedIds();
+
   return Changed || !FnsToInstrument.empty() ||
          M.global_size() != InitialGlobalSize || M.size() != InitialModuleSize;
 }
@@ -1956,6 +2637,11 @@ Value *TaintFunction::combineBinaryOperatorShadows(BinaryOperator *BO,
   return Shadow;
 }
 
+// Widest operand the label format can describe.  op1 and op2 are 64 bits each,
+// which is exactly what a concrete 128-bit operand needs; anything above this
+// would require a side channel, and nothing observed needs one.
+static const uint64_t kMaxOperandBits = 128;
+
 Value *TaintFunction::combineShadows(Value *V1, Value *V2,
                                      uint16_t op,
                                      Instruction *Pos) {
@@ -1966,6 +2652,40 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   if (Ty->isFloatingPointTy()) {
     // check for FP
     if (!ClTraceFP)
+      return TT.getZeroShadow(Pos);
+    // only half/float/double have a bitcast to an integer that fits the 64-bit
+    // union below.  Anything wider (x86_fp80, fp128, ppc_fp128) would fall
+    // through to the CreateZExtOrTrunc and emit `trunc x86_fp80 to i64`, which
+    // the backend cannot select ("Cannot select: i64 = truncate (f80 load)").
+    // Drop the shadow instead: imprecise, but it compiles and stays sound.
+    //
+    // x86_fp80 is now allowed for COMPARISONS, and the selection problem above
+    // is avoided rather than hit: the operand is bitcast to i80 FIRST, and
+    // `trunc i80 to i64` (plus the lshr for the high half) selects fine.  What
+    // could not be selected was the FP-to-integer truncate, not the width.
+    //
+    // Only comparisons, deliberately.  A compare is self-contained -- both
+    // operands are fp80, the result is an i1, and the whole thing is described
+    // by the two op slots.  A conversion is not: `fpext double to x86_fp80`
+    // already slips past this filter (it looks at operand 0, which is the
+    // double) and `fptrunc x86_fp80 to double` would produce a 64-bit node
+    // whose recorded operand value is an fp80 significand.  Both are declines
+    // below rather than nodes with a plausible wrong value in them.
+    //
+    // fp80 stays declined for z3 and jigsaw, which is a format problem and not
+    // a width one: fp80 has an EXPLICIT integer significand bit, so z3's
+    // (_ FloatingPoint 15 64) is a different, 79-bit sort and reinterpreting
+    // the bits into it would be wrong, while jigsaw carries every FP value as a
+    // double in a uint64 arg slot.  i2s is the exception because it evaluates
+    // in C++ on x86, where `long double` IS x86_fp80: it can decode, compare,
+    // step and re-encode on the hardware that produced the value, with no model
+    // in between.  See solve_fcmp80 in solvers/i2s-solver.cpp.
+    //
+    // fp128 and ppc_fp128 remain declined outright: no host type evaluates them
+    // natively the way `long double` does fp80, so there is no backend that
+    // could take them even if they were transported.
+    if (!Ty->isHalfTy() && !Ty->isFloatTy() && !Ty->isDoubleTy() &&
+        !(Ty->isX86_FP80Ty() && isa<CmpInst>(Pos)))
       return TT.getZeroShadow(Pos);
   } else if (Ty->isVectorTy()) {
     // FIXME: vector type
@@ -1979,12 +2699,33 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   // filter size
   auto &DL = Pos->getModule()->getDataLayout();
   uint64_t size = DL.getTypeSizeInBits(Pos->getType());
+  // a comparison records the width of its operands, not of its i1 result, so
+  // the size filter below has to look at the operands too -- otherwise a
+  // 128-bit icmp sails through (result is i1) and its operands get truncated
+  // to 64 bits while the label still claims size = 128, which is a wrong
+  // formula the solver will happily model
+  if (CmpInst *CI = dyn_cast<CmpInst>(Pos))
+    size = DL.getTypeSizeInBits(CI->getOperand(0)->getType());
   // FIXME: do not handle type larger than 64-bit
-  if (size > 64) return TT.getZeroShadow(Pos);
+  //
+  // Relaxed to 128 so __int128 arithmetic is tracked -- the shape at the core of
+  // every modern 64-bit hash (`(unsigned __int128)a * b >> 64`) and of
+  // __builtin_mul_overflow on uint64_t.  128 is a hard ceiling rather than an
+  // arbitrary one: a concrete operand has to travel in the label's op1 and op2
+  // slots, which are exactly 64 bits each (see WideConst in dfsan.h), so
+  // _BitInt(256) and friends still decline here.  Floating point never reaches
+  // this point above 64 bits -- the half/float/double filter above already
+  // rejects x86_fp80/fp128/ppc_fp128, which need a format conversion rather than
+  // a wider integer, not least because x86_fp80 has an explicit significand bit
+  // that z3's (_ FloatingPoint 15 64) does not.
+  if (size > kMaxOperandBits) return TT.getZeroShadow(Pos);
 
   IRBuilder<> IRB(Pos);
+  // x86_fp80's integer twin.  Note this is i80 and not i128: the type is 80
+  // bits wide even though it occupies 16 bytes of storage, and bitcast demands
+  // the exact primitive size.
+  Type *Int80Ty = IntegerType::get(Pos->getContext(), 80);
   if (CmpInst *CI = dyn_cast<CmpInst>(Pos)) { // for both icmp and fcmp
-    size = DL.getTypeSizeInBits(CI->getOperand(0)->getType());
     // op should be predicate
     op |= (CI->getPredicate() << 8);
   }
@@ -1999,6 +2740,11 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
     Op1 = IRB.CreateBitCast(Op1, TT.Int32Ty);
   else if (Ty->isDoubleTy())
     Op1 = IRB.CreateBitCast(Op1, TT.Int64Ty);
+  else if (Ty->isX86_FP80Ty())
+    // the trunc to 64 below keeps the low half, which for an fp80 is the whole
+    // significand -- the high 16 bits are sign and exponent, and they travel in
+    // the WideConst produced by the size > 64 path
+    Op1 = IRB.CreateBitCast(Op1, Int80Ty);
   else if (Ty->isPointerTy())
     Op1 = IRB.CreatePtrToInt(Op1, TT.Int64Ty);
   Op1 = IRB.CreateZExtOrTrunc(Op1, TT.Int64Ty);
@@ -2013,9 +2759,69 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
       Op2 = IRB.CreateBitCast(Op2, TT.Int32Ty);
     else if (Ty->isDoubleTy())
       Op2 = IRB.CreateBitCast(Op2, TT.Int64Ty);
+    else if (Ty->isX86_FP80Ty())
+      Op2 = IRB.CreateBitCast(Op2, Int80Ty);
     else if (Ty->isPointerTy())
       Op2 = IRB.CreatePtrToInt(Op2, TT.Int64Ty);
     Op2 = IRB.CreateZExtOrTrunc(Op2, TT.Int64Ty);
+  }
+  // A concrete operand of a wide operation cannot ride in the Op1/Op2 slots
+  // above -- they are 64 bits and the extends just truncated into them, so the
+  // runtime would embed a wrong constant in the AST without any way to tell.
+  // Such an operand needs a real label instead (see WideConst in dfsan.h), and
+  // that applies to small values too: `(unsigned __int128)x >> 64` has to go
+  // through it, because what a zero shadow cannot express is not "large" but
+  // "exact".
+  //
+  // Which operands are concrete is a *runtime* question, not one that can be
+  // settled here.  It is tempting to look for a ConstantInt and give up on
+  // anything else, but at -O0 clang keeps even a literal `__int128` in an
+  // alloca, so `a == 0x0123...` reaches the icmp as `load i128` with no
+  // constant in sight -- the shape would have worked only in optimized builds,
+  // which is exactly backwards.  So hand each operand's full value to
+  // __taint_get_wide, which can see the label: symbolic keeps its label,
+  // concrete becomes a WideConst leaf.  Normalizing the operands rather than
+  // replacing the union call is what keeps this to one extra entry point -- the
+  // union below is the same one every other width uses, and only the operands
+  // it is given have changed.  Both sides tainted costs two calls that return
+  // their argument, and no union-table entry.
+  if (size > 64) {
+    // Only integers and fp80 comparison operands should get this far -- the FP
+    // filter above rejects every other float format wider than double, and a
+    // pointer is 64 bits -- but `fpext double to x86_fp80` slips past it,
+    // because that filter looks at operand 0 and operand 0 is the double.  It
+    // arrives here at size 80 with no fp80 operand to bitcast, so decline it the
+    // way the old constant-only path did (by finding no ConstantInt) rather than
+    // asserting in CreateZExtOrTrunc.
+    //
+    // An fp80 operand is admitted because it does have a high half to extract,
+    // once bitcast to i80: the top 16 bits are its sign and exponent, and they
+    // are exactly what would be lost if only the 64-bit significand travelled.
+    for (unsigned i = 0, n = Pos->getNumOperands(); i < n && i < 2; ++i) {
+      Type *OpTy = Pos->getOperand(i)->getType();
+      if (!OpTy->isIntegerTy() && !OpTy->isX86_FP80Ty())
+        return TT.getZeroShadow(Pos);
+    }
+    Type *Int128Ty = IntegerType::get(Pos->getContext(), 128);
+    // the high half of an operand narrower than the operation (`zext i64 to
+    // i128`) is zero, which the zext produces without a special case
+    auto getWide = [&](Value *Label, Value *Lo, Value *Operand) -> Value * {
+      if (Operand->getType()->isX86_FP80Ty())
+        Operand = IRB.CreateBitCast(Operand, Int80Ty);
+      Value *W = IRB.CreateZExtOrTrunc(Operand, Int128Ty);
+      Value *Hi = IRB.CreateTrunc(IRB.CreateLShr(W, 64), TT.Int64Ty);
+      CallInst *C = IRB.CreateCall(TT.TaintGetWideFn, {Label, Lo, Hi, Size});
+      C->addRetAttr(Attribute::ZExt);
+      C->addParamAttr(0, Attribute::ZExt);
+      return C;
+    };
+    V1 = getWide(V1, Op1, Pos->getOperand(0));
+    // Only promote a slot that actually holds an operand value.  This is why
+    // the getter is per-operand: the caller knows, whereas a wide union would
+    // have to re-derive it from the opcode (a Load keeps a byte count in op2,
+    // an Extract a bit offset, a unary op nothing at all).
+    if (Pos->getNumOperands() > 1)
+      V2 = getWide(V2, Op2, Pos->getOperand(1));
   }
   CallInst *Call = IRB.CreateCall(TT.TaintUnionFn, {V1, V2, Op, Size, Op1, Op2});
   Call->addRetAttr(Attribute::ZExt);
@@ -2625,6 +3431,19 @@ void TaintFunction::hoistBoundsChecks() {
       Groups[AddrLabel].push_back({AR, SizeC->getZExtValue(), CI});
     }
 
+    // The backedge-taken count is typed by the loop's induction variable,
+    // which need not be as wide as the address recurrence: an i32 IV walking
+    // an i64 address is common once inlining exposes the loop (it shows up at
+    // -O2, and after LTO even in code that was fine per-TU). SCEV requires
+    // both operands of getMulExpr/getAddExpr to have the same width, but that
+    // check is an assert -- in a release LLVM it is compiled out, the
+    // mixed-width SCEV is built anyway, and SCEVExpander later materializes
+    // it as `shl i32 %btc, i64 2`, which fails the module verifier. Coerce
+    // the count to the width we are about to combine it with.
+    auto CountAs = [&](Type *Ty) {
+      return SE.getTruncateOrZeroExtend(BTC, Ty);
+    };
+
     SCEVExpander Expander(SE, M->getDataLayout(), "bounds.hoist");
     Instruction *InsertPt = Preheader->getTerminator();
     DenseSet<CallInst *> HoistedSolveBounds;
@@ -2643,11 +3462,13 @@ void TaintFunction::hoistBoundsChecks() {
         const SCEV *Start = C.AR->getStart();
         const SCEV *Step = C.AR->getStepRecurrence(SE);
         // end of this access: start + BTC * stride + elem_size
+        // Step is always integer-typed (only an add-rec's start may be a
+        // pointer), so it is the right width to compute the extent in.
         const SCEV *End = SE.getAddExpr(
           Start,
           SE.getAddExpr(
-            SE.getMulExpr(BTC, Step),
-            SE.getConstant(BTC->getType(), C.ElemSize)
+            SE.getMulExpr(CountAs(Step->getType()), Step),
+            SE.getConstant(Step->getType(), C.ElemSize)
           )
         );
         if (SE.isKnownPredicate(ICmpInst::ICMP_ULT, Start, MinStart))
@@ -2710,10 +3531,13 @@ void TaintFunction::hoistBoundsChecks() {
       if (!isa<AllocaInst>(Arg))
         continue;
 
-      const SCEV *TripCount =
-          SE.getAddExpr(BTC, SE.getConstant(BTC->getType(), 1));
+      // Widen before the +1 and the multiply, not after: the extent is about
+      // to be expanded at i64, and a narrow induction variable would otherwise
+      // have trip_count * access_size wrap before it is zero-extended.
+      const SCEV *TripCount = SE.getAddExpr(
+          CountAs(TT.Int64Ty), SE.getConstant(TT.Int64Ty, 1));
       const SCEV *TotalSCEV = SE.getMulExpr(
-          TripCount, SE.getConstant(TripCount->getType(), Summary.AccessSize));
+          TripCount, SE.getConstant(TT.Int64Ty, Summary.AccessSize));
 
       IRBuilder<> IRB(InsertPt);
       Type *I8PtrTy = PointerType::getUnqual(F->getContext());
@@ -2845,8 +3669,8 @@ void TaintFunction::hoistBoundsChecks() {
         const SCEV *Step = C.AR->getStepRecurrence(SE);
         const SCEV *End = SE.getAddExpr(
             Start,
-            SE.getAddExpr(SE.getMulExpr(BTC, Step),
-                          SE.getConstant(BTC->getType(), C.ElemSize)));
+            SE.getAddExpr(SE.getMulExpr(CountAs(Step->getType()), Step),
+                          SE.getConstant(Step->getType(), C.ElemSize)));
         if (SE.isKnownPredicate(ICmpInst::ICMP_ULT, Start, MinStart))
           MinStart = Start;
         if (!MaxEnd || SE.isKnownPredicate(ICmpInst::ICMP_UGT, End, MaxEnd))
@@ -3318,9 +4142,38 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
     TF.checkBounds(LI.getPointerOperand(),
                    ConstantInt::get(TF.TT.Int64Ty, Size), Pos);
 
-  Value *Shadow =
-      TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
-                    LI.getAlign(), Pos);
+  // A load from a read-only global table at a symbolic index: shadow memory
+  // over globals is zero, so the value we just loaded is concrete and any
+  // comparison consuming it never reaches the solver.  Give it a real shadow
+  // describing the lookup instead.  Done at the load, not the GEP, so the
+  // loaded value itself carries the label and propagates normally from here.
+  //
+  // This replaces the shadow load rather than combining with it: the table is a
+  // read-only global, so its shadow is zero by construction and loading it
+  // would only cost an access.  (Testing isZeroShadow() on the loaded shadow
+  // would never fire -- loadShadow returns an instruction, not a constant.)
+  Value *Shadow = nullptr;
+  if (ClTraceTableLookup) {
+    auto It = TF.TableGEPs.find(LI.getPointerOperand());
+    if (It != TF.TableGEPs.end()) {
+      const auto &TGI = It->second;
+      // Only the element type we recorded; a differently-sized load through the
+      // same GEP (type punning) is not the lookup we analyzed.
+      if (DL.getTypeStoreSize(LI.getType()) == TGI.ElemSize &&
+          LI.getType()->isIntegerTy()) {
+        IRBuilder<> IRB(Pos);
+        Shadow = IRB.CreateCall(
+            TF.TT.TaintTableLookupFn,
+            {TGI.IndexShadow, TGI.Index, TGI.TablePtr,
+             ConstantInt::get(TF.TT.Int64Ty, TGI.NumElements),
+             ConstantInt::get(TF.TT.Int64Ty, TGI.ElemSize)});
+      }
+    }
+  }
+
+  if (!Shadow)
+    Shadow = TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
+                           LI.getAlign(), Pos);
 #if 0
   //FIXME: tainted pointer
   if (ClCombinePointerLabelsOnLoad) {
@@ -3328,6 +4181,7 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
     Shadow = TF.combineShadows(Shadow, PtrShadow, Pos);
   }
 #endif
+
   if (!TF.TT.isZeroShadow(Shadow))
     TF.NonZeroChecks.push_back(Shadow);
 
@@ -3514,6 +4368,10 @@ void TaintFunction::visitCmpInst(CmpInst *I) {
   Module *M = F->getParent();
   auto &DL = M->getDataLayout();
   unsigned size = DL.getTypeSizeInBits(Op1->getType());
+  // same 64-bit ceiling as combineShadows: truncating wider operands while
+  // reporting their real width would hand the solver a wrong formula
+  if (size > 64)
+    return;
 
   IRBuilder<> IRB(I);
   Op1 = IRB.CreateZExtOrTrunc(Op1, TT.Int64Ty);
@@ -3545,9 +4403,10 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   Value *CondShadow = getShadow(Cond);
   if (TT.isZeroShadow(CondShadow))
     return;
-  uint32_t cid = TT.getInstructionId(I);
+  uint32_t cid = TT.getBranchId(I);
   if (cid == TT.InvalidInstructionId)
     return;
+  TT.documentBranchId(cid, I, "switch");
   unsigned size = DL.getTypeSizeInBits(Cond->getType());
   ConstantInt *Size = ConstantInt::get(TT.Int32Ty, size);
   ConstantInt *Predicate = ConstantInt::get(TT.Int32Ty, 32); // EQ, ==
@@ -3557,11 +4416,26 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
   for (auto C : I->cases()) {
     Value *CV = C.getCaseValue();
 
+    // Each case gets its own id.  They all used to share the switch's cid,
+    // which left (cid, direction) unable to say *which* case, and so left every
+    // case unjoinable with the fuzzer's per-case-block edge ids.  The case
+    // value is taken zero-extended to 64 bits because that is the form the
+    // CreateZExtOrTrunc below hands the runtime, and the form AFL++'s ids file
+    // has to agree on; see symsan::switch_case_cid in include/branch_id.h.
+    uint64_t CaseValue =
+        C.getCaseValue()->getValue().zextOrTrunc(64).getZExtValue();
+    uint32_t case_cid = symsan::switch_case_cid(cid, CaseValue);
+    TT.documentBranchId(case_cid, I, "switch-case",
+                        "case=" + std::to_string(CaseValue));
+    ConstantInt *CaseCID = ConstantInt::get(TT.Int32Ty, case_cid);
+
     Cond = IRB.CreateZExtOrTrunc(Cond, TT.Int64Ty);
     CV = IRB.CreateZExtOrTrunc(CV, TT.Int64Ty);
     IRB.CreateCall(TT.TaintTraceCmpFn, {CondShadow, TT.ZeroPrimitiveShadow,
-                   Size, Predicate, Cond, CV, CID});
+                   Size, Predicate, Cond, CV, CaseCID});
   }
+  // The switch's own cid, not any case's: the runtime uses it to tell that the
+  // case it has stashed belongs to this switch.
   IRB.CreateCall(TT.TaintTraceSwitchEndFn, {CID});
 }
 
@@ -3582,6 +4456,67 @@ void TaintVisitor::visitLandingPadInst(LandingPadInst &LPI) {
   // The second element in the pair result of the LandingPadInst is a
   // register value, but it is for a type ID and should never be tainted.
   TF.setShadow(&LPI, TF.TT.getZeroShadow(&LPI));
+}
+
+// Is GV a lookup table we can safely treat as a constant array?
+//
+// Note we deliberately do NOT use GV->isConstant(): tables are routinely
+// declared plain `static` rather than `const` (e.g. `static uint8_t hex[16]`),
+// and at -O0 GlobalOpt never runs to infer constancy, so isConstant() would
+// silently miss the common case.  GlobalStatus is the analysis GlobalOpt itself
+// uses to answer this.
+//
+// NotStored only tells us the global is never written *in this module*, so it
+// is sufficient only when no other module can reach it -- hence the linkage
+// check.  An external non-const global could be written from another TU.
+static bool isReadOnlyLookupTable(const GlobalVariable *GV, const DataLayout &DL,
+                                  uint64_t &NumElements, uint64_t &ElemSize) {
+  if (!GV->hasInitializer() || GV->isDeclaration())
+    return false;
+  // A non-const global with external linkage could be written from another
+  // translation unit, so "no stores in this module" would not be sound.
+  if (!GV->hasLocalLinkage() && !GV->isConstant())
+    return false;
+
+  GlobalStatus GS;
+  if (GlobalStatus::analyzeGlobal(GV, GS))
+    return false; // analysis bailed out; assume the worst
+  if (GS.StoredType != GlobalStatus::NotStored)
+    return false;
+
+  ArrayType *ATy = dyn_cast<ArrayType>(GV->getValueType());
+  if (!ATy)
+    return false;
+  Type *ETy = ATy->getElementType();
+  // Only integer elements: the loaded value has to fit in a label's 64-bit
+  // value slot, and i2s inverts by scanning for an exact integer match.
+  if (!ETy->isIntegerTy() || ETy->getIntegerBitWidth() > 64)
+    return false;
+
+  NumElements = ATy->getNumElements();
+  ElemSize = DL.getTypeAllocSize(ETy);
+  if (NumElements == 0 || ElemSize == 0)
+    return false;
+  if (NumElements * ElemSize > ClMaxTableBytes)
+    return false;
+  return true;
+}
+
+/// Find the read-only global arrays worth treating as lookup tables.
+///
+/// Must run before any instrumentation: getShadowForGlobal() passes a global's
+/// address to __taint_trace_global, and GlobalStatus::analyzeGlobal() gives up
+/// on any global whose address escapes into a call -- so asking the question
+/// later always answers "unanalyzable", and no table is ever found.
+void Taint::findReadOnlyTables(Module &M) {
+  if (!ClTraceTableLookup)
+    return;
+  const DataLayout &DL = M.getDataLayout();
+  for (GlobalVariable &GV : M.globals()) {
+    uint64_t NumElements = 0, ElemSize = 0;
+    if (isReadOnlyLookupTable(&GV, DL, NumElements, ElemSize))
+      ReadOnlyTables[&GV] = {NumElements, ElemSize};
+  }
 }
 
 void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
@@ -3657,6 +4592,22 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
           if (ClTraceGEPOffset) {
             IRB.CreateCall(TT.TaintTraceGEPFn,
                            {Shadow, Ptr, IndexShadow, Index, NE, ES, Offset, CID});
+          }
+          if (ClTraceTableLookup) {
+            // If this GEP indexes a read-only global table, remember it so the
+            // load that consumes it can be symbolized (visitLoadInst).  Note we
+            // check the *underlying* object, and only accept a GlobalVariable:
+            // glibc's ctype tables are reached via __ctype_b_loc(), so the base
+            // is a load rather than a global and they are skipped -- which is
+            // what keeps this from firing on every isupper()/tolower().
+            auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(Base));
+            auto TblItr = GV ? TT.ReadOnlyTables.find(GV)
+                             : TT.ReadOnlyTables.end();
+            if (TblItr != TT.ReadOnlyTables.end()) {
+              Value *TablePtr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
+              TableGEPs[I] = {IndexShadow, Index, TablePtr,
+                              TblItr->second.first, TblItr->second.second};
+            }
           }
         } else {
           break;
@@ -3808,11 +4759,19 @@ Value* TaintFunction::visitSelectInst(Value *Cond, Value *TrueShadow,
   }
 
   // special case, when select is used to implement logical AND and OR
+  uint32_t cid = TT.getBranchId(I);
+  if (cid == TT.InvalidInstructionId) {
+    // Nothing the coverage map can be asked about (see getAflBranchTargets):
+    // leave the select untraced, and combine the shadows the way the wider
+    // types do.
+    return TrueShadow == FalseShadow ? TrueShadow :
+        SelectInst::Create(Cond, TrueShadow, FalseShadow, "", I);
+  }
   IRBuilder<> IRB(I);
   Cond = IRB.CreateZExt(Cond, TT.Int8Ty);
   Value *TrueVal = IRB.CreateZExt(I->getTrueValue(), TT.Int8Ty);
   Value *FalseVal = IRB.CreateZExt(I->getFalseValue(), TT.Int8Ty);
-  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
+  ConstantInt *CID = ConstantInt::get(TT.Int32Ty, cid);
   return IRB.CreateCall(TT.TaintTraceSelectFn,
                         {CondShadow, TrueShadow, FalseShadow, Cond,
                          TrueVal, FalseVal, CID});
@@ -4522,6 +5481,40 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
     return;
   }
 
+  // bitreverse: one op node, not a decomposition.  Reversing an i64 the way
+  // bswap is handled above would take 64 Extracts plus 63 Concats per dynamic
+  // execution, and clang's idiom recognizer turns the reflection loop of every
+  // reflected CRC into an @llvm.bitreverse.i8 per message byte -- so the
+  // decomposition would be paid thousands of times per trace.  The solvers
+  // expand it instead: z3 as a concat of single-bit extracts, jigsaw as the
+  // native intrinsic.  Without this the shadow is dropped and the whole message
+  // silently goes concrete (see tests/symsan/bitreverse*.c).
+  if (IId == Intrinsic::bitreverse) {
+    Value *Arg = CB.getArgOperand(0);
+    Type *ArgTy = Arg->getType();
+    // The intrinsic is also defined on vectors, and getIntegerBitWidth() is a
+    // cast<IntegerType> away from asserting on one, so ask before assuming.
+    if (ArgTy->isIntegerTy() && ArgTy->getIntegerBitWidth() <= 64) {
+      unsigned Bits = ArgTy->getIntegerBitWidth();
+      Value *Shadow = TF.getShadow(Arg);
+      IRBuilder<> IRB(&CB);
+      CallInst *C = IRB.CreateCall(
+          TF.TT.TaintUnionFn,
+          {Shadow, TF.TT.ZeroPrimitiveShadow,
+           ConstantInt::get(TF.TT.Int16Ty, DfsanBitReverse),
+           ConstantInt::get(TF.TT.Int16Ty, Bits),
+           IRB.CreateZExtOrTrunc(Arg, TF.TT.Int64Ty),
+           ConstantInt::get(TF.TT.Int64Ty, 0)});
+      C->addRetAttr(Attribute::ZExt);
+      C->addParamAttr(0, Attribute::ZExt);
+      C->addParamAttr(1, Attribute::ZExt);
+      TF.setShadow(&CB, C);
+      return;
+    }
+    // A vector, or wider than a label's op1 slot: fall through and drop the
+    // shadow, the way this file already does for everything it cannot model.
+  }
+
   // Floating-point intrinsics: map to the self-defined FP ops so the z3 solver
   // can reconstruct them via the fpa theory.  Only modeled under ClTraceFP.
   if (ClTraceFP) {
@@ -4835,9 +5828,10 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   // except for loop exit
   if (TT.isZeroShadow(Shadow) && (flag & LoopExitBranch) == 0)
     return;
-  uint32_t cid = TT.getInstructionId(I);
+  uint32_t cid = TT.getBranchId(I);
   if (cid == TT.InvalidInstructionId)
     return; // XXX: forget about loop?
+  TT.documentBranchId(cid, I, isa<BranchInst>(I) ? "br" : "select");
   ConstantInt *LF = ConstantInt::get(TT.Int8Ty, flag);
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, cid);
   IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, LF, CID});

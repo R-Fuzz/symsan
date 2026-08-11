@@ -15,6 +15,7 @@ output*/
 auto/
 /bin/
 .DS_Store
+__pycache__/
 /build/
 /libcxx/
 !/libcxx/build_taint/lib/

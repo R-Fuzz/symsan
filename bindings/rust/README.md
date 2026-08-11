@@ -1,0 +1,565 @@
+# SymSan Rust bindings
+
+Three crates, layered so each is useful without the one above it:
+
+| crate | what it is | depends on LibAFL? |
+|---|---|---|
+| [`symsan`](symsan/) | safe wrapper over the `libsymsan_c.so` C ABI | no |
+| [`libafl-symsan`](libafl-symsan/) | `SymSanStage`, a LibAFL `Stage` | yes |
+| [`fuzzer`](fuzzer/) | `symsan-fuzz`, an example front-end binary | yes |
+
+`symsan` is a peer of [`bindings/python`](../python/): a binding, not a
+front-end. If you want to drive SymSan from your own harness rather than from
+LibAFL, that is the crate you want.
+
+## Quick start
+
+```bash
+# 1. build SymSan itself (this is what produces libsymsan_c.so)
+cd <symsan>/b4 && make -j && make install
+
+# 2. build the Rust side
+cd <symsan>/bindings/rust && cargo build --release
+
+# 3. instrument your target -- twice, see below
+afl-clang-fast -o target.afl target.c
+KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -o target.symsan target.c
+
+# 4. fuzz
+./target/release/symsan-fuzz \
+    -i ./seeds -o ./out --symsan ./target.symsan -- ./target.afl @@
+```
+
+### Why the target is built twice
+
+Coverage feedback and concolic execution need different instrumentation, and
+they run in different processes:
+
+- `target.afl` (afl-cc) is what the **forkserver executor** runs, ~1.4k times a
+  second, to measure coverage.
+- `target.symsan` (ko-clang) is what the **stage** runs, once per corpus entry,
+  to collect symbolic constraints.
+
+This is the same arrangement the AFL++ custom mutator used, where the second
+binary came from `$SYMSAN_TARGET`.
+
+`@@` means "the input file", as in AFL. It is expanded twice, to two different
+paths — the forkserver's scratch file and the stage's — because the two
+processes are independent. Leave it out and both read stdin.
+
+### `AFL_MAP_SIZE`
+
+The coverage map is 64K by default, which is afl-cc's own default and right for
+most targets. A big one — the sort where AFL++ tells you to set `AFL_MAP_SIZE`
+in the first place — instruments more edges than that, and the failure is not
+loud: the forkserver reports its real size during the handshake and LibAFL
+refuses to start, or, in an `AFL_LLVM_MAP_DYNAMIC` build, the extra edges just
+fold into the map we gave it and coverage quietly gets coarser.
+
+So `symsan-fuzz` reads the same variable afl-fuzz does, and a harness that
+already sets it needs no second knob:
+
+```bash
+AFL_MAP_SIZE=256000 symsan-fuzz -i ./seeds -o ./out --symsan ./target.symsan \
+    -- ./target.afl @@
+```
+
+Unset, unparseable or zero all mean 64K.
+
+### libFuzzer harnesses, persistent mode and the deferred fork server
+
+A target with no `main()` of its own — an OSS-Fuzz or Magma harness linked
+against AFL++'s `libAFLDriver.a`, say — gets both `__AFL_INIT()` and
+`__AFL_LOOP()` from the driver, and afl-cc records that in the binary as two
+marker strings. The markers only say what the target *can* do. Whether it does
+it is decided by `__AFL_DEFER_FORKSRV` and `__AFL_PERSISTENT` in its
+environment, and afl-fuzz is the one that scans for the markers and sets them.
+
+`symsan-fuzz` now does the same scan, so nothing has to be exported by hand.
+It matters most for the deferred fork server: without that variable the AFL
+runtime starts the fork server from a constructor, *before* `main`, and each
+forked child then asks "am I running under AFL?" after the fork — the answer
+being no, it reads `argv[1]` as a corpus file and exits without ever calling
+`LLVMFuzzerTestOneInput`. Nothing crashes and nothing warns; the handshake
+succeeds, executions are counted, and every coverage map comes back empty, so
+the fuzzer stops with
+
+```text
+Error: Empty("No entries in corpus. This often implies the target is not properly instrumented.")
+```
+
+which points at the target rather than at the missing variable. `AFL_PERSISTENT`
+and `AFL_DEFER_FORKSRV` still force either mode on for a target whose markers
+were stripped, exactly as in afl-fuzz.
+
+## Layout
+
+```
+bindings/rust/
+├── Cargo.toml            workspace
+├── symsan/
+│   ├── build.rs          bindgen over ../../include/symsan_c.h; link + rpath
+│   ├── src/lib.rs        Session, Config, Error, Stats
+│   └── tests/
+│       ├── data/branch.c a tiny target with two chained magic values
+│       └── session.rs    trace -> solve -> verify against an uninstrumented build
+├── libafl-symsan/
+│   ├── build.rs          re-emits the rpath (cargo does not propagate it)
+│   └── src/lib.rs        SymSanStage + SymSanStageBuilder
+└── fuzzer/
+    ├── build.rs          ditto
+    └── src/main.rs       forkserver_simple + the SymSan stage + a cmplog baseline
+```
+
+Nothing here is built by `make`; a C++ user needs no Rust toolchain. Configure
+with `-DSYMSAN_BUILD_RUST=ON` to get a `rust` target that shells out to cargo.
+
+## How the stage works
+
+Once per corpus entry, `SymSanStage::perform`:
+
+1. skips the entry if it has already been traced;
+2. runs `target.symsan` on it and turns the branches it hit into solving tasks;
+3. drains the solutions, handing each to `fuzzer.evaluate_filtered(...)`;
+4. feeds the resulting `ExecuteInputResult` back with `report_result`.
+
+Step 4 is the concrete win over the AFL++ custom mutator. A mutator never learns
+what happened to the bytes it produced, so the old driver inferred it by
+comparing queue-entry filenames afterwards. A stage runs the evaluation itself,
+so the answer is exact — and it matters, because `report_result(false)`
+escalates that task to the next, more expensive solver in the ladder while
+`report_result(true)` retires it.
+
+### It compounds
+
+The solver only sees constraints from branches the target actually *executed*.
+A branch nested behind an unsolved one does not exist yet. Solving the outer one
+produces an input that is interesting, so it enters the corpus, so the stage
+traces it, so the inner branch appears. Each round reaches one level deeper.
+
+You can watch this in the example target, which has two chained 4-byte magic
+values:
+
+```
+corpus: 1 -> 2      # 0xdeadbeef solved from the seed
+objectives: 0 -> 1  # 0x12345678 solved from re-tracing that new entry
+```
+
+Measured on `tests/data/branch.c` with an `abort()` on the inner path, 90-second
+runs:
+
+| | crash found | executions |
+|---|---|---|
+| with `--symsan` | **yes, after 1s / 18 execs** | — |
+| havoc only | no | 106,434 |
+
+Two chained 4-byte equalities is 2^64 of search space; havoc is not going to
+stumble into it.
+
+## Sharing coverage with the fuzzer (`--branch-map`)
+
+By default the stage only knows what *it* has traced, so it happily spends
+solver time on branches the fuzzer covered an hour ago. To read the fuzzer's
+knowledge it has to name branches the way the fuzzer does.
+
+`--branch-map` closes that, and the two sides no longer have separate names to
+reconcile: both binaries come out of **one** `afl-clang-lto` link.
+`-Wl,--save-temps=precodegen` makes lld write the merged module out as it stands
+after AFL++'s LTO pass has numbered the edges; running SymSan's TaintPass over
+*that* module makes a SymSan branch id literally be one of AFL++'s edge ids. The
+same pass writes the `.bmap` — which edge each side of each branch reaches —
+which is the part `--branch-map` reads.
+
+```bash
+L=<symsan>/b4/lib/symsan
+
+# one link: the coverage binary *and* target.afl.0.5.precodegen.bc
+AFL_LLVM_LTO_STARTID=4096 <aflpp>/afl-clang-lto \
+    -g -flto -fuse-ld=lld -Wl,--save-temps=precodegen -o target.afl target.c
+
+# the same module again, taint-instrumented, with the branch map beside it
+opt-18 -load-pass-plugin=$L/TaintPass.so -passes=taint \
+    -taint-abilist=$L/dfsan_abilist.txt -taint-abilist=$L/zlib_abilist.txt \
+    -taint-with-afl=1 -taint-branch-map=$PWD/target.bmap \
+    target.afl.0.5.precodegen.bc -o target.taint.bc
+llc-18 -relocation-model=pic -filetype=obj target.taint.bc -o target.taint.o
+KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -o target.symsan target.taint.o
+
+./target/release/symsan-fuzz -i ./seeds -o ./out \
+    --symsan ./target.symsan --branch-map ./target.bmap -- ./target.afl @@
+```
+
+`AFL_LLVM_LTO_STARTID=4096` is `symsan::AFL_ID_BASE`: it holds the bottom of the
+numbering back for the branch ids SymSan's runtime makes up for itself (bounds
+checks, UB checks), so `cid < 4096` is a complete test for "not an edge".
+`-taint-with-afl=1` *requires* the module to be AFL++-instrumented, so a pipeline
+that quietly stops producing one fails at build time instead of shipping ids the
+fuzzer cannot look up.
+
+The stage then reads `MaxMapFeedback`'s history map before each trace and hands
+it to the session, which treats a branch direction whose target edge is already
+covered as not worth solving.
+
+Where the map has nothing to say the behaviour is exactly what it was without
+it, so a partial map costs opportunities, not correctness — a solution the
+solver does produce is as valid as before. (A map left over from a *different*
+build is the one case worth avoiding: it can point a branch at some other
+branch's edge id and make the stage skip work it should have done. Regenerate
+the map whenever you rebuild the target.) Three things leave a direction
+unresolved, all of them expected:
+
+- **AFL++ prunes blocks** that dominate all their successors, or post-dominate
+  them with more than one predecessor, so those directions have no edge id at
+  all. The map records them explicitly, as `-1`, rather than omitting them. That
+  is not the same as "never interesting": a pruned full dominator is exactly the
+  true side of an `if` guarding nested work, and reaching what is behind it *is*
+  new coverage. What the map cannot do is name it with one edge, so the stage
+  falls back to its own history there.
+- **A switch case has a target in one direction only.** Only "take this case" is
+  an edge; "go anywhere but this case" is not one edge but everywhere else the
+  switch could go. That is the direction worth having anyway: the stage asks
+  whether the branch it did *not* take is worth solving, which for a case it
+  skipped is "would taking it be interesting?".
+- **Code AFL++ never instrumented** — a separately linked instrumented archive,
+  `libc++.a` being the one every C++ target pulls in — has no edge ids to give,
+  and those branches are not traced at all.
+
+`Stats::mapped_branches` and `Stats::unmapped_branches` are the split, and the
+honest way to check whether any of this is working on your target:
+`print_stats` reports them as `Branch map: N entries, M mapped, K unmapped`.
+
+Building without `--branch-map` keeps the old behaviour, including for anyone
+using the library directly: `Config::branch_map` and `Session::set_coverage` are
+both optional, and `set_coverage` on a session with no map is an error rather
+than a silent no-op.
+
+### Checking that the map really does point at the right edges
+
+`mapped_branches` only says how *much* of the map lands. It cannot say whether
+the targets are *right*, and that is the failure that costs bugs: a map that
+resolved every branch to some other branch's edge id reports a perfect ratio
+while telling the stage that everything is already covered. Nothing errors out.
+The fuzzer just quietly finds less.
+
+Three checks, cheapest first.
+
+**1. Compare the map against AFL++'s own id listing, without running anything.**
+A patched AFL++ (`patches/aflpp-document-ids.patch`, recipe in
+`patches/README.md`) makes `AFL_LLVM_DOCUMENT_IDS` write one line per edge it
+numbered, with the source location and direction it came from. Set it on the
+link above and every `C`/`X`/`S` target in the `.bmap` should appear there,
+under the branch you would expect:
+
+```bash
+AFL_LLVM_LTO_STARTID=4096 AFL_LLVM_DOCUMENT_IDS=$PWD/target.docids \
+    <aflpp>/afl-clang-lto -g -flto -fuse-ld=lld \
+    -Wl,--save-temps=precodegen -o target.afl target.c
+```
+
+The file is appended to, so delete it before a rebuild. Sharing the module makes
+agreement structural rather than something to be measured — which is exactly
+what makes a disagreement here worth chasing: it is a bug in the map, not a
+build that drifted.
+
+**2. Check one input against `afl-showmap`.** `b4/bin/covcheck` traces an input
+through the SymSan build and checks every branch direction it took against the
+edges the fuzzer's build recorded for the same bytes:
+
+```bash
+<aflpp>/afl-showmap -o showmap.out -- ./target.afl input
+<symsan>/b4/bin/covcheck -m target.bmap -c showmap.out -i input -- ./target.symsan @@
+```
+
+It exits non-zero on a contradiction. `tests/fuzzing/branch_map_join.c` in the
+SymSan tree is this run as a lit test, including the negative half — the same
+run with a deliberately wrong map has to come out `INCONSISTENT`, or a vacuous
+check would look identical to a passing one.
+`tests/fuzzing/branch_map_switch.c` is the same for switch cases, corrupting
+only the `S` lines.
+
+**3. Audit every entry during a real run.** `--validate-branch-map` (or
+`SymSanStageBuilder::validate_coverage`) does the same comparison on each traced
+corpus entry, and logs at `error` level when one contradicts the map:
+
+```bash
+RUST_LOG=error ./target/release/symsan-fuzz -i ./seeds -o ./out \
+    --symsan ./target.symsan --branch-map ./branch.map --validate-branch-map \
+    -- ./target.afl @@
+```
+
+The ground truth is free: the fuzzer's map feedback is built with
+`track_indices()`, so every corpus entry already carries the edge set its own
+execution produced — nothing is run a second time. It still costs a hash insert
+per branch, so this is a check to run when setting up a new target, not to leave
+on.
+
+All three only ever report one direction of disagreement: every branch SymSan
+executed must map to an edge the fuzzer recorded. The converse means nothing —
+the fuzzer records every edge it walks, including concrete branches and plain
+blocks, and a concolic trace only ever hears about the ones whose condition
+depended on the input.
+
+## The solver ladder
+
+Three solvers, tried in cost order, each one asked only what the cheaper ones
+could not answer — `report_result(false)` is what escalates a task to the next
+rung (see above).
+
+| rung | what it is good at | default in `symsan-fuzz` |
+| --- | --- | --- |
+| **i2s** | input-to-state: an input byte, or a run of them, compared against a constant. Nearly free — it reads the answer off the constraint rather than searching. | on (`--symsan-no-i2s`) |
+| **jigsaw** | JITs the constraint and runs gradient descent on it. Handles arithmetic i2s cannot invert, at maybe tens of microseconds a task. | on (`--symsan-no-jigsaw`) |
+| **z3** | a real SMT solver: decides what the other two only search for, and is the only one that can say *unsat*. Also the only one that can spend seconds on one task. | **off** (`--symsan-z3`) |
+
+Z3 is off by default because a fuzzing loop is a throughput game, and a rung
+that occasionally blocks for seconds costs more exec's than the extra solves
+return. That is a default, not a judgement: turn it on for a target whose checks
+jigsaw's descent cannot climb — and if you do, `--symsan-timeout` is what bounds
+the damage.
+
+Turning a rung off is otherwise a measurement tool: run the same target with
+`--symsan-no-i2s` to see what the rungs behind it were actually contributing,
+since i2s alone cracks most of the branches a real target has. With every rung
+off the stage still traces (and still costs what tracing costs) but can solve
+nothing; it says so at startup rather than looking like a target that resists
+solving.
+
+Using the library directly the knobs are `Config::i2s/jigsaw/z3`, or
+`SYMSAN_NO_I2S`, `SYMSAN_USE_JIGSAW` and `SYMSAN_USE_Z3` in the environment.
+Note the defaults differ by entry point: `SymSanStageBuilder` is set up for
+fuzzing (i2s + jigsaw), while `Config` and the C++ `ConcolicConfig` start from
+i2s alone and add to it, which is what the older drivers expect.
+
+## The cmplog baseline (`--cmplog`)
+
+The question SymSan has to answer is not "does it find things" but "does it find
+things the cheap technique does not". The cheap technique is cmplog: log both
+operands of every comparison the target executes, then splice the operand it
+wanted into the input bytes it read. No solver, no constraints — the same idea as
+the i2s rung, reached by observation instead of symbolic execution.
+
+`symsan-fuzz --cmplog <binary>` runs LibAFL's own implementation of it, against a
+third build of the target:
+
+```bash
+AFL_LLVM_CMPLOG=1 afl-clang-fast -o target.cmplog target.c
+
+# the baseline
+symsan-fuzz -i ./seeds -o ./out --cmplog ./target.cmplog -- ./target.afl @@
+# SymSan
+symsan-fuzz -i ./seeds -o ./out --symsan ./target.symsan -- ./target.afl @@
+# both
+symsan-fuzz -i ./seeds -o ./out --symsan ./target.symsan \
+                                --cmplog ./target.cmplog -- ./target.afl @@
+# and with neither flag, the floor: havoc alone
+```
+
+Three LibAFL stages behind the one flag, gated to run once per corpus entry
+(colorization and the trace both cost real executions, and the answer does not
+change the second time round):
+
+1. **`ColorizationStage`** replaces input bytes with random ones that leave the
+   coverage bitmap unchanged. What survives is the bytes the comparisons depend
+   on — the map from "this value" back to "these offsets".
+2. **`AflppCmplogTracingStage`** runs the cmplog build, which writes every
+   comparison's operands into a shared `AflppCmpLogMap`.
+3. **`AflppRedQueen`** puts each logged operand where the colorized bytes say the
+   other one came from.
+
+Two flags, four arms, one binary — which is the point. Comparing against
+`afl-fuzz -c` instead would mean comparing two different fuzzers, and any
+difference could be the scheduler, the mutator or the feedback rather than the
+technique. Here everything outside the stage list is literally the same code.
+
+### Dividing the work when both are on
+
+With `--symsan` and `--cmplog` together, the two stages run the same
+input-to-state technique over the same corpus entry, neither aware of the other
+— and SymSan got there first, having *proved* which bytes reach which branch
+while it traced. So it tells cmplog what is left. This is on by default when
+both flags are given; `--no-symsan-cmplog-filter` turns it off, and `--cmplog`
+on its own is untouched by any of it, which is what keeps the baseline arm of
+the measurement honest.
+
+SymSan's session classifies every input byte after a trace — untainted (no
+branch on this path read it), *open* (some branch target that depends on it is
+still unflipped), or *settled* (tainted, and every target depending on it has
+been reached, whether by SymSan solving it, by a later trace taking it the other
+way, or by the fuzzer's own coverage map). The classification is per data-flow
+group, not per byte, so a coupled four-byte integer is never half-frozen. It is
+published as a `SymSanTaintMetadata` on the testcase — on the *testcase*, not on
+the state, because the trace and the cmplog group are a scheduling apart and one
+state-wide slot would always be stale by the time it was read. Two things then
+read it:
+
+- **`SymSanColorizationStage`** replaces `ColorizationStage`. It randomizes the
+  open and untainted bytes, keeps the settled ones at their original value, and
+  verifies the result with **two executions** — the original and the candidate,
+  same map hash — rather than the `1 + 2 * input_len` the stock stage pays to
+  rediscover a dependency map SymSan is already holding. If the hashes differ,
+  it records a fallback and the stock stage runs behind it, unchanged.
+- **The gate on the whole group.** An entry with no open byte left is one SymSan
+  finished; colorization, the cmplog trace and RedQueen are all skipped for it.
+
+Freezing a byte is the entire mechanism, and it needs no change to RedQueen:
+`AflppRedQueen` acts on an integer comparison only when the operand actually
+moved between the original run and the colorized one —
+`if new_v0 != orig_v0 && orig_v0 != orig_v1`, on each of the U16/U32/U64 arms
+(`token_mutations.rs:1518,1607,1700`). A byte held still fails that test for
+every comparison it feeds, and drops out of the work list.
+
+Two things it therefore cannot do, both worth knowing before reading a number:
+
+- **RTN comparisons are not filtered.** The `CmpValues::Bytes` arm — `memcmp`,
+  `strcmp` and friends — has no such guard: `rtn_extend_encoding` matches the
+  pattern against both buffers and splices regardless of whether the colorized
+  input moved. Narrowing those means bounding RedQueen's own
+  `for cmp_buf_idx in 0..input_len` loop, i.e. vendoring it.
+- **There is no U8 arm at all.** LibAFL's RedQueen has the byte-wide case
+  commented out (`token_mutations.rs:1423`, "just don't do it for u8, not worth
+  it. not even instrumented"), and AFL++'s cmplog pass does not log sub-16-bit
+  comparisons either. Nothing here changes what happens to a single-byte
+  comparison in the baseline.
+
+## The fork server
+
+Tracing an input used to mean a full `execv`: dynamic linking, the shadow and
+union table mappings, interceptor setup — all of it repeated for every single
+input, and none of it depending on the input. The stage now spawns the target
+once and forks a child per trace instead. On `tests/data/branch.c` that is
+**24.6 ms → 16.4 ms per trace**, i.e. about 8 ms of fixed cost removed; the
+smaller the target, the larger the fraction.
+
+It is on by default in `SymSanStageBuilder`, and `--symsan-no-forkserver` turns
+it off. Using the library directly, it is `Config::forkserver(true)` (default
+off there) or `SYMSAN_FORKSRV=1`.
+
+Two conditions have to hold, and *neither is an error* — the session quietly
+falls back to exec'ing per run, so turning it on is always safe:
+
+- **File input.** A stdin target needs its fd wired into the child, and there is
+  no way to reach into a process that is already running.
+- **A backend that has one.** `backend/forkserver.cpp` is linked into Fastgen,
+  so a target built with `KO_USE_FASTGEN=1` has it. Thoroupy has its own.
+
+Turn it off if the target keeps state across `main()` that a fork would wrongly
+share — a `/dev/urandom` fd it seeded itself from, say. The fork happens before
+the input is loaded but after the runtime is set up (see the comment at the call
+to `InitializeSymSanForkServer` in `runtime/dfsan/dfsan.cpp`), so anything a
+*constructor* did is shared between runs.
+
+The protocol is AFL's, on fds 198/199, deliberately: it means a SymSan binary is
+also drivable by AFL++ or LibAFL's forkserver executor unchanged, which is what
+a coverage backend would need. The one wrinkle is that the event pipe
+no longer reaches EOF between runs, since its write end lives in the server —
+the child's wait status on fd 199 marks end-of-trace instead, and because the
+server only writes it after `waitpid()`, every event that child produced is
+already in the pipe by then.
+
+## Process model
+
+SymSan's launcher keeps its configuration in a C file-global, so **one session
+per process** — which means one `SymSanStage` per process. `Session::new()`
+returns `Error::Busy` for a second one rather than letting two corrupt each
+other.
+
+This is not a real limit. LibAFL's `Launcher` scales by forking a process per
+core, each getting its own stage and its own session, and the union-table
+shared memory is already named `/symsan-union-table-<pid>`.
+
+## Using the binding on its own
+
+```rust
+use symsan::{Config, Session};
+
+let config = Config::new("./target.symsan", "/tmp/.cur_input")
+    .args(["./target.symsan", "/tmp/.cur_input"])
+    .use_stdin(false)
+    .jigsaw(true)
+    .z3(true)
+    .timeout_ms(60_000);
+
+let mut session = Session::new()?;
+session.init(&config)?;
+
+let tasks = session.trace(b"AAAAAAAAAAAAAAAA")?;
+println!("{tasks} solving tasks");
+
+while let Some(solution) = session.next_solution() {
+    let interesting = run_and_check(&solution);   // your harness
+    session.report_result(interesting);
+}
+
+println!("{:?}", session.stats());
+```
+
+`Config::from_env()` reads the same `SYMSAN_*` variables the AFL++ mutator
+honours (`SYMSAN_TARGET`, `SYMSAN_USE_JIGSAW`, `SYMSAN_USE_Z3`,
+`SYMSAN_USE_NESTED`, `SYMSAN_TRACE_BOUNDS`, `SYMSAN_SOLVE_UB`,
+`SYMSAN_SAVE_SOLVED`, …) by calling the same C++ code, so the two front-ends
+cannot drift apart on what a variable means.
+
+## Where the C++ lives
+
+The bindings are deliberately thin. Everything real is shared with the AFL++
+mutator:
+
+| | |
+|---|---|
+| `include/symsan_c.h` | the C ABI; bindgen's input |
+| `driver/session/symsan_c.cpp` | forwarding + exception guards |
+| `driver/session/concolic-session.cpp` | `rgd::ConcolicSession` — the driver policy |
+| `driver/session/trace-session.cpp` | `symsan::TraceSession` — the event pump |
+| `parsers/rgd-parser.cpp`, `solvers/` | the RGD stack (i2s → jigsaw → z3) |
+
+If you find yourself about to reimplement parsing or solving in Rust, it already
+exists in one of those and is reachable through the C ABI.
+
+## Building and testing
+
+```bash
+cd <symsan>/bindings/rust
+
+cargo build                       # or --release
+cargo test                        # unit tests + the end-to-end session test
+cargo clippy --workspace --all-targets
+cargo doc --open -p symsan        # the safe API, with the FFI reasoning
+```
+
+`build.rs` finds SymSan by trying `b4`, `b3`, `b2`, `build` under the repository
+root. Point `SYMSAN_BUILD_DIR` at an install prefix to override; it panics if
+set but wrong, rather than silently linking a different build than you meant.
+
+The LibAFL checkout is a path dependency on `../../../libafl`, i.e. a sibling of
+the symsan repo. Change it in the workspace `Cargo.toml` if yours is elsewhere.
+
+### A note on the tests
+
+`cargo test` runs a test binary's `#[test]` functions on several threads of one
+process, which collides with one-session-per-process. So all session-using
+assertions live in a single `#[test]` in `symsan/tests/session.rs`; a second
+session test would need a second *file*, since cargo gives each file its own
+binary. The tests that need no session are unit tests inside `src/lib.rs`.
+
+## For the Rust-curious
+
+A few things in here are worth reading if you are still learning the language;
+the comments in the source go into more detail:
+
+- **`Session` is an RAII handle.** It owns a raw C pointer and frees it in
+  `Drop`. You cannot leak it or double-free it, and the borrow checker stops you
+  from using a solution buffer after the call that invalidates it.
+- **`next_solution` returns an owned `Vec`, not a `&[u8]`.** The borrow would
+  block the `report_result` call that must immediately follow, and `BytesInput`
+  wants an owned buffer anyway. `next_solution_ref` is the zero-copy escape
+  hatch, and its lifetime shows you exactly why the copy is the default.
+- **The C enums become newtype structs, not Rust `enum`s.** A Rust `enum`
+  holding a value outside its variants is instant UB, and a value crossing FFI
+  cannot be proven in range. See `check()` in `symsan/src/lib.rs`.
+- **`SymSanStage` has no type parameters.** The four generics live on the
+  `impl Stage<E, EM, S, Z>` instead, which is legal because all of them appear
+  in the trait — so no `PhantomData` and no turbofish at the call site.
+- **`tuple_list!` builds a type, not a value.** That is why `fuzzer/src/main.rs`
+  has two nearly identical arms for "with and without the stage" instead of an
+  `if`: the set of stages is fixed at compile time, which is how LibAFL keeps
+  dynamic dispatch out of the hot loop.
