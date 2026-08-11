@@ -1,7 +1,10 @@
 # A AFL++ plugin for using SYMSAN as a custom mutator
 
-libafl should be a better option but due to my familarity with C++,
-this is a temporary option.
+**The recommended integration is now the LibAFL one under
+[`bindings/rust/`](../../bindings/rust/README.md)** — see the
+[hybrid fuzzing how-to](../../bindings/rust/HYBRID_FUZZING.md) for an end-to-end
+walkthrough. This AFL++ custom-mutator plugin predates it and is kept as a
+C++-native alternative; the two share the same solver ladder (i2s → jigsaw → z3).
 
 ## HowTo
 
@@ -9,15 +12,15 @@ A quick guide to how to use the plugin:
 
 ### Compilation
 
-Right now I only have tested on Ubuntu 20.04 and 22.04.
+Tested on Ubuntu 24.04 with LLVM 18 (the main branch tracks LLVM-18).
 
 First, install dependencies:
 
 ```
 apt-get update
 apt-get install -y lsb-release wget software-properties-common gnupg
-wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && ./llvm.sh 12
-apt-get install -y cmake libc++-12-dev libc++abi-12-dev libunwind-12 python3-minimal python-is-python3 zlib1g-dev git gdb joe
+wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && ./llvm.sh 18
+apt-get install -y cmake libc++-18-dev libc++abi-18-dev libunwind-18 python3-minimal python-is-python3 zlib1g-dev git gdb joe
 apt-get install -y libz3-dev libgoogle-perftools-dev
 ```
 
@@ -25,8 +28,8 @@ Next, download and build AFL++:
 
 ```
 git clone --depth=1 https://github.com/AFLplusplus/AFLplusplus /workdir/aflpp
-ENV LLVM_CONFIG=llvm-config-14
-cd /workdir/aflpp && CC=clang-14 CXX=clang++-14 make source-only && make install
+export LLVM_CONFIG=llvm-config-18
+cd /workdir/aflpp && CC=clang-18 CXX=clang++-18 make source-only && make install
 ```
 
 Next, download symsan and build
@@ -34,7 +37,7 @@ Next, download symsan and build
 ```
 git clone https://github.com/R-Fuzz/symsan /workdir/symsan
 cd symsan/ && mkdir -p build && \
-  cd build && CC=clang-14 CXX=clang++-14 cmake -DAFLPP_PATH=/workdir/aflpp ../  && \
+  cd build && CC=clang-18 CXX=clang++-18 cmake -DAFLPP_PATH=/workdir/aflpp ../  && \
   make -j && make install
 ```
 
@@ -47,8 +50,8 @@ Please refer to the AFL++ manual for building options.
 
 For the symbolic tracing binary, set the following env options
 
-* `KO_CC=clang-14`: use clang-14 as the C compiler, because SymSan is compiled as a LLVM-12 pass
-* `KO_CXX=clang++-14`: using clang++-14 as the C++ compiler
+* `KO_CC=clang-18`: use clang-18 as the C compiler, because SymSan is compiled as a LLVM-18 pass
+* `KO_CXX=clang++-18`: using clang++-18 as the C++ compiler
 * `KO_USE_FASTGEN=1`: using the out-of-process solving mode (i.e., decoupled tracing and solving)
 * `KO_DONT_OPTIMIZE=1` (optional): keep the original optimization level, otherwise override with `-O3`
 * `KO_NO_NATIVE_ZLIB` (optional): if you're using instrumented libz
