@@ -6,19 +6,21 @@ import psutil
 
 from .shared_memory import SharedMemory
 from .pipe import Pipe
+from .event_ring import RingChannel
 from .message import PipeMsg, UcsanTicket # type: ignore
 
 logger = logging.getLogger(__name__)
 
 class Process:
-    def __init__(self, shm: Union[Optional[SharedMemory], int]=None, 
+    def __init__(self, shm: Union[Optional[SharedMemory], int]=None,
                        pipe_ct=None,
                        pipe_rpc=None,
                        env: Optional[Dict]=None,
                        args:List[str]=[],
                        target:str="echo",
                        logger:Optional[Callable]=None,
-                       adapter: bool|Callable=False
+                       adapter: bool|Callable=False,
+                       use_ring: bool=True,
                        ) -> None:
         self._modifier = []
         self._args = args
@@ -32,7 +34,17 @@ class Process:
             self._shm = SharedMemory() if shm is None else shm
         self._modifier.append(self._shm)
         self._pipe = Pipe(flag="control_pipe_name") if pipe_ct is None else pipe_ct
-        self._pipe_rpc = Pipe(flag="pipe_name", T=PipeMsg) if pipe_rpc is None else pipe_rpc
+        if pipe_rpc is None:
+            # The doorbell pipe (Pipe(flag="pipe_name", ...)) is still needed
+            # with the ring on: thoroupy drives its target with a plain
+            # fork+exec, so flags().forksrv is always false there, and that is
+            # exactly the case backend/solver_common.cpp's ring_wake_consumer()
+            # wakes with a doorbell byte down this pipe rather than a futex.
+            # See control/event_ring.py's RingChannel docstring.
+            doorbell = Pipe(flag="pipe_name", T=PipeMsg)
+            self._pipe_rpc = RingChannel(doorbell, T=PipeMsg) if use_ring else doorbell
+        else:
+            self._pipe_rpc = pipe_rpc
         self._modifier.append(self._pipe)
         self._modifier.append(self._pipe_rpc)
         if target is None:

@@ -182,9 +182,7 @@ __taint_trace_loop(uint32_t bid, int depth) {
     .result = (uint64_t)get_nested_loop_depth()
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -208,9 +206,7 @@ __taint_trace_event_addr(dfsan_label label, uint32_t event_id, uint64_t info,
     .result = info
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -229,9 +225,7 @@ __taint_trace_bb(uint32_t function_index, uint32_t bb_index) {
     .result = bb_index,
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -254,13 +248,9 @@ __taint_trace_global_var(uint32_t obj_id, uint64_t offset, uint64_t size, void *
     .result = size
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
   // FIXME: assuming single writer so msg will arrive in the same order
-  if (internal_write(__pipe_fd, gv, size) < 0) {
-    Die();
-  }
+  __taint_emit(gv, size);
 
   return;
 }
@@ -392,7 +382,11 @@ extern "C" void InitializeUCSanSolver() {
             .result = (uint64_t)status
           };
           AOUT("Fork server: report exit status: %d\n", status);
-          internal_write(__pipe_fd, &msg, sizeof(msg));
+          // Matches the other call sites' guard: __pipe_fd == -1 means tracing
+          // only, no out-of-process solving, and this write is a no-op then --
+          // __taint_emit() itself Die()s on a write failure, so the guard has
+          // to stay outside it.
+          if (__pipe_fd >= 0) __taint_emit(&msg, sizeof(msg));
         } else {
           AOUT("Fork server: fork failed, exiting\n");
           internal__exit(1);

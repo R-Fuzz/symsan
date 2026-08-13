@@ -8,6 +8,8 @@ extern "C" {
 #include "launch.h"
 }
 
+#include "symsan_ring.h"
+
 #include "parse-z3.h"
 
 #include <z3++.h>
@@ -266,6 +268,77 @@ static PyObject* SymSanRun(PyObject *self, PyObject *args, PyObject *keywds) {
 
 static PyObject* SymSanForkserverActive(PyObject *self) {
   return PyBool_FromLong(symsan_forkserver_active());
+}
+
+//===----------------------------------------------------------------------===//
+// Event ring primitives for a Python-side consumer (see include/symsan_ring.h).
+//
+// Everything except the two ops below is a plain load, a memcpy respecting
+// wraparound, or a monotonic count this side owns outright -- all of that is
+// done directly in Python against the mmap'd bytes, no native code needed.
+// What Python cannot do safely is the one place a consumer has to win a race
+// against the producer's atomic advance: arming the WAITING bit on the head
+// cursor before blocking. A plain read-modify-write there could clobber a
+// concurrent advance and silently under-count published bytes, so that op
+// (and disarm, its paired cleanup) stay native. The caller owns the mapping
+// (via Python's own mmap module) and just passes its address down.
+//===----------------------------------------------------------------------===//
+
+// Usage: ring_total_size(capacity) -> int
+static PyObject* RingTotalSize(PyObject *self, PyObject *args) {
+  unsigned long long capacity = 0;
+  if (!PyArg_ParseTuple(args, "K", &capacity)) {
+    return NULL;
+  }
+  return PyLong_FromUnsignedLongLong(
+      (unsigned long long)symsan_ring_total_size(capacity));
+}
+
+// Initialize a ring header at an address the caller has already mmap'd
+// MAP_SHARED over a region of at least ring_total_size(capacity) bytes.
+// Usage: ring_init(addr, capacity)
+static PyObject* RingInit(PyObject *self, PyObject *args) {
+  unsigned long long addr = 0;
+  unsigned long long capacity = 0;
+  if (!PyArg_ParseTuple(args, "KK", &addr, &capacity)) {
+    return NULL;
+  }
+  if (!symsan_ring_size_ok(capacity)) {
+    PyErr_SetString(PyExc_ValueError,
+                    "capacity must be a power of two >= 4096");
+    return NULL;
+  }
+  symsan_ring_init((struct symsan_ring_hdr *)(uintptr_t)addr, capacity);
+  Py_RETURN_NONE;
+}
+
+// Atomically set the WAITING bit on the ring's head cursor and return the
+// resulting word, matching driver/launcher/launch.c's ring_arm_head(). Call
+// this, re-check the ring for data against the returned word, and only then
+// block (e.g. select() on the doorbell pipe) -- exactly the pattern launch.c
+// itself uses on the exec-per-run path.
+// Usage: word = ring_arm_head(addr)
+static PyObject* RingArmHead(PyObject *self, PyObject *args) {
+  unsigned long long addr = 0;
+  if (!PyArg_ParseTuple(args, "K", &addr)) {
+    return NULL;
+  }
+  struct symsan_ring_hdr *ring = (struct symsan_ring_hdr *)(uintptr_t)addr;
+  uint64_t word = symsan_ring_arm(&ring->head) | SYMSAN_RING_WAITING;
+  return PyLong_FromUnsignedLongLong(word);
+}
+
+// Clear the WAITING bit on the ring's head cursor. Call on every path out of
+// a wait -- see symsan_ring_disarm()'s contract in include/symsan_ring.h.
+// Usage: ring_disarm_head(addr)
+static PyObject* RingDisarmHead(PyObject *self, PyObject *args) {
+  unsigned long long addr = 0;
+  if (!PyArg_ParseTuple(args, "K", &addr)) {
+    return NULL;
+  }
+  struct symsan_ring_hdr *ring = (struct symsan_ring_hdr *)(uintptr_t)addr;
+  symsan_ring_disarm(&ring->head);
+  Py_RETURN_NONE;
 }
 
 static PyObject* SymSanReadEvent(PyObject *self, PyObject *args) {
@@ -807,6 +880,10 @@ static PyMethodDef SymSanMethods[] = {
   {"record_minimize", RecordMinimize, METH_VARARGS, "record a label to minimize during solving (e.g., malloc size)"},
   {"solve_task", SolveTask, METH_VARARGS, "solve a task"},
   {"export_task_smt2", ExportTaskSMT2, METH_VARARGS, "export a task as SMT-LIB v2 to a file"},
+  {"ring_total_size", RingTotalSize, METH_VARARGS, "header size + capacity, for sizing a ring's backing memory"},
+  {"ring_init", RingInit, METH_VARARGS, "initialize a symsan_ring_hdr at an already-mapped address"},
+  {"ring_arm_head", RingArmHead, METH_VARARGS, "atomically set the WAITING bit on a ring's head cursor"},
+  {"ring_disarm_head", RingDisarmHead, METH_VARARGS, "clear the WAITING bit on a ring's head cursor"},
   {NULL, NULL, 0, NULL}  /* Sentinel */
 };
 
@@ -868,6 +945,18 @@ PyInit_symsan(void) {
 
   // Add OpType to module
   PyModule_AddObject(module, "OpType", op_type_enum);
+
+  // Ring layout constants (include/symsan_ring.h), so a Python-side ring
+  // consumer/producer never has to duplicate -- and risk drifting from --
+  // this binary's own idea of the layout.
+  PyModule_AddIntConstant(module, "RING_MAGIC", (long)SYMSAN_RING_MAGIC);
+  PyModule_AddIntConstant(module, "RING_VERSION", (long)SYMSAN_RING_VERSION);
+  PyModule_AddIntConstant(module, "RING_HDR_SIZE", (long)SYMSAN_RING_HDR_SIZE);
+  PyModule_AddIntConstant(module, "RING_DEFAULT_CAPACITY",
+                          (long)SYMSAN_RING_DEFAULT_CAPACITY);
+  PyModule_AddIntConstant(module, "RING_WAITING", (long)SYMSAN_RING_WAITING);
+  PyModule_AddIntConstant(module, "RING_EOR", (long)SYMSAN_RING_EOR);
+  PyModule_AddIntConstant(module, "RING_SHIFT", (long)SYMSAN_RING_SHIFT);
 
   return module;
 }
