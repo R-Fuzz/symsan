@@ -20,6 +20,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -618,6 +619,7 @@ class Taint {
   TransformedFunction getCustomFunctionType(FunctionType *T);
   WrapperKind getWrapperKind(Function *F);
   void addGlobalNameSuffix(GlobalValue *GV);
+  void renameInstrumentedComdats(Module &M);
   void buildExternWeakCheckIfNeeded(IRBuilder<> &IRB, Function *F);
   Function *buildWrapperFunction(Function *F, StringRef NewFName,
                                  GlobalValue::LinkageTypes NewFLink,
@@ -1794,6 +1796,54 @@ void Taint::addGlobalNameSuffix(GlobalValue *GV) {
   }
 }
 
+void Taint::renameInstrumentedComdats(Module &M) {
+  // addGlobalNameSuffix() renames the symbol but leaves the COMDAT group it
+  // lives in alone, so an instrumented definition ends up inside a group whose
+  // signature is still the *original* mangled name.  That signature collides
+  // with the group any uninstrumented translation unit emits for the same C++
+  // inline function, template instantiation or constructor -- and a linker
+  // keeps only the first group it sees for a given signature, silently
+  // dropping the other one along with the '.taint' definition inside it.
+  // Every reference to that definition then resolves as an undefined weak,
+  // i.e. address 0.  Because taint.ld links at a fixed 0x700000200000 base,
+  // and libc++'s _LIBCPP_HIDE_FROM_ABI makes these symbols hidden so they
+  // cannot be routed through the PLT, the result is
+  //   relocation truncated to fit: R_X86_64_PLT32 against undefined symbol
+  //     `...__throw_length_error...[clone .taint]'
+  // (or "relocation ... out of range" under lld).  Note that --whole-archive
+  // is no help: it forces the archive *member* in, but the group inside it is
+  // still discarded as a duplicate.
+  //
+  // So re-sign the group as well, which lets the instrumented and the
+  // uninstrumented copy coexist, each binding to the definition built for its
+  // own ABI.  A group is only re-signed when *all* of its members were
+  // suffixed.  A group that mixes the two -- a vtable group, or an inline
+  // variable's group holding the variable, its guard and the
+  // __cxx_global_var_init that got instrumented -- deliberately ties those
+  // symbols together and must keep deduplicating against the uninstrumented
+  // copy, or the shared state behind it would be initialized twice.
+  MapVector<Comdat *, SmallVector<GlobalObject *, 4>> Groups;
+  for (GlobalObject &GO : M.global_objects())
+    if (Comdat *C = GO.getComdat())
+      Groups[C].push_back(&GO);
+
+  const StringRef Suffix = ".taint";
+  for (auto &Group : Groups) {
+    Comdat *C = Group.first;
+    if (C->getName().ends_with(Suffix))
+      continue;
+    if (!llvm::all_of(Group.second, [&](GlobalObject *GO) {
+          return GO->getName().ends_with(Suffix);
+        }))
+      continue;
+
+    Comdat *NewC = M.getOrInsertComdat((C->getName() + Suffix).str());
+    NewC->setSelectionKind(C->getSelectionKind());
+    for (GlobalObject *GO : Group.second)
+      GO->setComdat(NewC);
+  }
+}
+
 void Taint::buildExternWeakCheckIfNeeded(IRBuilder<> &IRB, Function *F) {
   // If the function we are wrapping was ExternWeak, it may be null.
   // The original code before calling this wrapper may have checked for null,
@@ -2331,6 +2381,10 @@ bool Taint::runImpl(Module &M) {
       *FI = nullptr;
     }
   }
+
+  // Every rename that is going to happen has happened by now, so the COMDAT
+  // groups can be re-signed.
+  renameInstrumentedComdats(M);
 
   for (Function *F : FnsToInstrument) {
     if (!F || F->isDeclaration())
