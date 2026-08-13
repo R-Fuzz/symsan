@@ -1,0 +1,8 @@
+entry: cal
+
+custom:
+  custom_malloc:
+    ref_name: malloc
+    arg_maps:
+      - idx: 1 # map second arg to first arg of customized malloc in ucsan
+        ucsan_idx: 0
