@@ -1822,6 +1822,51 @@ void Taint::renameInstrumentedComdats(Module &M) {
   // __cxx_global_var_init that got instrumented -- deliberately ties those
   // symbols together and must keep deduplicating against the uninstrumented
   // copy, or the shared state behind it would be initialized twice.
+  //
+  // "All of its members" means all of the ones that could *be* that
+  // uninstrumented twin, which is to say all the ones with external linkage.
+  // On a target built with afl-clang-lto, SanitizerCoverage has already
+  // dropped a private guard global into the same comdat as each instrumented
+  // function -- e.g. `@__sancov_gen_.950 = private global [1 x i32]
+  // zeroinitializer, section "__sancov_guards", comdat($_ZNSt3__1...)` --
+  // purely so the guard is discarded along with the function if some other
+  // TU's copy wins the dedup.  addGlobalNameSuffix() never renames it (it is
+  // not a symbol TaintPass instruments), so requiring it to end in ".taint"
+  // too left every such group unsigned: the member function inside was still
+  // renamed, but the group's own signature was not, so it stayed a duplicate
+  // of the exact same unsuffixed signature an uninstrumented TU emits for that
+  // function -- the one collision this pass exists to avoid.  A local-linkage
+  // global cannot be that twin (being merged across TUs at all requires
+  // external linkage), so its own name says nothing about whether the group is
+  // safe to re-sign.
+  //
+  // But it must not be the *only* thing the decision rests on: a group whose
+  // members are all local and none of them suffixed has no instrumented
+  // definition in it to protect, and re-signing it would stop it deduplicating
+  // for no reason.  That combination is not hypothetical here -- LTO
+  // internalizes almost everything in the merged module, so "local" is the
+  // common case in exactly the pipeline this exemption is for.  Hence the
+  // second condition: at least one member actually got suffixed.
+  //
+  // A group whose members are *all* local goes further and leaves the comdat
+  // altogether, because for such a group deduplication has no upside and two
+  // ways to go wrong.  This is the shape LTO produces: internalization turns
+  // libc++'s linkonce_odr header helpers into local definitions but leaves
+  // them in their comdat groups, and the module is then linked against a
+  // separately built libc++.a whose copies of those same helpers are still
+  // weak+hidden -- so the whole-program assumption internalization was made
+  // under does not actually hold at the final link.  Whichever side wins the
+  // dedup, the loser's definitions are dropped: if the merged module wins, its
+  // survivor is local and cannot be bound to from outside, and every reference
+  // from libc++.a resolves to 0 (which under taint.ld's fixed 0x700000200000
+  // base is the "relocation truncated to fit" above); if libc++.a wins, this
+  // module's own calls silently leave the instrumented copy for that one.
+  // Neither is what internalization asked for -- a local definition is by
+  // definition private to this module -- and dropping the comdat is what says
+  // so: nothing here can merge with, or be merged away by, anything outside.
+  // Note that re-signing does *not* cover this case, because a linker
+  // deduplicates group members by section name too, and both sides call the
+  // section .text.<name>.taint.
   MapVector<Comdat *, SmallVector<GlobalObject *, 4>> Groups;
   for (GlobalObject &GO : M.global_objects())
     if (Comdat *C = GO.getComdat())
@@ -1830,10 +1875,20 @@ void Taint::renameInstrumentedComdats(Module &M) {
   const StringRef Suffix = ".taint";
   for (auto &Group : Groups) {
     Comdat *C = Group.first;
+    if (llvm::all_of(Group.second,
+                     [](GlobalObject *GO) { return GO->hasLocalLinkage(); })) {
+      for (GlobalObject *GO : Group.second)
+        GO->setComdat(nullptr);
+      continue;
+    }
     if (C->getName().ends_with(Suffix))
       continue;
-    if (!llvm::all_of(Group.second, [&](GlobalObject *GO) {
+    if (!llvm::any_of(Group.second, [&](GlobalObject *GO) {
           return GO->getName().ends_with(Suffix);
+        }))
+      continue;
+    if (!llvm::all_of(Group.second, [&](GlobalObject *GO) {
+          return GO->hasLocalLinkage() || GO->getName().ends_with(Suffix);
         }))
       continue;
 
