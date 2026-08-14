@@ -405,6 +405,17 @@ struct Opt {
     #[arg(long = "symsan-solve-ub", default_value = "false")]
     symsan_solve_ub: bool,
 
+    /// End the trace when a branch depends on memory whose shadow was never
+    /// written -- an uninitialized read, as far as the runtime can tell. This
+    /// is the SymSan runtime's own default, and it is off here: in a fuzzing
+    /// loop it throws away the rest of the trace over a branch that would
+    /// otherwise just be skipped, and a target that does it early enough
+    /// contributes nothing at all. Turn it on to find out where a trace is
+    /// reading uninitialized memory: the runtime names the site on the target's
+    /// stderr, which `-d` shows.
+    #[arg(long = "symsan-exit-on-memerror", default_value = "false")]
+    symsan_exit_on_memerror: bool,
+
     /// Keep the corpus in memory only, instead of writing it to
     /// `<output>/queue`. The queue is what lets a trace be replayed after the
     /// fact, so this is for a run whose corpus is of no interest afterwards --
@@ -632,6 +643,7 @@ pub fn main() -> Result<(), libafl::Error> {
                 .jigsaw(!opt.symsan_no_jigsaw)
                 .z3(opt.symsan_z3)
                 .solve_ub(opt.symsan_solve_ub)
+                .exit_on_memerror(opt.symsan_exit_on_memerror)
                 .cmplog_filter(cmplog_filter)
                 .tokens(opt.symsan_tokens)
                 .max_queue_tasks(opt.symsan_max_tasks)
