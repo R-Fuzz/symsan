@@ -1487,6 +1487,67 @@ void __ucsan_symbolize_input(void *ptr, size_t size, int id) {
   UCSAN_OUT("symbolize_input: done, labeled %zu bytes for object %u\n", size, object_id);
 }
 
+// Find a live stack alloca whose [base, base+size) contains ptr. Opaque
+// pointers leave resign call sites with n=0; the pointer's UCSan label (or
+// this address scan) is the sole size oracle — do not ask SymSan.
+static ucsan_label find_alloca_containing(void *ptr) {
+  if (!ptr || __alloca_stack_top > __alloca_stack_bottom)
+    return 0;
+  uptr addr = (uptr)ptr;
+  for (ucsan_label label = __alloca_stack_top; label <= __alloca_stack_bottom;
+       ++label) {
+    ucsan_label_info *info = get_label_info(label);
+    if (info->common.op != OP_ALLOCA)
+      continue;
+    ucsan_obj_info *obj = to_obj_info(info);
+    uptr lower = (uptr)obj->real_ptr - obj->lower_bound;
+    uptr upper = (uptr)obj->real_ptr + obj->upper_bound;
+    if (addr >= lower && addr < upper)
+      return label;
+  }
+  return 0;
+}
+
+static ucsan_label resign_alloca_object(ucsan_label label_for_ptr) {
+  UCSAN_OUT("Resign alloca object\n");
+  ucsan_label_info *orig = get_label_info(label_for_ptr);
+  ucsan_obj_info *obj_info = to_obj_info(orig);
+
+  // Calculate bounds: real_ptr is the base, lower_bound is bytes before, upper_bound is bytes after
+  char *lower = (char*)obj_info->real_ptr - obj_info->lower_bound;
+  char *upper = (char*)obj_info->real_ptr + obj_info->upper_bound;
+  size_t alloca_size = upper - lower;
+  if (alloca_size > ucsan_object_size_limit()) {
+    UCSAN_OUT("WARNING: alloca resign size %zu exceeds limit %lu, capping\n",
+              alloca_size, ucsan_object_size_limit());
+    upper = lower + ucsan_object_size_limit();
+  }
+  ucsan_label *lp = ucsan_shadow_for(lower);
+  ucsan_label *le = ucsan_shadow_for(upper);
+  char *obj_ptr = lower;
+
+  for (; lp < le; ++lp, ++obj_ptr) {
+    if (*lp == kUninitializedLabel) {
+      // Allocate a byte from super object
+      auto ret = create_label_from_super_object(1, false);
+      UCSAN_OUT("resign alloca ret: %u %lu\n", ret.label, ret.offset);
+      *lp = ret.label;
+
+      // Bridge to SymSan: create symbolic label for this byte
+      dfsan_label symsan_label = __taint_create_label(0, ret.offset, 1);
+      __taint_set_label(symsan_label, obj_ptr, 1);
+
+      if (ucsan_tainted.objects->size() && ret.offset < ucsan_tainted.objects->at(0).data.size()) {
+        UCSAN_OUT("resign alloca super object: %u\n", ucsan_tainted.objects->at(0).data.at(ret.offset));
+        *obj_ptr = ucsan_tainted.objects->at(0).data.at(ret.offset);
+      } else {
+        *obj_ptr = 0;
+      }
+    }
+  }
+  return label_for_ptr;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, void *ret_addr) {
   ucsan_label label_for_ptr = *orig_label;
@@ -1496,47 +1557,34 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
     return UCSAN_CONST_LABEL;
   }
 
+  // Opaque pointers can leave n=0 even when the pointer lands in a tracked
+  // stack object whose label did not travel with the arg (e.g. some GEPs).
+  if (label_for_ptr == 0 && ptr != nullptr) {
+    label_for_ptr = find_alloca_containing(ptr);
+    if (label_for_ptr != 0)
+      UCSAN_OUT("Resign recovered alloca label %u for %p\n", label_for_ptr, ptr);
+  }
+
   if (label_for_ptr != 0) {
     ucsan_label_info *orig = get_label_info(label_for_ptr);
 
     if (orig->common.op == OP_ALLOCA) {
-      // Handle alloca case - symbolize uninitialized bytes in the allocated region
-      UCSAN_OUT("Resign alloca object\n");
+      // With trace_bounds, memory was painted uninit: only fill holes (UBI).
+      // Without it, the alloca label is just a size oracle for opaque pointers;
+      // fall through to concrete overlay using the tracked object size — same
+      // as the old sizeof(*T) resign path that external.c relies on.
+      if (ucsan_flags().trace_bounds)
+        return resign_alloca_object(label_for_ptr);
+
       ucsan_obj_info *obj_info = to_obj_info(orig);
-
-      // Calculate bounds: real_ptr is the base, lower_bound is bytes before, upper_bound is bytes after
-      char *lower = (char*)obj_info->real_ptr - obj_info->lower_bound;
-      char *upper = (char*)obj_info->real_ptr + obj_info->upper_bound;
-      size_t alloca_size = upper - lower;
-      if (alloca_size > ucsan_object_size_limit()) {
-        UCSAN_OUT("WARNING: alloca resign size %zu exceeds limit %lu, capping\n",
-                  alloca_size, ucsan_object_size_limit());
-        upper = lower + ucsan_object_size_limit();
-      }
-      ucsan_label *lp = ucsan_shadow_for(lower);
-      ucsan_label *le = ucsan_shadow_for(upper);
-      char *obj_ptr = lower;
-
-      for (; lp < le; ++lp, ++obj_ptr) {
-        if (*lp == kUninitializedLabel) {
-          // Allocate a byte from super object
-          auto ret = create_label_from_super_object(1, false);
-          UCSAN_OUT("resign alloca ret: %u %lu\n", ret.label, ret.offset);
-          *lp = ret.label;
-
-          // Bridge to SymSan: create symbolic label for this byte
-          dfsan_label symsan_label = __taint_create_label(0, ret.offset, 1);
-          __taint_set_label(symsan_label, obj_ptr, 1);
-
-          if (ucsan_tainted.objects->size() && ret.offset < ucsan_tainted.objects->at(0).data.size()) {
-            UCSAN_OUT("resign alloca super object: %u\n", ucsan_tainted.objects->at(0).data.at(ret.offset));
-            *obj_ptr = ucsan_tainted.objects->at(0).data.at(ret.offset);
-          } else {
-            *obj_ptr = 0;
-          }
-        }
-      }
-      return label_for_ptr;
+      char *lower = (char *)obj_info->real_ptr - obj_info->lower_bound;
+      char *upper = (char *)obj_info->real_ptr + obj_info->upper_bound;
+      if ((char *)ptr >= lower && (char *)ptr < upper)
+        n = (uint64_t)(upper - (char *)ptr);
+      else
+        n = (uint64_t)(upper - lower);
+      UCSAN_OUT("Resign alloca as concrete: p=%p, size=%lu\n", ptr, n);
+      // Continue into concrete overlay below.
     } else if (orig->common.op == OP_FREE) {
       // Freed memory - return as-is for UAF detection
       UCSAN_OUT("Resign freed object\n");
@@ -1546,11 +1594,19 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       ucsan_ptr_info *ptr_info = to_ptr_info(orig);
       ptr_info->op = OP_EXTERNAL;
       ptr_info->status = PTR_UNINITIALIZED;
+      return label_for_ptr;
     }
-    return label_for_ptr;
+  }
 
-  } else {
+  {
     if (!is_writeable(ptr)) {
+      return UCSAN_CONST_LABEL;
+    }
+
+    // No UCSan object and no compile-time size: nothing to overlay. Avoid
+    // minting a zero-byte "concrete external" object (opaque-ptr dangle stubs).
+    if (n == 0) {
+      UCSAN_OUT("Concrete external object: p=%p, size unknown, skip\n", ptr);
       return UCSAN_CONST_LABEL;
     }
 
@@ -1641,47 +1697,49 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 ucsan_label ucsan_trace_alloca(uint64_t size, uint64_t elem_size, uint64_t addr) {
   // Track stack allocation bounds using stack-based label allocation
   // Labels are allocated from __alloca_stack_top (top of label space, growing downward)
-  // and automatically freed when the function exits via __taint_pop_stack_frame
+  // and automatically freed when the function exits via ucsan_pop_stack_frame
   //
   // size: array size (number of elements)
   // elem_size: size of each element in bytes
   // addr: address of the stack allocation
+  //
+  // Always record bounds: opaque pointers no longer give resign a pointee
+  // sizeof, so the OP_ALLOCA label is the size oracle for KO_RESIGN_PTRARGS.
+  // Painting memory as uninitialized (UBI) stays gated on trace_bounds.
+
+  uint64_t total_size = size * elem_size;
+  void *ptr = (void*)addr;
+
+  // Allocate label from stack top (grows downward)
+  __alloca_stack_top -= 1;
+  ucsan_label label = __alloca_stack_top;
+
+  UCSAN_OUT("ucsan_trace_alloca: label=%u, base=%p, size=%lu, elem_size=%lu, total=%lu\n",
+            label, ptr, size, elem_size, total_size);
+
+  ucsan_label_info *info = get_label_info(label);
+  ucsan_obj_info *obj = to_obj_info(info);
+
+  // Set up bounds tracking for stack allocation
+  obj->op = OP_ALLOCA;
+  obj->type_id = 0;
+  obj->object_id = 0;  // Not tracked in objects array (stack allocation)
+  obj->real_ptr = ptr;
+  obj->lower_bound = 0;           // No bytes before base
+  obj->upper_bound = (uint32_t)total_size;   // Total size in bytes
+
+  UCSAN_OUT("  created stack label %u: ptr=%p, lower=0, upper=%u\n",
+            label, ptr, obj->upper_bound);
 
   if (ucsan_flags().trace_bounds) {
-    uint64_t total_size = size * elem_size;
-    void *ptr = (void*)addr;
-
-    // Allocate label from stack top (grows downward)
-    __alloca_stack_top -= 1;
-    ucsan_label label = __alloca_stack_top;
-
-    UCSAN_OUT("ucsan_trace_alloca: label=%u, base=%p, size=%lu, elem_size=%lu, total=%lu\n",
-              label, ptr, size, elem_size, total_size);
-
-    ucsan_label_info *info = get_label_info(label);
-    ucsan_obj_info *obj = to_obj_info(info);
-
-    // Set up bounds tracking for stack allocation
-    obj->op = OP_ALLOCA;
-    obj->type_id = 0;
-    obj->object_id = 0;  // Not tracked in objects array (stack allocation)
-    obj->real_ptr = ptr;
-    obj->lower_bound = 0;           // No bytes before base
-    obj->upper_bound = (uint32_t)total_size;   // Total size in bytes
-
-    UCSAN_OUT("  created stack label %u: ptr=%p, lower=0, upper=%u\n",
-              label, ptr, obj->upper_bound);
-
     // Set shadow memory to kUninitializedLabel for UBI detection
     ucsan_label *shadow = ucsan_shadow_for(ptr);
     for (uptr i = 0; i < total_size; i++) {
       shadow[i] = kUninitializedLabel;
     }
-
-    return label;
-  } else {
-    return 0;
   }
+
+  return label;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1730,15 +1788,14 @@ ucsan_label ucsan_trace_global(uint64_t addr, uint64_t size) {
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_push_stack_frame() {
   // Save current stack top when entering a function
-  // This allows automatic cleanup of stack allocation labels on function exit
-  if (ucsan_flags().trace_bounds) {
-    if (__current_saved_stack_index < UCSAN_MAX_SAVED_STACK_ENTRIES) {
-      __saved_alloca_stack_top[++__current_saved_stack_index] = __alloca_stack_top;
-      UCSAN_OUT("ucsan_push_stack_frame: saved index=%d, stack_top=%u\n",
-                __current_saved_stack_index, __alloca_stack_top);
-    } else {
-      Report("WARNING: UCSan: stack frame save index overflow\n");
-    }
+  // This allows automatic cleanup of stack allocation labels on function exit.
+  // Always on: ucsan_trace_alloca always allocates labels now.
+  if (__current_saved_stack_index < UCSAN_MAX_SAVED_STACK_ENTRIES) {
+    __saved_alloca_stack_top[++__current_saved_stack_index] = __alloca_stack_top;
+    UCSAN_OUT("ucsan_push_stack_frame: saved index=%d, stack_top=%u\n",
+              __current_saved_stack_index, __alloca_stack_top);
+  } else {
+    Report("WARNING: UCSan: stack frame save index overflow\n");
   }
 }
 
@@ -1746,14 +1803,12 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_pop_stack_frame() {
   // Restore stack top when exiting a function
   // This automatically frees all stack allocation labels created in this function
-  if (ucsan_flags().trace_bounds) {
-    if (__current_saved_stack_index > 0) {
-      __alloca_stack_top = __saved_alloca_stack_top[__current_saved_stack_index--];
-      UCSAN_OUT("ucsan_pop_stack_frame: restored index=%d, stack_top=%u\n",
-                __current_saved_stack_index, __alloca_stack_top);
-    } else {
-      Report("WARNING: UCSan: stack frame save index underflow\n");
-    }
+  if (__current_saved_stack_index > 0) {
+    __alloca_stack_top = __saved_alloca_stack_top[__current_saved_stack_index--];
+    UCSAN_OUT("ucsan_pop_stack_frame: restored index=%d, stack_top=%u\n",
+              __current_saved_stack_index, __alloca_stack_top);
+  } else {
+    Report("WARNING: UCSan: stack frame save index underflow\n");
   }
 }
 
