@@ -1558,7 +1558,10 @@ void Taint::addFrameTracing(Function &F) {
          "Assume that entry block has no predecessors");
 
   IRBuilder<> IRB(&*(BB->getFirstInsertionPt()));
-  IRB.CreateCall(TaintPushStackFrameFn);
+  // Pass F.getGUID() so thoroupy can count per-function recursion against
+  // __stack_threshold (REASON_STACK_OOB / 125).
+  IRB.CreateCall(TaintPushStackFrameFn,
+                 {ConstantInt::get(Int64Ty, F.getGUID())});
 
   // Recover ctx at the end of a function
   for (auto FI = F.begin(), FE = F.end(); FI != FE; FI++) {
@@ -1566,7 +1569,8 @@ void Taint::addFrameTracing(Function &F) {
     Instruction *Inst = BB->getTerminator();
     if (isa<ReturnInst>(Inst) || isa<ResumeInst>(Inst)) {
       IRB.SetInsertPoint(Inst);
-      IRB.CreateCall(TaintPopStackFrameFn);
+      IRB.CreateCall(TaintPopStackFrameFn,
+                     {ConstantInt::get(Int64Ty, F.getGUID())});
     }
   }
 }
@@ -1695,9 +1699,9 @@ bool Taint::initializeModule(Module &M) {
   TaintTableLookupFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintTableLookupArgs, false);
   TaintPushStackFrameFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), {}, false);
+      Type::getVoidTy(*Ctx), {Int64Ty}, false);
   TaintPopStackFrameFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), {}, false);
+      Type::getVoidTy(*Ctx), {Int64Ty}, false);
   Type *TaintTraceAllocaArgs[4] =
       { PrimitiveShadowTy, Int64Ty, Int64Ty, Int64Ty };
   TaintTraceAllocaFnTy = FunctionType::get(

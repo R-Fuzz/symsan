@@ -1098,8 +1098,11 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __taint_trace_loop_push_stack();
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __taint_trace_loop_pop_stack();
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_push_stack_frame() {
+// Weak defaults: alloca nest + loop-depth nest.  Thoroupy provides strong
+// overrides that also enforce __stack_threshold (recursive depth limit).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
+void __taint_push_stack_frame(uint64_t func_guid) {
+  (void)func_guid;
   if (flags().trace_bounds) {
     if (__current_saved_stack_index < MAX_SAVED_STACK_ENTRIES)
       __saved_alloca_stack_top[++__current_saved_stack_index] = __alloca_stack_top;
@@ -1107,8 +1110,9 @@ void __taint_push_stack_frame() {
   __taint_trace_loop_push_stack();
 }
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_pop_stack_frame() {
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
+void __taint_pop_stack_frame(uint64_t func_guid) {
+  (void)func_guid;
   if (flags().trace_bounds) {
     __alloca_stack_top = __saved_alloca_stack_top[__current_saved_stack_index--];
   }
