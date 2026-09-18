@@ -93,6 +93,12 @@ class _NestManager():
                 logger.debug(f"Adding new loop counter: {loop_hash}, {id}, {context}, {depth}")
                 self.counters[loop_hash] = _LoopCounter(id, context, depth, self.inner_most_counter)
             loop_counter = self.counters[loop_hash]
+            # Re-entry after an exit (e.g. callee foo called again from the
+            # outer loop) reuses the same counter identity.  Trip count is
+            # per invocation: reset so is_current()/threshold stay at this
+            # entry's frontier instead of the previous call's.
+            if loop_counter._current:
+                loop_counter.reset()
             self.loop_path.append(loop_counter)
             logger.info(f"Trace loop: {id}, context: {context}, depth: {depth}, current depth: {self.current_depth}")
             loop_counter.trace()
@@ -139,13 +145,17 @@ class _NestManager():
         self._visited_iter.add(sig)
         if exiting:
             # Execution is exiting at this iteration; flip toward "continue"
-            # (one deeper iteration) only while at the frontier and below the
-            # threshold, and only until that deeper count has been reached.
+            # (one deeper iteration) while below the threshold.  Require that
+            # the deeper count has itself been *exited* -- not merely latched
+            # through during an OOB/threshold run -- otherwise an early exit
+            # (e.g. foo's first 0xbb) can never deepen: the OOB latch path
+            # already marked higher counts in _visited_iter and blocked every
+            # continue-from-exit ask (func_loop).
             self._visited_exit.add(sig)
             if not (c < threshold):
                 return False
             target = (c._id, c._context, c._depth, c._current + 1)
-            return target not in self._visited_iter
+            return target not in self._visited_exit
         # Latch (continuing); flip toward "exit here" until an execution has
         # actually exited at this iteration.
         if not c.is_current():

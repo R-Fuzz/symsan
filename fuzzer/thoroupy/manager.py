@@ -615,6 +615,27 @@ class UcsanManager:
                 logger.debug(f"Solution: DELETE obj[{obj_id}][{offset}] len={sol['len']}")
                 seed.delete_bytes(obj_id, offset, sol['len'])
 
+        # Mid-execution OOB size extension can re-label a pointer-arg buffer
+        # onto a fresh object id (3+).  On replay the entry point still wires
+        # the first pointer arg to object 1, so SET bytes on those ephemeral
+        # ids never reach the program (func_loop outer-exit is the canary).
+        # Mirror them onto object 1.  Object 2 is the second arg (e.g. arr2)
+        # and already receives correct ids from the callee-loop solves.
+        for sol in solutions:
+            if sol['op'] != OpType.SET:
+                continue
+            obj_id = sol['id']
+            if obj_id <= 2:
+                continue
+            offset = sol['offset']
+            primary = seed[1]
+            adjusted = offset - len(primary.lvalue) if offset >= 0 else offset
+            logger.debug(
+                f"Mirror SET obj[{obj_id}][{offset}] -> obj[1][{adjusted}] "
+                f"= 0x{sol['val']:02x}"
+            )
+            seed.set_byte(1, adjusted, sol['val'])
+
         # Propagate solver data from resign-alias objects to canonical objects.
         # When resign re-labels memory (e.g., return_ptr with KO_RESIGN_PTRARGS),
         # the solver may write to the resigned object (parent != super), but on

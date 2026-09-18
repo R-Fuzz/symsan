@@ -279,23 +279,38 @@ void __taint_send_cond(dfsan_label label, uint8_t result,
   uint16_t flags = 0;
   if (add_nested) flags |= F_ADD_CONS;
 
-  // set the loop flags according to branching results
-  switch (loop_flag) {
-    case TrueBranchLoopExit:
-      flags |= result ? F_LOOP_EXIT : F_LOOP_LATCH;
-      break;
-    case TrueBranchLoopLatch:
-      flags |= result ? F_LOOP_LATCH : F_LOOP_EXIT;
-      break;
-    case FalseBranchLoopExit:
-      flags |= result ? F_LOOP_LATCH : F_LOOP_EXIT;
-      break;
-    case FalseBranchLoopLatch:
-      flags |= result ? F_LOOP_EXIT : F_LOOP_LATCH;
-      break;
-    default:
-      // No loop flag or unrecognized flag, do nothing
-      break;
+  // Set F_LOOP_EXIT / F_LOOP_LATCH from the edge actually taken.
+  // TaintPass ORs latch+exit bits for a normal while(cond) (e.g. flag=9 =
+  // TrueBranchLoopLatch|FalseBranchLoopExit).  An equality switch on those
+  // combined values used to hit default and drop the loop role, so Python's
+  // Loop termination never drove func_loop / nested_loop's inner headers.
+  // Decode with bit tests; keep both-latch/no-exit (flag=12, in-loop
+  // non-header branches) unset so Branch still flips them.
+  const uint8_t roles = loop_flag & LoopFlagMask;
+  if (roles) {
+    const bool both_latch_no_exit =
+        (roles & (TrueBranchLoopLatch | FalseBranchLoopLatch)) ==
+            (TrueBranchLoopLatch | FalseBranchLoopLatch) &&
+        !(roles & (TrueBranchLoopExit | FalseBranchLoopExit));
+    if (!both_latch_no_exit) {
+      const bool taken_exit =
+          ((roles & TrueBranchLoopExit) && result) ||
+          ((roles & FalseBranchLoopExit) && !result);
+      const bool taken_latch =
+          ((roles & TrueBranchLoopLatch) && result) ||
+          ((roles & FalseBranchLoopLatch) && !result);
+      if (taken_exit) {
+        flags |= F_LOOP_EXIT;
+      } else if (taken_latch) {
+        flags |= F_LOOP_LATCH;
+      } else if (roles & (TrueBranchLoopExit | FalseBranchLoopExit)) {
+        // Exit-only tagging (e.g. flag=1): the non-exit edge is the latch.
+        flags |= F_LOOP_LATCH;
+      } else {
+        // Latch-only tagging (e.g. flag=8): the non-latch edge is the exit.
+        flags |= F_LOOP_EXIT;
+      }
+    }
   }
 
   // send info
