@@ -20,3 +20,5 @@ __pycache__/
 /libcxx/
 !/libcxx/build_taint/lib/
 /install
+/smt/
+/venv/
