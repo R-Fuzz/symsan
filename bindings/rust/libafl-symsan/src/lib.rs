@@ -153,6 +153,7 @@ pub struct SymSanStageBuilder {
     nested: bool,
     trace_bounds: bool,
     solve_ub: bool,
+    exit_on_memerror: bool,
     debug: bool,
     timeout_ms: Option<u32>,
     max_solutions_per_input: usize,
@@ -191,6 +192,11 @@ impl SymSanStageBuilder {
             // anything, and a target execution is the most expensive way to
             // learn that.
             dedup: true,
+            // Explicit, because it is the one place this builder overrides a
+            // runtime default rather than restating it: the runtime ends the
+            // trace on an uninitialized read, and a fuzzing stage cannot
+            // afford to lose the rest of a trace over one skippable branch.
+            exit_on_memerror: false,
             ..Default::default()
         }
     }
@@ -333,6 +339,22 @@ impl SymSanStageBuilder {
     #[must_use]
     pub fn solve_ub(mut self, yes: bool) -> Self {
         self.solve_ub = yes;
+        self
+    }
+
+    /// Kill the trace when a branch reads memory whose shadow was never
+    /// written (label `kInitializingLabel`). **Off** by default here, unlike
+    /// the runtime's own default: the runtime is right to be loud about it in
+    /// a one-shot tool, but in a fuzzing loop it ends the whole trace at the
+    /// first such branch, and everything the target would have done after it
+    /// is lost. libtiff's `tiff_read_rgba_fuzzer` is the extreme case -- it
+    /// hits one inside instrumented libc++ before the image is even opened, so
+    /// the whole stage queued nothing at all over a three-minute campaign,
+    /// against 222k solved with this off. Off, the branch is simply skipped,
+    /// which is what an unlabelled branch gets anyway.
+    #[must_use]
+    pub fn exit_on_memerror(mut self, yes: bool) -> Self {
+        self.exit_on_memerror = yes;
         self
     }
 
@@ -562,6 +584,7 @@ impl SymSanStageBuilder {
             .nested_solving(self.nested)
             .trace_bounds(self.trace_bounds)
             .solve_ub(self.solve_ub)
+            .exit_on_memerror(self.exit_on_memerror)
             .debug(self.debug)
             .forkserver(self.forkserver)
             // What export_taint buys is the per-branch record of which input
@@ -2042,6 +2065,12 @@ mod tests {
             b.forkserver,
             "the fork server should default on: it is a throughput win and \
              falls back on its own when a target cannot be served that way"
+        );
+        assert!(
+            !b.exit_on_memerror,
+            "exit_on_memerror should default off here even though the runtime \
+             defaults it on: it throws away the rest of a trace over a branch \
+             that is skipped anyway"
         );
     }
 }

@@ -20,6 +20,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -618,6 +619,7 @@ class Taint {
   TransformedFunction getCustomFunctionType(FunctionType *T);
   WrapperKind getWrapperKind(Function *F);
   void addGlobalNameSuffix(GlobalValue *GV);
+  void renameInstrumentedComdats(Module &M);
   void buildExternWeakCheckIfNeeded(IRBuilder<> &IRB, Function *F);
   Function *buildWrapperFunction(Function *F, StringRef NewFName,
                                  GlobalValue::LinkageTypes NewFLink,
@@ -1556,7 +1558,10 @@ void Taint::addFrameTracing(Function &F) {
          "Assume that entry block has no predecessors");
 
   IRBuilder<> IRB(&*(BB->getFirstInsertionPt()));
-  IRB.CreateCall(TaintPushStackFrameFn);
+  // Pass F.getGUID() so thoroupy can count per-function recursion against
+  // __stack_threshold (REASON_STACK_OOB / 125).
+  IRB.CreateCall(TaintPushStackFrameFn,
+                 {ConstantInt::get(Int64Ty, F.getGUID())});
 
   // Recover ctx at the end of a function
   for (auto FI = F.begin(), FE = F.end(); FI != FE; FI++) {
@@ -1564,7 +1569,8 @@ void Taint::addFrameTracing(Function &F) {
     Instruction *Inst = BB->getTerminator();
     if (isa<ReturnInst>(Inst) || isa<ResumeInst>(Inst)) {
       IRB.SetInsertPoint(Inst);
-      IRB.CreateCall(TaintPopStackFrameFn);
+      IRB.CreateCall(TaintPopStackFrameFn,
+                     {ConstantInt::get(Int64Ty, F.getGUID())});
     }
   }
 }
@@ -1693,9 +1699,9 @@ bool Taint::initializeModule(Module &M) {
   TaintTableLookupFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintTableLookupArgs, false);
   TaintPushStackFrameFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), {}, false);
+      Type::getVoidTy(*Ctx), {Int64Ty}, false);
   TaintPopStackFrameFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), {}, false);
+      Type::getVoidTy(*Ctx), {Int64Ty}, false);
   Type *TaintTraceAllocaArgs[4] =
       { PrimitiveShadowTy, Int64Ty, Int64Ty, Int64Ty };
   TaintTraceAllocaFnTy = FunctionType::get(
@@ -1791,6 +1797,109 @@ void Taint::addGlobalNameSuffix(GlobalValue *GV) {
 
     Asm.replace(Pos, 1, Suffix + "@");
     GV->getParent()->setModuleInlineAsm(Asm);
+  }
+}
+
+void Taint::renameInstrumentedComdats(Module &M) {
+  // addGlobalNameSuffix() renames the symbol but leaves the COMDAT group it
+  // lives in alone, so an instrumented definition ends up inside a group whose
+  // signature is still the *original* mangled name.  That signature collides
+  // with the group any uninstrumented translation unit emits for the same C++
+  // inline function, template instantiation or constructor -- and a linker
+  // keeps only the first group it sees for a given signature, silently
+  // dropping the other one along with the '.taint' definition inside it.
+  // Every reference to that definition then resolves as an undefined weak,
+  // i.e. address 0.  Because taint.ld links at a fixed 0x700000200000 base,
+  // and libc++'s _LIBCPP_HIDE_FROM_ABI makes these symbols hidden so they
+  // cannot be routed through the PLT, the result is
+  //   relocation truncated to fit: R_X86_64_PLT32 against undefined symbol
+  //     `...__throw_length_error...[clone .taint]'
+  // (or "relocation ... out of range" under lld).  Note that --whole-archive
+  // is no help: it forces the archive *member* in, but the group inside it is
+  // still discarded as a duplicate.
+  //
+  // So re-sign the group as well, which lets the instrumented and the
+  // uninstrumented copy coexist, each binding to the definition built for its
+  // own ABI.  A group is only re-signed when *all* of its members were
+  // suffixed.  A group that mixes the two -- a vtable group, or an inline
+  // variable's group holding the variable, its guard and the
+  // __cxx_global_var_init that got instrumented -- deliberately ties those
+  // symbols together and must keep deduplicating against the uninstrumented
+  // copy, or the shared state behind it would be initialized twice.
+  //
+  // "All of its members" means all of the ones that could *be* that
+  // uninstrumented twin, which is to say all the ones with external linkage.
+  // On a target built with afl-clang-lto, SanitizerCoverage has already
+  // dropped a private guard global into the same comdat as each instrumented
+  // function -- e.g. `@__sancov_gen_.950 = private global [1 x i32]
+  // zeroinitializer, section "__sancov_guards", comdat($_ZNSt3__1...)` --
+  // purely so the guard is discarded along with the function if some other
+  // TU's copy wins the dedup.  addGlobalNameSuffix() never renames it (it is
+  // not a symbol TaintPass instruments), so requiring it to end in ".taint"
+  // too left every such group unsigned: the member function inside was still
+  // renamed, but the group's own signature was not, so it stayed a duplicate
+  // of the exact same unsuffixed signature an uninstrumented TU emits for that
+  // function -- the one collision this pass exists to avoid.  A local-linkage
+  // global cannot be that twin (being merged across TUs at all requires
+  // external linkage), so its own name says nothing about whether the group is
+  // safe to re-sign.
+  //
+  // But it must not be the *only* thing the decision rests on: a group whose
+  // members are all local and none of them suffixed has no instrumented
+  // definition in it to protect, and re-signing it would stop it deduplicating
+  // for no reason.  That combination is not hypothetical here -- LTO
+  // internalizes almost everything in the merged module, so "local" is the
+  // common case in exactly the pipeline this exemption is for.  Hence the
+  // second condition: at least one member actually got suffixed.
+  //
+  // A group whose members are *all* local goes further and leaves the comdat
+  // altogether, because for such a group deduplication has no upside and two
+  // ways to go wrong.  This is the shape LTO produces: internalization turns
+  // libc++'s linkonce_odr header helpers into local definitions but leaves
+  // them in their comdat groups, and the module is then linked against a
+  // separately built libc++.a whose copies of those same helpers are still
+  // weak+hidden -- so the whole-program assumption internalization was made
+  // under does not actually hold at the final link.  Whichever side wins the
+  // dedup, the loser's definitions are dropped: if the merged module wins, its
+  // survivor is local and cannot be bound to from outside, and every reference
+  // from libc++.a resolves to 0 (which under taint.ld's fixed 0x700000200000
+  // base is the "relocation truncated to fit" above); if libc++.a wins, this
+  // module's own calls silently leave the instrumented copy for that one.
+  // Neither is what internalization asked for -- a local definition is by
+  // definition private to this module -- and dropping the comdat is what says
+  // so: nothing here can merge with, or be merged away by, anything outside.
+  // Note that re-signing does *not* cover this case, because a linker
+  // deduplicates group members by section name too, and both sides call the
+  // section .text.<name>.taint.
+  MapVector<Comdat *, SmallVector<GlobalObject *, 4>> Groups;
+  for (GlobalObject &GO : M.global_objects())
+    if (Comdat *C = GO.getComdat())
+      Groups[C].push_back(&GO);
+
+  const StringRef Suffix = ".taint";
+  for (auto &Group : Groups) {
+    Comdat *C = Group.first;
+    if (llvm::all_of(Group.second,
+                     [](GlobalObject *GO) { return GO->hasLocalLinkage(); })) {
+      for (GlobalObject *GO : Group.second)
+        GO->setComdat(nullptr);
+      continue;
+    }
+    if (C->getName().ends_with(Suffix))
+      continue;
+    if (!llvm::any_of(Group.second, [&](GlobalObject *GO) {
+          return GO->getName().ends_with(Suffix);
+        }))
+      continue;
+    if (!llvm::all_of(Group.second, [&](GlobalObject *GO) {
+          return GO->hasLocalLinkage() || GO->getName().ends_with(Suffix);
+        }))
+      continue;
+
+    Comdat *NewC = M.getOrInsertComdat((C->getName() + Suffix).str());
+    NewC->setSelectionKind(C->getSelectionKind());
+    for (GlobalObject *GO : Group.second)
+      GO->setComdat(NewC);
   }
 }
 
@@ -2331,6 +2440,10 @@ bool Taint::runImpl(Module &M) {
       *FI = nullptr;
     }
   }
+
+  // Every rename that is going to happen has happened by now, so the COMDAT
+  // groups can be re-signed.
+  renameInstrumentedComdats(M);
 
   for (Function *F : FnsToInstrument) {
     if (!F || F->isDeclaration())

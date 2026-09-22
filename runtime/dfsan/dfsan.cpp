@@ -939,10 +939,30 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   // for debugging
   // dfsan_label l = atomic_load(&__dfsan_last_label, memory_order_relaxed);
   // assert(label0 <= l);
-  if (label0 >= CONST_OFFSET) assert(get_label_info(label0)->size != 0);
+  // Indexof results (strchr/memchr/...) use size 0: they are opaque pointer/
+  // position labels, not bitvectors.  They are allowed to appear as label0
+  // when a pointer holding such a result was spilled (see union_store).
+  if (label0 >= CONST_OFFSET)
+    assert(get_label_info(label0)->size != 0 ||
+           is_indexof_op(get_label_info(label0)->op));
 
   // fast path 1: constant and bounds
   if (is_constant_label(label0) || is_bounds_label(label0)) {
+    bool same = true;
+    for (uptr i = 1; i < n; i++) {
+      if (ls[i] == kInitializingLabel) return kInitializingLabel;
+      else if (ls[i] != label0) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return label0;
+  }
+  // Same shape for indexof spills: union_store replicates the label across
+  // all pointer bytes without Extract, so the load must round-trip as itself.
+  // Without this, the slowpath Concat(Extract...) rebuild breaks the solver's
+  // Int-sort indexof folds (NULL checks and ptr-base -> index).
+  if (label0 >= CONST_OFFSET && is_indexof_op(get_label_info(label0)->op)) {
     bool same = true;
     for (uptr i = 1; i < n; i++) {
       if (ls[i] == kInitializingLabel) return kInitializingLabel;
@@ -998,7 +1018,12 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
       }
       offset += info->size;
     }
-    if (get_label_info(parent)->size == offset && offset == n * 8) {
+    // Indexof parents record size 0 (opaque pointer/position), so match on
+    // the reconstructed bit width instead of parent->size.
+    dfsan_label_info *parent_info = get_label_info(parent);
+    bool parent_covers = (parent_info->size == offset) ||
+                         (is_indexof_op(parent_info->op) && offset == n * 8);
+    if (parent_covers && offset == n * 8) {
       AOUT("Fast path (2): all labels are extracts: %u\n", parent);
       if (size_in_bits < n * 8)
         return do_taint_union(parent, CONST_LABEL, Trunc, size_in_bits, 0, 0);
@@ -1089,6 +1114,16 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
     return;
   }
 
+  // Indexof results (strchr/memchr/...) are opaque pointer/position labels
+  // with size 0.  Spilling them through a pointer alloca must not decompose
+  // into per-byte Extract nodes: that rebuilds as Concat on load and breaks
+  // the solver's Int-sort indexof folds.  Replicate the label like bounds.
+  if (is_indexof_op(info->op)) {
+    for (uptr i = 0; i < n; ++i)
+      ls[i] = l;
+    return;
+  }
+
   // default fall through
   for (uptr i = 0; i < n; ++i) {
     ls[i] = do_taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8);
@@ -1098,8 +1133,11 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __taint_trace_loop_push_stack();
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __taint_trace_loop_pop_stack();
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_push_stack_frame() {
+// Weak defaults: alloca nest + loop-depth nest.  Thoroupy provides strong
+// overrides that also enforce __stack_threshold (recursive depth limit).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
+void __taint_push_stack_frame(uint64_t func_guid) {
+  (void)func_guid;
   if (flags().trace_bounds) {
     if (__current_saved_stack_index < MAX_SAVED_STACK_ENTRIES)
       __saved_alloca_stack_top[++__current_saved_stack_index] = __alloca_stack_top;
@@ -1107,8 +1145,9 @@ void __taint_push_stack_frame() {
   __taint_trace_loop_push_stack();
 }
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_pop_stack_frame() {
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
+void __taint_pop_stack_frame(uint64_t func_guid) {
+  (void)func_guid;
   if (flags().trace_bounds) {
     __alloca_stack_top = __saved_alloca_stack_top[__current_saved_stack_index--];
   }

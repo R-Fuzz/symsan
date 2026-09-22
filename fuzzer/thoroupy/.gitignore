@@ -1,0 +1,10 @@
+venv
+__pycache__
+*.build
+*.bin
+.z3-trace
+.vscode
+*.json
+*.pickle
+gdb*.sh
+*.seed

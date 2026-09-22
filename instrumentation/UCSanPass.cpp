@@ -3768,19 +3768,19 @@ void UCSanVisitor::visitAllocaInst(AllocaInst &I) {
     }
   }
 
-  // Track bounds for stack allocations (arrays/structs)
-  if (isArray) {
+  // Due to opaque ptrs, track bounds for all allocations
+  {
     // Insert after the alloca instruction to get the address
     BasicBlock::iterator ip(&I);
     IRBuilder<> IRB(I.getParent(), ++ip);
 
-    // Get array size
+    // Get array size, if any
     Value *Size = IRB.CreateZExtOrTrunc(I.getArraySize(), UF.UC.Int64Ty);
     if (Size != I.getArraySize()) {
       UF.UC.markNosanitize(Size);
     }
 
-    // Get element size
+    // Get element size, if known
     const DataLayout &DL = getDataLayout();
     uint64_t es = DL.getTypeAllocSize(I.getAllocatedType());
     ConstantInt *ElemSize = ConstantInt::get(UF.UC.Int64Ty, es);
@@ -3794,8 +3794,6 @@ void UCSanVisitor::visitAllocaInst(AllocaInst &I) {
     CallInst *Bounds = IRB.CreateCall(UF.UC.UCTraceAllocaFn, {Size, ElemSize, Address});
     UF.UC.markNosanitize(Bounds);
     UF.setShadow(&I, Bounds);
-  } else {
-    UF.setShadow(&I, UF.UC.ZeroPrimitiveShadow);
   }
 }
 

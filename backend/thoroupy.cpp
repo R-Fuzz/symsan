@@ -54,6 +54,13 @@ static int __loop_depth_stack_previous[LOOP_COUNTER_SIZE];
 static int __loop_depth_stack_top = 0;
 static int __base_loop_depth = 0;
 
+// Per-function recursion depth (keyed by TaintPass F.getGUID()), analogous to
+// __loop_counter / __loop_threshold above.  Exceeding __stack_threshold exits
+// with REASON_STACK_OOB (125).
+#define STACK_FRAME_COUNTER_SIZE 4096
+static uint64_t __stack_frame_counter[STACK_FRAME_COUNTER_SIZE];
+static uint64_t __stack_frame_guid[STACK_FRAME_COUNTER_SIZE];
+
 extern void* __ucsan_null_deref_flag;
 
 // based on https://github.com/Cyan4973/xxHash
@@ -102,6 +109,55 @@ __taint_trace_loop_pop_stack() {
   __base_loop_depth = __loop_depth_stack_base[__loop_depth_stack_top];
   __previous_loop_depth = __loop_depth_stack_previous[__loop_depth_stack_top];
   AOUT("loop pop stack: %u %u %u\n", __current_loop_depth, __base_loop_depth, __previous_loop_depth);
+}
+
+// Strong overrides of the weak dfsan stubs: count per-function recursion and
+// enforce __stack_threshold, then nest the loop-depth stack like before.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_push_stack_frame(uint64_t func_guid) {
+  uint64_t hash =
+      xxhash(func_guid & 0xFFFFFFFFu, (func_guid >> 32) & 0xFFFFFFFFu, 0) %
+      STACK_FRAME_COUNTER_SIZE;
+  uint64_t initial_hash = hash;
+  while (__stack_frame_guid[hash] != 0 &&
+         __stack_frame_guid[hash] != func_guid) {
+    if (__stack_frame_counter[hash] == 0)
+      break;
+    hash = (hash + 1) % STACK_FRAME_COUNTER_SIZE;
+    if (hash == initial_hash) {
+      AOUT("stack frame slots exhausted\n");
+      internal__exit(exit_reason::REASON_STACK_OOB);
+    }
+  }
+  if (__stack_frame_guid[hash] == func_guid) {
+    __stack_frame_counter[hash]++;
+  } else {
+    __stack_frame_guid[hash] = func_guid;
+    __stack_frame_counter[hash] = 1;
+  }
+  __taint_trace_loop_push_stack();
+  if (__stack_frame_counter[hash] >= (uint64_t)__stack_threshold) {
+    AOUT("stack threshold reached, exiting\n");
+    internal__exit(exit_reason::REASON_STACK_OOB);
+  }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_pop_stack_frame(uint64_t func_guid) {
+  uint64_t hash =
+      xxhash(func_guid & 0xFFFFFFFFu, (func_guid >> 32) & 0xFFFFFFFFu, 0) %
+      STACK_FRAME_COUNTER_SIZE;
+  uint64_t initial_hash = hash;
+  while (__stack_frame_guid[hash] != func_guid) {
+    hash = (hash + 1) % STACK_FRAME_COUNTER_SIZE;
+    if (hash == initial_hash) {
+      AOUT("WARNING: pop_stack_frame guid not found\n");
+      return;
+    }
+  }
+  if (__stack_frame_counter[hash] > 0)
+    __stack_frame_counter[hash]--;
+  __taint_trace_loop_pop_stack();
 }
 
 #define get_nested_loop_depth() (__base_loop_depth + __current_loop_depth)
@@ -182,9 +238,7 @@ __taint_trace_loop(uint32_t bid, int depth) {
     .result = (uint64_t)get_nested_loop_depth()
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -208,9 +262,7 @@ __taint_trace_event_addr(dfsan_label label, uint32_t event_id, uint64_t info,
     .result = info
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -229,9 +281,7 @@ __taint_trace_bb(uint32_t function_index, uint32_t bb_index) {
     .result = bb_index,
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
 
   return;
 }
@@ -254,13 +304,9 @@ __taint_trace_global_var(uint32_t obj_id, uint64_t offset, uint64_t size, void *
     .result = size
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
-  }
+  __taint_emit(&msg, sizeof(msg));
   // FIXME: assuming single writer so msg will arrive in the same order
-  if (internal_write(__pipe_fd, gv, size) < 0) {
-    Die();
-  }
+  __taint_emit(gv, size);
 
   return;
 }
@@ -392,7 +438,11 @@ extern "C" void InitializeUCSanSolver() {
             .result = (uint64_t)status
           };
           AOUT("Fork server: report exit status: %d\n", status);
-          internal_write(__pipe_fd, &msg, sizeof(msg));
+          // Matches the other call sites' guard: __pipe_fd == -1 means tracing
+          // only, no out-of-process solving, and this write is a no-op then --
+          // __taint_emit() itself Die()s on a write failure, so the guard has
+          // to stay outside it.
+          if (__pipe_fd >= 0) __taint_emit(&msg, sizeof(msg));
         } else {
           AOUT("Fork server: fork failed, exiting\n");
           internal__exit(1);

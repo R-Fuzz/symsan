@@ -1,0 +1,5 @@
+entry: "cal(Node*)"
+scope:
+  - "foo(unsigned int&)"
+  - "unsigned int bar<unsigned int>(unsigned int)"
+  - "exit"

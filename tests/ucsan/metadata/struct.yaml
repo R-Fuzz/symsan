@@ -1,0 +1,3 @@
+entry: wrapper
+scope:
+  - func

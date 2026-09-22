@@ -1,0 +1,4 @@
+entry: "wrapper(Pair*)"
+scope:
+  - "Pair::sum() const"
+  - "exit"

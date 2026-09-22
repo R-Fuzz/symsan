@@ -1,0 +1,4 @@
+entry: "cal(int*)"
+scope:
+  - "Walker::walk(int*)"
+  - "exit"
