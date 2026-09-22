@@ -22,20 +22,22 @@ extern void dfsan_set_label(label, void *, unsigned long);
 extern label dfsan_read_label(const void *, unsigned long);
 extern info *dfsan_get_label_info(label);
 
-// Concat is runtime opcode 72; operand 1 contains the low bits.
+enum { INPUT = 0, LOAD = 32, CONCAT = 72 };
+
+// Concat operand 1 contains the low bits.
 static void evaluate(label l, unsigned char *out) {
   info *i = dfsan_get_label_info(l);
-  if (i->op == 0) {
+  if (i->op == INPUT) {
     assert(i->size == 8);
     out[0] = i->op2 == 1 ? (i->op1 * 31 + 17) & 255 : 0x47;
     return;
   }
-  // LLVM Load (32): consecutive input-byte labels.
-  if (i->op == 32) {
+  // Load: consecutive input-byte labels.
+  if (i->op == LOAD) {
     for (unsigned j = 0; j < i->l2; ++j) evaluate(i->l1 + j, out + j);
     return;
   }
-  assert(i->op == 72);
+  assert(i->op == CONCAT);
   assert(i->l1 || i->l2); // no valueless constant-only Concat nodes
   unsigned left = i->l1 ? dfsan_get_label_info(i->l1)->size
                         : i->size - dfsan_get_label_info(i->l2)->size;
