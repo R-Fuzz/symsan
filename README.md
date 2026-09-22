@@ -132,3 +132,16 @@ To cite SymSan in scientific work, please use the following BibTeX:
   month =        aug,
 }
 ```
+
+To cite UCSan in scientific work, please use the following BibTex:
+
+``` bibtex
+@inproceedings {yin2026compilation,
+  author =       {Mingjun Yin and Zhaorui Li and Ju Chen and Haochen Zeng and Chengyu Song},
+  title =        {A Compilation-Based Under-Constrained Execution Engine},
+  booktitle =    {{USENIX} Symposium on Operating Systems Design and Implementation (OSDI)},
+  year =         2026,
+  url =          {https://www.usenix.org/conference/osdi26/presentation/yin}
+  publisher =    {{USENIX} Association},
+}
+```
