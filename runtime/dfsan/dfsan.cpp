@@ -975,17 +975,42 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   }
   AOUT("label0 = %d, n = %lu, ls = %p\n", label0, n, ls);
 
-  // shape
+  // A compact Load encodes byte i as label0 + i. Consecutive input offsets
+  // alone are insufficient: unrelated allocations may separate the labels.
+  // Only consecutive raw-byte labels from the same input fit this encoding.
   bool shape = true;
-  if (is_constant_label(label0) || __dfsan_label_info[label0].op != 0) {
+  const dfsan_label_info *first_info = get_label_info(label0);
+  if (is_constant_label(label0) || first_info->op != 0 || first_info->size != 8) {
     // not raw input bytes
     shape = false;
   } else {
-    off_t offset = get_label_info(label0)->op1.i;
+    const uint64_t offset = first_info->op1.i;
+    const uint64_t input = first_info->op2.i;
+    uint32_t raw_byte_kind;
+    static_assert(sizeof(first_info->op) + sizeof(first_info->size) ==
+                      sizeof(raw_byte_kind) &&
+                  __builtin_offsetof(dfsan_label_info, size) ==
+                      __builtin_offsetof(dfsan_label_info, op) +
+                          sizeof(first_info->op),
+                  "packed raw-byte check requires adjacent op and size fields");
+    __builtin_memcpy(&raw_byte_kind, &first_info->op, sizeof(raw_byte_kind));
     for (uptr i = 1; i != n; ++i) {
       dfsan_label next_label = ls[i];
       if (next_label == kInitializingLabel) return kInitializingLabel;
-      else if (get_label_info(next_label)->op1.i != offset + i) {
+      if (next_label != label0 + i) {
+        shape = false;
+        break;
+      }
+      // The ID check makes metadata contiguous too. Address it directly,
+      // avoiding a dependent lookup through the just-loaded shadow label.
+      const dfsan_label_info *next_info = first_info + i;
+      // op and size are adjacent 16-bit fields. Compare them together,
+      // using memcpy to avoid alignment/aliasing assumptions or byte order.
+      uint32_t kind;
+      __builtin_memcpy(&kind, &next_info->op, sizeof(kind));
+      const uint64_t mismatch = (kind ^ raw_byte_kind) |
+          (next_info->op2.i ^ input) | (next_info->op1.i ^ (offset + i));
+      if (mismatch != 0) {
         shape = false;
         break;
       }
