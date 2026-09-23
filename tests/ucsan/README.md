@@ -21,8 +21,9 @@ python3 test.py                   # run the whole suite
 ```
 
 `test/*.c`/`test/*.cpp` are the test sources, each annotated with a
-`// METADATA:`/`// ENV:`/`// FLAG:`/`// DISCARD:` header consumed by
+`// METADATA:`/`// ENV:`/`// FLAG:`/`// DISCARD:`/`// ABSENT:` header consumed by
 `test.py`; `metadata/*.yaml` are the referenced UCSan entry/scope configs.
+`ABSENT` asserts that an exit status is never observed during exploration.
 `seeds/create_*_seed.py` are standalone generators for concrete seed files
 used with `test.py run_seed` to reproduce a specific path. `ll/` and
 `binary/` are build outputs (`test.py clean` removes them).

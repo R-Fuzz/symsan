@@ -79,6 +79,10 @@ def parse_test(file, test_name):
             flags = line.split(":", maxsplit=2)[1].strip().split(" ")
             for flag in flags:
                     test[2].append([int(flag), -1])
+        elif line.startswith("// ABSENT:"):
+            flags = line.split(":", maxsplit=2)[1].strip().split(" ")
+            for flag in flags:
+                test[2].append([int(flag, 0), -2])
     tests.append(test)
 
 for file in glob.glob(os.path.join(SCRIPT_DIR, "test", "*.c")):
@@ -211,6 +215,8 @@ def perform_test(stage, *args, seed=None):
                 expected = "any"
             if expected == -1:
                 expected = "discard"
+            if expected == -2:
+                expected = "absent"
             v = triggered[flag[0]]
             message.append(f"{key}:{v}/{expected}")
         message = ",".join(message)
@@ -218,6 +224,13 @@ def perform_test(stage, *args, seed=None):
 
         for flag in flags:
             if flag[1] == -1:
+                continue
+            if flag[1] == -2:
+                if triggered[flag[0]] != 0:
+                    raise Exception(
+                        f"Flag {flag[0]} triggered "
+                        f"{triggered[flag[0]]} times, expected none"
+                    )
                 continue
             if flag[1] != 0 and triggered[flag[0]] != flag[1]:
                 raise Exception(f"Flag {flag[0]} triggered {triggered[flag[0]]} times, expected {flag[1]}")

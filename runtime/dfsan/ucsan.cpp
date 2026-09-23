@@ -803,6 +803,13 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
   UCSAN_OUT("label %u: op=%u, trace_bounds=%d\n", label, label_info->common.op, ucsan_flags().trace_bounds);
 
+  // Alloca labels are emitted even when bounds tracing is disabled.  They
+  // describe the concrete stack object; they are not under-constrained
+  // pointer labels and must never fall through to the external-pointer path.
+  // The bounds-enabled path below still performs stack-UAF and OOB checks.
+  if (!ucsan_flags().trace_bounds && label_info->common.op == OP_ALLOCA)
+    return p;
+
   // Bounds checking when trace_bounds is enabled
   if (ucsan_flags().trace_bounds) {
     // Check for stack UAF - accessing freed stack allocations
