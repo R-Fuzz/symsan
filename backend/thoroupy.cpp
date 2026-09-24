@@ -338,6 +338,16 @@ static void fpe_handler(int sig, siginfo_t *si, void *unused)
   Die();
 }
 
+// A trap instruction the instrumentation left in place (ud2, int3) ends the
+// run the way a converted trap does (UCSanPass replaces those with exit(180)).
+// Without a handler the target dies of the signal, and on a host with a piped
+// core_pattern (apport) that reads as a hang, not a failure.
+static void trap_handler(int sig, siginfo_t *si, void *unused)
+{
+  AOUT("Trap (signal %d) at address: %p\n", sig, si->si_addr);
+  internal__exit(180);
+}
+
 void RegisterSegFault () {
 #ifdef __handle_segfualt__
   struct sigaction sa;
@@ -349,6 +359,11 @@ void RegisterSegFault () {
     Die();
   sa.sa_sigaction = fpe_handler;
   if (sigaction(SIGFPE, &sa, NULL) == -1)
+    Die();
+  sa.sa_sigaction = trap_handler;
+  if (sigaction(SIGILL, &sa, NULL) == -1)
+    Die();
+  if (sigaction(SIGTRAP, &sa, NULL) == -1)
     Die();
 #endif
 }

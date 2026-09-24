@@ -66,6 +66,7 @@
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -476,6 +477,9 @@ class UCSan {
   std::map<std::string, Function*> CustomFuncs;
   std::map<std::string, FunctionType*> CustomFuncTypes;
   DenseMap<Value *, Function *> UnwrappedFnMap;
+  // Functions inline asm calls by name that the module did not have,
+  // declared by declareAsmCallees before the scope split.
+  StringMap<WeakTrackingVH> AsmCallees;
 
   // ABIList for custom function detection
   UCSanABIList ABIList;
@@ -2795,68 +2799,745 @@ void UCSanVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
   UF.setShadow(&GEPI, Shadow);
 }
 
+namespace {
+
+// Canonical name of an x86-64 general purpose register ("ax", "di", "r8",
+// "sp", ...) for an inline asm constraint code ("a", "{rdi}", "{r8d}") or an
+// AT&T register operand ("%rdi", "%r8d"); empty if it names none.
+std::string asmRegName(StringRef S) {
+  S = S.trim();
+  if (S.size() == 1) {
+    switch (S[0]) {
+    case 'a': return "ax";
+    case 'b': return "bx";
+    case 'c': return "cx";
+    case 'd': return "dx";
+    case 'S': return "si";
+    case 'D': return "di";
+    default: return "";
+    }
+  }
+  if (!S.consume_front("%")) {
+    if (!S.consume_front("{") || !S.consume_back("}"))
+      return "";
+  }
+  std::string R = S.lower();
+  if (R.size() >= 2 && R[0] == 'r' && isdigit(R[1])) {
+    // r8..r15, with an optional d/w/b width suffix
+    while (!isdigit(R.back()))
+      R.pop_back();
+    return R;
+  }
+  static const char *Bases[] = {"ax", "bx", "cx", "dx", "si", "di", "sp", "bp"};
+  auto isBase = [](StringRef B) {
+    return llvm::is_contained(Bases, B);
+  };
+  if (isBase(R))
+    return R;
+  if (R.size() == 3 && (R[0] == 'e' || R[0] == 'r') && isBase(R.substr(1)))
+    return R.substr(1);
+  if (R.size() == 2 && R[1] == 'l' && isBase(std::string(1, R[0]) + "x"))
+    return std::string(1, R[0]) + "x";                    // al, bl, cl, dl
+  if (R.size() == 3 && R[2] == 'l' && isBase(R.substr(0, 2)))
+    return R.substr(0, 2);                                // sil, dil, spl, bpl
+  return "";
+}
+
+// Operand number of an asm operand reference `$N`, `${N}` or `${N:m}`, with
+// the modifier returned in Mod; -1 if T is not one.
+int asmOperandRef(StringRef T, StringRef *Mod = nullptr) {
+  T = T.trim();
+  if (!T.consume_front("$"))
+    return -1;
+  StringRef M;
+  if (T.consume_front("{")) {
+    if (!T.consume_back("}"))
+      return -1;
+    std::tie(T, M) = T.split(':');
+  }
+  unsigned N;
+  if (T.getAsInteger(10, N))
+    return -1;
+  if (Mod)
+    *Mod = M;
+  return N;
+}
+
+struct AsmInsn {
+  std::string Mnemonic;
+  SmallVector<std::string, 3> Operands;
+};
+
+// The instructions an asm actually executes, in order: the template is split
+// on newlines and `;`, labels, comments and directives are dropped, and
+// everything between .pushsection/.section and .popsection/.previous is
+// skipped -- that is where the kernel's ALTERNATIVE keeps its replacement
+// code and tables, and where exception tables go.  A lone prefix (`rep;`,
+// `lock;`) is joined to the instruction it prefixes.
+SmallVector<AsmInsn, 4> asmExecutedInsns(StringRef Asm) {
+  std::string Text = Asm.str();
+  // C comments, e.g. "/* output condition code e*/"
+  for (size_t P; (P = Text.find("/*")) != std::string::npos;) {
+    size_t E = Text.find("*/", P);
+    Text.erase(P, E == std::string::npos ? std::string::npos : E + 2 - P);
+  }
+  SmallVector<AsmInsn, 4> Insns;
+  SmallVector<StringRef, 16> Lines;
+  StringRef(Text).split(Lines, '\n');
+  int Depth = 0;
+  std::string Prefix;
+  for (StringRef Line : Lines) {
+    SmallVector<StringRef, 4> Stmts;
+    Line.split(Stmts, ';');
+    for (StringRef S : Stmts) {
+      S = S.split('#').first.trim();
+      if (S.starts_with(".pushsection") || S.starts_with(".section")) {
+        ++Depth;
+        continue;
+      }
+      if (S.starts_with(".popsection") || S.starts_with(".previous")) {
+        if (Depth)
+          --Depth;
+        continue;
+      }
+      if (Depth)
+        continue;
+      // labels: "661:", "998:", "name:"
+      while (true) {
+        size_t Colon = S.find(':');
+        if (Colon == StringRef::npos)
+          break;
+        StringRef L = S.substr(0, Colon);
+        if (L.empty() || L.find_first_of(" \t$%(,") != StringRef::npos)
+          break;
+        S = S.substr(Colon + 1).trim();
+      }
+      if (S.empty() || S.starts_with("."))
+        continue;
+      std::string Stmt = Prefix.empty() ? S.str() : Prefix + " " + S.str();
+      Prefix.clear();
+      std::replace(Stmt.begin(), Stmt.end(), '\t', ' ');
+      StringRef Rest(Stmt);
+      StringRef Mn;
+      std::tie(Mn, Rest) = Rest.split(' ');
+      std::string Mnemonic = Mn.str();
+      if (Mn == "rep" || Mn == "repz" || Mn == "repnz" || Mn == "repe" ||
+          Mn == "repne" || Mn == "lock") {
+        if (Rest.trim().empty()) {
+          Prefix = Mn.str();
+          continue;
+        }
+        StringRef Next;
+        std::tie(Next, Rest) = Rest.trim().split(' ');
+        Mnemonic += " " + Next.str();
+      }
+      AsmInsn I;
+      I.Mnemonic = Mnemonic;
+      // Trim leading whitespace
+      Rest = Rest.trim();
+      // operands, split at top-level commas
+      int Paren = 0;
+      std::string Cur;
+      for (char C : Rest) {
+        if (C == '(') ++Paren;
+        if (C == ')') --Paren;
+        if (C == ',' && Paren == 0) {
+          I.Operands.push_back(StringRef(Cur).trim().str());
+          Cur.clear();
+          continue;
+        }
+        Cur += C;
+      }
+      if (!StringRef(Cur).trim().empty())
+        I.Operands.push_back(StringRef(Cur).trim().str());
+      Insns.push_back(I);
+    }
+  }
+  return Insns;
+}
+
+// V converted to Ty the way a register would carry it.
+Value *castAsmValue(IRBuilder<> &IRB, const DataLayout &DL, Value *V, Type *Ty,
+                    bool Signed = false) {
+  Type *VT = V->getType();
+  if (VT == Ty)
+    return V;
+  if (VT->isIntegerTy() && Ty->isIntegerTy())
+    return IRB.CreateIntCast(V, Ty, Signed);
+  if (VT->isPointerTy() && Ty->isIntegerTy())
+    return IRB.CreateZExtOrTrunc(IRB.CreatePtrToInt(V, IRB.getInt64Ty()), Ty);
+  if (VT->isIntegerTy() && Ty->isPointerTy())
+    return IRB.CreateIntToPtr(
+        IRB.CreateIntCast(V, IRB.getInt64Ty(), Signed), Ty);
+  if (VT->isPointerTy() && Ty->isPointerTy())
+    return IRB.CreatePointerCast(V, Ty);
+  if (VT->isSized() && Ty->isSized() &&
+      DL.getTypeSizeInBits(VT) == DL.getTypeSizeInBits(Ty) &&
+      !VT->isAggregateType() && !Ty->isAggregateType())
+    return IRB.CreateBitCast(V, Ty);
+  return Constant::getNullValue(Ty);
+}
+
+// Access size, in bytes, of an instruction by its mnemonic suffix or its
+// vector register operands; 0 if unknown.
+uint64_t asmAccessSize(StringRef Mnemonic, ArrayRef<std::string> Operands) {
+  for (auto &O : Operands)
+    if (StringRef(O).starts_with("%xmm"))
+      return 16;
+  if (Mnemonic.size() > 1) {
+    switch (Mnemonic.back()) {
+    case 'b': return 1;
+    case 'w': return 2;
+    case 'l': return 4;
+    case 'q': return 8;
+    }
+  }
+  return 0;
+}
+
+const char *const AsmArgRegs[] = {"di", "si", "dx", "cx", "r8", "r9"};
+
+// The operands of an inline asm call, indexed by operand number ($N in the
+// template).  Register outputs are the asm's results; every other operand but
+// a label is an argument, and a memory ("*m") one is a pointer to its
+// elementtype.
+struct AsmOp {
+  const InlineAsm::ConstraintInfo *CI = nullptr;
+  int Result = -1;            // register output: index of the result
+  Value *V = nullptr;         // argument operands: the argument
+  Type *ElemTy = nullptr;     // memory operands: type of the memory
+  int TiedTo = -1;            // input tied to output operand TiedTo
+  std::string Reg;            // fixed register, if the constraint names one
+  std::string Code;
+  bool isInput() const { return CI->Type == InlineAsm::isInput; }
+  bool isMem() const { return CI->isIndirect && V && ElemTy; }
+  bool isValue() const { return isInput() && !CI->isIndirect && V; }
+};
+
+struct AsmOperands {
+  SmallVector<AsmOp, 8> Ops;
+  unsigned NumResults = 0;
+  bool AllClobbers = true;
+  bool HasMemOutput = false;
+
+  AsmOperands(CallBase &CB, const InlineAsm::ConstraintInfoVector &Constraints) {
+    unsigned ArgIdx = 0;
+    for (auto &CI : Constraints) {
+      // clobbers don't have corresponding arguments
+      if (CI.Type == InlineAsm::isClobber)
+        continue;
+      AllClobbers = false;
+      AsmOp Op;
+      Op.CI = &CI;
+      Op.Code = CI.Codes.empty() ? "" : CI.Codes[0];
+      // non-indirect outputs don't have a pointer argument
+      if (CI.Type == InlineAsm::isOutput && !CI.isIndirect) {
+        Op.Result = NumResults++;
+      } else if (CI.Type != InlineAsm::isLabel &&
+                 ArgIdx < CB.arg_size()) { // bounds check
+        Op.V = CB.getArgOperand(ArgIdx);
+        if (CI.isIndirect)
+          Op.ElemTy = CB.getParamElementType(ArgIdx);
+        ++ArgIdx;
+      }
+      if (CI.Type == InlineAsm::isOutput && CI.isIndirect)
+        HasMemOutput = true;
+      // an input tied to an output ("0") lives in that output's register
+      unsigned Tied;
+      if (Op.isInput() && !StringRef(Op.Code).getAsInteger(10, Tied) &&
+          Tied < Ops.size()) {
+        Op.TiedTo = Tied;
+        Op.Reg = Ops[Tied].Reg;
+      } else {
+        Op.Reg = asmRegName(Op.Code);
+      }
+      Ops.push_back(Op);
+    }
+  }
+};
+
+// One step of an inline asm that makes calls, followed as a small program
+// over the registers (see visitInlineAsm).
+struct AsmStep {
+  enum { Call, SetReg, CopyReg } Kind;
+  std::string Reg, Src; // SetReg/CopyReg: destination, CopyReg: source
+  int Operand = -1;     // SetReg: source operand; Call: callee operand
+  std::string Sym;      // Call: symbol, when not an operand
+};
+
+// The steps of an asm made only of calls, register moves and stack switches;
+// false if it has anything else.
+bool planAsmCalls(ArrayRef<AsmInsn> Insns, ArrayRef<AsmOp> Ops,
+                  SmallVectorImpl<AsmStep> &Steps) {
+  auto isSP = [](StringRef R) { return R == "sp"; };
+  for (auto &I : Insns) {
+    StringRef Mn = I.Mnemonic;
+    if ((Mn == "call" || Mn == "callq") && I.Operands.size() == 1) {
+      StringRef T = I.Operands[0];
+      AsmStep S{AsmStep::Call};
+      // Strip operand modifiers like ${0:P} - if it starts with $, it's a register operand
+      StringRef Mod;
+      int N = asmOperandRef(T, &Mod);
+      if (N >= 0) {
+        // `call ${N:P}`: the callee is an "i" operand
+        if (N < (int)Ops.size() && Ops[N].V &&
+            isa<Function>(Ops[N].V->stripPointerCasts()))
+          S.Operand = N;
+        else
+          return false;
+      } else if (T.starts_with("*") || T.starts_with("%") || T.empty()) {
+        return false;
+      } else {
+        // Extract symbol name after call/callq
+        // Symbol name ends at whitespace, newline, or end of string
+        // (the statement's only operand, see asmExecutedInsns); here it is
+        // a symbol, possibly spliced with constant operands
+        // (`__get_user_${4:P}`)
+        std::string Name;
+        while (!T.empty()) {
+          size_t P = T.find('$');
+          Name += T.substr(0, P).str();
+          if (P == StringRef::npos)
+            break;
+          T = T.substr(P);
+          size_t E = T.starts_with("${") ? T.find('}') + 1 : 2;
+          int K = asmOperandRef(T.substr(0, E));
+          auto *C = K >= 0 && K < (int)Ops.size() && Ops[K].V
+                        ? dyn_cast<ConstantInt>(Ops[K].V)
+                        : nullptr;
+          if (!C)
+            return false;
+          Name += std::to_string(C->getZExtValue());
+          T = T.substr(E);
+        }
+        S.Sym = Name;
+      }
+      Steps.push_back(S);
+    } else if (Mn.starts_with("mov") && Mn.size() <= 4 &&
+               I.Operands.size() == 2) {
+      StringRef Src = I.Operands[0], Dst = I.Operands[1];
+      std::string DReg = asmRegName(Dst), SReg = asmRegName(Src);
+      int N = asmOperandRef(Src);
+      if (isSP(DReg) || isSP(SReg)) {
+        // stack switch: `movq %rsp, (%r11)`, `movq %r11, %rsp`
+      } else if (!DReg.empty() && N >= 0 && N < (int)Ops.size() &&
+                 Ops[N].isValue()) {
+        Steps.push_back({AsmStep::SetReg, DReg, "", N});
+      } else if (!DReg.empty() && !SReg.empty()) {
+        Steps.push_back({AsmStep::CopyReg, DReg, SReg});
+      } else {
+        return false;
+      }
+    } else if ((Mn.starts_with("pop") || Mn.starts_with("push")) &&
+               I.Operands.size() == 1 && isSP(asmRegName(I.Operands[0]))) {
+      // restoring the stack switched from
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Callees that visitInlineAsm lowers instead of calling (the kernel's
+// assembly helpers with their own calling conventions), or drops (static call
+// trampolines).
+bool isAsmModeledCallee(StringRef Sym) {
+  return Sym.starts_with("__get_user_") || Sym.starts_with("__put_user_") ||
+         Sym == "this_cpu_cmpxchg16b_emu" || Sym.starts_with("__SCT__");
+}
+
+// Declare the functions inline asm calls by name without the module having
+// them (the kernel's ALTERNATIVE fallbacks such as __sw_hweight32), typed
+// from the registers the asm passes and the %rax output.  This runs before
+// functions are sorted by scope, so these get the same in-scope / external /
+// custom handling as a call from C would; visitInlineAsm finds them in
+// Callees (an out-of-scope one is replaced by its __external$ wrapper, which
+// the value handle follows).
+void declareAsmCallees(Module &M, StringMap<WeakTrackingVH> &Callees) {
+  SmallVector<CallInst *, 16> Sites;
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->isInlineAsm())
+          Sites.push_back(CI);
+  for (CallInst *CI : Sites) {
+    auto *IA = cast<InlineAsm>(CI->getCalledOperand());
+    auto Constraints = IA->ParseConstraints();
+    AsmOperands AO(*CI, Constraints);
+    SmallVector<AsmInsn, 4> Insns = asmExecutedInsns(IA->getAsmString());
+    SmallVector<AsmStep, 4> Steps;
+    if (AO.HasMemOutput || !planAsmCalls(Insns, AO.Ops, Steps))
+      continue;
+    StringMap<Type *> RegTys;
+    Type *AxTy = nullptr;
+    for (auto &Op : AO.Ops) {
+      if (Op.isValue() && !Op.Reg.empty())
+        RegTys[Op.Reg] = Op.V->getType();
+      if (Op.Result >= 0 && Op.Reg == "ax")
+        AxTy = AO.NumResults == 1
+                   ? CI->getType()
+                   : cast<StructType>(CI->getType())->getElementType(Op.Result);
+    }
+    for (auto &S : Steps) {
+      if (S.Kind == AsmStep::SetReg) {
+        RegTys[S.Reg] = AO.Ops[S.Operand].V->getType();
+        continue;
+      }
+      if (S.Kind == AsmStep::CopyReg) {
+        RegTys[S.Reg] = RegTys.lookup(S.Src);
+        continue;
+      }
+      Function *Fn = nullptr;
+      if (S.Operand >= 0) {
+        Fn = cast<Function>(AO.Ops[S.Operand].V->stripPointerCasts());
+      } else if (!(Fn = M.getFunction(S.Sym)) && !Callees.count(S.Sym) &&
+                 !isAsmModeledCallee(S.Sym)) {
+        SmallVector<Type *, 6> Params;
+        for (const char *R : AsmArgRegs) {
+          Type *T = RegTys.lookup(R);
+          if (!T)
+            break;
+          Params.push_back(T);
+        }
+        Type *RetTy = AxTy ? AxTy : Type::getVoidTy(M.getContext());
+        FunctionCallee FC = M.getOrInsertFunction(
+            S.Sym, FunctionType::get(RetTy, Params, false));
+        Callees[S.Sym] = FC.getCallee();
+        Fn = dyn_cast<Function>(FC.getCallee());
+      }
+      if (Fn && !Fn->getReturnType()->isVoidTy())
+        RegTys["ax"] = Fn->getReturnType();
+    }
+  }
+}
+
+} // namespace
+
 void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
   IRBuilder<> IRB(&CB);
-  auto DL = CB.getModule()->getDataLayout();
+  Module *M = CB.getModule();
+  const DataLayout &DL = M->getDataLayout();
 
   // Use ParseConstraints to identify memory operands and check their pointers
   auto Constraints = IA->ParseConstraints();
-  unsigned ArgIdx = 0;
-  for (auto &CI : Constraints) {
-    // clobbers don't have corresponding arguments
-    if (CI.Type == InlineAsm::isClobber)
-      continue;
-    // non-indirect outputs don't have a pointer argument
-    if (CI.Type == InlineAsm::isOutput && !CI.isIndirect) {
-      continue;
-    }
-    // bounds check
-    if (ArgIdx >= CB.arg_size())
-      break;
+  auto AsmStr = IA->getAsmString();
 
-    Value *Arg = CB.getArgOperand(ArgIdx);
-    // only check indirect (memory) operands that are pointers
-    if (CI.isIndirect && Arg->getType()->isPointerTy()) {
-      // skip compile time constants and allocas
-      if (!isa<Constant>(Arg) &&
-          !isa<AllocaInst>(Arg->stripPointerCasts())) {
-        unsigned ObjSize = 0;
-        // AllocaInst is excluded above, so this traces heap/global origins;
-        // opaque pointers carry no pointee type on Arg itself.
-        Type *PointeeTy = getUnderlyingObjectType(Arg);
-        uint32_t TypeID = 0;
-        if (PointeeTy && PointeeTy->isSized()) {
-          ObjSize = DL.getTypeAllocSize(PointeeTy);
-          TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
+  AsmOperands AO(CB, Constraints);
+  auto &Ops = AO.Ops;
+  unsigned NumResults = AO.NumResults;
+  // Check if all constraints are clobbers (no inputs/outputs)
+  bool allClobbers = AO.AllClobbers;
+  bool HasMemOutput = AO.HasMemOutput;
+  auto resultTy = [&](unsigned I) -> Type * {
+    if (NumResults == 1)
+      return CB.getType();
+    return cast<StructType>(CB.getType())->getElementType(I);
+  };
+  // the value an output register holds on entry: its tied input, if any
+  auto tiedInput = [&](unsigned OpNo) -> Value * {
+    for (auto &Op : Ops)
+      if (Op.TiedTo == (int)OpNo)
+        return Op.V;
+    return nullptr;
+  };
+  auto memSize = [&](const AsmOp &Op) -> uint64_t {
+    return Op.ElemTy && Op.ElemTy->isSized() ? DL.getTypeStoreSize(Op.ElemTy)
+                                             : 0;
+  };
+
+  // Replace the asm by IR built in front of it; Results[I] is the value of
+  // its I-th register output (null for zero).  The visitor has already moved
+  // past the new instructions, so they are visited here, in order.
+  Instruction *Before = CB.getPrevNode();
+  auto replaceWith = [&](ArrayRef<Value *> Results) {
+    Value *Res = nullptr;
+    auto result = [&](unsigned I) -> Value * {
+      Type *Ty = resultTy(I);
+      Value *V = I < Results.size() ? Results[I] : nullptr;
+      return V ? castAsmValue(IRB, DL, V, Ty) : Constant::getNullValue(Ty);
+    };
+    // Handle return value: replace all uses of the inline asm result
+    if (NumResults == 1) {
+      Res = result(0);
+    } else if (NumResults > 1) {
+      // Inline asm may return a struct; replace ExtractValue uses
+      // First element is typically the return value
+      // Other elements get zero/null
+      // (now: the struct is rebuilt, each element from its own register --
+      // the return value is the %rax element, wherever it is -- so the
+      // ExtractValue uses read it unchanged, and one with no value gets
+      // zero/null)
+      Res = PoisonValue::get(CB.getType());
+      for (unsigned I = 0; I < NumResults; ++I)
+        Res = IRB.CreateInsertValue(Res, result(I), I);
+    }
+    // Handle shadow propagation for the new call through visitCallBase;
+    // Check if the callee has a wrapper (custom or auto-custom)
+    // Now handle the new call through the normal wrapped call path
+    // For in-scope or normal out-of-scope functions, replace with direct call
+    // (visitCallBase does all three: for a callee with a wrapper,
+    // visitWrappedCallBase will redirect to the wrapper)
+    Instruction *I = Before ? Before->getNextNode() : &CB.getParent()->front();
+    while (I != &CB) {
+      Instruction *Next = I->getNextNode();
+      if (!UF.SkipInsts.count(I))
+        visit(*I);
+      I = Next;
+    }
+    if (Res)
+      CB.replaceAllUsesWith(Res);
+    CB.eraseFromParent();
+  };
+
+  SmallVector<AsmInsn, 4> Insns = asmExecutedInsns(AsmStr);
+  bool Volatile = IA->hasSideEffects();
+  bool IsCall = isa<CallInst>(CB);
+
+  // Asm whose effect is known is lowered to the equivalent IR, which is then
+  // checked, sized and labeled like any other code.
+
+  // `mov` between two operands: a register-to-register move, a load from a
+  // memory input (readl), or a store to a memory operand (writel).  A segment
+  // prefix (%gs: percpu) is not an operand reference and is not lowered.
+  if (IsCall && Insns.size() == 1 && Ops.size() == 2 &&
+      StringRef(Insns[0].Mnemonic).starts_with("mov") &&
+      Insns[0].Mnemonic.size() <= 4 && Insns[0].Operands.size() == 2) {
+    StringRef SMod, DMod;
+    int S = asmOperandRef(Insns[0].Operands[0], &SMod);
+    int D = asmOperandRef(Insns[0].Operands[1], &DMod);
+    uint64_t Width = asmAccessSize(Insns[0].Mnemonic, {});
+    if (Insns[0].Mnemonic == "mov" || Width) {
+      // register-width modifiers only; ${N:P} / ${N:c} are not a value
+      auto widthMod = [](StringRef Mod) {
+        return Mod.empty() || Mod == "b" || Mod == "h" || Mod == "w" ||
+               Mod == "k" || Mod == "q";
+      };
+      if (S >= 0 && D >= 0 && S != D && Ops[S].isInput() && widthMod(SMod) &&
+          widthMod(DMod)) {
+        AsmOp &SO = Ops[S], &DO = Ops[D];
+        if (DO.Result >= 0 && NumResults == 1) {
+          uint64_t Size = DL.getTypeStoreSize(resultTy(0));
+          if (!Width || Width == Size) {
+            if (SO.isValue()) {
+              replaceWith({SO.V});
+              return;
+            }
+            if (SO.isMem()) {
+              LoadInst *L = IRB.CreateLoad(resultTy(0), SO.V);
+              L->setVolatile(Volatile);
+              replaceWith({L});
+              return;
+            }
+          }
+        } else if (DO.isMem() && SO.isValue() && NumResults == 0 &&
+                   (!Width || Width == memSize(DO))) {
+          StoreInst *St = IRB.CreateStore(
+              castAsmValue(IRB, DL, SO.V, DO.ElemTy), DO.V);
+          St->setVolatile(Volatile);
+          replaceWith({});
+          return;
         }
-        Value *Size = ConstantInt::get(UF.UC.Int64Ty, ObjSize);
-        Value *Ptr = UF.checkPointer(Arg, Size, true, IRB, TypeID); // dereference pointer
-        CB.setArgOperand(ArgIdx, Ptr);
       }
     }
-    ++ArgIdx;
+  }
+
+  // `bt bit, base` into a carry-flag output (variable_test_bit).  A memory
+  // base is a bit string: a register bit offset is signed and may address
+  // past the first word.
+  if (IsCall && Insns.size() == 1 && Ops.size() == 3 && NumResults == 1 &&
+      (Insns[0].Mnemonic == "bt" || Insns[0].Mnemonic == "btw" ||
+       Insns[0].Mnemonic == "btl" || Insns[0].Mnemonic == "btq") &&
+      Insns[0].Operands.size() == 2) {
+    int B = asmOperandRef(Insns[0].Operands[0]);
+    int W = asmOperandRef(Insns[0].Operands[1]);
+    int Out = -1;
+    for (unsigned I = 0; I < Ops.size(); ++I)
+      if (Ops[I].Result == 0 && Ops[I].Code == "{@ccc}")
+        Out = I;
+    if (Out >= 0 && B >= 0 && W >= 0 && Ops[B].isValue() &&
+        (Ops[W].isValue() || (Ops[W].isInput() && Ops[W].isMem()))) {
+      uint64_t Bytes = asmAccessSize(Insns[0].Mnemonic, {});
+      if (!Bytes)
+        Bytes = Ops[W].isMem() ? memSize(Ops[W])
+                               : DL.getTypeStoreSize(Ops[W].V->getType());
+      if (Bytes == 2 || Bytes == 4 || Bytes == 8) {
+        unsigned Bits = Bytes * 8;
+        Type *WordTy = IRB.getIntNTy(Bits);
+        Value *Nr = castAsmValue(IRB, DL, Ops[B].V, IRB.getInt64Ty(), true);
+        Value *Word;
+        if (Ops[W].isMem()) {
+          Value *Idx = IRB.CreateAShr(Nr, Log2_32(Bits));
+          Value *Ptr = IRB.CreateGEP(WordTy, Ops[W].V, Idx);
+          LoadInst *L = IRB.CreateLoad(WordTy, Ptr);
+          L->setVolatile(Volatile);
+          Word = L;
+        } else {
+          Word = castAsmValue(IRB, DL, Ops[W].V, WordTy);
+        }
+        Value *Sh = IRB.CreateAnd(IRB.CreateTrunc(Nr, WordTy), Bits - 1);
+        Value *Bit = IRB.CreateAnd(IRB.CreateLShr(Word, Sh), 1);
+        replaceWith({Bit});
+        return;
+      }
+    }
+  }
+
+  // Build input args from parsed constraints
+  // Values of the input registers, by register name.
+  auto inputRegs = [&]() {
+    StringMap<Value *> Regs;
+    for (auto &Op : Ops)
+      if (Op.isValue() && !Op.Reg.empty())
+        Regs[Op.Reg] = Op.V;
+    return Regs;
+  };
+  // Results from the final register values; an output without a named
+  // register keeps its tied input.
+  // No return value or no uses — safe to just delete
+  // Has uses — try to find a type-matching input as passthrough
+  // (now: the input in the same register, or tied to the output)
+  // e.g., "={rsp},{rsp}" means rsp is passed through unchanged
+  auto regResults = [&](StringMap<Value *> &Regs) {
+    SmallVector<Value *, 4> Results(NumResults, nullptr);
+    for (unsigned I = 0; I < Ops.size(); ++I) {
+      if (Ops[I].Result < 0)
+        continue;
+      Value *V = Ops[I].Reg.empty() ? nullptr : Regs.lookup(Ops[I].Reg);
+      Results[Ops[I].Result] = V ? V : tiedInput(I);
+    }
+    return Results;
+  };
+
+  // `rep movsb` / `rep stosb` on (%rdi, %rsi, %rcx): the kernel's
+  // copy_user_generic and clear_user, whose ALTERNATIVE fallback is a call
+  // to rep_movs_alternative / rep_stos_alternative.  Lowered to memcpy /
+  // memset, which leaves the count at 0 and the pointers past the end.
+  if (IsCall && Insns.size() == 1 &&
+      (Insns[0].Mnemonic == "rep movsb" || Insns[0].Mnemonic == "rep stosb") &&
+      !HasMemOutput) {
+    bool Movs = Insns[0].Mnemonic == "rep movsb";
+    StringMap<Value *> Regs = inputRegs();
+    Value *Len = Regs.lookup("cx"), *Dst = Regs.lookup("di");
+    Value *Src = Movs ? Regs.lookup("si") : Regs.lookup("ax");
+    if (Len && Dst && Src) {
+      Len = castAsmValue(IRB, DL, Len, IRB.getInt64Ty());
+      Value *DstP = castAsmValue(IRB, DL, Dst, IRB.getPtrTy());
+      if (Movs) {
+        Value *SrcP = castAsmValue(IRB, DL, Src, IRB.getPtrTy());
+        IRB.CreateMemCpy(DstP, MaybeAlign(1), SrcP, MaybeAlign(1), Len,
+                         Volatile);
+        Regs["si"] = IRB.CreateGEP(IRB.getInt8Ty(), SrcP, Len);
+      } else {
+        IRB.CreateMemSet(DstP, castAsmValue(IRB, DL, Src, IRB.getInt8Ty()),
+                         Len, MaybeAlign(1), Volatile);
+      }
+      Regs["di"] = IRB.CreateGEP(IRB.getInt8Ty(), DstP, Len);
+      Regs["cx"] = ConstantInt::get(IRB.getInt64Ty(), 0);
+      replaceWith(regResults(Regs));
+      return;
+    }
+  }
+
+  // Calls into the kernel's assembly helpers, which have their own calling
+  // conventions and so cannot become calls:
+  // - __get_user_N / __get_user_nocheck_N: pointer in %rax, value out in
+  //   %rdx, error out in %rax;
+  // - __put_user_N / __put_user_nocheck_N: pointer in %rcx, value in %rax,
+  //   error out in %rcx;
+  // - this_cpu_cmpxchg16b_emu: cmpxchg16b of %rdx:%rax against the memory
+  //   operand, with %rcx:%rbx as the new value (percpu; the harness's %gs
+  //   base is 0, so the operand is the memory itself).
+  if (IsCall && Insns.size() == 1 &&
+      (Insns[0].Mnemonic == "call" || Insns[0].Mnemonic == "callq") &&
+      Insns[0].Operands.size() == 1) {
+    StringRef Sym = Insns[0].Operands[0];
+    bool Get = Sym.consume_front("__get_user_");
+    bool Put = !Get && Sym.consume_front("__put_user_");
+    if (Get || Put) {
+      Sym.consume_front("nocheck_");
+      int N = asmOperandRef(Sym);
+      ConstantInt *Size = N >= 0 && N < (int)Ops.size() && Ops[N].V
+                              ? dyn_cast<ConstantInt>(Ops[N].V)
+                              : nullptr;
+      StringMap<Value *> Regs = inputRegs();
+      Value *Ptr = Regs.lookup(Get ? "ax" : "cx");
+      Value *Val = Put ? Regs.lookup("ax") : nullptr;
+      if (Size && Ptr && (Get || Val)) {
+        Type *Ty = IRB.getIntNTy(Size->getZExtValue() * 8);
+        Value *P = castAsmValue(IRB, DL, Ptr, IRB.getPtrTy());
+        if (Get) {
+          LoadInst *L = IRB.CreateLoad(Ty, P);
+          L->setVolatile(Volatile);
+          Regs["dx"] = L;
+          Regs["ax"] = ConstantInt::get(IRB.getInt64Ty(), 0);
+        } else {
+          StoreInst *St = IRB.CreateStore(castAsmValue(IRB, DL, Val, Ty), P);
+          St->setVolatile(Volatile);
+          Regs["cx"] = ConstantInt::get(IRB.getInt64Ty(), 0);
+        }
+        replaceWith(regResults(Regs));
+        return;
+      }
+    }
+    if (Sym == "this_cpu_cmpxchg16b_emu") {
+      StringMap<Value *> Regs = inputRegs();
+      int Mem = -1, Flag = -1;
+      for (unsigned I = 0; I < Ops.size(); ++I) {
+        if (Ops[I].CI->Type == InlineAsm::isOutput && Ops[I].isMem())
+          Mem = I;
+        if (Ops[I].Code == "{@ccz}")
+          Flag = I;
+      }
+      Value *Ax = Regs.lookup("ax"), *Dx = Regs.lookup("dx");
+      Value *Bx = Regs.lookup("bx"), *Cx = Regs.lookup("cx");
+      if (Mem >= 0 && Flag >= 0 && Ax && Dx && Bx && Cx) {
+        Type *I128 = IRB.getInt128Ty();
+        auto pair = [&](Value *Hi, Value *Lo) {
+          return IRB.CreateOr(
+              IRB.CreateShl(castAsmValue(IRB, DL, Hi, I128), 64),
+              castAsmValue(IRB, DL, Lo, I128));
+        };
+        LoadInst *Old = IRB.CreateLoad(I128, Ops[Mem].V);
+        Old->setVolatile(Volatile);
+        Value *Eq = IRB.CreateICmpEQ(Old, pair(Dx, Ax));
+        StoreInst *St = IRB.CreateStore(
+            IRB.CreateSelect(Eq, pair(Cx, Bx), Old), Ops[Mem].V);
+        St->setVolatile(Volatile);
+        Regs["ax"] = IRB.CreateTrunc(Old, IRB.getInt64Ty());
+        Regs["dx"] = IRB.CreateTrunc(IRB.CreateLShr(Old, 64), IRB.getInt64Ty());
+        SmallVector<Value *, 4> Results = regResults(Regs);
+        Results[Ops[Flag].Result] = Eq;
+        replaceWith(Results);
+        return;
+      }
+    }
   }
 
   // Next, handle inline assembly patterns using parsed constraints
-  auto AsmStr = IA->getAsmString();
-
-  // Check if all constraints are clobbers (no inputs/outputs)
-  bool allClobbers = true;
-  for (auto &CI : Constraints) {
-    if (CI.Type != InlineAsm::isClobber) {
-      allClobbers = false;
-      break;
-    }
-  }
 
   // Handle trap/crash instructions: ud2, int3, .byte 0x0f,0x0b, etc.
   // These have only clobber constraints and should be replaced with exit()
-  if (allClobbers &&
-      (AsmStr.find("ud2") != StringRef::npos ||
-       AsmStr.find(".byte 0x0f, 0x0b") != StringRef::npos ||
-       AsmStr.find("int3") != StringRef::npos ||
-       AsmStr.find("int $3") != StringRef::npos ||
-       AsmStr.find("hlt") != StringRef::npos)) {
+  bool IsTrap = AsmStr.find("ud2") != std::string::npos ||
+                AsmStr.find(".byte 0x0f, 0x0b") != std::string::npos ||
+                AsmStr.find("int3") != std::string::npos ||
+                AsmStr.find("int $3") != std::string::npos ||
+                AsmStr.find("hlt") != std::string::npos;
+  // The kernel's BUG() and WARN() are a ud2 plus a __bug_table entry built
+  // from "i" operands (_BUG_FLAGS: file, line, flags, entry size), so they
+  // are never clobber-only.  With BUGFLAG_WARNING (bit 0 of flags) it is a
+  // WARN, which the kernel's trap handler resumes from: the trap is dropped.
+  // Anything else is a BUG and exits like the other traps.
+  if (IsTrap && !allClobbers && IsCall &&
+      AsmStr.find("__bug_table") != std::string::npos && Ops.size() >= 3 &&
+      NumResults == 0) {
+    auto *Flags = dyn_cast_or_null<ConstantInt>(Ops[2].V);
+    if (Flags && (Flags->getZExtValue() & 1)) {
+      CB.eraseFromParent();
+      return;
+    }
+    allClobbers = true;
+  }
+  if (allClobbers && IsTrap) {
     Value *Result = IRB.CreateCall(UF.UC.ExitFn,
                                    {ConstantInt::get(UF.UC.Int32Ty, 180)});
     UF.UC.markNosanitize(Result);
@@ -2867,172 +3548,172 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
 
   // Handle call/callq instructions in inline asm
   // Extract the callee symbol and route through normal call handling
-  StringRef AsmStrRef(AsmStr);
-  auto CallPos = AsmStrRef.find("callq ");
-  if (CallPos == StringRef::npos)
-    CallPos = AsmStrRef.find("call ");
-  if (CallPos != StringRef::npos) {
-    // Extract symbol name after call/callq
-    StringRef After = AsmStrRef.substr(
-        CallPos + (AsmStrRef[CallPos + 4] == 'q' ? 6 : 5));
-    // Trim leading whitespace
-    After = After.ltrim();
-    // Symbol name ends at whitespace, newline, or end of string
-    auto EndPos = After.find_first_of(" \t\n\r;");
-    StringRef Symbol = (EndPos != StringRef::npos) ?
-        After.substr(0, EndPos) : After;
-    // Strip operand modifiers like ${0:P} - if it starts with $, it's a register operand
-    if (!Symbol.empty() && Symbol[0] != '$' && Symbol[0] != '%' &&
-        Symbol[0] != '*') {
-      // Look up the function in the module
-      Function *Callee = CB.getModule()->getFunction(Symbol);
-
-      // If not found, the symbol is only referenced in inline asm
-      if (!Callee) {
-        // If the inline asm has side effects (volatile), insert a compiler
-        // barrier to preserve ordering before removing it
-        if (IA->hasSideEffects()) {
-          auto *Barrier = InlineAsm::get(
-              FunctionType::get(Type::getVoidTy(*UF.UC.Ctx), false),
-              "", "~{memory}", true);
-          auto *BarrierCall = IRB.CreateCall(Barrier);
-          UF.UC.markNosanitize(BarrierCall);
-        }
-        if (CB.getType()->isVoidTy() || CB.use_empty()) {
-          // No return value or no uses — safe to just delete
-          CB.eraseFromParent();
-          return;
-        }
-        // Has uses — try to find a type-matching input as passthrough
-        // e.g., "={rsp},{rsp}" means rsp is passed through unchanged
-        Value *Passthrough = nullptr;
-        for (unsigned I = 0; I < CB.arg_size(); ++I) {
-          if (CB.getArgOperand(I)->getType() == CB.getType()) {
-            Passthrough = CB.getArgOperand(I);
-            break;
-          }
-        }
-        if (Passthrough) {
-          CB.replaceAllUsesWith(Passthrough);
-        } else {
-          CB.replaceAllUsesWith(Constant::getNullValue(CB.getType()));
-        }
-        CB.eraseFromParent();
-        return;
+  //
+  // The executed instructions are followed as a small program over the
+  // registers: `mov` into a register sets it, `call` becomes a call whose
+  // arguments are read from the SysV argument registers (not from the order
+  // the constraints happen to be written in) and whose result lands in %rax,
+  // and moves of %rsp (switching to another stack, as call_on_irqstack does)
+  // are ignored.  The asm's outputs are then the final register values.  The
+  // new calls are ordinary calls, not nosanitize, so their argument and
+  // return labels propagate.  An asm with anything else in it (an indirect
+  // `call *$N`, other instructions, memory outputs) is left alone.
+  bool HasCall = llvm::any_of(Insns, [](const AsmInsn &I) {
+    return I.Mnemonic == "call" || I.Mnemonic == "callq";
+  });
+  SmallVector<AsmStep, 4> Steps;
+  if (HasCall && IsCall && !HasMemOutput && planAsmCalls(Insns, Ops, Steps)) {
+    // Resolve every callee before building anything: a symbol that is
+    // neither in the module nor declared for the asm by declareAsmCallees
+    // leaves the asm alone.
+    SmallVector<FunctionCallee, 4> Callees;
+    bool OK = true;
+    for (auto &S : Steps) {
+      if (S.Kind != AsmStep::Call)
+        continue;
+      FunctionCallee Callee;
+      if (S.Operand >= 0) {
+        auto *Fn = cast<Function>(Ops[S.Operand].V->stripPointerCasts());
+        Callee = FunctionCallee(Fn->getFunctionType(), Fn);
+      } else if (Function *Fn = M->getFunction(S.Sym)) {
+        // Look up the function in the module
+        Callee = FunctionCallee(Fn->getFunctionType(), Fn);
+      } else if (auto It = UF.UC.AsmCallees.find(S.Sym);
+                 It != UF.UC.AsmCallees.end() && It->second) {
+        // If not found, the symbol is only referenced in inline asm (the
+        // kernel's ALTERNATIVE fallbacks such as __sw_hweight32), and was
+        // declared for it by declareAsmCallees -- possibly replaced since by
+        // its __external$ wrapper.
+        auto *Fn = cast<Function>(&*It->second);
+        Callee = FunctionCallee(Fn->getFunctionType(), Fn);
+      } else if (!StringRef(S.Sym).starts_with("__SCT__")) {
+        OK = false;
+        break;
       }
-      {
-        // Build input args from parsed constraints
-        SmallVector<Value *, 4> CallArgs;
-        unsigned InArgIdx = 0;
-        for (auto &CI : Constraints) {
-          if (CI.Type == InlineAsm::isClobber)
-            continue;
-          if (CI.Type == InlineAsm::isOutput && !CI.isIndirect)
-            continue;
-          if (InArgIdx >= CB.arg_size())
-            break;
-          if (CI.Type == InlineAsm::isInput) {
-            CallArgs.push_back(CB.getArgOperand(InArgIdx));
-          }
-          ++InArgIdx;
+      // A static call trampoline (preempt_enable's __SCT__preempt_schedule)
+      // is emitted in assembly by the static call machinery and has no
+      // definition to call: the call is dropped, as before (null callee).
+      Callees.push_back(Callee);
+    }
+
+    if (OK) {
+      StringMap<Value *> Regs = inputRegs();
+      bool Emitted = false;
+      unsigned NextCallee = 0;
+      for (auto &S : Steps) {
+        if (S.Kind == AsmStep::SetReg) {
+          Regs[S.Reg] = Ops[S.Operand].V;
+          continue;
         }
-
-        // Check if the callee has a wrapper (custom or auto-custom)
-        DenseMap<Value *, Function *>::iterator UnwrappedFnIt =
-            UF.UC.UnwrappedFnMap.find(Callee);
-        if (UnwrappedFnIt != UF.UC.UnwrappedFnMap.end()) {
-          // Replace inline asm with a direct call to the callee
-          // visitWrappedCallBase will redirect to the wrapper
-          FunctionType *FT = Callee->getFunctionType();
-
-          // Adjust args to match function signature
-          SmallVector<Value *, 4> AdjustedArgs;
-          for (unsigned I = 0; I < FT->getNumParams() && I < CallArgs.size(); ++I) {
-            Value *Arg = CallArgs[I];
-            if (Arg->getType() != FT->getParamType(I)) {
-              Arg = IRB.CreateBitOrPointerCast(Arg, FT->getParamType(I));
-              UF.UC.markNosanitize(Arg);
-            }
-            AdjustedArgs.push_back(Arg);
-          }
-
-          CallInst *NewCall = IRB.CreateCall(Callee, AdjustedArgs);
-          UF.UC.markNosanitize(NewCall);
-
-          if (!CB.getType()->isVoidTy()) {
-            // Handle return value: replace all uses of the inline asm result
-            if (CB.getType() == NewCall->getType()) {
-              CB.replaceAllUsesWith(NewCall);
-            } else if (StructType *ST = dyn_cast<StructType>(CB.getType())) {
-              // Inline asm may return a struct; replace ExtractValue uses
-              for (auto *U : CB.users()) {
-                if (auto *EI = dyn_cast<ExtractValueInst>(U)) {
-                  if (EI->getIndices()[0] == 0) {
-                    // First element is typically the return value
-                    Value *Cast = IRB.CreateBitOrPointerCast(NewCall, EI->getType());
-                    UF.UC.markNosanitize(Cast);
-                    EI->replaceAllUsesWith(Cast);
-                  } else {
-                    // Other elements get zero/null
-                    EI->replaceAllUsesWith(Constant::getNullValue(EI->getType()));
-                  }
-                  UF.SkipInsts.insert(EI);
-                  UF.RemovalInsts.push_back(EI);
-                }
-              }
-            }
-          }
-          CB.eraseFromParent();
-
-          // Now handle the new call through the normal wrapped call path
-          visitWrappedCallBase(UnwrappedFnIt->second, *NewCall);
-          return;
+        if (S.Kind == AsmStep::CopyReg) {
+          Regs[S.Reg] = Regs.lookup(S.Src);
+          continue;
         }
-
-        // For in-scope or normal out-of-scope functions, replace with direct call
-        FunctionType *FT = Callee->getFunctionType();
-        SmallVector<Value *, 4> AdjustedArgs;
-        for (unsigned I = 0; I < FT->getNumParams() && I < CallArgs.size(); ++I) {
-          Value *Arg = CallArgs[I];
-          if (Arg->getType() != FT->getParamType(I)) {
-            Arg = IRB.CreateBitOrPointerCast(Arg, FT->getParamType(I));
-            UF.UC.markNosanitize(Arg);
-          }
-          AdjustedArgs.push_back(Arg);
+        FunctionCallee Callee = Callees[NextCallee++];
+        if (!Callee)
+          continue;
+        // Adjust args to match function signature
+        FunctionType *FT = Callee.getFunctionType();
+        SmallVector<Value *, 6> Args;
+        for (unsigned I = 0; I < FT->getNumParams(); ++I) {
+          Type *PT = FT->getParamType(I);
+          Value *V = I < std::size(AsmArgRegs) ? Regs.lookup(AsmArgRegs[I])
+                                               : nullptr;
+          Args.push_back(V ? castAsmValue(IRB, DL, V, PT)
+                           : Constant::getNullValue(PT));
         }
-
-        CallInst *NewCall = IRB.CreateCall(Callee, AdjustedArgs);
-        UF.UC.markNosanitize(NewCall);
-
-        if (!CB.getType()->isVoidTy()) {
-          if (CB.getType() == NewCall->getType()) {
-            CB.replaceAllUsesWith(NewCall);
-          } else if (isa<StructType>(CB.getType())) {
-            for (auto *U : CB.users()) {
-              if (auto *EI = dyn_cast<ExtractValueInst>(U)) {
-                if (EI->getIndices()[0] == 0) {
-                  Value *Cast = IRB.CreateBitOrPointerCast(NewCall, EI->getType());
-                  UF.UC.markNosanitize(Cast);
-                  EI->replaceAllUsesWith(Cast);
-                } else {
-                  EI->replaceAllUsesWith(Constant::getNullValue(EI->getType()));
-                }
-                UF.SkipInsts.insert(EI);
-                UF.RemovalInsts.push_back(EI);
-              }
-            }
-          }
-        }
-        CB.eraseFromParent();
-
-        // Handle shadow propagation for the new call through visitCallBase
-        visitCallBase(*NewCall);
-        return;
+        // Replace inline asm with a direct call to the callee
+        CallInst *NewCall = IRB.CreateCall(Callee, Args);
+        Emitted = true;
+        if (!NewCall->getType()->isVoidTy())
+          Regs["ax"] = NewCall;
       }
+      // If the inline asm has side effects (volatile), insert a compiler
+      // barrier to preserve ordering before removing it
+      if (!Emitted && Volatile) {
+        auto *Barrier = InlineAsm::get(
+            FunctionType::get(Type::getVoidTy(*UF.UC.Ctx), false),
+            "", "~{memory}", true);
+        auto *BarrierCall = IRB.CreateCall(Barrier);
+        UF.UC.markNosanitize(BarrierCall);
+      }
+      replaceWith(regResults(Regs));
+      return;
     }
   }
 
-  return;
+  // What is left runs as is.  Its memory operands are checked like a load or
+  // store of their elementtype: globals and allocas included, since
+  // checkPointer is where a global is symbolized (before the asm, so its seed
+  // value is in place when the asm reads it) and where an alloca is skipped.
+  // The rule here used to be:
+  // skip compile time constants and allocas
+  // AllocaInst is excluded above, so this traces heap/global origins;
+  // opaque pointers carry no pointee type on Arg itself.
+  // which left globals unsymbolized until after the asm had written them,
+  // and sized every other operand 0; the size is now the elementtype's.
+  for (auto &Op : Ops) {
+    // only check indirect (memory) operands that are pointers
+    if (!Op.isMem() || !Op.V->getType()->isPointerTy())
+      continue;
+    Value *Size = ConstantInt::get(UF.UC.Int64Ty, memSize(Op));
+    uint32_t TypeID = UF.UC.getOrCreateTypeID(Op.ElemTy);
+    Value *Ptr = UF.checkPointer(Op.V, Size, true, IRB, TypeID); // dereference pointer
+    for (unsigned I = 0; I < CB.arg_size(); ++I)
+      if (CB.getArgOperand(I) == Op.V)
+        CB.setArgOperand(I, Ptr);
+    Op.V = Ptr;
+  }
+  // A pointer passed in a register and dereferenced by the template itself,
+  // `movl (%1), %0`, is checked too: the asm would otherwise see the
+  // unmaterialized pointer.  Its size comes from the dereferencing
+  // instruction.
+  for (unsigned N = 0; N < Ops.size(); ++N) {
+    AsmOp &Op = Ops[N];
+    if (!Op.isValue() || !Op.V->getType()->isPointerTy() ||
+        isa<Constant>(Op.V))
+      continue;
+    std::string Plain = "($" + std::to_string(N) + ")";
+    std::string Braced = "(${" + std::to_string(N) + ":";
+    uint64_t Size = 0;
+    bool Deref = false;
+    for (auto &I : Insns)
+      for (auto &O : I.Operands)
+        if (O.find(Plain) != std::string::npos ||
+            O.find(Braced) != std::string::npos) {
+          Deref = true;
+          Size = std::max(Size, asmAccessSize(I.Mnemonic, I.Operands));
+        }
+    if (!Deref)
+      continue;
+    Value *Ptr = UF.checkPointer(Op.V, ConstantInt::get(UF.UC.Int64Ty, Size),
+                                 true, IRB, 0);
+    for (unsigned I = 0; I < CB.arg_size(); ++I)
+      if (CB.getArgOperand(I) == Op.V)
+        CB.setArgOperand(I, Ptr);
+    Op.V = Ptr;
+  }
+
+  // The asm writes its memory outputs concretely: whatever label the memory
+  // held is stale afterwards, so its shadow is cleared, as a store of a
+  // concrete value would.  (TaintPass does the same for the symbolic labels.)
+  if (HasMemOutput) {
+    SmallVector<Instruction *, 2> Positions;
+    if (auto *CBr = dyn_cast<CallBrInst>(&CB)) {
+      for (BasicBlock *Succ : successors(CBr))
+        if (Succ->getSinglePredecessor())
+          Positions.push_back(&*Succ->getFirstInsertionPt());
+    } else if (CB.getNextNode()) {
+      Positions.push_back(CB.getNextNode());
+    }
+    for (auto &Op : Ops) {
+      if (Op.CI->Type != InlineAsm::isOutput || !Op.isMem() || !memSize(Op))
+        continue;
+      for (Instruction *Pos : Positions)
+        UF.storeShadow(Op.V, memSize(Op), Align(1),
+                       UF.UC.getZeroShadow(Op.ElemTy), Op.ElemTy, Pos);
+    }
+  }
 }
 
 void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
@@ -4004,6 +4685,9 @@ bool UCSan::runImpl(Module &M) {
   if (Scope.entry.empty()) {
     report_fatal_error("No entry function specified in metadata");
   }
+
+  // Declare what inline asm calls before the split, so it is split too.
+  declareAsmCallees(M, AsmCallees);
 
   // Filter functions based on scope
   for (Function &F : M) {

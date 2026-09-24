@@ -5762,6 +5762,50 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
 void TaintVisitor::visitCallBase(CallBase &CB) {
   if (CB.isInlineAsm()) {
     // FIXME: inline asm
+    // Results stay unlabeled (UCSanPass lowers the asm whose semantics it
+    // knows to plain IR first).  What is handled here is the memory the asm
+    // writes: its memory outputs ("=m"/"+m") hold a concrete value
+    // afterwards, so their labels are cleared, as a store of a concrete
+    // value would; otherwise the next load reads the pre-asm label back and
+    // the solver sees a value it no longer has.
+    auto &DL = CB.getModule()->getDataLayout();
+    auto *IA = cast<InlineAsm>(CB.getCalledOperand());
+    SmallVector<Instruction *, 2> Positions;
+    if (auto *CBr = dyn_cast<CallBrInst>(&CB)) {
+      for (BasicBlock *Succ : successors(CBr))
+        if (Succ->getSinglePredecessor())
+          Positions.push_back(&*Succ->getFirstInsertionPt());
+    } else if (CB.getNextNode()) {
+      Positions.push_back(CB.getNextNode());
+    }
+    unsigned ArgIdx = 0;
+    for (auto &CI : IA->ParseConstraints()) {
+      if (CI.Type == InlineAsm::isClobber || CI.Type == InlineAsm::isLabel ||
+          (CI.Type == InlineAsm::isOutput && !CI.isIndirect))
+        continue;
+      if (ArgIdx >= CB.arg_size())
+        break;
+      unsigned Arg = ArgIdx++;
+      if (CI.Type != InlineAsm::isOutput)
+        continue;
+      Type *ElemTy = CB.getParamElementType(Arg);
+      if (!ElemTy || !ElemTy->isSized())
+        continue;
+      uint64_t Size = DL.getTypeStoreSize(ElemTy);
+      if (Size == 0)
+        continue;
+      Value *Ptr = CB.getArgOperand(Arg);
+      for (Instruction *Pos : Positions) {
+        if (Size <= 16) {
+          TF.storeShadow(Ptr, ElemTy, Size, Align(1),
+                         TF.TT.getZeroShadow(ElemTy), Pos);
+        } else {
+          IRBuilder<> IRB(Pos);
+          IRB.CreateMemSet(TF.TT.getShadowAddress(Ptr, IRB), IRB.getInt8(0),
+                           Size * TF.TT.ShadowWidthBytes, Align(1));
+        }
+      }
+    }
     return;
   }
 
