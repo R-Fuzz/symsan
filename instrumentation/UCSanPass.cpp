@@ -2328,6 +2328,19 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
         I1->moveBefore(Pos);
         if (I2) I2->moveBefore(I1);
         if (I3) I3->moveBefore(I2);
+        // For a global, the check's label is a ucsan_trace_global call
+        // emitted right before it (see GlobalBoundsShadow below); it has to
+        // move along, or the moved check uses it before its definition.  Its
+        // arguments are constants, so it can go anywhere.
+        Instruction *First = I3 ? I3 : (I2 ? I2 : I1);
+        if (auto *Label = dyn_cast<CallInst>(CB->getArgOperand(1))) {
+          if (Label->getCalledFunction() ==
+                  UC.UCTraceGlobalFn.getCallee() &&
+              llvm::all_of(Label->args(),
+                           [](Value *A) { return isa<Constant>(A); }) &&
+              !DT.dominates(Label, First))
+            Label->moveBefore(First);
+        }
         return itr->second;
       } else {
         cacheable = false; // do not cache if we need to move the instruction
