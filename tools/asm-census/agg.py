@@ -95,3 +95,12 @@ def bug_kind(r):
 S = section("kernel _BUG_FLAGS (ud2 + __bug_table)",
             lambda r: r['trap'] and '0x0f, 0x0b' in r['asm'] and not r['all_clobbers'],
             lambda r: [bug_kind(r)])
+
+# The templates themselves, most common first: the view that matters for
+# --instrumented runs (what inline asm is left, and whether it carries data).
+c = co.Counter(r['asm'].replace('\n', ' | ')[:70] for r in R)
+used = co.Counter(r['asm'].replace('\n', ' | ')[:70] for r in R if r['ret_used'])
+mem = co.Counter(r['asm'].replace('\n', ' | ')[:70] for r in R if r['ind_out'])
+print("\n## most common templates (sites, result used, writes memory)")
+for k, v in c.most_common(25):
+    print(f"   {v:7d} {used[k]:6d} {mem[k]:6d}  {k!r}")

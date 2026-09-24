@@ -12,9 +12,19 @@ tools/asm-census/run.sh ~/fast/linux/linux-6.8.2/bclist /tmp/asm-census
 This builds `AsmCensus.so` with `clang++-18`/`llvm-config-18` (override with
 `CXX`, `LLVM_CONFIG`, `OPT`), runs `opt -passes=asm-census` over every entry
 in parallel, and prints the summary from `agg.py`.  Entries that are not
-bitcode, such as native objects assembled from `.S` files, fail in `opt` and
-are listed in `err.log`.  The kernel list has 36 of them.  The kernel run
-takes a few seconds.
+bitcode, such as native objects assembled from `.S` files, are listed in
+`skipped.txt`.  The kernel list has 36 of them.  The kernel run takes a few
+seconds.
+
+```bash
+tools/asm-census/run.sh --instrumented ~/fast/linux/linux-6.8.2/bclist /tmp/asm-left
+```
+
+`--instrumented` first runs UCSanPass and TaintPass over each file (from
+`SYMSAN_LIB`, default the `b4` install), with every function the file defines
+in scope, and takes the census of the inline asm they leave.  A file the
+passes fail on is listed in `failed.txt`, so this is also the kernel
+regression check for the passes.  The kernel run takes about half a minute.
 
 ## Fields (one JSON object per site)
 
@@ -40,9 +50,16 @@ passed to `ucsan_check_pointer`.  `gep_global`, `gep_alloca`, `arg`, `load`,
   (commit 2d58f46): its string matching for `call`, its trap patterns and its
   operand-check rules.  It is the record of what that version got wrong, and
   the baseline the rework was measured against.  It does not describe the
-  current `visitInlineAsm`.  To check the current passes, run them over the
-  same bitcode and count what is left: that was 101,703 of 129,812 sites,
-  with no `ud2` and none of the modeled helper calls.
+  current `visitInlineAsm`.  To see what the current passes leave, use
+  `--instrumented` and read the template list at the end, not the per-issue
+  sections (those still apply the old rules; `size_bad` in particular is
+  meaningless there, since the operands are already checked pointers).
+- Over the kernel: 129,812 sites before the rework, 101,703 after it, and
+  30,351 once integer asm is lifted.  About 13,600 of those are empty
+  compiler barriers.  The rest is asm with no data flow to model (jump labels,
+  `lea 0(%rip)`, `cli`/`sti`, port and MSR access, `cpuid`, `rdtsc`, `vmx`),
+  the paravirt interrupt-flag calls, and `this_cpu_ptr`, which is left on
+  purpose so percpu offsets do not become symbolic.
 - `size_bad` overstates the impact.  A memory operand reached through a
   struct field is preceded by a GEP that UCSan checks with the struct's size,
   so the size-0 asm check only matters for a bare `*p` as the first access.
