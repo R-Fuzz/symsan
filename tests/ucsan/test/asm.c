@@ -1,5 +1,5 @@
 // METADATA: note.yaml
-//-- FLAG: 200
+// FLAG: 200
 // NOTE: Uses %rbx (64-bit) not %ebx (32-bit) because UCSan uses
 //       64-bit shadow memory addresses on x86-64
 int cal(int *a, int b) {

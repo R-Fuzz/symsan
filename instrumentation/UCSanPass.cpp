@@ -3224,6 +3224,806 @@ void declareAsmCallees(Module &M, StringMap<WeakTrackingVH> &Callees) {
   }
 }
 
+// A small x86-64 lifter for inline asm made of plain integer instructions:
+// the executed instructions are interpreted over a register file, memory and
+// the ZF/SF/CF flags, and emitted as the equivalent IR -- loads, stores and
+// arithmetic, `lock`ed read-modify-writes as atomicrmw/cmpxchg -- which the
+// visitor then checks, sizes and labels like any other code.  This is what
+// gives the kernel's atomics (atomic_add_return, test_and_set_bit,
+// dec_and_test), its percpu accesses and __ffs a symbolic result.
+//
+// It is all-or-nothing: an instruction, operand form or flag it does not
+// know makes it roll back what it built, and the asm runs as is.  It is not
+// meant to be complete, only exact for what it accepts.
+//
+// %gs: (percpu) operands are taken as plain memory, which holds while the %gs
+// base is 0; the runtime checks that at startup.  %gs: memory added into a
+// pointer (this_cpu_ptr: `add %gs:this_cpu_off, ptr`) is not lifted: percpu
+// offsets would then come from symbolized globals.
+class AsmLifter {
+  IRBuilder<> &IRB;
+  const DataLayout &DL;
+  ArrayRef<AsmOp> Ops;
+  SmallVector<Type *, 4> ResultTys; // types of the register outputs
+  bool Volatile;
+
+  // Register values by canonical name: a fixed register ("ax", "r8") or, for
+  // an operand in a register of the compiler's choosing, "v<N>" with N its
+  // output (a tied input shares its output's).  A value is kept in its own
+  // type -- a pointer stays a pointer, so address arithmetic keeps its base
+  // -- and a 32-bit write replaces the register (x86-64 zero-extends it).
+  StringMap<Value *> Regs;
+  Value *ZF = nullptr, *SF = nullptr, *CF = nullptr; // i1; null: unknown
+
+  struct Loc {
+    enum { LNone, LReg, LMem, LImm } K = LNone;
+    std::string Reg;      // Reg: register name
+    unsigned Bits = 0;    // Reg/Mem: natural width, 0 if not implied
+    Value *Ptr = nullptr; // Mem: address
+    bool Seg = false;     // Mem: %gs: relative
+    Value *Val = nullptr; // Imm
+  };
+
+public:
+  AsmLifter(IRBuilder<> &IRB, const DataLayout &DL, ArrayRef<AsmOp> Ops,
+            Type *ResultTy, bool Volatile)
+      : IRB(IRB), DL(DL), Ops(Ops), Volatile(Volatile) {
+    if (auto *ST = dyn_cast<StructType>(ResultTy))
+      ResultTys.append(ST->element_begin(), ST->element_end());
+    else if (!ResultTy->isVoidTy())
+      ResultTys.push_back(ResultTy);
+    for (unsigned N = 0; N < Ops.size(); ++N)
+      if (Ops[N].isValue())
+        Regs[regOf(N)] = Ops[N].V;
+  }
+
+  // The register operand N lives in.
+  std::string regOf(unsigned N) const {
+    if (!Ops[N].Reg.empty())
+      return Ops[N].Reg;
+    unsigned Root = Ops[N].TiedTo >= 0 ? Ops[N].TiedTo : N;
+    return "v" + std::to_string(Root);
+  }
+
+  // Lift Insns; false (with nothing built that is still used) if any of it
+  // is not supported.
+  bool lift(ArrayRef<AsmInsn> Insns) {
+    for (auto &I : Insns)
+      if (!step(I))
+        return false;
+    return true;
+  }
+
+  // Value of register output operand N, or its flag for a flag output.
+  Value *output(unsigned N) {
+    StringRef Code = Ops[N].Code;
+    if (Code.consume_front("{@cc")) {
+      Code.consume_back("}");
+      bool Neg = false;
+      Value *F = nullptr;
+      if (Code == "z" || Code == "e") F = ZF;
+      else if (Code == "nz" || Code == "ne") F = ZF, Neg = true;
+      else if (Code == "s") F = SF;
+      else if (Code == "ns") F = SF, Neg = true;
+      else if (Code == "c" || Code == "b" || Code == "nae") F = CF;
+      else if (Code == "nc" || Code == "ae" || Code == "nb") F = CF, Neg = true;
+      if (!F)
+        return nullptr;
+      return Neg ? IRB.CreateNot(F) : F;
+    }
+    return Regs.lookup(regOf(N));
+  }
+
+  // Whether every register or flag output has a value.
+  bool outputsKnown() {
+    for (unsigned N = 0; N < Ops.size(); ++N)
+      if (Ops[N].Result >= 0 && StringRef(Ops[N].Code).starts_with("{@cc") &&
+          !output(N))
+        return false;
+    return true;
+  }
+
+private:
+  static bool parseInt(StringRef S, int64_t &V) {
+    // small constant expressions as they appear in templates: `8`, `-8`,
+    // `0x10`, `0*8`, `2*8+4`
+    S = S.trim();
+    if (S.empty()) {
+      V = 0;
+      return true;
+    }
+    size_t P = S.find_last_of("+-");
+    if (P != StringRef::npos && P > 0) {
+      int64_t A, B;
+      if (!parseInt(S.substr(0, P), A) || !parseInt(S.substr(P + 1), B))
+        return false;
+      V = S[P] == '+' ? A + B : A - B;
+      return true;
+    }
+    P = S.find('*');
+    if (P != StringRef::npos) {
+      int64_t A, B;
+      if (!parseInt(S.substr(0, P), A) || !parseInt(S.substr(P + 1), B))
+        return false;
+      V = A * B;
+      return true;
+    }
+    bool Neg = S.consume_front("-");
+    uint64_t U;
+    if (S.getAsInteger(0, U))
+      return false;
+    V = Neg ? -(int64_t)U : (int64_t)U;
+    return true;
+  }
+
+  static unsigned regBits(StringRef Name) {
+    StringRef R = Name.drop_front(); // '%'
+    if (R.size() >= 2 && R[0] == 'r' && isdigit(R[1])) {
+      switch (R.back()) {
+      case 'd': return 32;
+      case 'w': return 16;
+      case 'b': return 8;
+      default: return 64;
+      }
+    }
+    if (R.size() == 3 && R[0] == 'r') return 64;
+    if (R.size() == 3 && R[0] == 'e') return 32;
+    if (R.size() == 2 && (R[1] == 'l' || R[1] == 'h')) return 8;
+    if (R.size() == 3 && R[2] == 'l') return 8;       // sil, dil, spl, bpl
+    return 16;
+  }
+
+  Value *toInt(Value *V, unsigned Bits) {
+    Type *Ty = IRB.getIntNTy(Bits);
+    if (V->getType()->isPointerTy())
+      V = IRB.CreatePtrToInt(V, IRB.getInt64Ty());
+    if (!V->getType()->isIntegerTy())
+      return nullptr;
+    return IRB.CreateZExtOrTrunc(V, Ty);
+  }
+
+  Value *toPtr(Value *V) {
+    if (V->getType()->isPointerTy())
+      return V;
+    if (!V->getType()->isIntegerTy())
+      return nullptr;
+    return IRB.CreateIntToPtr(IRB.CreateZExtOrTrunc(V, IRB.getInt64Ty()),
+                              IRB.getPtrTy());
+  }
+
+  bool parseLoc(StringRef T, Loc &L) {
+    T = T.trim();
+    if (T.consume_front("%gs:")) {
+      L.Seg = true;
+    } else if (T.starts_with("%fs:") || T.starts_with("%es:") ||
+               T.starts_with("%ds:") || T.starts_with("%cs:") ||
+               T.starts_with("%ss:")) {
+      return false;
+    }
+    if (!L.Seg && T.starts_with("$$")) {
+      int64_t V;
+      if (!parseInt(T.drop_front(2), V))
+        return false;
+      L.K = Loc::LImm;
+      L.Val = IRB.getInt64(V);
+      return true;
+    }
+    if (!L.Seg && T.starts_with("%")) {
+      L.K = Loc::LReg;
+      L.Reg = asmRegName(T);
+      L.Bits = regBits(T);
+      return !L.Reg.empty() && L.Reg != "sp" && L.Reg != "bp";
+    }
+    size_t Paren = T.find('(');
+    if (Paren == StringRef::npos) {
+      // an operand reference, or (after %gs:) a bare address
+      StringRef Mod;
+      int N = asmOperandRef(T, &Mod);
+      if (N < 0 || N >= (int)Ops.size())
+        return false;
+      const AsmOp &O = Ops[N];
+      if (O.isMem()) {
+        L.K = Loc::LMem;
+        L.Ptr = O.V;
+        L.Bits = DL.getTypeStoreSizeInBits(O.ElemTy);
+        return true;
+      }
+      if ((Mod == "P" || Mod == "a" || L.Seg) && O.V &&
+          O.V->getType()->isPointerTy() && !O.CI->isIndirect) {
+        // an address operand ("p", or an "i" symbol): memory at it
+        L.K = Loc::LMem;
+        L.Ptr = O.V;
+        return true;
+      }
+      if (L.Seg)
+        return false;
+      // a constant is an immediate only where the constraint allows one
+      // ("i", "n", "I", "e", ...); for "r" the compiler puts it in a register
+      auto immOK = [&]() {
+        for (auto &C : O.CI->Codes)
+          if (C.size() == 1 && StringRef("inIJKLMNOeZ").contains(C[0]))
+            return true;
+        return false;
+      };
+      if (O.V && isa<ConstantInt>(O.V) && O.isInput() && immOK()) {
+        L.K = Loc::LImm;
+        L.Val = O.V;
+        return true;
+      }
+      if (O.CI->isIndirect)
+        return false;
+      if (!(Mod.empty() || Mod == "b" || Mod == "w" || Mod == "k" ||
+            Mod == "q"))
+        return false;
+      L.K = Loc::LReg;
+      L.Reg = regOf(N);
+      if (Mod == "b") L.Bits = 8;
+      else if (Mod == "w") L.Bits = 16;
+      else if (Mod == "k") L.Bits = 32;
+      else if (Mod == "q") L.Bits = 64;
+      else {
+        // an output: the type of its result
+        Type *Ty = O.Result >= 0 ? (O.Result < (int)ResultTys.size()
+                                        ? ResultTys[O.Result]
+                                        : nullptr)
+                                 : O.V->getType();
+        if (Ty && Ty->isIntegerTy())
+          L.Bits = Ty->getIntegerBitWidth();
+        else if (Ty && Ty->isPointerTy())
+          L.Bits = 64;
+      }
+      return true;
+    }
+    // disp(base[,index[,scale]])
+    int64_t Disp;
+    if (!parseInt(T.substr(0, Paren), Disp) || !T.ends_with(")"))
+      return false;
+    SmallVector<StringRef, 3> Parts;
+    T.substr(Paren + 1, T.size() - Paren - 2).split(Parts, ',');
+    Value *Base = nullptr;
+    StringRef B = Parts[0].trim();
+    if (!B.empty()) {
+      Loc BL;
+      if (!parseLoc(B, BL) || BL.K != Loc::LReg || !Regs.lookup(BL.Reg))
+        return false;
+      Base = toPtr(Regs.lookup(BL.Reg));
+    } else {
+      Base = ConstantPointerNull::get(IRB.getPtrTy());
+    }
+    if (!Base)
+      return false;
+    Value *Off = IRB.getInt64(Disp);
+    if (Parts.size() >= 2) {
+      Loc IL;
+      int64_t Scale = 1;
+      if (!parseLoc(Parts[1], IL) || IL.K != Loc::LReg || !Regs.lookup(IL.Reg))
+        return false;
+      if (Parts.size() == 3 && !parseInt(Parts[2], Scale))
+        return false;
+      Value *Idx = toInt(Regs.lookup(IL.Reg), 64);
+      if (!Idx)
+        return false;
+      Off = IRB.CreateAdd(Off, IRB.CreateMul(Idx, IRB.getInt64(Scale)));
+    }
+    L.K = Loc::LMem;
+    L.Ptr = IRB.CreateGEP(IRB.getInt8Ty(), Base, Off);
+    return true;
+  }
+
+  Value *read(const Loc &L, unsigned Bits) {
+    switch (L.K) {
+    case Loc::LImm:
+      return IRB.CreateSExtOrTrunc(L.Val, IRB.getIntNTy(Bits));
+    case Loc::LReg: {
+      Value *V = Regs.lookup(L.Reg);
+      if (!V)
+        return nullptr;
+      if (Bits == 64 && V->getType()->isPointerTy())
+        return V;
+      return toInt(V, Bits);
+    }
+    case Loc::LMem: {
+      LoadInst *Ld = IRB.CreateLoad(IRB.getIntNTy(Bits), L.Ptr);
+      Ld->setVolatile(Volatile);
+      return Ld;
+    }
+    default:
+      return nullptr;
+    }
+  }
+
+  bool write(const Loc &L, Value *V, unsigned Bits) {
+    if (L.K == Loc::LReg) {
+      if (Bits >= 32 || !Regs.lookup(L.Reg)) {
+        Regs[L.Reg] = V;
+        return true;
+      }
+      // 8/16-bit writes keep the rest of the register
+      Value *Old = toInt(Regs.lookup(L.Reg), 64);
+      if (!Old)
+        return false;
+      uint64_t Mask = maskTrailingOnes<uint64_t>(Bits);
+      Regs[L.Reg] = IRB.CreateOr(IRB.CreateAnd(Old, ~Mask),
+                                 IRB.CreateZExt(toInt(V, Bits), IRB.getInt64Ty()));
+      return true;
+    }
+    if (L.K == Loc::LMem) {
+      Value *IV = V->getType()->isPointerTy() ? V : toInt(V, Bits);
+      StoreInst *St = IRB.CreateStore(IV, L.Ptr);
+      St->setVolatile(Volatile);
+      return true;
+    }
+    return false;
+  }
+
+  void setZS(Value *R) {
+    if (R->getType()->isPointerTy())
+      R = IRB.CreatePtrToInt(R, IRB.getInt64Ty());
+    ZF = IRB.CreateICmpEQ(R, Constant::getNullValue(R->getType()));
+    SF = IRB.CreateICmpSLT(R, Constant::getNullValue(R->getType()));
+  }
+
+  static bool splitMnemonic(StringRef Mn, StringRef Base, unsigned &Bits) {
+    if (Mn == Base) {
+      Bits = 0;
+      return true;
+    }
+    if (Mn.size() == Base.size() + 1 && Mn.starts_with(Base)) {
+      switch (Mn.back()) {
+      case 'b': Bits = 8; return true;
+      case 'w': Bits = 16; return true;
+      case 'l': Bits = 32; return true;
+      case 'q': Bits = 64; return true;
+      }
+    }
+    return false;
+  }
+
+  // width of an instruction: its suffix, else a register or memory operand's
+  unsigned width(unsigned Suffix, ArrayRef<Loc> Ls) {
+    if (Suffix)
+      return Suffix;
+    for (auto &L : Ls)
+      if (L.K == Loc::LReg && L.Bits)
+        return L.Bits;
+    for (auto &L : Ls)
+      if (L.K == Loc::LMem && L.Bits)
+        return L.Bits;
+    return 0;
+  }
+
+  AtomicRMWInst *rmw(AtomicRMWInst::BinOp Op, Value *Ptr, Value *V) {
+    AtomicRMWInst *A = IRB.CreateAtomicRMW(
+        Op, Ptr, V, MaybeAlign(), AtomicOrdering::SequentiallyConsistent);
+    A->setVolatile(Volatile);
+    return A;
+  }
+
+  bool step(const AsmInsn &I) {
+    StringRef Mn = I.Mnemonic;
+    bool Lock = Mn.consume_front("lock ");
+    bool Rep = Mn.consume_front("rep ");
+    SmallVector<Loc, 3> Ls;
+    for (auto &O : I.Operands) {
+      Loc L;
+      if (!parseLoc(O, L))
+        return false;
+      Ls.push_back(L);
+    }
+    unsigned Suf;
+    if (Mn == "nop")
+      return !Lock && !Rep;
+    // `sbb %0, %0`, `xor %0, %0`: the same register on both sides does not
+    // depend on its old value for these idioms, which is often undefined (an
+    // "=r" output read before any write); take it as 0
+    if (Ls.size() == 2 && Ls[0].K == Loc::LReg && Ls[1].K == Loc::LReg &&
+        Ls[0].Reg == Ls[1].Reg && !Regs.lookup(Ls[0].Reg))
+      Regs[Ls[0].Reg] = IRB.getInt64(0);
+    if (Rep && !(Mn.starts_with("bsf") || Mn.starts_with("bsr")))
+      return false;
+
+    // mov src, dst
+    if (splitMnemonic(Mn, "mov", Suf)) {
+      if (Lock || Ls.size() != 2 || Ls[1].K == Loc::LImm ||
+          (Ls[0].K == Loc::LMem && Ls[1].K == Loc::LMem))
+        return false;
+      unsigned W = width(Suf, Ls);
+      if (!W)
+        return false;
+      Value *V = read(Ls[0], W);
+      return V && write(Ls[1], V, W);
+    }
+    // movz/movs with two size letters: movzbl, movswq, movslq, ...
+    if ((Mn.starts_with("movz") || Mn.starts_with("movs")) && Mn.size() == 6) {
+      auto bits = [](char C) -> unsigned {
+        return C == 'b' ? 8 : C == 'w' ? 16 : C == 'l' ? 32 : C == 'q' ? 64 : 0;
+      };
+      unsigned From = bits(Mn[4]), To = bits(Mn[5]);
+      if (Lock || !From || !To || From >= To || Ls.size() != 2 ||
+          Ls[1].K != Loc::LReg)
+        return false;
+      Value *V = read(Ls[0], From);
+      if (!V)
+        return false;
+      V = Mn[3] == 'z' ? IRB.CreateZExt(V, IRB.getIntNTy(To))
+                       : IRB.CreateSExt(V, IRB.getIntNTy(To));
+      return write(Ls[1], V, To);
+    }
+
+    // two-operand arithmetic and logic: op src, dst
+    struct BinDef {
+      const char *Name;
+      Instruction::BinaryOps Op;
+      AtomicRMWInst::BinOp RMW;
+      bool WritesDst;
+    };
+    static const BinDef Bins[] = {
+        {"add", Instruction::Add, AtomicRMWInst::Add, true},
+        {"sub", Instruction::Sub, AtomicRMWInst::Sub, true},
+        {"and", Instruction::And, AtomicRMWInst::And, true},
+        {"or", Instruction::Or, AtomicRMWInst::Or, true},
+        {"xor", Instruction::Xor, AtomicRMWInst::Xor, true},
+        {"cmp", Instruction::Sub, AtomicRMWInst::BAD_BINOP, false},
+        {"test", Instruction::And, AtomicRMWInst::BAD_BINOP, false},
+    };
+    for (auto &B : Bins) {
+      if (!splitMnemonic(Mn, B.Name, Suf))
+        continue;
+      if (Ls.size() != 2 || Ls[1].K == Loc::LImm ||
+          (Ls[0].K == Loc::LMem && Ls[1].K == Loc::LMem))
+        return false;
+      unsigned W = width(Suf, Ls);
+      if (!W)
+        return false;
+      Value *Src = read(Ls[0], W);
+      if (!Src)
+        return false;
+      bool IsAddSub = B.Op == Instruction::Add || B.Op == Instruction::Sub;
+      if (Lock) {
+        if (!B.WritesDst || Ls[1].K != Loc::LMem)
+          return false;
+        Src = toInt(Src, W);
+        Value *Old = rmw(B.RMW, Ls[1].Ptr, Src);
+        Value *R = IRB.CreateBinOp(B.Op, Old, Src);
+        setZS(R);
+        CF = !IsAddSub ? IRB.getFalse()
+             : B.Op == Instruction::Add ? IRB.CreateICmpULT(R, Old)
+                                        : IRB.CreateICmpULT(Old, Src);
+        return true;
+      }
+      // pointer arithmetic keeps its base: add/sub of an integer to a
+      // pointer register is a GEP
+      Value *DstV = Ls[1].K == Loc::LReg ? Regs.lookup(Ls[1].Reg) : nullptr;
+      if (IsAddSub && B.WritesDst && W == 64 && DstV &&
+          DstV->getType()->isPointerTy() && !Src->getType()->isPointerTy()) {
+        if (Ls[0].Seg)
+          return false; // this_cpu_ptr: see the class comment
+        Value *Off = B.Op == Instruction::Add ? Src : IRB.CreateNeg(Src);
+        Value *R = IRB.CreateGEP(IRB.getInt8Ty(), DstV, Off);
+        Regs[Ls[1].Reg] = R;
+        setZS(R);
+        CF = nullptr;
+        return true;
+      }
+      Value *Dst = read(Ls[1], W);
+      if (!Dst)
+        return false;
+      Value *A = toInt(Dst, W), *S = toInt(Src, W);
+      Value *R = IRB.CreateBinOp(B.Op, A, S);
+      setZS(R);
+      CF = !IsAddSub ? IRB.getFalse()
+           : B.Op == Instruction::Add ? IRB.CreateICmpULT(R, A)
+                                      : IRB.CreateICmpULT(A, S);
+      return !B.WritesDst || write(Ls[1], R, W);
+    }
+
+    // adc/sbb src, dst: add/sub with the carry flag, which must be known
+    // (array_index_mask_nospec's `cmp; sbb`, the checksum `add; adc` chains)
+    for (const char *S : {"adc", "sbb"}) {
+      if (!splitMnemonic(Mn, S, Suf))
+        continue;
+      if (Lock || !CF || Ls.size() != 2 || Ls[1].K == Loc::LImm ||
+          (Ls[0].K == Loc::LMem && Ls[1].K == Loc::LMem))
+        return false;
+      unsigned W = width(Suf, Ls);
+      Value *Src = W ? read(Ls[0], W) : nullptr;
+      Value *Dst = W ? read(Ls[1], W) : nullptr;
+      if (!Src || !Dst)
+        return false;
+      Value *A = toInt(Dst, W), *B = toInt(Src, W);
+      Value *C = IRB.CreateZExt(CF, A->getType());
+      Value *R;
+      if (StringRef(S) == "adc") {
+        R = IRB.CreateAdd(IRB.CreateAdd(A, B), C);
+        // carry out: the sum wrapped, or it equals a with a carry in
+        CF = IRB.CreateOr(IRB.CreateICmpULT(R, A),
+                          IRB.CreateAnd(IRB.CreateICmpEQ(R, A), CF));
+      } else {
+        R = IRB.CreateSub(IRB.CreateSub(A, B), C);
+        // borrow: a < b + carry, without overflowing b + carry
+        CF = IRB.CreateOr(IRB.CreateICmpULT(A, B),
+                          IRB.CreateAnd(IRB.CreateICmpEQ(A, B), CF));
+      }
+      setZS(R);
+      return write(Ls[1], R, W);
+    }
+
+    // one-operand: inc, dec, neg, not
+    bool Inc = splitMnemonic(Mn, "inc", Suf), Dec = !Inc && splitMnemonic(Mn, "dec", Suf);
+    bool NegI = !Inc && !Dec && splitMnemonic(Mn, "neg", Suf);
+    bool NotI = !Inc && !Dec && !NegI && splitMnemonic(Mn, "not", Suf);
+    if (Inc || Dec || NegI || NotI) {
+      if (Ls.size() != 1 || Ls[0].K == Loc::LImm)
+        return false;
+      unsigned W = width(Suf, Ls);
+      if (!W)
+        return false;
+      Value *One = IRB.getIntN(W, 1);
+      if (Lock) {
+        if (Ls[0].K != Loc::LMem || !(Inc || Dec))
+          return false;
+        Value *Old = rmw(Inc ? AtomicRMWInst::Add : AtomicRMWInst::Sub,
+                         Ls[0].Ptr, One);
+        setZS(Inc ? IRB.CreateAdd(Old, One) : IRB.CreateSub(Old, One));
+        return true; // CF unchanged
+      }
+      Value *V = read(Ls[0], W);
+      if (!V)
+        return false;
+      V = toInt(V, W);
+      Value *R;
+      if (Inc) R = IRB.CreateAdd(V, One);
+      else if (Dec) R = IRB.CreateSub(V, One);
+      else if (NegI) R = IRB.CreateNeg(V);
+      else R = IRB.CreateNot(V);
+      if (!NotI)
+        setZS(R);
+      if (NegI)
+        CF = IRB.CreateICmpNE(V, Constant::getNullValue(V->getType()));
+      return write(Ls[0], R, W);
+    }
+
+    // shifts: shl/sal/shr/sar [count,] dst
+    for (const char *S : {"shl", "sal", "shr", "sar"}) {
+      if (!splitMnemonic(Mn, S, Suf))
+        continue;
+      if (Lock || Ls.empty() || Ls.size() > 2)
+        return false;
+      const Loc &Dst = Ls.back();
+      unsigned W = width(Suf, {Dst});
+      if (!W || Dst.K == Loc::LImm)
+        return false;
+      Value *Cnt;
+      int64_t C = -1;
+      if (Ls.size() == 1) {
+        C = 1;
+      } else if (Ls[0].K == Loc::LImm) {
+        C = cast<ConstantInt>(Ls[0].Val)->getSExtValue();
+      } else if (Ls[0].K != Loc::LReg || Ls[0].Reg != "cx") {
+        return false;
+      }
+      unsigned Mask = W == 64 ? 63 : 31;
+      Value *V = read(Dst, W);
+      if (!V)
+        return false;
+      V = toInt(V, W);
+      if (C >= 0) {
+        C &= Mask;
+        if (C == 0 || (unsigned)C >= W)
+          return C == 0; // flags and value unchanged / out of range
+        Cnt = IRB.getIntN(W, C);
+      } else {
+        Value *Cx = read(Ls[0], 8);
+        if (!Cx)
+          return false;
+        Cnt = IRB.CreateAnd(IRB.CreateZExt(Cx, IRB.getIntNTy(W)), Mask);
+      }
+      bool Left = StringRef(S) == "shl" || StringRef(S) == "sal";
+      Value *R = Left ? IRB.CreateShl(V, Cnt)
+                 : StringRef(S) == "shr" ? IRB.CreateLShr(V, Cnt)
+                                         : IRB.CreateAShr(V, Cnt);
+      if (C > 0) {
+        setZS(R);
+        unsigned Bit = Left ? W - C : C - 1;
+        CF = IRB.CreateTrunc(IRB.CreateLShr(V, Bit), IRB.getInt1Ty());
+      } else {
+        ZF = SF = CF = nullptr; // a zero count leaves them unchanged
+      }
+      return write(Dst, R, W);
+    }
+
+    // xadd src(reg), dst: dst += src, src = old dst
+    if (splitMnemonic(Mn, "xadd", Suf)) {
+      if (Ls.size() != 2 || Ls[0].K != Loc::LReg || Ls[1].K == Loc::LImm)
+        return false;
+      unsigned W = width(Suf, Ls);
+      Value *Src = W ? read(Ls[0], W) : nullptr;
+      if (!Src)
+        return false;
+      Src = toInt(Src, W);
+      Value *Old;
+      if (Lock) {
+        if (Ls[1].K != Loc::LMem)
+          return false;
+        Old = rmw(AtomicRMWInst::Add, Ls[1].Ptr, Src);
+      } else {
+        Old = read(Ls[1], W);
+        if (!Old)
+          return false;
+        Old = toInt(Old, W);
+        if (!write(Ls[1], IRB.CreateAdd(Old, Src), W))
+          return false;
+      }
+      Value *Sum = IRB.CreateAdd(Old, Src);
+      setZS(Sum);
+      CF = IRB.CreateICmpULT(Sum, Old);
+      return write(Ls[0], Old, W);
+    }
+
+    // xchg a, b (implicitly locked with a memory operand)
+    if (splitMnemonic(Mn, "xchg", Suf)) {
+      if (Ls.size() != 2 || Ls[0].K == Loc::LImm || Ls[1].K == Loc::LImm)
+        return false;
+      unsigned W = width(Suf, Ls);
+      if (!W)
+        return false;
+      const Loc *R = &Ls[0], *M = &Ls[1];
+      if (R->K == Loc::LMem)
+        std::swap(R, M);
+      Value *RV = read(*R, W);
+      if (!RV || R->K != Loc::LReg)
+        return false;
+      if (M->K == Loc::LMem) {
+        Value *Old = rmw(AtomicRMWInst::Xchg, M->Ptr,
+                         RV->getType()->isPointerTy() ? RV : toInt(RV, W));
+        return write(*R, Old, W);
+      }
+      Value *MV = read(*M, W);
+      return MV && write(*M, RV, W) && write(*R, MV, W);
+    }
+
+    // cmpxchg src(reg), dst: if (ax == dst) dst = src; ax = old dst
+    if (splitMnemonic(Mn, "cmpxchg", Suf)) {
+      if (Ls.size() != 2 || Ls[0].K != Loc::LReg || Ls[1].K == Loc::LImm)
+        return false;
+      unsigned W = width(Suf, Ls);
+      Loc Ax;
+      Ax.K = Loc::LReg;
+      Ax.Reg = "ax";
+      Value *Src = W ? read(Ls[0], W) : nullptr;
+      Value *Cmp = W ? read(Ax, W) : nullptr;
+      if (!Src || !Cmp)
+        return false;
+      Src = toInt(Src, W);
+      Cmp = toInt(Cmp, W);
+      Value *Old, *Eq;
+      if (Lock) {
+        if (Ls[1].K != Loc::LMem)
+          return false;
+        AtomicCmpXchgInst *X = IRB.CreateAtomicCmpXchg(
+            Ls[1].Ptr, Cmp, Src, MaybeAlign(),
+            AtomicOrdering::SequentiallyConsistent,
+            AtomicOrdering::SequentiallyConsistent);
+        X->setVolatile(Volatile);
+        Old = IRB.CreateExtractValue(X, 0);
+        Eq = IRB.CreateExtractValue(X, 1);
+      } else {
+        Old = read(Ls[1], W);
+        if (!Old)
+          return false;
+        Old = toInt(Old, W);
+        Eq = IRB.CreateICmpEQ(Old, Cmp);
+        if (!write(Ls[1], IRB.CreateSelect(Eq, Src, Old), W))
+          return false;
+      }
+      ZF = Eq;
+      Value *D = IRB.CreateSub(Cmp, Old);
+      SF = IRB.CreateICmpSLT(D, Constant::getNullValue(D->getType()));
+      CF = IRB.CreateICmpULT(Cmp, Old);
+      return write(Ax, Old, W);
+    }
+
+    // bt/bts/btr/btc bit, base: CF = the old bit
+    for (const char *S : {"bt", "bts", "btr", "btc"}) {
+      if (!splitMnemonic(Mn, S, Suf))
+        continue;
+      StringRef Op(S);
+      if (Ls.size() != 2 || Ls[1].K == Loc::LImm || (Lock && Op == "bt") ||
+          (Lock && Ls[1].K != Loc::LMem))
+        return false;
+      unsigned W = width(Suf, {Ls[1]});
+      if (!W && Ls[0].K == Loc::LReg)
+        W = Ls[0].Bits;
+      if (W != 16 && W != 32 && W != 64)
+        return false;
+      Value *Nr = read(Ls[0], 64);
+      if (!Nr)
+        return false;
+      Nr = Ls[0].K == Loc::LImm ? Nr : toInt(Nr, 64);
+      Loc Word = Ls[1];
+      if (Ls[1].K == Loc::LMem && Ls[0].K != Loc::LImm) {
+        // a register bit offset addresses a bit string
+        Value *Idx = IRB.CreateAShr(Nr, Log2_32(W));
+        Word.Ptr = IRB.CreateGEP(IRB.getIntNTy(W), Ls[1].Ptr, Idx);
+      }
+      Value *Bit = IRB.CreateAnd(IRB.CreateTrunc(Nr, IRB.getIntNTy(W)), W - 1);
+      Value *Mask = IRB.CreateShl(IRB.getIntN(W, 1), Bit);
+      Value *Old;
+      if (Lock) {
+        AtomicRMWInst::BinOp RMW = Op == "bts" ? AtomicRMWInst::Or
+                                   : Op == "btr" ? AtomicRMWInst::And
+                                                 : AtomicRMWInst::Xor;
+        Old = rmw(RMW, Word.Ptr, Op == "btr" ? IRB.CreateNot(Mask) : Mask);
+      } else {
+        Old = read(Word, W);
+        if (!Old)
+          return false;
+        Old = toInt(Old, W);
+        if (Op != "bt") {
+          Value *New = Op == "bts" ? IRB.CreateOr(Old, Mask)
+                       : Op == "btr" ? IRB.CreateAnd(Old, IRB.CreateNot(Mask))
+                                     : IRB.CreateXor(Old, Mask);
+          if (!write(Word, New, W))
+            return false;
+        }
+      }
+      CF = IRB.CreateICmpNE(IRB.CreateAnd(Old, Mask),
+                            Constant::getNullValue(Old->getType()));
+      ZF = SF = nullptr;
+      return true;
+    }
+
+    // bit scans and counts: op src, dst
+    for (const char *S : {"bsf", "bsr", "tzcnt", "lzcnt", "popcnt"}) {
+      if (!splitMnemonic(Mn, S, Suf))
+        continue;
+      StringRef Op(S);
+      if (Lock || Ls.size() != 2 || Ls[1].K != Loc::LReg || Ls[0].K == Loc::LImm)
+        return false;
+      unsigned W = width(Suf, Ls);
+      if (!W)
+        return false;
+      Value *Src = read(Ls[0], W);
+      if (!Src)
+        return false;
+      Src = toInt(Src, W);
+      Type *Ty = Src->getType();
+      Value *IsZero = IRB.CreateICmpEQ(Src, Constant::getNullValue(Ty));
+      Value *R;
+      // `rep; bsf` is how the kernel writes tzcnt; the two agree on every
+      // non-zero input, and __ffs is undefined for zero
+      if (Op == "bsf" || Op == "tzcnt")
+        R = IRB.CreateBinaryIntrinsic(Intrinsic::cttz, Src, IRB.getFalse());
+      else if (Op == "lzcnt")
+        R = IRB.CreateBinaryIntrinsic(Intrinsic::ctlz, Src, IRB.getFalse());
+      else if (Op == "bsr")
+        R = IRB.CreateSub(IRB.getIntN(W, W - 1),
+                          IRB.CreateBinaryIntrinsic(Intrinsic::ctlz, Src,
+                                                    IRB.getFalse()));
+      else
+        R = IRB.CreateUnaryIntrinsic(Intrinsic::ctpop, Src);
+      if (Op == "bsf" || Op == "bsr" || Op == "popcnt") {
+        ZF = IsZero;
+        CF = Op == "popcnt" ? IRB.getFalse() : nullptr;
+      } else {
+        CF = IsZero;
+        ZF = IRB.CreateICmpEQ(R, Constant::getNullValue(Ty));
+      }
+      SF = nullptr;
+      return write(Ls[1], R, W);
+    }
+
+    // lea mem, dst: the address itself
+    if (splitMnemonic(Mn, "lea", Suf)) {
+      if (Lock || Ls.size() != 2 || Ls[0].K != Loc::LMem || Ls[0].Seg ||
+          Ls[1].K != Loc::LReg || I.Operands[0].find("%rip") != std::string::npos)
+        return false;
+      return write(Ls[1], Ls[0].Ptr, 64);
+    }
+
+    return false;
+  }
+};
 } // namespace
 
 void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
@@ -3299,6 +4099,19 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     }
     if (Res)
       CB.replaceAllUsesWith(Res);
+    // An asm goto (the kernel's unsafe_get_user/unsafe_put_user, whose label
+    // is the fault fixup) falls through to its default destination: the
+    // lowered access does not fault the way the asm's exception table
+    // expects.  The other edges are kept, as dead cases of a switch on a
+    // constant, so the PHIs and the dominator tree stay as they are (removing
+    // a predecessor under PHIs already given shadow PHIs breaks the fixups).
+    if (auto *CBr = dyn_cast<CallBrInst>(&CB)) {
+      SwitchInst *Sw = SwitchInst::Create(IRB.getInt32(0), CBr->getDefaultDest(),
+                                          CBr->getNumIndirectDests(), CBr);
+      for (unsigned I = 0; I < CBr->getNumIndirectDests(); ++I)
+        Sw->addCase(IRB.getInt32(I + 1), CBr->getIndirectDest(I));
+      Sw->copyMetadata(*CBr);
+    }
     CB.eraseFromParent();
   };
 
@@ -3510,12 +4323,30 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
               IRB.CreateShl(castAsmValue(IRB, DL, Hi, I128), 64),
               castAsmValue(IRB, DL, Lo, I128));
         };
-        LoadInst *Old = IRB.CreateLoad(I128, Ops[Mem].V);
-        Old->setVolatile(Volatile);
-        Value *Eq = IRB.CreateICmpEQ(Old, pair(Dx, Ax));
-        StoreInst *St = IRB.CreateStore(
-            IRB.CreateSelect(Eq, pair(Cx, Bx), Old), Ops[Mem].V);
-        St->setVolatile(Volatile);
+        // An atomic cmpxchg i128 needs cmpxchg16b in the target (+cx16);
+        // without it LLVM would call a libatomic helper the kernel does not
+        // link, and a load/compare/store is equivalent for the single thread
+        // a UCSan run has.
+        Value *Old, *Eq;
+        StringRef Features =
+            CB.getFunction()->getFnAttribute("target-features").getValueAsString();
+        if (Features.contains("+cx16")) {
+          AtomicCmpXchgInst *X = IRB.CreateAtomicCmpXchg(
+              Ops[Mem].V, pair(Dx, Ax), pair(Cx, Bx), MaybeAlign(16),
+              AtomicOrdering::SequentiallyConsistent,
+              AtomicOrdering::SequentiallyConsistent);
+          X->setVolatile(Volatile);
+          Old = IRB.CreateExtractValue(X, 0);
+          Eq = IRB.CreateExtractValue(X, 1);
+        } else {
+          LoadInst *L = IRB.CreateLoad(I128, Ops[Mem].V);
+          L->setVolatile(Volatile);
+          Old = L;
+          Eq = IRB.CreateICmpEQ(Old, pair(Dx, Ax));
+          StoreInst *St = IRB.CreateStore(
+              IRB.CreateSelect(Eq, pair(Cx, Bx), Old), Ops[Mem].V);
+          St->setVolatile(Volatile);
+        }
         Regs["ax"] = IRB.CreateTrunc(Old, IRB.getInt64Ty());
         Regs["dx"] = IRB.CreateTrunc(IRB.CreateLShr(Old, 64), IRB.getInt64Ty());
         SmallVector<Value *, 4> Results = regResults(Regs);
@@ -3665,6 +4496,22 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
       replaceWith(regResults(Regs));
       return;
     }
+  }
+
+  // Lift what is left if it is plain integer code (see AsmLifter); what the
+  // lifter does not accept is rolled back and runs as is.
+  if ((IsCall || isa<CallBrInst>(CB)) && !Insns.empty() && !IsTrap) {
+    AsmLifter Lifter(IRB, DL, Ops, CB.getType(), Volatile);
+    if (Lifter.lift(Insns) && Lifter.outputsKnown()) {
+      SmallVector<Value *, 4> Results(NumResults, nullptr);
+      for (unsigned N = 0; N < Ops.size(); ++N)
+        if (Ops[N].Result >= 0)
+          Results[Ops[N].Result] = Lifter.output(N);
+      replaceWith(Results);
+      return;
+    }
+    while (CB.getPrevNode() != Before)
+      CB.getPrevNode()->eraseFromParent();
   }
 
   // What is left runs as is.  Its memory operands are checked like a load or

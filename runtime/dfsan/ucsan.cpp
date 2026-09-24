@@ -2050,6 +2050,26 @@ static void ucsan_fini_internal() {
   ucsan_fini_input_struct();
 }
 
+// UCSanPass lowers %gs:-relative inline asm (the kernel's percpu accesses)
+// to plain memory accesses, which is only the same memory while the %gs base
+// is 0 -- the default for a process that never sets it.  Checked once, so a
+// harness that does set it fails loudly instead of reading the wrong memory.
+static void ucsan_check_gs_base() {
+  uptr base = 0;
+  long ret;
+  // arch_prctl(ARCH_GET_GS, &base); this runtime is not instrumented
+  __asm__ __volatile__("syscall"
+                       : "=a"(ret)
+                       : "a"(158 /* SYS_arch_prctl */), "D"(0x1004 /* ARCH_GET_GS */),
+                         "S"(&base)
+                       : "rcx", "r11", "memory");
+  if (ret == 0 && base != 0) {
+    Report("ERROR: UCSan: %%gs base is %p, but percpu inline asm was lowered "
+           "assuming 0\n", (void *)base);
+    Die();
+  }
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_init() {
   // Initialize input struct first (C-style init for preinit_array safety)
@@ -2057,6 +2077,8 @@ void ucsan_init() {
 
   // Parse options
   ucsan_parse_flags();
+
+  ucsan_check_gs_base();
 
   // Initialize shadow memory and label table
   ucsan_init_shadow_memory();
