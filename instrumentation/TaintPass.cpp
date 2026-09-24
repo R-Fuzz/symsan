@@ -2696,7 +2696,10 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
       Value *Shadow = getShadow(Size);
       Value *Bounds = LI;
       if (!Bounds) Bounds = ConstantInt::get(TT.getShadowTy(CI), 0);
-      if (!TT.isZeroShadow(Shadow)) {
+      if (!TT.isZeroShadow(Shadow) && Size->getType()->isIntegerTy()) {
+        // __taint_minimize_label takes an i64 size; a wrapper matched by
+        // name may declare a narrower one (32-bit sizes in the kernel).
+        Size = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
         IRB.CreateCall(TT.TaintMinimizeLabelFn, {Shadow, Size, Bounds});
       }
     }
@@ -3290,8 +3293,15 @@ void TaintFunction::hoistBoundsChecks() {
         Value *UCLabel = StrUCChk->getArgOperand(1);
         if (!L->isLoopInvariant(UCLabel))
           UCLabel = ConstantInt::get(UCLabel->getType(), 0);
+        // The access size is loop-variant when the loop copies in chunks
+        // (`min(len - done, 2G)` around a memcpy): it is defined in the loop
+        // and does not reach the preheader.  One byte is enough to
+        // materialize the object.
+        Value *UCSize = StrUCChk->getArgOperand(2);
+        if (!L->isLoopInvariant(UCSize))
+          UCSize = ConstantInt::get(UCSize->getType(), 1);
         StrPtr = IRB.CreateCall(StrUCChk->getCalledFunction(),
-            {StrPtr, UCLabel, StrUCChk->getArgOperand(2),
+            {StrPtr, UCLabel, UCSize,
              ConstantInt::getTrue(*TT.Ctx), StrUCChk->getArgOperand(4)});
       }
 
