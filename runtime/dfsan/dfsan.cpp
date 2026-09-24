@@ -977,7 +977,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
 
   // shape
   bool shape = true;
-  if (__dfsan_label_info[label0].op != 0) {
+  // label 0 also has op 0, but it is a concrete byte, not input offset 0
+  if (is_constant_label(label0) || __dfsan_label_info[label0].op != 0) {
     // not raw input bytes
     shape = false;
   } else {
@@ -1034,7 +1035,38 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   // slowpath
   AOUT("union load slowpath at %p\n", __builtin_return_address(0));
   dfsan_label label = label0;
-  for (uptr i = get_label_info(label0)->size / 8; i < n;) {
+  uptr start = get_label_info(label0)->size / 8;
+  if (is_constant_label(label0)) {
+    // Leading concrete bytes: Concat with l1 == 0 is not a valid node, so the
+    // concrete prefix is folded into op1 of the first Concat with a symbolic
+    // label, whose width the parsers recover as size - l2's size.
+    const char *app = (const char *)app_for(ls);
+    uint64_t prefix = 0;
+    uptr i = 0;
+    for (; i < n && is_constant_label(ls[i]); i++) {
+      if (i >= sizeof(prefix)) {
+        Report("WARNING: concrete prefix wider than 64 bits, dropping taint\n");
+        return 0;
+      }
+      prefix |= (uint64_t)(uint8_t)app[i] << (i * 8);
+    }
+    // not all-constant, or fast path 1 would have returned
+    dfsan_label next_label = ls[i];
+    if (next_label == kInitializingLabel) return kInitializingLabel;
+    uint16_t next_size = get_label_info(next_label)->size;
+    if (next_size > (n - i) * 8) {
+      Report("WARNING: partial loading expected=%lu has=%d\n", n-i, next_size);
+      dfsan_label trunc = do_taint_union(next_label, CONST_LABEL, Trunc,
+                                         (n - i) * 8, 0, 0);
+      dfsan_label result = do_taint_union(0, trunc, Concat, n * 8, prefix, 0);
+      if (size_in_bits < n * 8)
+        result = do_taint_union(result, CONST_LABEL, Trunc, size_in_bits, 0, 0);
+      return result;
+    }
+    start = i + next_size / 8;
+    label = do_taint_union(0, next_label, Concat, start * 8, prefix, 0);
+  }
+  for (uptr i = start; i < n;) {
     dfsan_label next_label = ls[i];
     if (next_label == kInitializingLabel) return kInitializingLabel;
     uint16_t next_size = get_label_info(next_label)->size;
