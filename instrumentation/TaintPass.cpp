@@ -4132,28 +4132,48 @@ void TaintVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
   Value *Op1 = nullptr, *Cond = nullptr;
   IRBuilder<> IRB(&I);
 
+  // combineShadows records the concrete operands of the instruction it is
+  // given, and an atomicrmw's operand 0 is the pointer, not the value it
+  // read: the label then claimed `address op val`, which the solver rejects
+  // as a value mismatch.  The binary operations are therefore labeled on the
+  // equivalent `old op val` built right after the atomicrmw, where the old
+  // value is its result; that instruction is otherwise unused.
+  Instruction *After = I.getNextNode();
+  IRBuilder<> AfterIRB(After);
+  auto binOpShadow = [&](Instruction::BinaryOps Op) {
+    auto *BO = cast<Instruction>(AfterIRB.CreateBinOp(Op, &I, Val));
+    return TF.combineShadows(Shadow1, Shadow2, Op, BO);
+  };
+
   switch (I.getOperation()) {
     case AtomicRMWInst::Xchg:
       Shadow = Shadow2;
       break;
     case AtomicRMWInst::Add:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Add, &I);
+      Shadow = binOpShadow(BinaryOperator::Add);
       break;
     case AtomicRMWInst::Sub:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Sub, &I);
+      Shadow = binOpShadow(BinaryOperator::Sub);
       break;
     case AtomicRMWInst::And:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
+      Shadow = binOpShadow(BinaryOperator::And);
       break;
-    case AtomicRMWInst::Nand:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
-      Shadow = TF.combineShadows(TF.TT.getZeroShadow(Ty), Shadow, 2, &I); // __dfsan::Neg
+    case AtomicRMWInst::Nand: {
+      // Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
+      // Shadow = TF.combineShadows(TF.TT.getZeroShadow(Ty), Shadow, 2, &I); // __dfsan::Neg
+      // nand is ~(old & val), i.e. (old & val) ^ -1
+      auto *And = cast<Instruction>(AfterIRB.CreateAnd(&I, Val));
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, And);
+      auto *Not = cast<Instruction>(AfterIRB.CreateNot(And));
+      Shadow = TF.combineShadows(Shadow, TF.TT.getZeroShadow(Ty),
+                                 BinaryOperator::Xor, Not);
       break;
+    }
     case AtomicRMWInst::Or:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Or, &I);
+      Shadow = binOpShadow(BinaryOperator::Or);
       break;
     case AtomicRMWInst::Xor:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Xor, &I);
+      Shadow = binOpShadow(BinaryOperator::Xor);
       break;
     case AtomicRMWInst::Max:
       Op1 = IRB.CreateLoad(Ty, Ptr, true);
@@ -4181,7 +4201,8 @@ void TaintVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
       break;
   }
 
-  TF.storeShadow(Ptr, Ty, Size, I.getAlign(), Shadow, &I);
+  // after the atomicrmw, where the label of the new value exists
+  TF.storeShadow(Ptr, Ty, Size, I.getAlign(), Shadow, After);
   TF.setShadow(&I, Shadow1);
 
   // TODO: The ordering change follows MSan. It is possible not to change
@@ -4231,10 +4252,18 @@ void TaintVisitor::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   Value *StoredShadow = IRB.CreateSelect(Success, NewShadow, OldShadow);
   TF.storeShadow(Ptr, ValTy, Size, I.getAlign(), StoredShadow, Pos);
 
+  // The success flag is `old == cmp`: labeled as that comparison, built
+  // after the exchange where the old value exists (and otherwise unused),
+  // so a branch on it is solvable -- it used to get a zero label.
+  Value *Old = IRB.CreateExtractValue(&I, 0);
+  auto *Eq = cast<Instruction>(IRB.CreateICmpEQ(Old, I.getCompareOperand()));
+  Value *SuccessShadow =
+      TF.combineShadows(OldShadow, TF.getShadow(I.getCompareOperand()),
+                        Instruction::ICmp, Eq);
+
   Value *ResShadow = UndefValue::get(ResShadowTy);
   ResShadow = IRB.CreateInsertValue(ResShadow, OldShadow, 0);
-  ResShadow = IRB.CreateInsertValue(
-      ResShadow, TF.TT.getZeroShadow(I.getType()->getStructElementType(1)), 1);
+  ResShadow = IRB.CreateInsertValue(ResShadow, SuccessShadow, 1);
   TF.setShadow(&I, ResShadow);
 
   // TODO: The ordering change follows MSan. It is possible not to change
