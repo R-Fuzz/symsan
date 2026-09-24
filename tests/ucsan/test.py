@@ -37,7 +37,8 @@ ucsan_config = {
   "handler": {
     "ubi_handler": {},
     "objtrace_handler": {},
-    "forward_handler": {}
+    "forward_handler": {},
+    "warn_handler": {}
   },
   "scheduler": {
     "fifo": {
@@ -52,6 +53,8 @@ ucsan_config = {
 
 tests = []
 solver_error_absent_tests = set()
+# test name -> event ids (PIPE_EVENT_TYPE) that must be reported at least once
+expected_events = {}
 
 sys.path.append(os.path.join(SCRIPT_DIR, "..", "..", "fuzzer", "thoroupy"))
 
@@ -86,6 +89,9 @@ def parse_test(file, test_name):
                 test[2].append([int(flag, 0), -2])
         elif line.startswith("// SOLVER-ERROR-ABSENT"):
             solver_error_absent_tests.add(test_name)
+        elif line.startswith("// EVENT:"):
+            events = line.split(":", maxsplit=2)[1].strip().split(" ")
+            expected_events.setdefault(test_name, []).extend(int(e, 0) for e in events)
     tests.append(test)
 
 for file in glob.glob(os.path.join(SCRIPT_DIR, "test", "*.c")):
@@ -220,6 +226,9 @@ def perform_test(stage, *args, seed=None):
             logging.getLogger("manager").removeHandler(capture)
         if solver_errors:
             raise Exception(f"Solver errors during {test_name}: {solver_errors}")
+        for event in expected_events.get(test_name, []):
+            if not m.event_counts.get(event):
+                raise Exception(f"Event {event} never reported during {test_name}")
         for exit_status in m.exit_status:
             if exit_status > 255:
                 exit_status = exit_status >> 8

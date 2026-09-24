@@ -278,6 +278,7 @@ enum ucsan_event_type {
   EVENT_ASSERTION = 103,
   EVENT_TYPE_BIND = 104,
   EVENT_COPY_OVERFLOW = 105,
+  EVENT_WARN = 106,           // a kernel WARN() was hit; the run continues
 };
 
 enum ucsan_assertion_type {

@@ -2079,6 +2079,17 @@ void ucsan_init() {
   UCSAN_OUT("  Max labels:  %lu\n", (uint64_t)(kUnionTableSize / sizeof(ucsan_label_info)));
 }
 
+// A kernel WARN() (a _BUG_FLAGS ud2 with BUGFLAG_WARNING), which UCSanPass
+// replaces with this call: the kernel would report it and continue, so the
+// run continues and the manager gets an EVENT_WARN with the line and flags,
+// at the call site's address.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_trace_warn(const char *file, uint32_t line, uint32_t flags) {
+  UCSAN_OUT("WARN at %s:%u (flags %#x)\n", file ? file : "?", line, flags);
+  __taint_trace_event_addr(0, EVENT_WARN, line, __builtin_return_address(0),
+                           flags);
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_fini() {
   ucsan_fini_internal();

@@ -24,6 +24,8 @@ python3 test.py                   # run the whole suite
 `// METADATA:`/`// ENV:`/`// FLAG:`/`// DISCARD:`/`// ABSENT:` header consumed by
 `test.py`; `metadata/*.yaml` are the referenced UCSan entry/scope configs.
 `ABSENT` asserts that an exit status is never observed during exploration.
+`EVENT: <id>...` asserts that the target reports each event (`PIPE_EVENT_TYPE`,
+e.g. 106 for a kernel WARN) at least once.
 `SOLVER-ERROR-ABSENT` asserts that the manager reports no solver parse error;
 pair it with `DISCARD` when an exit status may be reached but is not the
 property under test.

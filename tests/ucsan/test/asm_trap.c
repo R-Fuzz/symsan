@@ -1,5 +1,6 @@
 // METADATA: asm_cal.yaml
 // FLAG: 180 200
+// EVENT: 106
 
 #include <stdlib.h>
 
@@ -9,7 +10,8 @@
  * the trap is left in place; the target then dies of SIGILL, which the
  * runtime has no handler for (under apport this shows up as a hang, not a
  * failure).  BUG (flags without BUGFLAG_WARNING) must terminate like other
- * traps (exit 180); WARN (BUGFLAG_WARNING, bit 0) must continue.
+ * traps (exit 180); WARN (BUGFLAG_WARNING, bit 0) must continue, and is
+ * reported as EVENT_WARN (106).
  */
 #define BUGFLAG_WARNING (1 << 0)
 #define BUGFLAG_TAINT(taint) ((taint) << 8)

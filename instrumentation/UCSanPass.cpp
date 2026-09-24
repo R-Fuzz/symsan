@@ -439,6 +439,7 @@ class UCSan {
   FunctionType *UCTraceBBFnTy;
   FunctionType *UCTraceAllocaFnTy;
   FunctionType *UCTraceGlobalFnTy;
+  FunctionType *UCTraceWarnFnTy;
   FunctionType *UCPushStackFrameFnTy;
   FunctionType *UCPopStackFrameFnTy;
   FunctionType *UCCheckCopyBoundsFnTy;
@@ -458,6 +459,7 @@ class UCSan {
   FunctionCallee UCTraceBBFn;
   FunctionCallee UCTraceAllocaFn;
   FunctionCallee UCTraceGlobalFn;
+  FunctionCallee UCTraceWarnFn;
   FunctionCallee UCPushStackFrameFn;
   FunctionCallee UCPopStackFrameFn;
   FunctionCallee UCCheckCopyBoundsFn;
@@ -890,6 +892,17 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCTraceGlobalFn = M.getOrInsertFunction("ucsan_trace_global", UCTraceGlobalFnTy);
   F = dyn_cast<Function>(UCTraceGlobalFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // void ucsan_trace_warn(ptr File, i32 Line, i32 Flags)
+  // Reports a kernel WARN() (see visitInlineAsm) and returns.
+  UCTraceWarnFnTy = FunctionType::get(
+    Type::getVoidTy(*Ctx),
+    {VoidPtrTy, Int32Ty, Int32Ty},
+    false);
+  UCTraceWarnFn = M.getOrInsertFunction("ucsan_trace_warn", UCTraceWarnFnTy);
+  F = dyn_cast<Function>(UCTraceWarnFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -3527,11 +3540,23 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
   // are never clobber-only.  With BUGFLAG_WARNING (bit 0 of flags) it is a
   // WARN, which the kernel's trap handler resumes from: the trap is dropped.
   // Anything else is a BUG and exits like the other traps.
+  // (The WARN is not dropped silently: it becomes a call to ucsan_trace_warn
+  // with its file, line and flags, which reports an EVENT_WARN and returns.)
   if (IsTrap && !allClobbers && IsCall &&
       AsmStr.find("__bug_table") != std::string::npos && Ops.size() >= 3 &&
       NumResults == 0) {
     auto *Flags = dyn_cast_or_null<ConstantInt>(Ops[2].V);
     if (Flags && (Flags->getZExtValue() & 1)) {
+      Value *File = Ops[0].V && Ops[0].V->getType()->isPointerTy()
+                        ? Ops[0].V
+                        : Constant::getNullValue(UF.UC.VoidPtrTy);
+      Value *Line = Ops[1].V && Ops[1].V->getType()->isIntegerTy()
+                        ? IRB.CreateZExtOrTrunc(Ops[1].V, UF.UC.Int32Ty)
+                        : ConstantInt::get(UF.UC.Int32Ty, 0);
+      CallInst *Warn = IRB.CreateCall(
+          UF.UC.UCTraceWarnFn,
+          {File, Line, IRB.CreateZExtOrTrunc(Flags, UF.UC.Int32Ty)});
+      UF.UC.markNosanitize(Warn);
       CB.eraseFromParent();
       return;
     }
