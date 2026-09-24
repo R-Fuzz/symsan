@@ -743,7 +743,11 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
         // Initialize from seed data if available
         if (ucsan_tainted.objects->size() && ret.offset < ucsan_tainted.objects->at(0).data.size()) {
           *((char*)p + i) = ucsan_tainted.objects->at(0).data.at(ret.offset);
-        } else if (!in_bss_section(p) && *((char*)p + i) != 0) {
+        } else if (*((char*)p + i) != 0) {
+          // Not gated on in_bss_section(): a BSS global is only zero until
+          // something writes it without updating the shadow (inline asm, an
+          // uninstrumented library), and then the solver's input cache would
+          // assume 0 against a non-zero concrete value.
           sent_data = true;
         }
       }

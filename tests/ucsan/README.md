@@ -24,6 +24,9 @@ python3 test.py                   # run the whole suite
 `// METADATA:`/`// ENV:`/`// FLAG:`/`// DISCARD:`/`// ABSENT:` header consumed by
 `test.py`; `metadata/*.yaml` are the referenced UCSan entry/scope configs.
 `ABSENT` asserts that an exit status is never observed during exploration.
+`SOLVER-ERROR-ABSENT` asserts that the manager reports no solver parse error;
+pair it with `DISCARD` when an exit status may be reached but is not the
+property under test.
 `seeds/create_*_seed.py` are standalone generators for concrete seed files
 used with `test.py run_seed` to reproduce a specific path. `ll/` and
 `binary/` are build outputs (`test.py clean` removes them).

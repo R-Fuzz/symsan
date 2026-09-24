@@ -51,6 +51,7 @@ ucsan_config = {
 }
 
 tests = []
+solver_error_absent_tests = set()
 
 sys.path.append(os.path.join(SCRIPT_DIR, "..", "..", "fuzzer", "thoroupy"))
 
@@ -83,6 +84,8 @@ def parse_test(file, test_name):
             flags = line.split(":", maxsplit=2)[1].strip().split(" ")
             for flag in flags:
                 test[2].append([int(flag, 0), -2])
+        elif line.startswith("// SOLVER-ERROR-ABSENT"):
+            solver_error_absent_tests.add(test_name)
     tests.append(test)
 
 for file in glob.glob(os.path.join(SCRIPT_DIR, "test", "*.c")):
@@ -200,7 +203,23 @@ def perform_test(stage, *args, seed=None):
             runtime_env['ucsan_options'] = ucsan_options
 
         m = UcsanManager(f'binary/{test_name}.ucsan', config=ucsan_config, terminate=False, env=runtime_env, adapter=adapter, seed=seed, debug=debug)
-        m.run()
+        solver_errors = []
+
+        class SolverErrorCapture(logging.Handler):
+            def emit(self, record):
+                message = record.getMessage()
+                if "Solver error:" in message:
+                    solver_errors.append(message)
+
+        capture = SolverErrorCapture()
+        if test_name in solver_error_absent_tests:
+            logging.getLogger("manager").addHandler(capture)
+        try:
+            m.run()
+        finally:
+            logging.getLogger("manager").removeHandler(capture)
+        if solver_errors:
+            raise Exception(f"Solver errors during {test_name}: {solver_errors}")
         for exit_status in m.exit_status:
             if exit_status > 255:
                 exit_status = exit_status >> 8
