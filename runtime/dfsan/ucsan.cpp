@@ -2071,7 +2071,14 @@ static void ucsan_init_shadow_memory() {
 
   // Initialize alloca stack for bounds tracking
   uptr num_labels = kUnionTableSize / sizeof(ucsan_label_info);
-  __alloca_stack_top = __alloca_stack_bottom = (ucsan_label)(num_labels - 2);
+  // Labels are 16-bit and kUninitializedLabel (0xFFFF) is reserved, so the
+  // table's 174,762 entries cannot all be named.  The cast used to wrap
+  // num_labels - 2 to 43,688, a third of what a label can address, and big
+  // kernel structs (struct kvm_vmx, 40 KB, one label per byte) exhausted it.
+  uptr top = num_labels - 2;
+  if (top > (uptr)kUninitializedLabel - 1)
+    top = (uptr)kUninitializedLabel - 1;
+  __alloca_stack_top = __alloca_stack_bottom = (ucsan_label)top;
 }
 
 static void ucsan_fini_internal() {
