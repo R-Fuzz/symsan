@@ -1078,16 +1078,18 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       __taint_set_label(symsan_label, nptr, 1);
     }
 
-    // Copy shadow memory from original object
+    // Copy shadow memory from original object.  obj_base is its offset 0;
+    // its bytes start lower_bound below that, once it has grown backwards.
+    void *old_start = (void*)((int64_t)obj_base - (int64_t)obj_label_info->lower_bound);
     void *dst_addr = (void*)((int64_t)np + extended_lower);
     ucsan_label *shadow = ucsan_shadow_for(dst_addr);
-    internal_memcpy(shadow, ucsan_shadow_for(obj_base), original_size * sizeof(ucsan_label));
+    internal_memcpy(shadow, ucsan_shadow_for(old_start), original_size * sizeof(ucsan_label));
 
     // Bridge to SymSan: copy shadow memory
-    __taint_copy_shadow(dst_addr, obj_base, original_size);
+    __taint_copy_shadow(dst_addr, old_start, original_size);
 
     // Copy original data
-    internal_memcpy((char*)np + extended_lower, obj_base, original_size);
+    internal_memcpy((char*)np + extended_lower, old_start, original_size);
 
     // Padding the right upper bounds with new labels
     for (uint64_t offset = extended_lower + original_size; offset < new_size; ++offset) {
@@ -1112,7 +1114,12 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     obj_label_info->upper_bound = (uint32_t)(new_size - new_lower_bound);
     obj_label_info->real_ptr = (char*)np + new_lower_bound;
 
-    return (void*)((int64_t)np + desired_offset);
+    // relative to offset 0 (real_ptr), as the fast path does.  np is the
+    // lowest byte, so returning np + desired_offset put a backward access
+    // (container_of, a[-1]) new_lower_bound bytes *before* the allocation,
+    // into the malloc gap: zero data and label-0 shadow, i.e. an unlabeled
+    // NULL for any pointer field read there.
+    return (void*)((int64_t)obj_label_info->real_ptr + desired_offset);
   }
 
   UCSAN_OUT("Unknown pointer state: %d\n", ptr_info->status);
