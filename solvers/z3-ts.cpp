@@ -565,10 +565,11 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
   input_deps.insert(std::make_pair(input, offset));
   uint64_t val = 0;
 #if FILTER_WRONG_AST
-  if (!is_negative_offset(offset) && inputs_cache_.size() > input &&
-      inputs_cache_[input].second > offset) {
-    val = (uint64_t)inputs_cache_[input].first[offset];
-  }
+  // offsets are relative to the input's origin (set_input_origins), so a byte
+  // below it -- negative -- is read from the seed too; it used to be 0
+  uint8_t byte_val;
+  if (cached_input_byte(input, offset, byte_val))
+    val = byte_val;
 #endif
   for (uint32_t i = 1; i < bytes; i++) {
     snprintf(name, sizeof(name), input_name_format, input, offset + i);
@@ -583,10 +584,8 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
     // val is 64 bits, so a load wider than 8 bytes can only keep its low half;
     // shifting past that is undefined.  wide_value_unknown() marks the label so
     // nothing trusts the partial value.
-    if (i < 8 && !is_negative_offset(offset + i) && inputs_cache_.size() > input &&
-        inputs_cache_[input].second > offset + i) {
-      val |= (uint64_t)inputs_cache_[input].first[offset + i] << (i * 8);
-    }
+    if (i < 8 && cached_input_byte(input, offset + i, byte_val))
+      val |= (uint64_t)byte_val << (i * 8);
 #endif
   }
 

@@ -22,13 +22,14 @@ class Z3Solver:
         symsan.init_parser(shm_name, size)
         self._initialized = True
 
-    def reset_input(self, inputs: list) -> None:
-        """Reset parser with new input data (list of bytes objects)."""
-        symsan.reset_input(inputs)
+    def reset_input(self, inputs: list, origins: list = None) -> None:
+        """Reset parser with new input data (list of bytes objects), and each
+        object's origin (Seed.origins(); None means 0 for all)."""
+        symsan.reset_input(inputs, origins)
 
-    def update_input(self, inputs: list) -> None:
+    def update_input(self, inputs: list, origins: list = None) -> None:
         """Update input cache without clearing deps (for late-arriving GV data)."""
-        symsan.update_input(inputs)
+        symsan.update_input(inputs, origins)
 
     def parse_cond(self, label: int, result: int, add_nested: bool) -> list:
         """Parse condition, return list of task IDs to solve."""

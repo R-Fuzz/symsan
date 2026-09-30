@@ -547,7 +547,8 @@ class UcsanManager:
                     for i in range(0, size):
                         self._current[obj_id][offset + i] = buf[i:i+1]
                     # Update solver's input cache with new data
-                    self.solver.update_input(self._current.to_bytes_list())
+                    self.solver.update_input(self._current.to_bytes_list(),
+                                             self._current.origins())
             case PIPE_MSG_TYPE.MINIMIZE_TYPE:
                 if msg.label != 0:
                     try:
@@ -614,8 +615,14 @@ class UcsanManager:
                 # negative indices for lvalue and positive for value.
                 # Adjust: flat_offset → UObject_index = flat_offset - len(lvalue)
                 # Extension offsets (negative int32) are already in UObject coords.
-                obj = seed[obj_id]
-                adjusted = offset - len(obj.lvalue) if offset >= 0 else offset
+                # (now: every solver offset is in UObject coords, relative to
+                # where the pointer lands.  The runtime labeled lazily created
+                # bytes 0-based and grown bytes relative, and len(lvalue) here
+                # was the length *after* this run's extensions, so a solution
+                # in the run that grew an object backwards landed that many
+                # bytes low.  insert_bytes/delete_bytes always took the offset
+                # as it is.)
+                adjusted = offset
                 logger.debug(f"Solution: SET obj[{obj_id}][{offset}] (adjusted={adjusted}) = 0x{sol['val']:02x}")
                 seed.set_byte(obj_id, adjusted, sol['val'])
                 solved_bytes.add((obj_id, offset))
@@ -639,8 +646,7 @@ class UcsanManager:
             if obj_id <= 2:
                 continue
             offset = sol['offset']
-            primary = seed[1]
-            adjusted = offset - len(primary.lvalue) if offset >= 0 else offset
+            adjusted = offset  # UObject coords, see above
             logger.debug(
                 f"Mirror SET obj[{obj_id}][{offset}] -> obj[1][{adjusted}] "
                 f"= 0x{sol['val']:02x}"
@@ -672,8 +678,10 @@ class UcsanManager:
                 for sol_obj_id, sol_offset in solved_bytes:
                     if sol_obj_id != obj_idx:
                         continue
-                    adj_src = sol_offset - len(obj.lvalue) if sol_offset >= 0 else sol_offset
-                    adj_dst = sol_offset - len(sib.lvalue) if sol_offset >= 0 else sol_offset
+                    # UObject coords, see above: the same offset from where
+                    # each object's pointer lands
+                    adj_src = sol_offset
+                    adj_dst = sol_offset
                     src_val = obj.value[adj_src] if adj_src >= 0 else obj.lvalue[-adj_src - 1]
                     if adj_dst >= 0:
                         if adj_dst < len(sib.value):
@@ -740,7 +748,8 @@ class UcsanManager:
                     logger.critical(f"[FLIP-DBG] Trace-only target: bid={self._flip_bid}, context={self._flip_original_context:#x}, occurrence={self._flip_original_occurrence}")
 
                 # Reset solver with current seed's input bytes (one per object)
-                self.solver.reset_input(self._current.to_bytes_list())
+                self.solver.reset_input(self._current.to_bytes_list(),
+                                        self._current.origins())
                 logger.info("Scheduling seed: " + current.__repr__())
                 for msg in self.p.get_pipe():
                     logger.debug("\033[92mrecv msg: " + msg.__repr__() + "\033[0m")
@@ -789,7 +798,8 @@ class UcsanManager:
                     logger.critical(f"[FLIP-DBG] === Immediately replaying flip seed: bid={self._flip_bid}, context={self._flip_original_context:#x}, occurrence={self._flip_original_occurrence}, task_id={self._flip_task_id}")
                     self._current = flip_seed
                     self._bug_reported_for_current_seed = False
-                    self.solver.reset_input(flip_seed.to_bytes_list())
+                    self.solver.reset_input(flip_seed.to_bytes_list(),
+                                            flip_seed.origins())
                     self._termination_manager.reset()
                     self.p._pipe.send(flip_seed.to_ticket())
                     for msg in self.p.get_pipe():

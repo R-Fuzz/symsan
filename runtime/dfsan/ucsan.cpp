@@ -993,7 +993,15 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
       // Bridge to SymSan: use 0-based offset so offsets stay consistent
       // across seed re-executions regardless of obj.offset growth
-      dfsan_label symsan_label = __taint_create_label(object_id, offset, 1);
+      // (now: relative to offset 0 like the UCSan label above, negative below
+      // it.  A 0-based offset is one into the seed as executed, and shifts by
+      // the amount the object has grown backwards: enlargement numbers the
+      // bytes it adds relative to offset 0, so a run that grows the object
+      // mixed the two, and the manager, converting back with the length the
+      // growth had just changed, put solutions on the wrong bytes.  Relative
+      // offsets never move; the parser and the manager take the origin from
+      // the seed.)
+      dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
       __taint_set_label(symsan_label, nptr, 1);
     }
 

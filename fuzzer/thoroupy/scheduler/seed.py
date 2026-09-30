@@ -242,6 +242,12 @@ class Seed:
         """Return list of bytes, one per object (for solver reset)."""
         return [bytes(obj) for obj in self.objects]
 
+    def origins(self) -> list:
+        """Where each object's offset 0 is in its bytes(), the length of its
+        lvalue: solver offsets are relative to it (negative into lvalue), as
+        UObject indices are."""
+        return [len(obj.lvalue) for obj in self.objects]
+
     def to_dict(self) -> "list[dict]":
         for obj in self.objects:
             from_object = obj.metadata.from_object

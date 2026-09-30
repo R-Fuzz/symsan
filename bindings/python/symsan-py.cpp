@@ -492,6 +492,28 @@ static PyObject* InitParser(PyObject *self, PyObject *args) {
 }
 
 // Reset parser with new input data
+// The optional origins argument of reset_input/update_input: where offset 0 of
+// each input is in its bytes (UCSan: the length of the seed object's part below
+// where its pointer lands); labels carry offsets relative to it.  None or
+// absent means 0 for every input.
+static bool ParseOrigins(PyObject *oargs, std::vector<uint32_t> &origins) {
+  origins.clear();
+  if (oargs == NULL || oargs == Py_None)
+    return true;
+  if (!PyList_Check(oargs)) {
+    PyErr_SetString(PyExc_TypeError, "origins must be a list of ints");
+    return false;
+  }
+  Py_ssize_t n = PyList_Size(oargs);
+  for (Py_ssize_t i = 0; i < n; i++) {
+    unsigned long v = PyLong_AsUnsignedLong(PyList_GetItem(oargs, i));
+    if (PyErr_Occurred())
+      return false;
+    origins.push_back((uint32_t)v);
+  }
+  return true;
+}
+
 static PyObject* ResetParser(PyObject *self, PyObject *args) {
   if (__z3_parser == nullptr) {
     PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
@@ -500,8 +522,13 @@ static PyObject* ResetParser(PyObject *self, PyObject *args) {
 
   std::vector<symsan::input_t> inputs;
   PyObject *iargs = NULL;
+  PyObject *oargs = NULL;
+  std::vector<uint32_t> origins;
 
-  if (!PyArg_ParseTuple(args, "O!", &PyList_Type, &iargs)) {
+  if (!PyArg_ParseTuple(args, "O!|O", &PyList_Type, &iargs, &oargs)) {
+    return NULL;
+  }
+  if (!ParseOrigins(oargs, origins)) {
     return NULL;
   }
 
@@ -530,6 +557,7 @@ static PyObject* ResetParser(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_RuntimeError, "failed to restart parser");
     return NULL;
   }
+  __z3_parser->set_input_origins(std::move(origins));
 
   Py_RETURN_NONE;
 }
@@ -543,8 +571,13 @@ static PyObject* UpdateInput(PyObject *self, PyObject *args) {
 
   std::vector<symsan::input_t> inputs;
   PyObject *iargs = NULL;
+  PyObject *oargs = NULL;
+  std::vector<uint32_t> origins;
 
-  if (!PyArg_ParseTuple(args, "O!", &PyList_Type, &iargs)) {
+  if (!PyArg_ParseTuple(args, "O!|O", &PyList_Type, &iargs, &oargs)) {
+    return NULL;
+  }
+  if (!ParseOrigins(oargs, origins)) {
     return NULL;
   }
 
@@ -571,6 +604,7 @@ static PyObject* UpdateInput(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_RuntimeError, "failed to update input");
     return NULL;
   }
+  __z3_parser->set_input_origins(std::move(origins));
 
   Py_RETURN_NONE;
 }
@@ -870,8 +904,8 @@ static PyMethodDef SymSanMethods[] = {
   {"terminate", (PyCFunction)SymSanTerminate, METH_NOARGS, "terminate current symsan instance"},
   {"destroy", (PyCFunction)SymSanDestroy, METH_NOARGS, "destroy symsan target"},
   {"init_parser", InitParser, METH_VARARGS, "initialize parser from shared memory (name or address)"},
-  {"reset_input", ResetParser, METH_VARARGS, "reset the symbolic expression parser with a new input"},
-  {"update_input", UpdateInput, METH_VARARGS, "update input cache without clearing deps"},
+  {"reset_input", ResetParser, METH_VARARGS, "reset the symbolic expression parser with a new input (list of bytes), optionally with each input's origin (list of ints)"},
+  {"update_input", UpdateInput, METH_VARARGS, "update input cache without clearing deps (list of bytes), optionally with each input's origin (list of ints)"},
   {"parse_cond", ParseCond, METH_VARARGS, "parse trace_cond event into solving tasks"},
   {"parse_gep", ParseGEP, METH_VARARGS, "parse trace_gep event into solving tasks"},
   {"add_constraint", AddConstraint, METH_VARARGS, "add a constraint"},
