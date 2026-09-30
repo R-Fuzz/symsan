@@ -276,7 +276,7 @@ class UcsanManager:
                         _msg.context = CHECKER_UBI
                         _msg.addr = msg.addr
                         self._event_handlers.handle(_msg)
-                        self._report(CHECKER_UBI)
+                        self._report(CHECKER_UBI, msg.addr)
                         self._stall = True
                         return True
                     self._last_label = msg.label
@@ -559,7 +559,13 @@ class UcsanManager:
 
         return True
 
-    def _report(self, exit_status):
+    def _report(self, exit_status, addr=0):
+        """addr: the PC of the error itself (the message that reports it); 0
+        for an exit status that carries none, which falls back to the last
+        solved condition.  That fallback used to be the only address: a
+        runtime helper's condition (__taint_solve_bounds' checks) is not the
+        faulting access, and was the right one only while a tail call made
+        its return address the instrumented caller."""
         normalized_status = exit_status if exit_status < 255 else exit_status >> 8
         if normalized_status in self._reported:
             return
@@ -573,7 +579,8 @@ class UcsanManager:
         if self._synth_type_table:
             self._synthesize_unittest(exit_status)
         if self._report_to:
-            self._report_to(exit_status, self._current, self._last_label, self._last_result, self._last_addr, self)
+            self._report_to(exit_status, self._current, self._last_label, self._last_result,
+                            addr if addr else self._last_addr, self)
         if normalized_status in self._stop_on_error:
             status_name = next((k for k, v in ERROR_EVENTS.items() if v == normalized_status), str(normalized_status))
             logger.critical(f"Stopping execution: error event {status_name} ({normalized_status}) matched stop_on_error config")
