@@ -1269,12 +1269,23 @@ ucsan_label ucsan_combine_label(ucsan_label l1, ucsan_label l2) {
       return l2;
     }
   }
-  // Warn only if pointer is combined with non-zero non-pointer
-  if (l1_is_ptr && l2 != 0 && !l2_is_ptr) {
-    UCSAN_OUT("WARNING: pointer label %u used in binary operation with non-pointer %u\n", l1, l2);
+  // A pointer with a non-pointer operand stays that pointer, as a GEP keeps
+  // its base whatever the index: the kernel rebuilds pointers in integers --
+  // a tag masked off (keyring_ptr_to_key, `p & ~3`), page_address()'s offset
+  // arithmetic, per_cpu_ptr()'s `p + __per_cpu_offset[cpu]` with a
+  // symbolized offset -- and returning 0 here dropped the label, so a NULL
+  // from the seed reached its dereference unlabeled and faulted instead of
+  // being materialized.  (visitCmpInst does the same for a comparison with
+  // null.)  Two pointers still combine to nothing.
+  if (l1_is_ptr && !l2_is_ptr) {
+    if (l2 != 0)
+      UCSAN_OUT("pointer label %u used in binary operation with non-pointer %u\n", l1, l2);
+    return l1;
   }
-  if (l2_is_ptr && l1 != 0 && !l1_is_ptr) {
-    UCSAN_OUT("WARNING: pointer label %u used in binary operation with non-pointer %u\n", l2, l1);
+  if (l2_is_ptr && !l1_is_ptr) {
+    if (l1 != 0)
+      UCSAN_OUT("pointer label %u used in binary operation with non-pointer %u\n", l2, l1);
+    return l2;
   }
 
   // Return 0 - we don't track symbolic expressions in standalone mode
