@@ -39,6 +39,12 @@ typedef uint32_t dfsan_label;
 #define UCSAN_SAFE_GAP 0x1000
 #define UCSAN_ROUNDUPGAP(x) (((x) + UCSAN_SAFE_GAP - 1) & ~(UCSAN_SAFE_GAP - 1))
 #define UCSAN_OBJECT_SIZE_LIMIT (4096 * 10)
+// An allocation above this fails (returns NULL), as malloc and kmalloc may.
+// The size is often solver-chosen, and a success is paid for up front: every
+// byte's shadow is set to uninitialized, so a 4 GB request touched 8 GB before
+// the program did anything (param_set_charp).  64 MB is 16x the kernel's own
+// KMALLOC_MAX_SIZE.
+#define UCSAN_ALLOC_SIZE_LIMIT (64UL << 20)
 #define UCSAN_MAX_SAVED_STACK_ENTRIES 1024
 
 namespace __ucsan {
@@ -343,6 +349,12 @@ inline uint64_t ucsan_object_size_limit() {
   return ucsan_flags().max_obj_size > 0
              ? static_cast<uint64_t>(ucsan_flags().max_obj_size)
              : static_cast<uint64_t>(UCSAN_OBJECT_SIZE_LIMIT);
+}
+
+inline uint64_t ucsan_alloc_size_limit() {
+  return ucsan_flags().max_alloc_size > 0
+             ? static_cast<uint64_t>(ucsan_flags().max_alloc_size)
+             : static_cast<uint64_t>(UCSAN_ALLOC_SIZE_LIMIT);
 }
 
 //===----------------------------------------------------------------------===//

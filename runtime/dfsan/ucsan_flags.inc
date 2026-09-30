@@ -34,6 +34,11 @@ UCSAN_FLAG(int, max_obj_size, 0,
            "Maximum object size for lazy initialization "
            "(0 = use UCSAN_OBJECT_SIZE_LIMIT).")
 
+UCSAN_FLAG(int, max_alloc_size, 0,
+           "Largest allocation (malloc/calloc/realloc and the kernel allocators "
+           "that wrap them) that succeeds; a larger one returns NULL "
+           "(0 = use UCSAN_ALLOC_SIZE_LIMIT).")
+
 UCSAN_FLAG(const char *, input_file, "",
            "Input file containing seed objects.")
 

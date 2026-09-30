@@ -87,7 +87,7 @@ static ucsan_label create_alloca_label(void *ptr, size_t size, bool set_uninitia
 __attribute__((visibility("default")))
 void *__dfsw_malloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size != 0 && size < UINT32_MAX) {
+  if (size != 0 && size <= ucsan_alloc_size_limit()) {
     ret = __libc_malloc(size);
   }
   UCSAN_OUT("__dfsw_malloc(%zu) = %p\n", size, ret);
@@ -121,7 +121,7 @@ void *__dfsw_calloc(size_t nmemb, size_t size, ucsan_label nmemb_label,
                     ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = nullptr;
   size_t total_size = nmemb * size;
-  if (total_size != 0 && total_size < UINT32_MAX) {
+  if (total_size != 0 && total_size <= ucsan_alloc_size_limit()) {
     ret = __libc_calloc(nmemb, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -168,7 +168,7 @@ void *__dfsw_realloc(void *ptr, size_t size, ucsan_label ptr_label,
 
   // don't actually free the buffer
   void *ret = nullptr;
-  if (size != 0 && size < UINT32_MAX) {
+  if (size != 0 && size <= ucsan_alloc_size_limit()) {
     ret = __libc_malloc(size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -222,7 +222,7 @@ void *__dfsw_memalign(size_t alignment, size_t size,
                       ucsan_label alignment_label, ucsan_label size_label,
                       ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size > 0 && size < UINT32_MAX) {
+  if (size > 0 && size <= ucsan_alloc_size_limit()) {
     ret = aligned_alloc(alignment, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -235,7 +235,7 @@ void *__dfsw_aligned_alloc(size_t alignment, size_t size,
                            ucsan_label alignment_label, ucsan_label size_label,
                            ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size > 0 && size < UINT32_MAX) {
+  if (size > 0 && size <= ucsan_alloc_size_limit()) {
     ret = aligned_alloc(alignment, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -248,7 +248,7 @@ void *__dfsw_aligned_alloc(size_t alignment, size_t size,
 __attribute__((visibility("default")))
 void *__dfsw_valloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size > 0 && size < UINT32_MAX) {
+  if (size > 0 && size <= ucsan_alloc_size_limit()) {
     ret = aligned_alloc(PAGE_SIZE, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -259,7 +259,7 @@ void *__dfsw_valloc(size_t size, ucsan_label size_label, ucsan_label *ret_label)
 __attribute__((visibility("default")))
 void *__dfsw_pvalloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size > 0 && size < UINT32_MAX) {
+  if (size > 0 && size <= ucsan_alloc_size_limit()) {
     ret = aligned_alloc(PAGE_SIZE, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
