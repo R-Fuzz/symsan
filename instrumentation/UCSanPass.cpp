@@ -3238,8 +3238,10 @@ void declareAsmCallees(Module &M, StringMap<WeakTrackingVH> &Callees) {
 //
 // %gs: (percpu) operands are taken as plain memory, which holds while the %gs
 // base is 0; the runtime checks that at startup.  %gs: memory added into a
-// pointer (this_cpu_ptr: `add %gs:this_cpu_off, ptr`) is not lifted: percpu
-// offsets would then come from symbolized globals.
+// pointer (this_cpu_ptr: `add %gs:this_cpu_off, ptr`) is lifted as offset 0,
+// the pointer itself: percpu offsets must not come from symbolized globals,
+// and running the asm as is instead (what this used to do) computed the same
+// value but dropped the pointer's label.
 class AsmLifter {
   IRBuilder<> &IRB;
   const DataLayout &DL;
@@ -3675,6 +3677,18 @@ private:
       unsigned W = width(Suf, Ls);
       if (!W)
         return false;
+      // this_cpu_ptr, `add %gs:this_cpu_off, ptr`: the percpu offset is 0 (see
+      // the class comment).  Decided before reading the source, which would
+      // otherwise load -- and symbolize -- this_cpu_off for nothing.
+      if (B.Op == Instruction::Add && B.WritesDst && !Lock && W == 64 &&
+          Ls[0].K == Loc::LMem && Ls[0].Seg && Ls[1].K == Loc::LReg) {
+        Value *P = Regs.lookup(Ls[1].Reg);
+        if (P && P->getType()->isPointerTy()) {
+          setZS(P);
+          CF = nullptr;
+          return true;
+        }
+      }
       Value *Src = read(Ls[0], W);
       if (!Src)
         return false;
@@ -3697,7 +3711,7 @@ private:
       if (IsAddSub && B.WritesDst && W == 64 && DstV &&
           DstV->getType()->isPointerTy() && !Src->getType()->isPointerTy()) {
         if (Ls[0].Seg)
-          return false; // this_cpu_ptr: see the class comment
+          return false; // this_cpu_ptr is handled before the read, above
         Value *Off = B.Op == Instruction::Add ? Src : IRB.CreateNeg(Src);
         Value *R = IRB.CreateGEP(IRB.getInt8Ty(), DstV, Off);
         Regs[Ls[1].Reg] = R;
