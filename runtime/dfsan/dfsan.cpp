@@ -248,14 +248,15 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid);
 
 // A UB check a runtime helper poses (__taint_union's arithmetic checks,
-// __taint_solve_bounds, __taint_solve_size): __taint_trace_cond(label, 0,
-// UndefinedCheck, cid), but at addr, the instrumented code the helper was
-// called from.  __taint_trace_cond's own return address is the helper, or
+// __taint_solve_bounds, __taint_solve_size, the malloc-size and assertion
+// wrappers): __taint_trace_cond(label, r, UndefinedCheck, cid), but at addr,
+// the instrumented code the helper was called from.  __taint_trace_cond's own return address is the helper, or
 // its caller only when the compiler happens to make the call a tail call;
 // the manager keys UB checks on the address and reports the last solved
 // condition's as a witness site.
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_trace_ub_check(dfsan_label label, uint32_t cid, void *addr);
+void __taint_trace_ub_check(dfsan_label label, bool r, uint32_t cid,
+                            void *addr);
 
 // Forward declarations for trace callbacks (implemented in solvers)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -555,7 +556,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         if (orig_op2 != 0) {
           cond = do_taint_union(l2, 0, (bveq << 8) | __dfsan::ICmp, size,
                                 orig_op2, 0);
-          __taint_trace_ub_check(cond, ub_division_by_zero, ub_addr);
+          __taint_trace_ub_check(cond, 0, ub_division_by_zero, ub_addr);
         } else {
           AOUT("WARNING: division by zero\n");
           __taint_trace_event_addr(l2, EVENT_DIV_BY_ZERO, 0, __builtin_return_address(0), 0);
@@ -590,7 +591,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
             } else {
               cond = c2;
             }
-            __taint_trace_ub_check(cond, ub_integer_overflow, ub_addr);
+            __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
           }
         }
         break;
@@ -602,7 +603,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         if (orig_op2 < size) {
           cond = do_taint_union(l2, 0, (bvuge << 8) | __dfsan::ICmp,
                                op_size, orig_op2, size);
-          __taint_trace_ub_check(cond, ub_shift_exponent, ub_addr);
+          __taint_trace_ub_check(cond, 0, ub_shift_exponent, ub_addr);
         }
         // There used to be a second exponent check here, `op2 <s 0`, for a
         // negative exponent.  It was guarded on `(int64_t)orig_op2 >= 0`, and
@@ -642,7 +643,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                 orig_op2, __builtin_clzl(orig_op1) - (64 - size));
           cond = do_taint_union(cond, valid_exp, __dfsan::And, 1, 0,
                                 orig_op2 < size);
-          __taint_trace_ub_check(cond, ub_shift_overflow, ub_addr);
+          __taint_trace_ub_check(cond, 0, ub_shift_overflow, ub_addr);
         }
         // same width bug as the negative-exponent guard above: the sign has to
         // be read at the base's own width, not at 64.
@@ -655,7 +656,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                 get_label_info(l1)->size, orig_op1, 0);
           cond = do_taint_union(cond, valid_exp, __dfsan::And, 1, 0,
                                 orig_op2 < size);
-          __taint_trace_ub_check(cond, ub_shift_base, ub_addr);
+          __taint_trace_ub_check(cond, 0, ub_shift_base, ub_addr);
         }
         break;
       }
@@ -677,7 +678,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         dfsan_label loss = do_taint_union(l1, 0, (bvuge << 8) | __dfsan::ICmp,
                                           get_label_info(l1)->size, orig_op1,
                                           1UL << size);
-        __taint_trace_ub_check(loss, ub_unsigned_integer_truncation, ub_addr);
+        __taint_trace_ub_check(loss, 0, ub_unsigned_integer_truncation, ub_addr);
       }
       // -fsanitize=implicit-signed-integer-truncation
       //
@@ -721,7 +722,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                         truncated, 0);
         dfsan_label loss = do_taint_union(se, l1, (bvneq << 8) | __dfsan::ICmp,
                                           old_size, re_ext, orig_op1 & old_mask);
-        __taint_trace_ub_check(loss, ub_signed_integer_truncation, ub_addr);
+        __taint_trace_ub_check(loss, 0, ub_signed_integer_truncation, ub_addr);
       }
 
       // -fsanitize=implicit-integer-sign-change
@@ -743,7 +744,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                                size, orig_op1 & new_mask, 0);
           dfsan_label sign_diff = do_taint_union(src_neg, dst_neg, __dfsan::Xor, 1,
                                                  src_sign ? 1 : 0, dst_sign ? 1 : 0);
-          __taint_trace_ub_check(sign_diff, ub_integer_sign_change, ub_addr);
+          __taint_trace_ub_check(sign_diff, 0, ub_integer_sign_change, ub_addr);
         }
       }
     } else if (op == __dfsan::Add) {
@@ -770,7 +771,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         dfsan_label and_xors = do_taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
         dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
                                           size, overflow_check, 0);
-        __taint_trace_ub_check(cond, ub_integer_overflow, ub_addr);
+        __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
       } else {
         AOUT("WARNING: signed integer overflow\n");
         __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
@@ -781,7 +782,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       if (result >= orig_op1 && (orig_op2 != 0 || l2 != 0)) {
         dfsan_label cond = do_taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
                                           size, result, orig_op1);
-        __taint_trace_ub_check(cond, ub_integer_overflow, ub_addr);
+        __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
       }
     } else if (op == __dfsan::Mul) {
       // check for integer overflow
@@ -824,7 +825,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           dfsan_label sres = do_taint_union(label, 0, __dfsan::SExt, wide_size, result, 0);
           dfsan_label cond = do_taint_union(smul, sres, (bvneq << 8) | __dfsan::ICmp,
                                             wide_size, swide & wide_mask, sr & wide_mask);
-          __taint_trace_ub_check(cond, ub_integer_overflow, ub_addr);
+          __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
         } else {
           AOUT("WARNING: signed integer overflow\n");
           __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
@@ -838,7 +839,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           dfsan_label umul = do_taint_union(z1, z2, __dfsan::Mul, wide_size, a, b);
           dfsan_label cond = do_taint_union(umul, 0, (bvugt << 8) | __dfsan::ICmp,
                                             wide_size, uwide, mask);
-          __taint_trace_ub_check(cond, ub_integer_overflow, ub_addr);
+          __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
         }
       }
     } else if (op == __dfsan::Sub) {
@@ -866,7 +867,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         dfsan_label and_xors = do_taint_union(xor_l1l2, xor_l1r, __dfsan::And, size, xor_ab, xor_ar);
         dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
                                           size, overflow_check, 0);
-        __taint_trace_ub_check(cond, ub_integer_overflow, ub_addr);
+        __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
       } else {
         AOUT("WARNING: signed integer overflow\n");
         __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
@@ -880,7 +881,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       if (result <= orig_op1 && (orig_op2 != 0 || l2 != 0)) {
         dfsan_label cond = do_taint_union(label, l1, (bvugt << 8) | __dfsan::ICmp,
                                           size, result, orig_op1);
-        __taint_trace_ub_check(cond, ub_integer_overflow, ub_addr);
+        __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
       }
     }
   }
@@ -1353,14 +1354,14 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
                                       index_bits, index, 0);
       // assume the result is false, as bounds check should happen before solving
       // no flag, no nested
-      __taint_trace_ub_check(lb, ub_index_underflow, addr);
+      __taint_trace_ub_check(lb, 0, ub_index_underflow, addr);
     }
 
     // check overflow, index >= num_elems
     if (index < 0 || (uint64_t)index < num_elems) {
       dfsan_label ub = do_taint_union(index_label, 0, (bvsge << 8) | ICmp,
                                       index_bits, index, num_elems);
-      __taint_trace_ub_check(ub, ub_index_overflow, addr);
+      __taint_trace_ub_check(ub, 0, ub_index_overflow, addr);
     }
   } else {
     // array with unknown size
@@ -1378,7 +1379,7 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
         if (!((uint64_t)index < lower_bound)) {
           dfsan_label lb = do_taint_union(index_label, 0, (bvult << 8) | ICmp,
                                           64, index, lower_bound);
-          __taint_trace_ub_check(lb, ub_index_underflow, addr);
+          __taint_trace_ub_check(lb, 0, ub_index_underflow, addr);
         }
 
         // check overflow, (index + 1) * elem_size + current_offset + ptr > upper_bound
@@ -1388,7 +1389,7 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
         if (!((uint64_t)index > upper_bound)) {
           dfsan_label ub = do_taint_union(index_label, 0, (bvugt << 8) | ICmp,
                                           64, index, upper_bound);
-          __taint_trace_ub_check(ub, ub_index_overflow, addr);
+          __taint_trace_ub_check(ub, 0, ub_index_overflow, addr);
         }
       } else {
         // index * elem_size + current_offset + (ptr - lower_bound) > array_size * alloc_elem_size
@@ -1409,7 +1410,7 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
           dfsan_label overflow =
               do_taint_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
                              64, size, alloc_size);
-          __taint_trace_ub_check(overflow, ub_integer_to_buffer_overflow, addr);
+          __taint_trace_ub_check(overflow, 0, ub_integer_to_buffer_overflow, addr);
         }
       }
     } else {
@@ -1418,7 +1419,7 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
            (void*)ptr, ptr_label, addr);
       // FIXME: check if null is possible?
       // dfsan_label null = do_taint_union(ptr_label, 0, bveq, 64, ptr, 0);
-      // __taint_trace_ub_check(null, ub_null_pointer, addr);
+      // __taint_trace_ub_check(null, 0, ub_null_pointer, addr);
     }
   }
 }
@@ -1485,7 +1486,7 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
           uint64_t min_size = bounds_info->op1.i - ptr;
           dfsan_label underflow = do_taint_union(size_label, 0, (bvult << 8) | ICmp,
                                                  64, size, min_size);
-          __taint_trace_ub_check(underflow, ub_size_underflow, addr);
+          __taint_trace_ub_check(underflow, 0, ub_size_underflow, addr);
         }
 
         // check overflow: ptr + size > upper_bound
@@ -1495,7 +1496,7 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
         if (!(size > max_size)) {
           dfsan_label overflow = do_taint_union(size_label, 0, (bvugt << 8) | ICmp,
                                                 64, size, max_size);
-          __taint_trace_ub_check(overflow, ub_size_overflow, addr);
+          __taint_trace_ub_check(overflow, 0, ub_size_overflow, addr);
         }
       } else {
         // symbolic allocation size
@@ -1509,7 +1510,7 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
           dfsan_label overflow = do_taint_union(adjusted_size, bounds_info->l2,
                                                 (bvugt << 8) | ICmp, 64,
                                                 actual_size, alloc_size);
-          __taint_trace_ub_check(overflow, ub_size_to_buffer_overflow, addr);
+          __taint_trace_ub_check(overflow, 0, ub_size_to_buffer_overflow, addr);
         }
       }
     } else if (ptr_label != 0) {
@@ -1518,7 +1519,7 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
            (void*)ptr, ptr_label, addr);
       // FIXME: check if null is possible
       // dfsan_label null = do_taint_union(ptr_label, 0, bveq, 64, ptr, 0);
-      // __taint_trace_ub_check(null, ub_null_pointer, addr);
+      // __taint_trace_ub_check(null, 0, ub_null_pointer, addr);
     }
   }
 }
@@ -2528,9 +2529,9 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, bool,
 // A backend without it (solvers/z3.cpp) still gets the check, at its own
 // address as before.
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_ub_check, dfsan_label label,
-                             uint32_t cid, void *addr) {
+                             bool r, uint32_t cid, void *addr) {
   (void)addr;
-  __taint_trace_cond(label, 0, UndefinedCheck, cid);
+  __taint_trace_cond(label, r, UndefinedCheck, cid);
 }
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop, uint32_t, uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop_push_stack, void) {}
