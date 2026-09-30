@@ -1390,15 +1390,25 @@ void* ucsan_set_label_for_args(uint32_t index, uint32_t size_in_bits, uint8_t is
     ucsan_tainted.objects = new ObjectStorage();
   }
 
-  if (ucsan_tainted.objects->size() &&
-      last_offset + size_in_bytes <= ucsan_tainted.objects->at(0).data.size()) {
-    uint64_t result = *((uint64_t*)(ucsan_tainted.objects->at(0).data.data() + last_offset));
+  if (!ucsan_tainted.objects->size()) ucsan_tainted.objects->resize(1);
+  auto &data = ucsan_tainted.objects->at(0).data;
+  // A seed can cover only part of the argument: the solver writes the bytes a
+  // constraint mentions and nothing past them, so `x & 0x101` on an int leaves
+  // a seed that ends two bytes into it.  Take what is there and read the rest
+  // as 0, which is what the parser assumes for bytes past the end.  Requiring
+  // the whole argument used to drop the seed's bytes along with the missing
+  // ones, so the target ran on `given` while the parser evaluated the seed,
+  // and every branch on the argument was rejected as a value mismatch.
+  bool in_seed = last_offset < data.size();
+  if (data.size() < last_offset + size_in_bytes)
+    data.resize(last_offset + size_in_bytes);
+  if (in_seed) {
+    uint64_t result = 0;
+    internal_memcpy(&result, data.data() + last_offset,
+                    size_in_bytes < sizeof(result) ? size_in_bytes : sizeof(result));
     UCSAN_OUT("Returning: 0x%lx\n", result);
     return (void*)result;
   }
-
-  if (!ucsan_tainted.objects->size()) ucsan_tainted.objects->resize(1);
-  ucsan_tainted.objects->at(0).data.resize(last_offset + size_in_bytes);
 
   return (void*)given;
 }
@@ -1689,16 +1699,14 @@ void* ucsan_wrap_retval(uint64_t size, ucsan_label *ret_label, bool is_ptr, void
   dfsan_label symsan_label = __taint_create_label(0, last_offset, (uint32_t)size);
   __taint_set_retval_tls(retval_tls_index, symsan_label, (uint32_t)bits);
 
-  if (ucsan_tainted.objects->size() &&
-      last_offset + size <= ucsan_tainted.objects->at(0).data.size()) {
-    UCSAN_OUT("offset (%lu + %lu) in the seed\n", last_offset, size);
-    for (uptr i = 0; i < size; ++i) {
-      __ucsan_wrapped_return_tls[i] = ucsan_tainted.objects->at(0).data[last_offset + i];
-    }
-  } else {
-    for (uptr i = 0; i < size; ++i) {
-      __ucsan_wrapped_return_tls[i] = 0;
-    }
+  // byte by byte, and 0 past the end of the seed: a seed that covers only part
+  // of the value must still deliver that part (see ucsan_set_label_for_args)
+  uptr seed_size = ucsan_tainted.objects->size() ?
+                   ucsan_tainted.objects->at(0).data.size() : 0;
+  UCSAN_OUT("offset (%lu + %lu), seed has %lu\n", last_offset, size, seed_size);
+  for (uptr i = 0; i < size; ++i) {
+    __ucsan_wrapped_return_tls[i] = last_offset + i < seed_size ?
+        ucsan_tainted.objects->at(0).data[last_offset + i] : 0;
   }
 
   return (void*)__ucsan_wrapped_return_tls;
