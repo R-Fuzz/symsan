@@ -451,6 +451,7 @@ class UCSan {
   FunctionCallee UCCheckUBIFn;
   FunctionCallee UCCombineLabelFn;
   FunctionCallee UCVmcsFieldFn;  // ptr ucsan_vmcs_field(i64): see AsmLifter
+  FunctionCallee UCMaterializeRangeFn;  // void ucsan_materialize_range(ptr, i64)
   FunctionCallee UCSetLabelForArgsFn;
   FunctionCallee UCLoadPointerShadowFn;
   FunctionCallee UCStorePointerShadowFn;
@@ -931,6 +932,16 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCCheckCopyBoundsFn = M.getOrInsertFunction("ucsan_check_copy_bounds", UCCheckCopyBoundsFnTy);
   F = dyn_cast<Function>(UCCheckCopyBoundsFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // void ucsan_materialize_range(ptr addr, i64 n): label the bytes of a
+  // lazily created object that have no UCSan label yet (on-demand labels),
+  // before a shadow copy reads them
+  UCMaterializeRangeFn = M.getOrInsertFunction(
+      "ucsan_materialize_range",
+      FunctionType::get(Type::getVoidTy(*Ctx), {VoidPtrTy, Int64Ty}, false));
+  F = dyn_cast<Function>(UCMaterializeRangeFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -2714,6 +2725,12 @@ void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
   I.setSource(src);
   I.setDest(dest);
 
+  // source bytes labeled on demand get their labels before their shadow is
+  // copied (a copied marker would name the source object at dest)
+  CallInst *Mat = IRB.CreateCall(UF.UC.UCMaterializeRangeFn,
+      {IRB.CreatePointerCast(src, UF.UC.VoidPtrTy), Length});
+  UF.UC.markNosanitize(Mat);
+
   // create a memcpy call to copy the shadow
   Value *ShadowLength = IRB.CreateMul(
       Length,
@@ -2775,6 +2792,11 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
 
   I.setDest(dest);
   I.setSource(src);
+
+  // on-demand labels first, as for memcpy
+  CallInst *Mat = IRB.CreateCall(UF.UC.UCMaterializeRangeFn,
+      {IRB.CreatePointerCast(src, UF.UC.VoidPtrTy), Length});
+  UF.UC.markNosanitize(Mat);
 
   // memmove shadow
   Value *DestShadowAddr = UF.UC.getShadowAddress(dest, IRB);

@@ -179,7 +179,9 @@ void *__dfsw_realloc(void *ptr, size_t size, ucsan_label ptr_label,
     // Copy data from old buffer to new buffer (up to min of old/new size)
     size_t copy_size = old_size < size ? old_size : size;
     internal_memcpy(ret, ptr, copy_size);
-    // Copy UCSan shadow memory from old to new
+    // Copy UCSan shadow memory from old to new (bytes labeled on demand get
+    // their labels first: see ucsan_materialize_range)
+    ucsan_materialize_range(ptr, copy_size);
     ucsan_label *sdest = ucsan_shadow_for(ret);
     const ucsan_label *ssrc = ucsan_shadow_for(ptr);
     internal_memcpy((void *)sdest, (const void *)ssrc, copy_size * sizeof(ucsan_label));
@@ -337,7 +339,9 @@ void *__dfsw_memcpy(void *dest, const void *src, size_t n,
                     ucsan_label dest_label, ucsan_label src_label,
                     ucsan_label n_label, ucsan_label *ret_label) {
   *ret_label = dest_label;
-  // Copy UCSan shadow memory from src to dest
+  // Copy UCSan shadow memory from src to dest (bytes labeled on demand get
+  // their labels first: see ucsan_materialize_range)
+  ucsan_materialize_range((void *)src, n);
   ucsan_label *sdest = ucsan_shadow_for(dest);
   const ucsan_label *ssrc = ucsan_shadow_for(src);
   internal_memcpy((void *)sdest, (const void *)ssrc, n * sizeof(ucsan_label));
@@ -352,6 +356,7 @@ void *__dfsw_memmove(void *dest, const void *src, size_t n,
                      ucsan_label dest_label, ucsan_label src_label,
                      ucsan_label n_label, ucsan_label *ret_label) {
   *ret_label = dest_label;
+  ucsan_materialize_range((void *)src, n);  // see ucsan_materialize_range
   ucsan_label *sdest = ucsan_shadow_for(dest);
   const ucsan_label *ssrc = ucsan_shadow_for(src);
   internal_memmove((void *)sdest, (const void *)ssrc, n * sizeof(ucsan_label));
@@ -401,6 +406,7 @@ unsigned long __dfsw__copy_from_user(void *to, const void *from, unsigned long n
     if (ptr_info->op != OP_EXTERNAL) {
       UCSAN_OUT("WARNING: copy_from_user: from_label %d is not external, op %d\n", from_label, ptr_info->op);
     }
+    ucsan_materialize_range((void *)from, n);  // see ucsan_materialize_range
     ucsan_label *sdest = ucsan_shadow_for(to);
     const ucsan_label *ssrc = ucsan_shadow_for(from);
     internal_memcpy((void *)sdest, (const void *)ssrc, n * sizeof(ucsan_label));

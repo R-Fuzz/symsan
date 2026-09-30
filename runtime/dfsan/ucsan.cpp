@@ -978,18 +978,26 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     ptr_info->pseudo_base = p;  // Store original pseudo pointer in ptr_info
 
     // Create labels for each byte in the object and set up shadow memory
+    // (for a large object, the object's own label: its bytes get theirs when
+    // first read, see ucsan_labels_on_demand; the SymSan labels are eager)
+    bool on_demand = ucsan_labels_on_demand(object_size);
     for (uint64_t offset = 0; offset < object_size; ++offset) {
-      ucsan_label byte_label = allocate_label();
-
-      ucsan_label_info *byte_info = get_label_info(byte_label);
-      ucsan_byte_info *byte = to_byte_info(byte_info);
-      byte->op = OP_NONE;
-      byte->object_id = object_id;
-      byte->offset = offset - obj.offset;
-
       void *nptr = (void*)((uint64_t)np + offset);
       ucsan_label *shadow = ucsan_shadow_for(nptr);
-      *shadow = byte_label;
+      int64_t rel = (int64_t)offset - (int64_t)obj.offset;
+      if (on_demand) {
+        *shadow = obj_label;
+      } else {
+        ucsan_label byte_label = allocate_label();
+
+        ucsan_label_info *byte_info = get_label_info(byte_label);
+        ucsan_byte_info *byte = to_byte_info(byte_info);
+        byte->op = OP_NONE;
+        byte->object_id = object_id;
+        byte->offset = rel;
+
+        *shadow = byte_label;
+      }
 
       // Bridge to SymSan: use 0-based offset so offsets stay consistent
       // across seed re-executions regardless of obj.offset growth
@@ -1001,7 +1009,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       // growth had just changed, put solutions on the wrong bytes.  Relative
       // offsets never move; the parser and the manager take the origin from
       // the seed.)
-      dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
+      dfsan_label symsan_label = __taint_create_label(object_id, rel, 1);
       __taint_set_label(symsan_label, nptr, 1);
     }
 
@@ -1108,17 +1116,22 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     UCSAN_OUT("Enlarged object in place: [%ld, %ld) -> [%ld, %ld)\n",
               old_lower, old_upper, -(int64_t)new_lower_bound, new_upper);
 
+    // (on demand once the object is large, see ucsan_labels_on_demand)
+    bool on_demand = ucsan_labels_on_demand(new_size);
     auto label_new_byte = [&](int64_t rel) {
-      ucsan_label byte_label = allocate_label();
-      ucsan_label_info *byte_info = get_label_info(byte_label);
-      ucsan_byte_info *byte = to_byte_info(byte_info);
-      byte->op = OP_NONE;
-      byte->object_id = object_id;
-      byte->offset = rel;
-
       void *nptr = base + rel;
       *(char *)nptr = 0;
-      *ucsan_shadow_for(nptr) = byte_label;
+      if (on_demand) {
+        *ucsan_shadow_for(nptr) = obj_label;
+      } else {
+        ucsan_label byte_label = allocate_label();
+        ucsan_label_info *byte_info = get_label_info(byte_label);
+        ucsan_byte_info *byte = to_byte_info(byte_info);
+        byte->op = OP_NONE;
+        byte->object_id = object_id;
+        byte->offset = rel;
+        *ucsan_shadow_for(nptr) = byte_label;
+      }
 
       // Bridge to SymSan: offset relative to offset 0 (negative below it)
       dfsan_label symsan_label = __taint_create_label(object_id, rel, 1);
@@ -1308,11 +1321,52 @@ ucsan_label ucsan_combine_label(ucsan_label l1, ucsan_label l2) {
   return 0;
 }
 
+namespace __ucsan {
+
+ucsan_label ucsan_materialize_byte(ucsan_label *ls, void *addr) {
+  ucsan_label l = *ls;
+  if (l < UCSAN_CONST_OFFSET || l == kUninitializedLabel)
+    return l;
+  ucsan_label_info *info = get_label_info(l);
+  if (info->common.op != OP_RESERVED_OBJ)
+    return l;
+  // the object's label: this byte has none yet
+  ucsan_obj_info *obj = to_obj_info(info);
+  ucsan_label byte_label = allocate_label();
+  ucsan_byte_info *byte = to_byte_info(get_label_info(byte_label));
+  byte->op = OP_NONE;
+  byte->object_id = obj->object_id;
+  byte->offset = (int64_t)addr - (int64_t)obj->real_ptr;
+  UCSAN_OUT("materialize: object %u offset %ld -> label %u\n",
+            obj->object_id, (long)byte->offset, byte_label);
+  *ls = byte_label;
+  return byte_label;
+}
+
+}  // namespace __ucsan
+
+// Give every byte of [addr, addr + n) that has no UCSan label yet its label,
+// before its shadow is copied somewhere else: a copied marker would name the
+// source object at the destination's address.  Called by the shadow copies
+// (memcpy/memmove intrinsics, the __dfsw_ copy wrappers).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_materialize_range(void *addr, uint64_t n) {
+  if (!addr)
+    return;
+  ucsan_label *ls = ucsan_shadow_for(addr);
+  for (uint64_t i = 0; i < n; ++i)
+    ucsan_materialize_byte(&ls[i], (char *)addr + i);
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_pointer,
                                       void *concrete_addr) {
   if (ls == nullptr) return 0;
 
+  // Only the first byte's label is ever used, and only for a pointer or a
+  // pointer-sized value (below): that is the one byte to label on demand.
+  if (is_pointer || n == sizeof(void*))
+    ucsan_materialize_byte(ls, concrete_addr);
   ucsan_label label0 = ls[0];
 
   UCSAN_OUT("load_pointer_shadow: *label(%p)=%d is_pointer=%d, size=%lu\n",
@@ -2098,7 +2152,9 @@ static void ucsan_init_shadow_memory() {
 }
 
 static void ucsan_fini_internal() {
-  UCSAN_OUT("UCSan runtime finalized\n");
+  UCSAN_OUT("UCSan runtime finalized (labels used: %u of %u)\n",
+            (unsigned)atomic_load(&__ucsan_last_label, memory_order_relaxed),
+            (unsigned)__alloca_stack_bottom);
 
   if (ucsan_flags().check_memleak) {
     ucsan_scan_shadow_for_leaks();

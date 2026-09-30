@@ -395,6 +395,21 @@ void* customized_malloc(uint64_t size);
 bool in_data_section(void *p);
 bool in_bss_section(void *p);
 
+// On-demand UCSan labels.  A lazily created object larger than the
+// eager_label_size flag does not give every byte a label: the shadow of a byte
+// that has none yet holds the object's own label (OP_RESERVED_OBJ), which no
+// byte's shadow holds otherwise, and the byte gets its label -- the same
+// (object_id, offset) an eager one would have had -- the first time something
+// reads it: the load hook, or a shadow copy (see ucsan_materialize_range).  In
+// the kernel eval only 0.2-0.8% of eager object labels were ever read, and
+// labels are 16-bit.
+inline bool ucsan_labels_on_demand(uint64_t object_size) {
+  int eager = ucsan_flags().eager_label_size;
+  return object_size > (uint64_t)(eager > 0 ? eager : 0);
+}
+// *ls, given its byte's label first if it has none yet (addr: the byte)
+ucsan_label ucsan_materialize_byte(ucsan_label *ls, void *addr);
+
 }  // namespace __ucsan
 
 //===----------------------------------------------------------------------===//
@@ -414,6 +429,10 @@ extern SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint8_t
 
 // Flag for null dereference checking
 extern void* __ucsan_null_deref_flag;
+
+// Label the bytes of [addr, addr + n) that have none yet, before their shadow
+// is copied (see ucsan_labels_on_demand)
+SANITIZER_INTERFACE_ATTRIBUTE void ucsan_materialize_range(void *addr, uint64_t n);
 
 //===----------------------------------------------------------------------===//
 // Core UCSan Functions
