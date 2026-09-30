@@ -1324,21 +1324,32 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
       index, index_label, num_elems, elem_size, current_offset);
 
   // construct bounds solving tasks here
+  //
+  // Each check below is sent with result 0, i.e. "in bounds", so it is only
+  // sent when that is concretely true -- the same guard the arithmetic checks
+  // in __taint_union have.  An index that is already out of bounds is the bug
+  // happening on this very input, and the sanitizer reports it; asking the
+  // solver to make it true is moot, and the recorded 0 would contradict the
+  // recomputed 1, which the parser rejects as a value mismatch.
   uint16_t index_bits = get_label_info(index_label)->size;
   if (num_elems > 0) {
     // array with known size
     //
     // check underflow, index < 0
-    dfsan_label lb = do_taint_union(index_label, 0, (bvslt << 8) | ICmp,
-                                    index_bits, index, 0);
-    // assume the result is false, as bounds check should happen before solving
-    // no flag, no nested
-    __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
+    if (index >= 0) {
+      dfsan_label lb = do_taint_union(index_label, 0, (bvslt << 8) | ICmp,
+                                      index_bits, index, 0);
+      // assume the result is false, as bounds check should happen before solving
+      // no flag, no nested
+      __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
+    }
 
     // check overflow, index >= num_elems
-    dfsan_label ub = do_taint_union(index_label, 0, (bvsge << 8) | ICmp,
-                                    index_bits, index, num_elems);
-    __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
+    if (index < 0 || (uint64_t)index < num_elems) {
+      dfsan_label ub = do_taint_union(index_label, 0, (bvsge << 8) | ICmp,
+                                      index_bits, index, num_elems);
+      __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
+    }
   } else {
     // array with unknown size
     dfsan_label_info *bounds_info = get_label_info(ptr_label);
@@ -1352,17 +1363,21 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
         // => index < (lower_bound - current_offset - ptr) / elem_size
         uint64_t lower_bound =
             (bounds_info->op1.i - current_offset - ptr) / elem_size;
-        dfsan_label lb = do_taint_union(index_label, 0, (bvult << 8) | ICmp,
-                                        64, index, lower_bound);
-        __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
+        if (!((uint64_t)index < lower_bound)) {
+          dfsan_label lb = do_taint_union(index_label, 0, (bvult << 8) | ICmp,
+                                          64, index, lower_bound);
+          __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
+        }
 
         // check overflow, (index + 1) * elem_size + current_offset + ptr > upper_bound
         // => index > (upper_bound - current_offset - ptr) / elem_size - 1
         uint64_t upper_bound =
             (bounds_info->op2.i - current_offset - ptr) / elem_size - 1;
-        dfsan_label ub = do_taint_union(index_label, 0, (bvugt << 8) | ICmp,
-                                        64, index, upper_bound);
-        __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
+        if (!((uint64_t)index > upper_bound)) {
+          dfsan_label ub = do_taint_union(index_label, 0, (bvugt << 8) | ICmp,
+                                          64, index, upper_bound);
+          __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
+        }
       } else {
         // index * elem_size + current_offset + (ptr - lower_bound) > array_size * alloc_elem_size
         dfsan_label size_label = elem_size == 1 ? index_label :
@@ -1378,10 +1393,12 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
             do_taint_union(size_label, 0, Add, 64, size, offset);
         size += offset;
         uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
-        dfsan_label overflow =
-            do_taint_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
-                           64, size, alloc_size);
-        __taint_trace_cond(overflow, 0, UndefinedCheck, ub_integer_to_buffer_overflow);
+        if (!(size > alloc_size)) {
+          dfsan_label overflow =
+              do_taint_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
+                             64, size, alloc_size);
+          __taint_trace_cond(overflow, 0, UndefinedCheck, ub_integer_to_buffer_overflow);
+        }
       }
     } else {
       // symbolic pointer but no bounds info?
@@ -1461,10 +1478,13 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
 
         // check overflow: ptr + size > upper_bound
         // => size > upper_bound - ptr
+        // (only while it is concretely false, see __taint_solve_bounds)
         uint64_t max_size = bounds_info->op2.i - ptr;
-        dfsan_label overflow = do_taint_union(size_label, 0, (bvugt << 8) | ICmp,
-                                              64, size, max_size);
-        __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_overflow);
+        if (!(size > max_size)) {
+          dfsan_label overflow = do_taint_union(size_label, 0, (bvugt << 8) | ICmp,
+                                                64, size, max_size);
+          __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_overflow);
+        }
       } else {
         // symbolic allocation size
         // check: size > alloc_size
@@ -1473,10 +1493,12 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
         dfsan_label adjusted_size = (offset == 0 || size_label == 0) ? size_label :
             do_taint_union(size_label, 0, Add, 64, size, offset);
         uint64_t actual_size = size + offset;
-        dfsan_label overflow = do_taint_union(adjusted_size, bounds_info->l2,
-                                              (bvugt << 8) | ICmp, 64,
-                                              actual_size, alloc_size);
-        __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_to_buffer_overflow);
+        if (!(actual_size > alloc_size)) {
+          dfsan_label overflow = do_taint_union(adjusted_size, bounds_info->l2,
+                                                (bvugt << 8) | ICmp, 64,
+                                                actual_size, alloc_size);
+          __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_to_buffer_overflow);
+        }
       }
     } else if (ptr_label != 0) {
       // symbolic pointer but no bounds info
