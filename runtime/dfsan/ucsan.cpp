@@ -777,6 +777,14 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
   // if non-global yet without label, can't do much
   if (label < UCSAN_CONST_OFFSET) {
+    // ... except refuse an access larger than any object UCSan would create,
+    // as the lazy-init path below does.  Without an object there is nothing
+    // to bound it by, and a solver-chosen length would otherwise have the
+    // caller (a memset's ucsan_set_label) touch that many bytes of shadow.
+    if (dereferencing && size > ucsan_object_size_limit()) {
+      UCSAN_OUT("Access size too large for an untracked pointer %p: %zu\n", p, size);
+      exit(exit_reason::REASON_OBJ_OOB);
+    }
     // Null dereference checking
     if (dereferencing && ucsan_flags().checker_nullderef) {
       if ((uint64_t)p < size || (uint64_t)p < ucsan_object_size_limit()) {
@@ -890,6 +898,16 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
   // Handle uninitialized pointer - lazy initialization
   if (ptr_info->status == PTR_UNINITIALIZED) {
     UCSAN_OUT("check pointer: uninit pointer\n");
+
+    // The same limit as for an allocated pointer below, and it must come
+    // first: sizes are 32-bit past this point (lookup_object, data.resize),
+    // so 1 << 37 truncates to an empty object that customized_malloc accepts,
+    // and the caller's memset then writes 128 GB of memory and shadow from it
+    // (kvmclock_init_mem, 59 GB RSS before the OOM killer).
+    if (size > ucsan_object_size_limit()) {
+      UCSAN_OUT("Object access size too large: %zu\n", size);
+      exit(exit_reason::REASON_OBJ_OOB);
+    }
 
     uint32_t object_id;
     void *return_addr = __builtin_return_address(0);

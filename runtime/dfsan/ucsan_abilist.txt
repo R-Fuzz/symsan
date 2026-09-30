@@ -157,6 +157,7 @@ fun:_copy_from_user=size2
 # explicit byte-count args for taint comparison/search/copy functions
 fun:memcpy=size2
 fun:memmove=size2
+fun:memset=size2
 fun:memcmp=size2
 fun:bcmp=size2
 fun:strncmp=size2
