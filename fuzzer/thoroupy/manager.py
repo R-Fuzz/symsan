@@ -399,7 +399,10 @@ class UcsanManager:
                                     result=msg.result,
                                 )
                     except Exception as e:
-                        logger.error(f"Solver error: {e}")
+                        # which kind of condition failed: a UB check carries its
+                        # check id as the bid, a branch its block id
+                        logger.error(f"Solver error: {e} "
+                                     f"[{'ub' if is_ub_solve else 'branch'} {msg.id}]")
                         seed_name = f"./solving-error/{self.binary_path.split('/')[-1]}-{msg.label}-{msg.id}.seed"
                         try:
                             open(seed_name, 'wb').write(pickle.dumps([self._current]))
@@ -409,7 +412,8 @@ class UcsanManager:
                     try:
                         self.solver.add_constraint(msg.label, msg.result)
                     except Exception as e:
-                        logger.error(f"Error adding constraint: {e}")
+                        logger.error(f"Error adding constraint: {e} "
+                                     f"[{'ub' if is_ub_solve else 'branch'} {msg.id}]")
             case PIPE_MSG_TYPE.EXIT_TYPE:
                 logger.info("Finish one seed, exit with code: {}".format(msg.result))
                 # Only report exit status if we haven't already reported a bug for this seed

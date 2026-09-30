@@ -222,6 +222,17 @@ void Z3AstParser::dump_value_cache(dfsan_label label) {
 }
 #endif
 
+std::string Z3AstParser::label_shape(dfsan_label label, int depth) {
+  if (label < CONST_OFFSET) return "C";
+  if (label >= size_) return "?";
+  dfsan_label_info *info = get_label_info(label);
+  std::string s = get_op_name(info->op);
+  if (depth == 0 || (info->l1 < CONST_OFFSET && info->l2 < CONST_OFFSET))
+    return s;
+  return s + "(" + label_shape(info->l1, depth - 1) + "," +
+         label_shape(info->l2, depth - 1) + ")";
+}
+
 Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
   : ASTParser(base, size), context_(context) {
     input_name_format = "input-%u-%u";
@@ -2432,7 +2443,22 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             is_special = true;
           }
           if (!is_special) {
-            throw z3::exception("value mismatch for ICmp");
+            // Name the operand that disagrees and its shape: the bare message
+            // said nothing about *which* expression went stale.  The shape,
+            // not labels or values, so that one cause stays one bucket (see
+            // set_error); the values go to the debug trace.
+            std::string why = "value mismatch for ICmp";
+            if ((info->op1.i & valmask) != val1) {
+              why += " op1=" + label_shape(info->l1, 2);
+              DEBUGF("  op1 recorded 0x%lx, recomputed 0x%lx\n",
+                     (uint64_t)(info->op1.i & valmask), val1);
+            }
+            if ((info->op2.i & valmask) != val2) {
+              why += " op2=" + label_shape(info->l2, 2);
+              DEBUGF("  op2 recorded 0x%lx, recomputed 0x%lx\n",
+                     (uint64_t)(info->op2.i & valmask), val2);
+            }
+            throw z3::exception(why.c_str());
           }
         }
         // Only evaluate when the operands are real values.  Besides being
@@ -2571,7 +2597,8 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
               label, value_cache_[label], result);
       DEBUGF("cond: %s\n", cond.to_string().c_str());
       dump_value_cache(label);
-      set_error("value mismatch for cond");
+      // the shape, not the label: it keeps one bucket per cause
+      set_error(("value mismatch for cond " + label_shape(label, 2)).c_str());
       return -1;
     }
 #endif
@@ -2760,8 +2787,10 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
 int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
     // invalid label
+    set_error("invalid label");
     return -1;
   }
+  clear_error();
 
   try {
     input_dep_set_t inputs;
@@ -2795,6 +2824,8 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
       // recalculated value must match the recorded value
       DEBUGF("WARNING: value mismatch for label %u: expected %ld, got %ld\n",
               label, value_cache_[label], result);
+      // the shape, not the label: it keeps one bucket per cause
+      set_error(("value mismatch for constraint " + label_shape(label, 2)).c_str());
       return -1;
     }
 #endif
@@ -2817,12 +2848,15 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
       }
     }
   } catch (z3::exception e) {
+    set_error(e.msg());
     return -1;
   } catch (std::exception& e) {
     DEBUGF("WARNING: std::exception in add_constraints: %s\n", e.what());
+    set_error("std::exception");
     return -1;
   } catch (...) {
     DEBUGF("WARNING: unknown exception in add_constraints\n");
+    set_error("unknown exception");
     return -1;
   }
 

@@ -626,7 +626,9 @@ static PyObject* ParseCond(PyObject *self, PyObject *args) {
 
   std::vector<uint64_t> tasks;
   if (__z3_parser->parse_cond(label, result, flags & F_ADD_CONS, tasks) != 0) {
-    PyErr_SetString(PyExc_RuntimeError, "failed to parse condition");
+    // carry the parser's reason, or every refusal reads the same
+    PyErr_Format(PyExc_RuntimeError, "failed to parse condition: %s",
+                 __z3_parser->last_error().c_str());
     return NULL;
   }
 
@@ -691,7 +693,8 @@ static PyObject* AddConstraint(PyObject *self, PyObject *args) {
   }
 
   if (__z3_parser->add_constraints(label, val) != 0) {
-    PyErr_SetString(PyExc_RuntimeError, "failed to add constraint");
+    PyErr_Format(PyExc_RuntimeError, "failed to add constraint: %s",
+                 __z3_parser->last_error().c_str());
     return NULL;
   }
 
