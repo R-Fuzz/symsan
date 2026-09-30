@@ -147,6 +147,28 @@ __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
   __taint_send_cond(label, r, add_nested, loop_flag, cid, addr);
 }
 
+// A UB check posed by a runtime helper, at addr, the instrumented code the
+// helper was called for (see its declaration in dfsan.cpp).  Posed as false
+// ("no UB"), with no nested constraints, like __taint_trace_cond with
+// UndefinedCheck.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_ub_check(dfsan_label label, uint32_t cid, void *addr) {
+  if (label == 0)
+    return;
+
+  if (label == kInitializingLabel) {
+    // uninitialized label
+    AOUT("WARNING: uninitialized label %u @%p\n", label, addr);
+    if (flags().solve_ub) __send_ubi(label, 0, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+
+  AOUT("solving ub check: %u 0x%x 0x%x %p\n",
+       label, __taint_trace_callstack, cid, addr);
+  __taint_send_cond(label, 0, 0, 0, cid, addr);
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
 __taint_trace_select(dfsan_label cond_label, dfsan_label true_label,
                      dfsan_label false_label, uint8_t r, uint8_t true_op,
