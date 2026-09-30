@@ -3151,6 +3151,44 @@ bool planAsmCalls(ArrayRef<AsmInsn> Insns, ArrayRef<AsmOp> Ops,
   return true;
 }
 
+// Privileged instructions (kernel mode only; in a userspace run they fault).
+// A read of hardware state gets a fresh symbolic value from AsmHwReadFn, an
+// undefined function the pre-pass below declares, so that the stub every
+// out-of-scope function gets returns it -- labeled from the seed, like any
+// callee's result.  A write or a control instruction does nothing.
+const char *const AsmHwReadFn = "__ucsan_hw_read";
+
+static bool isAsmCtrlReg(StringRef T) {
+  T = T.trim();
+  return T.starts_with("%cr") || T.starts_with("%dr") || T.starts_with("%db");
+}
+
+// rdmsr/rdpmc (%edx:%eax), in (%al/%ax/%eax), mov from %crN/%drN
+static bool isAsmHwRead(const AsmInsn &I) {
+  StringRef Mn = I.Mnemonic;
+  if (Mn == "rdmsr" || Mn == "rdpmc")
+    return true;
+  if ((Mn == "in" || Mn == "inb" || Mn == "inw" || Mn == "inl") &&
+      I.Operands.size() == 2)
+    return true;
+  return Mn.starts_with("mov") && I.Operands.size() == 2 &&
+         isAsmCtrlReg(I.Operands[0]) && !isAsmCtrlReg(I.Operands[1]);
+}
+
+// wrmsr, out, mov to %crN/%drN, and the control instructions
+static bool isAsmHwNoOp(const AsmInsn &I) {
+  StringRef Mn = I.Mnemonic;
+  if (Mn == "cli" || Mn == "sti" || Mn == "wbinvd" || Mn == "invd" ||
+      Mn == "clts" || Mn == "swapgs" || Mn == "xsetbv" || Mn == "wrmsr" ||
+      Mn == "wrmsrns" || Mn == "lgdt" || Mn == "lidt" || Mn == "lldt" ||
+      Mn == "ltr" || Mn == "invlpg")
+    return true;
+  if (Mn == "out" || Mn == "outb" || Mn == "outw" || Mn == "outl")
+    return true;
+  return Mn.starts_with("mov") && I.Operands.size() == 2 &&
+         isAsmCtrlReg(I.Operands[1]) && !isAsmCtrlReg(I.Operands[0]);
+}
+
 // Callees that visitInlineAsm lowers instead of calling (the kernel's
 // assembly helpers with their own calling conventions), or drops (static call
 // trampolines).
@@ -3178,6 +3216,13 @@ void declareAsmCallees(Module &M, StringMap<WeakTrackingVH> &Callees) {
     auto Constraints = IA->ParseConstraints();
     AsmOperands AO(*CI, Constraints);
     SmallVector<AsmInsn, 4> Insns = asmExecutedInsns(IA->getAsmString());
+    if (!Callees.count(AsmHwReadFn) &&
+        any_of(Insns, [](const AsmInsn &I) { return isAsmHwRead(I); })) {
+      Type *I32 = Type::getInt32Ty(M.getContext());
+      Callees[AsmHwReadFn] =
+          M.getOrInsertFunction(AsmHwReadFn, FunctionType::get(I32, false))
+              .getCallee();
+    }
     SmallVector<AsmStep, 4> Steps;
     if (AO.HasMemOutput || !planAsmCalls(Insns, AO.Ops, Steps))
       continue;
@@ -3242,6 +3287,11 @@ void declareAsmCallees(Module &M, StringMap<WeakTrackingVH> &Callees) {
 // the pointer itself: percpu offsets must not come from symbolized globals,
 // and running the asm as is instead (what this used to do) computed the same
 // value but dropped the pointer's label.
+//
+// Privileged instructions, which fault in a userspace run, are modeled: a read
+// of hardware state (rdmsr, rdpmc, in, mov from %crN/%drN) is a fresh symbolic
+// value (see AsmHwReadFn), and a write or a control instruction (wrmsr, out,
+// mov to %crN, cli/sti, wbinvd, lgdt, ...) does nothing.
 class AsmLifter {
   IRBuilder<> &IRB;
   const DataLayout &DL;
@@ -3256,6 +3306,7 @@ class AsmLifter {
   // -- and a 32-bit write replaces the register (x86-64 zero-extends it).
   StringMap<Value *> Regs;
   Value *ZF = nullptr, *SF = nullptr, *CF = nullptr; // i1; null: unknown
+  Value *HwRead;  // i32 (), a fresh symbolic value; null: not declared
 
   struct Loc {
     enum { LNone, LReg, LMem, LImm } K = LNone;
@@ -3268,8 +3319,8 @@ class AsmLifter {
 
 public:
   AsmLifter(IRBuilder<> &IRB, const DataLayout &DL, ArrayRef<AsmOp> Ops,
-            Type *ResultTy, bool Volatile)
-      : IRB(IRB), DL(DL), Ops(Ops), Volatile(Volatile) {
+            Type *ResultTy, bool Volatile, Value *HwRead)
+      : IRB(IRB), DL(DL), Ops(Ops), Volatile(Volatile), HwRead(HwRead) {
     if (auto *ST = dyn_cast<StructType>(ResultTy))
       ResultTys.append(ST->element_begin(), ST->element_end());
     else if (!ResultTy->isVoidTy())
@@ -3601,10 +3652,67 @@ private:
     return A;
   }
 
+  // A fresh symbolic value of Bits (<= 64) bits: see AsmHwReadFn.
+  Value *hwRead(unsigned Bits) {
+    FunctionType *FT = FunctionType::get(IRB.getInt32Ty(), false);
+    Value *Lo = IRB.CreateZExt(IRB.CreateCall(FT, HwRead), IRB.getInt64Ty());
+    if (Bits > 32) {
+      Value *Hi = IRB.CreateZExt(IRB.CreateCall(FT, HwRead), IRB.getInt64Ty());
+      Lo = IRB.CreateOr(Lo, IRB.CreateShl(Hi, 32));
+    }
+    return IRB.CreateZExtOrTrunc(Lo, IRB.getIntNTy(Bits));
+  }
+
+  // Privileged instructions, matched before their operands are parsed (a
+  // control register is not a register the lifter knows): see AsmHwReadFn.
+  // Returns false to decline, true when done; Handled says which applies.
+  bool stepPrivileged(const AsmInsn &I, bool &Handled) {
+    Handled = true;
+    if (isAsmHwNoOp(I))
+      return true;
+    Handled = isAsmHwRead(I);
+    if (!Handled)
+      return false;
+    if (!HwRead)
+      return false;
+    StringRef Mn = I.Mnemonic;
+    if (Mn == "rdmsr" || Mn == "rdpmc") {
+      // %edx:%eax, each zero-extended into its 64-bit register
+      Regs["ax"] = IRB.CreateZExt(hwRead(32), IRB.getInt64Ty());
+      Regs["dx"] = IRB.CreateZExt(hwRead(32), IRB.getInt64Ty());
+      CF = ZF = SF = nullptr;
+      return true;
+    }
+    // in port, dst / mov %crN, dst: a value into the destination
+    Loc D;
+    StringRef DT = StringRef(I.Operands[1]).trim();
+    if (DT == "%al" || DT == "%ax" || DT == "%eax") {
+      D.K = Loc::LReg;
+      D.Reg = "ax";
+      D.Bits = DT == "%al" ? 8 : DT == "%ax" ? 16 : 32;
+    } else if (!parseLoc(DT, D) || D.K != Loc::LReg) {
+      return false;
+    }
+    unsigned W = Mn.starts_with("mov") ? 64
+                 : Mn == "inb"         ? 8
+                 : Mn == "inw"         ? 16
+                 : Mn == "inl"         ? 32
+                                       : D.Bits;
+    if (!W)
+      return false;
+    return write(D, hwRead(W), W);
+  }
+
   bool step(const AsmInsn &I) {
     StringRef Mn = I.Mnemonic;
     bool Lock = Mn.consume_front("lock ");
     bool Rep = Mn.consume_front("rep ");
+    if (!Lock && !Rep) {
+      bool Handled;
+      bool OK = stepPrivileged(I, Handled);
+      if (Handled)
+        return OK;
+    }
     SmallVector<Loc, 3> Ls;
     for (auto &O : I.Operands) {
       Loc L;
@@ -4515,7 +4623,8 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
   // Lift what is left if it is plain integer code (see AsmLifter); what the
   // lifter does not accept is rolled back and runs as is.
   if ((IsCall || isa<CallBrInst>(CB)) && !Insns.empty() && !IsTrap) {
-    AsmLifter Lifter(IRB, DL, Ops, CB.getType(), Volatile);
+    Value *HwRead = UF.UC.AsmCallees.lookup(AsmHwReadFn);
+    AsmLifter Lifter(IRB, DL, Ops, CB.getType(), Volatile, HwRead);
     if (Lifter.lift(Insns) && Lifter.outputsKnown()) {
       SmallVector<Value *, 4> Results(NumResults, nullptr);
       for (unsigned N = 0; N < Ops.size(); ++N)
