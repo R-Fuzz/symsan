@@ -2156,6 +2156,25 @@ void ucsan_trace_warn(const char *file, uint32_t line, uint32_t flags) {
                            flags);
 }
 
+// VMX: the VMCS the kernel's vmread/vmwrite act on, modeled as memory.
+// UCSanPass lowers `vmread field, dst` to a load from ucsan_vmcs_field(field)
+// and `vmwrite src, field` to a store to it, so a field read before any write
+// is symbolized from the seed on first access, like any global, and a read
+// after a write returns what was written, label included.  A slot per field:
+// the encoding's width (bits 14:13), type (11:10) and index (9:1) select it,
+// and the high-access bit (0) the upper half of a 64-bit field.  Richer VMX
+// semantics (read-only exit information, a VM exit on vmlaunch/vmresume)
+// belong here.
+static u64 ucsan_vmcs[1 << 13];
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void *ucsan_vmcs_field(u64 field) {
+  u64 idx = (((field >> 13) & 3) << 11) | (((field >> 10) & 3) << 9) |
+            ((field >> 1) & 0x1ff);
+  char *slot = (char *)&ucsan_vmcs[idx];
+  return (field & 1) ? slot + 4 : slot;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_fini() {
   ucsan_fini_internal();

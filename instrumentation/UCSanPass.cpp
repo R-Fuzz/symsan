@@ -450,6 +450,7 @@ class UCSan {
   FunctionCallee UCCheckPointerArgFn;
   FunctionCallee UCCheckUBIFn;
   FunctionCallee UCCombineLabelFn;
+  FunctionCallee UCVmcsFieldFn;  // ptr ucsan_vmcs_field(i64): see AsmLifter
   FunctionCallee UCSetLabelForArgsFn;
   FunctionCallee UCLoadPointerShadowFn;
   FunctionCallee UCStorePointerShadowFn;
@@ -930,6 +931,13 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCCheckCopyBoundsFn = M.getOrInsertFunction("ucsan_check_copy_bounds", UCCheckCopyBoundsFnTy);
   F = dyn_cast<Function>(UCCheckCopyBoundsFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // ptr ucsan_vmcs_field(i64 field): the VMCS slot vmread/vmwrite act on
+  UCVmcsFieldFn = M.getOrInsertFunction(
+      "ucsan_vmcs_field", FunctionType::get(VoidPtrTy, {Int64Ty}, false));
+  F = dyn_cast<Function>(UCVmcsFieldFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -3307,6 +3315,12 @@ class AsmLifter {
   StringMap<Value *> Regs;
   Value *ZF = nullptr, *SF = nullptr, *CF = nullptr; // i1; null: unknown
   Value *HwRead;  // i32 (), a fresh symbolic value; null: not declared
+  FunctionCallee VmcsField;  // ptr (i64): the VMCS slot of a field
+public:
+  // Calls into the runtime the lifted code makes (ucsan_vmcs_field): the
+  // visitor must not treat them as calls of the program.
+  SmallVector<CallInst *, 2> RuntimeCalls;
+private:
 
   struct Loc {
     enum { LNone, LReg, LMem, LImm } K = LNone;
@@ -3319,8 +3333,10 @@ class AsmLifter {
 
 public:
   AsmLifter(IRBuilder<> &IRB, const DataLayout &DL, ArrayRef<AsmOp> Ops,
-            Type *ResultTy, bool Volatile, Value *HwRead)
-      : IRB(IRB), DL(DL), Ops(Ops), Volatile(Volatile), HwRead(HwRead) {
+            Type *ResultTy, bool Volatile, Value *HwRead,
+            FunctionCallee VmcsField)
+      : IRB(IRB), DL(DL), Ops(Ops), Volatile(Volatile), HwRead(HwRead),
+        VmcsField(VmcsField) {
     if (auto *ST = dyn_cast<StructType>(ResultTy))
       ResultTys.append(ST->element_begin(), ST->element_end());
     else if (!ResultTy->isVoidTy())
@@ -3713,6 +3729,17 @@ private:
       if (Handled)
         return OK;
     }
+    // `jna ${N:l}` to an asm goto label (the VMX failure path after vmread /
+    // vmwrite): only when the flags say it is not taken, since the lifted asm
+    // falls through to its default destination
+    if ((Mn == "jna" || Mn == "jbe") && I.Operands.size() == 1 &&
+        StringRef(I.Operands[0]).ends_with(":l}")) {
+      auto isFalse = [](Value *F) {
+        auto *C = dyn_cast_or_null<ConstantInt>(F);
+        return C && C->isZero();
+      };
+      return !Lock && !Rep && isFalse(CF) && isFalse(ZF);
+    }
     SmallVector<Loc, 3> Ls;
     for (auto &O : I.Operands) {
       Loc L;
@@ -3731,6 +3758,36 @@ private:
       Regs[Ls[0].Reg] = IRB.getInt64(0);
     if (Rep && !(Mn.starts_with("bsf") || Mn.starts_with("bsr")))
       return false;
+
+    // VMX: vmread field, dst / vmwrite src, field act on the runtime's VMCS
+    // model (ucsan_vmcs_field), and succeed: CF = ZF = 0
+    if ((Mn == "vmread" || Mn == "vmwrite") && !Lock && !Rep &&
+        Ls.size() == 2 && VmcsField) {
+      bool Rd = Mn == "vmread";
+      const Loc &FL = Rd ? Ls[0] : Ls[1];
+      const Loc &VL = Rd ? Ls[1] : Ls[0];
+      if (FL.K == Loc::LMem || VL.K == Loc::LImm)
+        return false;
+      Value *Fld = read(FL, 64);
+      if (!Fld || !(Fld = toInt(Fld, 64)))
+        return false;
+      CallInst *Slot = IRB.CreateCall(VmcsField, {Fld});
+      RuntimeCalls.push_back(Slot);
+      if (Rd) {
+        LoadInst *L = IRB.CreateLoad(IRB.getInt64Ty(), Slot);
+        L->setVolatile(true);
+        if (!write(VL, L, 64))
+          return false;
+      } else {
+        Value *V = read(VL, 64);
+        if (!V || !(V = toInt(V, 64)))
+          return false;
+        IRB.CreateStore(V, Slot)->setVolatile(true);
+      }
+      CF = ZF = IRB.getFalse();
+      SF = nullptr;
+      return true;
+    }
 
     // mov src, dst
     if (splitMnemonic(Mn, "mov", Suf)) {
@@ -4624,8 +4681,16 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
   // lifter does not accept is rolled back and runs as is.
   if ((IsCall || isa<CallBrInst>(CB)) && !Insns.empty() && !IsTrap) {
     Value *HwRead = UF.UC.AsmCallees.lookup(AsmHwReadFn);
-    AsmLifter Lifter(IRB, DL, Ops, CB.getType(), Volatile, HwRead);
+    AsmLifter Lifter(IRB, DL, Ops, CB.getType(), Volatile, HwRead,
+                     UF.UC.UCVmcsFieldFn);
     if (Lifter.lift(Insns) && Lifter.outputsKnown()) {
+      // runtime calls: skipped by both passes, their pointer unlabeled (a
+      // VMCS slot is a global, which check_pointer symbolizes)
+      for (CallInst *RC : Lifter.RuntimeCalls) {
+        UF.UC.markNosanitize(RC);
+        UF.SkipInsts.insert(RC);
+        UF.setShadow(RC, UF.UC.getZeroShadow(RC));
+      }
       SmallVector<Value *, 4> Results(NumResults, nullptr);
       for (unsigned N = 0; N < Ops.size(); ++N)
         if (Ops[N].Result >= 0)
