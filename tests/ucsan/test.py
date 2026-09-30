@@ -55,6 +55,8 @@ tests = []
 solver_error_absent_tests = set()
 # test name -> event ids (PIPE_EVENT_TYPE) that must be reported at least once
 expected_events = {}
+# test -> extra compiler flags (`// CFLAGS:`)
+test_cflags = {}
 
 sys.path.append(os.path.join(SCRIPT_DIR, "..", "..", "fuzzer", "thoroupy"))
 
@@ -87,6 +89,8 @@ def parse_test(file, test_name):
             flags = line.split(":", maxsplit=2)[1].strip().split(" ")
             for flag in flags:
                 test[2].append([int(flag, 0), -2])
+        elif line.startswith("// CFLAGS:"):
+            test_cflags[test_name] = line.split(":", maxsplit=1)[1].strip()
         elif line.startswith("// SOLVER-ERROR-ABSENT"):
             solver_error_absent_tests.add(test_name)
         elif line.startswith("// EVENT:"):
@@ -179,6 +183,10 @@ def perform_test(stage, *args, seed=None):
     compat_flags = "-Wno-error=implicit-function-declaration"
 
     # Compile with new command format
+    # `// CFLAGS:` adds compiler flags, e.g. -O2 for a test of what only
+    # optimized code does (the pass reusing a checked pointer).
+    if test_cflags.get(test_name):
+        compat_flags += " " + test_cflags[test_name]
     compile_cmd = f"{cc} -g -S -emit-llvm {compat_flags} -o ll/{test_name}.ll {src}"
     run(compile_cmd, cwd=".", env=env)
 

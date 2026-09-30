@@ -26,6 +26,8 @@ python3 test.py                   # run the whole suite
 `ABSENT` asserts that an exit status is never observed during exploration.
 `EVENT: <id>...` asserts that the target reports each event (`PIPE_EVENT_TYPE`,
 e.g. 106 for a kernel WARN) at least once.
+`CFLAGS: <flags>` adds compiler flags (e.g. `-O2`, for what only optimized code
+does, such as the pass reusing a checked pointer).
 `SOLVER-ERROR-ABSENT` asserts that the manager reports no solver parse error;
 pair it with `DISCARD` when an exit status may be reached but is not the
 property under test.

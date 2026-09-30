@@ -533,6 +533,29 @@ ucsan_label allocate_label() {
 // Memory Helpers
 //===----------------------------------------------------------------------===//
 
+// A lazily created object never moves.  It used to be copied to a larger
+// buffer when an access fell outside it, and a real address already handed
+// out -- a check_pointer result the pass reuses for later accesses
+// (CheckedPtrMap), one hoisted to a dominating block, a pointer a wrapper
+// returned -- kept pointing into the old buffer: writes through it were lost
+// to the object and reads were stale, silently.  Instead each object gets a
+// window twice the object size limit with its offset 0 in the middle, so it
+// can grow either way in place up to the limit, which bounds its total size.
+// Windows come from large no-reserve mappings: only touched pages cost
+// memory.  Returns the window's middle, the object's offset 0.
+static char *object_window() {
+  static char *cur, *end;
+  uptr half = RoundUpTo(ucsan_object_size_limit(), GetPageSizeCached());
+  if (!cur || cur + 2 * half > end) {
+    uptr chunk = Max((uptr)1 << 30, 2 * half);
+    cur = (char *)MmapNoReserveOrDie(chunk, "UCSan object windows");
+    end = cur + chunk;
+  }
+  char *mid = cur + half;
+  cur += 2 * half;
+  return mid;
+}
+
 void* customized_malloc(uint64_t size) {
   if (size > ucsan_object_size_limit()) {
     UCSAN_OUT("Object size too large: %lu\n", size);
@@ -929,10 +952,18 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     }
     object_size = obj.data.size();
 
+    // Seed data can make an object larger than the size limit
+    if (object_size > ucsan_object_size_limit()) {
+      UCSAN_OUT("Object size too large: %zu\n", object_size);
+      exit(exit_reason::REASON_OBJ_OOB);
+    }
+
     // Create object label
     ucsan_label obj_label = allocate_label();
 
-    void* np = customized_malloc(object_size);
+    // offset 0 at the window's middle (see object_window); np is the lowest
+    // byte, obj.offset below it
+    void* np = object_window() - obj.offset;
     internal_memcpy(np, obj.data.data(), object_size);
 
     ucsan_obj_info *obj_label_info = to_obj_info(get_label_info(obj_label));
@@ -1025,9 +1056,11 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       [new_size]            -> e.g. use container_of access to a larger object
       ---------------------
     */
+    // (now: nothing is copied.  The object keeps its window and its offset 0,
+    // and only the bytes between the old and the new bounds are added, in
+    // place: see object_window.)
 
     // Slow path: need to enlarge object
-    uint64_t original_size = obj_label_info->lower_bound + obj_label_info->upper_bound;
     uint64_t extended_lower = 0;
     uint64_t new_lower_bound = obj_label_info->lower_bound;
 
@@ -1056,70 +1089,45 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       exit(exit_reason::REASON_OBJ_OOB);
     }
 
-    void *np = customized_malloc(new_size);
-    UCSAN_OUT("Enlarged object: np=%p, new_size=%lu\n", np, new_size);
+    // Grow in place (see object_window): offset 0 stays where it is, the new
+    // bytes on either side get labels and zeroes -- the value the manager
+    // gives them in the seed (EVENT_EXTENSION) -- and nothing moves.  Byte
+    // labels are numbered relative to offset 0, as before.
+    char *base = (char *)obj_base;
+    int64_t old_lower = -(int64_t)obj_label_info->lower_bound;
+    int64_t old_upper = (int64_t)obj_label_info->upper_bound;
+    int64_t new_upper = (int64_t)new_size - (int64_t)new_lower_bound;
+    UCSAN_OUT("Enlarged object in place: [%ld, %ld) -> [%ld, %ld)\n",
+              old_lower, old_upper, -(int64_t)new_lower_bound, new_upper);
 
-    // Copy and extend shadow memory
+    auto label_new_byte = [&](int64_t rel) {
+      ucsan_label byte_label = allocate_label();
+      ucsan_label_info *byte_info = get_label_info(byte_label);
+      ucsan_byte_info *byte = to_byte_info(byte_info);
+      byte->op = OP_NONE;
+      byte->object_id = object_id;
+      byte->offset = rel;
+
+      void *nptr = base + rel;
+      *(char *)nptr = 0;
+      *ucsan_shadow_for(nptr) = byte_label;
+
+      // Bridge to SymSan: offset relative to offset 0 (negative below it)
+      dfsan_label symsan_label = __taint_create_label(object_id, rel, 1);
+      __taint_set_label(symsan_label, nptr, 1);
+    };
     // Padding the left lower bounds with new labels
-    for (uint64_t offset = 0; offset < extended_lower; ++offset) {
-      ucsan_label byte_label = allocate_label();
-
-      ucsan_label_info *byte_info = get_label_info(byte_label);
-      ucsan_byte_info *byte = to_byte_info(byte_info);
-      byte->op = OP_NONE;
-      byte->object_id = object_id;
-      byte->offset = (int64_t)offset - (int64_t)new_lower_bound;
-
-      void *nptr = (void*)((uint64_t)np + offset);
-      *ucsan_shadow_for(nptr) = byte_label;
-
-      // Bridge to SymSan: use signed offset (negative for backward extension)
-      dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
-      __taint_set_label(symsan_label, nptr, 1);
-    }
-
-    // Copy shadow memory from original object.  obj_base is its offset 0;
-    // its bytes start lower_bound below that, once it has grown backwards.
-    void *old_start = (void*)((int64_t)obj_base - (int64_t)obj_label_info->lower_bound);
-    void *dst_addr = (void*)((int64_t)np + extended_lower);
-    ucsan_label *shadow = ucsan_shadow_for(dst_addr);
-    internal_memcpy(shadow, ucsan_shadow_for(old_start), original_size * sizeof(ucsan_label));
-
-    // Bridge to SymSan: copy shadow memory
-    __taint_copy_shadow(dst_addr, old_start, original_size);
-
-    // Copy original data
-    internal_memcpy((char*)np + extended_lower, old_start, original_size);
-
+    for (int64_t rel = -(int64_t)new_lower_bound; rel < old_lower; ++rel)
+      label_new_byte(rel);
     // Padding the right upper bounds with new labels
-    for (uint64_t offset = extended_lower + original_size; offset < new_size; ++offset) {
-      ucsan_label byte_label = allocate_label();
+    for (int64_t rel = old_upper; rel < new_upper; ++rel)
+      label_new_byte(rel);
 
-      ucsan_label_info *byte_info = get_label_info(byte_label);
-      ucsan_byte_info *byte = to_byte_info(byte_info);
-      byte->op = OP_NONE;
-      byte->object_id = object_id;
-      byte->offset = offset - new_lower_bound;
-
-      void *nptr = (void*)((uint64_t)np + offset);
-      *ucsan_shadow_for(nptr) = byte_label;
-
-      // Bridge to SymSan: offset relative to original pointer base
-      dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
-      __taint_set_label(symsan_label, nptr, 1);
-    }
-
-    // Update object info
+    // Update object info (real_ptr, offset 0, does not change)
     obj_label_info->lower_bound = (uint32_t)new_lower_bound;
-    obj_label_info->upper_bound = (uint32_t)(new_size - new_lower_bound);
-    obj_label_info->real_ptr = (char*)np + new_lower_bound;
+    obj_label_info->upper_bound = (uint32_t)new_upper;
 
-    // relative to offset 0 (real_ptr), as the fast path does.  np is the
-    // lowest byte, so returning np + desired_offset put a backward access
-    // (container_of, a[-1]) new_lower_bound bytes *before* the allocation,
-    // into the malloc gap: zero data and label-0 shadow, i.e. an unlabeled
-    // NULL for any pointer field read there.
-    return (void*)((int64_t)obj_label_info->real_ptr + desired_offset);
+    return (void*)((int64_t)base + desired_offset);
   }
 
   UCSAN_OUT("Unknown pointer state: %d\n", ptr_info->status);
