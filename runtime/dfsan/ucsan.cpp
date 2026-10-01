@@ -1635,8 +1635,41 @@ static ucsan_label find_alloca_containing(void *ptr) {
   return 0;
 }
 
+// A label naming an allocation the out-of-scope callee can still write: a
+// heap object the function allocated, or a stack object of a frame that is
+// still live (a popped frame's labels lie between the heap labels and
+// __alloca_stack_top, see the stack UAF check in ucsan_check_pointer).
+static bool is_live_alloca_label(ucsan_label l) {
+  if (l < UCSAN_CONST_OFFSET || l == kUninitializedLabel)
+    return false;
+  ucsan_label last_heap = atomic_load(&__ucsan_last_label, memory_order_relaxed);
+  if (l > last_heap && l < __alloca_stack_top)
+    return false;
+  return get_label_info(l)->common.op == OP_ALLOCA;
+}
+
+static const int kResignMaxDepth = 4;
+static const int kResignMaxObjects = 64;
+
+static ucsan_label resign_alloca_object(ucsan_label label_for_ptr,
+                                        ucsan_label *seen, int *nseen,
+                                        int depth);
+
 static ucsan_label resign_alloca_object(ucsan_label label_for_ptr) {
+  ucsan_label seen[kResignMaxObjects];
+  int nseen = 0;
+  return resign_alloca_object(label_for_ptr, seen, &nseen, 0);
+}
+
+static ucsan_label resign_alloca_object(ucsan_label label_for_ptr,
+                                        ucsan_label *seen, int *nseen,
+                                        int depth) {
   UCSAN_OUT("Resign alloca object\n");
+  for (int i = 0; i < *nseen; ++i)
+    if (seen[i] == label_for_ptr)
+      return label_for_ptr;
+  if (*nseen < kResignMaxObjects)
+    seen[(*nseen)++] = label_for_ptr;
   ucsan_label_info *orig = get_label_info(label_for_ptr);
   ucsan_obj_info *obj_info = to_obj_info(orig);
 
@@ -1671,6 +1704,30 @@ static ucsan_label resign_alloca_object(ucsan_label label_for_ptr) {
         *obj_ptr = 0;
       }
     }
+  }
+
+  // The callee also writes what it reaches through the object: a buffer whose
+  // address the caller stored in it (i2c_msg.buf, msghdr.msg_name,
+  // printk_record.info).  Resigning only the object passed left that buffer
+  // uninitialized, and the caller's first read of it a UBI.  A stored pointer
+  // carries its allocation's label in all of its shadow bytes
+  // (ucsan_store_pointer_shadow).
+  if (depth >= kResignMaxDepth)
+    return label_for_ptr;
+  char *slot = (char *)RoundUpTo((uptr)lower, sizeof(void *));
+  for (; slot + sizeof(void *) <= upper; slot += sizeof(void *)) {
+    ucsan_label *ls = ucsan_shadow_for(slot);
+    ucsan_label l = ls[0];
+    if (l == label_for_ptr || !is_live_alloca_label(l))
+      continue;
+    bool whole = true;
+    for (uptr i = 1; i < sizeof(void *); ++i)
+      whole &= ls[i] == l;
+    if (!whole)
+      continue;
+    UCSAN_OUT("Resign alloca %u reached through %p in alloca %u\n",
+              l, slot, label_for_ptr);
+    resign_alloca_object(l, seen, nseen, depth + 1);
   }
   return label_for_ptr;
 }
