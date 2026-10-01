@@ -1775,9 +1775,21 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       return label_for_ptr;
     } else {
       // Mark as external pointer
+      // (only a pointer not dereferenced yet -- a byte label, or an external
+      // pointer still uninitialized -- as ucsan_check_pointer would on first
+      // use.  An initialized one keeps its object: lazy init has reused the
+      // fields lookup_object finds the object by, (parent, offset), for
+      // (obj_label, pseudo_base), so marking it uninitialized re-created the
+      // object from a label number and a pseudo pointer: an object the seed
+      // does not have, and the branches on it value mismatches.  An object
+      // label (an unmaterialized byte's marker) is not a pointer at all.)
       ucsan_ptr_info *ptr_info = to_ptr_info(orig);
-      ptr_info->op = OP_EXTERNAL;
-      ptr_info->status = PTR_UNINITIALIZED;
+      if (orig->common.op == OP_NONE ||
+          (orig->common.op == OP_EXTERNAL &&
+           ptr_info->status == PTR_UNINITIALIZED)) {
+        ptr_info->op = OP_EXTERNAL;
+        ptr_info->status = PTR_UNINITIALIZED;
+      }
       return label_for_ptr;
     }
   }
