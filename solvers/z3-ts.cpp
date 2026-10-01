@@ -606,6 +606,19 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
   return val;
 }
 
+// A `bits`-wide value, held zero-extended in a uint64 (value_cache_), as the
+// signed number it is.  The signed operations evaluated it as (int64_t)v,
+// which is right only at 64 bits: a 32-bit -100 is 0xffffff9c, i.e.
+// 4294967196, so sdiv by 5 gave 0x3333331f instead of -20, and ashr shifted
+// zeros in -- a value mismatch on every signed division or shift of a
+// negative narrow value (get_task_ioprio's IOPRIO_PRIO_VALUE arithmetic).
+static inline int64_t sext_bits(uint64_t v, unsigned bits) {
+  if (bits == 0 || bits >= 64)
+    return (int64_t)v;
+  unsigned shift = 64 - bits;
+  return (int64_t)(v << shift) >> shift;
+}
+
 // Mask of the low `bits` bits, saturating at 64.  `(1UL << bits) - 1` is UB at
 // bits == 64 and, worse, x86 masks the shift count so bits == 128 yields 0 --
 // a mask that silently zeroes the value it was meant to leave alone.  Widths of
@@ -2239,7 +2252,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       case __dfsan::AShr: {
         cache_expr(l, z3::ashr(op1, op2));
         TRACK_LABEL_BV_ONLY();
-        RECORD_VALUE((int64_t)val1 >> (val2 % size));
+        RECORD_VALUE(sext_bits(val1, size) >> (val2 % size));
         break;
       }
       case __dfsan::Add: {
@@ -2324,11 +2337,15 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       case __dfsan::SDiv: {
         cache_expr(l, op1 / op2);
         TRACK_LABEL_BV_ONLY();
-        if (val2 == 0) {
+        int64_t a = sext_bits(val1, size), b = sext_bits(val2, size);
+        if (b == 0) {
           DEBUGF("WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
-        } else
-          RECORD_VALUE((int64_t)val1 / (int64_t)val2);
+        } else {
+          // a / -1 as a negation: INT64_MIN / -1 traps here (and in the
+          // target; LLVM leaves it undefined), the negation just wraps
+          RECORD_VALUE(b == -1 ? (uint64_t)0 - (uint64_t)a : (uint64_t)(a / b));
+        }
         break;
       }
       case __dfsan::URem: {
@@ -2344,11 +2361,13 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       case __dfsan::SRem: {
         cache_expr(l, z3::srem(op1, op2));
         TRACK_LABEL_BV_ONLY();
-        if (val2 == 0) {
+        int64_t a = sext_bits(val1, size), b = sext_bits(val2, size);
+        if (b == 0) {
           DEBUGF("WARNING: division by zero for label %u\n", l);
           RECORD_VALUE(0);
-        } else
-          RECORD_VALUE((int64_t)val1 % (int64_t)val2);
+        } else {
+          RECORD_VALUE(b == -1 ? 0 : a % b);  // INT64_MIN % -1 traps
+        }
         break;
       }
       // floating-point arithmetic.  op1/op2 are IEEE-754 bit-vectors of `size`;
