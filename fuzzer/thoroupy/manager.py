@@ -754,12 +754,17 @@ class UcsanManager:
                 # Reset solver with current seed's input bytes (one per object)
                 self.solver.reset_input(self._current.to_bytes_list(),
                                         self._current.origins())
-                logger.info("Scheduling seed: " + current.__repr__())
+                logger.info("Scheduling seed: %r", current)
                 for msg in self.p.get_pipe():
-                    logger.debug("\033[92mrecv msg: " + msg.__repr__() + "\033[0m")
+                    logger.debug("\033[92mrecv msg: %r\033[0m", msg)
                     if not self._handle_msg(msg):
                         self._termination_manager.reset()
                         self._reported.clear()
+                        break
+                    # a stop request (e.g. a time budget) is honored between
+                    # messages: one long trace that keeps producing solutions
+                    # would otherwise run on until its seed ends
+                    if self._stop_requested:
                         break
                     logger.debug("\033[93mwait for next msg\033[0m")
 
