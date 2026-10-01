@@ -461,6 +461,9 @@ static const uint8_t TrueBranchLoopExit = 0x2;
 static const uint8_t FalseBranchLoopExit = 0x1;
 static const uint8_t LoopFlagMask = 0xF;
 static const uint8_t UndefinedCheck = 0x10;
+// the condition of a select, not of a branch: an uninitialized one is not a
+// UBI, the select's result carries it (TaintFunction::visitSelectInst)
+static const uint8_t SelectCondition = 0x20;
 
 enum undefined_check_ids {
   ub_integer_overflow = 1,

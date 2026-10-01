@@ -858,6 +858,7 @@ private:
   static const uint8_t TrueBranchLoopExit = 0x2;
   static const uint8_t FalseBranchLoopExit = 0x1;
   static const uint8_t LoopExitBranch = TrueBranchLoopExit | FalseBranchLoopExit;
+  static const uint8_t SelectCondition = 0x20;  // as in dfsan.h
 };
 
 class TaintVisitor : public InstVisitor<TaintVisitor> {
@@ -4906,8 +4907,22 @@ Value* TaintFunction::visitSelectInst(Value *Cond, Value *TrueShadow,
   if (!T->isIntegerTy(1)) {
     // most cases
     visitCondition(Cond, I);
-    return TrueShadow == FalseShadow ? TrueShadow :
+    Value *Shadow = TrueShadow == FalseShadow ? TrueShadow :
         SelectInst::Create(Cond, TrueShadow, FalseShadow, "", I);
+    // An uninitialized condition is not a use (the runtime does not report a
+    // select's as a UBI): the select may have been speculated, a load of a
+    // local the source reads only on a path where it is set
+    // (register_kretprobe's on_func_entry, read after an IS_ERR() check the
+    // optimizer moved past it).  The result is what depends on it, so it
+    // carries the uninitialized label to a branch or an access that is one.
+    if (!TT.isZeroShadow(CondShadow) &&
+        Shadow->getType() == TT.PrimitiveShadowTy) {
+      IRBuilder<> IRB(I);
+      Constant *Uninit = ConstantInt::getSigned(TT.PrimitiveShadowTy, -1);  // kInitializingLabel
+      Shadow = IRB.CreateSelect(IRB.CreateICmpEQ(CondShadow, Uninit), Uninit,
+                                Shadow);
+    }
+    return Shadow;
   }
 
   // special case, when select is used to implement logical AND and OR
@@ -6027,6 +6042,8 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   uint32_t cid = TT.getBranchId(I);
   if (cid == TT.InvalidInstructionId)
     return; // XXX: forget about loop?
+  if (isa<SelectInst>(I))
+    flag |= SelectCondition;
   TT.documentBranchId(cid, I, isa<BranchInst>(I) ? "br" : "select");
   ConstantInt *LF = ConstantInt::get(TT.Int8Ty, flag);
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, cid);

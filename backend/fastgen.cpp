@@ -130,6 +130,10 @@ __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
   void *addr = __builtin_return_address(0);
 
   if (label == kInitializingLabel) {
+    // a select's condition is not a use: its result carries the label to one
+    // (TaintFunction::visitSelectInst), and nothing to solve here
+    if (flag & SelectCondition)
+      return;
     // uninitialized label
     AOUT("WARNING: uninitialized label %u @%p\n", label, addr);
     if (flags().solve_ub) __send_ubi(label, r, cid, addr);
@@ -180,15 +184,31 @@ __taint_trace_select(dfsan_label cond_label, dfsan_label true_label,
   void *addr = __builtin_return_address(0);
 
   if (cond_label == kInitializingLabel) {
-    // uninitialized label
-    AOUT("WARNING: uninitialized label %u @%p\n", cond_label, addr);
-    if (flags().solve_ub) __send_ubi(cond_label, r, cid, addr);
-    if (flags().exit_on_memerror) Die();
-    else return r ? true_label : false_label;
+    // not a use, as a select's condition is not in __taint_trace_cond: the
+    // select may have been speculated, and the result is what depends on it
+    AOUT("uninitialized select condition @%p\n", addr);
+    return kInitializingLabel;
   }
 
   AOUT("solving select: %u %u %u %u %u %u 0x%x @%p\n",
        cond_label, true_label, false_label, r, true_op, false_op, cid, addr);
+
+  // An uninitialized operand of a logical AND/OR decides the result only when
+  // the condition lets it through; otherwise the condition alone does.  The
+  // union would be kInitializingLabel either way, and sent as a constraint it
+  // is not a label the solver has.
+  if (true_label == kInitializingLabel && false_op == 0) {
+    if (r)
+      return kInitializingLabel;
+    __taint_send_cond(cond_label, r, 1, 0, cid, addr);
+    return cond_label;
+  }
+  if (false_label == kInitializingLabel && true_op == 1) {
+    if (!r)
+      return kInitializingLabel;
+    __taint_send_cond(cond_label, r, 1, 0, cid, addr);
+    return cond_label;
+  }
 
   // check if it's actually a logical AND: select cond, label, false
   if (true_label != 0 && false_op == 0) {
