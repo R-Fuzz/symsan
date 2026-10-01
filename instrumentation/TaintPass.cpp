@@ -1513,6 +1513,65 @@ void Taint::writeBranchMap(Module &M) {
   OS << Buf;
 }
 
+// A load the frontend marks as a bool (!range [0, 2): clang's _Bool, and
+// whatever the optimizer derived from one) is trusted to be 0 or 1, and
+// codegen uses the loaded byte itself as the i1.  But the byte can come from
+// an input -- a UCSan seed's object, a global UCSan symbolized, a file -- and
+// hold anything, a trap representation: the target then branched on the whole
+// byte (a condition recorded as 0xff), while SymSan evaluated the frontend's
+// trunc/icmp of it to 1, and the branch was a value mismatch.  The solver makes
+// such bytes itself (0xff satisfies `b != 0`), and UCSan reuses a seed byte
+// across types (the super object's offsets depend on the path), so it cannot be
+// ruled out at the source.  Make the load's value the bool it stands for,
+// zext(v != 0) -- for 0 and 1 nothing changes -- and drop the range so nothing
+// downstream relies on it.  `!= 0` rather than the low bit, so that false is
+// only 0 and a solution keeps meaning the same in a build without this.
+//
+// The same goes for an i1 load (GlobalOpt shrinks a bool global to i1): its
+// byte is assumed 0 or 1 just the same.  It becomes an i8 load and `!= 0`.
+static void normalizeBoolLoads(Function &F) {
+  SmallVector<LoadInst *, 16> Loads;
+  SmallVector<LoadInst *, 4> I1Loads;
+  for (Instruction &I : instructions(F)) {
+    auto *LI = dyn_cast<LoadInst>(&I);
+    if (!LI || !LI->getType()->isIntegerTy())
+      continue;
+    if (LI->getType()->isIntegerTy(1)) {
+      if (LI->isSimple())
+        I1Loads.push_back(LI);
+      continue;
+    }
+    MDNode *Range = LI->getMetadata(LLVMContext::MD_range);
+    if (!Range || Range->getNumOperands() != 2)
+      continue;
+    auto *Lo = mdconst::dyn_extract<ConstantInt>(Range->getOperand(0));
+    auto *Hi = mdconst::dyn_extract<ConstantInt>(Range->getOperand(1));
+    if (!Lo || !Hi || !Lo->isZero() || !Hi->equalsInt(2))
+      continue;
+    Loads.push_back(LI);
+  }
+  for (LoadInst *LI : Loads) {
+    LI->setMetadata(LLVMContext::MD_range, nullptr);
+    IRBuilder<> IRB(LI->getNextNode());
+    Value *NonZero = IRB.CreateICmpNE(LI, ConstantInt::get(LI->getType(), 0));
+    Value *Bool = IRB.CreateZExt(NonZero, LI->getType());
+    LI->replaceUsesWithIf(Bool, [NonZero](Use &U) {
+      return U.getUser() != NonZero;
+    });
+  }
+  for (LoadInst *LI : I1Loads) {
+    IRBuilder<> IRB(LI);
+    LoadInst *Byte = IRB.CreateAlignedLoad(IRB.getInt8Ty(),
+                                           LI->getPointerOperand(),
+                                           LI->getAlign());
+    Byte->copyMetadata(*LI);  // UCSan's checked marker, debug location, ...
+    Byte->setMetadata(LLVMContext::MD_range, nullptr);
+    Value *NonZero = IRB.CreateICmpNE(Byte, IRB.getInt8(0));
+    LI->replaceAllUsesWith(NonZero);
+    LI->eraseFromParent();
+  }
+}
+
 void Taint::addContextRecording(Function &F) {
   // Most code from Angora
   BasicBlock *BB = &F.getEntryBlock();
@@ -2454,6 +2513,7 @@ bool Taint::runImpl(Module &M) {
     if (!(F->getName()).starts_with("dfsw$"))
       addFrameTracing(*F);
     removeUnreachableBlocks(*F);
+    normalizeBoolLoads(*F);
 
     TaintFunction TF(*this, F, FnsWithNativeABI.count(F),
                      FnsWithForceZeroLabel.count(F));
