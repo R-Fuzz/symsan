@@ -4914,16 +4914,18 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
       Args.push_back(ConstantPointerNull::get(UF.UC.VoidPtrTy));
       Value *Ret = IRB_EB.CreateCall(UF.UC.UCWrapRetvalFn, Args, "");
       UF.UC.markNosanitize(Ret);
-      if (!RT->isPointerTy()) { // if not a pointer return
-        Type *PRT = RT->getPointerTo();
-        Ret = IRB_EB.CreatePointerCast(Ret, PRT);
-        UF.UC.markNosanitize(Ret);
-        Ret = IRB_EB.CreateLoad(RT, Ret);
-        UF.UC.markNosanitize(Ret);
-      } else {
-        Ret = IRB_EB.CreatePointerCast(Ret, RT);
-        UF.UC.markNosanitize(Ret);
-      }
+      // A pointer is loaded from the buffer like any other value, as the
+      // dangle wrapper does (wrapRetvalRecursive).  The buffer's own address
+      // used to stand in for it: never NULL, while the pointer's SymSan label
+      // names the seed's bytes, so every NULL check on the result of a call
+      // through an invalid function pointer was a value mismatch
+      // (x86_pmu_event_init's x86_pmu.hw_config), and the NULL path was never
+      // taken.
+      Type *PRT = RT->getPointerTo();
+      Ret = IRB_EB.CreatePointerCast(Ret, PRT);
+      UF.UC.markNosanitize(Ret);
+      Ret = IRB_EB.CreateLoad(RT, Ret);
+      UF.UC.markNosanitize(Ret);
       retEB = Ret;
       if (RetPhiNode) RetPhiNode->addIncoming(retEB, IRB_EB.GetInsertBlock());
     }
