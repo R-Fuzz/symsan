@@ -3038,6 +3038,25 @@ static void collectSCEVUnknowns(const SCEV *S,
   // SCEVConstant has no unknowns
 }
 
+// Under UCSan every pointer SymSan is given is the result of
+// ucsan_check_pointer, the address actually accessed.  SCEV cannot see through
+// that call, so hoisting reads the recurrence off the pointer it was given,
+// and that is the same address only when the pointer is known to be real: a
+// stack object or a global, which ucsan_check_pointer returns unchanged.
+// Anything else may be a UCSan pseudo-pointer (an argument, a loaded pointer,
+// a call result), whose value is not an address at all -- 0 in the seed, while
+// every access through it is materialized: hoisted, it was a SymSan NULL
+// dereference (calc_sb_1_csum in the kernel eval).  Such accesses keep their
+// per-iteration checks on the checked pointer.
+static bool isRealAddress(const Value *Ptr, LoopInfo *LI) {
+  SmallVector<const Value *, 4> Objs;
+  getUnderlyingObjects(Ptr, Objs, LI);
+  for (const Value *Obj : Objs)
+    if (!isa<AllocaInst>(Obj) && !isa<GlobalVariable>(Obj))
+      return false;
+  return !Objs.empty();
+}
+
 // Hoist __taint_check_bounds / __taint_solve_bounds calls out of loops using
 // SCEV analysis.
 // For each loop with a computable backedge-taken count, find bounds checks
@@ -3307,6 +3326,8 @@ void TaintFunction::hoistBoundsChecks() {
       }
 
       DenseSet<Value *> EmittedBufs;
+      // the checks a __taint_solve_str_bounds stands for; the others stay
+      SmallVector<CallInst *, 8> Covered;
       for (CallInst *CI : BoundsChecks) {
         Value *AddrLabel = CI->getArgOperand(0);  // buf shadow (bounds info)
         Value *Addr = CI->getArgOperand(1);       // buf concrete address
@@ -3343,7 +3364,10 @@ void TaintFunction::hoistBoundsChecks() {
         }
 
         // One call per unique buffer
-        if (!EmittedBufs.insert(AddrLabel).second) continue;
+        if (EmittedBufs.count(AddrLabel)) {
+          Covered.push_back(CI);
+          continue;
+        }
 
         // Resolve buf_ptr to loop-invariant start address
         Value *BufPtr = Addr;
@@ -3354,8 +3378,11 @@ void TaintFunction::hoistBoundsChecks() {
             if (ClWithUCSan) {
               if (auto *ChkCall = dyn_cast<CallInst>(PtrOp)) {
                 Function *ChkFn = ChkCall->getCalledFunction();
-                if (ChkFn && ChkFn->getName() == "ucsan_check_pointer")
+                if (ChkFn && ChkFn->getName() == "ucsan_check_pointer") {
+                  if (!isRealAddress(ChkCall->getArgOperand(0), LI))
+                    continue;  // see isRealAddress
                   PtrOp = ChkCall->getArgOperand(0);
+                }
               }
             }
             if (auto *BufGEP = dyn_cast<GetElementPtrInst>(PtrOp)) {
@@ -3371,10 +3398,14 @@ void TaintFunction::hoistBoundsChecks() {
         IRB.CreateCall(TT.TaintSolveStrBoundsFn,
                        {StrPtr, AddrLabel,
                         BufPtr, ConstantInt::get(TT.Int64Ty, Step)});
+        EmittedBufs.insert(AddrLabel);
+        Covered.push_back(CI);
       }
 
       // Remove per-iteration bounds checks
-      for (CallInst *CI : BoundsChecks)
+      // (only those summarized: one skipped above, a buffer whose start is
+      // not known here, used to be removed all the same and never checked)
+      for (CallInst *CI : Covered)
         CI->eraseFromParent();
 
       continue;
@@ -3488,12 +3519,15 @@ void TaintFunction::hoistBoundsChecks() {
 
       // With UCSan, Addr is ptrtoint(ucsan_check_pointer(orig_ptr, ...)).
       // ucsan_check_pointer is opaque to SCEV; use the original pointer.
+      // (only when that is the same address, see isRealAddress)
       Value *AddrForSCEV = Addr;
       if (ClWithUCSan) {
         if (auto *PTI = dyn_cast<PtrToIntOperator>(Addr)) {
           if (auto *ChkCall = dyn_cast<CallInst>(PTI->getPointerOperand())) {
             Function *ChkFn = ChkCall->getCalledFunction();
             if (ChkFn && ChkFn->getName() == "ucsan_check_pointer") {
+              if (!isRealAddress(ChkCall->getArgOperand(0), LI))
+                continue;
               IRBuilder<> IRB(CI);
               AddrForSCEV = IRB.CreatePtrToInt(ChkCall->getArgOperand(0), TT.Int64Ty);
               SCEVTemps.push_back(cast<Instruction>(AddrForSCEV));
@@ -3536,6 +3570,10 @@ void TaintFunction::hoistBoundsChecks() {
 
       AddrLabel = ResolveLoopInvariantLabel(AddrLabel);
       if (!AddrLabel)
+        continue;
+
+      // the summary check below is given this pointer, not the checked one
+      if (!isRealAddress(CI->getArgOperand(0), LI))
         continue;
 
       IRBuilder<> LocalIRB(CI);
@@ -3736,11 +3774,18 @@ void TaintFunction::hoistBoundsChecks() {
             if (ChkFn && ChkFn->getName() == "ucsan_check_pointer")
               PtrOp = ChkCall->getArgOperand(0);
           }
+          // the GEP's base is not checked at all: UCSan checks the address
+          // the GEP computes, so this is the pointer before any check
+          // (see isRealAddress), and the summary is given it
+          if (!isRealAddress(PtrOp, LI))
+            continue;
         }
         if (L->isLoopInvariant(PtrOp)) {
           IRBuilder<> IRB(InsertPt);
           BasePtrForSCEV = IRB.CreatePtrToInt(PtrOp, TT.Int64Ty);
         }
+      } else if (ClWithUCSan) {
+        continue;  // no pointer to tell real from pseudo by
       }
       if (!L->isLoopInvariant(BasePtrForSCEV))
         continue;
