@@ -1883,6 +1883,13 @@ void* ucsan_wrap_retval(uint64_t size, ucsan_label *ret_label, bool is_ptr, void
     __ucsan_wrapped_return_tls[i] = last_offset + i < seed_size ?
         ucsan_tainted.objects->at(0).data[last_offset + i] : 0;
   }
+  // The caller loads the value as its own type, so a bool is one byte that
+  // must be 0 or 1: LLVM's i1 load leaves the other bits undefined and the
+  // branch tests the whole byte, while SymSan truncates the label to `bits`
+  // (__taint_set_retval_tls).  A seed byte of 2 was a false bool the target
+  // took as true, and the branch on it a value mismatch.
+  if (bits % 8)
+    __ucsan_wrapped_return_tls[size - 1] &= (1u << (bits % 8)) - 1;
 
   return (void*)__ucsan_wrapped_return_tls;
 }
