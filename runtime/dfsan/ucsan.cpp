@@ -567,14 +567,6 @@ void* customized_malloc(uint64_t size) {
   return (void*)ret;
 }
 
-static inline bool is_writeable(void *p) {
-  int fd = open("/dev/zero", O_RDONLY);
-  if (fd < 0) return false;
-  bool writeable = read(fd, p, 1) == 1;
-  close(fd);
-  return writeable;
-}
-
 //===----------------------------------------------------------------------===//
 // Object Lookup
 //===----------------------------------------------------------------------===//
@@ -1749,6 +1741,7 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       UCSAN_OUT("Resign recovered alloca label %u for %p\n", label_for_ptr, ptr);
   }
 
+  bool in_alloca = false;  // the overlay below is inside a live alloca
   if (label_for_ptr != 0) {
     ucsan_label_info *orig = get_label_info(label_for_ptr);
 
@@ -1763,10 +1756,14 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       ucsan_obj_info *obj_info = to_obj_info(orig);
       char *lower = (char *)obj_info->real_ptr - obj_info->lower_bound;
       char *upper = (char *)obj_info->real_ptr + obj_info->upper_bound;
-      if ((char *)ptr >= lower && (char *)ptr < upper)
-        n = (uint64_t)(upper - (char *)ptr);
-      else
-        n = (uint64_t)(upper - lower);
+      // (the overlay writes from ptr, so only a ptr inside the alloca; one
+      // outside it used to overlay the alloca's whole size starting there)
+      if ((char *)ptr < lower || (char *)ptr >= upper) {
+        UCSAN_OUT("Resign alloca: p=%p is outside it, skip\n", ptr);
+        return label_for_ptr;
+      }
+      n = (uint64_t)(upper - (char *)ptr);
+      in_alloca = true;
       UCSAN_OUT("Resign alloca as concrete: p=%p, size=%lu\n", ptr, n);
       // Continue into concrete overlay below.
     } else if (orig->common.op == OP_FREE) {
@@ -1795,14 +1792,25 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
   }
 
   {
-    if (!is_writeable(ptr)) {
-      return UCSAN_CONST_LABEL;
-    }
-
     // No UCSan object and no compile-time size: nothing to overlay. Avoid
     // minting a zero-byte "concrete external" object (opaque-ptr dangle stubs).
     if (n == 0) {
       UCSAN_OUT("Concrete external object: p=%p, size unknown, skip\n", ptr);
+      return UCSAN_CONST_LABEL;
+    }
+
+    // What the overlay may write is known, not probed: the alloca above, or
+    // else -- a pointer with no UCSan label that is in no live alloca -- a
+    // global, the image's writable data (in_data_section, as
+    // ucsan_check_pointer's global model).  Anything else is read-only data
+    // or code, or a value that is no object of ours (a pointer built from
+    // integers), and a callee writes none of it.  The probe this replaces
+    // read /dev/zero into ptr, zeroing the byte it tested -- even when n was
+    // 0 and nothing was overlaid -- behind the labels of a global already
+    // symbolized (init_hugetlbfs_fs's default_hstate_idx).
+    if (!in_alloca &&
+        !(in_data_section(ptr) && in_data_section((char *)ptr + n - 1))) {
+      UCSAN_OUT("Concrete external object: p=%p is not writable data, skip\n", ptr);
       return UCSAN_CONST_LABEL;
     }
 
