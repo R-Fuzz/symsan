@@ -32,7 +32,10 @@ the runtime places the whole image at 0x700000000000, out of their reach, PIE
 or not.  Those stay link/pie-relocation failures, a harness limit.
 
 A variadic entry function (panic, _printk, ...) is recorded as "skip", not as a
-failure: the pass does not support one, and nothing says it should.
+failure: the pass does not support one, and nothing says it should.  So is a
+function with a custom wrapper in the abilists (lib/string.o's strcpy, ...):
+calls to it, the driver's included, go to the runtime's model of it, so its own
+body never runs and there is nothing of it to evaluate.
 
 Output (all logs are size-capped; nothing here is a full log):
   <out>/results.tsv     one short line per function: module, function, status,
@@ -133,6 +136,23 @@ __x86_return_thunk:
         .size   __x86_return_thunk, .-__x86_return_thunk
         .section .note.GNU-stack,"",@progbits
 """
+
+
+def wrapped_functions():
+    """Names with a custom wrapper (`fun:NAME=custom`) in the abilists the
+    passes use: an entry function by one of these names is replaced by the
+    runtime's model of it."""
+    names = set()
+    for f in ("ucsan_abilist.txt", "dfsan_abilist.txt"):
+        try:
+            with open(os.path.join(SYMSAN, "lib", "symsan", f)) as fh:
+                for line in fh:
+                    m = re.match(r"fun:([^=\s]+)=custom\s*$", line)
+                    if m:
+                        names.add(m.group(1))
+        except OSError:
+            pass
+    return names
 
 
 def link_args(out):
@@ -464,6 +484,7 @@ class Evaluator:
         self.total = 0
         self.t0 = time.time()
         self.link_args = link_args(self.out)
+        self.wrapped = wrapped_functions()
 
     def record(self, rel, fn, status, stage, seeds, secs, findings, failure=None):
         fnd = ",".join("%s:%d" % kv for kv in sorted(findings.items())) or "-"
@@ -544,6 +565,10 @@ class Evaluator:
 
     def _do_function(self, rel, key, fn, t0):
         a = self.a
+        if fn in self.wrapped:
+            # not a failure: see the module docstring
+            self.record(rel, fn, "skip", "custom-wrapper", 0, time.time() - t0, {})
+            return
         wd = os.path.join(self.out, "funcs", key, safe_name(fn))
         shutil.rmtree(wd, ignore_errors=True)
         os.makedirs(wd)
