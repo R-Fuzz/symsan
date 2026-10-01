@@ -1368,6 +1368,10 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
     dfsan_label_info *bounds_info = get_label_info(ptr_label);
     if (bounds_info->op == __dfsan::Alloca) {
       // bounds information is available, check if allocation size is symbolic
+      // (the only place ptr's value is read.  Under UCSan ptr is the GEP's
+      // unchecked base and may be a pseudo-pointer; an Alloca label implies it
+      // is a real address -- see the ASSUMPTION note in TaintPass's GEP
+      // instrumentation, TaintFunction::visitGEPInst)
       if (index_bits < 64) // extends index to 64 bits
         index_label = do_taint_union(index_label, 0, ZExt, 64, index, 0);
       if (bounds_info->l2 == 0) {

@@ -4777,6 +4777,33 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
           ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, CurrentOffset);
           ConstantInt *NE = ConstantInt::get(TT.Int64Ty, NumElements);
           ConstantInt *ES = ConstantInt::get(TT.Int64Ty, ElemSize);
+          // ASSUMPTION (UCSan): Ptr may be a UCSan pseudo-pointer.  UCSan checks
+          // the address the GEP computes, not its base, so this is the one
+          // place SymSan is given a pointer that has not been through
+          // ucsan_check_pointer.  That is safe while a pseudo-pointer's value
+          // is never read:
+          // - __taint_solve_bounds and Z3AstParser::parse_gep read Ptr only
+          //   together with an Alloca (or Free) bounds label in Shadow, whose
+          //   op1/op2 are real addresses, to place the access in that buffer.
+          //   With an array extent (NE > 0) Ptr is not used at all, and
+          //   parse_gep does nothing unless index enumeration is on.
+          // - SymSan makes Alloca labels only for stack objects
+          //   (__taint_trace_alloca), globals (__taint_trace_global) and heap
+          //   memory from the allocator wrappers (UCSan's create_alloca_label,
+          //   the malloc family in dfsan_custom.cpp).  All of it is real
+          //   memory, which ucsan_check_pointer returns unchanged, so wherever
+          //   Ptr is read it is already a real address.
+          // - A lazily initialized object's pointer has no Alloca label (its
+          //   label is the input bytes it was loaded from), so a pseudo-pointer
+          //   is passed but never used.
+          // This stops holding the moment a pointer that ucsan_check_pointer
+          // translates gets an Alloca label -- e.g. bounds labels for UCSan
+          // objects, to solve OOB on them -- and then the GEP hooks would
+          // compute offsets from a pseudo base and build wrong bounds
+          // constraints without any error.  The fix then is to pass the
+          // checked base: UCSanVisitor::visitGetElementPtrInst already emits a
+          // non-dereferencing ucsan_check_pointer on a non-alloca base (once
+          // per base) whose result goes unused.
           Value *Ptr = IRB.CreatePtrToInt(I->getPointerOperand(), TT.Int64Ty);
           ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
           if (ClSolveUB) {

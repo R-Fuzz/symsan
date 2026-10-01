@@ -2749,6 +2749,10 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
       // fprintf(stderr, "GEP bounds: lower=0x%lx, upper=0x%lx)\n",
       //     bounds->op1.i, bounds->op2.i);
       // if the array size is unknow, check bound info
+      // (ptr's value is read only here.  Under UCSan it is the GEP's unchecked
+      // base and may be a pseudo-pointer; an Alloca/Free label implies it is a
+      // real address -- see the ASSUMPTION note in TaintPass's GEP
+      // instrumentation, TaintFunction::visitGEPInst)
       if (bounds->op == __dfsan::Alloca ||
           // due to async solving, we may have a Free op
           bounds->op == __dfsan::Free) {
