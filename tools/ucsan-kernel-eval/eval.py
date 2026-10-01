@@ -31,6 +31,12 @@ relocations (R_X86_64_32S: alternatives, kprobe templates) cannot link at all:
 the runtime places the whole image at 0x700000000000, out of their reach, PIE
 or not.  Those stay link/pie-relocation failures, a harness limit.
 
+Every function is built with ucsan_opt -r: an out-of-scope callee (a stub, since
+only the one function is in scope) resigns its pointer arguments, i.e. what they
+point to becomes fresh symbolic input, as if the callee may have written it.
+Without that, a stack variable passed to a callee to initialize stays marked
+uninitialized and its first read is reported as a UBI (--no-resign for an A/B).
+
 A variadic entry function (panic, _printk, ...) is recorded as "skip", not as a
 failure: the pass does not support one, and nothing says it should.  So is a
 function with a custom wrapper in the abilists (lib/string.o's strcpy, ...):
@@ -576,8 +582,11 @@ class Evaluator:
         with open(os.path.join(wd, "scope.yaml"), "w") as f:
             f.write("entry: %s\nscope:\n  - %s\n" % (json.dumps(fn), json.dumps(fn)))
 
+        # -r: out-of-scope callees resign their pointer arguments (see the
+        # module docstring); without it a stack variable a callee would have
+        # initialized stays uninitialized and its first read is a UBI
         build_cmd = [UCSAN_OPT, "-b", "-i", "-t", "-v", "-m", "scope.yaml", "-o", "f.ucsan"] + \
-            self.link_args + ["m.bc"]
+            (["-r"] if a.resign else []) + self.link_args + ["m.bc"]
         env = dict(os.environ)
         env["PYTHONPATH"] = os.path.join(SYMSAN, "lib", "symsan") + os.pathsep + env.get("PYTHONPATH", "")
         run_cmd_line = [a.python, RUN_ONE, "f.ucsan", "--workdir", "run",
@@ -750,6 +759,9 @@ def main():
     ap.add_argument("--keep-bins", type=int, default=20, help="run-failure binaries to keep")
     ap.add_argument("--python", default=VENV_PY if os.path.exists(VENV_PY) else sys.executable,
                     help="python with pyelftools/PyYAML/psutil, for run_one.py")
+    ap.add_argument("--no-resign", dest="resign", action="store_false",
+                    help="do not build with ucsan_opt -r (out-of-scope callees resign their "
+                         "pointer arguments); for an A/B")
     ap.add_argument("--retest", default=None, metavar="DIR",
                     help="only the functions that failed in an earlier --out DIR (to check a fix)")
     ap.add_argument("--summarize-only", action="store_true")
