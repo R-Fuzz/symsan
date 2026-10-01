@@ -1541,7 +1541,11 @@ Value *UCSanFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size, Align Alig
   Value *ShadowAddr = UC.getShadowAddress(Addr, IRB);
   // TOOD: Optimize for non-pointer types
   Value *ConcreteAddr = IRB.CreateBitCast(Addr, UC.VoidPtrTy);
-  UC.markNosanitize(ConcreteAddr);
+  // With opaque pointers the cast is Addr itself, the load's own address (an
+  // alloca, a GEP, a loaded pointer): marked nosanitize, TaintPass skipped it,
+  // and an alloca read this way was never given SymSan's uninitialized label.
+  if (ConcreteAddr != Addr)
+    UC.markNosanitize(ConcreteAddr);
   CallInst *FallbackCall = IRB.CreateCall(
       UC.UCLoadPointerShadowFn,
       {ShadowAddr, ConstantInt::get(UC.Int64Ty, Size),
@@ -5150,8 +5154,12 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
         DstShadow && SrcShadow) {
       Value *DstAddr = IRB.CreateBitCast(ResolvedDst, UF.UC.VoidPtrTy);
       Value *SrcAddr = IRB.CreateBitCast(ResolvedSrc, UF.UC.VoidPtrTy);
-      UF.UC.markNosanitize(DstAddr);
-      UF.UC.markNosanitize(SrcAddr);
+      // (the casts are the ucsan_check_pointer calls themselves under opaque
+      // pointers, and TaintPass must visit those; see RetArg below)
+      if (DstAddr != ResolvedDst)
+        UF.UC.markNosanitize(DstAddr);
+      if (SrcAddr != ResolvedSrc)
+        UF.UC.markNosanitize(SrcAddr);
       IRB.CreateCall(UF.UC.UCCheckCopyBoundsFn,
                      {DstAddr, DstShadow, SrcAddr, SrcShadow, DstBound});
     }
