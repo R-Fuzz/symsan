@@ -2682,6 +2682,18 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
     if (Value *RetShadow = GetFakeIORetShadow()) {
       setShadow(CI, RetShadow);
     } else {
+      // Most of these wrappers never set SymSan's return label (memcpy,
+      // _copy_from_user, lseek, ...), and what this load then read was the
+      // label the last call left there: an earlier wrapped return value, a
+      // symbolic input naming a seed byte, given to _copy_from_user's
+      // concrete 0, and every `if (copy_from_user(...))` was a value
+      // mismatch.  Clear it before the call; a wrapper that sets it still
+      // does.
+      IRBuilder<> PreIRB(CI);
+      StoreInst *Clear = PreIRB.CreateAlignedStore(
+          TT.getZeroShadow(CI), getRetvalTLS(CI->getType(), PreIRB),
+          ShadowTLSAlignment);
+      SkipInsts.insert(Clear);
       LI = NextIRB.CreateAlignedLoad(
           TT.getShadowTy(CI), getRetvalTLS(CI->getType(), NextIRB),
           ShadowTLSAlignment, "_dfsret");
