@@ -96,24 +96,34 @@ void *__dfsw_malloc(size_t size, ucsan_label size_label, ucsan_label *ret_label)
   return ret;
 }
 
+// The kernel's zeroing allocations (kzalloc, kcalloc, kmalloc_array and
+// friends with __GFP_ZERO) arrive here as a kmalloc with __GFP_ZERO in flags.
+// Their memory is initialized, to zero, like calloc's: painted uninitialized,
+// a read of a field the caller relies on being zero (ext4's kcalloc'ed
+// path[].p_bh) was a UBI that is not one.
+static const unsigned int kGfpZero = 0x100;  // ___GFP_ZERO, include/linux/gfp_types.h
+
+static void *kmalloc_flags(size_t size, unsigned int flags,
+                           ucsan_label size_label, ucsan_label *ret_label);
+
 __attribute__((visibility("default")))
 void *__dfsw_kmalloc_large(size_t size, unsigned int flags,
                            ucsan_label size_label, ucsan_label flags_label,
                            ucsan_label *ret_label) {
-  return __dfsw_malloc(size, size_label, ret_label);
+  return kmalloc_flags(size, flags, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
 void *__dfsw___kmalloc(size_t size, unsigned int flags,
                        ucsan_label size_label, ucsan_label flags_label,
                        ucsan_label *ret_label) {
-  return __dfsw_malloc(size, size_label, ret_label);
+  return kmalloc_flags(size, flags, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
 void *__dfsw_kmalloc(size_t size, unsigned int flags, ucsan_label size_label,
                      ucsan_label flags_label, ucsan_label *ret_label) {
-  return __dfsw_malloc(size, size_label, ret_label);
+  return kmalloc_flags(size, flags, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
@@ -128,6 +138,13 @@ void *__dfsw_calloc(size_t nmemb, size_t size, ucsan_label nmemb_label,
   // (calloc zeros memory, but we still want to detect reads before writes)
   *ret_label = create_alloca_label(ret, total_size, false);
   return ret;
+}
+
+static void *kmalloc_flags(size_t size, unsigned int flags,
+                           ucsan_label size_label, ucsan_label *ret_label) {
+  if (flags & kGfpZero)
+    return __dfsw_calloc(1, size, 0, size_label, ret_label);
+  return __dfsw_malloc(size, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
