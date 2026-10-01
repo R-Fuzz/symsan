@@ -1628,6 +1628,45 @@ dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
   return __taint_union(l1, l2, op, size, op1, op2);
 }
 
+// The seed byte an input label names, read the way the parser reads it (UCSan
+// provides it; a SymSan-only binary has no seed objects and reads none).
+extern "C" SANITIZER_WEAK_ATTRIBUTE bool __ucsan_seed_byte(uint32_t input,
+                                                           int64_t offset,
+                                                           uint8_t *out);
+
+// Debugging aid for value mismatches (UCSan's verify_inputs): the parser
+// evaluates an input label as the seed byte it names, so a byte in memory
+// that carries one and holds anything else makes every expression over it a
+// value mismatch.  Compare [addr, addr + n) against the seed and report each
+// such byte with the site of the load.  Single-byte input labels only: a
+// wider one (an argument, a return value) is a register value spilled whole,
+// and which of its bytes this is cannot be told from the shadow.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_verify_input_bytes(const void *addr, uptr n, void *site) {
+  static int reports = 0;
+  if (!&__ucsan_seed_byte || addr == nullptr || reports >= 64)
+    return;
+  const dfsan_label *ls = shadow_for(addr);
+  for (uptr i = 0; i < n; ++i) {
+    dfsan_label l = ls[i];
+    if (l < CONST_OFFSET || l == kInitializingLabel)
+      continue;
+    dfsan_label_info *info = get_label_info(l);
+    if (info->op != 0 || info->l1 != 0 || info->l2 != 0 || info->size != 8)
+      continue;
+    uint8_t seed = 0;  // the parser reads a byte past the seed as 0
+    __ucsan_seed_byte((uint32_t)info->op2.i, (int64_t)info->op1.i, &seed);
+    uint8_t mem = ((const uint8_t *)addr)[i];
+    if (mem != seed) {
+      Report("VERIFY-INPUT: site %p addr %p input %u offset %ld label %u: "
+             "seed 0x%02x, memory 0x%02x\n", site, (const char *)addr + i,
+             (uint32_t)info->op2.i, (long)(int64_t)info->op1.i, l, seed, mem);
+      if (++reports >= 64)
+        return;
+    }
+  }
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label dfsan_create_label(uint64_t input_id, uint64_t offset, uint32_t size_in_bytes) {
   dfsan_label label =

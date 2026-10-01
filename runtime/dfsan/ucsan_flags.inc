@@ -46,6 +46,12 @@ UCSAN_FLAG(int, max_alloc_size, 0,
            "that wrap them) that succeeds; a larger one returns NULL "
            "(0 = use UCSAN_ALLOC_SIZE_LIMIT).")
 
+UCSAN_FLAG(bool, verify_inputs, false,
+           "Debugging aid for value mismatches: on every load, compare each "
+           "byte carrying a SymSan input label with the seed byte that label "
+           "names, read the way the parser reads it, and report a byte that "
+           "differs (VERIFY-INPUT, with the load's site).")
+
 UCSAN_FLAG(const char *, input_file, "",
            "Input file containing seed objects.")
 

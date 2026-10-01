@@ -308,6 +308,7 @@ private:
   inline void dump_value_cache(dfsan_label label);
   /// op tree of `label`, `depth` levels deep, for failure messages
   std::string label_shape(dfsan_label label, int depth);
+  std::string describe_label(dfsan_label label, int depth);
 
   z3::expr read_concrete(dfsan_label label, uint16_t size);
   z3::expr serialize(dfsan_label label, input_dep_set_t &deps);

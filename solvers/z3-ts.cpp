@@ -233,6 +233,44 @@ std::string Z3AstParser::label_shape(dfsan_label label, int depth) {
          label_shape(info->l2, depth - 1) + ")";
 }
 
+// A value mismatch's operand tree with its values, for SYMSAN_MISMATCH_DETAIL
+// (the error message keeps only the shape, so that one cause is one bucket).
+// Each node is op[bits]=value as recomputed from the seed (value_cache_), an
+// input leaf in(input,offset,bytes); concrete operands recorded at runtime
+// are shown as #op1/#op2 where the node keeps them.
+std::string Z3AstParser::describe_label(dfsan_label label, int depth) {
+  if (label < CONST_OFFSET) return "C";
+  if (label >= size_) return "?";
+  dfsan_label_info *info = get_label_info(label);
+  char buf[160];
+  std::string s;
+  if (info->op == 0) {
+    snprintf(buf, sizeof(buf), "in(%lu,%ld,%u)", (unsigned long)info->op2.i,
+             (long)(int64_t)info->op1.i, (unsigned)info->size / 8);
+    s = buf;
+  } else {
+    snprintf(buf, sizeof(buf), "%s[%u]", get_op_name(info->op).c_str(),
+             (unsigned)info->size);
+    s = buf;
+  }
+  if (label < value_cache_.size()) {
+    snprintf(buf, sizeof(buf), "=0x%lx%s", (unsigned long)value_cache_[label],
+             value_is_unknown(label) ? "?" : "");
+    s += buf;
+  }
+  if (info->op == 0 || depth == 0) return s;
+  snprintf(buf, sizeof(buf), " #0x%lx,#0x%lx", (unsigned long)info->op1.i,
+           (unsigned long)info->op2.i);
+  return s + "(" + describe_label(info->l1, depth - 1) + ", " +
+         describe_label(info->l2, depth - 1) + ")" + buf;
+}
+
+static bool mismatch_detail() {
+  static int on = -1;
+  if (on < 0) on = getenv("SYMSAN_MISMATCH_DETAIL") != nullptr;
+  return on;
+}
+
 Z3AstParser::Z3AstParser(void *base, size_t size, z3::context &context)
   : ASTParser(base, size), context_(context) {
     input_name_format = "input-%u-%u";
@@ -2466,6 +2504,14 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             // said nothing about *which* expression went stale.  The shape,
             // not labels or values, so that one cause stays one bucket (see
             // set_error); the values go to the debug trace.
+            if (mismatch_detail())
+              fprintf(stderr, "MISMATCH-DETAIL icmp %u pred %u: op1 recorded "
+                      "0x%lx recomputed 0x%lx: %s | op2 recorded 0x%lx "
+                      "recomputed 0x%lx: %s\n", l, info->op >> 8,
+                      (unsigned long)(info->op1.i & valmask), val1,
+                      describe_label(info->l1, 5).c_str(),
+                      (unsigned long)(info->op2.i & valmask), val2,
+                      describe_label(info->l2, 5).c_str());
             std::string why = "value mismatch for ICmp";
             if ((info->op1.i & valmask) != val1) {
               why += " op1=" + label_shape(info->l1, 2);
@@ -2617,6 +2663,11 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
       DEBUGF("cond: %s\n", cond.to_string().c_str());
       dump_value_cache(label);
       // the shape, not the label: it keeps one bucket per cause
+      if (mismatch_detail())
+        fprintf(stderr, "MISMATCH-DETAIL cond %u: recorded %d recomputed "
+                "0x%lx: %s\n", label, (int)result,
+                (unsigned long)value_cache_[label],
+                describe_label(label, 6).c_str());
       set_error(("value mismatch for cond " + label_shape(label, 2)).c_str());
       return -1;
     }
@@ -2848,6 +2899,11 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
       DEBUGF("WARNING: value mismatch for label %u: expected %ld, got %ld\n",
               label, value_cache_[label], result);
       // the shape, not the label: it keeps one bucket per cause
+      if (mismatch_detail())
+        fprintf(stderr, "MISMATCH-DETAIL constraint %u: recorded 0x%lx "
+                "recomputed 0x%lx: %s\n", label, (unsigned long)result,
+                (unsigned long)value_cache_[label],
+                describe_label(label, 6).c_str());
       set_error(("value mismatch for constraint " + label_shape(label, 2)).c_str());
       return -1;
     }

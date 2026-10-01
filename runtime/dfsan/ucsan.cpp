@@ -68,6 +68,9 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_copy_shadow(void *dst, void *src, uint64_t size);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_verify_input_bytes(const void *addr, uptr n, void *site);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_get_ptr_bounds_label(void *ptr, uint64_t lower, uint64_t upper);
 
 //===----------------------------------------------------------------------===//
@@ -785,6 +788,17 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       if (sent_data) {
         UCSAN_OUT("Sent init data for global variable @%p\n", p);
         __taint_trace_global_var(0, first_byte_offset, size, p);
+        // and keep this run's copy of the seed in step, as the manager puts
+        // the bytes into its seed and the parser's input (GV_TYPE): what
+        // __ucsan_seed_byte reads for verify_inputs.  (Object 0 need not
+        // exist yet: an entry function without arguments, on an empty seed,
+        // makes none -- ucsan_set_label_for_args creates it the same way.)
+        if (!ucsan_tainted.objects->size()) ucsan_tainted.objects->resize(1);
+        auto &data = ucsan_tainted.objects->at(0).data;
+        if (data.size() < first_byte_offset + size)
+          data.resize(first_byte_offset + size);
+        for (uint64_t i = 0; i < size; ++i)
+          data[first_byte_offset + i] = ((uint8_t *)p)[i];
       }
     }
     return p;
@@ -1350,6 +1364,32 @@ void ucsan_materialize_range(void *addr, uint64_t n) {
     ucsan_materialize_byte(&ls[i], (char *)addr + i);
 }
 
+// The byte of the seed as sent, at `offset` from input's origin: what the
+// parser assumes an input label's byte is (cached_input_byte, with the
+// origins the manager gives it -- the header's per-object origin, len(lvalue),
+// not obj.offset, which the metadata's target_offset may override).  For
+// __taint_verify_input_bytes.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+bool __ucsan_seed_byte(uint32_t input, int64_t offset, uint8_t *out) {
+  const char *buf = ucsan_tainted.buf;
+  if (buf == nullptr || ucsan_tainted.buf_size < sizeof(uint64_t) ||
+      !ucsan_tainted.objects)
+    return false;
+  uint64_t cnt = *(const uint64_t *)buf;
+  if (input >= cnt || input >= ucsan_tainted.objects->size())
+    return false;
+  // the seed's bytes as loaded, plus what this run has told the manager
+  // since (a global's initial value, see the global symbolization); the
+  // origin is the header's
+  const uint32_t *origins = (const uint32_t *)(buf + sizeof(uint64_t));
+  auto &data = ucsan_tainted.objects->at(input).data;
+  int64_t idx = (int64_t)origins[input] + (int32_t)offset;
+  if (idx < 0 || (uint64_t)idx >= data.size())
+    return false;
+  *out = data[idx];
+  return true;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_pointer,
                                       void *concrete_addr) {
@@ -1360,6 +1400,9 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
   if (is_pointer || n == sizeof(void*))
     ucsan_materialize_byte(ls, concrete_addr);
   ucsan_label label0 = ls[0];
+
+  if (ucsan_flags().verify_inputs)
+    __taint_verify_input_bytes(concrete_addr, n, __builtin_return_address(0));
 
   UCSAN_OUT("load_pointer_shadow: *label(%p)=%d is_pointer=%d, size=%lu\n",
             ls, label0, is_pointer, n);
@@ -2448,6 +2491,10 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_label, dfsan_label, void*, uint64
 // @param src: source address
 // @param size: size in bytes
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_copy_shadow, void*, void*, uint64_t) {}
+
+// Check loaded input bytes against the seed (verify_inputs; dfsan.cpp)
+// @return: void (no-op when standalone: no SymSan labels to check)
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_verify_input_bytes, const void*, uptr, void*) {}
 
 // Move SymSan shadow memory from src to dst (handles overlapping regions)
 // @param dst: destination address
