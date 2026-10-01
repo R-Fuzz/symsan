@@ -522,6 +522,9 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
     case F_MEMERR_OLB: r = ptr; break;
     case F_MEMERR_OUB: r = ptr + size; break;
     case F_MEMERR_UBI: r = ptr; break;
+    // a NULL dereference was dropped here, so the Die() after it was a bare
+    // exit status 1 with nothing to say why
+    case F_MEMERR_NULL: r = ptr; break;
     default: return;
   }
 

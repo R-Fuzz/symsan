@@ -1264,12 +1264,24 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memerr, dfsan_label, uptr,
 // .l2 = (element) size label
 // .op1 = lower bounds
 // .op2 = upper bounds
+// Whether this process runs under UCSan (ucsan.cpp; a weak reference, so a
+// SymSan-only binary, which does not link UCSan, reads false).
+extern "C" SANITIZER_WEAK_ATTRIBUTE bool __ucsan_active;
+static inline bool ucsan_active() { return &__ucsan_active && __ucsan_active; }
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_check_bounds(dfsan_label addr_label, uptr addr,
                           dfsan_label size_label, uint64_t size) {
   if (flags().trace_bounds) {
     void *retaddr = __builtin_return_address(0);
-    if (addr == 0) {
+    // Under UCSan a NULL here is not a NULL dereference: UCSan decides those
+    // (ucsan_check_pointer, checker_nullderef) on the access itself, and what
+    // reaches this check can be a pseudo-pointer, legitimately 0 in the seed
+    // while every real access through it is materialized -- a loop-hoisted
+    // check is given the original pointer, since SCEV cannot see through
+    // ucsan_check_pointer.  It died here, with exit status 1 and no report
+    // (calc_sb_1_csum in the kernel eval).
+    if (addr == 0 && !ucsan_active()) {
       AOUT("WARNING: null ptr deref %p = %d @%p\n", (void*)addr, addr_label, retaddr);
       __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_NULL, retaddr);
       if (flags().exit_on_memerror) Die();

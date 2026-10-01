@@ -2193,8 +2193,16 @@ static void ucsan_check_gs_base() {
   }
 }
 
+// Set once UCSan is initialized, i.e. this process runs under UCSan: the
+// SymSan runtime it is combined with reads it (weakly, so a SymSan-only
+// binary sees false) where UCSan's model changes the meaning of what SymSan
+// sees -- pointers are UCSan pseudo-pointers.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE bool __ucsan_active = false;
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_init() {
+  __ucsan_active = true;
+
   // Initialize input struct first (C-style init for preinit_array safety)
   ucsan_init_input_struct();
 
