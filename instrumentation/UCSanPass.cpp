@@ -5798,6 +5798,17 @@ bool UCSan::runImpl(Module &M) {
       }
     }
 
+    // A wrapper takes over a function the module defines itself
+    // (kernel/exit.o's weak hidden abort, lib/string.o's strlen): what is left
+    // is a declaration that must resolve against the real definition, in libc
+    // or the runtime, which the wrapper calls.  It cannot keep the module's
+    // hidden visibility or dso_local: the linker refuses a hidden undefined
+    // symbol, and will not bind one to a shared library.
+    auto dropBody = [](Function &F) {
+      F.deleteBody();
+      F.setVisibility(GlobalValue::DefaultVisibility);
+      F.setDSOLocal(false);
+    };
     if (inScope) {
       FnsToInstrument.push_back(&F);
     } else {
@@ -5807,21 +5818,21 @@ bool UCSan::runImpl(Module &M) {
         // UCSan will only do check_pointer on pointer args at call sites.
         UnwrappedFnMap[&F] = &F;
         // Remove the body of there is one
-        if (!F.isDeclaration()) F.deleteBody();
+        if (!F.isDeclaration()) dropBody(F);
       } else if (WK == WK_Discard) {
         // Replace with a trivial stub so both UCSan and TaintPass skip it
         Function *Stub = buildDiscardFunction(&F);
         F.replaceAllUsesWith(Stub);
-        F.deleteBody();
+        dropBody(F);
       } else if (WK == WK_Uninstrumented) {
         // Leave the function as is, but add to UnwrappedFnMap
         UnwrappedFnMap[&F] = &F;
       } else if (WK == WK_Custom || WK == WK_AutoCustom) {
-        if (!F.isDeclaration()) F.deleteBody();
+        if (!F.isDeclaration()) dropBody(F);
         UnwrappedFnMap[&F] = &F;
       } else if (WK == WK_ShimOrig) {
         // Original function: delete body, redirect calls via visitWrappedCallBase
-        if (!F.isDeclaration()) F.deleteBody();
+        if (!F.isDeclaration()) dropBody(F);
         UnwrappedFnMap[&F] = &F;
       } else if (WK == WK_ShimTarget) {
         // LLM-generated __shim_ function, instrument like in-scope
