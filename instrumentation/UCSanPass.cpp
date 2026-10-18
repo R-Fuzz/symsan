@@ -723,6 +723,7 @@ public:
   void visitMemCpyInst(MemCpyInst &I);
   void visitMemSetInst(MemSetInst &I);
   void visitMemMoveInst(MemMoveInst &I);
+  void visitVACopyInst(VACopyInst &I);
   void visitGetElementPtrInst(GetElementPtrInst &GEPI);
   void visitSelectInst(SelectInst &I);
   void visitPHINode(PHINode &PN);
@@ -2850,6 +2851,42 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
       {DestShadowAddr, SrcShadowAddr, ShadowLength, I.getVolatileCst()}));
   MTI->setDestAlignment(Align(UF.UC.ShadowWidthBytes));
   MTI->setSourceAlignment(Align(UF.UC.ShadowWidthBytes));
+  UF.UC.markNosanitize(MTI);
+
+  I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, std::nullopt));
+}
+
+// va_copy(dst, src) reads and writes a whole va_list through its operands,
+// and src is often a parameter -- a function taking a va_list, such as
+// kvasprintf, gets a pointer to the caller's __va_list_tag -- so under UC a
+// pseudo-pointer that faulted (0x10 off a pseudo-NULL).  Both are checked for
+// the va_list's size, as memmove's operands are, and its shadow is copied.
+// Only where that size is known: the SysV x86-64 __va_list_tag, 24 bytes.
+void UCSanVisitor::visitVACopyInst(VACopyInst &I) {
+  Triple TT(I.getModule()->getTargetTriple());
+  if (TT.getArch() != Triple::x86_64 || TT.isOSWindows())
+    return;
+  IRBuilder<> IRB(&I);
+  Value *Length = ConstantInt::get(UF.UC.Int64Ty, 24);
+  Value *Src = UF.checkPointer(I.getSrc(), Length, true, IRB);
+  Value *Dest = UF.checkPointer(I.getDest(), Length, true, IRB);
+  I.setArgOperand(0, Dest);
+  I.setArgOperand(1, Src);
+
+  // on-demand labels first, as for memcpy
+  CallInst *Mat = IRB.CreateCall(UF.UC.UCMaterializeRangeFn,
+      {IRB.CreatePointerCast(Src, UF.UC.VoidPtrTy), Length});
+  UF.UC.markNosanitize(Mat);
+
+  Value *DestShadowAddr = UF.UC.getShadowAddress(Dest, IRB);
+  Value *SrcShadowAddr = UF.UC.getShadowAddress(Src, IRB);
+  Value *ShadowLength = ConstantInt::get(UF.UC.Int64Ty,
+                                         24 * UCSan::ShadowWidthBytes);
+  CallInst *MTI = IRB.CreateMemMove(DestShadowAddr,
+                                    MaybeAlign(UF.UC.ShadowWidthBytes),
+                                    SrcShadowAddr,
+                                    MaybeAlign(UF.UC.ShadowWidthBytes),
+                                    ShadowLength);
   UF.UC.markNosanitize(MTI);
 
   I.setMetadata("ucsan.checked", MDNode::get(*UF.UC.Ctx, std::nullopt));
