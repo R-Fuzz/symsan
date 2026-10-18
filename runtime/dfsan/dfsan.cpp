@@ -995,11 +995,22 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
     // not raw input bytes
     shape = false;
   } else {
+    // Load(label0, n) stands for the n labels from label0 on: the store fast
+    // path breaks it up as label0 + i.  So the bytes must be the next labels,
+    // not only the next offsets of the same input.  Under UCSan they need not
+    // be: an object enlarged after its creation labels its new bytes later
+    // (offset 0 had label N, offset 1 a label thousands on), and a store of
+    // the Load then wrote N+1.. -- unrelated labels -- into the bytes after
+    // the first (bprm_execve's container_of pointer, reloaded as a Concat
+    // of an Add's low bits).
     off_t offset = get_label_info(label0)->op1.i;
+    uint64_t input = get_label_info(label0)->op2.i;
     for (uptr i = 1; i != n; ++i) {
       dfsan_label next_label = ls[i];
       if (next_label == kInitializingLabel) return kInitializingLabel;
-      else if (get_label_info(next_label)->op1.i != offset + i) {
+      dfsan_label_info *next = get_label_info(next_label);
+      if (next_label != label0 + i || next->op != 0 ||
+          next->op1.i != offset + i || next->op2.i != input) {
         shape = false;
         break;
       }
