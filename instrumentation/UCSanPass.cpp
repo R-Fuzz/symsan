@@ -442,6 +442,7 @@ class UCSan {
   FunctionType *UCTraceBBFnTy;
   FunctionType *UCTraceAllocaFnTy;
   FunctionType *UCTraceGlobalFnTy;
+  FunctionType *UCCheckGlobalBoundsFnTy;
   FunctionType *UCTraceWarnFnTy;
   FunctionType *UCPushStackFrameFnTy;
   FunctionType *UCPopStackFrameFnTy;
@@ -467,6 +468,7 @@ class UCSan {
   FunctionCallee UCTraceBBFn;
   FunctionCallee UCTraceAllocaFn;
   FunctionCallee UCTraceGlobalFn;
+  FunctionCallee UCCheckGlobalBoundsFn;
   FunctionCallee UCTraceWarnFn;
   FunctionCallee UCPushStackFrameFn;
   FunctionCallee UCPopStackFrameFn;
@@ -674,6 +676,7 @@ struct UCSanFunction {
 
   Value *checkPointer(Value *Ptr, Value *Size, bool dereference, IRBuilder<> &IRB,
                       uint32_t TypeID = 0);
+  void checkGlobalDest(Value *Dest, Value *Length, IRBuilder<> &IRB);
   void recordPointerLoadSummary(LoadInst &LI);
   void recordMemoryAccessSummary(Value *Ptr, uint64_t AccessSize, bool IsWrite,
                                  uint32_t TypeID, Instruction *I);
@@ -901,6 +904,18 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCTraceGlobalFn = M.getOrInsertFunction("ucsan_trace_global", UCTraceGlobalFnTy);
   F = dyn_cast<Function>(UCTraceGlobalFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // void ucsan_check_global_bounds(ptr Addr, i16 BoundsLabel, i64 Size)
+  // Bounds a memory intrinsic's write into a global, see checkGlobalDest.
+  UCCheckGlobalBoundsFnTy = FunctionType::get(
+    Type::getVoidTy(*Ctx),
+    {VoidPtrTy, PrimitiveShadowTy, Int64Ty},
+    false);
+  UCCheckGlobalBoundsFn =
+      M.getOrInsertFunction("ucsan_check_global_bounds", UCCheckGlobalBoundsFnTy);
+  F = dyn_cast<Function>(UCCheckGlobalBoundsFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -2354,6 +2369,40 @@ TransformedFunction UCSan::getCustomFunctionType(FunctionType *T) {
       ArgumentIndexMapping);
 }
 
+// A memory intrinsic whose destination lies in a global skips checkPointer
+// (a written destination needs no symbolizing), but its length is bounded
+// by the global all the same: __early_make_pgtable memsets
+// early_dynamic_pgts[i] for ptrs_per_p4d * 8 bytes, a symbolized global's
+// value, and wrote gigabytes of shadow past the 256 KB array.
+void UCSanFunction::checkGlobalDest(Value *Dest, Value *Length,
+                                    IRBuilder<> &IRB) {
+  auto *GV = dyn_cast<GlobalVariable>(
+      getUnderlyingObject(Dest->stripPointerCasts()));
+  if (!GV)
+    return;
+  // the fixed bounds checkPointer traces for a global
+  auto &DL = F->getParent()->getDataLayout();
+  Type *GTy = GV->getValueType();
+  if (GV->hasInitializer())
+    GTy = GV->getInitializer()->getType();
+  if (!GTy->isSized() || !(GTy->isArrayTy() || GTy->isStructTy()))
+    return;
+  uint64_t TypeSize = DL.getTypeStoreSize(GTy);
+  if (auto *CI = dyn_cast<ConstantInt>(Length))
+    if (Dest->stripPointerCasts() == GV && CI->getZExtValue() <= TypeSize)
+      return;
+  Value *GlobalAddr = IRB.CreatePtrToInt(GV, UC.Int64Ty);
+  UC.markNosanitize(GlobalAddr);
+  Value *Bounds = IRB.CreateCall(UC.UCTraceGlobalFn,
+      {GlobalAddr, ConstantInt::get(UC.Int64Ty, TypeSize)});
+  UC.markNosanitize(Bounds);
+  Value *Addr = IRB.CreatePointerCast(Dest, UC.VoidPtrTy);
+  if (Addr != Dest)
+    UC.markNosanitize(Addr);
+  Value *CI = IRB.CreateCall(UC.UCCheckGlobalBoundsFn, {Addr, Bounds, Length});
+  UC.markNosanitize(CI);
+}
+
 Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
                                     IRBuilder<> &IRB, uint32_t TypeID) {
   Type *Ty = Ptr->getType();
@@ -2788,6 +2837,8 @@ void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
     dest = UF.checkPointer(dest, Length, true, IRB);
+  } else {
+    UF.checkGlobalDest(dest, Length, IRB);
   }
 
   I.setSource(src);
@@ -2832,6 +2883,8 @@ void UCSanVisitor::visitMemSetInst(MemSetInst &I) {
     // Check destination pointer
     dest = UF.checkPointer(dest, Length, true, IRB);
     I.setDest(dest);
+  } else {
+    UF.checkGlobalDest(dest, Length, IRB);
   }
 
   // update shadow
@@ -2856,6 +2909,8 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
     dest = UF.checkPointer(dest, Length, true, IRB);
+  } else {
+    UF.checkGlobalDest(dest, Length, IRB);
   }
 
   I.setDest(dest);

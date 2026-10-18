@@ -707,6 +707,43 @@ object_info create_label_from_super_object(size_t size, bool is_pointer) {
 
 using namespace __ucsan;
 
+// Check for out-of-bounds access to global variable (label: its bounds, from
+// ucsan_trace_global)
+static void check_global_bounds(void *p, ucsan_label label, uint64_t size,
+                                bool dereferencing, void *return_addr) {
+  ucsan_label_info *label_info = get_label_info(label);
+  ucsan_obj_info *obj = to_obj_info(label_info);
+  void *base = obj->real_ptr;
+  uint64_t base_addr = (uint64_t)base;
+  uint64_t ptr_addr = (uint64_t)p;
+  uint64_t upper_bound = (uint64_t)obj->upper_bound;
+  uint64_t offset = ptr_addr - base_addr;
+  if (ucsan_flags().trace_bounds &&
+      (ptr_addr < base_addr ||
+       offset > upper_bound ||
+       size > upper_bound - offset)) {
+    UCSAN_OUT("ERROR: Out-of-bounds access to global variable @%p, label=%u, access size=%lu, object size=%u\n",
+              p, label, size, obj->upper_bound);
+    if (dereferencing) {
+      __taint_trace_event_addr(label, EVENT_OOB, 0, return_addr, (uint32_t)obj->upper_bound);
+      exit(exit_reason::EVENT_OOB);
+    }
+  }
+}
+
+// The destination of a memory intrinsic inside a global is not given to
+// ucsan_check_pointer: it needs no symbolizing, it is written.  Its length
+// is still bounded by the global.  __early_make_pgtable memsets
+// early_dynamic_pgts[i] for ptrs_per_p4d * 8 bytes, a symbolized global's
+// value, and wrote gigabytes of shadow past the 256 KB array.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_check_global_bounds(void *p, ucsan_label label, uint64_t size) {
+  if (label < UCSAN_CONST_OFFSET || label == kUninitializedLabel ||
+      get_label_info(label)->common.op != OP_ALLOCA)
+    return;
+  check_global_bounds(p, label, size, true, __builtin_return_address(0));
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool dereferencing, uint32_t type_id) {
   UCSAN_OUT("%p: label: %d, size: %zu, dereferencing: %d, type_id: %u\n", p, label, size, dereferencing, type_id);
@@ -727,27 +764,8 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
         get_label_info(label)->common.op == OP_ALLOCA))) {
     // if label is not zero, perform bounds check
     if (label >= UCSAN_CONST_OFFSET) {
-      ucsan_label_info *label_info = get_label_info(label);
-      {
-        // Check for out-of-bounds access to global variable
-        ucsan_obj_info *obj = to_obj_info(label_info);
-        void *base = obj->real_ptr;
-        uint64_t base_addr = (uint64_t)base;
-        uint64_t ptr_addr = (uint64_t)p;
-        uint64_t upper_bound = (uint64_t)obj->upper_bound;
-        uint64_t offset = ptr_addr - base_addr;
-        if (ucsan_flags().trace_bounds &&
-            (ptr_addr < base_addr ||
-             offset > upper_bound ||
-             size > upper_bound - offset)) {
-          UCSAN_OUT("ERROR: Out-of-bounds access to global variable @%p, label=%u, access size=%lu, object size=%u\n",
-                    p, label, size, obj->upper_bound);
-          if (dereferencing) {
-            __taint_trace_event_addr(label, EVENT_OOB, 0, __builtin_return_address(0), (uint32_t)obj->upper_bound);
-            exit(exit_reason::EVENT_OOB);
-          }
-        }
-      }
+      check_global_bounds(p, label, size, dereferencing,
+                          __builtin_return_address(0));
     } else if (size > ucsan_object_size_limit()) {
       UCSAN_OUT("WARNING: global variable size too large: %lu\n", size);
       size = ucsan_object_size_limit();
