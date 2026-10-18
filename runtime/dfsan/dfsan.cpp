@@ -1224,6 +1224,16 @@ dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size,
     __alloca_stack_top -= 1;
     AOUT("label = %d, base = %p, size = %lu, elem_size = %lu\n",
         __alloca_stack_top, (void*)base, size, elem_size);
+    // The bound is in bytes, and its label must be too: l is the element
+    // count's, at the width of the alloca's array size.  __taint_solve_size
+    // compares a byte size with l2 at 64 bits, so for a VLA of ints the
+    // count against 4 * count was a value mismatch.
+    if (l != 0 && l != kInitializingLabel) {
+      if (get_label_info(l)->size < 64)
+        l = do_taint_union(l, 0, ZExt, 64, size, 0);
+      if (elem_size != 1)
+        l = do_taint_union(l, 0, Mul, 64, size, elem_size);
+    }
     dfsan_label_info *info = get_label_info(__alloca_stack_top);
     internal_memset(info, 0, sizeof(dfsan_label_info));
     info->l2    = l;
