@@ -3065,12 +3065,22 @@ void Z3AstParser::save_constraint(z3::expr expr, input_dep_set_t &inputs) {
   // Once for the whole loop rather than once per offset: this is the only z3
   // API call left on the dependency-bookkeeping path.
   const unsigned eid = expr.id();
+  // input_deps is only ever read for its transitive closure
+  // (collect_more_deps), so every byte is linked to one anchor byte and only
+  // the anchor holds them all.  Giving each byte the whole set was N^2: a
+  // memchr over 16 KB of input (the kernel's dns_resolver_preparse) took 17 GB.
+  if (inputs.empty())
+    return;
+  const offset_t anchor = *inputs.begin();
   for (auto off : inputs) {
     auto c = get_branch_dep(off);
     if (c == nullptr) {
       throw z3::exception("branch_dep not found for input byte");
     }
-    c->input_deps.insert(inputs.begin(), inputs.end());
+    if (off == anchor)
+      c->input_deps.insert(inputs.begin(), inputs.end());
+    else
+      c->input_deps.insert(anchor);
     // try_emplace, not emplace: the expr is only copied (and refcounted) when
     // this offset has not already recorded it.
     c->expr_deps.try_emplace(eid, expr);
