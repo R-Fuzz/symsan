@@ -3242,7 +3242,19 @@ static bool isAsmHwRead(const AsmInsn &I) {
          isAsmCtrlReg(I.Operands[0]) && !isAsmCtrlReg(I.Operands[1]);
 }
 
-// wrmsr, out, mov to %crN/%drN, and the control instructions
+// A segment register.  Loading one is not privileged as an instruction, but
+// the kernel's selectors are not valid descriptors in a userspace run: the
+// first `mov %eax, %ds` of machine_kexec's load_segments(__KERNEL_DS) was a
+// general-protection fault (and %fs is the process's TLS).  The model is
+// flat, so a load does nothing; reading one works as it is.
+static bool isAsmSegReg(StringRef T) {
+  T = T.trim();
+  return T == "%ds" || T == "%es" || T == "%ss" || T == "%fs" ||
+         T == "%gs" || T == "%cs";
+}
+
+// wrmsr, out, mov to %crN/%drN or a segment register, and the control
+// instructions
 static bool isAsmHwNoOp(const AsmInsn &I) {
   StringRef Mn = I.Mnemonic;
   if (Mn == "cli" || Mn == "sti" || Mn == "wbinvd" || Mn == "invd" ||
@@ -3253,7 +3265,8 @@ static bool isAsmHwNoOp(const AsmInsn &I) {
   if (Mn == "out" || Mn == "outb" || Mn == "outw" || Mn == "outl")
     return true;
   return Mn.starts_with("mov") && I.Operands.size() == 2 &&
-         isAsmCtrlReg(I.Operands[1]) && !isAsmCtrlReg(I.Operands[0]);
+         ((isAsmCtrlReg(I.Operands[1]) && !isAsmCtrlReg(I.Operands[0])) ||
+          isAsmSegReg(I.Operands[1]));
 }
 
 // Callees that visitInlineAsm lowers instead of calling (the kernel's
