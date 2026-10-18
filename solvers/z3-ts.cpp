@@ -2274,6 +2274,30 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     // update tree_size
     tsize_cache_.emplace_back(tsize_cache_[info->l1] + tsize_cache_[info->l2]);
 
+    // A shift by at least its width is poison, and there is no value to model:
+    // a native `shl r32, cl` masks the count (1 << 36 is 16), the same i32
+    // shift done in a 64-bit register and truncated gives 0
+    // (vm_reset_perms's `1U << page_order`, page_order 36 from the seed), and
+    // z3's bvshl says 0.  So the value is unknown -- the consistency checks
+    // skip what is computed from it -- and, like a branch the path took, the
+    // count is below the width: a solution must not step into poison, which
+    // bvshl made look like a 0 the solver could use (it chose 36 for the
+    // loop step above).  Saved as a nested constraint over the count's
+    // inputs, not an aux one: a task keeps its optimistic model when the
+    // nested ones are unsat, so the shift-exponent UB check, which asks for
+    // exactly `count >= width`, is still answered.  After RECORD_VALUE.
+    auto shift_count_in_range = [&]() {
+#if FILTER_WRONG_AST
+      if (val2 >= size)
+        value_unknown_.back() = 1;
+#endif
+      if (info->l2 < CONST_OFFSET || !op2.is_bv())
+        return;
+      input_dep_set_t count_deps(deps_cache_[info->l2]);
+      save_constraint(z3::ult(op2, context_.bv_val((uint64_t)size, size)),
+                      count_deps);
+    };
+
     switch((info->op & 0xff)) {
       // llvm doesn't distinguish between logical and bitwise and/or/xor
       case __dfsan::And: {
@@ -2298,18 +2322,21 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         cache_expr(l, z3::shl(op1, op2));
         TRACK_LABEL_BV_ONLY();
         RECORD_VALUE(val1 << (val2 % size));
+        shift_count_in_range();
         break;
       }
       case __dfsan::LShr: {
         cache_expr(l, z3::lshr(op1, op2));
         TRACK_LABEL_BV_ONLY();
         RECORD_VALUE(val1 >> (val2 % size));
+        shift_count_in_range();
         break;
       }
       case __dfsan::AShr: {
         cache_expr(l, z3::ashr(op1, op2));
         TRACK_LABEL_BV_ONLY();
         RECORD_VALUE(sext_bits(val1, size) >> (val2 % size));
+        shift_count_in_range();
         break;
       }
       case __dfsan::Add: {
