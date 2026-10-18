@@ -85,6 +85,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Object/ModuleSymbolTable.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -6131,6 +6133,19 @@ bool UCSan::runImpl(Module &M) {
       RI->eraseFromParent();
   }
 
+  // Symbols the module's own inline asm defines: declared in the IR (C's
+  // `extern kprobe_opcode_t optprobe_template_entry[]`) but defined by a
+  // top-level asm() block, so they are no undefined globals to give a weak
+  // definition -- that collided with the asm's label at codegen ("symbol
+  // 'optprobe_template_end' is already defined", every function of
+  // arch/x86/kernel/kprobes/opt.o).
+  StringSet<> AsmDefined;
+  ModuleSymbolTable::CollectAsmSymbols(
+      M, [&AsmDefined](StringRef Name, object::BasicSymbolRef::Flags Flags) {
+        if (!(Flags & object::BasicSymbolRef::SF_Undefined))
+          AsmDefined.insert(Name);
+      });
+
   // Fix initializer for declared global variables with external linkage
   // Also strip dso_local so llc generates PIC-compatible relocations
   // (needed for code compiled without -fPIC, e.g. kernel)
@@ -6176,7 +6191,8 @@ bool UCSan::runImpl(Module &M) {
       if (!usedAsImmInAsm)
         GV.setDSOLocal(false);
     }
-    if (GV.isDeclaration() && GV.hasExternalLinkage()) {
+    if (GV.isDeclaration() && GV.hasExternalLinkage() &&
+        !AsmDefined.contains(GV.getName())) {
       GV.setLinkage(GlobalValue::WeakAnyLinkage);
       GV.setInitializer(Constant::getNullValue(GV.getValueType()));
     }
