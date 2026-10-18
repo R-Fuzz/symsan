@@ -4552,6 +4552,72 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     }
   }
 
+  // String moves through (%rsi) to (%rdi), which in a userspace run would
+  // copy through the operands unchecked (a pseudo-pointer faulted:
+  // arch/x86/lib/iomem.c's memcpy_toio/memcpy_fromio).  Lowered to memcpy,
+  // advancing %rsi and %rdi past what was copied:
+  // - one `movs{b,w,l,q}`, or `rep movs{b,w,l,q}` of %rcx elements, which
+  //   leaves %rcx at 0 (the kernel's movs() and rep_movs pieces);
+  // - iomem.c's rep_movs(): `rep movsl`, then a movsw if bit 1 of n is set
+  //   and a movsb if bit 0 is, which together copy exactly n bytes -- n is
+  //   the operand the two testb read.
+  if (IsCall && !HasMemOutput) {
+    auto movsSize = [](StringRef Mn) -> unsigned {
+      if (!Mn.consume_front("movs") || Mn.size() != 1)
+        return 0;
+      switch (Mn[0]) {
+      case 'b': return 1;
+      case 'w': return 2;
+      case 'l': return 4;
+      case 'q': return 8;
+      }
+      return 0;
+    };
+    Value *Bytes = nullptr;
+    bool Rep = false;
+    StringMap<Value *> Regs = inputRegs();
+    if (Insns.size() == 1) {
+      StringRef Mn = Insns[0].Mnemonic;
+      Rep = Mn.consume_front("rep ");
+      unsigned K = movsSize(Mn);
+      if (K && Insns[0].Operands.empty()) {
+        if (!Rep) {
+          Bytes = IRB.getInt64(K);
+        } else if (Value *Cx = Regs.lookup("cx")) {
+          Bytes = IRB.CreateMul(castAsmValue(IRB, DL, Cx, IRB.getInt64Ty()),
+                                IRB.getInt64(K));
+        }
+      }
+    } else if (Insns.size() == 7 && Insns[0].Mnemonic == "rep movsl" &&
+               Insns[1].Mnemonic == "testb" && Insns[2].Mnemonic == "je" &&
+               Insns[3].Mnemonic == "movsw" && Insns[4].Mnemonic == "testb" &&
+               Insns[5].Mnemonic == "je" && Insns[6].Mnemonic == "movsb" &&
+               Insns[1].Operands.size() == 2 && Insns[4].Operands.size() == 2 &&
+               StringRef(Insns[1].Operands[0]).trim() == "$$2" &&
+               StringRef(Insns[4].Operands[0]).trim() == "$$1" &&
+               Insns[1].Operands[1] == Insns[4].Operands[1]) {
+      int N = asmOperandRef(Insns[1].Operands[1]);
+      if (N >= 0 && N < (int)Ops.size() && Ops[N].V &&
+          Ops[N].V->getType()->isIntegerTy()) {
+        Rep = true;
+        Bytes = castAsmValue(IRB, DL, Ops[N].V, IRB.getInt64Ty());
+      }
+    }
+    Value *Dst = Regs.lookup("di"), *Src = Regs.lookup("si");
+    if (Bytes && Dst && Src) {
+      Value *DstP = castAsmValue(IRB, DL, Dst, IRB.getPtrTy());
+      Value *SrcP = castAsmValue(IRB, DL, Src, IRB.getPtrTy());
+      IRB.CreateMemCpy(DstP, MaybeAlign(1), SrcP, MaybeAlign(1), Bytes,
+                       Volatile);
+      Regs["di"] = IRB.CreateGEP(IRB.getInt8Ty(), DstP, Bytes);
+      Regs["si"] = IRB.CreateGEP(IRB.getInt8Ty(), SrcP, Bytes);
+      if (Rep)
+        Regs["cx"] = ConstantInt::get(IRB.getInt64Ty(), 0);
+      replaceWith(regResults(Regs));
+      return;
+    }
+  }
+
   // Calls into the kernel's assembly helpers, which have their own calling
   // conventions and so cannot become calls:
   // - __get_user_N / __get_user_nocheck_N: pointer in %rax, value out in
