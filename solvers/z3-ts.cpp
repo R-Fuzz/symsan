@@ -2742,6 +2742,10 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
   } catch (z3::exception e) {
     DEBUGF("WARNING: parsing error: %s (label=%u)\n", e.msg(), label);
     try { dump_value_cache(label); } catch (...) {}
+    // the tree the error came from: z3's message names no expression
+    if (mismatch_detail())
+      fprintf(stderr, "PARSE-ERROR-DETAIL cond %u: %s: %s\n", label, e.msg(),
+              describe_label(label, 8).c_str());
     set_error(e.msg());
   } catch (std::exception& e) {
     DEBUGF("WARNING: std::exception in parse_cond: %s\n", e.what());
@@ -2973,6 +2977,9 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
       }
     }
   } catch (z3::exception e) {
+    if (mismatch_detail())
+      fprintf(stderr, "PARSE-ERROR-DETAIL constraint %u: %s: %s\n", label,
+              e.msg(), describe_label(label, 8).c_str());
     set_error(e.msg());
     return -1;
   } catch (std::exception& e) {
