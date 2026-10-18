@@ -3935,6 +3935,18 @@ private:
       return true;
     }
 
+    // movnti reg, mem: a store whose non-temporal hint means nothing here
+    // (__memcpy_flushcache's copy loop)
+    if (splitMnemonic(Mn, "movnti", Suf)) {
+      if (Lock || Ls.size() != 2 || Ls[0].K != Loc::LReg ||
+          Ls[1].K != Loc::LMem)
+        return false;
+      unsigned W = width(Suf, Ls);
+      if (W != 32 && W != 64)
+        return false;
+      Value *V = read(Ls[0], W);
+      return V && write(Ls[1], V, W);
+    }
     // mov src, dst
     if (splitMnemonic(Mn, "mov", Suf)) {
       if (Lock || Ls.size() != 2 || Ls[1].K == Loc::LImm ||
@@ -4792,6 +4804,7 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     CB.eraseFromParent();
     return;
   }
+
 
   // Handle call/callq instructions in inline asm
   // Extract the callee symbol and route through normal call handling
