@@ -495,7 +495,14 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     if (__dfsan_label_info[l1].op == __dfsan::ZExt ||
         __dfsan_label_info[l1].op == __dfsan::SExt) {
       dfsan_label base = __dfsan_label_info[l1].l1;
-      if (size == __dfsan_label_info[base].size) return base;
+      // A comparison's size is its operands' width, not its i1 result's:
+      // trunc(zext(icmp i16) to i32) to i16 is no icmp, and folding it gave
+      // z3 a bool where a bitvector goes ("arguments of the wrong sort",
+      // snd_intel8x0_probe storing a compare into a 16-bit bitfield).
+      uint16_t base_op = __dfsan_label_info[base].op & 0xff;
+      if (size == __dfsan_label_info[base].size &&
+          base_op != __dfsan::ICmp && base_op != __dfsan::FCmp)
+        return base;
     }
   } else if ((op == __dfsan::Xor || op == __dfsan::Sub) && l1 == l2) {
     // x ^ x = 0
