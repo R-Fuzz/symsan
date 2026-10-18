@@ -2493,16 +2493,25 @@ bool Taint::runImpl(Module &M) {
       // Other uses (e.g. store the function address somewhere) might be
       // called or compared or both - this case may not be handled correctly.
       // We will default to replacing with wrapper in cases we are unsure.
-      auto IsNotCmpUse = [](Use &U) -> bool {
+      //
+      // (now: only a comparison with null is left alone.  Against anything
+      // else the other side is a pointer the program stored, which is the
+      // wrapper, so `fp == memcpy` was false for fp = memcpy.)
+      auto IsNullCmp = [](User *Usr) {
+        return llvm::any_of(Usr->operands(), [](Value *V) {
+          return isa<ConstantPointerNull>(V);
+        });
+      };
+      auto IsNotCmpUse = [&IsNullCmp](Use &U) -> bool {
         User *Usr = U.getUser();
         if (ConstantExpr *CE = dyn_cast<ConstantExpr>(Usr)) {
           // This is the most common case for icmp ne null
-          if (CE->getOpcode() == Instruction::ICmp) {
+          if (CE->getOpcode() == Instruction::ICmp && IsNullCmp(CE)) {
             return false;
           }
         }
         if (Instruction *I = dyn_cast<Instruction>(Usr)) {
-          if (I->getOpcode() == Instruction::ICmp) {
+          if (I->getOpcode() == Instruction::ICmp && IsNullCmp(I)) {
             return false;
           }
         }
