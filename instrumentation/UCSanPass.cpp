@@ -6307,7 +6307,11 @@ bool UCSan::runImpl(Module &M) {
       if (!usedAsImmInAsm)
         GV.setDSOLocal(false);
     }
-    if (GV.isDeclaration() && GV.hasExternalLinkage() &&
+    // (an extern_weak one too: the kernel declares what only its final link
+    // defines -- kallsyms_num_syms, kallsyms_offsets -- __weak, and left
+    // undefined its address is 0, which kallsyms_lookup_names read through)
+    if (GV.isDeclaration() &&
+        (GV.hasExternalLinkage() || GV.hasExternalWeakLinkage()) &&
         !AsmDefined.contains(GV.getName())) {
       GV.setLinkage(GlobalValue::WeakAnyLinkage);
       GV.setInitializer(Constant::getNullValue(GV.getValueType()));
