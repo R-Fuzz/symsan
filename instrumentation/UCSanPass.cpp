@@ -4805,6 +4805,24 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     return;
   }
 
+  // An indirect far jump leaves the kernel for good: machine_real_restart's
+  // "ljmpl *%0" into the real-mode trampoline.  Run natively it is a GP
+  // fault; the run ends here instead, normally, since it is no bug.
+  {
+    SmallVector<AsmInsn, 4> Insns = asmExecutedInsns(AsmStr);
+    if (Insns.size() == 1 && NumResults == 0 &&
+        (Insns[0].Mnemonic == "ljmp" || Insns[0].Mnemonic == "ljmpl" ||
+         Insns[0].Mnemonic == "ljmpq") &&
+        Insns[0].Operands.size() == 1 &&
+        StringRef(Insns[0].Operands[0]).trim().starts_with("*")) {
+      Value *Result = IRB.CreateCall(UF.UC.ExitFn,
+                                     {ConstantInt::get(UF.UC.Int32Ty, 0)});
+      UF.UC.markNosanitize(Result);
+      CB.replaceAllUsesWith(Result);
+      CB.eraseFromParent();
+      return;
+    }
+  }
 
   // Handle call/callq instructions in inline asm
   // Extract the callee symbol and route through normal call handling
