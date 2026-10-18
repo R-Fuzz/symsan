@@ -705,6 +705,25 @@ static bool wide_value_unknown(const dfsan_label_info *info,
       return is_unknown(info->l1);
     case __dfsan::ICmp:
       return is_unknown(info->l1) || is_unknown(info->l2);
+    // The ICmp case makes a comparison of wide values a NARROW unknown -- a
+    // bool -- and the size test above cannot see what is computed from it:
+    // the zext of the bool, arithmetic on that, and so on, which recorded
+    // the bool's placeholder 0 as a value and failed the consistency check
+    // (a cmpxchg-double's `zext(Equal[128])` in SLUB).  Every op below takes
+    // labels where these read them.
+    case __dfsan::ZExt:
+    case __dfsan::SExt:
+      return is_unknown(info->l1);
+    case __dfsan::Not:
+    case __dfsan::Neg:
+      return is_unknown(info->l2);
+    case __dfsan::Add: case __dfsan::Sub: case __dfsan::Mul:
+    case __dfsan::UDiv: case __dfsan::SDiv:
+    case __dfsan::URem: case __dfsan::SRem:
+    case __dfsan::Shl: case __dfsan::LShr: case __dfsan::AShr:
+    case __dfsan::And: case __dfsan::Or: case __dfsan::Xor:
+    case __dfsan::Concat:
+      return is_unknown(info->l1) || is_unknown(info->l2);
     default:
       return false;
   }
