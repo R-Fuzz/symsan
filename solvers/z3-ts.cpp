@@ -878,6 +878,11 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       continue;
     } else if (info->op == __dfsan::SExt) {
       z3::expr base = get_cached_expr(info->l1, input_deps);
+      // the same hack as ZExt's: a comparison is a Bool here, and clang's
+      // `x + (c == 10 ? -1 : 0)` is `sext i1 (icmp)` (ext4_attr_store)
+      if (base.is_bool())
+        base = z3::ite(base, context_.bv_val(1, 1),
+                            context_.bv_val(0, 1));
       uint32_t base_size = base.get_sort().bv_size();
       tsize_cache_.emplace_back(tsize_cache_[info->l1]);
       cache_expr(l, z3::sext(base, info->size - base_size));
@@ -897,7 +902,13 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
                 l, info->l1, base.get_sort().to_string().c_str());
         dump_value_cache(l);
       }
-      z3::expr trunc_expr = base.extract(info->size - 1, 0);
+      // An Int is a pointer or a difference of pointers that sort coercion
+      // made one (a strchr result minus its string, __xlate_proc_name's
+      // `len = next - cp`): int2bv is the truncation, modulo 2^size, and right
+      // for a negative difference too.  extract() of an Int threw.
+      z3::expr trunc_expr = base.is_int()
+          ? z3::int2bv(info->size, base)
+          : base.extract(info->size - 1, 0);
       if (info->size == 1)
         trunc_expr = (trunc_expr == context_.bv_val(1, 1));
       cache_expr(l, trunc_expr);
@@ -2234,6 +2245,22 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
     // Tier 2: complex BV expressions use bv2int (still cheaper than int2bv of indexof)
     bool op1_is_int = op1.get_sort().is_int();
     bool op2_is_int = op2.get_sort().is_int();
+    // ...except for the bitwise ops and shifts, which Int has none of: there
+    // an Int side goes back to a bitvector, one or both (the signed-overflow UB check on
+    // `next - cp`, a strchr result minus its string, XORs the two pointers --
+    // __xlate_proc_name).  int2bv is the value modulo 2^size.
+    switch (info->op & 0xff) {
+      case __dfsan::And: case __dfsan::Or: case __dfsan::Xor:
+      case __dfsan::Shl: case __dfsan::LShr: case __dfsan::AShr:
+        if (info->size > 1) {
+          if (op1_is_int) op1 = z3::int2bv(size, op1);
+          if (op2_is_int) op2 = z3::int2bv(size, op2);
+          op1_is_int = op2_is_int = false;
+        }
+        break;
+      default:
+        break;
+    }
     if (op1_is_int != op2_is_int) {
       auto convert_bv_to_int = [&](z3::expr &bv_op, dfsan_label lbl, uint64_t concrete_val) {
         if (lbl < CONST_OFFSET) {
