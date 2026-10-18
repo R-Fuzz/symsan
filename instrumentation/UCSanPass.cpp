@@ -80,6 +80,7 @@
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/CallPromotionUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -5642,6 +5643,35 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
   UF.CheckedPtrMap.clear();
 
   if (!F) {
+    // An indirect call may reach a function that has a wrapper, whose
+    // pointer arguments the wrapped call path checks and an indirect call
+    // does not: __write_relocate_add's write(loc, &val, size) with write =
+    // memcpy handed __dfsw_memcpy the unmaterialized loc.  So each wrapped
+    // function the module takes the address of, of the call's type, gets a
+    // direct call of its own, taken when the pointer is it.
+    SmallVector<Function *, 2> Wrapped;
+    for (auto &KV : UF.UC.UnwrappedFnMap)
+      if (auto *W = dyn_cast<Function>(KV.first))
+        if (W->getFunctionType() == CB.getFunctionType() &&
+            W->hasAddressTaken(nullptr, /*IgnoreCallbackUses=*/false,
+                               /*IgnoreAssumeLikeCalls=*/true,
+                               /*IgnoreLLVMUsed=*/true) &&
+            isLegalToPromote(CB, W))
+          Wrapped.push_back(W);
+    llvm::sort(Wrapped, [](Function *A, Function *B) {
+      return A->getName() < B->getName();
+    });
+    for (Function *W : Wrapped) {
+      CallBase &Direct = promoteCallWithIfThenElse(CB, W);
+      UF.DT.recalculate(*UF.F);
+      SmallVector<PHINode *, 1> Phis;
+      for (User *U : Direct.users())
+        if (auto *Phi = dyn_cast<PHINode>(U))
+          Phis.push_back(Phi);
+      visit(Direct);
+      for (PHINode *Phi : Phis)
+        visit(*Phi);
+    }
     // indirect call
     visitIndirectCallBase(CB.getCalledOperand(), CB);
     return;
