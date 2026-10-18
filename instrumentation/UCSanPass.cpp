@@ -1539,6 +1539,12 @@ Value *UCSanFunction::getShadowForTLSArgument(Argument *A) {
     if (ArgOffset + Size > ArgTLSSize)
       break; // ArgTLS overflows, uses a zero shadow.
 
+    // A byval parameter points to this function's own copy, made by the
+    // call: a real object, whatever the caller's pointer was (see the
+    // prologue in runOnModule, which clears the copy's shadow).
+    if (FArg.hasByValAttr())
+      return UC.getZeroShadow(A);
+
     // Insert ArgTLS load at the start of the entry block. Use the
     // (BB, iterator) overload so we handle an empty entry block (e.g. an
     // auto-custom wrapper whose first checkPointer fires before any IR has
@@ -2038,6 +2044,25 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
     // Call runtime to create symbolic argument
     // Returns a pointer that we cast to the appropriate type
     Value *ret_val = IRB.CreateCall(UCSetLabelForArgsFn, {ArgNo, ArgSize, IsPtr, InitVal});
+    if (ai->hasByValAttr() && ai->getParamByValType()->isSized()) {
+      // a struct passed by value: the call copies it through the pointer,
+      // so the pointer must be a real object -- the UC object the argument's
+      // pseudo-pointer maps to -- and the call must say byval (it did not,
+      // and the entry read its copy from a stack slot nothing had written:
+      // rhashtable_lookup's struct rhashtable_params)
+      Type *ByValTy = ai->getParamByValType();
+      Value *LabelPtr = IRB.CreateGEP(
+          PrimitiveShadowTy, ArgTLS,
+          ConstantInt::get(Int64Ty, ai->getArgNo()));
+      Value *Label = IRB.CreateLoad(PrimitiveShadowTy, LabelPtr);
+      Value *Real = IRB.CreateCall(
+          UCCheckPointerFn,
+          {ret_val, Label, ConstantInt::get(Int64Ty, DL.getTypeAllocSize(ByValTy)),
+           ConstantInt::get(Int1Ty, true),
+           ConstantInt::get(Int32Ty, getOrCreateTypeID(ByValTy))});
+      Args.push_back(Real);
+      continue;
+    }
     if (ai->getType()->isFloatingPointTy()) {
       // Can't bitcast pointer directly to float; go through integer
       Type *IntTy = IntegerType::get(*Ctx, DL.getTypeSizeInBits(ai->getType()));
@@ -2049,7 +2074,11 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
   }
 
   // Call the actual entry point function
-  IRB.CreateCall(F, Args);
+  CallInst *EntryCall = IRB.CreateCall(F, Args);
+  for (Argument &A : F->args())
+    if (A.hasByValAttr())
+      EntryCall->addParamAttr(
+          A.getArgNo(), Attribute::getWithByValType(*Ctx, A.getParamByValType()));
 
   // Return 0 (success)
   IRB.CreateRet(ConstantInt::get(Int32Ty, 0));
@@ -5503,6 +5532,26 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
     return;
   }
 
+  // A byval argument is copied by the caller, through the pointer: under UC a
+  // pseudo-pointer, which faulted (mr_mfc_find_parent passes
+  // *mrt->ops.rht_params, a struct rhashtable_params, by value).  Checked
+  // for the copied type's size, as a memcpy source is, before the call and
+  // before the copy.
+  for (unsigned I = 0, N = CB.arg_size(); I != N; ++I) {
+    if (!CB.isByValArgument(I))
+      continue;
+    Value *Arg = CB.getArgOperand(I);
+    if (isa<AllocaInst>(Arg->stripPointerCasts()))
+      continue;
+    Type *Ty = CB.getParamByValType(I);
+    if (!Ty || !Ty->isSized())
+      continue;
+    IRBuilder<> IRB(&CB);
+    Value *Size = ConstantInt::get(UF.UC.Int64Ty,
+                                   getDataLayout().getTypeAllocSize(Ty));
+    CB.setArgOperand(I, UF.checkPointer(Arg, Size, true, IRB));
+  }
+
   // Callee may call ucsan_resign_shadow which changes pointer state;
   // invalidate all cached check_pointer results so subsequent accesses
   // go through ucsan_check_pointer again for lazy re-initialization.
@@ -6154,6 +6203,20 @@ bool UCSan::runImpl(Module &M) {
     IRBuilder<> EntryIRB(&*(EntryBB.getFirstInsertionPt()));
     CallInst *PushCall = EntryIRB.CreateCall(UCPushStackFrameFn, {});
     markNosanitize(PushCall);
+
+    // A byval parameter's memory is the copy the call made, on this frame's
+    // stack, where the shadow is whatever an earlier frame left: the copy's
+    // values are concrete here (the call copied the bytes, not their labels).
+    for (Argument &A : F->args()) {
+      if (!A.hasByValAttr() || !A.getParamByValType()->isSized())
+        continue;
+      Value *Len = ConstantInt::get(
+          Int64Ty, Mod->getDataLayout().getTypeAllocSize(A.getParamByValType()));
+      CallInst *Clear = EntryIRB.CreateCall(
+          UCSetLabelFn, {ConstantInt::get(PrimitiveShadowTy, 0),
+                         EntryIRB.CreatePointerCast(&A, VoidPtrTy), Len});
+      markNosanitize(Clear);
+    }
 
     // UCSanVisitor may create new basic blocks, which confuses df_iterator.
     // Build a copy of the list before iterating over it.
