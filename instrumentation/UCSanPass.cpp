@@ -3386,8 +3386,17 @@ static bool isAsmSegReg(StringRef T) {
 
 // wrmsr, out, mov to %crN/%drN or a segment register, and the control
 // instructions
+// (and the FPU state restores: they load hardware state too, from memory.
+// fpu__restore_sig's fxrstor64 of a signal frame from the seed was a general
+// protection fault -- reserved MXCSR bits, which the kernel's exception
+// table turns into an error -- and a valid one would load the seed into the
+// process's own FPU state)
 static bool isAsmHwNoOp(const AsmInsn &I) {
   StringRef Mn = I.Mnemonic;
+  if (Mn == "fxrstor" || Mn == "fxrstorq" || Mn == "fxrstor64" ||
+      Mn == "frstor" || Mn == "xrstor" || Mn == "xrstor64" ||
+      Mn == "xrstors" || Mn == "xrstors64")
+    return true;
   if (Mn == "cli" || Mn == "sti" || Mn == "wbinvd" || Mn == "invd" ||
       Mn == "clts" || Mn == "swapgs" || Mn == "xsetbv" || Mn == "wrmsr" ||
       Mn == "wrmsrns" || Mn == "lgdt" || Mn == "lidt" || Mn == "lldt" ||
