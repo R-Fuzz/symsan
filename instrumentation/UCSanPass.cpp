@@ -452,6 +452,9 @@ class UCSan {
   FunctionCallee UCCombineLabelFn;
   FunctionCallee UCVmcsFieldFn;  // ptr ucsan_vmcs_field(i64): see AsmLifter
   FunctionCallee UCMaterializeRangeFn;  // void ucsan_materialize_range(ptr, i64)
+  // pointer differences of UC pointers: see visitBinaryOperator
+  FunctionCallee UCPtrDiffRewriteFn;  // i1 ucsan_ptr_diff_rewrite(ptr, i16, ptr, i16)
+  FunctionCallee UCPtrIndexFn;        // i64 __dfsw_ucsan_ptr_index(i1, i64, ptr, ptr, i16, i16)
   FunctionCallee UCSetLabelForArgsFn;
   FunctionCallee UCLoadPointerShadowFn;
   FunctionCallee UCStorePointerShadowFn;
@@ -942,6 +945,26 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
       "ucsan_materialize_range",
       FunctionType::get(Type::getVoidTy(*Ctx), {VoidPtrTy, Int64Ty}, false));
   F = dyn_cast<Function>(UCMaterializeRangeFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // i1 ucsan_ptr_diff_rewrite(ptr p, i16 lp, ptr q, i16 lq), and
+  // i64 __dfsw_ucsan_ptr_index(i1 rewrite, i64 elem, ptr p, ptr q, i16 lp,
+  // i16 lq): the element index `p - q` of two UC pointers when it is not the
+  // one their pseudo-pointers give, see visitBinaryOperator.  The __dfsw_ prefix is what makes
+  // TaintPass take its result's SymSan label from the retval TLS.
+  UCPtrDiffRewriteFn = M.getOrInsertFunction(
+      "ucsan_ptr_diff_rewrite",
+      FunctionType::get(Int1Ty, {VoidPtrTy, PrimitiveShadowTy, VoidPtrTy,
+                                 PrimitiveShadowTy}, false));
+  F = dyn_cast<Function>(UCPtrDiffRewriteFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+  UCPtrIndexFn = M.getOrInsertFunction(
+      "__dfsw_ucsan_ptr_index",
+      FunctionType::get(Int64Ty, {Int1Ty, Int64Ty, VoidPtrTy, VoidPtrTy,
+                                  PrimitiveShadowTy, PrimitiveShadowTy}, false));
+  F = dyn_cast<Function>(UCPtrIndexFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -5603,7 +5626,83 @@ void UCSanVisitor::visitBranchInst(BranchInst &BI) {
   UF.UC.markNosanitize(CI);
 }
 
+// `p - q` for T *p, *q: clang emits sdiv exact (sub (ptrtoint p),
+// (ptrtoint q)), sizeof(T) -- ashr exact for a power of two -- because C
+// defines it only for pointers into the same array, which makes the byte
+// difference a multiple of sizeof(T).  Matches that, giving p, q and
+// sizeof(T).
+static bool matchPointerDiffIndex(BinaryOperator &BO, Value *&P, Value *&Q,
+                                  uint64_t &Elem) {
+  if (!BO.isExact() || !BO.getType()->isIntegerTy(64))
+    return false;
+  auto *C = dyn_cast<ConstantInt>(BO.getOperand(1));
+  if (!C)
+    return false;
+  if (BO.getOpcode() == Instruction::SDiv) {
+    if (C->isNegative() || C->isZero() || C->isOne())
+      return false;
+    Elem = C->getZExtValue();
+  } else if (BO.getOpcode() == Instruction::AShr) {
+    if (C->getZExtValue() == 0 || C->getZExtValue() >= 63)
+      return false;
+    Elem = 1ULL << C->getZExtValue();
+  } else {
+    return false;
+  }
+  auto *Sub = dyn_cast<BinaryOperator>(BO.getOperand(0));
+  if (!Sub || Sub->getOpcode() != Instruction::Sub)
+    return false;
+  auto *PI = dyn_cast<PtrToIntOperator>(Sub->getOperand(0));
+  auto *QI = dyn_cast<PtrToIntOperator>(Sub->getOperand(1));
+  if (!PI || !QI)
+    return false;
+  P = PI->getPointerOperand();
+  Q = QI->getPointerOperand();
+  return true;
+}
+
 void UCSanVisitor::visitBinaryOperator(BinaryOperator &BO) {
+  // The element index of two UC pointers that are not known to be related.
+  // Under UC that is the common case where the program assumes they are:
+  // counter_show's `attr - counter_attrs` gets attr, an argument, and
+  // counter_attrs, a global, as two independent roots, though attr is
+  // &counter_attrs[i] in every real call.  Their pseudo-pointers then have
+  // a difference that is any number, and sdiv exact of a non-multiple is
+  // poison -- codegen multiplies by the divisor's inverse, the solver
+  // divides, and every branch on the index was a value mismatch.  What the
+  // program means is i, the element index: a fresh symbolic value, and the
+  // runtime binds p into q's object at element i (__dfsw_ucsan_ptr_index).
+  // Once bound, p and q are two pointer labels of one object, whose
+  // pseudo-pointers still have unrelated bases: their index is the
+  // difference of their offsets in the object, i again, and the runtime
+  // gives that too.  Pointers that are related -- real ones, or the same
+  // label -- keep the index the program computes, and its SymSan label: the
+  // select.
+  Value *P, *Q;
+  uint64_t Elem;
+  if (matchPointerDiffIndex(BO, P, Q, Elem)) {
+    IRBuilder<> IRB(BO.getNextNode());
+    Value *LP = UF.getShadow(P), *LQ = UF.getShadow(Q);
+    Value *PV = IRB.CreatePointerCast(P, UF.UC.VoidPtrTy);
+    Value *QV = IRB.CreatePointerCast(Q, UF.UC.VoidPtrTy);
+    if (PV != P) UF.UC.markNosanitize(PV);
+    if (QV != Q) UF.UC.markNosanitize(QV);
+    CallInst *Rewrite =
+        IRB.CreateCall(UF.UC.UCPtrDiffRewriteFn, {PV, LP, QV, LQ});
+    UF.UC.markNosanitize(Rewrite);
+    CallInst *Fresh = IRB.CreateCall(
+        UF.UC.UCPtrIndexFn,
+        {Rewrite, ConstantInt::get(UF.UC.Int64Ty, Elem), PV, QV, LP, LQ});
+    UF.UC.markNosanitize(Fresh);
+    Value *Index = IRB.CreateSelect(Rewrite, Fresh, &BO);
+    BO.replaceUsesWithIf(Index, [Index](Use &U) { return U.getUser() != Index; });
+    // the visitor does not reach what is inserted after BO
+    UF.setShadow(Rewrite, UF.UC.getZeroShadow(Rewrite));
+    UF.setShadow(Fresh, UF.UC.getZeroShadow(Fresh));
+    if (auto *SI = dyn_cast<Instruction>(Index))
+      UF.setShadow(SI, UF.UC.getZeroShadow(SI));
+  }
+
   Value *Op1Shadow = UF.getShadow(BO.getOperand(0));
   Value *Op2Shadow = UF.getShadow(BO.getOperand(1));
 

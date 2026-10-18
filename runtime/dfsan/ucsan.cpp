@@ -65,6 +65,10 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_set_label(dfsan_label label, void *addr, uint64_t size);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
+                          uint16_t size, uint64_t op1, uint64_t op2);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_copy_shadow(void *dst, void *src, uint64_t size);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1945,6 +1949,199 @@ void* ucsan_wrap_retval(uint64_t size, ucsan_label *ret_label, bool is_ptr, void
   return (void*)__ucsan_wrapped_return_tls;
 }
 
+// A UC pointer: an external pointer, or a byte label (a pointer loaded from
+// a UC object or a global and not dereferenced yet, which ucsan_check_pointer
+// turns into one).  Not a real pointer (no label, an alloca, a global's
+// address).
+static bool is_uc_pointer_label(ucsan_label l) {
+  if (l < UCSAN_CONST_OFFSET || l == kUninitializedLabel)
+    return false;
+  uint16_t op = get_label_info(l)->common.op;
+  return op == OP_EXTERNAL || op == OP_NONE;
+}
+
+// The object of an initialized UC pointer label, or 0
+static ucsan_label uc_pointer_object(ucsan_label l) {
+  if (!is_uc_pointer_label(l))
+    return 0;
+  ucsan_ptr_info *pi = to_ptr_info(get_label_info(l));
+  if (pi->op != OP_EXTERNAL || pi->status != PTR_INITIALIZED)
+    return 0;
+  return pi->obj_label;
+}
+
+// SymSan's opcodes for the index expression (dfsan.h's, from the same .def)
+namespace {
+enum symsan_binary_op : uint16_t {
+#define HANDLE_BINARY_INST(num, opcode, Class) SYMSAN_##opcode = num,
+#include "llvm/IR/Instruction.def"
+#undef HANDLE_BINARY_INST
+};
+}  // namespace
+
+// A pointer bound into another's object by a pointer difference (see
+// __dfsw_ucsan_ptr_index).  The pointer label keeps its own number -- its
+// copies in memory and registers are not touched -- and its ptr_info names
+// the other's object, so an object can have more than one pointer label; what
+// a label alone cannot say is that its offset in the object is symbolic:
+// c + i * elem, with i the fresh index (its SymSan label and the value it had).
+// Recorded here, so that a later difference of the two is i again, not a new
+// fresh index.  Bindings are rare (one per unrelated difference that binds).
+struct ucsan_ptr_binding {
+  ucsan_label label;
+  dfsan_label index;
+  int64_t index_value;
+  int64_t elem;
+};
+static ucsan_ptr_binding ucsan_ptr_bindings[64];
+static unsigned ucsan_num_ptr_bindings;
+
+static const ucsan_ptr_binding *find_ptr_binding(ucsan_label l) {
+  for (unsigned i = 0; i < ucsan_num_ptr_bindings; ++i)
+    if (ucsan_ptr_bindings[i].label == l)
+      return &ucsan_ptr_bindings[i];
+  return nullptr;
+}
+
+// `p - q` (UCSanVisitor::visitBinaryOperator): whether the index the program
+// computes from p and q's pseudo-pointers is not the one it means, and
+// __dfsw_ucsan_ptr_index has to give it.  Two UC pointers with no known
+// relation: their pseudo-pointers' difference is any number.  Two pointer
+// labels of the same UC object (one bound into the other's by an earlier
+// difference): their pseudo-pointers have unrelated bases, the difference
+// of their offsets in the object is the one.  Real pointers, and two through
+// the same label, are related as the program has them.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+bool ucsan_ptr_diff_rewrite(void *p, ucsan_label lp, void *q, ucsan_label lq) {
+  bool up = is_uc_pointer_label(lp), uq = is_uc_pointer_label(lq);
+  if (!up && !uq)
+    return false;
+  if (lp == lq)
+    return false;
+  UCSAN_OUT("ptr_diff: %p (label %u) and %p (label %u) need the index\n",
+            p, lp, q, lq);
+  return true;
+}
+
+// The SymSan label of x's offset in its object, as rest + label * scale:
+// 0 for a pointer that is not bound, whose offset is concrete.  Sets *rest
+// to the concrete part, x's offset less the index's.
+static dfsan_label pointer_offset_term(void *x, ucsan_label l, int64_t *rest,
+                                       int64_t *scale) {
+  ucsan_ptr_info *pi = to_ptr_info(get_label_info(l));
+  *rest = (int64_t)x - (int64_t)pi->pseudo_base;
+  *scale = 0;
+  const ucsan_ptr_binding *b = find_ptr_binding(l);
+  if (!b)
+    return 0;
+  *rest -= b->index_value * b->elem;
+  *scale = b->elem;
+  return b->index;
+}
+
+// The element index of two pointer labels of one object: the difference of
+// their offsets in it, divided by elem, concrete and -- when either is bound
+// -- symbolic, in the index it was bound by.  The binding's own subtraction
+// again (counter_show reads `attr - counter_attrs` twice) is exactly the
+// index's label.
+static int64_t same_object_index(int64_t elem, void *p, void *q,
+                                 ucsan_label lp, ucsan_label lq) {
+  int64_t rp, rq, sp, sq;
+  dfsan_label ip = pointer_offset_term(p, lp, &rp, &sp);
+  dfsan_label iq = pointer_offset_term(q, lq, &rq, &sq);
+  ucsan_ptr_info *pi = to_ptr_info(get_label_info(lp));
+  ucsan_ptr_info *qi = to_ptr_info(get_label_info(lq));
+  int64_t diff = ((int64_t)p - (int64_t)pi->pseudo_base) -
+                 ((int64_t)q - (int64_t)qi->pseudo_base);
+  int64_t index = diff / elem;
+  dfsan_label label = 0;
+  // label = (rp - rq) / elem + ip * sp / elem - iq * sq / elem, when every
+  // part is a whole number of elements; otherwise the program's sdiv exact
+  // is poison and the index is left concrete
+  if ((ip || iq) && (rp - rq) % elem == 0 && sp % elem == 0 &&
+      sq % elem == 0) {
+    int64_t ival = 0, jval = 0;
+    if (const ucsan_ptr_binding *b = find_ptr_binding(lp)) ival = b->index_value;
+    if (const ucsan_ptr_binding *b = find_ptr_binding(lq)) jval = b->index_value;
+    int64_t kp = sp / elem, kq = sq / elem;
+    // ip * kp
+    dfsan_label tp = ip && kp != 1
+        ? __taint_union(ip, 0, SYMSAN_Mul, 64, ival, kp) : ip;
+    int64_t vp = ival * kp;
+    dfsan_label tq = iq && kq != 1
+        ? __taint_union(iq, 0, SYMSAN_Mul, 64, jval, kq) : iq;
+    int64_t vq = jval * kq;
+    // tp - tq
+    label = tq ? __taint_union(tp, tq, SYMSAN_Sub, 64, vp, vq) : tp;
+    // + (rp - rq) / elem
+    int64_t c = (rp - rq) / elem;
+    if (label && c)
+      label = __taint_union(label, 0, SYMSAN_Add, 64, vp - vq, c);
+  }
+  __taint_set_retval_tls(0, label, 64);
+  UCSAN_OUT("ptr_diff: same object, index %ld (SymSan label %u)\n",
+            index, label);
+  return index;
+}
+
+// The element index `p - q` that ucsan_ptr_diff_rewrite says the program does
+// not compute.  For two pointer labels of one object, the difference of their
+// offsets (same_object_index).  For two unrelated UC pointers, what the
+// program assumes they are, p == &q[i], with i a fresh symbolic value -- from
+// the super object, as a wrapped return value is -- and its SymSan label in
+// the retval TLS (TaintPass reads it there for a __dfsw_ call from UCSan).  p
+// is then bound into q's object at element i, so that what is written through
+// one is seen through the other; only while p has no object of its own, and only into a UC object (a real q
+// -- lock_classes in match_held_lock -- is not one).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+int64_t __dfsw_ucsan_ptr_index(bool rewrite, int64_t elem, void *p, void *q,
+                               ucsan_label lp, ucsan_label lq) {
+  if (!rewrite)
+    return 0;
+  ucsan_label op = uc_pointer_object(lp);
+  if (op && op == uc_pointer_object(lq))
+    return same_object_index(elem, p, q, lp, lq);
+
+  auto ret = create_label_from_super_object(sizeof(int64_t), false);
+  dfsan_label index_label = __taint_create_label(0, ret.offset, sizeof(int64_t));
+  __taint_set_retval_tls(0, index_label, 64);
+  // byte by byte, 0 past the end of the seed (as ucsan_wrap_retval)
+  uint64_t index = 0;
+  uptr seed_size = ucsan_tainted.objects->size() ?
+                   ucsan_tainted.objects->at(0).data.size() : 0;
+  for (uptr i = 0; i < sizeof(index); ++i)
+    if (ret.offset + i < seed_size)
+      index |= (uint64_t)ucsan_tainted.objects->at(0).data[ret.offset + i] << (8 * i);
+  UCSAN_OUT("ptr_diff: index %ld from offset %lu (element size %ld)\n",
+            (int64_t)index, ret.offset, elem);
+
+  if (is_uc_pointer_label(lp) && is_uc_pointer_label(lq)) {
+    ucsan_ptr_info *pi = to_ptr_info(get_label_info(lp));
+    if (pi->op == OP_EXTERNAL && pi->status == PTR_INITIALIZED) {
+      UCSAN_OUT("ptr_diff: %p already has its object, not bound\n", p);
+    } else if (ucsan_num_ptr_bindings == ARRAY_SIZE(ucsan_ptr_bindings)) {
+      UCSAN_OUT("ptr_diff: too many bindings, %p not bound\n", p);
+    } else {
+      // q's object, created now if it was not yet
+      ucsan_check_pointer(q, lq, 1, false, 0);
+      ucsan_ptr_info *qi = to_ptr_info(get_label_info(lq));
+      if (qi->op == OP_EXTERNAL && qi->status == PTR_INITIALIZED) {
+        // p - pseudo_base is p's offset in the object: q's, plus i elements
+        int64_t qoff = (int64_t)q - (int64_t)qi->pseudo_base;
+        pi->op = OP_EXTERNAL;
+        pi->status = PTR_INITIALIZED;
+        pi->obj_label = qi->obj_label;
+        pi->pseudo_base = (void *)((int64_t)p - qoff - (int64_t)index * elem);
+        ucsan_ptr_bindings[ucsan_num_ptr_bindings++] =
+            {lp, index_label, (int64_t)index, elem};
+        UCSAN_OUT("ptr_diff: %p bound to element %ld of %p's object\n",
+                  p, (int64_t)index, q);
+      }
+    }
+  }
+  return (int64_t)index;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 ucsan_label ucsan_trace_alloca(uint64_t size, uint64_t elem_size, uint64_t addr) {
   // Track stack allocation bounds using stack-based label allocation
@@ -2485,6 +2682,13 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_retval_tls, uint32_t, dfsan_label
 // @param addr: memory address
 // @param size: size in bytes
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_label, dfsan_label, void*, uint64_t) {}
+
+// Make a SymSan expression label (op over l1/op1 and l2/op2)
+// @return: SymSan label (0 when standalone)
+SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_union, dfsan_label, dfsan_label,
+                             uint16_t, uint16_t, uint64_t, uint64_t) {
+  return 0;
+}
 
 // Copy SymSan shadow memory from src to dst
 // @param dst: destination address
