@@ -409,6 +409,12 @@ def target_signature(tail):
     return ""
 
 
+# Solver errors that are a deliberate decline, not a compatibility failure.
+SOLVER_DECLINES = (
+    "symbolic string too long",  # z3-ts kMaxSeqLength
+)
+
+
 def classify_run(res):
     """result.json of run_one.py -> (failures, findings, seeds)."""
     fails = []
@@ -438,6 +444,8 @@ def classify_run(res):
         else:
             fails.append(("run", "exit-code", "%d %s" % (code, target_signature(res.get("target_tail", "")))))
     for e in res.get("errors", []):
+        if any(d in e for d in SOLVER_DECLINES):
+            continue
         if "Solver error" in e:
             fails.append(("run", "solver-error", norm_sig(e.split("Solver error:", 1)[-1])))
         else:
