@@ -2719,18 +2719,24 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
 
   // Emit minimize hints for allocation size arguments
   SmallVector<unsigned, 2> SizeArgIndices;
+  // __taint_minimize_label also makes the label the allocation's symbolic
+  // size (its bound's l2), which __taint_solve_size compares with the byte
+  // size: so the label has to be the byte size's.  kmalloc(size, flags) has
+  // it first -- it was taken from the flags, and i915_deps_grow's memcpy size
+  // was checked against deps->gfp -- and calloc/reallocarray as a product,
+  // see below.
   if (BaseName == "malloc" || BaseName == "__libc_malloc" ||
       BaseName == "valloc" || BaseName == "__libc_valloc" ||
       BaseName == "pvalloc" || BaseName == "__libc_pvalloc" ||
-      BaseName == "kmalloc_large") {
+      BaseName == "kmalloc_large" || BaseName == "kmalloc" ||
+      BaseName == "__kmalloc") {
     SizeArgIndices.push_back(0);
   } else if (BaseName == "calloc" || BaseName == "__libc_calloc") {
     SizeArgIndices.push_back(0);
     SizeArgIndices.push_back(1);
   } else if (BaseName == "realloc" || BaseName == "__libc_realloc" ||
              BaseName == "aligned_alloc" ||
-             BaseName == "memalign" || BaseName == "__libc_memalign" ||
-             BaseName == "kmalloc" || BaseName == "__kmalloc") {
+             BaseName == "memalign" || BaseName == "__libc_memalign") {
     SizeArgIndices.push_back(1);
   } else if (BaseName == "reallocarray" || BaseName == "__libc_reallocarray") {
     SizeArgIndices.push_back(1);
@@ -2768,16 +2774,40 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
 
   if (!SizeArgIndices.empty()) {
     IRBuilder<> IRB(LI ? LI->getNextNode() : Next);
+    Value *NoBounds = ConstantInt::get(TT.getShadowTy(CI), 0);
+    // two factors (calloc's nmemb and size): each is a hint of its own, and
+    // neither is the byte size, so only their product updates the bound
+    bool Product = SizeArgIndices.size() > 1;
     for (unsigned Idx : SizeArgIndices) {
       Value *Size = CI->getArgOperand(Idx);
       Value *Shadow = getShadow(Size);
       Value *Bounds = LI;
-      if (!Bounds) Bounds = ConstantInt::get(TT.getShadowTy(CI), 0);
+      if (!Bounds || Product) Bounds = NoBounds;
       if (!TT.isZeroShadow(Shadow) && Size->getType()->isIntegerTy()) {
         // __taint_minimize_label takes an i64 size; a wrapper matched by
         // name may declare a narrower one (32-bit sizes in the kernel).
         Size = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
         IRB.CreateCall(TT.TaintMinimizeLabelFn, {Shadow, Size, Bounds});
+      }
+    }
+    if (Product && LI) {
+      Value *N = CI->getArgOperand(SizeArgIndices[0]);
+      Value *E = CI->getArgOperand(SizeArgIndices[1]);
+      if (N->getType()->isIntegerTy() && E->getType()->isIntegerTy()) {
+        auto wide = [&](Value *V) -> Value * {
+          Value *L = getShadow(V);
+          if (V->getType()->getIntegerBitWidth() < 64)
+            L = unionLabel(IRB, L, TT.ZeroPrimitiveShadow, Instruction::ZExt,
+                           64, V, ConstantInt::get(TT.Int64Ty, 0));
+          return L;
+        };
+        Value *N64 = IRB.CreateZExtOrTrunc(N, TT.Int64Ty);
+        Value *E64 = IRB.CreateZExtOrTrunc(E, TT.Int64Ty);
+        Value *Bytes = unionLabel(IRB, wide(N), wide(E), Instruction::Mul, 64,
+                                  N64, E64);
+        if (!TT.isZeroShadow(Bytes))
+          IRB.CreateCall(TT.TaintMinimizeLabelFn,
+                         {Bytes, IRB.CreateMul(N64, E64), LI});
       }
     }
   }
