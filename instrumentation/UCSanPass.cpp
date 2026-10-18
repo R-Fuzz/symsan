@@ -6161,6 +6161,10 @@ static bool mentionsSymbol(StringRef Text, StringRef Sym) {
 // does "movq __per_cpu_offset(,%rdi,8)", an R_X86_64_32S the PIE link
 // refuses, so every function of arch/x86/kernel/kvm.o failed to link.  Drop
 // the .pushsection/.popsection block when every label in it is unreferenced.
+// A function written straight into .text, from `.type X, @function` to
+// `.size X`, is dropped the same way: rethook.c's arch_rethook_trampoline
+// does "pushq $arch_rethook_trampoline", and once its C users are stubs that
+// self-reference is all that is left of it.
 static void dropUnreferencedAsmFunctions(Module &M) {
   std::string Asm = M.getModuleInlineAsm();
   if (Asm.empty())
@@ -6172,17 +6176,45 @@ static void dropUnreferencedAsmFunctions(Module &M) {
   SmallVector<std::pair<size_t, size_t>, 4> Regions;
   size_t Depth = 0, Start = 0;
   bool IsText = false;
+  auto IsTextSection = [](StringRef Sec) {
+    Sec = Sec.trim().split(',').first.trim().trim('"');
+    return Sec == ".text" || Sec.starts_with(".text.");
+  };
+  // the section top-level code is in, and the open `.type X, @function`
+  bool TopIsText = true;
+  StringRef Func;
+  size_t FuncStart = 0;
   for (size_t I = 0; I < Lines.size(); ++I) {
     StringRef L = Lines[I].trim();
     if (L.consume_front(".pushsection")) {
       if (Depth++ == 0) {
-        StringRef Sec = L.trim().split(',').first.trim().trim('"');
-        IsText = Sec == ".text" || Sec.starts_with(".text.");
+        IsText = IsTextSection(L);
         Start = I;
       }
     } else if (L.starts_with(".popsection") && Depth > 0) {
       if (--Depth == 0 && IsText)
         Regions.push_back({Start, I});
+    } else if (Depth > 0) {
+      continue;
+    } else if (L == ".text") {
+      TopIsText = true;
+    } else if (L.starts_with(".data") || L.starts_with(".bss") ||
+               L.starts_with(".rodata")) {
+      TopIsText = false;
+      Func = StringRef();
+    } else if (L.consume_front(".section")) {
+      TopIsText = IsTextSection(L);
+      Func = StringRef();
+    } else if (L.consume_front(".type")) {
+      auto [Name, Kind] = L.split(',');
+      if (TopIsText && Kind.trim() == "@function") {
+        Func = Name.trim();
+        FuncStart = I;
+      }
+    } else if (L.consume_front(".size") && !Func.empty() &&
+               L.split(',').first.trim() == Func) {
+      Regions.push_back({FuncStart, I});
+      Func = StringRef();
     }
   }
   if (Regions.empty())
@@ -6194,6 +6226,17 @@ static void dropUnreferencedAsmFunctions(Module &M) {
       if (auto *CB = dyn_cast<CallBase>(&I))
         if (auto *IA = dyn_cast<InlineAsm>(CB->getCalledOperand()))
           InlineAsms.push_back(IA->getAsmString());
+
+  // `.globl X` and friends name a symbol without referring to it; the lines
+  // naming a dropped label go with it
+  auto SymbolDirective = [&](size_t I, StringRef Sym) {
+    StringRef L = Lines[I].trim();
+    for (StringRef D : {".globl", ".global", ".weak", ".hidden", ".local",
+                        ".type", ".size"})
+      if (L.consume_front(D) && !L.empty() && isSpace(L[0]))
+        return L.trim().split(',').first.trim() == Sym;
+    return false;
+  };
 
   DenseSet<size_t> Dropped;
   for (auto [First, Last] : Regions) {
@@ -6219,7 +6262,8 @@ static void dropUnreferencedAsmFunctions(Module &M) {
         if (!GV->isDeclaration() || !GV->use_empty())
           return true;
       for (size_t I = 0; I < Lines.size(); ++I)
-        if ((I < First || I > Last) && mentionsSymbol(Lines[I], Sym))
+        if ((I < First || I > Last) && mentionsSymbol(Lines[I], Sym) &&
+            !SymbolDirective(I, Sym))
           return true;
       for (StringRef A : InlineAsms)
         if (mentionsSymbol(A, Sym))
@@ -6230,6 +6274,10 @@ static void dropUnreferencedAsmFunctions(Module &M) {
       continue;
     for (size_t I = First; I <= Last; ++I)
       Dropped.insert(I);
+    for (StringRef Sym : Labels)
+      for (size_t I = 0; I < Lines.size(); ++I)
+        if (SymbolDirective(I, Sym))
+          Dropped.insert(I);
   }
   if (Dropped.empty())
     return;
