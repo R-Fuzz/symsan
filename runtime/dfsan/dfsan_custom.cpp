@@ -4056,8 +4056,11 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_reallocarray(void *ptr, size_t nmemb, size_t new_size,
                           dfsan_label ptr_label, dfsan_label nmemb_label,
                           dfsan_label new_size_label, dfsan_label *ret_label) {
+  // the bound is nmemb * size bytes, so its label is the product's, not the
+  // two factors' (__taint_solve_size compares a byte size with l2)
+  dfsan_label byte_size = 0;
   if (nmemb_label != 0 || new_size_label != 0) {
-    dfsan_label byte_size = dfsan_union(nmemb_label, new_size_label, Mul,
+    byte_size = dfsan_union(nmemb_label, new_size_label, Mul,
         64, nmemb, new_size);
     __taint_check_malloc_size(nmemb * new_size, byte_size, __builtin_return_address(0));
   }
@@ -4066,7 +4069,7 @@ void *__dfsw_reallocarray(void *ptr, size_t nmemb, size_t new_size,
   if (ret) {
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size * nmemb);
     if (flags().trace_bounds) {
-      dfsan_label bound = dfsan_union(nmemb_label, new_size_label, Alloca, sizeof(ret) * 8,
+      dfsan_label bound = dfsan_union(0, byte_size, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (new_size * nmemb));
       *ret_label = bound;
     }
@@ -4104,8 +4107,11 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw___libc_reallocarray(void *ptr, size_t nmemb, size_t new_size,
                                  dfsan_label ptr_label, dfsan_label nmemb_label,
                                  dfsan_label new_size_label, dfsan_label *ret_label) {
+  // the bound is nmemb * size bytes, so its label is the product's, not the
+  // two factors' (__taint_solve_size compares a byte size with l2)
+  dfsan_label byte_size = 0;
   if (nmemb_label != 0 || new_size_label != 0) {
-    dfsan_label byte_size = dfsan_union(nmemb_label, new_size_label, Mul,
+    byte_size = dfsan_union(nmemb_label, new_size_label, Mul,
         64, nmemb, new_size);
     __taint_check_malloc_size(nmemb * new_size, byte_size, __builtin_return_address(0));
   }
@@ -4113,7 +4119,7 @@ void *__dfsw___libc_reallocarray(void *ptr, size_t nmemb, size_t new_size,
   if (ret) {
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size * nmemb);
     if (flags().trace_bounds) {
-      dfsan_label bound = dfsan_union(nmemb_label, new_size_label, Alloca, sizeof(ret) * 8,
+      dfsan_label bound = dfsan_union(0, byte_size, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (new_size * nmemb));
       *ret_label = bound;
     }
@@ -4151,8 +4157,11 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_calloc(size_t nmemb, size_t size,
                     dfsan_label nmemb_label, dfsan_label size_label,
                     dfsan_label *ret_label) {
+  // the bound is nmemb * size bytes, so its label is the product's, not the
+  // two factors' (__taint_solve_size compares a byte size with l2)
+  dfsan_label byte_size = 0;
   if (nmemb_label != 0 || size_label != 0) {
-    dfsan_label byte_size = dfsan_union(nmemb_label, size_label, Mul,
+    byte_size = dfsan_union(nmemb_label, size_label, Mul,
         64, nmemb, size);
     __taint_check_malloc_size(nmemb * size, byte_size, __builtin_return_address(0));
   }
@@ -4161,7 +4170,7 @@ void *__dfsw_calloc(size_t nmemb, size_t size,
   if (ret) {
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size * nmemb);
     if (flags().trace_bounds) {
-      dfsan_label bound = dfsan_union(nmemb_label, size_label, Alloca, sizeof(ret) * 8,
+      dfsan_label bound = dfsan_union(0, byte_size, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (size * nmemb));
       *ret_label = bound;
       AOUT("nmemb: %lu = %d, size: %lu = %d, addr: %p = %d\n", nmemb, nmemb_label,
@@ -4175,8 +4184,11 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw___libc_calloc(size_t nmemb, size_t size,
                            dfsan_label nmemb_label, dfsan_label size_label,
                            dfsan_label *ret_label) {
+  // the bound is nmemb * size bytes, so its label is the product's, not the
+  // two factors' (__taint_solve_size compares a byte size with l2)
+  dfsan_label byte_size = 0;
   if (nmemb_label != 0 || size_label != 0) {
-    dfsan_label byte_size = dfsan_union(nmemb_label, size_label, Mul,
+    byte_size = dfsan_union(nmemb_label, size_label, Mul,
         64, nmemb, size);
     __taint_check_malloc_size(nmemb * size, byte_size, __builtin_return_address(0));
   }
@@ -4185,7 +4197,7 @@ void *__dfsw___libc_calloc(size_t nmemb, size_t size,
   if (ret) {
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size * nmemb);
     if (flags().trace_bounds) {
-      dfsan_label bound = dfsan_union(nmemb_label, size_label, Alloca, sizeof(ret) * 8,
+      dfsan_label bound = dfsan_union(0, byte_size, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (size * nmemb));
       *ret_label = bound;
       AOUT("nmemb: %lu = %d, size: %lu = %d, addr: %p = %d\n", nmemb, nmemb_label,
