@@ -530,7 +530,10 @@ __taint_trace_memcmp(dfsan_label label) {
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
                      uint64_t size, uint16_t flag, void *addr) {
-  if (ptr_label == 0 && size_label == 0)
+  // (but not a NULL dereference: a NULL that never came from the input, a
+  // local initialized to it, has no label either, and dropping it left the
+  // Die() after it a bare exit status 1 -- sata_pmp_error_handler)
+  if (ptr_label == 0 && size_label == 0 && flag != F_MEMERR_NULL)
     return;
 
   if (__pipe_fd < 0)
