@@ -140,6 +140,11 @@ static std::string get_op_name(uint32_t op) {
   return std::to_string(op);
 }
 
+// The longest symbolic string handed to z3's sequence theory. Its axioms
+// (prefix, at) grow with the string, so a memchr over 16 KB of input takes
+// gigabytes before the query times out; such a constraint is declined.
+static const uint32_t kMaxSeqLength = 4096;
+
 // Check if an op is a string operation (fstr_op_start to fstr_op_end)
 static inline bool is_string_op(uint16_t op) {
   return op >= __dfsan::fstr_op_start && op < __dfsan::fstr_op_end;
@@ -3834,6 +3839,9 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
     uint32_t offset = get_label_info(info->l1)->op1.i;
     uint32_t input = get_label_info(info->l1)->op2.i;
     uint32_t len = info->l2;  // number of bytes loaded
+    if (len > kMaxSeqLength) {
+      throw z3::exception("symbolic string too long");
+    }
 
     // Create a single symbolic string variable: str-input-offset-len
     char name[256];
@@ -4000,6 +4008,9 @@ z3::expr Z3AstParser::build_string_from_label(dfsan_label label, input_dep_set_t
     };
 
     collect_offsets(label);
+    if (offsets.size() > kMaxSeqLength) {
+      throw z3::exception("symbolic string too long");
+    }
 
     // Check if offsets are truly consecutive
     if (is_consecutive && !offsets.empty() && input_id != UINT32_MAX) {
