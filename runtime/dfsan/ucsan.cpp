@@ -1744,10 +1744,46 @@ static ucsan_label resign_alloca_object(ucsan_label label_for_ptr,
   ucsan_label *le = ucsan_shadow_for(upper);
   char *obj_ptr = lower;
 
+  // A run of uninitialized bytes longer than eager_label_size gets one
+  // on-demand marker, as a large lazily created object does (see
+  // ucsan_labels_on_demand): unlzo hands two 40 KB buffers to out-of-scope
+  // callees, and a label per byte exhausted the 16-bit labels.  The bytes
+  // keep the super object offsets, one each, consecutive within the run, so
+  // the marker's real_ptr is placed for addr - real_ptr to be that offset.
+  ucsan_label run_marker = 0;
+  ucsan_label *run_end = lp;
   for (; lp < le; ++lp, ++obj_ptr) {
-    if (*lp == kUninitializedLabel) {
-      // Allocate a byte from super object
-      auto ret = create_label_from_super_object(1, false);
+    if (*lp != kUninitializedLabel)
+      continue;
+    if (lp >= run_end) {
+      run_marker = 0;
+      for (run_end = lp; run_end < le && *run_end == kUninitializedLabel;)
+        ++run_end;
+      uint64_t run_len = run_end - lp;
+      if (ucsan_labels_on_demand(run_len)) {
+        uint64_t base = atomic_load(&ucsan_tainted.arg_used, memory_order_relaxed);
+        run_marker = allocate_label();
+        ucsan_obj_info *marker = to_obj_info(get_label_info(run_marker));
+        marker->op = OP_RESERVED_OBJ;
+        marker->type_id = 0;
+        marker->object_id = 0;  // super object
+        marker->real_ptr = obj_ptr - base;
+        marker->lower_bound = (uint32_t)base;
+        marker->upper_bound = (uint32_t)run_len;
+        UCSAN_OUT("resign alloca run: %p +%lu at super offset %lu, marker %u\n",
+                  obj_ptr, run_len, base, run_marker);
+      }
+    }
+    {
+      object_info ret;
+      if (run_marker) {
+        // the byte's offset, its label given when first read
+        ret.offset = atomic_fetch_add(&ucsan_tainted.arg_used, 1, memory_order_relaxed);
+        ret.label = run_marker;
+      } else {
+        // Allocate a byte from super object
+        ret = create_label_from_super_object(1, false);
+      }
       UCSAN_OUT("resign alloca ret: %u %lu\n", ret.label, ret.offset);
       *lp = ret.label;
 
