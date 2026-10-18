@@ -713,13 +713,22 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
   __ucsan_null_deref_flag = nullptr;
 
   // Global variable handling
-  if (in_data_section(p)) {
+  // Only for a pointer the program got from a global itself: no label, or
+  // the bounds label ucsan_trace_global gives a fixed-size global (OP_ALLOCA).
+  // Any other label is a UC pointer -- a value from seed bytes -- and goes
+  // through the mapping below whatever its value, as it did before the
+  // section test was moved ahead of the label test for the bounds check:
+  // a value the solver picked can land in the image, mid-global and odd
+  // (unregister_nmi_handler's list head `next`, 33 bytes before nmi_desc),
+  // and was taken as a real global address.
+  if (in_data_section(p) &&
+      (label < UCSAN_CONST_OFFSET ||
+       (label != kUninitializedLabel &&
+        get_label_info(label)->common.op == OP_ALLOCA))) {
     // if label is not zero, perform bounds check
     if (label >= UCSAN_CONST_OFFSET) {
       ucsan_label_info *label_info = get_label_info(label);
-      if (label_info->common.op != OP_ALLOCA) {
-        UCSAN_OUT("WARNING: global variable with non-alloca label %u\n", label);
-      } else {
+      {
         // Check for out-of-bounds access to global variable
         ucsan_obj_info *obj = to_obj_info(label_info);
         void *base = obj->real_ptr;
