@@ -1533,6 +1533,38 @@ void Taint::writeBranchMap(Module &M) {
 //
 // The same goes for an i1 load (GlobalOpt shrinks a bool global to i1): its
 // byte is assumed 0 or 1 just the same.  It becomes an i8 load and `!= 0`.
+// llvm.umin/umax/smin/smax and llvm.abs have no label op: lower them to the
+// icmp + select they stand for, so the result carries the label of the operand
+// it picked and the comparison is traced like any select's.  Without it the
+// result went concrete -- instcombine turns the kernel's min_t(size_t, len,
+// PAGE_SIZE) before a copy into one.  Codegen matches the select back.
+static void lowerMinMaxAbs(Function &F) {
+  SmallVector<IntrinsicInst *, 8> Worklist;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (II->getType()->isIntegerTy() &&
+          (isa<MinMaxIntrinsic>(II) || II->getIntrinsicID() == Intrinsic::abs))
+        Worklist.push_back(II);
+  for (IntrinsicInst *II : Worklist) {
+    IRBuilder<> IRB(II);
+    Value *A = II->getArgOperand(0);
+    Value *Res;
+    if (auto *MM = dyn_cast<MinMaxIntrinsic>(II)) {
+      Value *B = MM->getRHS();
+      Res = IRB.CreateSelect(IRB.CreateICmp(MM->getPredicate(), A, B), A, B);
+    } else {
+      // abs(INT_MIN) wraps unless the poison flag is set; either way the
+      // negation below gives INT_MIN back, the value the program sees.
+      Value *Neg = IRB.CreateNeg(A);
+      Res = IRB.CreateSelect(
+          IRB.CreateICmpSLT(A, ConstantInt::get(A->getType(), 0)), Neg, A);
+    }
+    Res->takeName(II);
+    II->replaceAllUsesWith(Res);
+    II->eraseFromParent();
+  }
+}
+
 static void normalizeBoolLoads(Function &F) {
   SmallVector<LoadInst *, 16> Loads;
   SmallVector<LoadInst *, 4> I1Loads;
@@ -2518,6 +2550,7 @@ bool Taint::runImpl(Module &M) {
       addFrameTracing(*F);
     removeUnreachableBlocks(*F);
     normalizeBoolLoads(*F);
+    lowerMinMaxAbs(*F);
 
     TaintFunction TF(*this, F, FnsWithNativeABI.count(F),
                      FnsWithForceZeroLabel.count(F));
