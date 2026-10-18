@@ -811,6 +811,10 @@ struct TaintFunction {
   void checkBounds(Value *Ptr, Value *Size, Instruction *Pos);
   void solveBounds(Value *Ptr, Value *Size, Instruction *Pos);
   void hoistBoundsChecks();
+  Value *unionLabel(IRBuilder<> &IRB, Value *L1, Value *L2, unsigned Op,
+                    unsigned Bits, Value *V1, Value *V2);
+  Value *labelForSCEV(const SCEV *S, ScalarEvolution &SE,
+                      SCEVExpander &Expander, Instruction *InsertPt);
 
   /// XXX: because we never collapse taint labels for aggregate types,
   ///      we also do not expand taint labels from an aggreated primitive
@@ -3093,6 +3097,94 @@ void TaintFunction::solveBounds(Value *Ptr, Value* Size, Instruction *Pos) {
       {PtrShadow, Addr, SizeShadow, Size64, CID});
 }
 
+// A label for the operation Op over L1/V1 and L2/V2, at Bits bits, as an
+// instrumented instruction would make it (V1/V2 the concrete operands, a zero
+// label for a concrete one).
+Value *TaintFunction::unionLabel(IRBuilder<> &IRB, Value *L1, Value *L2,
+                                 unsigned Op, unsigned Bits, Value *V1,
+                                 Value *V2) {
+  if (TT.isZeroShadow(L1) && TT.isZeroShadow(L2))
+    return TT.ZeroPrimitiveShadow;
+  CallInst *Call = IRB.CreateCall(
+      TT.TaintUnionFn,
+      {L1, L2, ConstantInt::get(TT.Int16Ty, Op),
+       ConstantInt::get(TT.Int16Ty, Bits),
+       IRB.CreateZExtOrTrunc(V1, TT.Int64Ty),
+       IRB.CreateZExtOrTrunc(V2, TT.Int64Ty)});
+  Call->addRetAttr(Attribute::ZExt);
+  Call->addParamAttr(0, Attribute::ZExt);
+  Call->addParamAttr(1, Attribute::ZExt);
+  return Call;
+}
+
+// The label of S's value, built from its leaves' labels the way the
+// instructions computing it would have built it, or nullptr for a shape it
+// cannot say (an add recurrence, a min/max, ...).  A summarized range's size
+// is an expression over the loop's symbolic leaves -- `4 * n`, `(n - 1) * 8
+// + 4` -- and __taint_solve_size compares its label with its concrete value:
+// the label of one leaf alone recorded the size against the leaf
+// (snd_hdac_setup_channel_mapping: a loop over ints, 0x20 against n = 8),
+// and every such check was a value mismatch.
+Value *TaintFunction::labelForSCEV(const SCEV *S, ScalarEvolution &SE,
+                                   SCEVExpander &Expander,
+                                   Instruction *InsertPt) {
+  IRBuilder<> IRB(InsertPt);
+  if (!S->getType()->isIntegerTy())
+    return nullptr;
+  unsigned Bits = S->getType()->getIntegerBitWidth();
+  if (isa<SCEVConstant>(S))
+    return TT.ZeroPrimitiveShadow;
+  if (auto *U = dyn_cast<SCEVUnknown>(S)) {
+    if (!U->getValue()->getType()->isIntegerTy())
+      return nullptr;
+    return getShadow(U->getValue());
+  }
+  auto concrete = [&](const SCEV *X) {
+    return Expander.expandCodeFor(X, X->getType(), InsertPt);
+  };
+  if (auto *C = dyn_cast<SCEVCastExpr>(S)) {
+    unsigned Op = isa<SCEVZeroExtendExpr>(S)   ? Instruction::ZExt
+                  : isa<SCEVSignExtendExpr>(S) ? Instruction::SExt
+                  : isa<SCEVTruncateExpr>(S)   ? Instruction::Trunc
+                                               : 0;
+    if (!Op)
+      return nullptr;
+    Value *L = labelForSCEV(C->getOperand(), SE, Expander, InsertPt);
+    if (!L)
+      return nullptr;
+    return unionLabel(IRB, L, TT.ZeroPrimitiveShadow, Op, Bits,
+                      concrete(C->getOperand()),
+                      ConstantInt::get(TT.Int64Ty, 0));
+  }
+  if (isa<SCEVAddExpr>(S) || isa<SCEVMulExpr>(S)) {
+    auto *N = cast<SCEVNAryExpr>(S);
+    unsigned Op = isa<SCEVAddExpr>(S) ? Instruction::Add : Instruction::Mul;
+    // left to right, as (((a op b) op c) ...), with the partial value
+    const SCEV *Acc = N->getOperand(0);
+    Value *L = labelForSCEV(Acc, SE, Expander, InsertPt);
+    if (!L)
+      return nullptr;
+    for (unsigned I = 1; I < N->getNumOperands(); ++I) {
+      const SCEV *X = N->getOperand(I);
+      Value *LX = labelForSCEV(X, SE, Expander, InsertPt);
+      if (!LX)
+        return nullptr;
+      L = unionLabel(IRB, L, LX, Op, Bits, concrete(Acc), concrete(X));
+      Acc = Op == Instruction::Add ? SE.getAddExpr(Acc, X) : SE.getMulExpr(Acc, X);
+    }
+    return L;
+  }
+  if (auto *D = dyn_cast<SCEVUDivExpr>(S)) {
+    Value *L1 = labelForSCEV(D->getLHS(), SE, Expander, InsertPt);
+    Value *L2 = labelForSCEV(D->getRHS(), SE, Expander, InsertPt);
+    if (!L1 || !L2)
+      return nullptr;
+    return unionLabel(IRB, L1, L2, Instruction::UDiv, Bits,
+                      concrete(D->getLHS()), concrete(D->getRHS()));
+  }
+  return nullptr;
+}
+
 // Collect all SCEVUnknown values from a SCEV expression.
 static void collectSCEVUnknowns(const SCEV *S,
                                 SmallVectorImpl<Value *> &Unknowns) {
@@ -3259,7 +3351,18 @@ void TaintFunction::hoistBoundsChecks() {
         if (Summary.AccessSize != 1)
           TotalVal = IRB.CreateMul(
               Count64, ConstantInt::get(TT.Int64Ty, Summary.AccessSize));
+        // the label of TotalVal, not of Count: the size is Count elements of
+        // AccessSize bytes (see labelForSCEV)
         Value *SizeShadow = getShadow(Count);
+        if (Count->getType()->getIntegerBitWidth() < 64)
+          SizeShadow = unionLabel(IRB, SizeShadow, TT.ZeroPrimitiveShadow,
+                                  Instruction::ZExt, 64, Count,
+                                  ConstantInt::get(TT.Int64Ty, 0));
+        if (Summary.AccessSize != 1)
+          SizeShadow = unionLabel(IRB, SizeShadow, TT.ZeroPrimitiveShadow,
+                                  Instruction::Mul, 64, Count64,
+                                  ConstantInt::get(TT.Int64Ty,
+                                                   Summary.AccessSize));
 
         // Soft solve_size hint only: the guard value is a heuristic for the
         // write count, not a proven bound, so a hard check_bounds here would
@@ -3725,15 +3828,10 @@ void TaintFunction::hoistBoundsChecks() {
       // If the summarized range is symbolic, emit one solve_size outside the
       // loop. Looking at TotalSCEV catches both symbolic trip counts and
       // symbolic extents folded into the address/range expression.
-      SmallVector<Value *, 4> Unknowns;
-      collectSCEVUnknowns(TotalSCEV, Unknowns);
-      Value *SizeShadow = TT.ZeroPrimitiveShadow;
-      for (Value *V : Unknowns) {
-        Value *S = getShadow(V);
-        if (!TT.isZeroShadow(S))
-          SizeShadow = S;
-      }
-      if (!TT.isZeroShadow(SizeShadow)) {
+      // (the label of TotalSCEV itself, not of one of its leaves: see
+      // labelForSCEV; none for a shape it cannot say)
+      Value *SizeShadow = labelForSCEV(TotalSCEV, SE, Expander, InsertPt);
+      if (SizeShadow && !TT.isZeroShadow(SizeShadow)) {
         ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
             TT.getInstructionId(FirstCI));
         IRB.CreateCall(TT.TaintSolveSizeFn,
@@ -3794,18 +3892,14 @@ void TaintFunction::hoistBoundsChecks() {
       // Soft solve_size hint only. The summary records a fixed field offset and
       // access size with no per-iteration stride, so trip_count * access_size is
       // not a proven extent; a hard check_bounds here could abort spuriously.
-      SmallVector<Value *, 4> Unknowns;
-      collectSCEVUnknowns(TotalSCEV, Unknowns);
-      Value *SizeShadow = TT.ZeroPrimitiveShadow;
-      for (Value *V : Unknowns) {
-        Value *S = getShadow(V);
-        if (!TT.isZeroShadow(S))
-          SizeShadow = S;
+      // (TotalSCEV's own label, as above)
+      Value *SizeShadow = labelForSCEV(TotalSCEV, SE, Expander, InsertPt);
+      if (SizeShadow && !TT.isZeroShadow(SizeShadow)) {
+        ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
+            TT.getInstructionId(CI));
+        IRB.CreateCall(TT.TaintSolveSizeFn,
+                       {AddrLabel, StartVal, SizeShadow, TotalVal, CID});
       }
-      ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
-          TT.getInstructionId(CI));
-      IRB.CreateCall(TT.TaintSolveSizeFn,
-                     {AddrLabel, StartVal, SizeShadow, TotalVal, CID});
     }
 
     // Some accesses do not have a matching check_bounds call with an affine
@@ -3926,15 +4020,10 @@ void TaintFunction::hoistBoundsChecks() {
       IRB.CreateCall(TT.TaintCheckBoundsFn,
                      {AddrLabel, StartVal, TT.ZeroPrimitiveShadow, TotalVal});
 
-      SmallVector<Value *, 4> Unknowns;
-      collectSCEVUnknowns(TotalSCEV, Unknowns);
-      Value *SizeShadow = TT.ZeroPrimitiveShadow;
-      for (Value *V : Unknowns) {
-        Value *S = getShadow(V);
-        if (!TT.isZeroShadow(S))
-          SizeShadow = S;
-      }
-      if (!TT.isZeroShadow(SizeShadow)) {
+      // (the label of TotalSCEV itself, not of one of its leaves: see
+      // labelForSCEV; none for a shape it cannot say)
+      Value *SizeShadow = labelForSCEV(TotalSCEV, SE, Expander, InsertPt);
+      if (SizeShadow && !TT.isZeroShadow(SizeShadow)) {
         ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
             TT.getInstructionId(FirstCI));
         IRB.CreateCall(TT.TaintSolveSizeFn,
