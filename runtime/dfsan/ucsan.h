@@ -410,6 +410,15 @@ inline bool ucsan_labels_on_demand(uint64_t object_size) {
 // *ls, given its byte's label first if it has none yet (addr: the byte)
 ucsan_label ucsan_materialize_byte(ucsan_label *ls, void *addr);
 
+// Freed UC objects, by object label.  An object is reached through
+// ptr label -> ptr_info.obj_label, and more than one pointer label can name
+// the same object (a pointer difference binds one pointer into another's
+// object, see __dfsw_ucsan_ptr_index), so a free that marked only the label
+// it was given left the object live through the others.  Not in the obj_info
+// op: on-demand byte labels are recognized by OP_RESERVED_OBJ.
+bool ucsan_obj_freed(ucsan_label obj_label);
+void ucsan_mark_obj_freed(ucsan_label obj_label);
+
 }  // namespace __ucsan
 
 //===----------------------------------------------------------------------===//

@@ -34,6 +34,7 @@ ERROR_EVENTS = {
     'OOB': 152,
     'NULL_DEREF': 153,
     'DOUBLE_FREE': 156,
+    'INVALID_FREE': 158,
     'OOB_UPCAST': 161,
     'PANIC': 171,
 }

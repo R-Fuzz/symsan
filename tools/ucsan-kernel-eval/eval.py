@@ -91,7 +91,8 @@ LLVM_AS = os.environ.get("LLVM_AS", "llvm-as-18")
 # exit statuses (runtime/dfsan/ucsan_exit_reason.h) that are UCSan doing its job
 FINDING_CODES = {
     150: "UBI", 151: "UAF", 152: "OOB", 153: "NULL_DEREF", 154: "DIV_BY_ZERO",
-    155: "INT_OVERFLOW", 156: "DOUBLE_FREE", 157: "MEMLEAK", 161: "OOB_UPCAST",
+    155: "INT_OVERFLOW", 156: "DOUBLE_FREE", 157: "MEMLEAK", 158: "INVALID_FREE",
+    161: "OOB_UPCAST",
     171: "PANIC", 180: "KERNEL_BUG", 201: "CONTRACTION",
 }
 # internal termination reasons: execution was cut off, nothing is wrong

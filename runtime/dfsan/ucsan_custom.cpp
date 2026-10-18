@@ -222,6 +222,33 @@ void __dfsw_free(void *ptr, ucsan_label ptr_label) {
   // Mark buffer as freed for UAF detection
   if (ptr && ptr_label > UCSAN_CONST_LABEL) {
     ucsan_label_info *info = get_label_info(ptr_label);
+    // A UC object can have more than one pointer label (see
+    // ucsan_obj_freed): mark the object, which the others reach, as well as
+    // this label.  Freed through another one already, this is a double free.
+    if (info->common.op == OP_EXTERNAL &&
+        to_ptr_info(info)->status == PTR_INITIALIZED) {
+      ucsan_label obj_label = to_ptr_info(info)->obj_label;
+      if (ucsan_obj_freed(obj_label)) {
+        UCSAN_OUT("WARNING: double free detected for ptr %p, label %d (object label %d)\n",
+                  ptr, ptr_label, obj_label);
+        __taint_trace_event_addr(ptr_label, EVENT_DOUBLE_FREE, 0, __builtin_return_address(0), 0);
+        exit(exit_reason::EVENT_DOUBLE_FREE);
+      }
+      // ptr is the checked address.  Bytes of the object below it -- known
+      // because something accessed them -- make it an address inside the
+      // object, not its start (a pointer bound to an element, freed).  Below
+      // all known bytes it is the start: under UC the object extends down to
+      // wherever it is freed from (container_of, then kfree).
+      ucsan_obj_info *obj = to_obj_info(get_label_info(obj_label));
+      int64_t off = (int64_t)ptr - (int64_t)obj->real_ptr;
+      if (off > -(int64_t)obj->lower_bound && off <= (int64_t)obj->upper_bound) {
+        UCSAN_OUT("WARNING: invalid free of ptr %p, label %d: offset %ld in object label %d\n",
+                  ptr, ptr_label, off, obj_label);
+        __taint_trace_event_addr(ptr_label, EVENT_INVALID_FREE, 0, __builtin_return_address(0), 0);
+        exit(exit_reason::EVENT_INVALID_FREE);
+      }
+      ucsan_mark_obj_freed(obj_label);
+    }
     if (info->common.op == OP_ALLOCA || info->common.op == OP_EXTERNAL) {
       info->common.op = OP_FREE;
     } else if (info->common.op == OP_FREE) {
@@ -484,7 +511,11 @@ __dfsw_assert_freed(void *ptr, uint64_t id, ucsan_label ptr_label, ucsan_label i
   }
   ucsan_label_info *info = get_label_info(ptr_label);
   ucsan_obj_info *obj = to_obj_info(info);
-  if (obj->op != OP_FREE) {
+  // or its object freed through another of its pointer labels
+  bool obj_freed = info->common.op == OP_EXTERNAL &&
+                   to_ptr_info(info)->status == PTR_INITIALIZED &&
+                   ucsan_obj_freed(to_ptr_info(info)->obj_label);
+  if (obj->op != OP_FREE && !obj_freed) {
     UCSAN_OUT("ERROR: assertion %lu failure: ptr %p, label %d, op %d\n", id, ptr, ptr_label, obj->op);
     __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSERTION_FREED_FAILED);
     return;
@@ -665,6 +696,10 @@ __dfsw_assume_freed(void *ptr, uint64_t id, ucsan_label ptr_label,
   }
   // otherwise we just mark it as freed
   // internal_memset(info, 0, sizeof(*info));
+  // (its object too, for its other pointer labels: see __dfsw_free)
+  if (info->common.op == OP_EXTERNAL &&
+      to_ptr_info(info)->status == PTR_INITIALIZED)
+    ucsan_mark_obj_freed(to_ptr_info(info)->obj_label);
   info->common.op = OP_FREE;
   *ret_label = ptr_label;
   return ptr;

@@ -13,6 +13,7 @@ enum exit_reason {
   EVENT_INT_OVERFLOW = 155,
   EVENT_DOUBLE_FREE = 156,
   EVENT_MEMLEAK = 157,
+  EVENT_INVALID_FREE = 158,   // free of an address inside an object
 
   EVENT_OOB_UPCAST = 161,
 

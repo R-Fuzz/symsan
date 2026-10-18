@@ -1033,6 +1033,16 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     ucsan_obj_info *obj_label_info = to_obj_info(get_label_info(obj_label));
     uint32_t object_id = obj_label_info->object_id;
 
+    // the object freed through another of its pointer labels: this label's
+    // own op is still OP_EXTERNAL (see ucsan_obj_freed)
+    if (ucsan_flags().trace_bounds && dereferencing &&
+        ucsan_obj_freed(obj_label)) {
+      UCSAN_OUT("ERROR: Heap UAF detected ptr %p, label = %u (object label %u freed)\n",
+                p, label, obj_label);
+      __taint_trace_event_addr(label, EVENT_UAF, 0, __builtin_return_address(0), 0);
+      exit(exit_reason::EVENT_UAF);
+    }
+
     void *obj_base = obj_label_info->real_ptr;
     int64_t pseudo_base = (int64_t)ptr_info->pseudo_base;  // Read from ptr_info
     int64_t desired_offset = (int64_t)p - pseudo_base;
@@ -1949,6 +1959,18 @@ void* ucsan_wrap_retval(uint64_t size, ucsan_label *ret_label, bool is_ptr, void
   return (void*)__ucsan_wrapped_return_tls;
 }
 
+namespace __ucsan {
+static u64 ucsan_freed_objs[(1u << (8 * sizeof(ucsan_label))) / 64];
+
+bool ucsan_obj_freed(ucsan_label obj_label) {
+  return (ucsan_freed_objs[obj_label / 64] >> (obj_label % 64)) & 1;
+}
+
+void ucsan_mark_obj_freed(ucsan_label obj_label) {
+  ucsan_freed_objs[obj_label / 64] |= 1ULL << (obj_label % 64);
+}
+}  // namespace __ucsan
+
 // A UC pointer: an external pointer, or a byte label (a pointer loaded from
 // a UC object or a global and not dereferenced yet, which ucsan_check_pointer
 // turns into one).  Not a real pointer (no label, an alloca, a global's
@@ -2091,7 +2113,8 @@ static int64_t same_object_index(int64_t elem, void *p, void *q,
 // the super object, as a wrapped return value is -- and its SymSan label in
 // the retval TLS (TaintPass reads it there for a __dfsw_ call from UCSan).  p
 // is then bound into q's object at element i, so that what is written through
-// one is seen through the other; only while p has no object of its own, and only into a UC object (a real q
+// one is seen through the other, and freeing one frees the other's object;
+// only while p has no object of its own, and only into a UC object (a real q
 // -- lock_classes in match_held_lock -- is not one).
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 int64_t __dfsw_ucsan_ptr_index(bool rewrite, int64_t elem, void *p, void *q,
@@ -2282,7 +2305,9 @@ void ucsan_scan_mark_reachable(void *base, uint64_t size) {
           ucsan_label obj_label = ptr_info->obj_label;
           if (obj_label >= UCSAN_CONST_OFFSET) {
             ucsan_label_info *obj_info = get_label_info(obj_label);
-            if (obj_info->common.op == OP_RESERVED_OBJ) {
+            // (a freed object's contents keep nothing reachable)
+            if (ucsan_obj_freed(obj_label)) {
+            } else if (obj_info->common.op == OP_RESERVED_OBJ) {
               ucsan_obj_info *obj = to_obj_info(obj_info);
               // object spans [real_ptr - lower_bound, real_ptr + upper_bound)
               ucsan_scan_mark_reachable((char*)obj->real_ptr - obj->lower_bound,
@@ -2345,7 +2370,9 @@ void ucsan_scan_shadow_for_leaks() {
         ucsan_label obj_label = ptr_info->obj_label;
         if (obj_label >= UCSAN_CONST_OFFSET) {
           ucsan_label_info *obj_info = get_label_info(obj_label);
-          if (obj_info->common.op == OP_RESERVED_OBJ) {
+          // (a freed object's contents keep nothing reachable)
+          if (ucsan_obj_freed(obj_label)) {
+          } else if (obj_info->common.op == OP_RESERVED_OBJ) {
             ucsan_obj_info *obj = to_obj_info(obj_info);
             // object spans [real_ptr - lower_bound, real_ptr + upper_bound)
             ucsan_scan_mark_reachable((char*)obj->real_ptr - obj->lower_bound,
