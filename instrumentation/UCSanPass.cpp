@@ -1663,7 +1663,14 @@ Value *UCSanFunction::loadShadow(Value *Addr, uint64_t Size, Align Align,
   if (AllConstants)
     return UC.ZeroPrimitiveShadow;
 
-  const llvm::Align ShadowAlign(Align.value() * UCSan::ShadowWidthBytes);
+  // Only the shadow width's own alignment, not the access's scaled up: the
+  // IR's alignment is a promise about the address the program computes, and
+  // under UC the address is what ucsan_check_pointer returns, which need not
+  // keep it (a seed value taken as a pointer into the image can be odd --
+  // unregister_nmi_handler's list walk).  x86 does the access itself
+  // unaligned; a shadow access scaled to 16 bytes became a movaps, and a
+  // general-protection fault.
+  const llvm::Align ShadowAlign(UCSan::ShadowWidthBytes);
 
   // now check if we're loading an aggragate object
   if (!isa<ArrayType>(Ty) && !isa<StructType>(Ty))
@@ -1750,7 +1757,8 @@ void UCSanFunction::storeShadow(Value *Addr, uint64_t Size, Align Alignment,
     }
   }
 
-  const Align ShadowAlign(Alignment.value() * UCSan::ShadowWidthBytes);
+  // the shadow width's alignment only, as in loadShadow
+  const Align ShadowAlign(UCSan::ShadowWidthBytes);
   Value *ShadowAddr = UC.getShadowAddress(Addr, IRB);
   // check if the shadow is zero, if so, clear the shadow memory regardless
   // of the shadow type
