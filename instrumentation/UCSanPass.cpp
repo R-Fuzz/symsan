@@ -5006,17 +5006,32 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     if (!Op.isValue() || !Op.V->getType()->isPointerTy() ||
         isa<Constant>(Op.V))
       continue;
-    std::string Plain = "($" + std::to_string(N) + ")";
-    std::string Braced = "(${" + std::to_string(N) + ":";
+    // An input tied to an output is named by the output's number in the
+    // template: ip_fast_csum's "movl (%1), %0" with "1" (iph).  The size
+    // reaches past the largest displacement, "adcl 16(%1), %0" reading
+    // bytes 16..19.
+    SmallVector<unsigned, 2> Names = {N};
+    if (Op.TiedTo >= 0)
+      Names.push_back(Op.TiedTo);
     uint64_t Size = 0;
     bool Deref = false;
-    for (auto &I : Insns)
-      for (auto &O : I.Operands)
-        if (O.find(Plain) != std::string::npos ||
-            O.find(Braced) != std::string::npos) {
+    for (unsigned Name : Names) {
+      std::string Plain = "($" + std::to_string(Name) + ")";
+      std::string Braced = "(${" + std::to_string(Name) + ":";
+      for (auto &I : Insns)
+        for (auto &O : I.Operands) {
+          size_t P = O.find(Plain);
+          if (P == std::string::npos)
+            P = O.find(Braced);
+          if (P == std::string::npos)
+            continue;
           Deref = true;
-          Size = std::max(Size, asmAccessSize(I.Mnemonic, I.Operands));
+          uint64_t Disp = 0;  // none, or a negative one: 0
+          if (StringRef(O).substr(0, P).trim().getAsInteger(0, Disp))
+            Disp = 0;
+          Size = std::max(Size, Disp + asmAccessSize(I.Mnemonic, I.Operands));
         }
+    }
     if (!Deref)
       continue;
     Value *Ptr = UF.checkPointer(Op.V, ConstantInt::get(UF.UC.Int64Ty, Size),
