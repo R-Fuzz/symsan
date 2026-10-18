@@ -3394,8 +3394,16 @@ void declareAsmCallees(Module &M, StringMap<WeakTrackingVH> &Callees) {
       Function *Fn = nullptr;
       if (S.Operand >= 0) {
         Fn = cast<Function>(AO.Ops[S.Operand].V->stripPointerCasts());
-      } else if (!(Fn = M.getFunction(S.Sym)) && !Callees.count(S.Sym) &&
-                 !isAsmModeledCallee(S.Sym)) {
+      } else if ((Fn = M.getFunction(S.Sym))) {
+        // In the module already (the C next to the asm calls it too:
+        // call_on_irqstack_cond's irq_enter_rcu), but an out-of-scope one is
+        // replaced by its __external$ wrapper and erased before the asm is
+        // visited, and then found neither by name nor here: the asm was left
+        // alone, and linked against the bare symbol (sysvec_irq_work).  The
+        // value handle follows the replacement.
+        if (!Callees.count(S.Sym))
+          Callees[S.Sym] = Fn;
+      } else if (!Callees.count(S.Sym) && !isAsmModeledCallee(S.Sym)) {
         SmallVector<Type *, 6> Params;
         for (const char *R : AsmArgRegs) {
           Type *T = RegTys.lookup(R);
