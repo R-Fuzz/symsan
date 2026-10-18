@@ -3209,6 +3209,7 @@ struct AsmStep {
   std::string Reg, Src; // SetReg/CopyReg: destination, CopyReg: source
   int Operand = -1;     // SetReg: source operand; Call: callee operand
   std::string Sym;      // Call: symbol, when not an operand
+  bool Indirect = false; // Call: `call *$N`, through the memory operand N
 };
 
 // The steps of an asm made only of calls, register moves and stack switches;
@@ -3231,6 +3232,14 @@ bool planAsmCalls(ArrayRef<AsmInsn> Insns, ArrayRef<AsmOp> Ops,
           S.Operand = N;
         else
           return false;
+      } else if (T.starts_with("*$") || T.starts_with("*${")) {
+        // `call *$N` through a memory operand: a paravirt call, slow_down_io's
+        // PVOP_VCALL0(cpu.io_delay) through pv_ops
+        int K = asmOperandRef(T.drop_front());
+        if (K < 0 || K >= (int)Ops.size() || !Ops[K].isMem())
+          return false;
+        S.Operand = K;
+        S.Indirect = true;
       } else if (T.starts_with("*") || T.starts_with("%") || T.empty()) {
         return false;
       } else {
@@ -4850,7 +4859,9 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
       if (S.Kind != AsmStep::Call)
         continue;
       FunctionCallee Callee;
-      if (S.Operand >= 0) {
+      if (S.Indirect) {
+        // typed when it is built, from the registers set by then
+      } else if (S.Operand >= 0) {
         auto *Fn = cast<Function>(Ops[S.Operand].V->stripPointerCasts());
         Callee = FunctionCallee(Fn->getFunctionType(), Fn);
       } else if (Function *Fn = M->getFunction(S.Sym)) {
@@ -4888,6 +4899,25 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
           continue;
         }
         FunctionCallee Callee = Callees[NextCallee++];
+        if (S.Indirect) {
+          // The arguments are the argument registers set so far, in order,
+          // and the result is %rax if the asm has it as an output.  The
+          // pointer is loaded in IR, so an out-of-scope pv_ops is symbolized
+          // and its slot called the way any indirect call is.
+          SmallVector<Type *, 6> Params;
+          for (const char *R : AsmArgRegs) {
+            if (!Regs.lookup(R))
+              break;
+            Params.push_back(IRB.getInt64Ty());
+          }
+          bool HasRet = llvm::any_of(Ops, [](const AsmOp &O) {
+            return O.Result >= 0 && O.Reg == "ax";
+          });
+          auto *FT = FunctionType::get(
+              HasRet ? IRB.getInt64Ty() : IRB.getVoidTy(), Params, false);
+          Value *FPtr = IRB.CreateLoad(IRB.getPtrTy(), Ops[S.Operand].V);
+          Callee = FunctionCallee(FT, FPtr);
+        }
         if (!Callee)
           continue;
         // Adjust args to match function signature
