@@ -6034,6 +6034,110 @@ bool UCSan::initializeModule(Module &M) {
   return true;
 }
 
+static bool mentionsSymbol(StringRef Text, StringRef Sym) {
+  auto IsIdent = [](char C) {
+    return isAlnum(C) || C == '_' || C == '.' || C == '$';
+  };
+  for (size_t Pos = Text.find(Sym); Pos != StringRef::npos;
+       Pos = Text.find(Sym, Pos + 1)) {
+    size_t End = Pos + Sym.size();
+    if ((Pos == 0 || !IsIdent(Text[Pos - 1])) &&
+        (End == Text.size() || !IsIdent(Text[End])))
+      return true;
+  }
+  return false;
+}
+
+// Functions a top-level asm() block defines in .text that nothing the scope
+// keeps refers to any more: their callers were out of scope and became
+// __external$ stubs.  Such asm still gets assembled, and kernel asm addresses
+// globals absolutely -- kvm.c's __raw_callee_save___kvm_vcpu_is_preempted
+// does "movq __per_cpu_offset(,%rdi,8)", an R_X86_64_32S the PIE link
+// refuses, so every function of arch/x86/kernel/kvm.o failed to link.  Drop
+// the .pushsection/.popsection block when every label in it is unreferenced.
+static void dropUnreferencedAsmFunctions(Module &M) {
+  std::string Asm = M.getModuleInlineAsm();
+  if (Asm.empty())
+    return;
+  SmallVector<StringRef, 64> Lines;
+  StringRef(Asm).split(Lines, '\n');
+
+  // [first, last] line of each top-level .text push/pop block
+  SmallVector<std::pair<size_t, size_t>, 4> Regions;
+  size_t Depth = 0, Start = 0;
+  bool IsText = false;
+  for (size_t I = 0; I < Lines.size(); ++I) {
+    StringRef L = Lines[I].trim();
+    if (L.consume_front(".pushsection")) {
+      if (Depth++ == 0) {
+        StringRef Sec = L.trim().split(',').first.trim().trim('"');
+        IsText = Sec == ".text" || Sec.starts_with(".text.");
+        Start = I;
+      }
+    } else if (L.starts_with(".popsection") && Depth > 0) {
+      if (--Depth == 0 && IsText)
+        Regions.push_back({Start, I});
+    }
+  }
+  if (Regions.empty())
+    return;
+
+  std::vector<StringRef> InlineAsms;
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (auto *IA = dyn_cast<InlineAsm>(CB->getCalledOperand()))
+          InlineAsms.push_back(IA->getAsmString());
+
+  DenseSet<size_t> Dropped;
+  for (auto [First, Last] : Regions) {
+    SmallVector<StringRef, 4> Labels;
+    for (size_t I = First; I <= Last; ++I) {
+      SmallVector<StringRef, 4> Stmts;
+      Lines[I].split(Stmts, ';');
+      for (StringRef S : Stmts) {
+        S = S.trim();
+        if (!S.consume_back(":") || S.empty() || S.starts_with(".L") ||
+            isDigit(S[0]) ||
+            S.find_first_not_of("abcdefghijklmnopqrstuvwxyz"
+                                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.$") !=
+                StringRef::npos)
+          continue;
+        Labels.push_back(S);
+      }
+    }
+    if (Labels.empty())
+      continue;
+    auto Referenced = [&](StringRef Sym) {
+      if (GlobalValue *GV = M.getNamedValue(Sym))
+        if (!GV->isDeclaration() || !GV->use_empty())
+          return true;
+      for (size_t I = 0; I < Lines.size(); ++I)
+        if ((I < First || I > Last) && mentionsSymbol(Lines[I], Sym))
+          return true;
+      for (StringRef A : InlineAsms)
+        if (mentionsSymbol(A, Sym))
+          return true;
+      return false;
+    };
+    if (llvm::any_of(Labels, Referenced))
+      continue;
+    for (size_t I = First; I <= Last; ++I)
+      Dropped.insert(I);
+  }
+  if (Dropped.empty())
+    return;
+
+  std::string Kept;
+  for (size_t I = 0; I < Lines.size(); ++I) {
+    if (Dropped.count(I))
+      continue;
+    Kept += Lines[I];
+    Kept += '\n';
+  }
+  M.setModuleInlineAsm(Kept);
+}
+
 bool UCSan::runImpl(Module &M) {
   initializeModule(M);
   bool Changed = false;
@@ -6319,6 +6423,8 @@ bool UCSan::runImpl(Module &M) {
     for (auto *RI : UF.RemovalInsts)
       RI->eraseFromParent();
   }
+
+  dropUnreferencedAsmFunctions(M);
 
   // Symbols the module's own inline asm defines: declared in the IR (C's
   // `extern kprobe_opcode_t optprobe_template_entry[]`) but defined by a
