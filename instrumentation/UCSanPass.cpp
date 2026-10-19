@@ -677,6 +677,9 @@ struct UCSanFunction {
   /// SS(Addr, PS) = SS(Addr, PS)
   void storeShadow(Value *Addr, uint64_t Size, Align Align, Value *Shadow, Type *Ty, Instruction *Pos);
 
+  /// Whether a cached check's result (Checked) still holds at Pos: nothing
+  /// between them can move a UC object (see checkPointer).
+  bool reusableCheck(Instruction *Checked, Instruction *Pos);
   Value *checkPointer(Value *Ptr, Value *Size, bool dereference, IRBuilder<> &IRB,
                       uint32_t TypeID = 0);
   void checkGlobalDest(Value *Dest, Value *Length, IRBuilder<> &IRB);
@@ -2416,6 +2419,32 @@ void UCSanFunction::checkGlobalDest(Value *Dest, Value *Length,
   UC.markNosanitize(CI);
 }
 
+bool UCSanFunction::reusableCheck(Instruction *Checked, Instruction *Pos) {
+  if (Checked->getParent() != Pos->getParent())
+    return false;
+  // the runtime's helpers that never check a pointer with an alignment, so
+  // never move an object (ucsan_resign_shadow changes a pointer's state,
+  // and ucsan_check_pointer is the one that moves)
+  static const StringSet<> Inert = {
+      "ucsan_load_pointer_shadow", "ucsan_store_pointer_shadow",
+      "ucsan_set_label",           "ucsan_check_ubi",
+      "ucsan_combine_label",       "ucsan_trace_alloca",
+      "ucsan_trace_global",        "ucsan_check_global_bounds",
+      "ucsan_check_copy_bounds",   "ucsan_trace_warn",
+      "__taint_trace_bb"};
+  for (Instruction *I = Checked->getNextNode(); I; I = I->getNextNode()) {
+    if (I == Pos)
+      return true;
+    auto *CB = dyn_cast<CallBase>(I);
+    if (!CB || isa<IntrinsicInst>(CB))
+      continue;
+    Function *Callee = CB->getCalledFunction();
+    if (!Callee || !Inert.contains(Callee->getName()))
+      return false;
+  }
+  return false;  // Pos is not after it
+}
+
 Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
                                     IRBuilder<> &IRB, uint32_t TypeID) {
   Type *Ty = Ptr->getType();
@@ -2426,6 +2455,16 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
   if (cacheable) {
     // cache is only possible if size is a constant
     auto itr = CheckedPtrMap.find(Ptr);
+    // A check's result is a real address, which ucsan_check_pointer may move
+    // the object away from at a later check (to place it at the alignment an
+    // access needs, see align_object in ucsan.cpp), through any pointer to
+    // it, or in a callee.  So it is reused only in its own block with no
+    // check or call in between.  (It used to be reused wherever it dominated
+    // the use, hoisted if it did not: with a check between them that moved
+    // the object, a store went to the old buffer and reads were stale.)
+    if (itr != CheckedPtrMap.end() &&
+        !reusableCheck(itr->second, &*IRB.GetInsertPoint()))
+      itr = CheckedPtrMap.end();
     if (itr != CheckedPtrMap.end()) {
       // finding related instructions created by checkPointer
       // worst case, cast(ptr) -> check_ptr -> cast(result)
@@ -2462,6 +2501,8 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
       auto *SBB = itr->second->getParent();
       if (DT.dominates(SBB, TBB)) {
         // The check is already in a dominating block, no need to move it.
+        // (always, now: it is in the same block, see reusableCheck, and the
+        // move below would take it across code that can move the object)
         return itr->second;
       }
 
@@ -2861,6 +2902,11 @@ void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
     dest = UF.checkPointer(dest, Length, true, IRB);
+    // the destination's check can move the object the source points into
+    // (when it is the same one, see align_object in ucsan.cpp): the source
+    // is checked again, with no alignment, which never moves anything
+    if (I.getDestAlign().valueOrOne() > 1)
+      src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0);
   } else {
     UF.checkGlobalDest(dest, Length, IRB);
   }
@@ -2933,6 +2979,11 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
     dest = UF.checkPointer(dest, Length, true, IRB);
+    // the destination's check can move the object the source points into
+    // (when it is the same one, see align_object in ucsan.cpp): the source
+    // is checked again, with no alignment, which never moves anything
+    if (I.getDestAlign().valueOrOne() > 1)
+      src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0);
   } else {
     UF.checkGlobalDest(dest, Length, IRB);
   }
