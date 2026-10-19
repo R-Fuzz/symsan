@@ -550,23 +550,16 @@ ucsan_label allocate_label() {
 // can grow either way in place up to the limit, which bounds its total size.
 // Windows come from large no-reserve mappings: only touched pages cost
 // memory.  Returns the window's middle, the object's offset 0.
-// (plus the page offset of the pseudo pointer the object is created for, so
-// a real address is the pseudo one's equal modulo the page: code aligns a
-// pointer by its value -- i915_unaligned_memcpy_from_wc rounds src up to 16
-// bytes, from the pseudo pointer, before movntdqa, which faults on an
-// address that is not, and offset_in_page/PTR_ALIGN do the same)
-static char *object_window(void *pseudo) {
+static char *object_window() {
   static char *cur, *end;
-  uptr page = GetPageSizeCached();
-  uptr half = RoundUpTo(ucsan_object_size_limit(), page);
-  uptr window = 2 * half + page;
-  if (!cur || cur + window > end) {
-    uptr chunk = Max((uptr)1 << 30, window);
+  uptr half = RoundUpTo(ucsan_object_size_limit(), GetPageSizeCached());
+  if (!cur || cur + 2 * half > end) {
+    uptr chunk = Max((uptr)1 << 30, 2 * half);
     cur = (char *)MmapNoReserveOrDie(chunk, "UCSan object windows");
     end = cur + chunk;
   }
-  char *mid = cur + half + ((uptr)pseudo & (page - 1));
-  cur += window;
+  char *mid = cur + half;
+  cur += 2 * half;
   return mid;
 }
 
@@ -1007,7 +1000,7 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
     // offset 0 at the window's middle (see object_window); np is the lowest
     // byte, obj.offset below it
-    void* np = object_window(p) - obj.offset;
+    void* np = object_window() - obj.offset;
     internal_memcpy(np, obj.data.data(), object_size);
 
     ucsan_obj_info *obj_label_info = to_obj_info(get_label_info(obj_label));
