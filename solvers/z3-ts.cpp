@@ -2195,7 +2195,67 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             throw z3::exception("unsupported predicate for string search result");
           }
         } else {
-          throw z3::exception("unsupported string comparison");
+          // A search result against a pointer other than NULL --
+          // vfs_parse_monolithic_sep's `value == key`, seq_buf's
+          // `lf + 1 < end`.  Found at position E, the result is the haystack
+          // pointer plus E: the pointer's own label, which strchr/strrchr
+          // (and memchr/memrchr) stash in op2's high bits, or, with none, a
+          // concrete pointer, the result's value less its position.  (A
+          // concrete base for a symbolic pointer let the solver meet
+          // `value == key + 2` by moving key, which the next run undoes.)
+          // Not found it is NULL plus the offset.  Both sides are then
+          // compared as 64-bit pointers.
+          auto as_pointer = [&](dfsan_label lab, uint64_t concrete,
+                                z3::expr &out) -> bool {
+            if (lab < CONST_OFFSET) {
+              out = context_.bv_val(concrete, 64);
+              return true;
+            }
+            dfsan_label_info *li = get_label_info(lab);
+            if (!is_indexof_op(li->op)) {
+              out = get_cached_expr(lab, input_deps);
+              return out.is_bv() && out.get_sort().bv_size() == 64;
+            }
+            bool off_op = li->op == __dfsan::fstr_off;
+            dfsan_label root = off_op ? li->l1 : lab;
+            if (root < CONST_OFFSET)
+              return false;
+            dfsan_label_info *ri = get_label_info(root);
+            if (ri->op != __dfsan::fstrchr && ri->op != __dfsan::fstrrchr)
+              return false;  // no stashed pointer label
+            uint64_t offset = off_op ? (uint64_t)li->op2.i : 0;
+            z3::expr pos = get_cached_expr(lab, input_deps);
+            z3::expr root_pos = get_cached_expr(root, input_deps);
+            dfsan_label ptr_label = (dfsan_label)(ri->op2.i >> 32);
+            z3::expr base(context_);
+            if (ptr_label >= CONST_OFFSET && ptr_label < size_ &&
+                get_label_info(ptr_label)->op != __dfsan::Alloca &&
+                get_label_info(ptr_label)->op != __dfsan::Free) {
+              base = get_cached_expr(ptr_label, input_deps);
+              if (!base.is_bv() || base.get_sort().bv_size() != 64)
+                return false;
+            } else {
+              if ((int64_t)value_cache_[root] < 0)
+                return false;  // not found here: no value to take it from
+              base = context_.bv_val(concrete - (uint64_t)value_cache_[lab], 64);
+            }
+            z3::expr found_ptr =
+                base + z3::to_expr(context_, Z3_mk_int2bv(context_, 64, pos));
+            out = z3::ite(root_pos >= context_.int_val(0), found_ptr,
+                          context_.bv_val(offset, 64));
+            return true;
+          };
+          z3::expr lhs(context_), rhs(context_);
+          if (!as_pointer(info->l1, (uint64_t)info->op1.i, lhs) ||
+              !as_pointer(info->l2, (uint64_t)info->op2.i, rhs))
+            throw z3::exception("unsupported string comparison");
+          cmp_expr = get_cmd(lhs, rhs, predicate);
+          tsize_cache_.emplace_back(tsize_cache_[info->l1] + tsize_cache_[info->l2]);
+          cache_expr(l, cmp_expr);
+          TRACK_LABEL_SEQ_ONLY();
+          RECORD_VALUE(eval_icmp(predicate, (uint64_t)info->op1.i,
+                                 (uint64_t)info->op2.i, 64) ? 1 : 0);
+          continue;
         }
 
         tsize_cache_.emplace_back(tsize_cache_[info->l1] + tsize_cache_[info->l2]);
