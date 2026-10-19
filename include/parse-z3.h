@@ -326,6 +326,7 @@ private:
   z3::expr build_string_from_label(dfsan_label content_label, input_dep_set_t &deps);
   z3::expr get_byte_expr(uint32_t input, uint32_t offset, input_dep_set_t &deps);
   bool label_contains_indexof(dfsan_label label);
+  bool label_contains_unvalued(dfsan_label label);
 
   // Helper for linking bitvec and string constraints on shared offsets
   void add_string_bitvec_link(offset_t off, z3_task_t *task);

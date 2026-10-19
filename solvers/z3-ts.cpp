@@ -163,6 +163,25 @@ static inline bool is_content_string_op(uint16_t op) {
 
 // Helper function to check if label tree contains indexOf operations
 // (used to skip validation since op1 is repurposed for haystack pointer)
+// ... or a memcmp/strcmp/atoi node, whose cached value is a placeholder too
+// (the parser models memcmp as 0/1, the program sees a byte difference).  As
+// a direct ICmp operand it takes the runtime value from the ICmp; nested
+// deeper -- counter_set's `(x & 8) | memcmp(...)` -- it cannot, so a value
+// check over it compares against a placeholder.
+bool Z3AstParser::label_contains_unvalued(dfsan_label label) {
+  if (label < CONST_OFFSET) return false;
+
+  dfsan_label_info *info = get_label_info(label);
+  if (is_indexof_op(info->op) || info->op == __dfsan::fmemcmp ||
+      info->op == __dfsan::fatoi || info->op == __dfsan::fstrcmp)
+    return true;
+
+  if (info->l1 >= CONST_OFFSET && label_contains_unvalued(info->l1)) return true;
+  if (info->l2 >= CONST_OFFSET && label_contains_unvalued(info->l2)) return true;
+
+  return false;
+}
+
 bool Z3AstParser::label_contains_indexof(dfsan_label label) {
   if (label < CONST_OFFSET) return false;
 
@@ -2573,8 +2592,8 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
             is_special = true;
           }
           // Check if either operand contains indexOf operations
-          if ((info->l1 >= CONST_OFFSET && label_contains_indexof(info->l1)) ||
-              (info->l2 >= CONST_OFFSET && label_contains_indexof(info->l2))) {
+          if ((info->l1 >= CONST_OFFSET && label_contains_unvalued(info->l1)) ||
+              (info->l2 >= CONST_OFFSET && label_contains_unvalued(info->l2))) {
             is_special = true;
           }
           if (!is_special) {
@@ -2728,7 +2747,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
 
 #if FILTER_WRONG_AST
     // Skip validation for indexOf operations (op1 repurposed for haystack pointer)
-    bool contains_indexof = label_contains_indexof(label);
+    bool contains_indexof = label_contains_unvalued(label);
 
     // A condition derived from an operand wider than 64 bits has no trustworthy
     // cached value (see wide_value_unknown), so this comparison would reject a
@@ -2975,7 +2994,7 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
     // Skip validation for indexOf operations (op1 repurposed for haystack pointer,
     // RECORD_VALUE uses placeholder 0 which propagates wrong concrete values to
     // downstream ICmp labels, causing spurious mismatches)
-    if (!label_contains_indexof(label) && !value_is_unknown(label) &&
+    if (!label_contains_unvalued(label) && !value_is_unknown(label) &&
         value_cache_[label] != result) {
       // recalculated value must match the recorded value
       DEBUGF("WARNING: value mismatch for label %u: expected %ld, got %ld\n",
