@@ -1064,17 +1064,25 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   }
 
   // slowpath
+  // (a byte of a stored pointer carries its bounds label, which is no value:
+  // loaded as part of something else -- an integer overlapping a struct's
+  // pointer field, handle_eject_request's acpi_object -- it is a concrete
+  // byte.  Built into a Concat it was a bounds node in an expression, which
+  // the parser cannot serialize: "invalid label".)
+  auto concrete = [](dfsan_label l) {
+    return is_constant_label(l) || is_bounds_label(l);
+  };
   AOUT("union load slowpath at %p\n", __builtin_return_address(0));
   dfsan_label label = label0;
   uptr start = get_label_info(label0)->size / 8;
-  if (is_constant_label(label0)) {
+  if (concrete(label0)) {
     // Leading concrete bytes: Concat with l1 == 0 is not a valid node, so the
     // concrete prefix is folded into op1 of the first Concat with a symbolic
     // label, whose width the parsers recover as size - l2's size.
     const char *app = (const char *)app_for(ls);
     uint64_t prefix = 0;
     uptr i = 0;
-    for (; i < n && is_constant_label(ls[i]); i++) {
+    for (; i < n && concrete(ls[i]); i++) {
       if (i >= sizeof(prefix)) {
         Report("WARNING: concrete prefix wider than 64 bits, dropping taint\n");
         return 0;
@@ -1082,6 +1090,9 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
       prefix |= (uint64_t)(uint8_t)app[i] << (i * 8);
     }
     // not all-constant, or fast path 1 would have returned
+    // (but constant and bounds bytes mixed are all concrete)
+    if (i == n)
+      return 0;
     dfsan_label next_label = ls[i];
     if (next_label == kInitializingLabel) return kInitializingLabel;
     uint16_t next_size = get_label_info(next_label)->size;
@@ -1102,7 +1113,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
     if (next_label == kInitializingLabel) return kInitializingLabel;
     uint16_t next_size = get_label_info(next_label)->size;
     AOUT("next label=%u, size=%u\n", next_label, next_size);
-    if (!is_constant_label(next_label)) {
+    if (!concrete(next_label)) {
       if (next_size <= (n - i) * 8) {
         i += next_size / 8;
         label = do_taint_union(label, next_label, Concat, i * 8, 0, 0);
