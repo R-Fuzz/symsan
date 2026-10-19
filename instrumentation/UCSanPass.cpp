@@ -6497,6 +6497,23 @@ bool UCSan::runImpl(Module &M) {
       } else if (WK == WK_Custom || WK == WK_AutoCustom) {
         if (!F.isDeclaration()) dropBody(F);
         UnwrappedFnMap[&F] = &F;
+        // Calls go to the custom wrapper; the function's address as a value
+        // is left to name the function, which no object defines (only the
+        // wrapper), and TaintPass, which does not list it, renamed it to its
+        // instrumented name: ftrace_pop_return_trace's `ret = (unsigned
+        // long)panic` was an undefined panic.taint.  It names an
+        // out-of-scope stub instead, as for any other out-of-scope function.
+        bool AddressUsed = any_of(F.uses(), [&F](Use &U) {
+          auto *CB = dyn_cast<CallBase>(U.getUser());
+          return !CB || CB->getCalledOperand() != &F;
+        });
+        if (AddressUsed) {
+          if (Function *Stub = buildDangleFunction(&F))
+            F.replaceUsesWithIf(Stub, [&F](Use &U) {
+              auto *CB = dyn_cast<CallBase>(U.getUser());
+              return !CB || CB->getCalledOperand() != &F;
+            });
+        }
       } else if (WK == WK_ShimOrig) {
         // Original function: delete body, redirect calls via visitWrappedCallBase
         if (!F.isDeclaration()) dropBody(F);
