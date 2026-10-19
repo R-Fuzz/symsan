@@ -768,6 +768,12 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
                           __builtin_return_address(0));
     } else if (size > ucsan_object_size_limit()) {
       UCSAN_OUT("WARNING: global variable size too large: %lu\n", size);
+      // (an access that large is ended, as for a lazily created object
+      // below: capping only what is symbolized left the access itself at
+      // its size -- rm_map_entry_at's memmove of cache_map_n - idx entries,
+      // both from the seed, materialized and copied gigabytes, a hang)
+      if (dereferencing)
+        exit(exit_reason::REASON_OBJ_OOB);
       size = ucsan_object_size_limit();
     }
     // Symbolize global variable on first access (label == 0)
