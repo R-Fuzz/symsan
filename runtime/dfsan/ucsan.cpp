@@ -550,16 +550,22 @@ ucsan_label allocate_label() {
 // can grow either way in place up to the limit, which bounds its total size.
 // Windows come from large no-reserve mappings: only touched pages cost
 // memory.  Returns the window's middle, the object's offset 0.
+//
+// (now: an object does move, to place it at the alignment an access needs,
+// once the pass stopped reusing a check's result across anything that can
+// move it: see align_object.  Growth is still in place.  A window has a page
+// more above its middle, so offset 0 can sit up to a page past it.)
 static char *object_window() {
   static char *cur, *end;
-  uptr half = RoundUpTo(ucsan_object_size_limit(), GetPageSizeCached());
-  if (!cur || cur + 2 * half > end) {
-    uptr chunk = Max((uptr)1 << 30, 2 * half);
+  uptr page = GetPageSizeCached();
+  uptr half = RoundUpTo(ucsan_object_size_limit(), page);
+  if (!cur || cur + 2 * half + page > end) {
+    uptr chunk = Max((uptr)1 << 30, 2 * half + page);
     cur = (char *)MmapNoReserveOrDie(chunk, "UCSan object windows");
     end = cur + chunk;
   }
   char *mid = cur + half;
-  cur += 2 * half;
+  cur += 2 * half + page;
   return mid;
 }
 
@@ -744,8 +750,79 @@ void ucsan_check_global_bounds(void *p, ucsan_label label, uint64_t size) {
   check_global_bounds(p, label, size, true, __builtin_return_address(0));
 }
 
+// A UC object's real address must have the alignment the access assumes (the
+// IR's align): the code may rely on it (a movaps of a 16-byte aligned member)
+// and fault on an object placed off it.  An object is placed at its first
+// check, so a first check that is not at the object's start (a field reached
+// on a path without a base check) misplaces every field after it; an error
+// here names that, where the program would fault later without a trace.
+//
+// (now: the object is moved instead.  A real address lives only in registers
+// -- memory holds pseudo-pointers -- and the pass reuses a check's result only
+// where no other check or call can run in between, so nothing points into the
+// old window afterwards.  Each object placed by ucsan_check_pointer keeps the
+// alignment its offset 0 has been placed to so far (its log2 plus one, below;
+// 0 for an object it did not place, which never moves); offset 0's
+// residue modulo that is what every access so far needs, and an access that
+// needs a larger alignment, consistent with it, moves the object to a window
+// where offset 0 has both.  An access consistent with none is the code's own
+// misalignment (the BIOS data area's 0x40e and 0x413, both align 2): it stays
+// where it is, and is an error only where the access can fault.)
+static u8 obj_align_log2p1[1 << (sizeof(ucsan_label) * 8)];
+
+// Copies the object to a fresh window with offset 0 d bytes past its middle,
+// shadows (UCSan and SymSan) included.  Returns the new offset 0.
+static char *move_object(ucsan_obj_info *obj, uptr d) {
+  char *old_lo = (char *)obj->real_ptr - obj->lower_bound;
+  uptr size = (uptr)obj->lower_bound + obj->upper_bound;
+  char *base = object_window() + d;
+  char *lo = base - obj->lower_bound;
+  internal_memcpy(lo, old_lo, size);
+  internal_memcpy(ucsan_shadow_for(lo), ucsan_shadow_for(old_lo),
+                  size * sizeof(ucsan_label));
+  __taint_copy_shadow(lo, old_lo, size);
+  UCSAN_OUT("Moved object %u: %p -> %p\n", obj->object_id, obj->real_ptr, base);
+  obj->real_ptr = base;
+  return base;
+}
+
+// Places the object for a dereference of offset off with alignment align
+// (see obj_align_log2p1), moving it if needed.  Returns its offset 0.
+static char *align_object(ucsan_obj_info *obj, ucsan_label obj_label,
+                          int64_t off, uint32_t align, size_t size, void *p,
+                          ucsan_label label) {
+  char *base = (char *)obj->real_ptr;
+  u8 log2p1 = obj_align_log2p1[obj_label];
+  if (align <= 1 || log2p1 == 0)
+    return base;
+  // offset 0 is less than a page past a window's page-aligned middle
+  uptr a = Min((uptr)align, GetPageSizeCached());
+  uptr m = (uptr)1 << (log2p1 - 1);
+  uptr need = (uptr)(-off) & (a - 1);
+  uptr c = (uptr)base & (m - 1);
+  if ((need & (Min(a, m) - 1)) != (c & (Min(a, m) - 1))) {
+    UCSAN_OUT("Misaligned access: offset %ld needs %lu-byte alignment, the "
+              "object's accesses so far %lu-byte with residue %lu\n",
+              off, a, m, c);
+    // only a vector move of 16 bytes or more faults (movaps, movdqa)
+    if (a >= 16 && size >= 16) {
+      Printf("ERROR: UCSan: misaligned access to a UC object: real %p "
+             "(pseudo %p, label %u) is not %u-byte aligned\n",
+             base + off, p, label, align);
+      exit(exit_reason::REASON_MISALIGNED);
+    }
+    return base;
+  }
+  if (a <= m)
+    return base;
+  obj_align_log2p1[obj_label] = (u8)(Log2(a) + 1);
+  if (((uptr)base & (a - 1)) == need)
+    return base;
+  return move_object(obj, need);
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool dereferencing, uint32_t type_id) {
+void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool dereferencing, uint32_t type_id, uint32_t align) {
   UCSAN_OUT("%p: label: %d, size: %zu, dereferencing: %d, type_id: %u\n", p, label, size, dereferencing, type_id);
   __ucsan_null_deref_flag = nullptr;
 
@@ -1057,6 +1134,10 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     }
 
     ptr_info->status = PTR_INITIALIZED;
+    // offset 0 is page aligned, which any first access's alignment is
+    obj_align_log2p1[obj_label] = 1;
+    if (dereferencing)
+      align_object(obj_label_info, obj_label, 0, align, size, p, label);
     return (char*)np + obj.offset;
 
   } else if (ptr_info->status == PTR_INITIALIZED) {
@@ -1103,6 +1184,9 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     int64_t upper_bound = (int64_t)obj_label_info->upper_bound;
 
     if (lower_bound <= desired_offset && desired_end <= upper_bound) {
+      if (dereferencing)
+        obj_base = align_object(obj_label_info, obj_label, desired_offset,
+                                align, size, p, label);
       void* target = (void*)((int64_t)obj_base + desired_offset);
       UCSAN_OUT("Fast path: returning %p\n", target);
       return target;
@@ -1201,6 +1285,9 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     obj_label_info->lower_bound = (uint32_t)new_lower_bound;
     obj_label_info->upper_bound = (uint32_t)new_upper;
 
+    if (dereferencing)
+      base = align_object(obj_label_info, obj_label, desired_offset, align,
+                          size, p, label);
     return (void*)((int64_t)base + desired_offset);
   }
 
@@ -2246,7 +2333,7 @@ int64_t __dfsw_ucsan_ptr_index(bool rewrite, int64_t elem, void *p, void *q,
       UCSAN_OUT("ptr_diff: too many bindings, %p not bound\n", p);
     } else {
       // q's object, created now if it was not yet
-      ucsan_check_pointer(q, lq, 1, false, 0);
+      ucsan_check_pointer(q, lq, 1, false, 0, 1);
       ucsan_ptr_info *qi = to_ptr_info(get_label_info(lq));
       if (qi->op == OP_EXTERNAL && qi->status == PTR_INITIALIZED) {
         // p - pseudo_base is p's offset in the object: q's, plus i elements

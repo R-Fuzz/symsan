@@ -3,6 +3,7 @@ enum exit_reason {
   REASON_LOOP_OOB = 123,
   REASON_OBJ_OOB = 124,
   REASON_STACK_OOB = 125,
+  REASON_MISALIGNED = 126,    // a faulting access whose alignment no placement of its UC object satisfies
 
   /* checker */
   EVENT_UBI = 150,

@@ -680,8 +680,10 @@ struct UCSanFunction {
   /// Whether a cached check's result (Checked) still holds at Pos: nothing
   /// between them can move a UC object (see checkPointer).
   bool reusableCheck(Instruction *Checked, Instruction *Pos);
+  // Alignment: what the access assumes of the address (the IR's align),
+  // which the runtime holds a UC object's real address to
   Value *checkPointer(Value *Ptr, Value *Size, bool dereference, IRBuilder<> &IRB,
-                      uint32_t TypeID = 0);
+                      uint32_t TypeID = 0, MaybeAlign Alignment = std::nullopt);
   void checkGlobalDest(Value *Dest, Value *Length, IRBuilder<> &IRB);
   void recordPointerLoadSummary(LoadInst &LI);
   void recordMemoryAccessSummary(Value *Ptr, uint64_t AccessSize, bool IsWrite,
@@ -751,10 +753,10 @@ private:
 void UCSan::initializeRuntimeFunctions(Module &M) {
   Function *F = nullptr;
 
-  // Pointer checking: void* ucsan_check_pointer(void*, i16, i64, i1, i32)
+  // Pointer checking: void* ucsan_check_pointer(void*, i16, i64, i1, i32, i32)
   UCCheckPointerFnTy = FunctionType::get(
     VoidPtrTy,
-    {VoidPtrTy, PrimitiveShadowTy, Int64Ty, Int1Ty, Int32Ty},
+    {VoidPtrTy, PrimitiveShadowTy, Int64Ty, Int1Ty, Int32Ty, Int32Ty},
     false);
   UCCheckPointerFn = M.getOrInsertFunction("ucsan_check_pointer", UCCheckPointerFnTy);
   F = dyn_cast<Function>(UCCheckPointerFn.getCallee()->stripPointerCasts());
@@ -2091,7 +2093,8 @@ Function *UCSan::buildDriverWrapperFunction(Function *F) {
           UCCheckPointerFn,
           {ret_val, Label, ConstantInt::get(Int64Ty, DL.getTypeAllocSize(ByValTy)),
            ConstantInt::get(Int1Ty, true),
-           ConstantInt::get(Int32Ty, getOrCreateTypeID(ByValTy))});
+           ConstantInt::get(Int32Ty, getOrCreateTypeID(ByValTy)),
+           ConstantInt::get(Int32Ty, ai->getParamAlign().valueOrOne().value())});
       Args.push_back(Real);
       continue;
     }
@@ -2446,7 +2449,8 @@ bool UCSanFunction::reusableCheck(Instruction *Checked, Instruction *Pos) {
 }
 
 Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
-                                    IRBuilder<> &IRB, uint32_t TypeID) {
+                                    IRBuilder<> &IRB, uint32_t TypeID,
+                                    MaybeAlign Alignment) {
   Type *Ty = Ptr->getType();
   Value *SPtr = Ptr->stripPointerCasts();
   bool cacheable = isa<Constant>(Size);
@@ -2495,6 +2499,11 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
         // update size
         CB->setArgOperand(2, Size);
       }
+      // and the alignment: the check stands for this access too
+      auto *OldAlign = cast<ConstantInt>(CB->getArgOperand(5));
+      if (Alignment.valueOrOne().value() > OldAlign->getZExtValue())
+        CB->setArgOperand(5, ConstantInt::get(UC.Int32Ty,
+                                              Alignment.valueOrOne().value()));
 
       // cached check pointer must dominate the new use
       auto *TBB = IRB.GetInsertBlock();
@@ -2621,9 +2630,11 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
     }
     ConstantInt *Deref = ConstantInt::get(UC.Int1Ty, dereference);
     ConstantInt *TypeIDVal = ConstantInt::get(UC.Int32Ty, TypeID);
+    ConstantInt *AlignVal = ConstantInt::get(UC.Int32Ty,
+                                             Alignment.valueOrOne().value());
 
     CallInst *NewAddr = IRB.CreateCall(
-      UC.UCCheckPointerFn, {Addr, Shadow, ExtSize, Deref, TypeIDVal});
+      UC.UCCheckPointerFn, {Addr, Shadow, ExtSize, Deref, TypeIDVal, AlignVal});
     // UC.markNosanitize(NewAddr); // don't mark as nonsanitize
 
     Value *Checked = NewAddr;
@@ -2848,7 +2859,7 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
 
   // Check and replace pointer
   IRBuilder<> IRB(&LI);
-  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID);
+  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID, LI.getAlign());
   LI.setOperand(0, Ptr);
 
   Value *Shadow = UF.loadShadow(Ptr, StoreSize, LI.getAlign(), Ty, &LI);
@@ -2878,7 +2889,7 @@ void UCSanVisitor::visitStoreInst(StoreInst &SI) {
 
   // Check and replace pointer
   IRBuilder<> IRB(&SI);
-  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID);
+  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID, SI.getAlign());
   SI.setOperand(SI.getPointerOperandIndex(), Ptr);
   Value *Shadow = UF.getShadow(Val);
   UF.storeShadow(Ptr, StoreSize, SI.getAlign(), Shadow, Ty, &SI);
@@ -2896,12 +2907,13 @@ void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
   }
 
   // Check source and destination pointers
-  Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB);
+  Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
+                               I.getSourceAlign());
   // check the destination pointer, if it's a global variable,
   // no need to call check pointer to symbolize, as it's the dest.
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
-    dest = UF.checkPointer(dest, Length, true, IRB);
+    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign());
     // the destination's check can move the object the source points into
     // (when it is the same one, see align_object in ucsan.cpp): the source
     // is checked again, with no alignment, which never moves anything
@@ -2951,7 +2963,7 @@ void UCSanVisitor::visitMemSetInst(MemSetInst &I) {
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
     // Check destination pointer
-    dest = UF.checkPointer(dest, Length, true, IRB);
+    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign());
     I.setDest(dest);
   } else {
     UF.checkGlobalDest(dest, Length, IRB);
@@ -2973,12 +2985,13 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
   }
 
   // Check source and destination pointers
-  Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB);
+  Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
+                               I.getSourceAlign());
   // check the destination pointer, if it's a global variable,
   // no need to call check pointer to symbolize, as it's the dest.
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
-    dest = UF.checkPointer(dest, Length, true, IRB);
+    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign());
     // the destination's check can move the object the source points into
     // (when it is the same one, see align_object in ucsan.cpp): the source
     // is checked again, with no alignment, which never moves anything
@@ -3075,7 +3088,8 @@ void UCSanVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
     if (Addr != Ptr) UF.UC.markNosanitize(Addr);
     Value *Checked = IRB.CreateCall(UF.UC.UCCheckPointerFn,
       { Addr, UF.getShadow(Ptr), Size, ConstantInt::get(UF.UC.Int1Ty, false),
-        ConstantInt::get(UF.UC.Int32Ty, TypeID) });
+        ConstantInt::get(UF.UC.Int32Ty, TypeID),
+        ConstantInt::get(UF.UC.Int32Ty, 1) });
     UF.UC.markNosanitize(Checked);
     BaseChecks.push_back(cast<Instruction>(Checked));
   }
@@ -5994,7 +6008,7 @@ void UCSanVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
   uint32_t TypeID = UF.UC.getOrCreateTypeID(Ty);
 
   IRBuilder<> IRB(&I);
-  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID);
+  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID, I.getAlign());
   I.setOperand(0, Ptr);
 
   // FIXME: AtomicRMWInst should not operate on ptrs
@@ -6012,7 +6026,7 @@ void UCSanVisitor::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   uint32_t TypeID = UF.UC.getOrCreateTypeID(Ty);
 
   IRBuilder<> IRB(&I);
-  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID);
+  Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID, I.getAlign());
   I.setOperand(0, Ptr);
 
   // The result is { Ty old_value, i1 success }; like AtomicRMWInst we only

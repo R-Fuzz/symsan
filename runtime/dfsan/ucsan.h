@@ -454,9 +454,13 @@ SANITIZER_INTERFACE_ATTRIBUTE void ucsan_materialize_range(void *addr, uint64_t 
 // @param size: access size in bytes
 // @param dereferencing: true if this is a dereference (load/store)
 // @param type_id: compile-time type ID from type table (0 = unknown)
+// @param align: the alignment the access assumes of p (the IR's align, 1 =
+//               none); a UC object is moved to have it, and one access that
+//               no placement satisfies along with the earlier ones, and that
+//               can fault, is an error (REASON_MISALIGNED)
 // @return: resolved real pointer (may differ from p for pseudo-pointers)
 SANITIZER_INTERFACE_ATTRIBUTE
-void* ucsan_check_pointer(void* p, __ucsan::ucsan_label label, size_t size, bool dereferencing, uint32_t type_id);
+void* ucsan_check_pointer(void* p, __ucsan::ucsan_label label, size_t size, bool dereferencing, uint32_t type_id, uint32_t align);
 
 // Inverse of ucsan_check_pointer: translate a real (materialized) pointer back
 // into the UC pseudo-pointer space, using the pointer's label to find the

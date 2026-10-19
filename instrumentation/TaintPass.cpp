@@ -3574,7 +3574,8 @@ void TaintFunction::hoistBoundsChecks() {
           UCSize = ConstantInt::get(UCSize->getType(), 1);
         StrPtr = IRB.CreateCall(StrUCChk->getCalledFunction(),
             {StrPtr, UCLabel, UCSize,
-             ConstantInt::getTrue(*TT.Ctx), StrUCChk->getArgOperand(4)});
+             ConstantInt::getTrue(*TT.Ctx), StrUCChk->getArgOperand(4),
+             ConstantInt::get(StrUCChk->getArgOperand(5)->getType(), 1)});
       }
 
       DenseSet<Value *> EmittedBufs;
