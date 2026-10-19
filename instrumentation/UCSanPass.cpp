@@ -2558,7 +2558,11 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
     }
   }
 
-  if (!isa<AllocaInst>(SPtr) || VariableStackIndex) {
+  // (and so is one written for a variable length: memzero_explicit(desc,
+  // sizeof(*desc) + crypto_shash_descsize(tfm)) on a stack shash_desc, the
+  // length from the seed, set the shadow of whatever followed it first --
+  // jent_hash_time)
+  if (!isa<AllocaInst>(SPtr) || VariableStackIndex || !isa<ConstantInt>(Size)) {
     Value *Addr = Ptr;
     if (Ty != UC.VoidPtrTy) {
       Addr = IRB.CreateBitCast(Ptr, UC.VoidPtrTy);
