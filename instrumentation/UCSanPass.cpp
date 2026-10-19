@@ -5717,6 +5717,22 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
 
     std::vector<Value *> Args;
 
+    // A wrapper with a byte count (the abilist's sizeN: memcpy, memset,
+    // _copy_from_user, ...) touches that many bytes behind each pointer
+    // argument, so they are checked for it, as typeless bytes, like the
+    // WK_TaintCustom case does.  With the pointee's size instead (0 for a
+    // void * buffer) the size limit never saw the count, and the wrapper
+    // copied it, data and both shadows: i915_gem_execbuffer2_ioctl's
+    // copy_from_user of 1147569976 bytes from the seed went over 6 GB.
+    int LenArgIdx = UF.UC.ABIList.getSizeArgIdx(FName);
+    Value *LenVal = nullptr;
+    if (LenArgIdx >= 0 && (unsigned)LenArgIdx < CB.arg_size()) {
+      LenVal = IRB.CreateZExtOrTrunc(CB.getArgOperand(LenArgIdx),
+                                     UF.UC.Int64Ty);
+      if (LenVal != CB.getArgOperand(LenArgIdx))
+        UF.UC.markNosanitize(LenVal);
+    }
+
     // Adds non-variable arguments.
     auto *I = CB.arg_begin();
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
@@ -5734,6 +5750,10 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
           TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
         }
         Value *sizeArg = ConstantInt::get(UF.UC.Int64Ty, PointeeSize);
+        if (LenVal) {
+          sizeArg = LenVal;
+          TypeID = 0;
+        }
         Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
         Args.push_back(rptr);
       } else {
