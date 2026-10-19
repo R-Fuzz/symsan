@@ -4955,6 +4955,25 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     }
   }
 
+  // sync_core()'s iret to self -- push %ss, %rsp, flags and %cs, `pushq $1f`,
+  // iretq, `1:` -- only serializes the CPU, a control instruction with no
+  // data flow, as cli or wbinvd are (see isAsmHwNoOp); its `pushq $1f` was
+  // an R_X86_64_32S the PIE link refused (every function of
+  // arch/x86/kernel/alternative.o).  It does nothing: an output tied to an
+  // input -- %rsp, its ASM_CALL_CONSTRAINT -- keeps the input's value (zeroed,
+  // the stack pointer was 0 after it), and its scratch output gets none.
+  {
+    SmallVector<AsmInsn, 8> Insns = asmExecutedInsns(AsmStr);
+    if (any_of(Insns, [](const AsmInsn &I) {
+          return I.Mnemonic == "iretq" || I.Mnemonic == "iret";
+        }) &&
+        !HasMemOutput) {
+      StringMap<Value *> Regs = inputRegs();
+      replaceWith(regResults(Regs));
+      return;
+    }
+  }
+
   // Handle call/callq instructions in inline asm
   // Extract the callee symbol and route through normal call handling
   //
