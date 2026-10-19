@@ -427,6 +427,9 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
                         uint32_t cid);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_gep_offset(dfsan_label label, char *result, char *base);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_memerr(dfsan_label ptr_label, uptr ptr,
                           dfsan_label size_label, uint64_t size,
                           uint16_t flag, void *addr);
@@ -2066,7 +2069,10 @@ char *__dfsw_stpcpy(char *dest, const char *src, dfsan_label dest_label,
   if (ret) {
     internal_memcpy(shadow_for(dest), shadow_for(src), sizeof(dfsan_label) * len);
   }
-  *ret_label = dest_label;
+  // the end of the copy, not dest: `stpcpy(buf, s) - buf` (what sprintf(buf,
+  // "%s", s) compiles to, uncore_event_show) was dest_label - dest_label, 0,
+  // for a value of strlen(s)
+  *ret_label = __taint_gep_offset(dest_label, ret, dest);
   return ret;
 }
 

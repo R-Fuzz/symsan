@@ -183,3 +183,6 @@ fun:strchr=retptr0
 fun:strrchr=retptr0
 fun:memchr=retptr0
 fun:memrchr=retptr0
+# stpcpy returns the end of its copy in dest (sprintf(buf, "%s", s) becomes
+# stpcpy(buf, s) - buf); it has no op2 to stash a label in, and needs none
+fun:stpcpy=retptr0
