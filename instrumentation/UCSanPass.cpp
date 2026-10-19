@@ -456,6 +456,7 @@ class UCSan {
   FunctionCallee UCCombineLabelFn;
   FunctionCallee UCVmcsFieldFn;  // ptr ucsan_vmcs_field(i64): see AsmLifter
   FunctionCallee UCMaterializeRangeFn;  // void ucsan_materialize_range(ptr, i64)
+  FunctionCallee UCFillPatternFn;  // void ucsan_fill_pattern(ptr, i64, i64, i64)
   // pointer differences of UC pointers: see visitBinaryOperator
   FunctionCallee UCPtrDiffRewriteFn;  // i1 ucsan_ptr_diff_rewrite(ptr, i16, ptr, i16)
   FunctionCallee UCPtrIndexFn;        // i64 __dfsw_ucsan_ptr_index(i1, i64, ptr, ptr, i16, i16)
@@ -964,6 +965,16 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
       "ucsan_materialize_range",
       FunctionType::get(Type::getVoidTy(*Ctx), {VoidPtrTy, Int64Ty}, false));
   F = dyn_cast<Function>(UCMaterializeRangeFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // void ucsan_fill_pattern(ptr addr, i64 value, i64 elem_size, i64 count):
+  // the stores of a lowered `rep stos{w,l,q}` (see visitInlineAsm)
+  UCFillPatternFn = M.getOrInsertFunction(
+      "ucsan_fill_pattern",
+      FunctionType::get(Type::getVoidTy(*Ctx),
+                        {VoidPtrTy, Int64Ty, Int64Ty, Int64Ty}, false));
+  F = dyn_cast<Function>(UCFillPatternFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -4678,6 +4689,41 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
       Regs["di"] = IRB.CreateGEP(IRB.getInt8Ty(), DstP, Len);
       Regs["cx"] = ConstantInt::get(IRB.getInt64Ty(), 0);
       replaceWith(regResults(Regs));
+      return;
+    }
+  }
+
+  // `rep stos{w,l,q}`: %rcx elements of %ax/%eax/%rax at (%rdi), the
+  // kernel's memset16/32/64 (gen6_ppgtt_clear_range's memset32 ran as is on
+  // a pseudo-pointer).  Lowered to a memset of the range, which checks the
+  // pointer and sets the shadow (from the value's low byte), and then the
+  // element pattern written through the checked pointer by
+  // ucsan_fill_pattern; %rdi ends past the range and %rcx at 0.
+  if (IsCall && Insns.size() == 1 && !HasMemOutput &&
+      Insns[0].Operands.empty()) {
+    StringRef Mn = Insns[0].Mnemonic;
+    unsigned K = Mn == "rep stosw" ? 2 : Mn == "rep stosl" ? 4
+               : Mn == "rep stosq" ? 8 : 0;
+    StringMap<Value *> Regs = inputRegs();
+    Value *Cnt = Regs.lookup("cx"), *Dst = Regs.lookup("di"),
+          *Val = Regs.lookup("ax");
+    if (K && Cnt && Dst && Val) {
+      Cnt = castAsmValue(IRB, DL, Cnt, IRB.getInt64Ty());
+      Val = castAsmValue(IRB, DL, Val, IRB.getIntNTy(K * 8));
+      Value *Bytes = IRB.CreateMul(Cnt, IRB.getInt64(K));
+      Value *DstP = castAsmValue(IRB, DL, Dst, IRB.getPtrTy());
+      auto *MS = cast<MemSetInst>(IRB.CreateMemSet(
+          DstP, IRB.CreateTrunc(Val, IRB.getInt8Ty()), Bytes, MaybeAlign(1),
+          Volatile));
+      CallInst *Fill = IRB.CreateCall(
+          UF.UC.UCFillPatternFn,
+          {DstP, IRB.CreateZExt(Val, IRB.getInt64Ty()), IRB.getInt64(K), Cnt});
+      UF.UC.markNosanitize(Fill);
+      Regs["di"] = IRB.CreateGEP(IRB.getInt8Ty(), DstP, Bytes);
+      Regs["cx"] = ConstantInt::get(IRB.getInt64Ty(), 0);
+      replaceWith(regResults(Regs));
+      // the memset's destination is now the checked pointer
+      Fill->setArgOperand(0, MS->getRawDest());
       return;
     }
   }

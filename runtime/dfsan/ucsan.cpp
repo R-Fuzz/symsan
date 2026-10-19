@@ -1405,6 +1405,17 @@ void ucsan_materialize_range(void *addr, uint64_t n) {
     ucsan_materialize_byte(&ls[i], (char *)addr + i);
 }
 
+// The stores of a lowered `rep stos{w,l,q}`: count elements of elem_size
+// bytes, each the low bytes of value, at addr (a checked pointer; the memset
+// lowered before it has set the shadow).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_fill_pattern(void *addr, uint64_t value, uint64_t elem_size,
+                        uint64_t count) {
+  char *p = (char *)addr;
+  for (uint64_t i = 0; i < count; ++i, p += elem_size)
+    internal_memcpy(p, &value, elem_size);
+}
+
 // The byte of the seed as sent, at `offset` from input's origin: what the
 // parser assumes an input label's byte is (cached_input_byte, with the
 // origins the manager gives it -- the header's per-object origin, len(lvalue),
