@@ -6413,6 +6413,58 @@ static void dropUnreferencedAsmFunctions(Module &M) {
   M.setModuleInlineAsm(Kept);
 }
 
+// A code template a top-level asm() block keeps as data (.rodata), for the
+// kernel to copy and patch -- callthunks.c's skl_call_thunk_template, `sarq
+// $5, %gs:pcpu_hot + 16` -- addresses a percpu symbol absolutely, an
+// R_X86_64_32S the PIE link refuses, and every function of
+// arch/x86/kernel/callthunks.o failed to link.  Never run in place, its
+// percpu offsets name nothing in a userspace run: they become 0, which keeps
+// the encoding (a 32-bit displacement) and so the template's length.
+static void zeroPercpuInAsmData(Module &M) {
+  std::string Asm = M.getModuleInlineAsm();
+  if (Asm.find("%gs:") == std::string::npos)
+    return;
+  SmallVector<StringRef, 64> Lines;
+  StringRef(Asm).split(Lines, '\n');
+  std::string Out;
+  bool Changed = false;
+  size_t Depth = 0;
+  bool InData = false;
+  auto IsIdent = [](char C) { return isAlnum(C) || C == '_' || C == '.'; };
+  for (StringRef Line : Lines) {
+    StringRef L = Line.trim();
+    if (L.consume_front(".pushsection")) {
+      if (Depth++ == 0) {
+        StringRef Sec = L.trim().split(',').first.trim().trim('"');
+        InData = !(Sec == ".text" || Sec.starts_with(".text."));
+      }
+    } else if (L.starts_with(".popsection") && Depth > 0) {
+      if (--Depth == 0)
+        InData = false;
+    }
+    std::string Text = Line.str();
+    if (InData) {
+      for (size_t Pos = Text.find("%gs:"); Pos != std::string::npos;
+           Pos = Text.find("%gs:", Pos + 4)) {
+        size_t B = Pos + 4, E = B;
+        while (E < Text.size() && Text[E] == ' ')
+          ++E;
+        size_t S = E;
+        if (S < Text.size() && (isAlpha(Text[S]) || Text[S] == '_')) {
+          while (E < Text.size() && IsIdent(Text[E]))
+            ++E;
+          Text.replace(B, E - B, "0");
+          Changed = true;
+        }
+      }
+    }
+    Out += Text;
+    Out += '\n';
+  }
+  if (Changed)
+    M.setModuleInlineAsm(Out);
+}
+
 bool UCSan::runImpl(Module &M) {
   initializeModule(M);
   bool Changed = false;
@@ -6717,6 +6769,7 @@ bool UCSan::runImpl(Module &M) {
   }
 
   dropUnreferencedAsmFunctions(M);
+  zeroPercpuInAsmData(M);
 
   // Symbols the module's own inline asm defines: declared in the IR (C's
   // `extern kprobe_opcode_t optprobe_template_entry[]`) but defined by a
