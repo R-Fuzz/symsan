@@ -2502,9 +2502,16 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
     }
   }
 
+  // A stack object indexed by a variable is checked against its bounds (the
+  // OP_ALLOCA label ucsan_trace_alloca gives it): SymSan's own check comes
+  // after this access's UCSan shadow store, and a wild index from the seed
+  // (sata_pmp_error_handler's link_tries[link->pmp]) made that store fault
+  // first wherever the stack happened to sit -- exit status 1, not an OOB.
+  bool VariableStackIndex = false;
   if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(SPtr)) {
     // If this is a GEP, we need to check the base pointer.
     SPtr = GEP->getPointerOperand();
+    VariableStackIndex = !GEP->hasAllConstantIndices();
   }
 
   GlobalVariable *GV =
@@ -2540,7 +2547,7 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
     }
   }
 
-  if (!isa<AllocaInst>(SPtr)) {
+  if (!isa<AllocaInst>(SPtr) || VariableStackIndex) {
     Value *Addr = Ptr;
     if (Ty != UC.VoidPtrTy) {
       Addr = IRB.CreateBitCast(Ptr, UC.VoidPtrTy);
