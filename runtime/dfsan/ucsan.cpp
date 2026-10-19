@@ -1957,20 +1957,40 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
     auto& object = lookup_object(ret.label, 0, ret_addr, &object_id);
 
     // Set up shadow memory for object bytes
+    // (a large object's bytes get their labels on demand, as a lazily
+    // created object's do, see ucsan_labels_on_demand: serial8250_resume_port
+    // hands an out-of-scope callee a buffer big enough to exhaust the 16-bit
+    // labels one per byte.  The marker is an object label of this object,
+    // offset 0 at ptr, so a byte materializes the label it would have had.)
+    ucsan_label marker = 0;
+    if (ucsan_labels_on_demand(n)) {
+      marker = allocate_label();
+      ucsan_obj_info *obj = to_obj_info(get_label_info(marker));
+      obj->op = OP_RESERVED_OBJ;
+      obj->type_id = 0;
+      obj->object_id = object_id;
+      obj->real_ptr = ptr;
+      obj->lower_bound = 0;
+      obj->upper_bound = (uint32_t)n;
+    }
     ucsan_label *shadow = ucsan_shadow_for(ptr);
     for (uptr i = 0; i < n; ++i) {
-      ucsan_label next_label = allocate_label();
+      if (marker) {
+        shadow[i] = marker;
+      } else {
+        ucsan_label next_label = allocate_label();
 
-      shadow[i] = next_label;
-      ucsan_label_info *new_label_info = get_label_info(next_label);
-      ucsan_byte_info *byte = to_byte_info(new_label_info);
-      byte->op = OP_NONE;
-      byte->object_id = object_id;
-      byte->offset = i;
+        shadow[i] = next_label;
+        ucsan_label_info *new_label_info = get_label_info(next_label);
+        ucsan_byte_info *byte = to_byte_info(new_label_info);
+        byte->op = OP_NONE;
+        byte->object_id = object_id;
+        byte->offset = i;
+      }
 
       // Bridge to SymSan: create symbolic label for this byte and set shadow
       void *byte_addr = (void*)((uint64_t)ptr + i);
-      dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
+      dfsan_label symsan_label = __taint_create_label(object_id, i, 1);
       __taint_set_label(symsan_label, byte_addr, 1);
     }
 
