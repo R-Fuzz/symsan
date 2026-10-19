@@ -630,7 +630,9 @@ struct UCSanFunction {
 
   // Pointer checking state
   DenseMap<Value *, Instruction *> CheckedPtrMap;
-  DenseSet<Value *> CheckedPtrSet;
+  // Ptr -> its GEP base checks (visitGetElementPtrInst), one per region
+  // they dominate
+  DenseMap<Value *, SmallVector<Instruction *, 2>> GEPBaseChecks;
   SmallVector<Value *, 16> NonZeroChecks;
 
   struct LoadedPointerSummary {
@@ -3002,8 +3004,16 @@ void UCSanVisitor::visitVACopyInst(VACopyInst &I) {
 void UCSanVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
   // use the type of the pointer operand to estimate object size
   Value *Ptr = GEPI.getPointerOperand();
-  if (UF.CheckedPtrSet.count(Ptr) == 0 &&
-      !isa<AllocaInst>(Ptr->stripPointerCasts())) {
+  // A base check only stands for the GEPs it dominates.  It is what creates
+  // a lazily created object at the base, so a GEP on a path that skips it
+  // created the object at the field it reaches instead: offset 0 at a field,
+  // and decode_operand's switch arms other than the first put
+  // ctxt->memop off its 16-byte alignment (a movaps of it faulted).
+  auto &BaseChecks = UF.GEPBaseChecks[Ptr];
+  bool Dominated = llvm::any_of(BaseChecks, [&](Instruction *C) {
+    return UF.DT.dominates(C, &GEPI);
+  });
+  if (!Dominated && !isa<AllocaInst>(Ptr->stripPointerCasts())) {
     IRBuilder<> IRB(&GEPI);
     const DataLayout &DL = getDataLayout();
     Type *SrcElemTy = GEPI.getSourceElementType();
@@ -3016,7 +3026,7 @@ void UCSanVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
       { Addr, UF.getShadow(Ptr), Size, ConstantInt::get(UF.UC.Int1Ty, false),
         ConstantInt::get(UF.UC.Int32Ty, TypeID) });
     UF.UC.markNosanitize(Checked);
-    UF.CheckedPtrSet.insert(Ptr);
+    BaseChecks.push_back(cast<Instruction>(Checked));
   }
   // Propagate shadow through GEP
   Value *Shadow = UF.getShadow(Ptr);
