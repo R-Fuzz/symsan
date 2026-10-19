@@ -3534,6 +3534,11 @@ void TaintFunction::hoistBoundsChecks() {
         StrBase = GEP->getPointerOperand();
       }
       if (!StrBase) continue;
+      // With no check of the string in the loop to hoist, the summary would
+      // hand __taint_solve_str_bounds the pointer as it is, which under UCSan
+      // may be a pseudo-pointer it then strlen()s (optimize_nops' instr, NULL
+      // in the seed): only a real address is summarized, see isRealAddress.
+      if (ClWithUCSan && !StrUCChk && !isRealAddress(StrBase, LI)) continue;
 
       // Collect __taint_check_bounds calls in this loop
       SmallVector<CallInst *, 8> BoundsChecks;
