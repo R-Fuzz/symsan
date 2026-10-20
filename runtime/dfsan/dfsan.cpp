@@ -945,15 +945,24 @@ dfsan_label __taint_gep_offset(dfsan_label label, char* result, char* base) {
   return do_taint_union(0, label, __dfsan::Add, info->size, (uint64_t)offset, 0);
 }
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_bits, uint64_t align) {
+// unread (bit i: byte i) are bytes of the load nothing it is used for reads
+// (a bitfield's neighbours, masked off): an uninitialized one is a concrete
+// byte, as its value is, not a reason to make the whole value uninitialized.
+static dfsan_label union_load(const dfsan_label *ls, uptr n, uint64_t size_in_bits,
+                              uint64_t align, uint64_t unread) {
+  auto at = [ls, unread](uptr i) -> dfsan_label {
+    dfsan_label l = ls[i];
+    if (l == kInitializingLabel && i < 64 && (unread >> i & 1))
+      return 0;
+    return l;
+  };
   if ((uptr)ls < 4096) {
     AOUT("WARNING: nullptr deref\n");
     return 0;
   } else if (((uptr)ls & (align - 1)) != 0) {
     AOUT("WARNING: unaligned load %p\n", ls);
   }
-  dfsan_label label0 = ls[0];
+  dfsan_label label0 = at(0);
   if (label0 == kInitializingLabel) return kInitializingLabel;
 
   // for debugging
@@ -970,8 +979,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   if (is_constant_label(label0) || is_bounds_label(label0)) {
     bool same = true;
     for (uptr i = 1; i < n; i++) {
-      if (ls[i] == kInitializingLabel) return kInitializingLabel;
-      else if (ls[i] != label0) {
+      if (at(i) == kInitializingLabel) return kInitializingLabel;
+      else if (at(i) != label0) {
         same = false;
         break;
       }
@@ -985,8 +994,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   if (label0 >= CONST_OFFSET && is_indexof_op(get_label_info(label0)->op)) {
     bool same = true;
     for (uptr i = 1; i < n; i++) {
-      if (ls[i] == kInitializingLabel) return kInitializingLabel;
-      else if (ls[i] != label0) {
+      if (at(i) == kInitializingLabel) return kInitializingLabel;
+      else if (at(i) != label0) {
         same = false;
         break;
       }
@@ -1013,7 +1022,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
     off_t offset = get_label_info(label0)->op1.i;
     uint64_t input = get_label_info(label0)->op2.i;
     for (uptr i = 1; i != n; ++i) {
-      dfsan_label next_label = ls[i];
+      dfsan_label next_label = at(i);
       if (next_label == kInitializingLabel) return kInitializingLabel;
       dfsan_label_info *next = get_label_info(next_label);
       if (next_label != label0 + i || next->op != 0 ||
@@ -1042,7 +1051,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
     dfsan_label parent = get_label_info(label0)->l1;
     uptr offset = 0;
     for (uptr i = 0; i < n; i++) {
-      dfsan_label next_label = ls[i];
+      dfsan_label next_label = at(i);
       if (next_label == kInitializingLabel) return kInitializingLabel;
       dfsan_label_info *info = get_label_info(next_label);
       if (info->op != Extract || offset != info->op2.i || parent != info->l1) {
@@ -1082,7 +1091,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
     const char *app = (const char *)app_for(ls);
     uint64_t prefix = 0;
     uptr i = 0;
-    for (; i < n && concrete(ls[i]); i++) {
+    for (; i < n && concrete(at(i)); i++) {
       if (i >= sizeof(prefix)) {
         Report("WARNING: concrete prefix wider than 64 bits, dropping taint\n");
         return 0;
@@ -1093,7 +1102,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
     // (but constant and bounds bytes mixed are all concrete)
     if (i == n)
       return 0;
-    dfsan_label next_label = ls[i];
+    dfsan_label next_label = at(i);
     if (next_label == kInitializingLabel) return kInitializingLabel;
     uint16_t next_size = get_label_info(next_label)->size;
     if (next_size > (n - i) * 8) {
@@ -1109,7 +1118,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
     label = do_taint_union(0, next_label, Concat, start * 8, prefix, 0);
   }
   for (uptr i = start; i < n;) {
-    dfsan_label next_label = ls[i];
+    dfsan_label next_label = at(i);
     if (next_label == kInitializingLabel) return kInitializingLabel;
     uint16_t next_size = get_label_info(next_label)->size;
     AOUT("next label=%u, size=%u\n", next_label, next_size);
@@ -1137,6 +1146,18 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   if (size_in_bits < n * 8)
     label = do_taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
   return label;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_bits, uint64_t align) {
+  return union_load(ls, n, size_in_bits, align, 0);
+}
+
+// A load whose uses read only some of its bytes (see TaintVisitor::visitLoadInst)
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_union_load_partial(const dfsan_label *ls, uptr n, uint64_t size_in_bits,
+                                       uint64_t align, uint64_t unread) {
+  return union_load(ls, n, size_in_bits, align, unread);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1202,6 +1223,29 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
   for (uptr i = 0; i < n; ++i) {
     ls[i] = do_taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8);
   }
+}
+
+// A store of what was loaded from the same address with the bytes in touched
+// (bit i: byte i) rewritten, a bitfield assignment (instrumentation/Bitfield.h).
+// An uninitialized load makes the whole value so, but a byte the store rewrites
+// is written: it takes its byte of l_alt, the value's label with the load's as
+// zero.  A byte it does not is stored as it was loaded and keeps its own.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_store_rmw(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align,
+                       dfsan_label l_load, dfsan_label l_alt, uint64_t touched) {
+  if ((uptr)ls < 4096) {
+    AOUT("WARNING: nullptr deref\n");
+    return;
+  }
+  dfsan_label tmp[64];
+  if (n > sizeof(tmp) / sizeof(tmp[0])) {
+    __taint_union_store(l, ls, n, align);
+    return;
+  }
+  __taint_union_store(l_load == kInitializingLabel ? l_alt : l, tmp, n, 1);
+  for (uptr i = 0; i < n; ++i)
+    if (touched & (1ULL << i))
+      ls[i] = tmp[i];
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __taint_trace_loop_push_stack();

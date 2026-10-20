@@ -486,6 +486,14 @@ __ucsan::ucsan_label ucsan_load_pointer_shadow(__ucsan::ucsan_label *ls, uint64_
 SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_store_pointer_shadow(__ucsan::ucsan_label l, __ucsan::ucsan_label *ls, uint64_t n);
 
+// Store the shadow of a bitfield assignment, a store of what was loaded from
+// the same address with the bytes in touched (bit i: byte i) rewritten: l is
+// the stored value's label, l_load the load's, and l_new the new bits'
+SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_store_rmw_shadow(__ucsan::ucsan_label l, __ucsan::ucsan_label l_load,
+                            __ucsan::ucsan_label l_new, __ucsan::ucsan_label *ls,
+                            uint64_t n, uint64_t touched);
+
 // Set label for a memory region
 // @param label: the label to set
 // @param addr: start address of the memory region

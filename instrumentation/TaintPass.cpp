@@ -14,6 +14,7 @@
 
 //#include "defs.h"
 #include "branch_id.h"
+#include "Bitfield.h"
 #include "UCSanSummary.h"
 
 #include <optional>
@@ -540,7 +541,9 @@ class Taint {
   FunctionType *TaintUnionFnTy;
   FunctionType *TaintGetWideFnTy;
   FunctionType *TaintUnionLoadFnTy;
+  FunctionType *TaintUnionLoadPartialFnTy;
   FunctionType *TaintUnionStoreFnTy;
+  FunctionType *TaintStoreRMWFnTy;
   FunctionType *TaintGEPOffsetFnTy;
   FunctionType *TaintUnimplementedFnTy;
   FunctionType *TaintWrapperExternWeakNullFnTy;
@@ -568,7 +571,9 @@ class Taint {
   FunctionCallee TaintUnionFn;
   FunctionCallee TaintGetWideFn;
   FunctionCallee TaintUnionLoadFn;
+  FunctionCallee TaintUnionLoadPartialFn;
   FunctionCallee TaintUnionStoreFn;
+  FunctionCallee TaintStoreRMWFn;
   FunctionCallee TaintGEPOffsetFn;
   FunctionCallee TaintUnimplementedFn;
   FunctionCallee TaintWrapperExternWeakNullFn;
@@ -826,8 +831,9 @@ struct TaintFunction {
   /// LS({T1,T2, ...}, Addr) = {LS(T1, SubAdrr),LS(T2, SubAddr),...}
   /// LS([n x T], Addr) = [n x LS(T, SubAddr)]
   /// LS(other types, Addr) = LS(PS, Addr)
+  /// Unread: bytes of a primitive no use reads (see Bitfield.h)
   Value *loadShadow(Type *T, Value *Addr, uint64_t Size, Align Alignment,
-                    Instruction *Pos);
+                    Instruction *Pos, uint64_t Unread = 0);
 
   /// XXX: we do not union taint labels for aggregate types before store;
   ///      instead, we store each privimitive field individually.
@@ -845,7 +851,8 @@ struct TaintFunction {
 private:
   /// Loads a primitive shadow label
   Value *loadPrimitiveShadow(Value *Addr, uint64_t Size, uint64_t SizeInBits,
-                             uint64_t Align, IRBuilder<> &IRB);
+                             uint64_t Align, IRBuilder<> &IRB,
+                             uint64_t Unread = 0);
   /// Loads shadow recursively for aggregate types
   Value *loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                              Type *SubTy, Value *Addr, uint64_t Size,
@@ -1744,11 +1751,22 @@ bool Taint::initializeModule(Module &M) {
   Type *TaintUnionLoadArgs[4] = { PrimitiveShadowPtrTy, IntptrTy, Int64Ty, Int64Ty };
   TaintUnionLoadFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintUnionLoadArgs, /*isVarArg=*/ false);
+  // as __taint_union_load, and the bytes no use reads (see Bitfield.h)
+  Type *TaintUnionLoadPartialArgs[5] = { PrimitiveShadowPtrTy, IntptrTy,
+      Int64Ty, Int64Ty, Int64Ty };
+  TaintUnionLoadPartialFnTy = FunctionType::get(
+      PrimitiveShadowTy, TaintUnionLoadPartialArgs, /*isVarArg=*/ false);
   // args: shadow_ptr, n (bytes), size_in_bits, align
   Type *TaintUnionStoreArgs[4] = { PrimitiveShadowTy, PrimitiveShadowPtrTy,
       IntptrTy, Int64Ty };
   TaintUnionStoreFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintUnionStoreArgs, /*isVarArg=*/ false);
+  // args: label, shadow_ptr, n (bytes), align, load's label, label with the
+  // load's as zero, touched bytes (see Bitfield.h)
+  Type *TaintStoreRMWArgs[7] = { PrimitiveShadowTy, PrimitiveShadowPtrTy,
+      IntptrTy, Int64Ty, PrimitiveShadowTy, PrimitiveShadowTy, Int64Ty };
+  TaintStoreRMWFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), TaintStoreRMWArgs, /*isVarArg=*/ false);
   TaintGEPOffsetFnTy = FunctionType::get(
       PrimitiveShadowTy,
       { PrimitiveShadowTy, VoidPtrTy, VoidPtrTy }, /*isVarArg=*/ false);
@@ -2074,6 +2092,9 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
     TaintUnionLoadFn =
         Mod->getOrInsertFunction("__taint_union_load", TaintUnionLoadFnTy, AL);
+    TaintUnionLoadPartialFn =
+        Mod->getOrInsertFunction("__taint_union_load_partial",
+                                 TaintUnionLoadPartialFnTy, AL);
   }
   {
     AttributeList AL;
@@ -2081,6 +2102,15 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     TaintUnionStoreFn =
         Mod->getOrInsertFunction("__taint_union_store", TaintUnionStoreFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 4, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 5, Attribute::ZExt);
+    TaintStoreRMWFn =
+        Mod->getOrInsertFunction("__taint_store_rmw", TaintStoreRMWFnTy, AL);
   }
   {
     AttributeList AL;
@@ -2131,7 +2161,11 @@ void Taint::initializeRuntimeFunctions(Module &M) {
   TaintRuntimeFunctions.insert(
       TaintUnionLoadFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
+      TaintUnionLoadPartialFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
       TaintUnionStoreFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintStoreRMWFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintGEPOffsetFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -4258,11 +4292,21 @@ void TaintFunction::hoistBoundsChecks() {
 // Addr has alignment Align, and take the union of each of those shadows.
 Value *TaintFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size,
                                           uint64_t SizeInBits, uint64_t Align,
-                                          IRBuilder<> &IRB) {
+                                          IRBuilder<> &IRB, uint64_t Unread) {
   if (Size == 0)
     return TT.ZeroPrimitiveShadow;
 
   Value *ShadowAddr = TT.getShadowAddress(Addr, IRB);
+  if (Unread) {
+    CallInst *Partial = IRB.CreateCall(
+        TT.TaintUnionLoadPartialFn,
+        {ShadowAddr, ConstantInt::get(TT.IntptrTy, Size),
+         ConstantInt::get(TT.Int64Ty, SizeInBits),
+         ConstantInt::get(TT.IntptrTy, Align),
+         ConstantInt::get(TT.Int64Ty, Unread)});
+    Partial->addRetAttr(Attribute::ZExt);
+    return Partial;
+  }
   CallInst *FallbackCall = IRB.CreateCall(
       TT.TaintUnionLoadFn, {ShadowAddr, ConstantInt::get(TT.IntptrTy, Size),
                             ConstantInt::get(TT.Int64Ty, SizeInBits),
@@ -4324,7 +4368,8 @@ Value *TaintFunction::loadShadowRecursive(
 }
 
 Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size,
-                                 Align Alignment, Instruction *Pos) {
+                                 Align Alignment, Instruction *Pos,
+                                 uint64_t Unread) {
   IRBuilder<> IRB(Pos);
   // if loading from a local variable, load label from its shadow
   if (AllocaInst *AI = dyn_cast<AllocaInst>(Addr)) {
@@ -4359,7 +4404,8 @@ Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size,
   // now check if we're loading an aggragate object
   if (!isa<ArrayType>(T) && !isa<StructType>(T)) {
     uint64_t SizeInBits = DL.getTypeSizeInBits(T);
-    return loadPrimitiveShadow(Addr, Size, SizeInBits, ShadowAlign, IRB);
+    return loadPrimitiveShadow(Addr, Size, SizeInBits, ShadowAlign, IRB,
+                               Unread);
   }
 
   // if loading an aggregate object, load its shadow recursively
@@ -4608,9 +4654,11 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
     }
   }
 
+  // the bytes of a bitfield's access unit outside the fields it is read for
+  // may never have been written, and are not read (see Bitfield.h)
   if (!Shadow)
     Shadow = TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
-                           LI.getAlign(), Pos);
+                           LI.getAlign(), Pos, symsan::unreadBytes(LI));
 #if 0
   //FIXME: tainted pointer
   if (ClCombinePointerLabelsOnLoad) {
@@ -4756,6 +4804,40 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
     Shadow = TF.combineShadows(Shadow, PtrShadow, &SI);
   }
 #endif
+  // A bitfield assignment writes only the bytes its masks touch, and those
+  // are initialized whatever the load was (see Bitfield.h).  When it was not,
+  // they take the label the chain gives with the load's as zero: the old bits
+  // they keep are concrete, the new ones are the new value's.
+  symsan::RMWStore RMW;
+  auto *AI = dyn_cast<AllocaInst>(SI.getPointerOperand());
+  if (!SI.isAtomic() && !TF.TT.isZeroShadow(Shadow) &&
+      Shadow->getType() == TF.TT.PrimitiveShadowTy &&
+      !(AI && TF.AllocaShadowMap.count(AI)) &&
+      symsan::matchRMWStore(SI, [](Instruction &I) {
+        if (I.getMetadata("nosanitize"))
+          return true;
+        auto *CB = dyn_cast<CallBase>(&I);
+        Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+        return Callee && (Callee->getName().starts_with("__taint_") ||
+                          Callee->getName().starts_with("__dfsan_"));
+      }, RMW)) {
+    Value *Alt = TF.TT.ZeroPrimitiveShadow;
+    for (auto [BO, Idx] : RMW.Chain) {
+      Value *Other = TF.getShadow(BO->getOperand(1 - Idx));
+      Alt = Idx == 0 ? TF.combineShadows(Alt, Other, BO->getOpcode(), BO)
+                     : TF.combineShadows(Other, Alt, BO->getOpcode(), BO);
+    }
+    IRBuilder<> IRB(&SI);
+    IRB.CreateCall(TF.TT.TaintStoreRMWFn,
+                   {Shadow, TF.TT.getShadowAddress(SI.getPointerOperand(), IRB),
+                    ConstantInt::get(TF.TT.IntptrTy, Size),
+                    ConstantInt::get(TF.TT.Int64Ty,
+                                     TF.getShadowAlign(SI.getAlign()).value()),
+                    TF.getShadow(RMW.Load), Alt,
+                    ConstantInt::get(TF.TT.Int64Ty, RMW.Touched)});
+    return;
+  }
+
   TF.storeShadow(SI.getPointerOperand(), VT, Size, SI.getAlign(), Shadow, &SI);
 }
 

@@ -47,6 +47,7 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#include "Bitfield.h"
 #include "UCSanSummary.h"
 
 #include <optional>
@@ -436,6 +437,7 @@ class UCSan {
   FunctionType *UCSetLabelForArgsFnTy;
   FunctionType *UCLoadPointerShadowFnTy;
   FunctionType *UCStorePointerShadowFnTy;
+  FunctionType *UCStoreRMWShadowFnTy;
   FunctionType *UCResignShadowFnTy;
   FunctionType *UCWrapRetvalFnTy;
   FunctionType *UCSetLabelFnTy;
@@ -463,6 +465,7 @@ class UCSan {
   FunctionCallee UCSetLabelForArgsFn;
   FunctionCallee UCLoadPointerShadowFn;
   FunctionCallee UCStorePointerShadowFn;
+  FunctionCallee UCStoreRMWShadowFn;
   FunctionCallee UCResignShadowFn;
   FunctionCallee UCWrapRetvalFn;
   FunctionCallee UCSetLabelFn;
@@ -858,6 +861,18 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCStorePointerShadowFn = M.getOrInsertFunction("ucsan_store_pointer_shadow", UCStorePointerShadowFnTy);
   F = dyn_cast<Function>(UCStorePointerShadowFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // Store a bitfield's shadow (see Bitfield.h):
+  // void ucsan_store_rmw_shadow(i16, i16, i16, i16*, i64, i64)
+  UCStoreRMWShadowFnTy = FunctionType::get(
+    Type::getVoidTy(*Ctx),
+    {PrimitiveShadowTy, PrimitiveShadowTy, PrimitiveShadowTy,
+     PrimitiveShadowPtrTy, Int64Ty, Int64Ty},
+    false);
+  UCStoreRMWShadowFn = M.getOrInsertFunction("ucsan_store_rmw_shadow", UCStoreRMWShadowFnTy);
+  F = dyn_cast<Function>(UCStoreRMWShadowFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -2435,6 +2450,7 @@ bool UCSanFunction::reusableCheck(Instruction *Checked, Instruction *Pos) {
   // and ucsan_check_pointer is the one that moves)
   static const StringSet<> Inert = {
       "ucsan_load_pointer_shadow", "ucsan_store_pointer_shadow",
+      "ucsan_store_rmw_shadow",
       "ucsan_set_label",           "ucsan_check_ubi",
       "ucsan_combine_label",       "ucsan_trace_alloca",
       "ucsan_trace_global",        "ucsan_check_global_bounds",
@@ -2897,7 +2913,42 @@ void UCSanVisitor::visitStoreInst(StoreInst &SI) {
   Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID, SI.getAlign());
   SI.setOperand(SI.getPointerOperandIndex(), Ptr);
   Value *Shadow = UF.getShadow(Val);
-  UF.storeShadow(Ptr, StoreSize, SI.getAlign(), Shadow, Ty, &SI);
+
+  // A bitfield assignment writes only the bytes its masks touch, and those
+  // are initialized whatever the load was (see Bitfield.h).  The new bits'
+  // shadow is what the touched bytes take when the load was uninitialized;
+  // the runtime picks.
+  symsan::RMWStore RMW;
+  auto *AI = dyn_cast<AllocaInst>(Ptr);
+  if (!UF.UC.isZeroShadow(Shadow) &&
+      !(AI && UF.AllocaShadowMap.count(AI)) &&
+      symsan::matchRMWStore(
+          SI,
+          [](Instruction &I) { return I.getMetadata("nosanitize") != nullptr; },
+          RMW)) {
+    Value *NewShadow = UF.UC.ZeroPrimitiveShadow;
+    for (auto [BO, Idx] : RMW.Chain) {
+      if (BO->getOpcode() != Instruction::Or)
+        continue;
+      Value *Bits = UF.getShadow(BO->getOperand(1 - Idx));
+      if (UF.UC.isZeroShadow(Bits))
+        continue;
+      if (UF.UC.isZeroShadow(NewShadow)) {
+        NewShadow = Bits;
+        continue;
+      }
+      CallInst *C = IRB.CreateCall(UF.UC.UCCombineLabelFn, {NewShadow, Bits});
+      UF.UC.markNosanitize(C);
+      NewShadow = C;
+    }
+    CallInst *CI = IRB.CreateCall(UF.UC.UCStoreRMWShadowFn,
+        {Shadow, UF.getShadow(RMW.Load), NewShadow,
+         UF.UC.getShadowAddress(Ptr, IRB), Size,
+         ConstantInt::get(UF.UC.Int64Ty, RMW.Touched)});
+    UF.UC.markNosanitize(CI);
+  } else {
+    UF.storeShadow(Ptr, StoreSize, SI.getAlign(), Shadow, Ty, &SI);
+  }
 
   // Mark as checked
   SI.setMetadata("ucsan.checked",

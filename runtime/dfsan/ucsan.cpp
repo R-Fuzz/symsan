@@ -1636,6 +1636,25 @@ void ucsan_store_pointer_shadow(ucsan_label l, ucsan_label *ls, uint64_t n) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_store_rmw_shadow(ucsan_label l, ucsan_label l_load, ucsan_label l_new,
+                            ucsan_label *ls, uint64_t n, uint64_t touched) {
+  UCSAN_OUT("store_rmw_shadow: label=%d, load=%d, new=%d, n=%lu, touched=%lx, ls=%p\n",
+            l, l_load, l_new, n, touched, ls);
+  // An uninitialized load makes the whole value so, but a byte the store
+  // rewrites is written: it takes the new bits' label.  A byte it does not is
+  // stored as it was loaded and keeps its own.
+  ucsan_label w = l_load == kUninitializedLabel ? l_new : l;
+  if (w != 0 && w != kUninitializedLabel) {
+    // a pointer label, which no bitfield holds
+    ucsan_store_pointer_shadow(w, ls, n);
+    return;
+  }
+  for (uint64_t i = 0; i < n; ++i)
+    if (touched & (1ULL << i))
+      ls[i] = w;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_set_label(ucsan_label label, void *addr, uint64_t size) {
   UCSAN_OUT("ucsan_set_label: label=%d, addr=%p, size=%lu\n", label, addr, size);
 
