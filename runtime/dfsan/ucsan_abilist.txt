@@ -134,10 +134,8 @@ fun:fprintf=ignore
 fun:vfprintf=ignore
 fun:printf=ignore
 fun:vprintf=ignore
-fun:snprintf=ignore
-fun:vsnprintf=ignore
-fun:sprintf=ignore
-fun:vsprintf=ignore
+# (not snprintf/sprintf/vsnprintf/vsprintf: they write the buffer they are
+# given, so their stubs resign it like any out-of-scope callee's)
 fun:fwrite=ignore
 fun:fwrite_unlocked=ignore
 fun:fflush=ignore
