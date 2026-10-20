@@ -537,6 +537,9 @@ class UCSan {
   bool initializeModule(Module &M);
 
   Function *buildDangleFunction(Function *F);
+  // the out-of-scope stubs that resign their pointer arguments (-r): a call
+  // resigns the variadic ones itself (see visitCallBase)
+  DenseSet<Function *> ResigningStubs;
   Function *buildDiscardFunction(Function *F);
   Function *buildDriverWrapperFunction(Function *F);
   Function *getCustomFunction(const Function *F);
@@ -1882,6 +1885,8 @@ Function *UCSan::buildDangleFunction(Function *F) {
   bool ignore_resign = getWrapperKind(F) == WK_Ignore;
   bool resign_ptrargs = getenv("KO_RESIGN_PTRARGS") != nullptr && !ignore_resign;
   bool checker_ubi = getenv("KO_CHECKER_UBI") != nullptr;
+  if (resign_ptrargs)
+    ResigningStubs.insert(NewF);
 
   // Get return address for tracking
   auto RetAddr = IRB.CreateCall(LLVMReturnAddrFn, {ConstantInt::get(Int32Ty, 0)}, "retaddr");
@@ -5975,6 +5980,48 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
       UF.SkipInsts.insert(LI);
       UF.setShadow(&CB, LI);
       UF.NonZeroChecks.push_back(LI);
+    }
+  }
+
+  // An out-of-scope callee resigns its pointer arguments (-r, see
+  // buildDangleFunction), but its stub sees only the fixed ones: a variadic
+  // argument's type and shadow do not reach it.  So a pointer passed as one
+  // is resigned here, after the call, which is where the stub's resigning
+  // happens from the caller's view.  sld_state_setup's
+  // sscanf(arg, "ratelimit:%d", &ratelimit) == 1 left ratelimit marked
+  // uninitialized, and its read was a UBI report on every seed taking it.
+  if (F && FT->isVarArg() && UF.UC.ResigningStubs.count(F) &&
+      !(isa<CallInst>(CB) && cast<CallInst>(CB).isMustTailCall())) {
+    // after the return value's shadow load, if any (it is right before Next)
+    Instruction *After = Next;
+    if (!After) {
+      if (auto *II = dyn_cast<InvokeInst>(&CB)) {
+        if (II->getNormalDest()->getSinglePredecessor())
+          After = &*II->getNormalDest()->getFirstInsertionPt();
+      } else {
+        After = CB.getNextNode();
+      }
+    }
+    for (unsigned I = FT->getNumParams(), N = CB.arg_size();
+         After && I != N; ++I) {
+      Value *Arg = CB.getArgOperand(I);
+      if (!Arg->getType()->isPointerTy() || isa<Constant>(Arg))
+        continue;
+      IRBuilder<> AfterIRB(After);
+      Type *PointeeTy = getUnderlyingObjectType(Arg);
+      uint64_t ObjSize = (PointeeTy && PointeeTy->isSized())
+                             ? DL.getTypeAllocSize(PointeeTy) : 0;
+      // the shadow is handed over in the (free, after the call) arg TLS
+      Value *ArgTLS = UF.getArgTLS(Arg->getType(), 0, AfterIRB);
+      StoreInst *SI = AfterIRB.CreateAlignedStore(UF.getShadow(Arg), ArgTLS,
+                                                  ShadowTLSAlignment);
+      UF.UC.markNosanitize(SI);
+      CallInst *Call = AfterIRB.CreateCall(
+          UF.UC.UCResignShadowFn,
+          {AfterIRB.CreatePointerCast(Arg, UF.UC.VoidPtrTy), ArgTLS,
+           ConstantInt::get(UF.UC.Int64Ty, ObjSize),
+           ConstantPointerNull::get(UF.UC.VoidPtrTy)});
+      UF.UC.markNosanitize(Call);
     }
   }
 }
