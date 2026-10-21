@@ -479,8 +479,9 @@ void ucsan_check_ptr_arg(__ucsan::ucsan_label *label, uint32_t arg_index, void* 
 
 // Load shadow for pointer type
 SANITIZER_INTERFACE_ATTRIBUTE
+// @param unread: bytes (bit i: byte i) of a non-pointer value no use reads
 __ucsan::ucsan_label ucsan_load_pointer_shadow(__ucsan::ucsan_label *ls, uint64_t n, bool is_pointer,
-                                               void *concrete_addr);
+                                               void *concrete_addr, uint64_t unread);
 
 // Store shadow for pointer type
 SANITIZER_INTERFACE_ATTRIBUTE

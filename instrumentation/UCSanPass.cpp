@@ -671,7 +671,9 @@ struct UCSanFunction {
   /// LS({T1,T2, ...}, Addr) = {LS(T1, SubAdrr),LS(T2, SubAddr),...}
   /// LS([n x T], Addr) = [n x LS(T, SubAddr)]
   /// LS(other types, Addr) = LS(PS, Addr)
-  Value *loadShadow(Value *Addr, uint64_t Size, Align Align, Type *Ty, Instruction *Pos);
+  /// Unread: bytes of a primitive no use reads (see Bitfield.h)
+  Value *loadShadow(Value *Addr, uint64_t Size, Align Align, Type *Ty, Instruction *Pos,
+                    uint64_t Unread = 0);
   
   /// XXX: we do not union taint labels for aggregate types before store;
   ///      instead, we store each privimitive field individually.
@@ -704,7 +706,7 @@ struct UCSanFunction {
 private:
   /// Loads a primivite shadow label
   Value *loadPrimitiveShadow(Value *Addr, uint64_t Size, Align Align,
-                             Type *Ty, IRBuilder<> &IRB);
+                             Type *Ty, IRBuilder<> &IRB, uint64_t Unread = 0);
   /// Loads shadow recursively for aggregate types
   Value *loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                              Type *SubTy, Value *Addr, uint64_t Size,
@@ -843,11 +845,12 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
-  // Load pointer shadow: i16 ucsan_load_pointer_shadow(i16*, i64, i1, void*)
+  // Load pointer shadow: i16 ucsan_load_pointer_shadow(i16*, i64, i1, void*, i64)
   // 4th arg: concrete source address (for make_input addr range lookup)
+  // 5th arg: the bytes no use reads (see Bitfield.h)
   UCLoadPointerShadowFnTy = FunctionType::get(
     PrimitiveShadowTy,
-    {PrimitiveShadowPtrTy, Int64Ty, Int1Ty, VoidPtrTy},
+    {PrimitiveShadowPtrTy, Int64Ty, Int1Ty, VoidPtrTy, Int64Ty},
     false);
   UCLoadPointerShadowFn = M.getOrInsertFunction("ucsan_load_pointer_shadow", UCLoadPointerShadowFnTy);
   F = dyn_cast<Function>(UCLoadPointerShadowFn.getCallee()->stripPointerCasts());
@@ -1618,7 +1621,8 @@ Value *UCSanFunction::getShadowForTLSArgument(Argument *A) {
 /// Load primitive shadow corresponding to bytes [Addr, Addr+Size), where
 // Addr has alignment Align, and take the union of each of those shadows.
 Value *UCSanFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size, Align Align,
-                                          Type *Ty, IRBuilder<> &IRB) {
+                                          Type *Ty, IRBuilder<> &IRB,
+                                          uint64_t Unread) {
   if (Size == 0)
     return UC.ZeroPrimitiveShadow;
 
@@ -1633,7 +1637,8 @@ Value *UCSanFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size, Align Alig
   CallInst *FallbackCall = IRB.CreateCall(
       UC.UCLoadPointerShadowFn,
       {ShadowAddr, ConstantInt::get(UC.Int64Ty, Size),
-       ConstantInt::get(UC.Int1Ty, Ty->isPointerTy()), ConcreteAddr});
+       ConstantInt::get(UC.Int1Ty, Ty->isPointerTy()), ConcreteAddr,
+       ConstantInt::get(UC.Int64Ty, Unread)});
   FallbackCall->addRetAttr(Attribute::ZExt);
   UC.markNosanitize(FallbackCall);
   return FallbackCall;
@@ -1697,7 +1702,7 @@ Value *UCSanFunction::loadShadowRecursive(
 
 /// Load shadow from shadow memory for a given address.
 Value *UCSanFunction::loadShadow(Value *Addr, uint64_t Size, Align Align,
-                                 Type *Ty, Instruction *Pos) {
+                                 Type *Ty, Instruction *Pos, uint64_t Unread) {
   IRBuilder<> IRB(Pos);
   // if loading from a local variable, load label from its shadow alloca
   if (AllocaInst *AI = dyn_cast<AllocaInst>(Addr)) {
@@ -1735,7 +1740,7 @@ Value *UCSanFunction::loadShadow(Value *Addr, uint64_t Size, Align Align,
 
   // now check if we're loading an aggragate object
   if (!isa<ArrayType>(Ty) && !isa<StructType>(Ty))
-    return loadPrimitiveShadow(Addr, Size, ShadowAlign, Ty, IRB);
+    return loadPrimitiveShadow(Addr, Size, ShadowAlign, Ty, IRB, Unread);
 
   // if loading an aggregate object, load its shadow recursively
   SmallVector<unsigned, 4> Indices;
@@ -2883,7 +2888,11 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
   Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID, LI.getAlign());
   LI.setOperand(0, Ptr);
 
-  Value *Shadow = UF.loadShadow(Ptr, StoreSize, LI.getAlign(), Ty, &LI);
+  // a value is uninitialized when a byte its uses read is, and the bytes
+  // of a bitfield's access unit outside its fields are not read (see
+  // Bitfield.h)
+  Value *Shadow = UF.loadShadow(Ptr, StoreSize, LI.getAlign(), Ty, &LI,
+                                symsan::unreadBytes(LI));
   if (!UF.UC.isZeroShadow(Shadow))
     UF.NonZeroChecks.push_back(Shadow);
 

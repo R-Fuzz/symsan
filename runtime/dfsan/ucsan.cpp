@@ -1537,7 +1537,7 @@ bool __ucsan_seed_byte(uint32_t input, int64_t offset, uint8_t *out) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_pointer,
-                                      void *concrete_addr) {
+                                      void *concrete_addr, uint64_t unread) {
   if (ls == nullptr) return 0;
 
   // Only the first byte's label is ever used, and only for a pointer or a
@@ -1553,6 +1553,17 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
             ls, label0, is_pointer, n);
 
   // Allow loading kUninitializedLabel for UBI detection
+  // (a value is uninitialized when any byte of it its uses read is, not only
+  // the first: a bitfield in the third byte of its access unit was read as
+  // initialized when the first byte had been written.  The bytes no use reads
+  // -- the unit's other fields -- do not count either way.)
+  if (!is_pointer) {
+    for (uint64_t i = 0; i < n; ++i)
+      if (ls[i] == kUninitializedLabel && !(i < 64 && (unread >> i & 1)))
+        return kUninitializedLabel;
+    if (label0 == kUninitializedLabel)
+      return 0;
+  }
   if (label0 == kUninitializedLabel) {
     return label0;
   }
