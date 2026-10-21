@@ -3350,6 +3350,44 @@ uint64_t asmAccessSize(StringRef Mnemonic, ArrayRef<std::string> Operands) {
   return 0;
 }
 
+// Alignment, in bytes, an instruction needs of its memory operand, or 1.  The
+// aligned moves fault on an address not aligned to their vector width, VEX
+// encoded or not; a legacy (non-VEX) SSE instruction with a 16-byte memory
+// operand faults on one not 16-byte aligned, except the explicitly unaligned
+// moves and those whose memory operand is narrower (scalar, half-vector,
+// insert/extract, widening converts and loads).
+uint64_t asmAccessAlign(StringRef Mnemonic, ArrayRef<std::string> Operands) {
+  StringRef M = Mnemonic;
+  bool Vex = M.consume_front("v");
+  if (M == "movaps" || M == "movapd" || M == "movdqa" || M == "movntdqa" ||
+      M == "movntdq" || M == "movntps" || M == "movntpd") {
+    if (Vex)
+      for (auto &O : Operands) {
+        if (StringRef(O).starts_with("%ymm"))
+          return 32;
+        if (StringRef(O).starts_with("%zmm"))
+          return 64;
+      }
+    return 16;
+  }
+  if (Vex)
+    return 1;
+  bool Xmm = false;
+  for (auto &O : Operands)
+    Xmm |= StringRef(O).starts_with("%xmm");
+  if (!Xmm)
+    return 1;
+  if (M == "movups" || M == "movupd" || M == "movdqu" || M == "lddqu" ||
+      M == "movq" || M == "movd" || M == "movlps" || M == "movhps" ||
+      M == "movlpd" || M == "movhpd" || M == "movddup" || M == "insertps" ||
+      M == "extractps" || M.ends_with("ss") || M.ends_with("sd") ||
+      M.starts_with("pinsr") || M.starts_with("pextr") ||
+      M.starts_with("pmovzx") || M.starts_with("pmovsx") ||
+      M.starts_with("cvt") || M.starts_with("maskmov"))
+    return 1;
+  return 16;
+}
+
 const char *const AsmArgRegs[] = {"di", "si", "dx", "cx", "r8", "r9"};
 
 // The operands of an inline asm call, indexed by operand number ($N in the
@@ -5257,13 +5295,24 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
   // opaque pointers carry no pointee type on Arg itself.
   // which left globals unsymbolized until after the asm had written them,
   // and sized every other operand 0; the size is now the elementtype's.
-  for (auto &Op : Ops) {
+  for (unsigned N = 0; N < Ops.size(); ++N) {
+    AsmOp &Op = Ops[N];
     // only check indirect (memory) operands that are pointers
     if (!Op.isMem() || !Op.V->getType()->isPointerTy())
       continue;
     Value *Size = ConstantInt::get(UF.UC.Int64Ty, memSize(Op));
     uint32_t TypeID = UF.UC.getOrCreateTypeID(Op.ElemTy);
-    Value *Ptr = UF.checkPointer(Op.V, Size, true, IRB, TypeID); // dereference pointer
+    // the alignment the instructions naming the operand need of it, as for a
+    // register pointer below: `movaps %1, %%xmm0` with "m"(*p)
+    uint64_t AlignBytes = 1;
+    std::string Plain = "$" + std::to_string(N);
+    std::string Braced = "${" + std::to_string(N) + ":";
+    for (auto &I : Insns)
+      for (auto &O : I.Operands)
+        if (O == Plain || StringRef(O).starts_with(Braced))
+          AlignBytes = std::max(AlignBytes, asmAccessAlign(I.Mnemonic, I.Operands));
+    Value *Ptr = UF.checkPointer(Op.V, Size, true, IRB, TypeID,
+                                 Align(AlignBytes)); // dereference pointer
     for (unsigned I = 0; I < CB.arg_size(); ++I)
       if (CB.getArgOperand(I) == Op.V)
         CB.setArgOperand(I, Ptr);
@@ -5286,6 +5335,12 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     if (Op.TiedTo >= 0)
       Names.push_back(Op.TiedTo);
     uint64_t Size = 0;
+    // the alignment the pointer itself needs: an aligned move at a
+    // displacement that is a multiple of what it needs, else none.  The
+    // runtime places the object for it (align_object in ucsan.cpp):
+    // i915_unaligned_memcpy_from_wc rounds src up to 16 bytes by its pseudo
+    // value and reads it with movntdqa.
+    uint64_t AlignBytes = 1;
     bool Deref = false;
     for (unsigned Name : Names) {
       std::string Plain = "($" + std::to_string(Name) + ")";
@@ -5302,12 +5357,15 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
           if (StringRef(O).substr(0, P).trim().getAsInteger(0, Disp))
             Disp = 0;
           Size = std::max(Size, Disp + asmAccessSize(I.Mnemonic, I.Operands));
+          uint64_t A = asmAccessAlign(I.Mnemonic, I.Operands);
+          if (Disp % A == 0)
+            AlignBytes = std::max(AlignBytes, A);
         }
     }
     if (!Deref)
       continue;
     Value *Ptr = UF.checkPointer(Op.V, ConstantInt::get(UF.UC.Int64Ty, Size),
-                                 true, IRB, 0);
+                                 true, IRB, 0, Align(AlignBytes));
     for (unsigned I = 0; I < CB.arg_size(); ++I)
       if (CB.getArgOperand(I) == Op.V)
         CB.setArgOperand(I, Ptr);
