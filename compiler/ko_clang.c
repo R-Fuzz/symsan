@@ -192,6 +192,12 @@ static void add_runtime() {
 
   cc_params[cc_par_cnt++] = alloc_printf("-Wl,-T%s/taint.ld", obj_path);
 
+  // Bind every symbol at load time.  The fork servers fork in .preinit_array,
+  // so with lazy binding each child resolved, and wrote into the GOT, every
+  // function it called for the first time: symbol lookups and copy-on-write
+  // faults paid again per run.  Bound in the parent, children inherit them.
+  cc_params[cc_par_cnt++] = "-Wl,-z,now";
+
   if (is_cxx && use_ucsan_only) {
     // UCSan-only: link the plain (uninstrumented) EH runtime so C++ exception
     // handling resolves to the real __cxa_*/personality/unwinder symbols that

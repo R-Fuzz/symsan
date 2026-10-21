@@ -2779,12 +2779,16 @@ void ucsan_init() {
     ucsan_init_input(ucsan_flags_data.input_file);
   }
 
-  // Initialize UCSan solver (thoroupy backend)
-  InitializeUCSanSolver();
-
   // Register cleanup callback
+  // (above the fork point in InitializeUCSanSolver, so a child inherits the
+  // registration instead of writing libc's exit list and the die callbacks
+  // again, a few copy-on-write faults each run; the fork server itself only
+  // ever leaves through internal__exit, which runs neither)
   Atexit(ucsan_fini_internal);
   AddDieCallback(ucsan_fini_internal);
+
+  // Initialize UCSan solver (thoroupy backend)
+  InitializeUCSanSolver();
 
   UCSAN_OUT("UCSan runtime initialized\n");
   UCSAN_OUT("  Shadow:      0x%lx - 0x%lx\n", (uint64_t)kShadowBase, (uint64_t)kUnionTableAddr);

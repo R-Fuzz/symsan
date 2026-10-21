@@ -2603,6 +2603,15 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   // ring_fd.
   InitializeSymSanEventRing();
 
+  // Register the fini callback to run when the program terminates successfully
+  // or it is killed by the runtime.
+  // (above the fork point, so a child inherits the registration instead of
+  // writing libc's exit list and the die callbacks again each run; the fork
+  // server only ever leaves through internal__exit, which runs neither, and
+  // dfsan_fini runs at exit, after everything below)
+  Atexit(dfsan_fini);
+  AddDieCallback(dfsan_fini);
+
   // The fork server, if one was asked for, has to sit exactly here.  Everything
   // above is input-independent -- the shadow and union mappings, the hashtable
   // allocator, the interceptors -- and is what we want to pay for once and
@@ -2619,11 +2628,6 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   InitializeStringMaps();
 
   InitializeSymSanSolver();
-
-  // Register the fini callback to run when the program terminates successfully
-  // or it is killed by the runtime.
-  Atexit(dfsan_fini);
-  AddDieCallback(dfsan_fini);
 }
 
 #if SANITIZER_CAN_USE_PREINIT_ARRAY
