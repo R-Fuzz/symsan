@@ -132,6 +132,39 @@ bool in_bss_section(void *p) {
   return (&edata <= (char*)p && (char*)p <= &end);
 }
 
+// A global byte is symbolized from the seed at its first dereference.  That
+// used to be told by its shadow alone, 0 -- but 0 is also the shadow of a
+// byte the program has written with a concrete value, so a global cleared or
+// stored and then read was symbolized again at the read: a fresh label, and
+// the seed's byte in memory where the seed covers it.  Identity is the
+// label, so a pointer read back that way named a lazily created object
+// instead of what the program stored (an ICMP fixture's skb head,
+// queued_output.head = queued_frame, read back in its push).  A bit per byte
+// of the image's data and bss records that a byte has been symbolized or
+// written by a memset or memcpy (a store is checked first, and that check
+// symbolizes); mapped above the fork point, so a child starts from the
+// parent's.
+static u8 *global_seen;
+
+static void init_global_seen() {
+  uptr n = (uptr)(&end - &__dso_handle) / 8 + 1;
+  global_seen = (u8 *)MmapNoReserveOrDie(n, "UCSan global bytes seen");
+}
+
+static bool global_byte_seen(void *p) {
+  uptr i = (uptr)((char *)p - &__dso_handle);
+  return global_seen[i / 8] & (1 << (i % 8));
+}
+
+static void mark_global_seen(void *p, uptr size) {
+  for (uptr k = 0; k < size; ++k) {
+    char *b = (char *)p + k;
+    if (!in_data_section(b)) break;
+    uptr i = (uptr)(b - &__dso_handle);
+    global_seen[i / 8] |= (u8)(1 << (i % 8));
+  }
+}
+
 }  // namespace __ucsan
 
 //===----------------------------------------------------------------------===//
@@ -777,6 +810,10 @@ static void check_global_bounds(void *p, ucsan_label label, uint64_t size,
 // value, and wrote gigabytes of shadow past the 256 KB array.
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_check_global_bounds(void *p, ucsan_label label, uint64_t size) {
+  // the destination of a memset or memcpy (UCSanFunction::checkGlobalDest):
+  // written, so never symbolized after (see global_seen)
+  if (in_data_section(p))
+    mark_global_seen(p, Min(size, (uint64_t)ucsan_object_size_limit()));
   if (label < UCSAN_CONST_OFFSET || label == kUninitializedLabel ||
       get_label_info(label)->common.op != OP_ALLOCA)
     return;
@@ -887,8 +924,10 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       size = ucsan_object_size_limit();
     }
     // Symbolize global variable on first access (label == 0)
+    // (and not written or symbolized before: see global_seen)
     ucsan_label *shadow = ucsan_shadow_for(p);
-    if (*shadow == 0 && dereferencing) {
+    if (*shadow == 0 && dereferencing && !global_byte_seen(p)) {
+      mark_global_seen(p, size);
       // only symbolize on deref
       bool sent_data = false;
       uint64_t first_byte_offset = 0;
@@ -2814,6 +2853,9 @@ void ucsan_init() {
 
   // the first chunk of object windows, once for every run (see object_window)
   reserve_object_windows();
+
+  // which global bytes have been symbolized or written (see global_seen)
+  init_global_seen();
 
   // Register cleanup callback
   // (above the fork point in InitializeUCSanSolver, so a child inherits the
