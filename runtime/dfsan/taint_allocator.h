@@ -9,6 +9,8 @@ namespace __taint {
 
 void allocator_init(uptr begin, uptr end);
 void *allocator_alloc(uptr size);
+// nullptr, rather than dying, when size does not fit
+void *allocator_try_alloc(uptr size);
 void allocator_dealloc(uptr addr);
 
 } // namespace

@@ -70,7 +70,9 @@ struct taint_socket __dfsan::tainted_socket;
 
 // Hash table
 static const uptr hashtable_size = (1ULL << 32);
-static const size_t hashtable_buckets = (1ULL << 20);
+// The union table's initial slot count: it grows (see union_hashtable.h).
+// It was a fixed (1ULL << 20) buckets.
+static const size_t hashtable_initial_slots = (1ULL << 12);
 // Default-constructed on purpose, so it lands in .bss with no dynamic
 // initializer; dfsan_init calls init() above the fork point.  See the comment
 // on the class -- a sized constructor here would be an .init_array entry, which
@@ -2570,7 +2572,7 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   // constructor gets an .init_array entry, and .init_array runs after all of
   // .preinit_array -- i.e. after the fork point below -- so every forked child
   // would build its own table, faulting in the 8MB of buckets each time.
-  __union_table.init(hashtable_buckets);
+  __union_table.init(hashtable_initial_slots, __dfsan_label_info);
 
   // init main thread
   auto num_of_labels = uniontable_size / sizeof(dfsan_label_info);
