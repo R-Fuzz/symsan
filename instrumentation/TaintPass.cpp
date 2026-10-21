@@ -1613,6 +1613,27 @@ static void normalizeBoolLoads(Function &F) {
     LI->replaceAllUsesWith(NonZero);
     LI->eraseFromParent();
   }
+  // An i1 store becomes a store of its zext, the byte codegen writes, so that
+  // the byte's label is 8 bits wide like the i8 load above reads.  Stored as
+  // is, the 1-bit label (a comparison) went through union_store's per-byte
+  // Extract of 8 bits from a 1-bit value, which neither solver can build: the
+  // load's `!= 0` failed to parse in fastgen and was a z3 sort error
+  // (pci_acpi_crs_quirks's pci_use_crs, a bool global GlobalOpt shrank).
+  SmallVector<StoreInst *, 4> I1Stores;
+  for (Instruction &I : instructions(F)) {
+    auto *SI = dyn_cast<StoreInst>(&I);
+    if (SI && SI->isSimple() &&
+        SI->getValueOperand()->getType()->isIntegerTy(1))
+      I1Stores.push_back(SI);
+  }
+  for (StoreInst *SI : I1Stores) {
+    IRBuilder<> IRB(SI);
+    Value *Byte = IRB.CreateZExt(SI->getValueOperand(), IRB.getInt8Ty());
+    StoreInst *NS = IRB.CreateAlignedStore(Byte, SI->getPointerOperand(),
+                                           SI->getAlign());
+    NS->copyMetadata(*SI);  // UCSan's checked marker, debug location, ...
+    SI->eraseFromParent();
+  }
 }
 
 void Taint::addContextRecording(Function &F) {
