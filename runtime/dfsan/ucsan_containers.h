@@ -17,6 +17,24 @@
 namespace __ucsan {
 
 //===----------------------------------------------------------------------===//
+// Container memory
+//===----------------------------------------------------------------------===//
+// The containers here and in ucsan.h hold a run's state: the seed's objects,
+// the object map, the address-range maps.  Each used to be its own mapping
+// (MmapOrDie), a page at least, so a forked child made ~10 mmap and ~5 munmap
+// calls a run and took a zero-fill fault per buffer however small.  They come
+// from one arena instead, reserved (no-reserve) above the fork point: a child
+// bumps through pages the parent never touched, so they are zero, no memory is
+// ever handed out twice in a process, and nothing is given back -- a run ends
+// with its process.  Past the arena an allocation falls back to its own
+// mapping.
+void container_arena_init();
+// size bytes, zeroed, 16-byte aligned
+void *container_alloc(uptr size);
+// p from container_alloc(size); a no-op inside the arena
+void container_free(void *p, uptr size);
+
+//===----------------------------------------------------------------------===//
 // AddrRangeMap - sorted array for address range → object ID lookup
 //===----------------------------------------------------------------------===//
 // Supports container_of/list_entry patterns where pointers point into
@@ -39,17 +57,12 @@ struct AddrRangeMap {
   void init(uint32_t initial_cap = 64) {
     cap = initial_cap;
     len = 0;
-    uptr alloc_size = __sanitizer::RoundUpTo(
-        cap * sizeof(AddrRangeEntry), __sanitizer::GetPageSizeCached());
-    entries = (AddrRangeEntry *)__sanitizer::MmapOrDie(
-        alloc_size, "AddrRangeMap");
+    entries = (AddrRangeEntry *)container_alloc(cap * sizeof(AddrRangeEntry));
   }
 
   void destroy() {
     if (entries) {
-      uptr alloc_size = __sanitizer::RoundUpTo(
-          cap * sizeof(AddrRangeEntry), __sanitizer::GetPageSizeCached());
-      __sanitizer::UnmapOrDie(entries, alloc_size);
+      container_free(entries, cap * sizeof(AddrRangeEntry));
       entries = nullptr;
     }
     len = cap = 0;
@@ -131,14 +144,9 @@ private:
     uint32_t old_cap = cap;
     AddrRangeEntry *old = entries;
     cap *= 2;
-    uptr alloc_size = __sanitizer::RoundUpTo(
-        cap * sizeof(AddrRangeEntry), __sanitizer::GetPageSizeCached());
-    entries = (AddrRangeEntry *)__sanitizer::MmapOrDie(
-        alloc_size, "AddrRangeMap");
+    entries = (AddrRangeEntry *)container_alloc(cap * sizeof(AddrRangeEntry));
     __sanitizer::internal_memcpy(entries, old, len * sizeof(AddrRangeEntry));
-    uptr old_size = __sanitizer::RoundUpTo(
-        old_cap * sizeof(AddrRangeEntry), __sanitizer::GetPageSizeCached());
-    __sanitizer::UnmapOrDie(old, old_size);
+    container_free(old, old_cap * sizeof(AddrRangeEntry));
   }
 };
 

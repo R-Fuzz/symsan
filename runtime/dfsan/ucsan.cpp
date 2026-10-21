@@ -167,9 +167,37 @@ using __sanitizer::GetPageSizeCached;
 using __sanitizer::internal_memcpy;
 using __sanitizer::internal_memset;
 
+static char *container_arena_beg, *container_arena_cur, *container_arena_end;
+
+void __ucsan::container_arena_init() {
+  if (container_arena_beg) return;
+  uptr size = (uptr)1 << 30;
+  container_arena_beg = (char *)MmapNoReserveOrDie(size, "UCSan containers");
+  container_arena_cur = container_arena_beg;
+  container_arena_end = container_arena_beg + size;
+}
+
+void *__ucsan::container_alloc(uptr size) {
+  size = RoundUpTo(Max(size, (uptr)1), 16);
+  if (container_arena_cur &&
+      size <= (uptr)(container_arena_end - container_arena_cur)) {
+    void *p = container_arena_cur;
+    container_arena_cur += size;
+    return p;
+  }
+  return MmapOrDie(RoundUpTo(size, GetPageSizeCached()), "UCSan containers");
+}
+
+void __ucsan::container_free(void *p, uptr size) {
+  if ((char *)p >= container_arena_beg && (char *)p < container_arena_end)
+    return;
+  UnmapOrDie(p, RoundUpTo(RoundUpTo(Max(size, (uptr)1), 16),
+                          GetPageSizeCached()));
+}
+
 void ByteBuffer::destroy() {
   if (buf) {
-    UnmapOrDie(buf, RoundUpTo(cap, GetPageSizeCached()));
+    container_free(buf, cap);
     buf = nullptr;
   }
   len = cap = 0;
@@ -179,21 +207,12 @@ void ByteBuffer::resize(uint32_t new_size) {
   if (new_size > cap) {
     uint32_t new_cap = cap ? cap : 16;
     while (new_cap < new_size) new_cap *= 2;
-    uptr old_alloc = RoundUpTo(cap, GetPageSizeCached());
-    uptr new_alloc = RoundUpTo(new_cap, GetPageSizeCached());
+    unsigned char *new_buf = (unsigned char *)container_alloc(new_cap);
     if (buf) {
-      uptr r = internal_mremap(buf, old_alloc, new_alloc, MREMAP_MAYMOVE, nullptr);
-      if (!internal_iserror(r)) {
-        buf = (unsigned char *)r;
-      } else {
-        unsigned char *new_buf = (unsigned char *)MmapOrDie(new_alloc, "ByteBuffer");
-        __builtin_memcpy(new_buf, buf, len);
-        UnmapOrDie(buf, old_alloc);
-        buf = new_buf;
-      }
-    } else {
-      buf = (unsigned char *)MmapOrDie(new_alloc, "ByteBuffer");
+      __builtin_memcpy(new_buf, buf, len);
+      container_free(buf, cap);
     }
+    buf = new_buf;
     cap = new_cap;
   }
   len = new_size;
@@ -208,7 +227,7 @@ void ObjectStorage::destroy() {
   if (items) {
     for (uint32_t i = 0; i < len; i++)
       items[i].data.destroy();
-    UnmapOrDie(items, RoundUpTo(cap * sizeof(UCSanObject), GetPageSizeCached()));
+    container_free(items, cap * sizeof(UCSanObject));
     items = nullptr;
   }
   len = cap = 0;
@@ -218,16 +237,17 @@ void ObjectStorage::resize(uint32_t new_size) {
   if (new_size > cap) {
     uint32_t new_cap = cap ? cap : 4;
     while (new_cap < new_size) new_cap *= 2;
-    uptr alloc_size = RoundUpTo(new_cap * sizeof(UCSanObject), GetPageSizeCached());
-    UCSanObject *new_items = (UCSanObject *)MmapOrDie(alloc_size, "ObjectStorage");
+    UCSanObject *new_items =
+        (UCSanObject *)container_alloc(new_cap * sizeof(UCSanObject));
     if (items) {
       internal_memcpy(new_items, items, len * sizeof(UCSanObject));
-      UnmapOrDie(items, RoundUpTo(cap * sizeof(UCSanObject), GetPageSizeCached()));
+      container_free(items, cap * sizeof(UCSanObject));
     }
     items = new_items;
     cap = new_cap;
   }
   // Initialize new entries (MmapOrDie zero-fills, but init ByteBuffer explicitly)
+  // (container_alloc zero-fills too)
   for (uint32_t i = len; i < new_size; i++) {
     items[i].offset = 0;
     items[i].data.init();
@@ -259,14 +279,14 @@ UCSanObject& ObjectStorage::emplace_back(const UCSanObject &obj) {
 void ObjectMap::init(uint32_t initial_cap) {
   cap = initial_cap;
   count = 0;
-  uptr alloc_size = RoundUpTo(cap * sizeof(ObjectMapEntry), GetPageSizeCached());
-  entries = (ObjectMapEntry *)MmapOrDie(alloc_size, "ObjectMap");
+  entries = (ObjectMapEntry *)container_alloc(cap * sizeof(ObjectMapEntry));
   // MmapOrDie returns zero-filled, so occupied=0 for all entries
+  // (container_alloc too)
 }
 
 void ObjectMap::destroy() {
   if (entries) {
-    UnmapOrDie(entries, RoundUpTo(cap * sizeof(ObjectMapEntry), GetPageSizeCached()));
+    container_free(entries, cap * sizeof(ObjectMapEntry));
     entries = nullptr;
   }
   cap = count = 0;
@@ -314,14 +334,13 @@ void ObjectMap::grow() {
   uint32_t old_cap = cap;
   ObjectMapEntry *old = entries;
   cap *= 2;
-  uptr alloc_size = RoundUpTo(cap * sizeof(ObjectMapEntry), GetPageSizeCached());
-  entries = (ObjectMapEntry *)MmapOrDie(alloc_size, "ObjectMap");
+  entries = (ObjectMapEntry *)container_alloc(cap * sizeof(ObjectMapEntry));
   count = 0;
   for (uint32_t i = 0; i < old_cap; i++) {
     if (old[i].occupied)
       insert(old[i].key.first, old[i].key.second, old[i].value);
   }
-  UnmapOrDie(old, RoundUpTo(old_cap * sizeof(ObjectMapEntry), GetPageSizeCached()));
+  container_free(old, old_cap * sizeof(ObjectMapEntry));
 }
 
 //===----------------------------------------------------------------------===//
@@ -334,6 +353,8 @@ namespace __ucsan {
 // with preinit_array.
 
 static void ucsan_init_input_struct() {
+  // the containers' memory, before the first of them (see ucsan_containers.h)
+  container_arena_init();
   internal_memset(ucsan_tainted.filename, 0, sizeof(ucsan_tainted.filename));
   ucsan_tainted.fd = -1;
   ucsan_tainted.offset = 0;
@@ -555,15 +576,27 @@ ucsan_label allocate_label() {
 // once the pass stopped reusing a check's result across anything that can
 // move it: see align_object.  Growth is still in place.  A window has a page
 // more above its middle, so offset 0 can sit up to a page past it.)
-static char *object_window() {
-  static char *cur, *end;
+static char *object_window_cur, *object_window_end;
+
+// Map a chunk of windows if the next window does not fit.  ucsan_init calls it
+// above the fork point, so the first chunk is the parent's and every child
+// uses it rather than mapping its own each run.
+static void reserve_object_windows() {
   uptr page = GetPageSizeCached();
   uptr half = RoundUpTo(ucsan_object_size_limit(), page);
+  char *&cur = object_window_cur, *&end = object_window_end;
   if (!cur || cur + 2 * half + page > end) {
     uptr chunk = Max((uptr)1 << 30, 2 * half + page);
     cur = (char *)MmapNoReserveOrDie(chunk, "UCSan object windows");
     end = cur + chunk;
   }
+}
+
+static char *object_window() {
+  char *&cur = object_window_cur;
+  uptr page = GetPageSizeCached();
+  uptr half = RoundUpTo(ucsan_object_size_limit(), page);
+  reserve_object_windows();
   char *mid = cur + half;
   cur += 2 * half + page;
   return mid;
@@ -2778,6 +2811,9 @@ void ucsan_init() {
   if (ucsan_flags_data.input_file && ucsan_flags_data.input_file[0] != '\0') {
     ucsan_init_input(ucsan_flags_data.input_file);
   }
+
+  // the first chunk of object windows, once for every run (see object_window)
+  reserve_object_windows();
 
   // Register cleanup callback
   // (above the fork point in InitializeUCSanSolver, so a child inherits the
