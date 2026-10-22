@@ -1625,6 +1625,12 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
             ls, label0, is_pointer, n);
 
   // Allow loading kUninitializedLabel for UBI detection
+  // FIXME: per byte, so a load the compiler widened past what the program
+  // reads is uninitialized as a whole: mode_store's strncmp(_buf, "on", 2)
+  // became a load i16 compared with "on", and with _buf = "\0" its second
+  // byte was never written (a UBI the C does not have).  Exact equality
+  // (defined once initialized bits differ, as MSan has) needs bitwise
+  // initialization state, which is not planned.
   // (a value is uninitialized when any byte of it its uses read is, not only
   // the first: a bitfield in the third byte of its access unit was read as
   // initialized when the first byte had been written.  The bytes no use reads

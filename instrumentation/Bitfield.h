@@ -101,6 +101,13 @@ inline bool walk(llvm::Value *V, llvm::Value *Addr, const llvm::DataLayout &DL,
 // SI stores what a load of its own address in its block loaded, through ands
 // with constant masks and ors of new bits, and nothing in between can write
 // the program's memory -- Skip(I) says I is the instrumentation's own.
+// FIXME: initialization is tracked per byte, so a store this does not match is
+// judged by its whole byte.  dm_split_and_process_bio sets two bitfields of
+// one byte in two blocks, the second `or` reusing the first's `and` of the
+// load across stores to other fields and calls; the plain store copies the
+// load's uninitialized label onto the bit the first had written (a UBI).
+// Matching it needs alias reasoning, and the general fix, bitwise
+// initialization state, is not planned.
 inline bool matchRMWStore(llvm::StoreInst &SI,
                           llvm::function_ref<bool(llvm::Instruction &)> Skip,
                           RMWStore &R) {
