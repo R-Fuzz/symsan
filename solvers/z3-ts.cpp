@@ -83,6 +83,7 @@ static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::fstrstr,  "strstr"},
   {__dfsan::fstrpbrk, "strpbrk"},
   {__dfsan::fstr_off, "stroff"},
+  {__dfsan::fstr_ptr, "strptr"},
   {__dfsan::fsubstr,  "substr"},
   {__dfsan::fstrcat,  "strcat"},
   {__dfsan::fprefixof, "prefixof"},
@@ -2090,6 +2091,34 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         TRACK_LABEL_SEQ_ONLY();
         RECORD_VALUE(0);
       }
+      continue;
+    } else if (info->op == __dfsan::fstr_ptr) {
+      // fstr_ptr: a search's result as an address (see dfsan.h), built where
+      // it is compared with a pointer: the haystack pointer (l2, or op1 when
+      // concrete) plus the found position, else NULL plus the fstr_off
+      // offset.  op2 is the result's value.
+      dfsan_label s = info->l1;
+      dfsan_label_info *si = get_label_info(s);
+      bool off_op = si->op == __dfsan::fstr_off;
+      dfsan_label root = off_op ? si->l1 : s;
+      uint64_t offset = off_op ? (uint64_t)si->op2.i : 0;
+      z3::expr pos = get_cached_expr(s, input_deps);
+      z3::expr root_pos = get_cached_expr(root, input_deps);
+      z3::expr base = info->l2 >= CONST_OFFSET
+                          ? get_cached_expr(info->l2, input_deps)
+                          : context_.bv_val((uint64_t)info->op1.i, 64);
+      if (!pos.is_int() || !root_pos.is_int() || !base.is_bv() ||
+          base.get_sort().bv_size() != 64)
+        throw z3::exception("unsupported string pointer");
+      z3::expr found_ptr =
+          base + z3::to_expr(context_, Z3_mk_int2bv(context_, 64, pos));
+      z3::expr ptr = z3::ite(root_pos >= context_.int_val(0), found_ptr,
+                             context_.bv_val(offset, 64));
+      tsize_cache_.emplace_back(tsize_cache_[s] +
+                                (info->l2 >= CONST_OFFSET ? tsize_cache_[info->l2] : 0));
+      cache_expr(l, ptr);
+      TRACK_LABEL_PROPAGATE_BOTH();
+      RECORD_VALUE(info->op2.i);
       continue;
     } else if (info->op == __dfsan::Alloca || info->op == __dfsan::Free) {
       // not expression, do nothing

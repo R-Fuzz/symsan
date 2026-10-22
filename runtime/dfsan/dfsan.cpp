@@ -271,6 +271,8 @@ static inline bool is_wide_const(dfsan_label l) {
   return l != 0 && get_label_info(l)->op == __dfsan::WideConst;
 }
 
+static dfsan_label str_ptr_label(dfsan_label l, uint64_t value);
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2) {
@@ -317,6 +319,23 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     return 0;
   if (l1 == kInitializingLabel || l2 == kInitializingLabel)
     return kInitializingLabel;
+
+  // A search's result compared with a pointer other than NULL -- trace_create
+  // _new_event's `p != systems`, p = strstr(systems, system) -- is compared as
+  // the address it is (fstr_ptr): as a position it cannot meet a pointer, and
+  // the parser gave up ("unsupported string comparison").  A comparison with
+  // NULL stays as it is, found or not found.
+  if ((op & 0xff) == __dfsan::ICmp && size == 64 &&
+      !(l1 == 0 && op1 == 0) && !(l2 == 0 && op2 == 0)) {
+    dfsan_label s1 = str_ptr_label(l1, op1), s2 = str_ptr_label(l2, op2);
+    if (s1 != l1 || s2 != l2) {
+      // the other side's bounds label (a stack or heap object's, under
+      // trace_bounds) is no expression: its address is concrete, and the
+      // bounds handling below would drop the comparison
+      l1 = is_bounds_label(s1) ? 0 : s1;
+      l2 = is_bounds_label(s2) ? 0 : s2;
+    }
+  }
 
   // special handling for bounds
   if (is_bounds_label(l1) ||
@@ -2272,6 +2291,49 @@ extern "C" dfsan_label taint_get_str_content_label(const void *addr) {
   }
   AOUT("addr=%p, not found\n", addr);
   return 0;
+}
+
+// The haystack pointer a search ran over, by the search's label: the
+// pointer's own label and its value, for a pointer comparison of the search's
+// result (fstr_ptr, see str_ptr_label).  Direct mapped; a search that lost its
+// slot compares as it did before.
+static struct {
+  dfsan_label search, base_label;
+  uptr base;
+} search_bases[4096];
+
+extern "C" void taint_set_search_base(dfsan_label search, dfsan_label base_label,
+                                      const void *base) {
+  if (search < CONST_OFFSET)
+    return;
+  auto &e = search_bases[search % (sizeof(search_bases) / sizeof(search_bases[0]))];
+  e.search = search;
+  e.base_label = base_label;
+  e.base = (uptr)base;
+}
+
+// l, a search's result or an fstr_off of one, as the pointer it is: fstr_ptr
+// over the haystack pointer.  Anything else, or a search whose haystack is
+// not known, is l unchanged.
+static dfsan_label str_ptr_label(dfsan_label l, uint64_t value) {
+  if (l < CONST_OFFSET || l == kInitializingLabel)
+    return l;
+  dfsan_label_info *info = get_label_info(l);
+  if (!is_indexof_op(info->op))
+    return l;
+  dfsan_label root = info->op == __dfsan::fstr_off ? info->l1 : l;
+  if (root < CONST_OFFSET)
+    return l;
+  auto &e = search_bases[root % (sizeof(search_bases) / sizeof(search_bases[0]))];
+  if (e.search != root)
+    return l;
+  // a haystack that is itself a search's result (drm_mode_parse_cmdline_
+  // options' strchr(option, ...), option = sep + 1) is an address too
+  dfsan_label base_label = str_ptr_label(e.base_label, e.base);
+  // (a bounds label is an object's, not an expression: the base is concrete)
+  if (base_label == kInitializingLabel || is_bounds_label(base_label))
+    base_label = 0;
+  return do_taint_union(l, base_label, __dfsan::fstr_ptr, 64, e.base, value);
 }
 
 extern "C" void taint_set_str_indexof_label(void *addr, dfsan_label label) {

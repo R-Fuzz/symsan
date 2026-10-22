@@ -627,6 +627,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
                              content_len,
                              (uint64_t)s,
                              encode_strchr_op2((uint8_t)c, s_label));
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(*ret_label, s_label, s);
 
     // Send concrete haystack content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -680,6 +682,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
                                     content_len,
                                     (uint64_t)s,
                                     (uint64_t)accept);
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(label, s_label, s);
 
     // Send concrete content (haystack or accept)
     if (content_len > 0 && label) {
@@ -2471,6 +2475,8 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrchr,
                              content_len,
                              (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(*ret_label, s_label, s);
 
     // Send concrete content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -2512,6 +2518,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
                              content_len,
                              (uint64_t)s,
                              encode_strchr_op2((uint8_t)c, s_label));
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(*ret_label, s_label, s);
 
     // Send concrete haystack content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -2566,6 +2574,8 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrrchr,
                              content_len,
                              (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(*ret_label, s_label, s);
 
     // Send concrete content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -2615,6 +2625,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
                                     content_len,
                                     (uint64_t)haystack,
                                     (uint64_t)needle);
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(label, haystack_label, haystack);
 
     // Send concrete content (haystack or needle)
     if (content_len > 0 && label) {
@@ -2686,6 +2698,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strnstr(char *haystack, char *needle,
                                     content_len,
                                     (uint64_t)haystack,
                                     (uint64_t)needle);
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(label, haystack_label, haystack);
 
     // Send concrete content (haystack or needle)
     if (content_len > 0 && label) {
@@ -2754,6 +2768,8 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     content_len,
                                     (uint64_t)haystack, (uint64_t)needle);
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(label, haystack_label, haystack);
 
     // Send concrete content (haystack or needle)
     if (content_len > 0 && label) {

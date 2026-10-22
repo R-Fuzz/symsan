@@ -106,6 +106,8 @@ dfsan_label taint_get_offset_label();
 void taint_set_str_content_label(void *addr, dfsan_label label);
 dfsan_label taint_get_str_content_label(const void *addr);
 void taint_set_str_indexof_label(void *addr, dfsan_label label);
+void taint_set_search_base(dfsan_label search, dfsan_label base_label,
+                           const void *base);
 dfsan_label taint_get_str_indexof_label(const void *addr);
 dfsan_label taint_find_string_op_source(dfsan_label label);
 dfsan_label taint_get_base_input_label(dfsan_label label);
@@ -279,7 +281,16 @@ enum operators {
   // is.  The parser lowers it to a multi-slot rgd::Constant, the convention
   // z3-solver.cpp and jit.cc already read.
   WideConst = last_llvm_op + 43, // 110
-  LastOp    = last_llvm_op + 44, // 111
+  // The pointer a string search returns, as an address: l1 is the search (or
+  // an fstr_off of it), l2 the haystack pointer's own label, op1 the haystack
+  // pointer, op2 the result; size is 64.  It is the haystack plus the found
+  // position, or NULL plus the offset when nothing was found.  Built only
+  // where the result is compared with a pointer other than NULL (see
+  // __taint_union): a search label alone is a position, and strstr's op2,
+  // the needle, leaves no room for the haystack's label the way strchr's
+  // does.
+  fstr_ptr  = last_llvm_op + 44, // 111
+  LastOp    = last_llvm_op + 45, // 112
 };
 
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP
