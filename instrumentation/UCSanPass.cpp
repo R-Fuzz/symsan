@@ -747,6 +747,8 @@ public:
   void visitGetElementPtrInst(GetElementPtrInst &GEPI);
   void visitSelectInst(SelectInst &I);
   void visitPHINode(PHINode &PN);
+  void visitInsertValueInst(InsertValueInst &I);
+  void visitExtractValueInst(ExtractValueInst &I);
   void visitUnreachableInst(UnreachableInst &I);
   // void visitIntrinsicInst(IntrinsicInst &I);
 
@@ -6751,6 +6753,38 @@ void UCSanVisitor::visitSelectInst(SelectInst &I) {
     ShadowSel = SelectInst::Create(I.getCondition(), TrueShadow, FalseShadow, "", &I);
   }
   UF.setShadow(&I, ShadowSel);
+}
+
+// An aggregate's shadow has its shape (getShadowTy), element by element.
+// Without these an extractvalue's shadow was zero: get_user's lowered load
+// (rseq_get_rseq_cs's `ptr`, the seed's bytes) lost its label in the
+// { ptr, i64, i64 } the lowering rebuilds the asm's results in, and the
+// pointer later made of it was taken for a real one.
+void UCSanVisitor::visitInsertValueInst(InsertValueInst &I) {
+  Value *AggShadow = UF.getShadow(I.getAggregateOperand());
+  Value *ElemShadow = UF.getShadow(I.getInsertedValueOperand());
+  if (UF.UC.isZeroShadow(AggShadow) && UF.UC.isZeroShadow(ElemShadow)) {
+    UF.setShadow(&I, UF.UC.getZeroShadow(&I));
+    return;
+  }
+  IRBuilder<> IRB(&I);
+  Value *S = IRB.CreateInsertValue(AggShadow, ElemShadow, I.getIndices());
+  if (auto *SI = dyn_cast<Instruction>(S))
+    UF.UC.markNosanitize(SI);
+  UF.setShadow(&I, S);
+}
+
+void UCSanVisitor::visitExtractValueInst(ExtractValueInst &I) {
+  Value *AggShadow = UF.getShadow(I.getAggregateOperand());
+  if (UF.UC.isZeroShadow(AggShadow)) {
+    UF.setShadow(&I, UF.UC.getZeroShadow(&I));
+    return;
+  }
+  IRBuilder<> IRB(&I);
+  Value *S = IRB.CreateExtractValue(AggShadow, I.getIndices());
+  if (auto *SI = dyn_cast<Instruction>(S))
+    UF.UC.markNosanitize(SI);
+  UF.setShadow(&I, S);
 }
 
 void UCSanVisitor::visitPHINode(PHINode &PN) {
