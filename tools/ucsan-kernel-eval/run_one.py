@@ -142,7 +142,11 @@ def main():
 
     # solver-side ub options as debug.py: the taint options label the object
     # bound, the ucsan options trace it
-    env = {"trace_bounds": "1", "solve_ub": "1"}
+    env = {"trace_bounds": "1", "solve_ub": "1",
+           # a poison-flag violation (nsw/nuw/exact) on the seed's made-up
+           # values is a finding, not the end of the run: it goes on with
+           # the poisoned value concrete (dfsan.cpp poison_check)
+           "exit_on_poison": "0"}
     # checker_nullderef: a NULL the program itself dereferences is reported
     # (a finding, EVENT_NULL_DEREF), not left to fault, so what is left as a
     # SIGSEGV is a UCSan/SymSan failure and not a NULL the kernel code returned

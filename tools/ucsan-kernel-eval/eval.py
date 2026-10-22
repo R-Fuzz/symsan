@@ -92,6 +92,7 @@ LLVM_AS = os.environ.get("LLVM_AS", "llvm-as-18")
 FINDING_CODES = {
     150: "UBI", 151: "UAF", 152: "OOB", 153: "NULL_DEREF", 154: "DIV_BY_ZERO",
     155: "INT_OVERFLOW", 156: "DOUBLE_FREE", 157: "MEMLEAK", 158: "INVALID_FREE",
+    159: "INEXACT_DIV",
     161: "OOB_UPCAST",
     171: "PANIC", 180: "KERNEL_BUG", 201: "CONTRACTION",
 }
@@ -443,6 +444,13 @@ def classify_run(res):
             pass
         else:
             fails.append(("run", "exit-code", "%d %s" % (code, target_signature(res.get("target_tail", "")))))
+    # a poison-flag violation the run goes on past (run_one.py's
+    # exit_on_poison=0) is a finding reported as an event, with no exit
+    for code in (155, 159):
+        n = res.get("events", {}).get(str(code), 0)
+        if n:
+            name = FINDING_CODES[code]
+            findings[name] = max(findings.get(name, 0), n)
     for e in res.get("errors", []):
         if any(d in e for d in SOLVER_DECLINES):
             continue

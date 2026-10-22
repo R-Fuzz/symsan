@@ -210,6 +210,10 @@ def perform_test(stage, *args, seed=None):
             taint_options.setdefault('trace_bounds', "1")
             taint_options.setdefault('solve_ub', "1")
 
+        # a poison-flag violation (nsw/nuw/exact) on the seed's made-up values
+        # is a finding, not the end of the run (as the kernel eval runs it)
+        taint_options.setdefault('exit_on_poison', "0")
+
         # Build runtime env with properly categorized options
         runtime_env = {}
         runtime_env.update(taint_options)
