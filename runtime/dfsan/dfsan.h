@@ -493,7 +493,15 @@ enum undefined_check_ids {
   ub_signed_integer_truncation,
   ub_integer_sign_change,
   ub_assertion_failure,
+  ub_inexact_division, // a udiv/sdiv/lshr/ashr exact that is not
 };
+
+// Poison flags of an integer operation, in the high byte of the op TaintPass
+// gives __taint_union (instrumentation/TaintPass.cpp has the same values):
+// nsw, nuw, exact
+#define P_NSW   0x1
+#define P_NUW   0x2
+#define P_EXACT 0x4
 
 #define F_ADD_CONS   0x1
 #define F_LOOP_EXIT  0x2

@@ -2962,6 +2962,12 @@ Value *TaintFunction::combineBinaryOperatorShadows(BinaryOperator *BO,
 // would require a side channel, and nothing observed needs one.
 static const uint64_t kMaxOperandBits = 128;
 
+// Poison flags of an integer operation, passed to __taint_union in the high
+// byte of its op (runtime/dfsan/dfsan.h has the same values).
+static const uint16_t TaintPoisonNSW = 0x1;
+static const uint16_t TaintPoisonNUW = 0x2;
+static const uint16_t TaintPoisonExact = 0x4;
+
 Value *TaintFunction::combineShadows(Value *V1, Value *V2,
                                      uint16_t op,
                                      Instruction *Pos) {
@@ -3048,6 +3054,20 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   if (CmpInst *CI = dyn_cast<CmpInst>(Pos)) { // for both icmp and fcmp
     // op should be predicate
     op |= (CI->getPredicate() << 8);
+  } else if (Pos->getType()->isIntegerTy()) {
+    // An integer operation's poison flags, in the byte a comparison keeps its
+    // predicate in: the compiled code relies on them (sext(add nsw) became a
+    // 64-bit add, an sdiv exact a shift and a multiply), so the runtime
+    // assumes them on the path and reports a violation (__taint_union).
+    if (auto *OBO = dyn_cast<OverflowingBinaryOperator>(Pos)) {
+      if (OBO->hasNoSignedWrap())
+        op |= TaintPoisonNSW << 8;
+      if (OBO->hasNoUnsignedWrap())
+        op |= TaintPoisonNUW << 8;
+    }
+    if (auto *PEO = dyn_cast<PossiblyExactOperator>(Pos))
+      if (PEO->isExact())
+        op |= TaintPoisonExact << 8;
   }
   Value *Op = ConstantInt::get(TT.Int16Ty, op);
   Value *Size = ConstantInt::get(TT.Int16Ty, size);

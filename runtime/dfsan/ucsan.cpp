@@ -745,6 +745,51 @@ out_default:
 // Super Object Label Creation
 //===----------------------------------------------------------------------===//
 
+// The seed bytes that hold a pseudo pointer's value, by (object, offset):
+// where UCSan made a pointer of them (ucsan_load_pointer_shadow) or handed one
+// out (a super-object pointer slot).  SymSan asks, at a poison-flag violation
+// (dfsan.cpp poison_check), whether the violated condition depends on any:
+// then the violation is the seed's placement of pseudo pointers -- whose
+// values only have to satisfy the path's constraints -- and not UB in the
+// program.  Open addressing; a full table records no more (those
+// violations count as the program's, the conservative side).
+static uint64_t placement_keys[1 << 14];
+static unsigned placement_count;
+
+static inline uint64_t placement_key(uint32_t object_id, int64_t offset) {
+  // +1: key 0 is the empty slot
+  return (((uint64_t)object_id << 32) | (uint32_t)offset) + 1;
+}
+
+static void record_placement(uint32_t object_id, int64_t offset, uint64_t n) {
+  const unsigned cap = sizeof(placement_keys) / sizeof(placement_keys[0]);
+  for (uint64_t i = 0; i < n; ++i) {
+    if (placement_count * 4 >= cap * 3)
+      return;
+    uint64_t k = placement_key(object_id, offset + (int64_t)i);
+    unsigned h = (unsigned)(k * 0x9E3779B97F4A7C15ULL >> 50) & (cap - 1);
+    while (placement_keys[h] && placement_keys[h] != k)
+      h = (h + 1) & (cap - 1);
+    if (!placement_keys[h]) {
+      placement_keys[h] = k;
+      ++placement_count;
+    }
+  }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+bool __ucsan_is_placement_byte(uint32_t object_id, int64_t offset) {
+  const unsigned cap = sizeof(placement_keys) / sizeof(placement_keys[0]);
+  uint64_t k = placement_key(object_id, offset);
+  unsigned h = (unsigned)(k * 0x9E3779B97F4A7C15ULL >> 50) & (cap - 1);
+  while (placement_keys[h]) {
+    if (placement_keys[h] == k)
+      return true;
+    h = (h + 1) & (cap - 1);
+  }
+  return false;
+}
+
 object_info create_label_from_super_object(size_t size, bool is_pointer) {
   uint64_t offset = atomic_fetch_add(&ucsan_tainted.arg_used, size, memory_order_relaxed);
   ucsan_label label = allocate_label();
@@ -760,6 +805,7 @@ object_info create_label_from_super_object(size_t size, bool is_pointer) {
     ptr->status = PTR_UNINITIALIZED;
     ptr->obj_label = 0;  // parent object ID (0 = super object)
     ptr->pseudo_base = (void*)offset;  // Repurpose to store offset for lookup
+    record_placement(0, (int64_t)offset, size);  // see record_placement
   } else {
     // Create byte info for super object (object 0)
     ucsan_byte_info *byte = &label_info->byte;
@@ -1650,6 +1696,11 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
 
   if (is_pointer) {
     if (label0 >= UCSAN_CONST_OFFSET && label_info->common.op == OP_NONE) {
+      // the pointer's value is these seed bytes (see record_placement)
+      {
+        ucsan_byte_info *b = to_byte_info(label_info);
+        record_placement(b->object_id, b->offset, n);
+      }
       // Check if the concrete pointer value points to a symbolize_input object
       if (__symbolize_addr_map_inited && concrete_addr && n == sizeof(void*)) {
         void *concrete_val = *(void **)concrete_addr;

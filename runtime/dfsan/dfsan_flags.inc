@@ -54,6 +54,16 @@ DFSAN_FLAG(bool, trace_bounds, false, "trace bounds info.")
 DFSAN_FLAG(bool, trace_fsize, false, "trace file size.")
 DFSAN_FLAG(bool, exit_on_memerror, true, "terminate on memory error.")
 DFSAN_FLAG(bool, solve_ub, false, "solve undefined behavior.")
+DFSAN_FLAG(bool, model_poison, true,
+           "assume an integer operation's poison flags (nsw, nuw, exact) on "
+           "the path, and report a run that violates one.")
+DFSAN_FLAG(bool, exit_on_poison, true,
+           "terminate on a poison-flag violation of the program's own values "
+           "(a pseudo pointer's placement is not one); otherwise go on with "
+           "the poisoned value concrete.")
+DFSAN_FLAG(bool, solve_wrap, false,
+           "ask the solver to wrap an add/sub/mul with no poison flag, signed "
+           "and unsigned (-fsanitize=unsigned-integer-overflow's opt-in check).")
 DFSAN_FLAG(bool, allow_zero_size_alloc, false,
            "Allow malloc-size minimization to solve allocation sizes to zero.")
 DFSAN_FLAG(bool, debug, false, "Print debug output.")

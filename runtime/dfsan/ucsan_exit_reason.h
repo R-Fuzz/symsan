@@ -15,6 +15,7 @@ enum exit_reason {
   EVENT_DOUBLE_FREE = 156,
   EVENT_MEMLEAK = 157,
   EVENT_INVALID_FREE = 158,   // free of an address inside an object
+  EVENT_INEXACT_DIV = 159,    // a udiv/sdiv/lshr/ashr exact with a remainder
 
   EVENT_OOB_UPCAST = 161,
 

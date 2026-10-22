@@ -1,6 +1,6 @@
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out
-// RUN: python -c'print("A"*32)' > %t.bin
+// RUN: python -c'print("\x11"*32)' > %t.bin
 // RUN: clang -o %t.uninstrumented %s
 // RUN: env KO_USE_FASTGEN=1 %ko-clang -o %t.fg %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg %t.bin
@@ -18,6 +18,9 @@
 // RUN: %t.uninstrumented %t.out/id-0-0-3 | FileCheck --check-prefix=CHECK-GEN4 %s
 // RUN: %t.uninstrumented %t.out/id-0-0-4 | FileCheck --check-prefix=CHECK-GEN5 %s
 // RUN: %t.uninstrumented %t.out/id-0-0-5 | FileCheck --check-prefix=CHECK-GEN6 %s
+// (The seed is 0x11 bytes, not 'A's: 0x41414141 + 0x41414141 overflows the
+// signed int sum, which is UB the run now reports and stops at -- the add is
+// nsw -- before anything is solved.)
 
 #include <stdint.h>
 #include <stdio.h>

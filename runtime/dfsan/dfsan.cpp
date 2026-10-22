@@ -260,6 +260,10 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_ub_check(dfsan_label label, bool r, uint32_t cid,
                             void *addr);
 
+// a constraint of the path every solver adds (backend/fastgen.cpp)
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_add_constraint(dfsan_label label, uint8_t result);
+
 // Forward declarations for trace callbacks (implemented in solvers)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_event_addr(uint32_t label, uint32_t event_id,
@@ -273,6 +277,97 @@ static inline bool is_wide_const(dfsan_label l) {
 
 static dfsan_label str_ptr_label(dfsan_label l, uint64_t value);
 
+// Whether a pseudo pointer's value is part of label: any input byte it reads
+// that UCSan made a pointer of (__ucsan_is_placement_byte; plain SymSan has
+// none).  Bounded: past the bound it says no, and the violation counts as the
+// program's, which is the side that reports.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+bool __ucsan_is_placement_byte(uint32_t object_id, int64_t offset);
+
+static bool depends_on_placement(dfsan_label root) {
+  if (root < CONST_OFFSET || root == kInitializingLabel)
+    return false;
+  dfsan_label stack[256];
+  dfsan_label seen[1024];
+  unsigned nstack = 0, nseen = 0;
+  stack[nstack++] = root;
+  while (nstack) {
+    dfsan_label l = stack[--nstack];
+    bool dup = false;
+    for (unsigned i = 0; i < nseen && !dup; ++i)
+      dup = seen[i] == l;
+    if (dup)
+      continue;
+    if (nseen == sizeof(seen) / sizeof(seen[0]))
+      return false;
+    seen[nseen++] = l;
+    dfsan_label_info *info = get_label_info(l);
+    if (info->op == 0 && info->l1 == 0 && info->l2 == 0) {
+      // an input byte: op2 its object, op1 its offset
+      if (__ucsan_is_placement_byte((uint32_t)info->op2.i, (int64_t)info->op1.i))
+        return true;
+      continue;
+    }
+    dfsan_label kids[2] = {info->l1, info->l2};
+    for (dfsan_label c : kids) {
+      if (c < CONST_OFFSET || c == kInitializingLabel)
+        continue;
+      if (nstack == sizeof(stack) / sizeof(stack[0]))
+        return false;
+      stack[nstack++] = c;
+    }
+  }
+  return false;
+}
+
+// A poison-flag condition of an operation (nsw, nuw, exact; see the end of
+// __taint_union): `bad` labels its violation, `violated` says this run
+// violates it.  Held, it is an assumption of the path -- the compiled code
+// relies on it, so a solution that breaks it is one the binary does not
+// compute the model's value for -- sent as a constraint every solver takes
+// (__taint_add_constraint), and with solve_ub also a UB task to break it.
+// Violated, the run has poison the model cannot follow: it is reported, and
+// ends under exit_on_poison.
+// (Not assumed -- solve_wrap's checks of an operation that may wrap -- it is
+// only a UB task, and a wrap is no violation.)
+// Returns whether the operation's result is poison the run goes on with: its
+// label is then dropped (__taint_union returns 0), so what follows uses the
+// value the binary computed, not one the model would have -- sext(add nsw)
+// carried on would be a value mismatch at the next condition.
+static bool poison_check(dfsan_label bad, bool violated, bool assumed,
+                         uint32_t ub_kind, int event, dfsan_label label,
+                         void *ub_addr) {
+  if (!assumed) {
+    if (!violated && bad >= CONST_OFFSET)
+      __taint_trace_ub_check(bad, 0, ub_kind, ub_addr);
+    return false;
+  }
+  if (violated) {
+    // The seed's placement of pseudo pointers, not the program: solve the
+    // condition back to hold -- a UB task, which comes with the path's
+    // constraints -- for a seed that places them consistently, and go on.
+    if (depends_on_placement(bad)) {
+      AOUT("poison (event %d) from a pseudo pointer's placement, label %u\n",
+           event, label);
+      dfsan_label holds = do_taint_union(bad, 0, (bveq << 8) | __dfsan::ICmp,
+                                         1, 1, 0);
+      __taint_trace_ub_check(holds, 0, ub_kind, ub_addr);
+      return true;
+    }
+    AOUT("WARNING: poison (event %d) from label %u\n", event, label);
+    __taint_trace_event_addr(label, event, 0, ub_addr, 0);
+    if (flags().exit_on_poison)
+      internal__exit(event);
+    return true;
+  }
+  if (bad < CONST_OFFSET)
+    return false;
+  __taint_add_constraint(bad, 0);
+  if (flags().solve_ub)
+    __taint_trace_ub_check(bad, 0, ub_kind, ub_addr);
+  return false;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2) {
@@ -281,6 +376,20 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   if (!is_valid_op(op)) {
     AOUT("WARNING: invalid op %d\n", op);
     return 0;
+  }
+  // An integer operation's poison flags (nsw, nuw, exact) come in the byte a
+  // comparison keeps its predicate in (TaintPass); they are no part of the
+  // label, only of what is assumed and checked for it below.
+  uint8_t poison = 0;
+  switch (op & 0xff) {
+    case __dfsan::Add: case __dfsan::Sub: case __dfsan::Mul:
+    case __dfsan::Shl: case __dfsan::LShr: case __dfsan::AShr:
+    case __dfsan::UDiv: case __dfsan::SDiv:
+      poison = op >> 8;
+      op &= 0xff;
+      break;
+    default:
+      break;
   }
   if (l1 > l2 && is_commutative(op)) {
     // needs to swap both labels and concretes
@@ -775,7 +884,27 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           __taint_trace_ub_check(sign_diff, 0, ub_integer_sign_change, ub_addr);
         }
       }
-    } else if (op == __dfsan::Add) {
+    }
+  }
+
+  // The poison flags (nsw, nuw, exact) of an integer operation: what the
+  // compiled code relies on, assumed on the path and checked (poison_check).
+  // (now: the Add/Sub/Mul checks below were ubsan-style checks of every such
+  // operation, signed and unsigned alike, under solve_ub.  Unsigned wrap is
+  // defined, and so is signed wrap without nsw: the flags say which overflow
+  // is the program's to avoid.)
+  // (and with solve_wrap, the wrap of an Add/Sub/Mul without the flag, as a
+  // UB task only: -fsanitize=unsigned-integer-overflow's opt-in check)
+  const uint8_t assumed = flags().model_poison ? poison : 0;
+  bool poisoned = false;
+  uint8_t wrap = 0;
+  if (flags().solve_wrap &&
+      (op == __dfsan::Add || op == __dfsan::Sub || op == __dfsan::Mul))
+    wrap = (P_NSW | P_NUW) & ~assumed;
+  const bool want_s = (assumed | wrap) & P_NSW, assume_s = assumed & P_NSW;
+  const bool want_u = (assumed | wrap) & P_NUW, assume_u = assumed & P_NUW;
+  if ((assumed || wrap) && ub_width_ok) {
+    if (op == __dfsan::Add) {
       // check for integer overflow
       // -fsanitize=signed-integer-overflow, unsigned-integer-overflow
       //
@@ -792,25 +921,32 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       uint64_t sign_bit = 1ULL << (size - 1);
       bool has_signed_overflow = (overflow_check & sign_bit) != 0;
 
-      if (!has_signed_overflow) {
+      if (!want_s) {
+        // wraps by definition
+      } else {
+        // (built whether or not it is violated: a violation that is the placement's
+        // is solved back to hold, see poison_check)
         // Build symbolic expression: ((l1 ^ label) & (l2 ^ label)) < 0
         dfsan_label xor_l1 = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
         dfsan_label xor_l2 = do_taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
         dfsan_label and_xors = do_taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
         dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
                                           size, overflow_check, 0);
-        __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
-      } else {
-        AOUT("WARNING: signed integer overflow\n");
-        __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
+        if (has_signed_overflow)
+          AOUT("WARNING: signed integer overflow\n");
+        poisoned |= poison_check(cond, has_signed_overflow, assume_s, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
       }
 
       // Unsigned overflow: result < op1 (for any non-zero op2)
       // When adding two unsigned numbers, overflow means result wrapped around
-      if (result >= orig_op1 && (orig_op2 != 0 || l2 != 0)) {
+      if (!want_u) {
+        // wraps by definition
+      } else if (result < orig_op1 || orig_op2 != 0 || l2 != 0) {
+        // (built whether or not it is violated: a violation that is the placement's
+        // is solved back to hold, see poison_check)
         dfsan_label cond = do_taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
                                           size, result, orig_op1);
-        __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
+        poisoned |= poison_check(cond, result < orig_op1, assume_u, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
       }
     } else if (op == __dfsan::Mul) {
       // check for integer overflow
@@ -845,7 +981,11 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         int64_t swide = sa * sb;
         const uint64_t wide_mask =
             wide_size >= 64 ? 0xFFFFFFFFFFFFFFFFUL : (1ULL << wide_size) - 1;
-        if (swide == sr) {
+        if (!want_s) {
+          // wraps by definition
+        } else {
+          // (built whether or not it is violated: a violation that is the placement's
+          // is solved back to hold, see poison_check)
           dfsan_label s1 = l1 ? do_taint_union(l1, 0, __dfsan::SExt, wide_size, orig_op1, 0) : 0;
           dfsan_label s2 = l2 ? do_taint_union(l2, 0, __dfsan::SExt, wide_size, orig_op2, 0) : 0;
           dfsan_label smul = do_taint_union(s1, s2, __dfsan::Mul, wide_size,
@@ -853,21 +993,24 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           dfsan_label sres = do_taint_union(label, 0, __dfsan::SExt, wide_size, result, 0);
           dfsan_label cond = do_taint_union(smul, sres, (bvneq << 8) | __dfsan::ICmp,
                                             wide_size, swide & wide_mask, sr & wide_mask);
-          __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
-        } else {
-          AOUT("WARNING: signed integer overflow\n");
-          __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
+          if (swide != sr)
+            AOUT("WARNING: signed integer overflow\n");
+          poisoned |= poison_check(cond, swide != sr, assume_s, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
         }
 
         // unsigned: zext(op1) * zext(op2) >u mask
         uint64_t uwide = a * b;
-        if (uwide <= mask) {
+        if (!want_u) {
+          // wraps by definition
+        } else {
+          // (built whether or not it is violated: a violation that is the placement's
+          // is solved back to hold, see poison_check)
           dfsan_label z1 = l1 ? do_taint_union(l1, 0, __dfsan::ZExt, wide_size, orig_op1, 0) : 0;
           dfsan_label z2 = l2 ? do_taint_union(l2, 0, __dfsan::ZExt, wide_size, orig_op2, 0) : 0;
           dfsan_label umul = do_taint_union(z1, z2, __dfsan::Mul, wide_size, a, b);
           dfsan_label cond = do_taint_union(umul, 0, (bvugt << 8) | __dfsan::ICmp,
                                             wide_size, uwide, mask);
-          __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
+          poisoned |= poison_check(cond, uwide > mask, assume_u, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
         }
       }
     } else if (op == __dfsan::Sub) {
@@ -888,17 +1031,20 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       uint64_t sign_bit = 1ULL << (size - 1);
       bool has_signed_overflow = (overflow_check & sign_bit) != 0;
 
-      if (!has_signed_overflow) {
+      if (!want_s) {
+        // wraps by definition
+      } else {
+        // (built whether or not it is violated: a violation that is the placement's
+        // is solved back to hold, see poison_check)
         // Build symbolic expression: ((l1 ^ l2) & (l1 ^ label)) < 0
         dfsan_label xor_l1l2 = do_taint_union(l1, l2, __dfsan::Xor, size, orig_op1, orig_op2);
         dfsan_label xor_l1r = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
         dfsan_label and_xors = do_taint_union(xor_l1l2, xor_l1r, __dfsan::And, size, xor_ab, xor_ar);
         dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
                                           size, overflow_check, 0);
-        __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
-      } else {
-        AOUT("WARNING: signed integer overflow\n");
-        __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
+        if (has_signed_overflow)
+          AOUT("WARNING: signed integer overflow\n");
+        poisoned |= poison_check(cond, has_signed_overflow, assume_s, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
       }
 
       // Unsigned underflow: result > op1 when op2 > 0
@@ -906,14 +1052,95 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       // `orig_op2 != 0` alone skips a symbolic subtrahend that happens to be 0
       // right now, which is exactly the one worth solving for; Add's twin
       // guard already has the `|| l2 != 0` arm.
-      if (result <= orig_op1 && (orig_op2 != 0 || l2 != 0)) {
+      if (!want_u) {
+        // wraps by definition
+      } else if (result > orig_op1 || orig_op2 != 0 || l2 != 0) {
+        // (built whether or not it is violated: a violation that is the placement's
+        // is solved back to hold, see poison_check)
         dfsan_label cond = do_taint_union(label, l1, (bvugt << 8) | __dfsan::ICmp,
                                           size, result, orig_op1);
-        __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
+        poisoned |= poison_check(cond, result > orig_op1, assume_u, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
       }
+    } else if (op == __dfsan::Shl) {
+      // shl nsw/nuw: shifting the result back gives the operand, arithmetic
+      // for nsw and logical for nuw.  An exponent out of range is poison of
+      // its own (the shift-exponent check), with no bits to speak of.
+      const uint64_t mask = size == 64 ? ~0ULL : (1ULL << size) - 1;
+      const uint64_t sh = orig_op2;
+      if (sh < size) {
+        const uint64_t x = orig_op1 & mask;
+        const uint64_t result = (x << sh) & mask;
+        static const uint16_t shl_flags[] = {P_NUW, P_NSW};
+        for (uint16_t f : shl_flags) {
+          if (!(assumed & f))
+            continue;
+          uint64_t back;
+          if (f == P_NUW) {
+            back = result >> sh;
+          } else {
+            int64_t sres = (int64_t)(result << (64 - size)) >> (64 - size);
+            back = (uint64_t)(sres >> sh) & mask;
+          }
+          dfsan_label b = do_taint_union(label, l2,
+                                         f == P_NUW ? __dfsan::LShr : __dfsan::AShr,
+                                         size, result, sh);
+          dfsan_label cond = do_taint_union(b, l1, (bvneq << 8) | __dfsan::ICmp,
+                                            size, back, x);
+          poisoned |= poison_check(cond, back != x, true, ub_shift_overflow,
+                                   EVENT_INT_OVERFLOW, label, ub_addr);
+        }
+      }
+    } else if ((op == __dfsan::UDiv || op == __dfsan::SDiv) &&
+               (assumed & P_EXACT) && orig_op2 != 0) {
+      // udiv/sdiv exact: the remainder is 0.  The compiled code divides by
+      // shifting and multiplying by the inverse, which is the quotient only
+      // then: intel_pmu_drain_pebs_core's (top - at) / 144 of two pseudo
+      // pointers 0x8000000000000000 apart gave 0x3800000000000000.  Assumed,
+      // it keeps pseudo pointers a whole number of elements apart.
+      // (INT_MIN / -1 is the division checks' own.)
+      const uint64_t mask = size == 64 ? ~0ULL : (1ULL << size) - 1;
+      uint64_t rem;
+      if (op == __dfsan::UDiv) {
+        rem = (orig_op1 & mask) % (orig_op2 & mask);
+      } else {
+        int64_t a = (int64_t)(orig_op1 << (64 - size)) >> (64 - size);
+        int64_t b = (int64_t)(orig_op2 << (64 - size)) >> (64 - size);
+        // (anything % -1 is 0, and INT64_MIN % -1 is UB to compute)
+        rem = b == -1 ? 0 : (uint64_t)(a % b) & mask;
+      }
+      // (built whether or not it is violated, see poison_check)
+      dfsan_label r = do_taint_union(l1, l2,
+                                     op == __dfsan::UDiv ? __dfsan::URem
+                                                         : __dfsan::SRem,
+                                     size, orig_op1, orig_op2);
+      dfsan_label cond = do_taint_union(r, 0, (bvneq << 8) | __dfsan::ICmp,
+                                        size, rem, 0);
+      poisoned |= poison_check(cond, rem != 0, true, ub_inexact_division,
+                               EVENT_INEXACT_DIV, label, ub_addr);
+    } else if ((op == __dfsan::LShr || op == __dfsan::AShr) &&
+               (assumed & P_EXACT) && orig_op2 < size) {
+      // lshr/ashr exact: no set bit is shifted out, i.e. shifting the result
+      // back gives the operand
+      const uint64_t mask = size == 64 ? ~0ULL : (1ULL << size) - 1;
+      const uint64_t sh = orig_op2;
+      const uint64_t x = orig_op1 & mask;
+      uint64_t result;
+      if (op == __dfsan::LShr) {
+        result = x >> sh;
+      } else {
+        int64_t sx = (int64_t)(x << (64 - size)) >> (64 - size);
+        result = (uint64_t)(sx >> sh) & mask;
+      }
+      const uint64_t back = (result << sh) & mask;
+      // (built whether or not it is violated, see poison_check)
+      dfsan_label b = do_taint_union(label, l2, __dfsan::Shl, size, result, sh);
+      dfsan_label cond = do_taint_union(b, l1, (bvneq << 8) | __dfsan::ICmp,
+                                        size, back, x);
+      poisoned |= poison_check(cond, back != x, true, ub_inexact_division,
+                               EVENT_INEXACT_DIV, label, ub_addr);
     }
   }
-  return label;
+  return poisoned ? 0 : label;
 }
 
 // If label is zero or kInitializingLabel, return it directly
@@ -2745,6 +2972,9 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_distance, uint64_t, uint64_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_add_constraint, dfsan_label, uint8_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(bool, __ucsan_is_placement_byte, uint32_t, int64_t) {
+  return false;
+}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_minimize_label, dfsan_label, uint64_t, dfsan_label) {}
 SANITIZER_WEAK_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 }  // extern "C"
