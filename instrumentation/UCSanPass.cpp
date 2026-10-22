@@ -7191,6 +7191,8 @@ bool UCSan::runImpl(Module &M) {
   // an address taken only in one of those (rethook's self-referencing
   // trampoline, whose C users are stubs) leaves the declaration unused, and
   // erased, so dropUnreferencedAsmFunctions can still drop the asm.
+  SmallPtrSet<Function *, 16> InstrumentedFns(FnsToInstrument.begin(),
+                                              FnsToInstrument.end());
   std::stable_partition(FnsOutOfScope.begin(), FnsOutOfScope.end(),
                         [&AsmDefinedFns](Function *F) {
                           return !(F->isDeclaration() &&
@@ -7199,9 +7201,50 @@ bool UCSan::runImpl(Module &M) {
   for (Function *F : FnsOutOfScope) {
     if (Function *dangle = buildDangleFunction(F)) {
       if (F->isDeclaration() && AsmDefinedFns.count(F->getName())) {
-        F->replaceUsesWithIf(dangle, [F](Use &U) {
+        // Only an address that in-scope code hands to inline asm, through
+        // address arithmetic, keeps naming the asm; anything else takes the
+        // wrapper, as before: C that stores it or passes it on would call it
+        // as C.  A static call trampoline (__SCT__tp_func_rseq_ip_fixup,
+        // `jmp __traceiter_rseq_ip_fixup`), named by its static_call key's
+        // initializer or by static_call_update's STATIC_CALL_TRAMP_ADDR, was
+        // kept for that, and its asm block still jumped to functions the
+        // split had erased: kernel/rseq.o, arch/x86/events/core.o and
+        // arch/x86/kvm/x86.o stopped linking.
+        F->removeDeadConstantUsers();
+        DenseMap<User *, bool> Seen;
+        std::function<bool(User *)> ToAsm = [&](User *Usr) {
+          auto It = Seen.find(Usr);
+          if (It != Seen.end())
+            return It->second;
+          Seen[Usr] = false; // a phi cycle
+          bool R = false;
+          if (auto *CB = dyn_cast<CallBase>(Usr)) {
+            R = CB->isInlineAsm() &&
+                InstrumentedFns.count(CB->getFunction()) > 0;
+          } else if (auto *St = dyn_cast<StoreInst>(Usr)) {
+            // through a local at -O0: `fop` stored to its alloca, then loaded
+            auto *A = dyn_cast<AllocaInst>(St->getPointerOperand());
+            R = A && InstrumentedFns.count(St->getFunction()) &&
+                any_of(A->users(), [&](User *AU) {
+                  return isa<LoadInst>(AU) && ToAsm(AU);
+                });
+          } else if (auto *I = dyn_cast<Instruction>(Usr)) {
+            bool Arith = isa<LoadInst>(I) || isa<GetElementPtrInst>(I) ||
+                         isa<PHINode>(I) ||
+                         isa<SelectInst>(I) || isa<CastInst>(I) ||
+                         isa<BinaryOperator>(I);
+            R = Arith && InstrumentedFns.count(I->getFunction()) &&
+                any_of(I->users(), ToAsm);
+          } else if (isa<Constant>(Usr) && !isa<GlobalValue>(Usr)) {
+            R = any_of(Usr->users(), ToAsm);
+          }
+          return Seen[Usr] = R;
+        };
+        F->replaceUsesWithIf(dangle, [&](Use &U) {
           auto *CB = dyn_cast<CallBase>(U.getUser());
-          return CB && CB->getCalledOperand() == F;
+          if (CB && CB->getCalledOperand() == F)
+            return true;
+          return !ToAsm(U.getUser());
         });
         // the asm's symbol, not one TaintPass renames to F.taint (a
         // `ptrtoint (ptr @F)` left by an erased body is no use)
