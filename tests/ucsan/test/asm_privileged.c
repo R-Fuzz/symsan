@@ -88,6 +88,13 @@ int cal(int x)
 {
 	struct desc_ptr gdt = { 0, 0 };
 
+	/*
+	 * wrfsbase is not privileged where FSGSBASE is on, as Linux turns it on
+	 * for userspace, and run as is it moves the process's own TLS: the next
+	 * TLS access kills it (do_arch_prctl_64).  Writing hardware state, it
+	 * does nothing.
+	 */
+	__asm__ __volatile__("wrfsbase %0" : : "r"((unsigned long)x) : "memory");
 	__asm__ __volatile__("cli" : : : "memory");
 	native_write_msr(0x10, (unsigned int)x, 0);
 	outb(0x42, 0x80);

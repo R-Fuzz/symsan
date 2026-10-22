@@ -3734,11 +3734,18 @@ static bool isAsmSegReg(StringRef T) {
 // protection fault -- reserved MXCSR bits, which the kernel's exception
 // table turns into an error -- and a valid one would load the seed into the
 // process's own FPU state)
+// (and wrfsbase/wrgsbase, which are not privileged where FSGSBASE is on, as
+// Linux turns it on for userspace: do_arch_prctl_64's ARCH_SET_FS ran
+// x86_fsbase_write_cpu's wrfsbase with the seed's value, which moved the
+// process's own TLS, and the next TLS access -- the SIGSEGV handler's
+// included -- killed it with signal 11, exit status 139)
 static bool isAsmHwNoOp(const AsmInsn &I) {
   StringRef Mn = I.Mnemonic;
   if (Mn == "fxrstor" || Mn == "fxrstorq" || Mn == "fxrstor64" ||
       Mn == "frstor" || Mn == "xrstor" || Mn == "xrstor64" ||
       Mn == "xrstors" || Mn == "xrstors64")
+    return true;
+  if (Mn == "wrfsbase" || Mn == "wrgsbase")
     return true;
   if (Mn == "cli" || Mn == "sti" || Mn == "wbinvd" || Mn == "invd" ||
       Mn == "clts" || Mn == "swapgs" || Mn == "xsetbv" || Mn == "wrmsr" ||
