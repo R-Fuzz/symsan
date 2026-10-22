@@ -5863,6 +5863,13 @@ void UCSanVisitor::guardAsmIndirectCall(CallBase &CB, ArrayRef<AsmOp> Ops,
     for (auto &Op : Ops)
       if (Op.TiedTo == (int)N)
         Tied = Op.V;
+    // or the input in the same register: fastop's ASM_CALL_CONSTRAINT is
+    // "={rsp}" with a separate "{rsp}" input, and a fresh value there was
+    // the stack pointer the kernel writes back (x86_emulate_insn hung)
+    if (!Tied && !Ops[N].Reg.empty())
+      for (auto &Op : Ops)
+        if (Op.isValue() && Op.Result < 0 && Op.Reg == Ops[N].Reg)
+          Tied = Op.V;
     Type *T = ResultTys[R];
     if ((calleeSaved(Ops[N].Reg) || T->isPointerTy()) && Tied &&
         Tied->getType() == T)

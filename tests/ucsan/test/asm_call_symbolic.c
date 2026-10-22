@@ -10,12 +10,16 @@
  * pointer goes to an out-of-scope stub; run as is, the asm jumped to the
  * seed's value (exit status 1, SIGSEGV).  It is skipped instead, and its
  * caller-saved outputs are fresh symbolic values (200 on the result, 201
- * past it).
+ * past it).  The stack pointer, an output by the kernel's
+ * ASM_CALL_CONSTRAINT with its own "{rsp}" input, keeps its value.
  */
 struct ctxt {
 	void (*fop)(void);
 	unsigned long val;
 };
+
+/* the kernel's current_stack_pointer, written back after the asm */
+register unsigned long current_stack_pointer asm("rsp");
 
 int cal(struct ctxt *c)
 {
@@ -23,7 +27,8 @@ int cal(struct ctxt *c)
 	void (*fop)(void) = c->fop;
 
 	__asm__ __volatile__("push %[flags]; popf; call *%[f]; pushf; pop %[flags]"
-			     : "+a"(ret), [flags] "+D"(flags), [f] "+S"(fop)
+			     : "+a"(ret), [flags] "+D"(flags), [f] "+S"(fop),
+			       "+r"(current_stack_pointer)
 			     :
 			     : "memory", "rdx", "rcx", "r8", "r9", "r10", "r11");
 	if (ret == 0x1234)
