@@ -3760,6 +3760,117 @@ bool isAsmModeledCallee(StringRef Sym) {
          Sym == "this_cpu_cmpxchg16b_emu" || Sym.starts_with("__SCT__");
 }
 
+// String port I/O, `rep; ins{b,w,l}` / `rep; outs{b,w,l}` (the kernel's
+// insb/outsb, behind ioread8_rep and friends), becomes the loop the kernel
+// itself uses when CC_ATTR_GUEST_UNROLL_STRING_IO is set: each element in is
+// a hardware read (AsmHwReadFn) stored to the buffer, each element out a load
+// of it whose value goes nowhere, as for `in` and `out`.  Run as is, the
+// instruction is privileged and the first one faults (ioread8_rep's port
+// path was a SIGSEGV).  As a loop, the buffer accesses are checked like any
+// other.  The outputs are the pointer advanced past the buffer and a zero
+// count; the direction flag is clear, as the kernel keeps it.
+void lowerAsmStringIO(Module &M, StringMap<WeakTrackingVH> &Callees) {
+  SmallVector<CallInst *, 4> Sites;
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->isInlineAsm())
+          Sites.push_back(CI);
+  LLVMContext &Ctx = M.getContext();
+  for (CallInst *CI : Sites) {
+    auto *IA = cast<InlineAsm>(CI->getCalledOperand());
+    SmallVector<AsmInsn, 4> Insns = asmExecutedInsns(IA->getAsmString());
+    if (Insns.size() != 1 || !Insns[0].Operands.empty())
+      continue;
+    StringRef Mn = Insns[0].Mnemonic;
+    bool In = Mn.consume_front("rep ins");
+    if (!In && !Mn.consume_front("rep outs"))
+      continue;
+    unsigned Size = Mn == "b" ? 1 : Mn == "w" ? 2 : Mn == "l" ? 4 : 0;
+    if (!Size)
+      continue;
+    auto Constraints = IA->ParseConstraints();
+    AsmOperands AO(*CI, Constraints);
+    // register outputs: the pointer (%rdi in, %rsi out) and the count (%rcx),
+    // each with its starting value in a tied input
+    const char *PtrReg = In ? "di" : "si";
+    int PtrOut = -1, CntOut = -1;
+    Value *Ptr = nullptr, *Cnt = nullptr;
+    bool Other = false;
+    for (unsigned N = 0; N < AO.Ops.size(); ++N) {
+      const AsmOp &Op = AO.Ops[N];
+      if (Op.Result >= 0) {
+        if (Op.Reg == PtrReg)
+          PtrOut = N;
+        else if (Op.Reg == "cx")
+          CntOut = N;
+        else
+          Other = true;
+      } else if (Op.isMem() || (Op.isInput() && Op.TiedTo < 0 &&
+                                Op.Reg != "dx")) {
+        Other = true;
+      }
+    }
+    if (Other || PtrOut < 0 || CntOut < 0 || AO.HasMemOutput ||
+        AO.NumResults != 2)
+      continue;
+    auto *ResTy = dyn_cast<StructType>(CI->getType());
+    if (!ResTy ||
+        !ResTy->getElementType(AO.Ops[PtrOut].Result)->isPointerTy() ||
+        !ResTy->getElementType(AO.Ops[CntOut].Result)->isIntegerTy(64))
+      continue;
+    for (const AsmOp &Op : AO.Ops) {
+      if (Op.TiedTo == PtrOut)
+        Ptr = Op.V;
+      else if (Op.TiedTo == CntOut)
+        Cnt = Op.V;
+    }
+    if (!Ptr || !Cnt || !Ptr->getType()->isPointerTy() ||
+        !Cnt->getType()->isIntegerTy(64))
+      continue;
+    Type *ElemTy = IntegerType::get(Ctx, Size * 8);
+    FunctionCallee HwRead;
+    if (In) {
+      HwRead = M.getOrInsertFunction(
+          AsmHwReadFn, FunctionType::get(Type::getInt32Ty(Ctx), false));
+      Callees[AsmHwReadFn] = HwRead.getCallee();
+    }
+
+    BasicBlock *Head = CI->getParent();
+    BasicBlock *Exit = Head->splitBasicBlock(CI, "ucsan.strio.exit");
+    BasicBlock *Loop =
+        BasicBlock::Create(Ctx, "ucsan.strio.loop", Head->getParent(), Exit);
+    Head->getTerminator()->eraseFromParent();
+    IRBuilder<> IRB(Head);
+    IRB.SetCurrentDebugLocation(CI->getDebugLoc());
+    IRB.CreateCondBr(IRB.CreateICmpEQ(Cnt, IRB.getInt64(0)), Exit, Loop);
+    IRB.SetInsertPoint(Loop);
+    PHINode *Idx = IRB.CreatePHI(IRB.getInt64Ty(), 2);
+    Idx->addIncoming(IRB.getInt64(0), Head);
+    Value *P = IRB.CreateGEP(ElemTy, Ptr, Idx);
+    if (In) {
+      Value *V = IRB.CreateCall(HwRead);
+      IRB.CreateStore(IRB.CreateZExtOrTrunc(V, ElemTy), P);
+    } else {
+      IRB.CreateLoad(ElemTy, P, /*isVolatile=*/true);
+    }
+    Value *Next = IRB.CreateAdd(Idx, IRB.getInt64(1));
+    Idx->addIncoming(Next, Loop);
+    IRB.CreateCondBr(IRB.CreateICmpEQ(Next, Cnt), Exit, Loop);
+
+    IRB.SetInsertPoint(CI);
+    Value *Outs[2];
+    Outs[AO.Ops[PtrOut].Result] =
+        IRB.CreateGEP(ElemTy, Ptr, Cnt);
+    Outs[AO.Ops[CntOut].Result] = IRB.getInt64(0);
+    Value *Res = PoisonValue::get(CI->getType());
+    for (unsigned R = 0; R < 2; ++R)
+      Res = IRB.CreateInsertValue(Res, Outs[R], R);
+    CI->replaceAllUsesWith(Res);
+    CI->eraseFromParent();
+  }
+}
+
 // Declare the functions inline asm calls by name without the module having
 // them (the kernel's ALTERNATIVE fallbacks such as __sw_hweight32), typed
 // from the registers the asm passes and the %rax output.  This runs before
@@ -6956,6 +7067,9 @@ bool UCSan::runImpl(Module &M) {
   }
 
   // Declare what inline asm calls before the split, so it is split too.
+  // String port I/O is rewritten first: its loop reads hardware through a
+  // call of the same kind.
+  lowerAsmStringIO(M, AsmCallees);
   declareAsmCallees(M, AsmCallees);
 
   // Filter functions based on scope
