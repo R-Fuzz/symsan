@@ -45,6 +45,12 @@ int symsan_set_solve_ub(int enable);
 /// @brief set the exit on memory error mode for the target binary
 int symsan_set_exit_on_memerror(int enable);
 
+/// @brief more runtime flags for the target binary, ":"-separated key=value
+/// items appended to its TAINT_OPTIONS as they are (solve_wrap=1,
+/// model_poison=0): the runtime's own flags the launcher has no setter for.
+/// NULL or "" clears them.
+int symsan_set_runtime_options(const char *options);
+
 /// @brief set the trace file size mode for the target binary
 int symsan_set_trace_file_size(int enable);
 

@@ -495,6 +495,16 @@ int symsan_set_solve_ub(int enable) {
   return 0;
 }
 
+// see symsan_set_runtime_options
+static char *g_runtime_options;
+
+__attribute__((visibility("default")))
+int symsan_set_runtime_options(const char *options) {
+  free(g_runtime_options);
+  g_runtime_options = (options && *options) ? strdup(options) : NULL;
+  return 0;
+}
+
 __attribute__((visibility("default")))
 int symsan_set_exit_on_memerror(int enable) {
   g_config.exit_on_memerror = !!enable;
@@ -632,17 +642,20 @@ static void cov_map_export(void) {
 static char *build_symsan_env(int use_forksrv) {
   // ring_fd=-1 is the "no ring, keep writing events down the pipe" case, which
   // is exactly the flag's default, so this needs no conditional spelling.
+  // (the runtime flags the launcher has no setter for come last, as given:
+  // see symsan_set_runtime_options)
   return alloc_printf(
       "taint_file=\"%s\":shm_fd=%d:pipe_fd=%d:ring_fd=%d:ring_size=%zu:"
       "debug=%d:trace_bounds=%d:"
       "solve_ub=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d:"
-      "forksrv=%d",
+      "forksrv=%d%s%s",
       g_config.input_file, g_config.shm_fd, g_config.pipefds[1],
       g_config.ring_fd,
       g_config.ring != NULL ? (size_t)g_config.ring->capacity : (size_t)0,
       g_config.enable_debug, g_config.enable_bounds_check,
       g_config.enable_solve_ub, g_config.exit_on_memerror,
-      g_config.trace_file_size, g_config.force_stdin, use_forksrv);
+      g_config.trace_file_size, g_config.force_stdin, use_forksrv,
+      g_runtime_options ? ":" : "", g_runtime_options ? g_runtime_options : "");
 }
 
 /* Turn ASLR off for the traced child.  Call between fork() and execv():
