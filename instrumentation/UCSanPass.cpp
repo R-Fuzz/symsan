@@ -472,6 +472,7 @@ class UCSan {
   FunctionCallee UCTraceBBFn;
   FunctionCallee UCTraceAllocaFn;
   FunctionCallee UCTraceGlobalFn;
+  FunctionCallee UCTraceUnsizedGlobalFn;
   FunctionCallee UCCheckGlobalBoundsFn;
   FunctionCallee UCTraceWarnFn;
   FunctionCallee UCPushStackFrameFn;
@@ -599,6 +600,17 @@ class UCSan {
   /// Marks a function as "nosanitize" so TaintPass will skip instrumenting it
   inline void markFunctionNosanitize(Function *F) {
     if (F) F->addFnAttr(Attribute::DisableSanitizerInstrumentation);
+  }
+
+  // Symbols the module's top-level asm defines (filled before instrumenting)
+  StringSet<> AsmDefinedSyms;
+
+  // An array the module declares without a size and does not define in its
+  // own asm (kprobes' optprobe_template_entry[] has real bytes there)
+  bool isUnsizedExternArray(GlobalVariable *GV) {
+    auto *AT = dyn_cast<ArrayType>(GV->getValueType());
+    return GV->isDeclaration() && AT && AT->getNumElements() == 0 &&
+           !AsmDefinedSyms.contains(GV->getName());
   }
 
 public:
@@ -935,6 +947,15 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCTraceGlobalFn = M.getOrInsertFunction("ucsan_trace_global", UCTraceGlobalFnTy);
   F = dyn_cast<Function>(UCTraceGlobalFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // i16 ucsan_trace_unsized_global(i64 Address)
+  // The pointer label of an array declared without a size, see checkPointer.
+  UCTraceUnsizedGlobalFn = M.getOrInsertFunction(
+      "ucsan_trace_unsized_global",
+      FunctionType::get(PrimitiveShadowTy, {Int64Ty}, false));
+  F = dyn_cast<Function>(UCTraceUnsizedGlobalFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -2424,7 +2445,8 @@ void UCSanFunction::checkGlobalDest(Value *Dest, Value *Length,
                                     IRBuilder<> &IRB) {
   auto *GV = dyn_cast<GlobalVariable>(
       getUnderlyingObject(Dest->stripPointerCasts()));
-  if (!GV)
+  // (an unsized extern array has no fixed bounds: checkPointer translates it)
+  if (!GV || UC.isUnsizedExternArray(GV))
     return;
   // the fixed bounds checkPointer traces for a global
   auto &DL = F->getParent()->getDataLayout();
@@ -2620,6 +2642,19 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
     uint64_t TypeSize = DL.getTypeStoreSize(GTy);
     bool HasFixedBounds =
         GTy->isSized() && (GTy->isArrayTy() || GTy->isStructTy());
+
+    // An array declared without a size (`extern T x[]`, defined in another
+    // file) is an under-constrained object: a pointer label for it, and
+    // check_pointer gives it an object that grows with use (see
+    // ucsan_trace_unsized_global).  Its weak definition has no bytes.
+    if (UC.isUnsizedExternArray(GV)) {
+      Value *GlobalAddr = IRB.CreatePtrToInt(GV, UC.Int64Ty);
+      UC.markNosanitize(GlobalAddr);
+      GlobalBoundsShadow =
+          IRB.CreateCall(UC.UCTraceUnsizedGlobalFn, {GlobalAddr});
+      UC.markNosanitize(GlobalBoundsShadow);
+      HasFixedBounds = false;
+    }
 
     // trace globals with fixed bounds to allow bounds checks
     if (HasFixedBounds) {
@@ -7106,6 +7141,12 @@ bool UCSan::runImpl(Module &M) {
   if (Scope.entry.empty()) {
     report_fatal_error("No entry function specified in metadata");
   }
+
+  ModuleSymbolTable::CollectAsmSymbols(
+      M, [this](StringRef Name, object::BasicSymbolRef::Flags Flags) {
+        if (!(Flags & object::BasicSymbolRef::SF_Undefined))
+          AsmDefinedSyms.insert(Name);
+      });
 
   // Declare what inline asm calls before the split, so it is split too.
   // String port I/O is rewritten first: its loop reads hardware through a

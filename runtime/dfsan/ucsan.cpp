@@ -2546,6 +2546,35 @@ ucsan_label ucsan_trace_global(uint64_t addr, uint64_t size) {
   return label;
 }
 
+// An array the module declares without a size (`extern const struct
+// io_cold_def io_cold_defs[]`, defined in another file): the weak definition
+// UCSanPass gives it has no bytes, and with no bounds to trace a load from it
+// read whatever lay past it, unlabeled -- io_req_prep_async called the
+// function pointer it found there.  It is an under-constrained object instead,
+// like one a pseudo pointer names: one pointer label per array, whose object
+// check_pointer allocates on first use, from the seed, and grows as it is
+// used.  The array's address stays what it is; check_pointer translates it.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+ucsan_label ucsan_trace_unsized_global(uint64_t addr) {
+  // (a pointer label, not bounds: whether or not trace_bounds is on)
+  if (addr == 0)
+    return 0;
+  // a module declares a handful; past the table, the old untraced behavior
+  static object_info seen[256];  // {label, address}
+  static unsigned nseen;
+  for (unsigned i = 0; i < nseen; ++i)
+    if (seen[i].offset == addr)
+      return seen[i].label;
+  if (nseen == sizeof(seen) / sizeof(seen[0]))
+    return 0;
+  ucsan_label label =
+      create_label_from_super_object(sizeof(void *), /*is_pointer=*/true).label;
+  seen[nseen++] = {label, addr};
+  UCSAN_OUT("ucsan_trace_unsized_global: label=%u, base=%p\n", label,
+            (void *)addr);
+  return label;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_push_stack_frame() {
   // Save current stack top when entering a function
