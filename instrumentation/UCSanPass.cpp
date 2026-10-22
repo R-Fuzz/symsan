@@ -7166,8 +7166,45 @@ bool UCSan::runImpl(Module &M) {
   }
 
   // Build dangle wrappers for out-of-scope functions
+  // (now: a function the module's own top-level asm defines keeps its
+  // address, and only its direct calls go to the wrapper.  Its address names
+  // the asm's code, which asm calls with a convention of its own: KVM's
+  // fastop() does `call *fop`, fop = em_bsr + k * FASTOP_SIZE into a block of
+  // `bsr; ret` stubs.  Pointed at the wrapper instead, that call landed in
+  // the middle of compiled C, and em_bsr_c died in __taint_union on a
+  // garbage label.)
+  StringSet<> AsmDefinedFns;
+  ModuleSymbolTable::CollectAsmSymbols(
+      M, [&AsmDefinedFns](StringRef Name,
+                          object::BasicSymbolRef::Flags Flags) {
+        if (!(Flags & object::BasicSymbolRef::SF_Undefined))
+          AsmDefinedFns.insert(Name);
+      });
+  // The asm-defined ones go last, once the other out-of-scope bodies are gone:
+  // an address taken only in one of those (rethook's self-referencing
+  // trampoline, whose C users are stubs) leaves the declaration unused, and
+  // erased, so dropUnreferencedAsmFunctions can still drop the asm.
+  std::stable_partition(FnsOutOfScope.begin(), FnsOutOfScope.end(),
+                        [&AsmDefinedFns](Function *F) {
+                          return !(F->isDeclaration() &&
+                                   AsmDefinedFns.count(F->getName()));
+                        });
   for (Function *F : FnsOutOfScope) {
     if (Function *dangle = buildDangleFunction(F)) {
+      if (F->isDeclaration() && AsmDefinedFns.count(F->getName())) {
+        F->replaceUsesWithIf(dangle, [F](Use &U) {
+          auto *CB = dyn_cast<CallBase>(U.getUser());
+          return CB && CB->getCalledOperand() == F;
+        });
+        // the asm's symbol, not one TaintPass renames to F.taint (a
+        // `ptrtoint (ptr @F)` left by an erased body is no use)
+        F->removeDeadConstantUsers();
+        if (F->use_empty())
+          F->eraseFromParent();
+        else
+          markFunctionNosanitize(F);
+        continue;
+      }
       F->replaceAllUsesWith(dangle);
       F->eraseFromParent();
     }
