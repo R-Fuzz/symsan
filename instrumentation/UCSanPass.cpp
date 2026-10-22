@@ -731,6 +731,12 @@ private:
   Value *getShadowForTLSArgument(Argument *A);
 };
 
+// (defined below, in the same unnamed namespace)
+namespace {
+struct AsmOp;
+struct AsmInsn;
+} // namespace
+
 class UCSanVisitor : public InstVisitor<UCSanVisitor> {
 public:
   UCSanFunction &UF;
@@ -760,6 +766,8 @@ public:
   void visitSelectInst(SelectInst &I);
   void visitPHINode(PHINode &PN);
   void visitInsertValueInst(InsertValueInst &I);
+  void guardAsmIndirectCall(CallBase &CB, ArrayRef<AsmOp> Ops,
+                            ArrayRef<AsmInsn> Insns);
   void visitExtractValueInst(ExtractValueInst &I);
   void visitUnreachableInst(UnreachableInst &I);
   // void visitIntrinsicInst(IntrinsicInst &I);
@@ -3934,8 +3942,18 @@ void declareAsmCallees(Module &M, StringMap<WeakTrackingVH> &Callees) {
     auto Constraints = IA->ParseConstraints();
     AsmOperands AO(*CI, Constraints);
     SmallVector<AsmInsn, 4> Insns = asmExecutedInsns(IA->getAsmString());
+    // (and for a call through an operand, whose skipped results are fresh
+    // symbolic values: see guardAsmIndirectCall)
+    auto callsOperand = [](const AsmInsn &I) {
+      StringRef Mn = I.Mnemonic;
+      return (Mn == "call" || Mn == "callq" || Mn == "jmp" || Mn == "jmpq") &&
+             I.Operands.size() == 1 &&
+             StringRef(I.Operands[0]).trim().starts_with("*$");
+    };
     if (!Callees.count(AsmHwReadFn) &&
-        any_of(Insns, [](const AsmInsn &I) { return isAsmHwRead(I); })) {
+        any_of(Insns, [&](const AsmInsn &I) {
+          return isAsmHwRead(I) || callsOperand(I);
+        })) {
       Type *I32 = Type::getInt32Ty(M.getContext());
       Callees[AsmHwReadFn] =
           M.getOrInsertFunction(AsmHwReadFn, FunctionType::get(I32, false))
@@ -5694,9 +5712,16 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     for (unsigned Name : Names) {
       std::string Plain = "($" + std::to_string(Name) + ")";
       std::string Braced = "(${" + std::to_string(Name) + ":";
+      // (and as the base of a base+index address, `($N,%rax)`:
+      // vmx_l1d_flush's `movzbl (%[flush_pages], %rax), %ecx` read 64 KB at
+      // the unchecked value of a pointer global.  The index is a register,
+      // so the size is the access's at the base; the object grows as used.)
+      std::string Indexed = "($" + std::to_string(Name) + ",";
       for (auto &I : Insns)
         for (auto &O : I.Operands) {
           size_t P = O.find(Plain);
+          if (P == std::string::npos)
+            P = O.find(Indexed);
           if (P == std::string::npos)
             P = O.find(Braced);
           if (P == std::string::npos)
@@ -5741,6 +5766,134 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
                        UF.UC.getZeroShadow(Op.ElemTy), Op.ElemTy, Pos);
     }
   }
+
+  guardAsmIndirectCall(CB, Ops, Insns);
+}
+
+// `call *$N` through a register operand runs whatever the operand holds, and
+// a symbolic one -- a function pointer the seed gave, which the C call
+// through it would not make (visitIndirectCallBase) -- is the seed's value:
+// x86_emulate_insn's fastop(ctxt, ctxt->fop) jumped to 0x4ff.  Such an asm
+// runs only when the pointer has no UCSan label; otherwise it is skipped as
+// an out-of-scope callee would be: its outputs in callee-saved registers
+// (%rsp, %rbx, %rbp, %r12-%r15) and its pointer outputs keep their inputs,
+// and the others take fresh symbolic values (AsmHwReadFn, as for a read of
+// hardware state).
+void UCSanVisitor::guardAsmIndirectCall(CallBase &CB, ArrayRef<AsmOp> Ops,
+                                        ArrayRef<AsmInsn> Insns) {
+  auto *Call = dyn_cast<CallInst>(&CB);
+  if (!Call || !Call->getParent())
+    return;
+  int Target = -1;
+  for (auto &I : Insns) {
+    StringRef Mn = I.Mnemonic;
+    if (!(Mn == "call" || Mn == "callq" || Mn == "jmp" || Mn == "jmpq") ||
+        I.Operands.size() != 1)
+      continue;
+    StringRef O = StringRef(I.Operands[0]).trim();
+    if (!O.consume_front("*"))
+      continue;
+    int N = asmOperandRef(O);
+    if (N < 0 || N >= (int)Ops.size())
+      continue;
+    // `"+S"(fop)` names the output; its value is the input tied to it
+    if (Ops[N].Result >= 0) {
+      int In = -1;
+      for (unsigned K = 0; K < Ops.size(); ++K)
+        if (Ops[K].TiedTo == N)
+          In = K;
+      if (In < 0)
+        continue;
+      N = In;
+    }
+    if (Ops[N].isValue() && Ops[N].V->getType()->isPointerTy())
+      Target = N;
+  }
+  if (Target < 0)
+    return;
+  Value *Shadow = UF.getShadow(Ops[Target].V);
+  Value *HwRead = UF.UC.AsmCallees.lookup(AsmHwReadFn);
+  if (UF.UC.isZeroShadow(Shadow) || !HwRead)
+    return;
+
+  Type *RT = Call->getType();
+  SmallVector<Type *, 4> ResultTys;
+  if (auto *ST = dyn_cast<StructType>(RT))
+    ResultTys.append(ST->element_begin(), ST->element_end());
+  else if (!RT->isVoidTy())
+    ResultTys.push_back(RT);
+  for (Type *T : ResultTys)
+    if (!T->isIntegerTy() && !T->isPointerTy())
+      return;
+
+  auto *BBID = Call->getParent()->getTerminator()->getMetadata(BBIDName);
+  IRBuilder<> IRB(Call);
+  Value *Real = IRB.CreateICmpEQ(Shadow, UF.UC.ZeroPrimitiveShadow);
+  UF.UC.markNosanitize(Real);
+  Instruction *TB, *EB;
+  SplitBlockAndInsertIfThenElse(Real, Call, &TB, &EB);
+  Call->moveBefore(TB);
+  BasicBlock *Tail = TB->getParent()->getSingleSuccessor();
+  if (BBID) {
+    TB->getParent()->getTerminator()->setMetadata(BBIDName, nullptr);
+    EB->getParent()->getTerminator()->setMetadata(BBIDName, nullptr);
+    Tail->getTerminator()->setMetadata(BBIDName, BBID);
+  }
+
+  // the skipped asm's results, visited here: the visitor has moved past them
+  IRBuilder<> EIRB(EB);
+  Instruction *Before = EB->getPrevNode();
+  auto fresh = [&](Type *T) -> Value * {
+    auto *FT = FunctionType::get(EIRB.getInt32Ty(), false);
+    Value *Lo = EIRB.CreateZExt(EIRB.CreateCall(FT, HwRead), EIRB.getInt64Ty());
+    Value *Hi = EIRB.CreateZExt(EIRB.CreateCall(FT, HwRead), EIRB.getInt64Ty());
+    Value *V = EIRB.CreateOr(Lo, EIRB.CreateShl(Hi, 32));
+    return EIRB.CreateTrunc(V, T);
+  };
+  auto calleeSaved = [](StringRef R) {
+    return R == "sp" || R == "bx" || R == "bp" || R == "r12" || R == "r13" ||
+           R == "r14" || R == "r15";
+  };
+  SmallVector<Value *, 4> Results(ResultTys.size(), nullptr);
+  for (unsigned N = 0; N < Ops.size(); ++N) {
+    int R = Ops[N].Result;
+    if (R < 0)
+      continue;
+    Value *Tied = nullptr;
+    for (auto &Op : Ops)
+      if (Op.TiedTo == (int)N)
+        Tied = Op.V;
+    Type *T = ResultTys[R];
+    if ((calleeSaved(Ops[N].Reg) || T->isPointerTy()) && Tied &&
+        Tied->getType() == T)
+      Results[R] = Tied;
+    else if (T->isPointerTy())
+      Results[R] = Constant::getNullValue(T);
+    else
+      Results[R] = fresh(T);
+  }
+  Value *Skipped = nullptr;
+  if (isa<StructType>(RT)) {
+    Skipped = PoisonValue::get(RT);
+    for (unsigned R = 0; R < Results.size(); ++R)
+      Skipped = EIRB.CreateInsertValue(Skipped, Results[R], R);
+  } else if (!RT->isVoidTy()) {
+    Skipped = Results[0];
+  }
+  for (Instruction *I = Before ? Before->getNextNode() : &EB->getParent()->front();
+       I && I != EB;) {
+    Instruction *Next = I->getNextNode();
+    visit(*I);
+    I = Next;
+  }
+  if (Skipped) {
+    PHINode *PN = PHINode::Create(RT, 2, "", &Tail->front());
+    Call->replaceAllUsesWith(PN);
+    PN->addIncoming(Call, Call->getParent());
+    PN->addIncoming(Skipped, EB->getParent());
+    visit(*PN);
+  }
+  UF.DT.recalculate(*UF.F);
 }
 
 void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
