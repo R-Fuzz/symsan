@@ -3458,6 +3458,149 @@ struct AsmOperands {
   }
 };
 
+// The data an asm puts in another section, by label: `mov $1f, %0` with `1:`
+// in a .section/.pushsection block of data directives is the address of that
+// data (the kernel's TRACE_RESUME, a packed {u16 line; char *file} record in
+// .tracedata).  Run as is, that absolute address is a 32-bit relocation a PIE
+// cannot link.  Here each such block becomes a private packed global holding
+// the same bytes, and each label in it the address of its offset there.  A
+// block with anything but integer or constant-operand data gives no labels,
+// and neither does a label defined twice (where `1f` and `1b` could differ).
+StringMap<Constant *> asmSectionLabels(StringRef Asm, ArrayRef<AsmOp> Ops,
+                                       Module &M) {
+  StringMap<Constant *> Labels;
+  StringMap<unsigned> Defs;
+  LLVMContext &Ctx = M.getContext();
+  int Depth = 0;
+  bool Bad = false, Writable = true;
+  uint64_t Offset = 0;
+  SmallVector<Constant *, 4> Elems;
+  SmallVector<std::pair<std::string, uint64_t>, 2> BlockLabels;
+  auto dataSize = [](StringRef D) -> unsigned {
+    if (D == ".byte")
+      return 1;
+    if (D == ".word" || D == ".short" || D == ".value" || D == ".2byte")
+      return 2;
+    if (D == ".long" || D == ".int" || D == ".4byte")
+      return 4;
+    if (D == ".quad" || D == ".8byte")
+      return 8;
+    return 0;
+  };
+  // one item of a data directive: an integer, or a constant input operand
+  auto item = [&](StringRef T, unsigned Size) -> Constant * {
+    T = T.trim();
+    Type *IntTy = IntegerType::get(Ctx, Size * 8);
+    int64_t N;
+    if (!T.getAsInteger(0, N))
+      return isIntN(Size * 8, N) || isUIntN(Size * 8, N)
+                 ? ConstantInt::get(IntTy, N)
+                 : nullptr;
+    StringRef Mod;
+    int Ref = asmOperandRef(T, &Mod);
+    if (Ref < 0 || Ref >= (int)Ops.size() || !(Mod.empty() || Mod == "c" ||
+                                               Mod == "P"))
+      return nullptr;
+    const AsmOp &O = Ops[Ref];
+    if (!O.isValue())
+      return nullptr;
+    if (auto *CI = dyn_cast<ConstantInt>(O.V)) {
+      const APInt &V = CI->getValue();
+      if (!V.isSignedIntN(Size * 8) && !V.isIntN(Size * 8))
+        return nullptr;
+      return ConstantInt::get(IntTy, V.trunc(Size * 8));
+    }
+    if (isa<Constant>(O.V) && O.V->getType()->isPointerTy() && Size == 8)
+      return cast<Constant>(O.V);
+    return nullptr;
+  };
+  auto closeBlock = [&]() {
+    if (!Bad && !Elems.empty()) {
+      SmallVector<Type *, 4> Tys;
+      for (Constant *C : Elems)
+        Tys.push_back(C->getType());
+      auto *Ty = StructType::get(Ctx, Tys, /*isPacked=*/true);
+      auto *GV = new GlobalVariable(M, Ty, !Writable,
+                                    GlobalValue::PrivateLinkage,
+                                    ConstantStruct::get(Ty, Elems),
+                                    "ucsan.asm.section");
+      GV->setAlignment(Align(1));
+      for (auto &[Name, Off] : BlockLabels)
+        Labels[Name] = Off ? ConstantExpr::getInBoundsGetElementPtr(
+                                 Type::getInt8Ty(Ctx), GV,
+                                 ConstantInt::get(Type::getInt64Ty(Ctx), Off))
+                           : GV;
+    }
+    Bad = false;
+    Writable = true;
+    Offset = 0;
+    Elems.clear();
+    BlockLabels.clear();
+  };
+  SmallVector<StringRef, 16> Lines;
+  Asm.split(Lines, '\n');
+  for (StringRef Line : Lines) {
+    SmallVector<StringRef, 4> Stmts;
+    Line.split(Stmts, ';');
+    for (StringRef S : Stmts) {
+      S = S.split('#').first.trim();
+      if (S.starts_with(".pushsection") || S.starts_with(".section")) {
+        if (Depth++ == 0) {
+          // flags: "a" is read-only; without them, assume it is written
+          size_t Q = S.find('"');
+          if (Q != StringRef::npos)
+            Writable = S.substr(Q + 1).split('"').first.contains('w');
+        } else {
+          Bad = true;
+        }
+        continue;
+      }
+      if (S.starts_with(".popsection") || S.starts_with(".previous")) {
+        if (Depth && --Depth == 0)
+          closeBlock();
+        continue;
+      }
+      while (true) {
+        size_t Colon = S.find(':');
+        if (Colon == StringRef::npos)
+          break;
+        StringRef L = S.substr(0, Colon);
+        if (L.empty() || L.find_first_of(" \t$%(,") != StringRef::npos)
+          break;
+        ++Defs[L];
+        if (Depth == 1)
+          BlockLabels.push_back({L.str(), Offset});
+        S = S.substr(Colon + 1).trim();
+      }
+      if (Depth != 1 || S.empty())
+        continue;
+      size_t Sp = S.find_first_of(" \t");
+      StringRef Dir = S.substr(0, Sp);
+      StringRef Rest = Sp == StringRef::npos ? StringRef() : S.substr(Sp);
+      unsigned Size = dataSize(Dir);
+      if (!Size) {
+        Bad = true;
+        continue;
+      }
+      SmallVector<StringRef, 4> Items;
+      Rest.split(Items, ',');
+      for (StringRef T : Items) {
+        Constant *C = item(T, Size);
+        if (!C) {
+          Bad = true;
+          break;
+        }
+        Elems.push_back(C);
+        Offset += Size;
+      }
+    }
+  }
+  for (auto &D : Defs)
+    if (D.second > 1)
+      Labels.erase(D.first());
+  return Labels;
+}
+
 // One step of an inline asm that makes calls, followed as a small program
 // over the registers (see visitInlineAsm).
 struct AsmStep {
@@ -3737,6 +3880,8 @@ class AsmLifter {
   Value *HwRead;  // i32 (), a fresh symbolic value; null: not declared
   FunctionCallee VmcsField;  // ptr (i64): the VMCS slot of a field
 public:
+  // Labels of the data the asm puts in other sections (asmSectionLabels).
+  const StringMap<Constant *> *SectionLabels = nullptr;
   // Calls into the runtime the lifted code makes (ucsan_vmcs_field): the
   // visitor must not treat them as calls of the program.
   SmallVector<CallInst *, 2> RuntimeCalls;
@@ -3891,8 +4036,18 @@ private:
     }
     if (!L.Seg && T.starts_with("$$")) {
       int64_t V;
-      if (!parseInt(T.drop_front(2), V))
-        return false;
+      if (!parseInt(T.drop_front(2), V)) {
+        // `$1f`: the address of data the asm puts in another section
+        StringRef Lbl = T.drop_front(2);
+        if (!Lbl.consume_back("f") && !Lbl.consume_back("b"))
+          return false;
+        Constant *C = SectionLabels ? SectionLabels->lookup(Lbl) : nullptr;
+        if (!C)
+          return false;
+        L.K = Loc::LImm;
+        L.Val = C;
+        return true;
+      }
       L.K = Loc::LImm;
       L.Val = IRB.getInt64(V);
       return true;
@@ -4002,6 +4157,9 @@ private:
   Value *read(const Loc &L, unsigned Bits) {
     switch (L.K) {
     case Loc::LImm:
+      // a section label is an address, kept a pointer like a register's
+      if (L.Val->getType()->isPointerTy())
+        return Bits == 64 ? L.Val : toInt(L.Val, Bits);
       return IRB.CreateSExtOrTrunc(L.Val, IRB.getIntNTy(Bits));
     case Loc::LReg: {
       Value *V = Regs.lookup(L.Reg);
@@ -4409,7 +4567,10 @@ private:
       if (Ls.size() == 1) {
         C = 1;
       } else if (Ls[0].K == Loc::LImm) {
-        C = cast<ConstantInt>(Ls[0].Val)->getSExtValue();
+        auto *CI = dyn_cast<ConstantInt>(Ls[0].Val);
+        if (!CI)
+          return false;
+        C = CI->getSExtValue();
       } else if (Ls[0].K != Loc::LReg || Ls[0].Reg != "cx") {
         return false;
       }
@@ -5275,6 +5436,29 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     Value *HwRead = UF.UC.AsmCallees.lookup(AsmHwReadFn);
     AsmLifter Lifter(IRB, DL, Ops, CB.getType(), Volatile, HwRead,
                      UF.UC.UCVmcsFieldFn);
+    // section data, only for an asm that takes a label's address (`$1f`)
+    StringMap<Constant *> SectionLabels;
+    if (any_of(Insns, [](const AsmInsn &I) {
+          return any_of(I.Operands, [](StringRef O) {
+            return O.starts_with("$$") && O.size() > 3 &&
+                   isDigit(O[2]) && (O.back() == 'f' || O.back() == 'b');
+          });
+        }))
+      SectionLabels = asmSectionLabels(AsmStr, Ops, *M);
+    Lifter.SectionLabels = &SectionLabels;
+    // the globals of a lift that is rolled back
+    auto dropSectionData = [&]() {
+      SmallPtrSet<GlobalVariable *, 2> GVs;
+      for (auto &L : SectionLabels)
+        if (auto *GV = dyn_cast<GlobalVariable>(
+                L.second->stripInBoundsConstantOffsets()))
+          GVs.insert(GV);
+      for (GlobalVariable *GV : GVs) {
+        GV->removeDeadConstantUsers();
+        if (GV->use_empty())
+          GV->eraseFromParent();
+      }
+    };
     if (Lifter.lift(Insns) && Lifter.outputsKnown()) {
       // runtime calls: skipped by both passes, their pointer unlabeled (a
       // VMCS slot is a global, which check_pointer symbolizes)
@@ -5292,6 +5476,7 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
     }
     while (CB.getPrevNode() != Before)
       CB.getPrevNode()->eraseFromParent();
+    dropSectionData();
   }
 
   // What is left runs as is.  Its memory operands are checked like a load or
