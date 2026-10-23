@@ -85,7 +85,8 @@ struct Constraint {
   // catch it: 85 and 98 kinds both pack into two words.
   //   v1  LastOp = 85 (through BitReverse)
   //   v2  LastOp = 98 (the string kinds, StrLen..StrPtrToInt)
-  static constexpr uint32_t kVersion = 2u;
+  //   v3  LastOp = 101 (Cttz, Ctlz, Ctpop)
+  static constexpr uint32_t kVersion = 3u;
 
   // Laid out so every field is naturally aligned and sizeof() has no implicit
   // padding -- the static_asserts below hold the format to that.

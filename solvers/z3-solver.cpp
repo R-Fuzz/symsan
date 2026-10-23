@@ -1,3 +1,4 @@
+#include "z3-bitcount.h"
 #include "solver.h"
 
 #include <z3++.h>
@@ -196,6 +197,17 @@ z3::expr Z3Solver::serialize(const AstNode* node,
       for (uint32_t i = 1; i < bits; ++i)
         r = z3::concat(r, c1.extract(i, i));
       return cache_expr(node->label(), r, expr_cache);
+    }
+    // No primitives either: see include/z3-bitcount.h.
+    case rgd::Cttz:
+    case rgd::Ctlz:
+    case rgd::Ctpop: {
+      z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);
+      symsan::BitCount kind = node->kind() == rgd::Cttz ? symsan::BitCount::Tz
+                            : node->kind() == rgd::Ctlz ? symsan::BitCount::Lz
+                                                        : symsan::BitCount::Pop;
+      return cache_expr(node->label(), symsan::z3_bitcount(context_, c1, kind),
+                        expr_cache);
     }
     case rgd::ZExt: {
       z3::expr c1 = serialize(&node->children(0), input_args, expr_cache);

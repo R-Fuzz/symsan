@@ -213,6 +213,9 @@ enum {
   DfsanFpMax      = 94, // fp_max
   DfsanFpCopysign = 95, // fp_copysign
   DfsanBitReverse = 109, // bitreverse (last_llvm_op + 42)
+  DfsanCttz       = 112, // cttz (last_llvm_op + 45)
+  DfsanCtlz       = 113, // ctlz
+  DfsanCtpop      = 114, // ctpop
 };
 // Rounding-mode selector (must match __dfsan::fp_rounding_mode in dfsan.h).
 enum {
@@ -6242,7 +6245,19 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
   // expand it instead: z3 as a concat of single-bit extracts, jigsaw as the
   // native intrinsic.  Without this the shadow is dropped and the whole message
   // silently goes concrete (see tests/symsan/bitreverse*.c).
-  if (IId == Intrinsic::bitreverse) {
+  // cttz/ctlz/ctpop the same way, one op node each: no decomposition into
+  // operations with labels exists (a binary search, or a sum of bits, ends in
+  // selects between constants, which carry none).  The kernel's __ffs, fls,
+  // ilog2 and hweight are inline asm (bsf, bsr, popcnt) that UCSanPass lifts
+  // to them; fastop() indexes its stubs by __ffs(dst.bytes).  A zero operand
+  // gives the width, whether or not the intrinsic says it is poison (the
+  // lifted bsf/bsr say not).
+  uint16_t UnaryBitOp = IId == Intrinsic::bitreverse ? DfsanBitReverse
+                        : IId == Intrinsic::cttz     ? DfsanCttz
+                        : IId == Intrinsic::ctlz     ? DfsanCtlz
+                        : IId == Intrinsic::ctpop    ? DfsanCtpop
+                                                     : 0;
+  if (UnaryBitOp) {
     Value *Arg = CB.getArgOperand(0);
     Type *ArgTy = Arg->getType();
     // The intrinsic is also defined on vectors, and getIntegerBitWidth() is a
@@ -6254,7 +6269,7 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
       CallInst *C = IRB.CreateCall(
           TF.TT.TaintUnionFn,
           {Shadow, TF.TT.ZeroPrimitiveShadow,
-           ConstantInt::get(TF.TT.Int16Ty, DfsanBitReverse),
+           ConstantInt::get(TF.TT.Int16Ty, UnaryBitOp),
            ConstantInt::get(TF.TT.Int16Ty, Bits),
            IRB.CreateZExtOrTrunc(Arg, TF.TT.Int64Ty),
            ConstantInt::get(TF.TT.Int64Ty, 0)});

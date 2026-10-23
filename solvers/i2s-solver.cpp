@@ -834,6 +834,25 @@ static bool i2s_eval_int(i2s_ctx &ctx, const AstNode &n_, uint64_t &out,
       out = i2s_bitrev(v, node.bits());
       return true;
     }
+    // evaluated, so a constraint over them verifies; not inverted (no case in
+    // i2s_invert): many operands give each count
+    case rgd::Cttz:
+    case rgd::Ctlz:
+    case rgd::Ctpop: {
+      uint64_t v;
+      if (!i2s_eval_int(ctx, node.children(0), v, depth + 1)) return false;
+      unsigned bits = node.bits();
+      v &= i2s_mask(bits);
+      if (node.kind() == rgd::Ctpop)
+        out = __builtin_popcountll(v);
+      else if (!v)
+        out = bits;
+      else if (node.kind() == rgd::Cttz)
+        out = __builtin_ctzll(v);
+      else
+        out = bits - 64 + __builtin_clzll(v);
+      return true;
+    }
     case rgd::StrLen: {
       // strlen() is an honest unsigned integer, so it belongs in the general
       // evaluator: that is what lets Ugt(StrLen(...), 10) verify through the

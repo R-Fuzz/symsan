@@ -290,7 +290,18 @@ enum operators {
   // the needle, leaves no room for the haystack's label the way strchr's
   // does.
   fstr_ptr  = last_llvm_op + 44, // 111
-  LastOp    = last_llvm_op + 45, // 112
+  // llvm.cttz / llvm.ctlz / llvm.ctpop: the trailing zeros, leading zeros, and
+  // set bits of the operand.  Unary like bitreverse: l1 is the operand, size
+  // its width, which is also the result's; a zero operand gives the width
+  // (cttz/ctlz).  No decomposition into labeled operations exists -- each
+  // ends in selects between constants -- so they are nodes of their own: z3
+  // expands them to ite chains / a sum of bits, jigsaw JITs the native
+  // intrinsics, i2s declines.  The kernel's __ffs, fls, ilog2 and hweight are
+  // inline asm (bsf, bsr, popcnt) that UCSanPass lifts to them.
+  cttz      = last_llvm_op + 45, // 112
+  ctlz      = last_llvm_op + 46, // 113
+  ctpop     = last_llvm_op + 47, // 114
+  LastOp    = last_llvm_op + 48, // 115
 };
 
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP
@@ -392,7 +403,7 @@ static inline bool wide_op_reads_op2(uint16_t op) {
     case FPToUI: case FPToSI: case UIToFP: case SIToFP:
     case FPTrunc: case FPExt: case PtrToInt: case IntToPtr:
     case AddrSpaceCast:
-    case bitreverse:
+    case bitreverse: case cttz: case ctlz: case ctpop:
     // Extract does read op2, but it is the bit offset the instrumentation
     // emitted, always < the operand width and so never truncated.
     case Extract:

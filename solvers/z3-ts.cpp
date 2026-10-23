@@ -1,3 +1,4 @@
+#include "z3-bitcount.h"
 #include "dfsan/dfsan.h"
 
 #include "parse-z3.h"
@@ -64,6 +65,9 @@ static const std::unordered_map<unsigned, const char*> OP_MAP {
   {__dfsan::Or,      "Or"},
   {__dfsan::Xor,     "Xor"},
   {__dfsan::bitreverse, "BitReverse"},
+  {__dfsan::cttz,    "Cttz"},
+  {__dfsan::ctlz,    "Ctlz"},
+  {__dfsan::ctpop,   "Ctpop"},
   // relational comparisons
 #define RELATIONAL_ICMP(cmp) (__dfsan::ICmp | (cmp << 8))
   {RELATIONAL_ICMP(__dfsan::bveq),  "Equal"},
@@ -962,6 +966,35 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       uint64_t rv = 0;
       for (uint32_t i = 0; i < bits; ++i)
         rv |= ((bv >> i) & 1UL) << (bits - 1 - i);
+      RECORD_VALUE(rv);
+      continue;
+    } else if (info->op == __dfsan::cttz || info->op == __dfsan::ctlz ||
+               info->op == __dfsan::ctpop) {
+      // No z3 primitive either: see include/z3-bitcount.h.
+      z3::expr base = get_cached_expr(info->l1, input_deps);
+      if (!base.is_bv()) {
+        DEBUGF("WARNING: bit count on non-BV (label=%u, l1=%u, sort=%s)\n",
+                l, info->l1, base.get_sort().to_string().c_str());
+        throw z3::exception("bit count on non-bitvector operand");
+      }
+      uint32_t bits = base.get_sort().bv_size();
+      uint64_t bv = value_cache_[info->l1] & low64_mask(bits);
+      uint64_t rv;
+      symsan::BitCount kind;
+      if (info->op == __dfsan::cttz) {
+        kind = symsan::BitCount::Tz;
+        rv = bv ? __builtin_ctzll(bv) : bits;
+      } else if (info->op == __dfsan::ctlz) {
+        kind = symsan::BitCount::Lz;
+        rv = bv ? bits - 64 + __builtin_clzll(bv) : bits;
+      } else {
+        kind = symsan::BitCount::Pop;
+        rv = __builtin_popcountll(bv);
+      }
+      z3::expr r = symsan::z3_bitcount(context_, base, kind);
+      tsize_cache_.emplace_back(tsize_cache_[info->l1]);
+      cache_expr(l, r);
+      TRACK_LABEL_BV_ONLY();
       RECORD_VALUE(rv);
       continue;
     } else if (info->op == __dfsan::IntToPtr) {
