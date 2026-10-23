@@ -45,7 +45,14 @@ body never runs and there is nothing of it to evaluate.
 
 Output (all logs are size-capped; nothing here is a full log):
   <out>/results.tsv     one short line per function: module, function, status,
-                        failing stage, seeds, seconds, findings
+                        failing stage, seeds, seconds, findings, blocks,
+                        directions -- the last two coverage: basic blocks
+                        executed and symbolic branch directions taken, over
+                        the run.  Compare coverage, not seeds: a loop over a
+                        mask makes hundreds of seeds that take the same few
+                        branches (__pcpu_freelist_pop: 1106 seeds, 21
+                        branches; 13 seeds, 26 branches once its bit index was
+                        symbolic)
   <out>/failures.jsonl  one record per failed function, with a capped excerpt
   <out>/summary.txt     failures grouped by (stage, kind, signature)
   <out>/funcs/...       work dir of each *failed* function, with repro.sh
@@ -421,7 +428,7 @@ SOLVER_DECLINES = (
 
 
 def classify_run(res):
-    """result.json of run_one.py -> (failures, findings, seeds)."""
+    """result.json of run_one.py -> (failures, findings, seeds, coverage)."""
     fails = []
     findings = {}
     if res.get("exception"):
@@ -468,7 +475,8 @@ def classify_run(res):
         if f not in seen:
             seen.add(f)
             uniq.append(f)
-    return uniq[:MAX_SIGNATURES], findings, res.get("seeds", 0)
+    cov = (res["blocks"], res["directions"]) if "blocks" in res else None
+    return uniq[:MAX_SIGNATURES], findings, res.get("seeds", 0), cov
 
 
 # --------------------------------------------------------------------------
@@ -513,9 +521,12 @@ class Evaluator:
         self.link_args = link_args(self.out)
         self.wrapped = wrapped_functions()
 
-    def record(self, rel, fn, status, stage, seeds, secs, findings, failure=None):
+    def record(self, rel, fn, status, stage, seeds, secs, findings, failure=None,
+               cov=None):
         fnd = ",".join("%s:%d" % kv for kv in sorted(findings.items())) or "-"
-        line = "\t".join([rel, fn, status, stage or "-", str(seeds), "%.1f" % secs, fnd]) + "\n"
+        blocks, dirs = cov if cov else ("-", "-")
+        line = "\t".join([rel, fn, status, stage or "-", str(seeds), "%.1f" % secs, fnd,
+                          str(blocks), str(dirs)]) + "\n"
         with self.lock:
             self.results.write(line)
             self.results.flush()
@@ -613,13 +624,13 @@ class Evaluator:
         run_cmd_line = [a.python, RUN_ONE, "f.ucsan", "--workdir", "run",
                         "--budget", str(a.budget), "--loop-threshold", str(a.loop_threshold)]
 
-        def fail(stage, sigs, log_text, findings=None, seeds=0):
+        def fail(stage, sigs, log_text, findings=None, seeds=0, cov=None):
             failure = {"module": rel, "function": fn, "workdir": wd,
                        "failures": [{"stage": s, "kind": k, "signature": g} for s, k, g in sigs],
                        "excerpt": log_text[-MAX_EXCERPT:]}
             write_repro(wd, rel, fn)
             self.record(rel, fn, "fail", sigs[0][0] if sigs else stage, seeds,
-                        time.time() - t0, findings or {}, failure)
+                        time.time() - t0, findings or {}, failure, cov)
 
         mem = int(a.mem_limit_gb * 1024 * 1024)
         rc = run_cmd(build_cmd, wd, os.path.join(wd, "build.log"), a.build_timeout, env, mem)
@@ -653,10 +664,11 @@ class Evaluator:
             return fail("run", [("run", "runner-crash", norm_sig(text.strip().split("\n")[-1] if text.strip() else "rc=%s" % rc))], text)
         with open(rjson) as f:
             res = json.load(f)
-        fails, findings, seeds = classify_run(res)
+        fails, findings, seeds, cov = classify_run(res)
         fails = (warns + fails)[:MAX_SIGNATURES]
         if not fails:
-            self.record(rel, fn, "pass", None, seeds, time.time() - t0, findings)
+            self.record(rel, fn, "pass", None, seeds, time.time() - t0, findings,
+                        cov=cov)
             if not a.keep_passing:
                 shutil.rmtree(wd, ignore_errors=True)
             return
@@ -669,7 +681,7 @@ class Evaluator:
         excerpt = "\n".join(res.get("errors", [])[:5]) + "\n--- target ---\n" + res.get("target_tail", "")
         if res.get("exception"):
             excerpt = res["exception"] + "\n" + excerpt
-        fail("run", fails, excerpt, findings, seeds)
+        fail("run", fails, excerpt, findings, seeds, cov)
         # keep the binary of only a few run failures; repro.sh rebuilds the rest
         with self.lock:
             keep = self.kept_bins < a.keep_bins
@@ -690,15 +702,21 @@ def summarize(out, topn=40):
     with open(os.path.join(out, "results.tsv")) as f:
         for line in f:
             p = line.rstrip("\n").split("\t")
-            if len(p) == 7:
-                rows.append(p)
+            # (7 columns before the coverage ones)
+            if len(p) in (7, 9):
+                rows.append(p + ["-", "-"] if len(p) == 7 else p)
     total = len(rows)
     fnd = collections.Counter()
     stages = collections.Counter()
     permod = collections.defaultdict(lambda: [0, 0])
     npass = 0
     skipped = collections.Counter()
-    for rel, fn, st, stage, seeds, secs, findings in rows:
+    blocks = dirs = covered = 0
+    for rel, fn, st, stage, seeds, secs, findings, nb, nd in rows:
+        if nb.isdigit():
+            blocks += int(nb)
+            dirs += int(nd)
+            covered += 1
         if st == "skip":
             skipped[stage] += 1
             continue
@@ -731,6 +749,9 @@ def summarize(out, topn=40):
         total, npass, total - npass, 100.0 * (total - npass) / max(total, 1)))
     if skipped:
         L.append("skipped (not evaluated): " + ", ".join("%s %d" % kv for kv in skipped.most_common()))
+    if covered:
+        L.append("coverage over %d runs: %d basic blocks, %d branch directions" % (
+            covered, blocks, dirs))
     L.append("")
     L.append("failing functions by stage:")
     for k, v in stages.most_common():

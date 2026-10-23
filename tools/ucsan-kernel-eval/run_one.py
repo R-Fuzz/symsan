@@ -173,6 +173,12 @@ def main():
             result["exit_counts"] = dict(collections.Counter(str(s) for s in m.exit_status))
             result["events"] = {str(k): v for k, v in m.event_counts.items()}
             result["seeds"] = getattr(m.scheduler, "_counter", 0)
+            # coverage, what the run achieved (a seed count is not: see
+            # TerminationManager): basic blocks executed and symbolic branch
+            # directions taken, over the whole session
+            tm = getattr(m, "_termination_manager", None)
+            result["blocks"] = len(getattr(tm, "blocks", ()))
+            result["directions"] = len(getattr(tm, "directions", ()))
         result["proc_died"] = cap.proc_died
         result["errors"] = cap.errors
         result["target_tail"] = cap.tail.decode(errors="replace")
