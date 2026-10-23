@@ -72,6 +72,13 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_copy_shadow(void *dst, void *src, uint64_t size);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_add_constraint(dfsan_label label, uint8_t result);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_trace_ub_check(dfsan_label label, bool r, uint32_t cid,
+                            void *addr);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_verify_input_bytes(const void *addr, uptr n, void *site);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -2355,9 +2362,15 @@ static ucsan_label uc_pointer_object(ucsan_label l) {
 namespace {
 enum symsan_binary_op : uint16_t {
 #define HANDLE_BINARY_INST(num, opcode, Class) SYMSAN_##opcode = num,
+#define HANDLE_OTHER_INST(num, opcode, Class) SYMSAN_##opcode = num,
 #include "llvm/IR/Instruction.def"
 #undef HANDLE_BINARY_INST
+#undef HANDLE_OTHER_INST
 };
+// dfsan.h's: a comparison's predicate (in the op's high byte), and the UB
+// check kind of an index past its object
+const uint16_t SYMSAN_bveq = 32, SYMSAN_bvugt = 34;
+const uint32_t SYMSAN_ub_index_overflow = 7;
 }  // namespace
 
 // A pointer bound into another's object by a pointer difference (see
@@ -2496,11 +2509,47 @@ int64_t __dfsw_ucsan_ptr_index(bool rewrite, int64_t elem, void *p, void *q,
       index |= (uint64_t)ucsan_tainted.objects->at(0).data[ret.offset + i] << (8 * i);
   UCSAN_OUT("ptr_diff: index %ld from offset %lu (element size %ld)\n",
             (int64_t)index, ret.offset, elem);
+  // i is where p is relative to q: a placement of pseudo pointers, whose
+  // value only has to satisfy the path (see record_placement).  A poison
+  // flag it breaks -- kimage_alloc_control_pages adds to it, nsw, and the
+  // seed's i was INT64_MAX -- is solved back, not the program's overflow.
+  record_placement(0, (int64_t)ret.offset, sizeof(int64_t));
+
+  // p == &q[i] is in q's object, which UCSan bounds
+  // (ucsan_object_size_limit) when q is a UC pointer: |i| * elem is within
+  // it.  Assumed when the seed's i is, as a poison flag that holds is;
+  // otherwise p is not bound below -- its first access would end the run,
+  // REASON_OBJ_OOB, as in i915's do_bit_17_swizzle, where the solver had
+  // picked the pfn for one bit -- and the seed is solved for an i that is, as
+  // a placement that breaks a poison flag is.  (A real q's object is not
+  // UCSan's to bound.)
+  bool in_range = true;
+  if (is_uc_pointer_label(lq)) {
+    int64_t bound = (int64_t)(ucsan_object_size_limit() / (uint64_t)elem);
+    in_range = (uint64_t)((int64_t)index + bound) <= (uint64_t)(2 * bound);
+    // out of range: i + bound >u 2 * bound
+    dfsan_label shifted = __taint_union(index_label, 0, SYMSAN_Add, 64,
+                                        index, bound);
+    dfsan_label out = __taint_union(
+        shifted, 0, (SYMSAN_bvugt << 8) | SYMSAN_ICmp, 64,
+        (int64_t)index + bound, 2 * bound);
+    if (in_range) {
+      __taint_add_constraint(out, 0);
+    } else {
+      dfsan_label holds = __taint_union(
+          out, 0, (SYMSAN_bveq << 8) | SYMSAN_ICmp, 1, 1, 0);
+      __taint_trace_ub_check(holds, 0, SYMSAN_ub_index_overflow,
+                             __builtin_return_address(0));
+    }
+  }
 
   if (is_uc_pointer_label(lp) && is_uc_pointer_label(lq)) {
     ucsan_ptr_info *pi = to_ptr_info(get_label_info(lp));
     if (pi->op == OP_EXTERNAL && pi->status == PTR_INITIALIZED) {
       UCSAN_OUT("ptr_diff: %p already has its object, not bound\n", p);
+    } else if (!in_range) {
+      UCSAN_OUT("ptr_diff: index %ld out of any object, %p not bound\n",
+                (int64_t)index, p);
     } else if (ucsan_num_ptr_bindings == ARRAY_SIZE(ucsan_ptr_bindings)) {
       UCSAN_OUT("ptr_diff: too many bindings, %p not bound\n", p);
     } else {
@@ -3179,6 +3228,15 @@ SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_union, dfsan_label, dfsan_labe
 // @param src: source address
 // @param size: size in bytes
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_copy_shadow, void*, void*, uint64_t) {}
+
+// Add a constraint of the path (dfsan.cpp)
+// @return: void (no-op when standalone)
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_add_constraint, dfsan_label, uint8_t) {}
+
+// Ask the solver to make a condition other than r (dfsan.cpp)
+// @return: void (no-op when standalone)
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_ub_check, dfsan_label, bool,
+                             uint32_t, void*) {}
 
 // Check loaded input bytes against the seed (verify_inputs; dfsan.cpp)
 // @return: void (no-op when standalone: no SymSan labels to check)
