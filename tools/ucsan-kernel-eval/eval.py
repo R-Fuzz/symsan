@@ -97,7 +97,11 @@ FINDING_CODES = {
     171: "PANIC", 180: "KERNEL_BUG", 201: "CONTRACTION",
 }
 # internal termination reasons: execution was cut off, nothing is wrong
-BOUND_CODES = {123: "LOOP_OOB", 124: "OBJ_OOB", 125: "STACK_OOB"}
+# (INVALID_INPUT: the seed breaks an invariant the code relies on, such as
+# fastop()'s call landing on an entry of its block -- no input the program
+# can have)
+BOUND_CODES = {122: "INVALID_INPUT", 123: "LOOP_OOB", 124: "OBJ_OOB",
+               125: "STACK_OOB"}
 
 MAX_EXCERPT = 1500      # bytes of log kept in a failure record
 MAX_LOG_FILE = 16384    # any log file left on disk is trimmed to this

@@ -368,6 +368,25 @@ static bool poison_check(dfsan_label bad, bool violated, bool assumed,
   return false;
 }
 
+// An invariant the code relies on, as UCSan finds it (an inline asm's
+// indirect call lands on an entry of its block: UCSanPass's
+// assumeAsmCallTarget), label the condition's.  Where it holds, a constraint
+// of the path -- the solver keeps it, as an assumed poison flag; where it
+// does not, the input breaks it: a UB task for an input that keeps it (the
+// run itself ends, in the UCSan runtime).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_assume(dfsan_label label, bool holds) {
+  if (label < CONST_OFFSET)
+    return;
+  if (holds) {
+    __taint_add_constraint(label, 1);
+    return;
+  }
+  AOUT("assumption broken by the input, label %u\n", label);
+  __taint_trace_ub_check(label, 0, ub_assertion_failure,
+                         __builtin_return_address(0));
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2) {

@@ -81,6 +81,7 @@
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Analysis/Utils/Local.h"
 #include "llvm/Transforms/Utils/CallPromotionUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -474,6 +475,7 @@ class UCSan {
   FunctionCallee UCTraceGlobalFn;
   FunctionCallee UCTraceUnsizedGlobalFn;
   FunctionCallee UCIntToPointerFn;
+  FunctionCallee UCAssumeFn;
   FunctionCallee UCCheckGlobalBoundsFn;
   FunctionCallee UCTraceWarnFn;
   FunctionCallee UCPushStackFrameFn;
@@ -621,6 +623,12 @@ class UCSan {
   // the integer loads from them (by the instruction: instrumenting replaces
   // a load's address with the checked pointer, which names no slot)
   DenseSet<const LoadInst *> PointerIntLoads;
+
+  // The function entries the module asm defines after each of its labels,
+  // in that label's section: what an inline asm's `call *` through
+  // label + offset may land on (see collectAsmFunctionBlocks)
+  StringMap<SmallVector<std::string, 4>> AsmFunctionBlocks;
+  void collectAsmFunctionBlocks(Module &M);
   std::optional<PointerSlot> slotOf(Value *Addr);
   void collectPointerSlots(Module &M);
 
@@ -630,6 +638,13 @@ public:
   // Whether integer X is a pointer's value: a ptrtoint, or loaded from a
   // pointer slot -- through tag masks and constant offsets
   bool isPointerInt(Value *X);
+
+  // the entries an asm call through Label + offset may land on, or nullptr
+  const SmallVector<std::string, 4> *asmFunctionBlock(StringRef Label) {
+    auto It = AsmFunctionBlocks.find(Label);
+    return It == AsmFunctionBlocks.end() || It->second.empty() ? nullptr
+                                                                : &It->second;
+  }
 
   bool runImpl(Module &M);
 };
@@ -781,6 +796,7 @@ public:
   void visitSelectInst(SelectInst &I);
   void visitPHINode(PHINode &PN);
   void visitInsertValueInst(InsertValueInst &I);
+  void assumeAsmCallTarget(CallBase &CB, Value *Target);
   void guardAsmIndirectCall(CallBase &CB, ArrayRef<AsmOp> Ops,
                             ArrayRef<AsmInsn> Insns);
   void visitExtractValueInst(ExtractValueInst &I);
@@ -1079,6 +1095,15 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
       FunctionType::get(Int64Ty, {Int1Ty, Int64Ty, VoidPtrTy, VoidPtrTy,
                                   PrimitiveShadowTy, PrimitiveShadowTy}, false));
   F = dyn_cast<Function>(UCPtrIndexFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // void __dfsw_ucsan_assume(i1 Holds): an invariant the code relies on
+  // (see assumeAsmCallTarget); the __dfsw_ prefix has TaintPass record it
+  // for the solver (__taint_assume)
+  UCAssumeFn = M.getOrInsertFunction(
+      "__dfsw_ucsan_assume", FunctionType::get(Type::getVoidTy(*Ctx), {Int1Ty}, false));
+  F = dyn_cast<Function>(UCAssumeFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -5795,6 +5820,131 @@ void UCSanVisitor::visitInlineAsm(InlineAsm *IA, CallBase &CB) {
   guardAsmIndirectCall(CB, Ops, Insns);
 }
 
+// fastop() calls em_bsr + __ffs(dst.bytes) * FASTOP_SIZE, which the kernel
+// keeps on one of em_bsr's entries: dst.bytes is 1, 2, 4 or 8.  Under UC it
+// is the seed's, and with 0 the call went to em_bsr + 0x400, past the block,
+// into whatever code lay there (em_bsr_c, em_cmpxchg).  That an inline asm's
+// indirect call through Base + offset lands on one of the function entries
+// the module asm defines in Base's block (UCSan::collectAsmFunctionBlocks)
+// is an invariant of the code, not a check the program makes: assumed where
+// it holds, and where it does not the seed breaks it, and the run ends
+// (__dfsw_ucsan_assume, REASON_INVALID_INPUT) with the solver asked for a
+// seed that keeps it.  Only for a Base that is no entry itself, whose entries
+// are labeled: a block entered at a label plus offsets with none in between
+// says nothing of which offsets are valid.  The entries are named, not
+// placed: their addresses are the linker's.
+void UCSanVisitor::assumeAsmCallTarget(CallBase &CB, Value *Target) {
+  const DataLayout &DL = getDataLayout();
+  // the target's shape: phis, selects and GEPs over one base
+  GlobalValue *Base = nullptr;
+  SmallPtrSet<Value *, 8> Seen;
+  std::function<bool(Value *, unsigned)> Shape = [&](Value *V,
+                                                     unsigned Depth) {
+    V = V->stripPointerCasts();
+    if (Depth > 8)
+      return false;
+    if (!Seen.insert(V).second)
+      return true;
+    if (auto *GV = dyn_cast<GlobalValue>(V)) {
+      if (Base && Base != GV)
+        return false;
+      Base = GV;
+      return true;
+    }
+    if (auto *GEP = dyn_cast<GEPOperator>(V))
+      return Shape(GEP->getPointerOperand(), Depth + 1);
+    if (auto *PN = dyn_cast<PHINode>(V))
+      return llvm::all_of(PN->incoming_values(),
+                          [&](Value *In) { return Shape(In, Depth + 1); });
+    if (auto *Sel = dyn_cast<SelectInst>(V))
+      return Shape(Sel->getTrueValue(), Depth + 1) &&
+             Shape(Sel->getFalseValue(), Depth + 1);
+    return false;
+  };
+  if (!Shape(Target, 0) || !Base || !Base->hasName())
+    return;
+  const SmallVector<std::string, 4> *Entries =
+      UF.UC.asmFunctionBlock(Base->getName());
+  if (!Entries || llvm::is_contained(*Entries, Base->getName().str()))
+    return;
+
+  // the offset from Base, rebuilt as an integer where the target is built
+  Type *I64 = UF.UC.Int64Ty;
+  DenseMap<Value *, Value *> Offsets;
+  SmallVector<Instruction *, 8> Made;
+  auto made = [&](Value *V) {
+    if (auto *I = dyn_cast<Instruction>(V))
+      Made.push_back(I);
+    return V;
+  };
+  std::function<Value *(Value *)> Offset = [&](Value *V) -> Value * {
+    V = V->stripPointerCasts();
+    auto It = Offsets.find(V);
+    if (It != Offsets.end())
+      return It->second;
+    Value *R = nullptr;
+    if (isa<GlobalValue>(V)) {
+      R = ConstantInt::get(I64, 0);
+    } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+      APInt C(64, 0);
+      if (isa<Constant>(GEP) && GEP->accumulateConstantOffset(DL, C)) {
+        R = ConstantExpr::getAdd(cast<Constant>(Offset(GEP->getPointerOperand())),
+                                 ConstantInt::get(I64, C));
+      } else {
+        auto *GI = cast<Instruction>(GEP);
+        IRBuilder<> IRB(GI->getNextNode());
+        Value *B = Offset(GEP->getPointerOperand());
+        Value *O = made(emitGEPOffset(&IRB, DL, GI, /*NoAssumptions=*/true));
+        O = made(IRB.CreateSExtOrTrunc(O, I64));
+        R = made(IRB.CreateAdd(B, O));
+      }
+    } else if (auto *PN = dyn_cast<PHINode>(V)) {
+      PHINode *OP = PHINode::Create(I64, PN->getNumIncomingValues(), "", PN);
+      Made.push_back(OP);
+      Offsets[V] = OP;
+      for (unsigned K = 0; K < PN->getNumIncomingValues(); ++K)
+        OP->addIncoming(Offset(PN->getIncomingValue(K)),
+                        PN->getIncomingBlock(K));
+      R = OP;
+    } else {
+      auto *Sel = cast<SelectInst>(V);
+      Value *T = Offset(Sel->getTrueValue()), *F = Offset(Sel->getFalseValue());
+      IRBuilder<> IRB(Sel);
+      R = made(IRB.CreateSelect(Sel->getCondition(), T, F));
+    }
+    Offsets[V] = R;
+    return R;
+  };
+  // (a constant one too: the path to it may be the seed's, a branch on the
+  // index having folded it)
+  Value *Off = Offset(Target);
+
+  Module *M = CB.getModule();
+  IRBuilder<> IRB(&CB);
+  Constant *BaseInt = ConstantExpr::getPtrToInt(Base, I64);
+  Value *Ok = nullptr;
+  for (const std::string &E : *Entries) {
+    GlobalValue *EV = M->getNamedValue(E);
+    if (!EV)
+      EV = Function::Create(FunctionType::get(IRB.getVoidTy(), false),
+                            GlobalValue::ExternalLinkage, E, M);
+    // the asm's symbol, not one TaintPass renames to E.taint
+    if (auto *EF = dyn_cast<Function>(EV))
+      if (EF->isDeclaration())
+        UF.UC.markFunctionNosanitize(EF);
+    Constant *Rel =
+        ConstantExpr::getSub(ConstantExpr::getPtrToInt(EV, I64), BaseInt);
+    Value *Eq = made(IRB.CreateICmpEQ(Off, Rel));
+    Ok = Ok ? made(IRB.CreateOr(Ok, Eq)) : Eq;
+  }
+  CallInst *A = IRB.CreateCall(UF.UC.UCAssumeFn, {Ok});
+  UF.UC.markNosanitize(A);
+  Made.push_back(A);
+  // program code to TaintPass, which labels the condition; not to UCSan
+  for (Instruction *I : Made)
+    UF.SkipInsts.insert(I);
+}
+
 // `call *$N` through a register operand runs whatever the operand holds, and
 // a symbolic one -- a function pointer the seed gave, which the C call
 // through it would not make (visitIndirectCallBase) -- is the seed's value:
@@ -5836,6 +5986,7 @@ void UCSanVisitor::guardAsmIndirectCall(CallBase &CB, ArrayRef<AsmOp> Ops,
   }
   if (Target < 0)
     return;
+  assumeAsmCallTarget(CB, Ops[Target].V);
   Value *Shadow = UF.getShadow(Ops[Target].V);
   Value *HwRead = UF.UC.AsmCallees.lookup(AsmHwReadFn);
   if (UF.UC.isZeroShadow(Shadow) || !HwRead)
@@ -7481,6 +7632,67 @@ bool UCSan::isPointerInt(Value *X) {
   return LI && PointerIntLoads.count(LI);
 }
 
+// KVM's fastop() calls `em_bsr + __ffs(dst.bytes) * FASTOP_SIZE` from
+// inline asm, and the module asm that defines em_bsr defines its entries,
+// each a function of its own:
+//   .pushsection .text; .global em_bsr; em_bsr:
+//     .type __UNIQUE_ID_nop696, @function; __UNIQUE_ID_nop696: ...
+//     .type bsrw_ax_dx, @function; bsrw_ax_dx: ...  (bsrl_, bsrq_ alike)
+//   .popsection
+// Records, for each label, the `.type @function` labels from it to the end
+// of its section (a .popsection back out of it, or a section switch); those
+// in a section pushed meanwhile (.discard.ibt_endbr_noseal) are not in it.
+void UCSan::collectAsmFunctionBlocks(Module &M) {
+  SmallVector<StringRef, 0> Lines;
+  StringRef(M.getModuleInlineAsm()).split(Lines, '\n');
+  StringSet<> Typed;
+  // labels whose block is open, with the section depth they are in
+  SmallVector<std::pair<std::string, unsigned>, 0> Open;
+  unsigned Depth = 0;
+  auto closeAt = [&](unsigned D) {
+    llvm::erase_if(Open, [D](auto &O) { return O.second == D; });
+  };
+  auto isIdent = [](StringRef S) {
+    if (S.empty() || isDigit(S[0]))
+      return false;
+    return llvm::all_of(S, [](char C) {
+      return isAlnum(C) || C == '_' || C == '.' || C == '$';
+    });
+  };
+  for (StringRef Line : Lines) {
+    SmallVector<StringRef, 2> Stmts;
+    Line.split(Stmts, ';');
+    for (StringRef St : Stmts) {
+      St = St.trim();
+      if (St.consume_front(".pushsection")) {
+        ++Depth;
+      } else if (St.starts_with(".popsection")) {
+        closeAt(Depth);
+        if (Depth)
+          --Depth;
+      } else if (St.starts_with(".section") || St == ".text" ||
+                 St == ".data" || St == ".bss" || St == ".previous") {
+        closeAt(Depth);
+      } else if (St.consume_front(".type")) {
+        auto [Name, Kind] = St.split(',');
+        Kind = Kind.trim();
+        if (Kind == "@function" || Kind == "%function" || Kind == "STT_FUNC")
+          Typed.insert(Name.trim());
+      } else {
+        size_t Colon = St.find(':');
+        if (Colon == StringRef::npos || !isIdent(St.take_front(Colon)))
+          continue;
+        std::string Label = St.take_front(Colon).str();
+        Open.push_back({Label, Depth});
+        if (Typed.contains(Label))
+          for (auto &O : Open)
+            if (O.second == Depth)
+              AsmFunctionBlocks[O.first].push_back(Label);
+      }
+    }
+  }
+}
+
 bool UCSan::runImpl(Module &M) {
   initializeModule(M);
   bool Changed = false;
@@ -7514,6 +7726,7 @@ bool UCSan::runImpl(Module &M) {
       });
 
   collectPointerSlots(M);
+  collectAsmFunctionBlocks(M);
 
   // Declare what inline asm calls before the split, so it is split too.
   // String port I/O is rewritten first: its loop reads hardware through a

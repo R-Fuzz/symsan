@@ -598,6 +598,7 @@ class Taint {
   FunctionCallee TaintTraceGlobalFn;
   FunctionCallee TaintDebugFn;
   FunctionCallee TaintMinimizeLabelFn;
+  FunctionCallee TaintAssumeFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
   /// Read-only global arrays eligible to be treated as lookup tables, mapped to
   /// {num_elements, element_size}.  Computed once, before anything is
@@ -2174,6 +2175,17 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     TaintMinimizeLabelFn =
         Mod->getOrInsertFunction("__taint_minimize_label", TaintMinimizeLabelFnTy, AL);
   }
+  {
+    // void __taint_assume(label, i1 holds): see handleUCSanCall
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
+    TaintAssumeFn = Mod->getOrInsertFunction(
+        "__taint_assume", AL, Type::getVoidTy(*Ctx), PrimitiveShadowTy,
+        Type::getInt1Ty(*Ctx));
+    TaintRuntimeFunctions.insert(TaintAssumeFn.getCallee()->stripPointerCasts());
+  }
 
   TaintRuntimeFunctions.insert(
       TaintUnionFn.getCallee()->stripPointerCasts());
@@ -2797,6 +2809,21 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
     return false;
 
   StringRef BaseName = FName.drop_front(7); // skip "__dfsw_"
+
+  // An invariant UCSan found the code to rely on (UCSanPass's
+  // assumeAsmCallTarget): the condition's label goes to the solver, as a
+  // constraint of the path where it holds, and as one to solve for where it
+  // does not (the UCSan runtime then ends the run).
+  if (BaseName == "ucsan_assume") {
+    Value *Cond = CI->getArgOperand(0);
+    Value *Shadow = getShadow(Cond);
+    if (!TT.isZeroShadow(Shadow)) {
+      IRBuilder<> IRB(CI);
+      CallInst *A = IRB.CreateCall(TT.TaintAssumeFn, {Shadow, Cond});
+      SkipInsts.insert(A);
+    }
+    return true;
+  }
 
   auto GetFakeIORetShadow = [&]() -> Value * {
     // ucsan_custom.cpp simulates reads without forwarding to libc. For these

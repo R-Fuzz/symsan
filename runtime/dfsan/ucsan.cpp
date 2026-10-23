@@ -2714,6 +2714,19 @@ ucsan_label ucsan_trace_unsized_global(uint64_t addr) {
 //    alone for the same reason: the kernel's constant pointers are those
 //    sentinels.)
 // Any other label is already a pointer's, or UBI's: it stays.
+// An invariant the code relies on (UCSanPass's assumeAsmCallTarget): a seed
+// that breaks it is no input the program can have -- the run ends, nothing
+// wrong with the program (SymSan's __taint_assume, which TaintPass calls
+// before this, has asked for a seed that keeps it).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __dfsw_ucsan_assume(bool holds) {
+  if (holds)
+    return;
+  UCSAN_OUT("assumption broken by the input at %p\n",
+            __builtin_return_address(0));
+  exit(exit_reason::REASON_INVALID_INPUT);
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 ucsan_label ucsan_int_to_pointer(uint64_t v, ucsan_label op, uint64_t width) {
   if (op == kUninitializedLabel)

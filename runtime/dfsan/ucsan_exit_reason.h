@@ -1,5 +1,6 @@
 enum exit_reason {
   /* internal */
+  REASON_INVALID_INPUT = 122, // the input breaks an invariant the code relies on (__dfsw_ucsan_assume)
   REASON_LOOP_OOB = 123,
   REASON_OBJ_OOB = 124,
   REASON_STACK_OOB = 125,
