@@ -55,6 +55,10 @@ tests = []
 solver_error_absent_tests = set()
 # test name -> event ids (PIPE_EVENT_TYPE) that must be reported at least once
 expected_events = {}
+# test name -> event ids that must never be reported (`// EVENT-ABSENT:`): a
+# report that does not end the run -- a poison violation, under
+# exit_on_poison=0 -- is no exit status for ABSENT to see
+absent_events = {}
 # test -> extra compiler flags (`// CFLAGS:`)
 test_cflags = {}
 
@@ -96,6 +100,9 @@ def parse_test(file, test_name):
         elif line.startswith("// EVENT:"):
             events = line.split(":", maxsplit=2)[1].strip().split(" ")
             expected_events.setdefault(test_name, []).extend(int(e, 0) for e in events)
+        elif line.startswith("// EVENT-ABSENT:"):
+            events = line.split(":", maxsplit=2)[1].strip().split(" ")
+            absent_events.setdefault(test_name, []).extend(int(e, 0) for e in events)
     tests.append(test)
 
 for file in glob.glob(os.path.join(SCRIPT_DIR, "test", "*.c")):
@@ -241,6 +248,10 @@ def perform_test(stage, *args, seed=None):
         for event in expected_events.get(test_name, []):
             if not m.event_counts.get(event):
                 raise Exception(f"Event {event} never reported during {test_name}")
+        for event in absent_events.get(test_name, []):
+            if m.event_counts.get(event):
+                raise Exception(f"Event {event} reported {m.event_counts[event]} "
+                                f"times during {test_name}, expected none")
         for exit_status in m.exit_status:
             if exit_status > 255:
                 exit_status = exit_status >> 8
