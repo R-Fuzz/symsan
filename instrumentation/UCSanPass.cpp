@@ -614,8 +614,22 @@ class UCSan {
            !AsmDefinedSyms.contains(GV->getName());
   }
 
+  // Memory that holds a pointer as an integer: a global, or a field of a
+  // struct type, by byte offset (see collectPointerSlots)
+  using PointerSlot = std::pair<const void *, int64_t>;
+  DenseSet<PointerSlot> PointerSlots;
+  // the integer loads from them (by the instruction: instrumenting replaces
+  // a load's address with the checked pointer, which names no slot)
+  DenseSet<const LoadInst *> PointerIntLoads;
+  std::optional<PointerSlot> slotOf(Value *Addr);
+  void collectPointerSlots(Module &M);
+
 public:
   UCSan() = default;
+
+  // Whether integer X is a pointer's value: a ptrtoint, or loaded from a
+  // pointer slot -- through tag masks and constant offsets
+  bool isPointerInt(Value *X);
 
   bool runImpl(Module &M);
 };
@@ -6873,12 +6887,12 @@ static bool matchPointerDiffIndex(BinaryOperator &BO, Value *&P, Value *&Q,
   auto *Sub = dyn_cast<BinaryOperator>(BO.getOperand(0));
   if (!Sub || Sub->getOpcode() != Instruction::Sub)
     return false;
-  auto *PI = dyn_cast<PtrToIntOperator>(Sub->getOperand(0));
-  auto *QI = dyn_cast<PtrToIntOperator>(Sub->getOperand(1));
-  if (!PI || !QI)
-    return false;
-  P = PI->getPointerOperand();
-  Q = QI->getPointerOperand();
+  // (now: gives the subtraction's operands, the integers of p and q, which
+  // visitBinaryOperator checks are pointers' -- a ptrtoint, or loaded from
+  // where the module keeps pointers, UCSan::isPointerInt -- since the
+  // optimizer folds ptrtoint (inttoptr x) to x)
+  P = Sub->getOperand(0);
+  Q = Sub->getOperand(1);
   return true;
 }
 
@@ -6899,11 +6913,42 @@ void UCSanVisitor::visitBinaryOperator(BinaryOperator &BO) {
   // gives that too.  Pointers that are related -- real ones, or the same
   // label -- keep the index the program computes, and its SymSan label: the
   // select.
+  // A difference whose integers are not ptrtoints but come from where the
+  // module keeps pointers is one too (see UCSan::collectPointerSlots): i915's
+  // `(page_link & ~3) - vmemmap_base`, sg_page() then page_to_pfn() once
+  // the optimizer has folded the pointers away.  Its pointers are the
+  // integers, labeled as an inttoptr labels them (ucsan_int_to_pointer) --
+  // before BO: that records them as a placement, which BO's poison check
+  // asks about.
   Value *P, *Q;
   uint64_t Elem;
-  if (matchPointerDiffIndex(BO, P, Q, Elem)) {
+  if (matchPointerDiffIndex(BO, P, Q, Elem) && UF.UC.isPointerInt(P) &&
+      UF.UC.isPointerInt(Q)) {
+    Value *LP, *LQ;
+    auto PointerOf = [&](Value *&V, Value *&L) {
+      if (auto *PI = dyn_cast<PtrToIntOperator>(V)) {
+        V = PI->getPointerOperand();
+        L = UF.getShadow(V);
+        return;
+      }
+      IRBuilder<> Before(&BO);
+      CallInst *Label = Before.CreateCall(
+          UF.UC.UCIntToPointerFn,
+          {V, UF.getShadow(V), ConstantInt::get(UF.UC.Int64Ty, 8)});
+      Label->addRetAttr(Attribute::ZExt);
+      UF.UC.markNosanitize(Label);
+      UF.setShadow(Label, UF.UC.getZeroShadow(Label));
+      Value *Ptr = Before.CreateIntToPtr(V, UF.UC.VoidPtrTy);
+      if (auto *PtrI = dyn_cast<Instruction>(Ptr)) {
+        UF.UC.markNosanitize(PtrI);
+        UF.setShadow(PtrI, Label);
+      }
+      V = Ptr;
+      L = Label;
+    };
+    PointerOf(P, LP);
+    PointerOf(Q, LQ);
     IRBuilder<> IRB(BO.getNextNode());
-    Value *LP = UF.getShadow(P), *LQ = UF.getShadow(Q);
     Value *PV = IRB.CreatePointerCast(P, UF.UC.VoidPtrTy);
     Value *QV = IRB.CreatePointerCast(Q, UF.UC.VoidPtrTy);
     if (PV != P) UF.UC.markNosanitize(PV);
@@ -7308,6 +7353,134 @@ static void zeroPercpuInAsmData(Module &M) {
     M.setModuleInlineAsm(Out);
 }
 
+// The integer a pointer kept as one is, under the arithmetic the kernel does
+// on it: tag bits masked off or set (sg_page's `page_link & ~3`), a constant
+// offset added.  (Only used to find where the integer came from.)
+static Value *stripPointerIntArith(Value *V) {
+  for (unsigned Depth = 0; Depth < 8; ++Depth) {
+    auto *BO = dyn_cast<BinaryOperator>(V);
+    if (!BO)
+      return V;
+    switch (BO->getOpcode()) {
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor:
+    case Instruction::Add:
+    case Instruction::Sub:
+      break;
+    default:
+      return V;
+    }
+    if (isa<ConstantInt>(BO->getOperand(1)))
+      V = BO->getOperand(0);
+    else if (isa<ConstantInt>(BO->getOperand(0)) &&
+             BO->getOpcode() != Instruction::Sub)
+      V = BO->getOperand(1);
+    else
+      return V;
+  }
+  return V;
+}
+
+// The struct type B points to, as the IR uses it: a GEP's result, or the one
+// struct type that GEPs from B index (opaque pointers carry no pointee type).
+static StructType *pointeeStruct(Value *B) {
+  if (auto *GEP = dyn_cast<GEPOperator>(B))
+    if (auto *ST = dyn_cast<StructType>(GEP->getResultElementType()))
+      return ST;
+  StructType *Found = nullptr;
+  for (User *U : B->users()) {
+    auto *GEP = dyn_cast<GEPOperator>(U);
+    if (!GEP || GEP->getPointerOperand() != B)
+      continue;
+    auto *ST = dyn_cast<StructType>(GEP->getSourceElementType());
+    if (!ST)
+      continue;
+    if (Found && Found != ST)
+      return nullptr;
+    Found = ST;
+  }
+  return Found;
+}
+
+// The memory Addr names, as a pointer slot's key: a global and the offset
+// into it, or a struct type and the offset into one (modulo its size: an
+// element of an array of them).
+std::optional<UCSan::PointerSlot> UCSan::slotOf(Value *Addr) {
+  const DataLayout &DL = Mod->getDataLayout();
+  APInt Off(64, 0);
+  Value *B = Addr->stripAndAccumulateConstantOffsets(DL, Off, true);
+  int64_t O = Off.getSExtValue();
+  if (auto *GV = dyn_cast<GlobalVariable>(B))
+    return PointerSlot{GV, O};
+  StructType *ST = pointeeStruct(B);
+  if (!ST || ST->isOpaque() || !ST->isSized())
+    return std::nullopt;
+  int64_t Size = DL.getTypeAllocSize(ST);
+  if (Size <= 0)
+    return std::nullopt;
+  O %= Size;
+  if (O < 0)
+    O += Size;
+  return PointerSlot{ST, O};
+}
+
+// The memory the module keeps pointers in, as integers or not: what a loaded
+// integer that becomes a pointer (inttoptr) was loaded from, what a pointer's
+// integer (ptrtoint) is stored to, and what a pointer is loaded from or
+// stored to.  A pointer difference the optimizer has folded to integers --
+// sg_page() then page_to_pfn(), `(page_link & ~3) - vmemmap_base`, in which
+// the inttoptr and ptrtoint of the source cancel out -- is then still known
+// for one (isPointerInt): both integers come from where the module keeps
+// pointers, scatterlist's page_link (an inttoptr on the sg_chain path) and
+// vmemmap_base (one in pfn_to_page).  Before instrumenting: it adds
+// inttoptrs of its own.
+void UCSan::collectPointerSlots(Module &M) {
+  auto Add = [this](Value *Addr) {
+    if (auto S = slotOf(Addr))
+      PointerSlots.insert(*S);
+  };
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      if (auto *ITP = dyn_cast<IntToPtrInst>(&I)) {
+        auto *LI = dyn_cast<LoadInst>(stripPointerIntArith(ITP->getOperand(0)));
+        if (LI && LI->getType()->isIntegerTy(64))
+          Add(LI->getPointerOperand());
+      } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        Value *V = SI->getValueOperand();
+        if (V->getType()->isPointerTy() ||
+            isa<PtrToIntOperator>(stripPointerIntArith(V)))
+          Add(SI->getPointerOperand());
+      } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (LI->getType()->isPointerTy())
+          Add(LI->getPointerOperand());
+      }
+    }
+  }
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F))
+      if (auto *LI = dyn_cast<LoadInst>(&I))
+        if (LI->getType()->isIntegerTy(64))
+          if (auto S = slotOf(LI->getPointerOperand()))
+            if (PointerSlots.count(*S))
+              PointerIntLoads.insert(LI);
+  }
+}
+
+bool UCSan::isPointerInt(Value *X) {
+  if (!X->getType()->isIntegerTy(64))
+    return false;
+  Value *S = stripPointerIntArith(X);
+  if (isa<PtrToIntOperator>(S))
+    return true;
+  auto *LI = dyn_cast<LoadInst>(S);
+  return LI && PointerIntLoads.count(LI);
+}
+
 bool UCSan::runImpl(Module &M) {
   initializeModule(M);
   bool Changed = false;
@@ -7339,6 +7512,8 @@ bool UCSan::runImpl(Module &M) {
         if (!(Flags & object::BasicSymbolRef::SF_Undefined))
           AsmDefinedSyms.insert(Name);
       });
+
+  collectPointerSlots(M);
 
   // Declare what inline asm calls before the split, so it is split too.
   // String port I/O is rewritten first: its loop reads hardware through a
