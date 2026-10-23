@@ -1573,6 +1573,130 @@ static void lowerMinMaxAbs(Function &F) {
   }
 }
 
+// More intrinsics with no label op, lowered for the same reason, to the
+// operations they stand for (none of which can trap, shift out of range or
+// carry a poison flag, so they add no UB check the program does not have):
+//  - llvm.fshl/fshr, the kernel's rol32/ror32 (jhash, siphash): shl, lshr and
+//    or by the amount modulo the width, the other operand where it is 0;
+//  - llvm.u/s{add,sub}.sat: the wrapping operation, and the bound where it
+//    overflowed (icmp + select);
+//  - llvm.u/s{add,sub}.with.overflow and umul.with.overflow, the kernel's
+//    check_add_overflow / check_mul_overflow: the wrapping operation and its
+//    overflow test -- for umul, r / b != a (b != 0), with no wider multiply,
+//    which the solvers decline past 64 bits.  smul.with.overflow is left
+//    alone.
+// Codegen matches most of them back.
+static void lowerArithIntrinsics(Function &F) {
+  SmallVector<IntrinsicInst *, 8> Worklist;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+      Type *T = II->getArgOperand(0)->getType();
+      if (!T->isIntegerTy() || T->getIntegerBitWidth() > 64)
+        continue;
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::fshl: case Intrinsic::fshr:
+      case Intrinsic::uadd_sat: case Intrinsic::usub_sat:
+      case Intrinsic::sadd_sat: case Intrinsic::ssub_sat:
+      case Intrinsic::uadd_with_overflow: case Intrinsic::usub_with_overflow:
+      case Intrinsic::sadd_with_overflow: case Intrinsic::ssub_with_overflow:
+      case Intrinsic::umul_with_overflow:
+        Worklist.push_back(II);
+        break;
+      default:
+        break;
+      }
+    }
+  for (IntrinsicInst *II : Worklist) {
+    IRBuilder<> IRB(II);
+    Value *A = II->getArgOperand(0), *B = II->getArgOperand(1);
+    auto *T = cast<IntegerType>(A->getType());
+    unsigned W = T->getBitWidth();
+    auto C = [&](uint64_t V) { return ConstantInt::get(T, V); };
+    APInt Max = APInt::getMaxValue(W), SMax = APInt::getSignedMaxValue(W),
+          SMin = APInt::getSignedMinValue(W);
+    // signed overflow of S = A op B: for add, A and B agree in sign and S
+    // does not; for sub, they differ and S differs from A
+    auto SOvf = [&](Value *S, bool Add) {
+      Value *X = IRB.CreateXor(A, S);
+      Value *Y = Add ? IRB.CreateXor(B, S) : IRB.CreateXor(A, B);
+      return IRB.CreateICmpSLT(IRB.CreateAnd(X, Y), C(0));
+    };
+    Value *Res = nullptr;
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::fshl:
+    case Intrinsic::fshr: {
+      bool L = II->getIntrinsicID() == Intrinsic::fshl;
+      // W is a power of two for every integer type it is used on; urem
+      // otherwise
+      Value *Sh = isPowerOf2_32(W) ? IRB.CreateAnd(II->getArgOperand(2), C(W - 1))
+                                   : IRB.CreateURem(II->getArgOperand(2), C(W));
+      // W - Sh, which is W for Sh == 0: masked to stay in range (that case
+      // is selected away below)
+      Value *Rev = IRB.CreateSub(C(W), Sh);
+      Rev = isPowerOf2_32(W) ? IRB.CreateAnd(Rev, C(W - 1))
+                             : IRB.CreateURem(Rev, C(W));
+      Value *V = L ? IRB.CreateOr(IRB.CreateShl(A, Sh), IRB.CreateLShr(B, Rev))
+                   : IRB.CreateOr(IRB.CreateLShr(B, Sh), IRB.CreateShl(A, Rev));
+      Res = IRB.CreateSelect(IRB.CreateICmpEQ(Sh, C(0)), L ? A : B, V);
+      break;
+    }
+    case Intrinsic::uadd_sat: {
+      Value *S = IRB.CreateAdd(A, B);
+      Res = IRB.CreateSelect(IRB.CreateICmpULT(S, A), ConstantInt::get(T, Max), S);
+      break;
+    }
+    case Intrinsic::usub_sat:
+      Res = IRB.CreateSelect(IRB.CreateICmpULT(A, B), C(0), IRB.CreateSub(A, B));
+      break;
+    case Intrinsic::sadd_sat:
+    case Intrinsic::ssub_sat: {
+      bool Add = II->getIntrinsicID() == Intrinsic::sadd_sat;
+      Value *S = Add ? IRB.CreateAdd(A, B) : IRB.CreateSub(A, B);
+      // past which bound: A's side
+      Value *Bound = IRB.CreateSelect(IRB.CreateICmpSLT(A, C(0)),
+                                      ConstantInt::get(T, SMin),
+                                      ConstantInt::get(T, SMax));
+      Res = IRB.CreateSelect(SOvf(S, Add), Bound, S);
+      break;
+    }
+    case Intrinsic::uadd_with_overflow:
+    case Intrinsic::usub_with_overflow:
+    case Intrinsic::sadd_with_overflow:
+    case Intrinsic::ssub_with_overflow:
+    case Intrinsic::umul_with_overflow: {
+      Intrinsic::ID ID = II->getIntrinsicID();
+      Value *S, *O;
+      if (ID == Intrinsic::uadd_with_overflow) {
+        S = IRB.CreateAdd(A, B);
+        O = IRB.CreateICmpULT(S, A);
+      } else if (ID == Intrinsic::usub_with_overflow) {
+        S = IRB.CreateSub(A, B);
+        O = IRB.CreateICmpULT(A, B);
+      } else if (ID == Intrinsic::umul_with_overflow) {
+        S = IRB.CreateMul(A, B);
+        Value *BZero = IRB.CreateICmpEQ(B, C(0));
+        // divided by 1 where B is 0, and that case is not an overflow
+        Value *D = IRB.CreateSelect(BZero, C(1), B);
+        O = IRB.CreateAnd(IRB.CreateNot(BZero),
+                          IRB.CreateICmpNE(IRB.CreateUDiv(S, D), A));
+      } else {
+        bool Add = ID == Intrinsic::sadd_with_overflow;
+        S = Add ? IRB.CreateAdd(A, B) : IRB.CreateSub(A, B);
+        O = SOvf(S, Add);
+      }
+      Res = IRB.CreateInsertValue(PoisonValue::get(II->getType()), S, 0);
+      Res = IRB.CreateInsertValue(Res, O, 1);
+      break;
+    }
+    default:
+      continue;
+    }
+    Res->takeName(II);
+    II->replaceAllUsesWith(Res);
+    II->eraseFromParent();
+  }
+}
+
 static void normalizeBoolLoads(Function &F) {
   SmallVector<LoadInst *, 16> Loads;
   SmallVector<LoadInst *, 4> I1Loads;
@@ -2627,6 +2751,7 @@ bool Taint::runImpl(Module &M) {
     removeUnreachableBlocks(*F);
     normalizeBoolLoads(*F);
     lowerMinMaxAbs(*F);
+    lowerArithIntrinsics(*F);
 
     TaintFunction TF(*this, F, FnsWithNativeABI.count(F),
                      FnsWithForceZeroLabel.count(F));
