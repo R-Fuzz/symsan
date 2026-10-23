@@ -120,6 +120,8 @@ extern "C" {
 extern char __dso_handle;
 extern char edata;
 extern char end;
+// (the image's start, its code included: see ucsan_int_to_pointer)
+extern char __executable_start __attribute__((weak));
 }
 
 namespace __ucsan {
@@ -1653,6 +1655,56 @@ bool __ucsan_seed_byte(uint32_t input, int64_t offset, uint8_t *out) {
   return true;
 }
 
+// A pointer made of seed bytes: label0, an (OP_NONE) byte label, is the first
+// of the n bytes that hold the pointer's value, concrete_val (nullptr if not
+// known).  Becomes the pointer's label: a pointer load
+// (ucsan_load_pointer_shadow), or an integer the program turns into a pointer
+// (ucsan_int_to_pointer).
+static ucsan_label seed_bytes_to_pointer(ucsan_label label0, uint64_t n,
+                                         void *concrete_val) {
+  ucsan_label_info *label_info = get_label_info(label0);
+  // the pointer's value is these seed bytes (see record_placement)
+  {
+    ucsan_byte_info *b = to_byte_info(label_info);
+    record_placement(b->object_id, b->offset, n);
+  }
+  // Check if the concrete pointer value points to a symbolize_input object
+  if (__symbolize_addr_map_inited && concrete_val) {
+    uint32_t target_id, target_offset;
+    ucsan_label target_ptr_label;
+    if (__symbolize_addr_map.find(concrete_val, &target_id, &target_offset,
+                                   &target_ptr_label)) {
+      UCSAN_OUT("load_pointer_shadow: symbolize_input hit: target_id=%u, "
+                "target_offset=%u, ptr_label=%u\n",
+                target_id, target_offset, target_ptr_label);
+
+      // Populate obj_map for lookup_object to find later
+      ucsan_byte_info *byte = to_byte_info(label_info);
+      uint32_t parent_id = byte->object_id;
+      int32_t parent_offset = (int32_t)byte->offset;
+      ucsan_tainted.obj_map->insert(parent_id, parent_offset, target_id);
+
+      // Set target's origin
+      if (target_id < ucsan_tainted.objects->size()) {
+        ucsan_tainted.objects->at(target_id).origin = {
+          parent_id, parent_offset, target_offset
+        };
+      }
+
+      // Return the saved ptr_label instead of converting to OP_EXTERNAL
+      if (target_ptr_label) {
+        return target_ptr_label;
+      }
+    }
+  }
+
+  // Default: convert byte label to pointer label
+  ucsan_ptr_info *ptr = to_ptr_info(label_info);
+  ptr->op = OP_EXTERNAL;
+  ptr->status = PTR_UNINITIALIZED;
+  return label0;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_pointer,
                                       void *concrete_addr, uint64_t unread) {
@@ -1695,50 +1747,11 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
   ucsan_label_info *label_info = get_label_info(label0);
 
   if (is_pointer) {
-    if (label0 >= UCSAN_CONST_OFFSET && label_info->common.op == OP_NONE) {
-      // the pointer's value is these seed bytes (see record_placement)
-      {
-        ucsan_byte_info *b = to_byte_info(label_info);
-        record_placement(b->object_id, b->offset, n);
-      }
-      // Check if the concrete pointer value points to a symbolize_input object
-      if (__symbolize_addr_map_inited && concrete_addr && n == sizeof(void*)) {
-        void *concrete_val = *(void **)concrete_addr;
-        if (concrete_val) {
-          uint32_t target_id, target_offset;
-          ucsan_label target_ptr_label;
-          if (__symbolize_addr_map.find(concrete_val, &target_id, &target_offset,
-                                         &target_ptr_label)) {
-            UCSAN_OUT("load_pointer_shadow: symbolize_input hit: target_id=%u, "
-                      "target_offset=%u, ptr_label=%u\n",
-                      target_id, target_offset, target_ptr_label);
-
-            // Populate obj_map for lookup_object to find later
-            ucsan_byte_info *byte = to_byte_info(label_info);
-            uint32_t parent_id = byte->object_id;
-            int32_t parent_offset = (int32_t)byte->offset;
-            ucsan_tainted.obj_map->insert(parent_id, parent_offset, target_id);
-
-            // Set target's origin
-            if (target_id < ucsan_tainted.objects->size()) {
-              ucsan_tainted.objects->at(target_id).origin = {
-                parent_id, parent_offset, target_offset
-              };
-            }
-
-            // Return the saved ptr_label instead of converting to OP_EXTERNAL
-            if (target_ptr_label) {
-              return target_ptr_label;
-            }
-          }
-        }
-      }
-
-      // Default: convert byte label to pointer label
-      ucsan_ptr_info *ptr = to_ptr_info(label_info);
-      ptr->op = OP_EXTERNAL;
-      ptr->status = PTR_UNINITIALIZED;
-    }
+    if (label0 >= UCSAN_CONST_OFFSET && label_info->common.op == OP_NONE)
+      return seed_bytes_to_pointer(
+          label0, n,
+          concrete_addr && n == sizeof(void *) ? *(void **)concrete_addr
+                                               : nullptr);
     return label0;
   }
 
@@ -2629,6 +2642,65 @@ ucsan_label ucsan_trace_unsized_global(uint64_t addr) {
   seen[nseen++] = {label, addr};
   UCSAN_OUT("ucsan_trace_unsized_global: label=%u, base=%p\n", label,
             (void *)addr);
+  return label;
+}
+
+// The pointer label of `inttoptr v` (op is v's label, width its bytes): a
+// pointer the program makes of an integer is one it could have loaded.
+//  - v is seed bytes (an OP_NONE byte label, as an integer load of them
+//    gives): a pointer made of them, as ucsan_load_pointer_shadow makes one,
+//    and those bytes are a placement (record_placement).  sg_page()'s
+//    `page_link & ~3` and page_to_virt()'s `vmemmap_base`, loaded as u64.
+//  - v has no label and is not NULL: an address that is no memory of ours --
+//    canonical, but unmapped (a kernel-half address, which no user process
+//    has) -- is a pseudo pointer, whose object check_pointer allocates on
+//    first use and grows as it is used.  Without one the access faulted.  The
+//    label is a fresh pointer slot of the super object, the same one for the
+//    same address (a fixed address is one object, however often the program
+//    computes it), so the object has a place in the seed.  Not: the program's
+//    own memory (the image, a stack, the heap: `(unsigned long)&x` and back),
+//    a small value (NULL plus a field, check_pointer's NULL dereference), an
+//    ERR_PTR, or a non-canonical address -- LIST_POISON and the like, which
+//    exist to fault when dereferenced.  (UCSanPass leaves a constant operand
+//    alone for the same reason: the kernel's constant pointers are those
+//    sentinels.)
+// Any other label is already a pointer's, or UBI's: it stays.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+ucsan_label ucsan_int_to_pointer(uint64_t v, ucsan_label op, uint64_t width) {
+  if (op == kUninitializedLabel)
+    return op;
+  if (op >= UCSAN_CONST_OFFSET) {
+    if (get_label_info(op)->common.op == OP_NONE)
+      return seed_bytes_to_pointer(op, width, (void *)v);
+    return op;
+  }
+  if (op != 0)
+    return op;
+
+  if (v < ucsan_object_size_limit() || v >= (uint64_t)-4095)
+    return 0;
+  // canonical: bits 63..47 all equal
+  uint64_t top = v >> 47;
+  if (top != 0 && top != 0x1ffff)
+    return 0;
+  char *image = &__executable_start ? &__executable_start : &__dso_handle;
+  if (image <= (char *)v && (char *)v <= &end)
+    return 0;
+  if (top == 0 && IsAccessibleMemoryRange((uptr)v, 1))
+    return 0;
+
+  // a handful of fixed addresses per run; past the table, the old behavior
+  static object_info seen[1024];  // {label, address}
+  static unsigned nseen;
+  for (unsigned i = 0; i < nseen; ++i)
+    if (seen[i].offset == v)
+      return seen[i].label;
+  if (nseen == sizeof(seen) / sizeof(seen[0]))
+    return 0;
+  ucsan_label label =
+      create_label_from_super_object(sizeof(void *), /*is_pointer=*/true).label;
+  seen[nseen++] = {label, v};
+  UCSAN_OUT("ucsan_int_to_pointer: label=%u, address=%p\n", label, (void *)v);
   return label;
 }
 

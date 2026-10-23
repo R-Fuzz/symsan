@@ -473,6 +473,7 @@ class UCSan {
   FunctionCallee UCTraceAllocaFn;
   FunctionCallee UCTraceGlobalFn;
   FunctionCallee UCTraceUnsizedGlobalFn;
+  FunctionCallee UCIntToPointerFn;
   FunctionCallee UCCheckGlobalBoundsFn;
   FunctionCallee UCTraceWarnFn;
   FunctionCallee UCPushStackFrameFn;
@@ -964,6 +965,16 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
       "ucsan_trace_unsized_global",
       FunctionType::get(PrimitiveShadowTy, {Int64Ty}, false));
   F = dyn_cast<Function>(UCTraceUnsizedGlobalFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // i16 ucsan_int_to_pointer(i64 Value, i16 Label, i64 Width)
+  // The pointer label of an inttoptr, see visitCastInst.
+  UCIntToPointerFn = M.getOrInsertFunction(
+      "ucsan_int_to_pointer",
+      FunctionType::get(PrimitiveShadowTy, {Int64Ty, PrimitiveShadowTy, Int64Ty},
+                        false));
+  F = dyn_cast<Function>(UCIntToPointerFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -6647,6 +6658,27 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
 void UCSanVisitor::visitCastInst(CastInst &CI) {
   // Propagate shadow through cast
   Value *Shadow = UF.getShadow(CI.getOperand(0));
+  // A pointer made of an integer is one the program could have loaded: the
+  // runtime makes a pointer label of seed bytes, as a pointer load does, or
+  // of an unlabeled address that is no memory of ours (ucsan_int_to_pointer).
+  // Not of a constant: the kernel's are sentinels (ERR_PTR, LIST_POISON),
+  // which must fault when dereferenced, not become objects.
+  Value *Op = CI.getOperand(0);
+  if (isa<IntToPtrInst>(CI) && !isa<Constant>(Op) &&
+      Op->getType()->isIntegerTy() &&
+      Op->getType()->getIntegerBitWidth() <= 64) {
+    IRBuilder<> IRB(&CI);
+    Value *V = IRB.CreateZExtOrTrunc(Op, UF.UC.Int64Ty);
+    if (V != Op)
+      UF.UC.markNosanitize(V);
+    unsigned Width = (Op->getType()->getIntegerBitWidth() + 7) / 8;
+    CallInst *Label = IRB.CreateCall(
+        UF.UC.UCIntToPointerFn,
+        {V, Shadow, ConstantInt::get(UF.UC.Int64Ty, Width)});
+    Label->addRetAttr(Attribute::ZExt);
+    UF.UC.markNosanitize(Label);
+    Shadow = Label;
+  }
   UF.setShadow(&CI, Shadow);
 }
 
