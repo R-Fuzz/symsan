@@ -134,10 +134,8 @@ fun:fprintf=ignore
 fun:vfprintf=ignore
 fun:printf=ignore
 fun:vprintf=ignore
-fun:snprintf=ignore
-fun:vsnprintf=ignore
-fun:sprintf=ignore
-fun:vsprintf=ignore
+# (not snprintf/sprintf/vsnprintf/vsprintf: they write the buffer they are
+# given, so their stubs resign it like any out-of-scope callee's)
 fun:fwrite=ignore
 fun:fwrite_unlocked=ignore
 fun:fflush=ignore
@@ -157,6 +155,7 @@ fun:_copy_from_user=size2
 # explicit byte-count args for taint comparison/search/copy functions
 fun:memcpy=size2
 fun:memmove=size2
+fun:memset=size2
 fun:memcmp=size2
 fun:bcmp=size2
 fun:strncmp=size2
@@ -182,3 +181,6 @@ fun:strchr=retptr0
 fun:strrchr=retptr0
 fun:memchr=retptr0
 fun:memrchr=retptr0
+# stpcpy returns the end of its copy in dest (sprintf(buf, "%s", s) becomes
+# stpcpy(buf, s) - buf); it has no op2 to stash a label in, and needs none
+fun:stpcpy=retptr0

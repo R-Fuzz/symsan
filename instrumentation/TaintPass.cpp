@@ -14,6 +14,7 @@
 
 //#include "defs.h"
 #include "branch_id.h"
+#include "Bitfield.h"
 #include "UCSanSummary.h"
 
 #include <optional>
@@ -212,6 +213,9 @@ enum {
   DfsanFpMax      = 94, // fp_max
   DfsanFpCopysign = 95, // fp_copysign
   DfsanBitReverse = 109, // bitreverse (last_llvm_op + 42)
+  DfsanCttz       = 112, // cttz (last_llvm_op + 45)
+  DfsanCtlz       = 113, // ctlz
+  DfsanCtpop      = 114, // ctpop
 };
 // Rounding-mode selector (must match __dfsan::fp_rounding_mode in dfsan.h).
 enum {
@@ -540,7 +544,9 @@ class Taint {
   FunctionType *TaintUnionFnTy;
   FunctionType *TaintGetWideFnTy;
   FunctionType *TaintUnionLoadFnTy;
+  FunctionType *TaintUnionLoadPartialFnTy;
   FunctionType *TaintUnionStoreFnTy;
+  FunctionType *TaintStoreRMWFnTy;
   FunctionType *TaintGEPOffsetFnTy;
   FunctionType *TaintUnimplementedFnTy;
   FunctionType *TaintWrapperExternWeakNullFnTy;
@@ -568,7 +574,9 @@ class Taint {
   FunctionCallee TaintUnionFn;
   FunctionCallee TaintGetWideFn;
   FunctionCallee TaintUnionLoadFn;
+  FunctionCallee TaintUnionLoadPartialFn;
   FunctionCallee TaintUnionStoreFn;
+  FunctionCallee TaintStoreRMWFn;
   FunctionCallee TaintGEPOffsetFn;
   FunctionCallee TaintUnimplementedFn;
   FunctionCallee TaintWrapperExternWeakNullFn;
@@ -593,6 +601,7 @@ class Taint {
   FunctionCallee TaintTraceGlobalFn;
   FunctionCallee TaintDebugFn;
   FunctionCallee TaintMinimizeLabelFn;
+  FunctionCallee TaintAssumeFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
   /// Read-only global arrays eligible to be treated as lookup tables, mapped to
   /// {num_elements, element_size}.  Computed once, before anything is
@@ -811,6 +820,10 @@ struct TaintFunction {
   void checkBounds(Value *Ptr, Value *Size, Instruction *Pos);
   void solveBounds(Value *Ptr, Value *Size, Instruction *Pos);
   void hoistBoundsChecks();
+  Value *unionLabel(IRBuilder<> &IRB, Value *L1, Value *L2, unsigned Op,
+                    unsigned Bits, Value *V1, Value *V2);
+  Value *labelForSCEV(const SCEV *S, ScalarEvolution &SE,
+                      SCEVExpander &Expander, Instruction *InsertPt);
 
   /// XXX: because we never collapse taint labels for aggregate types,
   ///      we also do not expand taint labels from an aggreated primitive
@@ -822,8 +835,9 @@ struct TaintFunction {
   /// LS({T1,T2, ...}, Addr) = {LS(T1, SubAdrr),LS(T2, SubAddr),...}
   /// LS([n x T], Addr) = [n x LS(T, SubAddr)]
   /// LS(other types, Addr) = LS(PS, Addr)
+  /// Unread: bytes of a primitive no use reads (see Bitfield.h)
   Value *loadShadow(Type *T, Value *Addr, uint64_t Size, Align Alignment,
-                    Instruction *Pos);
+                    Instruction *Pos, uint64_t Unread = 0);
 
   /// XXX: we do not union taint labels for aggregate types before store;
   ///      instead, we store each privimitive field individually.
@@ -841,7 +855,8 @@ struct TaintFunction {
 private:
   /// Loads a primitive shadow label
   Value *loadPrimitiveShadow(Value *Addr, uint64_t Size, uint64_t SizeInBits,
-                             uint64_t Align, IRBuilder<> &IRB);
+                             uint64_t Align, IRBuilder<> &IRB,
+                             uint64_t Unread = 0);
   /// Loads shadow recursively for aggregate types
   Value *loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                              Type *SubTy, Value *Addr, uint64_t Size,
@@ -858,6 +873,7 @@ private:
   static const uint8_t TrueBranchLoopExit = 0x2;
   static const uint8_t FalseBranchLoopExit = 0x1;
   static const uint8_t LoopExitBranch = TrueBranchLoopExit | FalseBranchLoopExit;
+  static const uint8_t SelectCondition = 0x20;  // as in dfsan.h
 };
 
 class TaintVisitor : public InstVisitor<TaintVisitor> {
@@ -1512,6 +1528,242 @@ void Taint::writeBranchMap(Module &M) {
   OS << Buf;
 }
 
+// A load the frontend marks as a bool (!range [0, 2): clang's _Bool, and
+// whatever the optimizer derived from one) is trusted to be 0 or 1, and
+// codegen uses the loaded byte itself as the i1.  But the byte can come from
+// an input -- a UCSan seed's object, a global UCSan symbolized, a file -- and
+// hold anything, a trap representation: the target then branched on the whole
+// byte (a condition recorded as 0xff), while SymSan evaluated the frontend's
+// trunc/icmp of it to 1, and the branch was a value mismatch.  The solver makes
+// such bytes itself (0xff satisfies `b != 0`), and UCSan reuses a seed byte
+// across types (the super object's offsets depend on the path), so it cannot be
+// ruled out at the source.  Make the load's value the bool it stands for,
+// zext(v != 0) -- for 0 and 1 nothing changes -- and drop the range so nothing
+// downstream relies on it.  `!= 0` rather than the low bit, so that false is
+// only 0 and a solution keeps meaning the same in a build without this.
+//
+// The same goes for an i1 load (GlobalOpt shrinks a bool global to i1): its
+// byte is assumed 0 or 1 just the same.  It becomes an i8 load and `!= 0`.
+// llvm.umin/umax/smin/smax and llvm.abs have no label op: lower them to the
+// icmp + select they stand for, so the result carries the label of the operand
+// it picked and the comparison is traced like any select's.  Without it the
+// result went concrete -- instcombine turns the kernel's min_t(size_t, len,
+// PAGE_SIZE) before a copy into one.  Codegen matches the select back.
+static void lowerMinMaxAbs(Function &F) {
+  SmallVector<IntrinsicInst *, 8> Worklist;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (II->getType()->isIntegerTy() &&
+          (isa<MinMaxIntrinsic>(II) || II->getIntrinsicID() == Intrinsic::abs))
+        Worklist.push_back(II);
+  for (IntrinsicInst *II : Worklist) {
+    IRBuilder<> IRB(II);
+    Value *A = II->getArgOperand(0);
+    Value *Res;
+    if (auto *MM = dyn_cast<MinMaxIntrinsic>(II)) {
+      Value *B = MM->getRHS();
+      Res = IRB.CreateSelect(IRB.CreateICmp(MM->getPredicate(), A, B), A, B);
+    } else {
+      // abs(INT_MIN) wraps unless the poison flag is set; either way the
+      // negation below gives INT_MIN back, the value the program sees.
+      Value *Neg = IRB.CreateNeg(A);
+      Res = IRB.CreateSelect(
+          IRB.CreateICmpSLT(A, ConstantInt::get(A->getType(), 0)), Neg, A);
+    }
+    Res->takeName(II);
+    II->replaceAllUsesWith(Res);
+    II->eraseFromParent();
+  }
+}
+
+// More intrinsics with no label op, lowered for the same reason, to the
+// operations they stand for (none of which can trap, shift out of range or
+// carry a poison flag, so they add no UB check the program does not have):
+//  - llvm.fshl/fshr, the kernel's rol32/ror32 (jhash, siphash): shl, lshr and
+//    or by the amount modulo the width, the other operand where it is 0;
+//  - llvm.u/s{add,sub}.sat: the wrapping operation, and the bound where it
+//    overflowed (icmp + select);
+//  - llvm.u/s{add,sub}.with.overflow and umul.with.overflow, the kernel's
+//    check_add_overflow / check_mul_overflow: the wrapping operation and its
+//    overflow test -- for umul, r / b != a (b != 0), with no wider multiply,
+//    which the solvers decline past 64 bits.  smul.with.overflow is left
+//    alone.
+// Codegen matches most of them back.
+static void lowerArithIntrinsics(Function &F) {
+  SmallVector<IntrinsicInst *, 8> Worklist;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+      Type *T = II->getArgOperand(0)->getType();
+      if (!T->isIntegerTy() || T->getIntegerBitWidth() > 64)
+        continue;
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::fshl: case Intrinsic::fshr:
+      case Intrinsic::uadd_sat: case Intrinsic::usub_sat:
+      case Intrinsic::sadd_sat: case Intrinsic::ssub_sat:
+      case Intrinsic::uadd_with_overflow: case Intrinsic::usub_with_overflow:
+      case Intrinsic::sadd_with_overflow: case Intrinsic::ssub_with_overflow:
+      case Intrinsic::umul_with_overflow:
+        Worklist.push_back(II);
+        break;
+      default:
+        break;
+      }
+    }
+  for (IntrinsicInst *II : Worklist) {
+    IRBuilder<> IRB(II);
+    Value *A = II->getArgOperand(0), *B = II->getArgOperand(1);
+    auto *T = cast<IntegerType>(A->getType());
+    unsigned W = T->getBitWidth();
+    auto C = [&](uint64_t V) { return ConstantInt::get(T, V); };
+    APInt Max = APInt::getMaxValue(W), SMax = APInt::getSignedMaxValue(W),
+          SMin = APInt::getSignedMinValue(W);
+    // signed overflow of S = A op B: for add, A and B agree in sign and S
+    // does not; for sub, they differ and S differs from A
+    auto SOvf = [&](Value *S, bool Add) {
+      Value *X = IRB.CreateXor(A, S);
+      Value *Y = Add ? IRB.CreateXor(B, S) : IRB.CreateXor(A, B);
+      return IRB.CreateICmpSLT(IRB.CreateAnd(X, Y), C(0));
+    };
+    Value *Res = nullptr;
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::fshl:
+    case Intrinsic::fshr: {
+      bool L = II->getIntrinsicID() == Intrinsic::fshl;
+      // W is a power of two for every integer type it is used on; urem
+      // otherwise
+      Value *Sh = isPowerOf2_32(W) ? IRB.CreateAnd(II->getArgOperand(2), C(W - 1))
+                                   : IRB.CreateURem(II->getArgOperand(2), C(W));
+      // W - Sh, which is W for Sh == 0: masked to stay in range (that case
+      // is selected away below)
+      Value *Rev = IRB.CreateSub(C(W), Sh);
+      Rev = isPowerOf2_32(W) ? IRB.CreateAnd(Rev, C(W - 1))
+                             : IRB.CreateURem(Rev, C(W));
+      Value *V = L ? IRB.CreateOr(IRB.CreateShl(A, Sh), IRB.CreateLShr(B, Rev))
+                   : IRB.CreateOr(IRB.CreateLShr(B, Sh), IRB.CreateShl(A, Rev));
+      Res = IRB.CreateSelect(IRB.CreateICmpEQ(Sh, C(0)), L ? A : B, V);
+      break;
+    }
+    case Intrinsic::uadd_sat: {
+      Value *S = IRB.CreateAdd(A, B);
+      Res = IRB.CreateSelect(IRB.CreateICmpULT(S, A), ConstantInt::get(T, Max), S);
+      break;
+    }
+    case Intrinsic::usub_sat:
+      Res = IRB.CreateSelect(IRB.CreateICmpULT(A, B), C(0), IRB.CreateSub(A, B));
+      break;
+    case Intrinsic::sadd_sat:
+    case Intrinsic::ssub_sat: {
+      bool Add = II->getIntrinsicID() == Intrinsic::sadd_sat;
+      Value *S = Add ? IRB.CreateAdd(A, B) : IRB.CreateSub(A, B);
+      // past which bound: A's side
+      Value *Bound = IRB.CreateSelect(IRB.CreateICmpSLT(A, C(0)),
+                                      ConstantInt::get(T, SMin),
+                                      ConstantInt::get(T, SMax));
+      Res = IRB.CreateSelect(SOvf(S, Add), Bound, S);
+      break;
+    }
+    case Intrinsic::uadd_with_overflow:
+    case Intrinsic::usub_with_overflow:
+    case Intrinsic::sadd_with_overflow:
+    case Intrinsic::ssub_with_overflow:
+    case Intrinsic::umul_with_overflow: {
+      Intrinsic::ID ID = II->getIntrinsicID();
+      Value *S, *O;
+      if (ID == Intrinsic::uadd_with_overflow) {
+        S = IRB.CreateAdd(A, B);
+        O = IRB.CreateICmpULT(S, A);
+      } else if (ID == Intrinsic::usub_with_overflow) {
+        S = IRB.CreateSub(A, B);
+        O = IRB.CreateICmpULT(A, B);
+      } else if (ID == Intrinsic::umul_with_overflow) {
+        S = IRB.CreateMul(A, B);
+        Value *BZero = IRB.CreateICmpEQ(B, C(0));
+        // divided by 1 where B is 0, and that case is not an overflow
+        Value *D = IRB.CreateSelect(BZero, C(1), B);
+        O = IRB.CreateAnd(IRB.CreateNot(BZero),
+                          IRB.CreateICmpNE(IRB.CreateUDiv(S, D), A));
+      } else {
+        bool Add = ID == Intrinsic::sadd_with_overflow;
+        S = Add ? IRB.CreateAdd(A, B) : IRB.CreateSub(A, B);
+        O = SOvf(S, Add);
+      }
+      Res = IRB.CreateInsertValue(PoisonValue::get(II->getType()), S, 0);
+      Res = IRB.CreateInsertValue(Res, O, 1);
+      break;
+    }
+    default:
+      continue;
+    }
+    Res->takeName(II);
+    II->replaceAllUsesWith(Res);
+    II->eraseFromParent();
+  }
+}
+
+static void normalizeBoolLoads(Function &F) {
+  SmallVector<LoadInst *, 16> Loads;
+  SmallVector<LoadInst *, 4> I1Loads;
+  for (Instruction &I : instructions(F)) {
+    auto *LI = dyn_cast<LoadInst>(&I);
+    if (!LI || !LI->getType()->isIntegerTy())
+      continue;
+    if (LI->getType()->isIntegerTy(1)) {
+      if (LI->isSimple())
+        I1Loads.push_back(LI);
+      continue;
+    }
+    MDNode *Range = LI->getMetadata(LLVMContext::MD_range);
+    if (!Range || Range->getNumOperands() != 2)
+      continue;
+    auto *Lo = mdconst::dyn_extract<ConstantInt>(Range->getOperand(0));
+    auto *Hi = mdconst::dyn_extract<ConstantInt>(Range->getOperand(1));
+    if (!Lo || !Hi || !Lo->isZero() || !Hi->equalsInt(2))
+      continue;
+    Loads.push_back(LI);
+  }
+  for (LoadInst *LI : Loads) {
+    LI->setMetadata(LLVMContext::MD_range, nullptr);
+    IRBuilder<> IRB(LI->getNextNode());
+    Value *NonZero = IRB.CreateICmpNE(LI, ConstantInt::get(LI->getType(), 0));
+    Value *Bool = IRB.CreateZExt(NonZero, LI->getType());
+    LI->replaceUsesWithIf(Bool, [NonZero](Use &U) {
+      return U.getUser() != NonZero;
+    });
+  }
+  for (LoadInst *LI : I1Loads) {
+    IRBuilder<> IRB(LI);
+    LoadInst *Byte = IRB.CreateAlignedLoad(IRB.getInt8Ty(),
+                                           LI->getPointerOperand(),
+                                           LI->getAlign());
+    Byte->copyMetadata(*LI);  // UCSan's checked marker, debug location, ...
+    Byte->setMetadata(LLVMContext::MD_range, nullptr);
+    Value *NonZero = IRB.CreateICmpNE(Byte, IRB.getInt8(0));
+    LI->replaceAllUsesWith(NonZero);
+    LI->eraseFromParent();
+  }
+  // An i1 store becomes a store of its zext, the byte codegen writes, so that
+  // the byte's label is 8 bits wide like the i8 load above reads.  Stored as
+  // is, the 1-bit label (a comparison) went through union_store's per-byte
+  // Extract of 8 bits from a 1-bit value, which neither solver can build: the
+  // load's `!= 0` failed to parse in fastgen and was a z3 sort error
+  // (pci_acpi_crs_quirks's pci_use_crs, a bool global GlobalOpt shrank).
+  SmallVector<StoreInst *, 4> I1Stores;
+  for (Instruction &I : instructions(F)) {
+    auto *SI = dyn_cast<StoreInst>(&I);
+    if (SI && SI->isSimple() &&
+        SI->getValueOperand()->getType()->isIntegerTy(1))
+      I1Stores.push_back(SI);
+  }
+  for (StoreInst *SI : I1Stores) {
+    IRBuilder<> IRB(SI);
+    Value *Byte = IRB.CreateZExt(SI->getValueOperand(), IRB.getInt8Ty());
+    StoreInst *NS = IRB.CreateAlignedStore(Byte, SI->getPointerOperand(),
+                                           SI->getAlign());
+    NS->copyMetadata(*SI);  // UCSan's checked marker, debug location, ...
+    SI->eraseFromParent();
+  }
+}
+
 void Taint::addContextRecording(Function &F) {
   // Most code from Angora
   BasicBlock *BB = &F.getEntryBlock();
@@ -1648,11 +1900,22 @@ bool Taint::initializeModule(Module &M) {
   Type *TaintUnionLoadArgs[4] = { PrimitiveShadowPtrTy, IntptrTy, Int64Ty, Int64Ty };
   TaintUnionLoadFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintUnionLoadArgs, /*isVarArg=*/ false);
+  // as __taint_union_load, and the bytes no use reads (see Bitfield.h)
+  Type *TaintUnionLoadPartialArgs[5] = { PrimitiveShadowPtrTy, IntptrTy,
+      Int64Ty, Int64Ty, Int64Ty };
+  TaintUnionLoadPartialFnTy = FunctionType::get(
+      PrimitiveShadowTy, TaintUnionLoadPartialArgs, /*isVarArg=*/ false);
   // args: shadow_ptr, n (bytes), size_in_bits, align
   Type *TaintUnionStoreArgs[4] = { PrimitiveShadowTy, PrimitiveShadowPtrTy,
       IntptrTy, Int64Ty };
   TaintUnionStoreFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintUnionStoreArgs, /*isVarArg=*/ false);
+  // args: label, shadow_ptr, n (bytes), align, load's label, label with the
+  // load's as zero, touched bytes (see Bitfield.h)
+  Type *TaintStoreRMWArgs[7] = { PrimitiveShadowTy, PrimitiveShadowPtrTy,
+      IntptrTy, Int64Ty, PrimitiveShadowTy, PrimitiveShadowTy, Int64Ty };
+  TaintStoreRMWFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), TaintStoreRMWArgs, /*isVarArg=*/ false);
   TaintGEPOffsetFnTy = FunctionType::get(
       PrimitiveShadowTy,
       { PrimitiveShadowTy, VoidPtrTy, VoidPtrTy }, /*isVarArg=*/ false);
@@ -1978,6 +2241,9 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     AL = AL.addRetAttribute(M.getContext(), Attribute::ZExt);
     TaintUnionLoadFn =
         Mod->getOrInsertFunction("__taint_union_load", TaintUnionLoadFnTy, AL);
+    TaintUnionLoadPartialFn =
+        Mod->getOrInsertFunction("__taint_union_load_partial",
+                                 TaintUnionLoadPartialFnTy, AL);
   }
   {
     AttributeList AL;
@@ -1985,6 +2251,15 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     TaintUnionStoreFn =
         Mod->getOrInsertFunction("__taint_union_store", TaintUnionStoreFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 4, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 5, Attribute::ZExt);
+    TaintStoreRMWFn =
+        Mod->getOrInsertFunction("__taint_store_rmw", TaintStoreRMWFnTy, AL);
   }
   {
     AttributeList AL;
@@ -2027,6 +2302,17 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     TaintMinimizeLabelFn =
         Mod->getOrInsertFunction("__taint_minimize_label", TaintMinimizeLabelFnTy, AL);
   }
+  {
+    // void __taint_assume(label, i1 holds): see handleUCSanCall
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
+    TaintAssumeFn = Mod->getOrInsertFunction(
+        "__taint_assume", AL, Type::getVoidTy(*Ctx), PrimitiveShadowTy,
+        Type::getInt1Ty(*Ctx));
+    TaintRuntimeFunctions.insert(TaintAssumeFn.getCallee()->stripPointerCasts());
+  }
 
   TaintRuntimeFunctions.insert(
       TaintUnionFn.getCallee()->stripPointerCasts());
@@ -2035,7 +2321,11 @@ void Taint::initializeRuntimeFunctions(Module &M) {
   TaintRuntimeFunctions.insert(
       TaintUnionLoadFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
+      TaintUnionLoadPartialFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
       TaintUnionStoreFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintStoreRMWFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintGEPOffsetFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -2397,16 +2687,25 @@ bool Taint::runImpl(Module &M) {
       // Other uses (e.g. store the function address somewhere) might be
       // called or compared or both - this case may not be handled correctly.
       // We will default to replacing with wrapper in cases we are unsure.
-      auto IsNotCmpUse = [](Use &U) -> bool {
+      //
+      // (now: only a comparison with null is left alone.  Against anything
+      // else the other side is a pointer the program stored, which is the
+      // wrapper, so `fp == memcpy` was false for fp = memcpy.)
+      auto IsNullCmp = [](User *Usr) {
+        return llvm::any_of(Usr->operands(), [](Value *V) {
+          return isa<ConstantPointerNull>(V);
+        });
+      };
+      auto IsNotCmpUse = [&IsNullCmp](Use &U) -> bool {
         User *Usr = U.getUser();
         if (ConstantExpr *CE = dyn_cast<ConstantExpr>(Usr)) {
           // This is the most common case for icmp ne null
-          if (CE->getOpcode() == Instruction::ICmp) {
+          if (CE->getOpcode() == Instruction::ICmp && IsNullCmp(CE)) {
             return false;
           }
         }
         if (Instruction *I = dyn_cast<Instruction>(Usr)) {
-          if (I->getOpcode() == Instruction::ICmp) {
+          if (I->getOpcode() == Instruction::ICmp && IsNullCmp(I)) {
             return false;
           }
         }
@@ -2453,6 +2752,9 @@ bool Taint::runImpl(Module &M) {
     if (!(F->getName()).starts_with("dfsw$"))
       addFrameTracing(*F);
     removeUnreachableBlocks(*F);
+    normalizeBoolLoads(*F);
+    lowerMinMaxAbs(*F);
+    lowerArithIntrinsics(*F);
 
     TaintFunction TF(*this, F, FnsWithNativeABI.count(F),
                      FnsWithForceZeroLabel.count(F));
@@ -2636,6 +2938,21 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
 
   StringRef BaseName = FName.drop_front(7); // skip "__dfsw_"
 
+  // An invariant UCSan found the code to rely on (UCSanPass's
+  // assumeAsmCallTarget): the condition's label goes to the solver, as a
+  // constraint of the path where it holds, and as one to solve for where it
+  // does not (the UCSan runtime then ends the run).
+  if (BaseName == "ucsan_assume") {
+    Value *Cond = CI->getArgOperand(0);
+    Value *Shadow = getShadow(Cond);
+    if (!TT.isZeroShadow(Shadow)) {
+      IRBuilder<> IRB(CI);
+      CallInst *A = IRB.CreateCall(TT.TaintAssumeFn, {Shadow, Cond});
+      SkipInsts.insert(A);
+    }
+    return true;
+  }
+
   auto GetFakeIORetShadow = [&]() -> Value * {
     // ucsan_custom.cpp simulates reads without forwarding to libc. For these
     // fake full-read paths the return value is derived from the requested
@@ -2654,18 +2971,24 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
 
   // Emit minimize hints for allocation size arguments
   SmallVector<unsigned, 2> SizeArgIndices;
+  // __taint_minimize_label also makes the label the allocation's symbolic
+  // size (its bound's l2), which __taint_solve_size compares with the byte
+  // size: so the label has to be the byte size's.  kmalloc(size, flags) has
+  // it first -- it was taken from the flags, and i915_deps_grow's memcpy size
+  // was checked against deps->gfp -- and calloc/reallocarray as a product,
+  // see below.
   if (BaseName == "malloc" || BaseName == "__libc_malloc" ||
       BaseName == "valloc" || BaseName == "__libc_valloc" ||
       BaseName == "pvalloc" || BaseName == "__libc_pvalloc" ||
-      BaseName == "kmalloc_large") {
+      BaseName == "kmalloc_large" || BaseName == "kmalloc" ||
+      BaseName == "__kmalloc") {
     SizeArgIndices.push_back(0);
   } else if (BaseName == "calloc" || BaseName == "__libc_calloc") {
     SizeArgIndices.push_back(0);
     SizeArgIndices.push_back(1);
   } else if (BaseName == "realloc" || BaseName == "__libc_realloc" ||
              BaseName == "aligned_alloc" ||
-             BaseName == "memalign" || BaseName == "__libc_memalign" ||
-             BaseName == "kmalloc" || BaseName == "__kmalloc") {
+             BaseName == "memalign" || BaseName == "__libc_memalign") {
     SizeArgIndices.push_back(1);
   } else if (BaseName == "reallocarray" || BaseName == "__libc_reallocarray") {
     SizeArgIndices.push_back(1);
@@ -2681,6 +3004,18 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
     if (Value *RetShadow = GetFakeIORetShadow()) {
       setShadow(CI, RetShadow);
     } else {
+      // Most of these wrappers never set SymSan's return label (memcpy,
+      // _copy_from_user, lseek, ...), and what this load then read was the
+      // label the last call left there: an earlier wrapped return value, a
+      // symbolic input naming a seed byte, given to _copy_from_user's
+      // concrete 0, and every `if (copy_from_user(...))` was a value
+      // mismatch.  Clear it before the call; a wrapper that sets it still
+      // does.
+      IRBuilder<> PreIRB(CI);
+      StoreInst *Clear = PreIRB.CreateAlignedStore(
+          TT.getZeroShadow(CI), getRetvalTLS(CI->getType(), PreIRB),
+          ShadowTLSAlignment);
+      SkipInsts.insert(Clear);
       LI = NextIRB.CreateAlignedLoad(
           TT.getShadowTy(CI), getRetvalTLS(CI->getType(), NextIRB),
           ShadowTLSAlignment, "_dfsret");
@@ -2691,13 +3026,40 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
 
   if (!SizeArgIndices.empty()) {
     IRBuilder<> IRB(LI ? LI->getNextNode() : Next);
+    Value *NoBounds = ConstantInt::get(TT.getShadowTy(CI), 0);
+    // two factors (calloc's nmemb and size): each is a hint of its own, and
+    // neither is the byte size, so only their product updates the bound
+    bool Product = SizeArgIndices.size() > 1;
     for (unsigned Idx : SizeArgIndices) {
       Value *Size = CI->getArgOperand(Idx);
       Value *Shadow = getShadow(Size);
       Value *Bounds = LI;
-      if (!Bounds) Bounds = ConstantInt::get(TT.getShadowTy(CI), 0);
-      if (!TT.isZeroShadow(Shadow)) {
+      if (!Bounds || Product) Bounds = NoBounds;
+      if (!TT.isZeroShadow(Shadow) && Size->getType()->isIntegerTy()) {
+        // __taint_minimize_label takes an i64 size; a wrapper matched by
+        // name may declare a narrower one (32-bit sizes in the kernel).
+        Size = IRB.CreateZExtOrTrunc(Size, TT.Int64Ty);
         IRB.CreateCall(TT.TaintMinimizeLabelFn, {Shadow, Size, Bounds});
+      }
+    }
+    if (Product && LI) {
+      Value *N = CI->getArgOperand(SizeArgIndices[0]);
+      Value *E = CI->getArgOperand(SizeArgIndices[1]);
+      if (N->getType()->isIntegerTy() && E->getType()->isIntegerTy()) {
+        auto wide = [&](Value *V) -> Value * {
+          Value *L = getShadow(V);
+          if (V->getType()->getIntegerBitWidth() < 64)
+            L = unionLabel(IRB, L, TT.ZeroPrimitiveShadow, Instruction::ZExt,
+                           64, V, ConstantInt::get(TT.Int64Ty, 0));
+          return L;
+        };
+        Value *N64 = IRB.CreateZExtOrTrunc(N, TT.Int64Ty);
+        Value *E64 = IRB.CreateZExtOrTrunc(E, TT.Int64Ty);
+        Value *Bytes = unionLabel(IRB, wide(N), wide(E), Instruction::Mul, 64,
+                                  N64, E64);
+        if (!TT.isZeroShadow(Bytes))
+          IRB.CreateCall(TT.TaintMinimizeLabelFn,
+                         {Bytes, IRB.CreateMul(N64, E64), LI});
       }
     }
   }
@@ -2754,6 +3116,12 @@ Value *TaintFunction::combineBinaryOperatorShadows(BinaryOperator *BO,
 // which is exactly what a concrete 128-bit operand needs; anything above this
 // would require a side channel, and nothing observed needs one.
 static const uint64_t kMaxOperandBits = 128;
+
+// Poison flags of an integer operation, passed to __taint_union in the high
+// byte of its op (runtime/dfsan/dfsan.h has the same values).
+static const uint16_t TaintPoisonNSW = 0x1;
+static const uint16_t TaintPoisonNUW = 0x2;
+static const uint16_t TaintPoisonExact = 0x4;
 
 Value *TaintFunction::combineShadows(Value *V1, Value *V2,
                                      uint16_t op,
@@ -2841,6 +3209,20 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   if (CmpInst *CI = dyn_cast<CmpInst>(Pos)) { // for both icmp and fcmp
     // op should be predicate
     op |= (CI->getPredicate() << 8);
+  } else if (Pos->getType()->isIntegerTy()) {
+    // An integer operation's poison flags, in the byte a comparison keeps its
+    // predicate in: the compiled code relies on them (sext(add nsw) became a
+    // 64-bit add, an sdiv exact a shift and a multiply), so the runtime
+    // assumes them on the path and reports a violation (__taint_union).
+    if (auto *OBO = dyn_cast<OverflowingBinaryOperator>(Pos)) {
+      if (OBO->hasNoSignedWrap())
+        op |= TaintPoisonNSW << 8;
+      if (OBO->hasNoUnsignedWrap())
+        op |= TaintPoisonNUW << 8;
+    }
+    if (auto *PEO = dyn_cast<PossiblyExactOperator>(Pos))
+      if (PEO->isExact())
+        op |= TaintPoisonExact << 8;
   }
   Value *Op = ConstantInt::get(TT.Int16Ty, op);
   Value *Size = ConstantInt::get(TT.Int16Ty, size);
@@ -3017,6 +3399,94 @@ void TaintFunction::solveBounds(Value *Ptr, Value* Size, Instruction *Pos) {
       {PtrShadow, Addr, SizeShadow, Size64, CID});
 }
 
+// A label for the operation Op over L1/V1 and L2/V2, at Bits bits, as an
+// instrumented instruction would make it (V1/V2 the concrete operands, a zero
+// label for a concrete one).
+Value *TaintFunction::unionLabel(IRBuilder<> &IRB, Value *L1, Value *L2,
+                                 unsigned Op, unsigned Bits, Value *V1,
+                                 Value *V2) {
+  if (TT.isZeroShadow(L1) && TT.isZeroShadow(L2))
+    return TT.ZeroPrimitiveShadow;
+  CallInst *Call = IRB.CreateCall(
+      TT.TaintUnionFn,
+      {L1, L2, ConstantInt::get(TT.Int16Ty, Op),
+       ConstantInt::get(TT.Int16Ty, Bits),
+       IRB.CreateZExtOrTrunc(V1, TT.Int64Ty),
+       IRB.CreateZExtOrTrunc(V2, TT.Int64Ty)});
+  Call->addRetAttr(Attribute::ZExt);
+  Call->addParamAttr(0, Attribute::ZExt);
+  Call->addParamAttr(1, Attribute::ZExt);
+  return Call;
+}
+
+// The label of S's value, built from its leaves' labels the way the
+// instructions computing it would have built it, or nullptr for a shape it
+// cannot say (an add recurrence, a min/max, ...).  A summarized range's size
+// is an expression over the loop's symbolic leaves -- `4 * n`, `(n - 1) * 8
+// + 4` -- and __taint_solve_size compares its label with its concrete value:
+// the label of one leaf alone recorded the size against the leaf
+// (snd_hdac_setup_channel_mapping: a loop over ints, 0x20 against n = 8),
+// and every such check was a value mismatch.
+Value *TaintFunction::labelForSCEV(const SCEV *S, ScalarEvolution &SE,
+                                   SCEVExpander &Expander,
+                                   Instruction *InsertPt) {
+  IRBuilder<> IRB(InsertPt);
+  if (!S->getType()->isIntegerTy())
+    return nullptr;
+  unsigned Bits = S->getType()->getIntegerBitWidth();
+  if (isa<SCEVConstant>(S))
+    return TT.ZeroPrimitiveShadow;
+  if (auto *U = dyn_cast<SCEVUnknown>(S)) {
+    if (!U->getValue()->getType()->isIntegerTy())
+      return nullptr;
+    return getShadow(U->getValue());
+  }
+  auto concrete = [&](const SCEV *X) {
+    return Expander.expandCodeFor(X, X->getType(), InsertPt);
+  };
+  if (auto *C = dyn_cast<SCEVCastExpr>(S)) {
+    unsigned Op = isa<SCEVZeroExtendExpr>(S)   ? Instruction::ZExt
+                  : isa<SCEVSignExtendExpr>(S) ? Instruction::SExt
+                  : isa<SCEVTruncateExpr>(S)   ? Instruction::Trunc
+                                               : 0;
+    if (!Op)
+      return nullptr;
+    Value *L = labelForSCEV(C->getOperand(), SE, Expander, InsertPt);
+    if (!L)
+      return nullptr;
+    return unionLabel(IRB, L, TT.ZeroPrimitiveShadow, Op, Bits,
+                      concrete(C->getOperand()),
+                      ConstantInt::get(TT.Int64Ty, 0));
+  }
+  if (isa<SCEVAddExpr>(S) || isa<SCEVMulExpr>(S)) {
+    auto *N = cast<SCEVNAryExpr>(S);
+    unsigned Op = isa<SCEVAddExpr>(S) ? Instruction::Add : Instruction::Mul;
+    // left to right, as (((a op b) op c) ...), with the partial value
+    const SCEV *Acc = N->getOperand(0);
+    Value *L = labelForSCEV(Acc, SE, Expander, InsertPt);
+    if (!L)
+      return nullptr;
+    for (unsigned I = 1; I < N->getNumOperands(); ++I) {
+      const SCEV *X = N->getOperand(I);
+      Value *LX = labelForSCEV(X, SE, Expander, InsertPt);
+      if (!LX)
+        return nullptr;
+      L = unionLabel(IRB, L, LX, Op, Bits, concrete(Acc), concrete(X));
+      Acc = Op == Instruction::Add ? SE.getAddExpr(Acc, X) : SE.getMulExpr(Acc, X);
+    }
+    return L;
+  }
+  if (auto *D = dyn_cast<SCEVUDivExpr>(S)) {
+    Value *L1 = labelForSCEV(D->getLHS(), SE, Expander, InsertPt);
+    Value *L2 = labelForSCEV(D->getRHS(), SE, Expander, InsertPt);
+    if (!L1 || !L2)
+      return nullptr;
+    return unionLabel(IRB, L1, L2, Instruction::UDiv, Bits,
+                      concrete(D->getLHS()), concrete(D->getRHS()));
+  }
+  return nullptr;
+}
+
 // Collect all SCEVUnknown values from a SCEV expression.
 static void collectSCEVUnknowns(const SCEV *S,
                                 SmallVectorImpl<Value *> &Unknowns) {
@@ -3032,6 +3502,25 @@ static void collectSCEVUnknowns(const SCEV *S,
     collectSCEVUnknowns(UDiv->getRHS(), Unknowns);
   }
   // SCEVConstant has no unknowns
+}
+
+// Under UCSan every pointer SymSan is given is the result of
+// ucsan_check_pointer, the address actually accessed.  SCEV cannot see through
+// that call, so hoisting reads the recurrence off the pointer it was given,
+// and that is the same address only when the pointer is known to be real: a
+// stack object or a global, which ucsan_check_pointer returns unchanged.
+// Anything else may be a UCSan pseudo-pointer (an argument, a loaded pointer,
+// a call result), whose value is not an address at all -- 0 in the seed, while
+// every access through it is materialized: hoisted, it was a SymSan NULL
+// dereference (calc_sb_1_csum in the kernel eval).  Such accesses keep their
+// per-iteration checks on the checked pointer.
+static bool isRealAddress(const Value *Ptr, LoopInfo *LI) {
+  SmallVector<const Value *, 4> Objs;
+  getUnderlyingObjects(Ptr, Objs, LI);
+  for (const Value *Obj : Objs)
+    if (!isa<AllocaInst>(Obj) && !isa<GlobalVariable>(Obj))
+      return false;
+  return !Objs.empty();
 }
 
 // Hoist __taint_check_bounds / __taint_solve_bounds calls out of loops using
@@ -3164,7 +3653,18 @@ void TaintFunction::hoistBoundsChecks() {
         if (Summary.AccessSize != 1)
           TotalVal = IRB.CreateMul(
               Count64, ConstantInt::get(TT.Int64Ty, Summary.AccessSize));
+        // the label of TotalVal, not of Count: the size is Count elements of
+        // AccessSize bytes (see labelForSCEV)
         Value *SizeShadow = getShadow(Count);
+        if (Count->getType()->getIntegerBitWidth() < 64)
+          SizeShadow = unionLabel(IRB, SizeShadow, TT.ZeroPrimitiveShadow,
+                                  Instruction::ZExt, 64, Count,
+                                  ConstantInt::get(TT.Int64Ty, 0));
+        if (Summary.AccessSize != 1)
+          SizeShadow = unionLabel(IRB, SizeShadow, TT.ZeroPrimitiveShadow,
+                                  Instruction::Mul, 64, Count64,
+                                  ConstantInt::get(TT.Int64Ty,
+                                                   Summary.AccessSize));
 
         // Soft solve_size hint only: the guard value is a heuristic for the
         // write count, not a proven bound, so a hard check_bounds here would
@@ -3264,6 +3764,11 @@ void TaintFunction::hoistBoundsChecks() {
         StrBase = GEP->getPointerOperand();
       }
       if (!StrBase) continue;
+      // With no check of the string in the loop to hoist, the summary would
+      // hand __taint_solve_str_bounds the pointer as it is, which under UCSan
+      // may be a pseudo-pointer it then strlen()s (optimize_nops' instr, NULL
+      // in the seed): only a real address is summarized, see isRealAddress.
+      if (ClWithUCSan && !StrUCChk && !isRealAddress(StrBase, LI)) continue;
 
       // Collect __taint_check_bounds calls in this loop
       SmallVector<CallInst *, 8> BoundsChecks;
@@ -3290,12 +3795,22 @@ void TaintFunction::hoistBoundsChecks() {
         Value *UCLabel = StrUCChk->getArgOperand(1);
         if (!L->isLoopInvariant(UCLabel))
           UCLabel = ConstantInt::get(UCLabel->getType(), 0);
+        // The access size is loop-variant when the loop copies in chunks
+        // (`min(len - done, 2G)` around a memcpy): it is defined in the loop
+        // and does not reach the preheader.  One byte is enough to
+        // materialize the object.
+        Value *UCSize = StrUCChk->getArgOperand(2);
+        if (!L->isLoopInvariant(UCSize))
+          UCSize = ConstantInt::get(UCSize->getType(), 1);
         StrPtr = IRB.CreateCall(StrUCChk->getCalledFunction(),
-            {StrPtr, UCLabel, StrUCChk->getArgOperand(2),
-             ConstantInt::getTrue(*TT.Ctx), StrUCChk->getArgOperand(4)});
+            {StrPtr, UCLabel, UCSize,
+             ConstantInt::getTrue(*TT.Ctx), StrUCChk->getArgOperand(4),
+             ConstantInt::get(StrUCChk->getArgOperand(5)->getType(), 1)});
       }
 
       DenseSet<Value *> EmittedBufs;
+      // the checks a __taint_solve_str_bounds stands for; the others stay
+      SmallVector<CallInst *, 8> Covered;
       for (CallInst *CI : BoundsChecks) {
         Value *AddrLabel = CI->getArgOperand(0);  // buf shadow (bounds info)
         Value *Addr = CI->getArgOperand(1);       // buf concrete address
@@ -3332,7 +3847,10 @@ void TaintFunction::hoistBoundsChecks() {
         }
 
         // One call per unique buffer
-        if (!EmittedBufs.insert(AddrLabel).second) continue;
+        if (EmittedBufs.count(AddrLabel)) {
+          Covered.push_back(CI);
+          continue;
+        }
 
         // Resolve buf_ptr to loop-invariant start address
         Value *BufPtr = Addr;
@@ -3343,8 +3861,11 @@ void TaintFunction::hoistBoundsChecks() {
             if (ClWithUCSan) {
               if (auto *ChkCall = dyn_cast<CallInst>(PtrOp)) {
                 Function *ChkFn = ChkCall->getCalledFunction();
-                if (ChkFn && ChkFn->getName() == "ucsan_check_pointer")
+                if (ChkFn && ChkFn->getName() == "ucsan_check_pointer") {
+                  if (!isRealAddress(ChkCall->getArgOperand(0), LI))
+                    continue;  // see isRealAddress
                   PtrOp = ChkCall->getArgOperand(0);
+                }
               }
             }
             if (auto *BufGEP = dyn_cast<GetElementPtrInst>(PtrOp)) {
@@ -3360,10 +3881,14 @@ void TaintFunction::hoistBoundsChecks() {
         IRB.CreateCall(TT.TaintSolveStrBoundsFn,
                        {StrPtr, AddrLabel,
                         BufPtr, ConstantInt::get(TT.Int64Ty, Step)});
+        EmittedBufs.insert(AddrLabel);
+        Covered.push_back(CI);
       }
 
       // Remove per-iteration bounds checks
-      for (CallInst *CI : BoundsChecks)
+      // (only those summarized: one skipped above, a buffer whose start is
+      // not known here, used to be removed all the same and never checked)
+      for (CallInst *CI : Covered)
         CI->eraseFromParent();
 
       continue;
@@ -3477,12 +4002,15 @@ void TaintFunction::hoistBoundsChecks() {
 
       // With UCSan, Addr is ptrtoint(ucsan_check_pointer(orig_ptr, ...)).
       // ucsan_check_pointer is opaque to SCEV; use the original pointer.
+      // (only when that is the same address, see isRealAddress)
       Value *AddrForSCEV = Addr;
       if (ClWithUCSan) {
         if (auto *PTI = dyn_cast<PtrToIntOperator>(Addr)) {
           if (auto *ChkCall = dyn_cast<CallInst>(PTI->getPointerOperand())) {
             Function *ChkFn = ChkCall->getCalledFunction();
             if (ChkFn && ChkFn->getName() == "ucsan_check_pointer") {
+              if (!isRealAddress(ChkCall->getArgOperand(0), LI))
+                continue;
               IRBuilder<> IRB(CI);
               AddrForSCEV = IRB.CreatePtrToInt(ChkCall->getArgOperand(0), TT.Int64Ty);
               SCEVTemps.push_back(cast<Instruction>(AddrForSCEV));
@@ -3525,6 +4053,10 @@ void TaintFunction::hoistBoundsChecks() {
 
       AddrLabel = ResolveLoopInvariantLabel(AddrLabel);
       if (!AddrLabel)
+        continue;
+
+      // the summary check below is given this pointer, not the checked one
+      if (!isRealAddress(CI->getArgOperand(0), LI))
         continue;
 
       IRBuilder<> LocalIRB(CI);
@@ -3604,15 +4136,10 @@ void TaintFunction::hoistBoundsChecks() {
       // If the summarized range is symbolic, emit one solve_size outside the
       // loop. Looking at TotalSCEV catches both symbolic trip counts and
       // symbolic extents folded into the address/range expression.
-      SmallVector<Value *, 4> Unknowns;
-      collectSCEVUnknowns(TotalSCEV, Unknowns);
-      Value *SizeShadow = TT.ZeroPrimitiveShadow;
-      for (Value *V : Unknowns) {
-        Value *S = getShadow(V);
-        if (!TT.isZeroShadow(S))
-          SizeShadow = S;
-      }
-      if (!TT.isZeroShadow(SizeShadow)) {
+      // (the label of TotalSCEV itself, not of one of its leaves: see
+      // labelForSCEV; none for a shape it cannot say)
+      Value *SizeShadow = labelForSCEV(TotalSCEV, SE, Expander, InsertPt);
+      if (SizeShadow && !TT.isZeroShadow(SizeShadow)) {
         ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
             TT.getInstructionId(FirstCI));
         IRB.CreateCall(TT.TaintSolveSizeFn,
@@ -3673,18 +4200,14 @@ void TaintFunction::hoistBoundsChecks() {
       // Soft solve_size hint only. The summary records a fixed field offset and
       // access size with no per-iteration stride, so trip_count * access_size is
       // not a proven extent; a hard check_bounds here could abort spuriously.
-      SmallVector<Value *, 4> Unknowns;
-      collectSCEVUnknowns(TotalSCEV, Unknowns);
-      Value *SizeShadow = TT.ZeroPrimitiveShadow;
-      for (Value *V : Unknowns) {
-        Value *S = getShadow(V);
-        if (!TT.isZeroShadow(S))
-          SizeShadow = S;
+      // (TotalSCEV's own label, as above)
+      Value *SizeShadow = labelForSCEV(TotalSCEV, SE, Expander, InsertPt);
+      if (SizeShadow && !TT.isZeroShadow(SizeShadow)) {
+        ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
+            TT.getInstructionId(CI));
+        IRB.CreateCall(TT.TaintSolveSizeFn,
+                       {AddrLabel, StartVal, SizeShadow, TotalVal, CID});
       }
-      ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
-          TT.getInstructionId(CI));
-      IRB.CreateCall(TT.TaintSolveSizeFn,
-                     {AddrLabel, StartVal, SizeShadow, TotalVal, CID});
     }
 
     // Some accesses do not have a matching check_bounds call with an affine
@@ -3725,11 +4248,18 @@ void TaintFunction::hoistBoundsChecks() {
             if (ChkFn && ChkFn->getName() == "ucsan_check_pointer")
               PtrOp = ChkCall->getArgOperand(0);
           }
+          // the GEP's base is not checked at all: UCSan checks the address
+          // the GEP computes, so this is the pointer before any check
+          // (see isRealAddress), and the summary is given it
+          if (!isRealAddress(PtrOp, LI))
+            continue;
         }
         if (L->isLoopInvariant(PtrOp)) {
           IRBuilder<> IRB(InsertPt);
           BasePtrForSCEV = IRB.CreatePtrToInt(PtrOp, TT.Int64Ty);
         }
+      } else if (ClWithUCSan) {
+        continue;  // no pointer to tell real from pseudo by
       }
       if (!L->isLoopInvariant(BasePtrForSCEV))
         continue;
@@ -3798,15 +4328,10 @@ void TaintFunction::hoistBoundsChecks() {
       IRB.CreateCall(TT.TaintCheckBoundsFn,
                      {AddrLabel, StartVal, TT.ZeroPrimitiveShadow, TotalVal});
 
-      SmallVector<Value *, 4> Unknowns;
-      collectSCEVUnknowns(TotalSCEV, Unknowns);
-      Value *SizeShadow = TT.ZeroPrimitiveShadow;
-      for (Value *V : Unknowns) {
-        Value *S = getShadow(V);
-        if (!TT.isZeroShadow(S))
-          SizeShadow = S;
-      }
-      if (!TT.isZeroShadow(SizeShadow)) {
+      // (the label of TotalSCEV itself, not of one of its leaves: see
+      // labelForSCEV; none for a shape it cannot say)
+      Value *SizeShadow = labelForSCEV(TotalSCEV, SE, Expander, InsertPt);
+      if (SizeShadow && !TT.isZeroShadow(SizeShadow)) {
         ConstantInt *CID = ConstantInt::get(TT.Int32Ty,
             TT.getInstructionId(FirstCI));
         IRB.CreateCall(TT.TaintSolveSizeFn,
@@ -3963,11 +4488,21 @@ void TaintFunction::hoistBoundsChecks() {
 // Addr has alignment Align, and take the union of each of those shadows.
 Value *TaintFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size,
                                           uint64_t SizeInBits, uint64_t Align,
-                                          IRBuilder<> &IRB) {
+                                          IRBuilder<> &IRB, uint64_t Unread) {
   if (Size == 0)
     return TT.ZeroPrimitiveShadow;
 
   Value *ShadowAddr = TT.getShadowAddress(Addr, IRB);
+  if (Unread) {
+    CallInst *Partial = IRB.CreateCall(
+        TT.TaintUnionLoadPartialFn,
+        {ShadowAddr, ConstantInt::get(TT.IntptrTy, Size),
+         ConstantInt::get(TT.Int64Ty, SizeInBits),
+         ConstantInt::get(TT.IntptrTy, Align),
+         ConstantInt::get(TT.Int64Ty, Unread)});
+    Partial->addRetAttr(Attribute::ZExt);
+    return Partial;
+  }
   CallInst *FallbackCall = IRB.CreateCall(
       TT.TaintUnionLoadFn, {ShadowAddr, ConstantInt::get(TT.IntptrTy, Size),
                             ConstantInt::get(TT.Int64Ty, SizeInBits),
@@ -4029,7 +4564,8 @@ Value *TaintFunction::loadShadowRecursive(
 }
 
 Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size,
-                                 Align Alignment, Instruction *Pos) {
+                                 Align Alignment, Instruction *Pos,
+                                 uint64_t Unread) {
   IRBuilder<> IRB(Pos);
   // if loading from a local variable, load label from its shadow
   if (AllocaInst *AI = dyn_cast<AllocaInst>(Addr)) {
@@ -4064,7 +4600,8 @@ Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size,
   // now check if we're loading an aggragate object
   if (!isa<ArrayType>(T) && !isa<StructType>(T)) {
     uint64_t SizeInBits = DL.getTypeSizeInBits(T);
-    return loadPrimitiveShadow(Addr, Size, SizeInBits, ShadowAlign, IRB);
+    return loadPrimitiveShadow(Addr, Size, SizeInBits, ShadowAlign, IRB,
+                               Unread);
   }
 
   // if loading an aggregate object, load its shadow recursively
@@ -4122,28 +4659,48 @@ void TaintVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
   Value *Op1 = nullptr, *Cond = nullptr;
   IRBuilder<> IRB(&I);
 
+  // combineShadows records the concrete operands of the instruction it is
+  // given, and an atomicrmw's operand 0 is the pointer, not the value it
+  // read: the label then claimed `address op val`, which the solver rejects
+  // as a value mismatch.  The binary operations are therefore labeled on the
+  // equivalent `old op val` built right after the atomicrmw, where the old
+  // value is its result; that instruction is otherwise unused.
+  Instruction *After = I.getNextNode();
+  IRBuilder<> AfterIRB(After);
+  auto binOpShadow = [&](Instruction::BinaryOps Op) {
+    auto *BO = cast<Instruction>(AfterIRB.CreateBinOp(Op, &I, Val));
+    return TF.combineShadows(Shadow1, Shadow2, Op, BO);
+  };
+
   switch (I.getOperation()) {
     case AtomicRMWInst::Xchg:
       Shadow = Shadow2;
       break;
     case AtomicRMWInst::Add:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Add, &I);
+      Shadow = binOpShadow(BinaryOperator::Add);
       break;
     case AtomicRMWInst::Sub:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Sub, &I);
+      Shadow = binOpShadow(BinaryOperator::Sub);
       break;
     case AtomicRMWInst::And:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
+      Shadow = binOpShadow(BinaryOperator::And);
       break;
-    case AtomicRMWInst::Nand:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
-      Shadow = TF.combineShadows(TF.TT.getZeroShadow(Ty), Shadow, 2, &I); // __dfsan::Neg
+    case AtomicRMWInst::Nand: {
+      // Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, &I);
+      // Shadow = TF.combineShadows(TF.TT.getZeroShadow(Ty), Shadow, 2, &I); // __dfsan::Neg
+      // nand is ~(old & val), i.e. (old & val) ^ -1
+      auto *And = cast<Instruction>(AfterIRB.CreateAnd(&I, Val));
+      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::And, And);
+      auto *Not = cast<Instruction>(AfterIRB.CreateNot(And));
+      Shadow = TF.combineShadows(Shadow, TF.TT.getZeroShadow(Ty),
+                                 BinaryOperator::Xor, Not);
       break;
+    }
     case AtomicRMWInst::Or:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Or, &I);
+      Shadow = binOpShadow(BinaryOperator::Or);
       break;
     case AtomicRMWInst::Xor:
-      Shadow = TF.combineShadows(Shadow1, Shadow2, BinaryOperator::Xor, &I);
+      Shadow = binOpShadow(BinaryOperator::Xor);
       break;
     case AtomicRMWInst::Max:
       Op1 = IRB.CreateLoad(Ty, Ptr, true);
@@ -4171,7 +4728,8 @@ void TaintVisitor::visitAtomicRMWInst(AtomicRMWInst &I) {
       break;
   }
 
-  TF.storeShadow(Ptr, Ty, Size, I.getAlign(), Shadow, &I);
+  // after the atomicrmw, where the label of the new value exists
+  TF.storeShadow(Ptr, Ty, Size, I.getAlign(), Shadow, After);
   TF.setShadow(&I, Shadow1);
 
   // TODO: The ordering change follows MSan. It is possible not to change
@@ -4221,10 +4779,18 @@ void TaintVisitor::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   Value *StoredShadow = IRB.CreateSelect(Success, NewShadow, OldShadow);
   TF.storeShadow(Ptr, ValTy, Size, I.getAlign(), StoredShadow, Pos);
 
+  // The success flag is `old == cmp`: labeled as that comparison, built
+  // after the exchange where the old value exists (and otherwise unused),
+  // so a branch on it is solvable -- it used to get a zero label.
+  Value *Old = IRB.CreateExtractValue(&I, 0);
+  auto *Eq = cast<Instruction>(IRB.CreateICmpEQ(Old, I.getCompareOperand()));
+  Value *SuccessShadow =
+      TF.combineShadows(OldShadow, TF.getShadow(I.getCompareOperand()),
+                        Instruction::ICmp, Eq);
+
   Value *ResShadow = UndefValue::get(ResShadowTy);
   ResShadow = IRB.CreateInsertValue(ResShadow, OldShadow, 0);
-  ResShadow = IRB.CreateInsertValue(
-      ResShadow, TF.TT.getZeroShadow(I.getType()->getStructElementType(1)), 1);
+  ResShadow = IRB.CreateInsertValue(ResShadow, SuccessShadow, 1);
   TF.setShadow(&I, ResShadow);
 
   // TODO: The ordering change follows MSan. It is possible not to change
@@ -4284,9 +4850,11 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
     }
   }
 
+  // the bytes of a bitfield's access unit outside the fields it is read for
+  // may never have been written, and are not read (see Bitfield.h)
   if (!Shadow)
     Shadow = TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
-                           LI.getAlign(), Pos);
+                           LI.getAlign(), Pos, symsan::unreadBytes(LI));
 #if 0
   //FIXME: tainted pointer
   if (ClCombinePointerLabelsOnLoad) {
@@ -4432,6 +5000,40 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
     Shadow = TF.combineShadows(Shadow, PtrShadow, &SI);
   }
 #endif
+  // A bitfield assignment writes only the bytes its masks touch, and those
+  // are initialized whatever the load was (see Bitfield.h).  When it was not,
+  // they take the label the chain gives with the load's as zero: the old bits
+  // they keep are concrete, the new ones are the new value's.
+  symsan::RMWStore RMW;
+  auto *AI = dyn_cast<AllocaInst>(SI.getPointerOperand());
+  if (!SI.isAtomic() && !TF.TT.isZeroShadow(Shadow) &&
+      Shadow->getType() == TF.TT.PrimitiveShadowTy &&
+      !(AI && TF.AllocaShadowMap.count(AI)) &&
+      symsan::matchRMWStore(SI, [](Instruction &I) {
+        if (I.getMetadata("nosanitize"))
+          return true;
+        auto *CB = dyn_cast<CallBase>(&I);
+        Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+        return Callee && (Callee->getName().starts_with("__taint_") ||
+                          Callee->getName().starts_with("__dfsan_"));
+      }, RMW)) {
+    Value *Alt = TF.TT.ZeroPrimitiveShadow;
+    for (auto [BO, Idx] : RMW.Chain) {
+      Value *Other = TF.getShadow(BO->getOperand(1 - Idx));
+      Alt = Idx == 0 ? TF.combineShadows(Alt, Other, BO->getOpcode(), BO)
+                     : TF.combineShadows(Other, Alt, BO->getOpcode(), BO);
+    }
+    IRBuilder<> IRB(&SI);
+    IRB.CreateCall(TF.TT.TaintStoreRMWFn,
+                   {Shadow, TF.TT.getShadowAddress(SI.getPointerOperand(), IRB),
+                    ConstantInt::get(TF.TT.IntptrTy, Size),
+                    ConstantInt::get(TF.TT.Int64Ty,
+                                     TF.getShadowAlign(SI.getAlign()).value()),
+                    TF.getShadow(RMW.Load), Alt,
+                    ConstantInt::get(TF.TT.Int64Ty, RMW.Touched)});
+    return;
+  }
+
   TF.storeShadow(SI.getPointerOperand(), VT, Size, SI.getAlign(), Shadow, &SI);
 }
 
@@ -4692,6 +5294,33 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
           ConstantInt *Offset = ConstantInt::get(TT.Int64Ty, CurrentOffset);
           ConstantInt *NE = ConstantInt::get(TT.Int64Ty, NumElements);
           ConstantInt *ES = ConstantInt::get(TT.Int64Ty, ElemSize);
+          // ASSUMPTION (UCSan): Ptr may be a UCSan pseudo-pointer.  UCSan checks
+          // the address the GEP computes, not its base, so this is the one
+          // place SymSan is given a pointer that has not been through
+          // ucsan_check_pointer.  That is safe while a pseudo-pointer's value
+          // is never read:
+          // - __taint_solve_bounds and Z3AstParser::parse_gep read Ptr only
+          //   together with an Alloca (or Free) bounds label in Shadow, whose
+          //   op1/op2 are real addresses, to place the access in that buffer.
+          //   With an array extent (NE > 0) Ptr is not used at all, and
+          //   parse_gep does nothing unless index enumeration is on.
+          // - SymSan makes Alloca labels only for stack objects
+          //   (__taint_trace_alloca), globals (__taint_trace_global) and heap
+          //   memory from the allocator wrappers (UCSan's create_alloca_label,
+          //   the malloc family in dfsan_custom.cpp).  All of it is real
+          //   memory, which ucsan_check_pointer returns unchanged, so wherever
+          //   Ptr is read it is already a real address.
+          // - A lazily initialized object's pointer has no Alloca label (its
+          //   label is the input bytes it was loaded from), so a pseudo-pointer
+          //   is passed but never used.
+          // This stops holding the moment a pointer that ucsan_check_pointer
+          // translates gets an Alloca label -- e.g. bounds labels for UCSan
+          // objects, to solve OOB on them -- and then the GEP hooks would
+          // compute offsets from a pseudo base and build wrong bounds
+          // constraints without any error.  The fix then is to pass the
+          // checked base: UCSanVisitor::visitGetElementPtrInst already emits a
+          // non-dereferencing ucsan_check_pointer on a non-alloca base (once
+          // per base) whose result goes unused.
           Value *Ptr = IRB.CreatePtrToInt(I->getPointerOperand(), TT.Int64Ty);
           ConstantInt *CID = ConstantInt::get(TT.Int32Ty, TT.getInstructionId(I));
           if (ClSolveUB) {
@@ -4867,8 +5496,22 @@ Value* TaintFunction::visitSelectInst(Value *Cond, Value *TrueShadow,
   if (!T->isIntegerTy(1)) {
     // most cases
     visitCondition(Cond, I);
-    return TrueShadow == FalseShadow ? TrueShadow :
+    Value *Shadow = TrueShadow == FalseShadow ? TrueShadow :
         SelectInst::Create(Cond, TrueShadow, FalseShadow, "", I);
+    // An uninitialized condition is not a use (the runtime does not report a
+    // select's as a UBI): the select may have been speculated, a load of a
+    // local the source reads only on a path where it is set
+    // (register_kretprobe's on_func_entry, read after an IS_ERR() check the
+    // optimizer moved past it).  The result is what depends on it, so it
+    // carries the uninitialized label to a branch or an access that is one.
+    if (!TT.isZeroShadow(CondShadow) &&
+        Shadow->getType() == TT.PrimitiveShadowTy) {
+      IRBuilder<> IRB(I);
+      Constant *Uninit = ConstantInt::getSigned(TT.PrimitiveShadowTy, -1);  // kInitializingLabel
+      Shadow = IRB.CreateSelect(IRB.CreateICmpEQ(CondShadow, Uninit), Uninit,
+                                Shadow);
+    }
+    return Shadow;
   }
 
   // special case, when select is used to implement logical AND and OR
@@ -5602,7 +6245,19 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
   // expand it instead: z3 as a concat of single-bit extracts, jigsaw as the
   // native intrinsic.  Without this the shadow is dropped and the whole message
   // silently goes concrete (see tests/symsan/bitreverse*.c).
-  if (IId == Intrinsic::bitreverse) {
+  // cttz/ctlz/ctpop the same way, one op node each: no decomposition into
+  // operations with labels exists (a binary search, or a sum of bits, ends in
+  // selects between constants, which carry none).  The kernel's __ffs, fls,
+  // ilog2 and hweight are inline asm (bsf, bsr, popcnt) that UCSanPass lifts
+  // to them; fastop() indexes its stubs by __ffs(dst.bytes).  A zero operand
+  // gives the width, whether or not the intrinsic says it is poison (the
+  // lifted bsf/bsr say not).
+  uint16_t UnaryBitOp = IId == Intrinsic::bitreverse ? DfsanBitReverse
+                        : IId == Intrinsic::cttz     ? DfsanCttz
+                        : IId == Intrinsic::ctlz     ? DfsanCtlz
+                        : IId == Intrinsic::ctpop    ? DfsanCtpop
+                                                     : 0;
+  if (UnaryBitOp) {
     Value *Arg = CB.getArgOperand(0);
     Type *ArgTy = Arg->getType();
     // The intrinsic is also defined on vectors, and getIntegerBitWidth() is a
@@ -5614,7 +6269,7 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
       CallInst *C = IRB.CreateCall(
           TF.TT.TaintUnionFn,
           {Shadow, TF.TT.ZeroPrimitiveShadow,
-           ConstantInt::get(TF.TT.Int16Ty, DfsanBitReverse),
+           ConstantInt::get(TF.TT.Int16Ty, UnaryBitOp),
            ConstantInt::get(TF.TT.Int16Ty, Bits),
            IRB.CreateZExtOrTrunc(Arg, TF.TT.Int64Ty),
            ConstantInt::get(TF.TT.Int64Ty, 0)});
@@ -5752,6 +6407,50 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
 void TaintVisitor::visitCallBase(CallBase &CB) {
   if (CB.isInlineAsm()) {
     // FIXME: inline asm
+    // Results stay unlabeled (UCSanPass lowers the asm whose semantics it
+    // knows to plain IR first).  What is handled here is the memory the asm
+    // writes: its memory outputs ("=m"/"+m") hold a concrete value
+    // afterwards, so their labels are cleared, as a store of a concrete
+    // value would; otherwise the next load reads the pre-asm label back and
+    // the solver sees a value it no longer has.
+    auto &DL = CB.getModule()->getDataLayout();
+    auto *IA = cast<InlineAsm>(CB.getCalledOperand());
+    SmallVector<Instruction *, 2> Positions;
+    if (auto *CBr = dyn_cast<CallBrInst>(&CB)) {
+      for (BasicBlock *Succ : successors(CBr))
+        if (Succ->getSinglePredecessor())
+          Positions.push_back(&*Succ->getFirstInsertionPt());
+    } else if (CB.getNextNode()) {
+      Positions.push_back(CB.getNextNode());
+    }
+    unsigned ArgIdx = 0;
+    for (auto &CI : IA->ParseConstraints()) {
+      if (CI.Type == InlineAsm::isClobber || CI.Type == InlineAsm::isLabel ||
+          (CI.Type == InlineAsm::isOutput && !CI.isIndirect))
+        continue;
+      if (ArgIdx >= CB.arg_size())
+        break;
+      unsigned Arg = ArgIdx++;
+      if (CI.Type != InlineAsm::isOutput)
+        continue;
+      Type *ElemTy = CB.getParamElementType(Arg);
+      if (!ElemTy || !ElemTy->isSized())
+        continue;
+      uint64_t Size = DL.getTypeStoreSize(ElemTy);
+      if (Size == 0)
+        continue;
+      Value *Ptr = CB.getArgOperand(Arg);
+      for (Instruction *Pos : Positions) {
+        if (Size <= 16) {
+          TF.storeShadow(Ptr, ElemTy, Size, Align(1),
+                         TF.TT.getZeroShadow(ElemTy), Pos);
+        } else {
+          IRBuilder<> IRB(Pos);
+          IRB.CreateMemSet(TF.TT.getShadowAddress(Ptr, IRB), IRB.getInt8(0),
+                           Size * TF.TT.ShadowWidthBytes, Align(1));
+        }
+      }
+    }
     return;
   }
 
@@ -5944,6 +6643,8 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   uint32_t cid = TT.getBranchId(I);
   if (cid == TT.InvalidInstructionId)
     return; // XXX: forget about loop?
+  if (isa<SelectInst>(I))
+    flag |= SelectCondition;
   TT.documentBranchId(cid, I, isa<BranchInst>(I) ? "br" : "select");
   ConstantInt *LF = ConstantInt::get(TT.Int8Ty, flag);
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, cid);

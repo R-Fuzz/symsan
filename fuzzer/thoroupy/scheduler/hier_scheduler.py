@@ -46,26 +46,26 @@ class HierachicalScheduler(SchedulerBase):
             self._counter += 1
             seed = self._id_queue.pop(0)
             self._pipe.send(seed.to_ticket())
-            logger.debug(f"Send seed {seed} to pipe from ID queue")
+            logger.debug("Send seed %s to pipe from ID queue", seed)
             return seed
         elif self._context_queue:
             self._counter += 1
             seed = self._context_queue.pop(0)
             self._pipe.send(seed.to_ticket())
-            logger.debug(f"Send seed {seed} to pipe from context queue")
+            logger.debug("Send seed %s to pipe from context queue", seed)
             return seed
         elif self._loop_queue:
             self._counter += 1
             seed = self._loop_queue.pop(0)
             self._pipe.send(seed.to_ticket())
-            logger.debug(f"Send seed {seed} to pipe from loop queue")
+            logger.debug("Send seed %s to pipe from loop queue", seed)
             return seed
         elif self._path_queue:
             self._counter += 1
             self._path_counter += 1
             seed = self._path_queue.pop(0)
             self._pipe.send(seed.to_ticket())
-            logger.debug(f"Send seed {seed} to pipe from path queue")
+            logger.debug("Send seed %s to pipe from path queue", seed)
             return seed
 
         elif self._counter == 0:
@@ -106,7 +106,7 @@ class HierachicalScheduler(SchedulerBase):
                 switch_use_context_queue = True
             self._visited_switches.add((bid, self._switch_index))
         self._last_id = bid
-        logger.info(f"Append seed {seed} to queue from bid {bid} and context {context}")
+        logger.info("Append seed %s to queue from bid %s and context %s", seed, bid, context)
         digest = seed.digest().hexdigest()
         if digest not in self._seeds_hash:
             if bid not in self._visited_ids:
@@ -147,7 +147,7 @@ class HierachicalScheduler(SchedulerBase):
                 file_name = f"seeds/seed_{time()}.pickle"
                 with open(file_name, "wb") as f:
                     pickle.dump([seed], f)
-                    logger.info(f"Save seed {seed} to {file_name}")
+                    logger.info("Save seed %s to %s", seed, file_name)
 
             if target_branch and target_branch.get("bid")== bid:
                 if target_branch.get("context") and context != target_branch["context"]:

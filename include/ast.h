@@ -178,6 +178,15 @@ namespace rgd {
     // the haystack subtree.  A solver that needs it walks there.
     StrPtrToInt, // 97
 
+    // llvm.cttz / llvm.ctlz / llvm.ctpop (dfsan.h's cttz, ctlz, ctpop): one
+    // child, same width in as out, the width for a zero operand (cttz/ctlz).
+    // Unary like BitReverse, and appended for the same reason.  z3 expands
+    // them (ite chains, a sum of bits), jigsaw JITs the native intrinsics,
+    // i2s declines.
+    Cttz,  // 98
+    Ctlz,  // 99
+    Ctpop, // 100
+
     // Last
     LastOp
   };
@@ -281,6 +290,9 @@ namespace rgd {
     "SuffixOf",
     "StrLength",
     "StrPtrToInt",
+    "Cttz",
+    "Ctlz",
+    "Ctpop",
   };
 
   static inline bool isRelationalKind(uint16_t kind) {

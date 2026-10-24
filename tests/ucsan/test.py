@@ -37,7 +37,8 @@ ucsan_config = {
   "handler": {
     "ubi_handler": {},
     "objtrace_handler": {},
-    "forward_handler": {}
+    "forward_handler": {},
+    "warn_handler": {}
   },
   "scheduler": {
     "fifo": {
@@ -51,6 +52,15 @@ ucsan_config = {
 }
 
 tests = []
+solver_error_absent_tests = set()
+# test name -> event ids (PIPE_EVENT_TYPE) that must be reported at least once
+expected_events = {}
+# test name -> event ids that must never be reported (`// EVENT-ABSENT:`): a
+# report that does not end the run -- a poison violation, under
+# exit_on_poison=0 -- is no exit status for ABSENT to see
+absent_events = {}
+# test -> extra compiler flags (`// CFLAGS:`)
+test_cflags = {}
 
 sys.path.append(os.path.join(SCRIPT_DIR, "..", "..", "fuzzer", "thoroupy"))
 
@@ -79,6 +89,20 @@ def parse_test(file, test_name):
             flags = line.split(":", maxsplit=2)[1].strip().split(" ")
             for flag in flags:
                     test[2].append([int(flag), -1])
+        elif line.startswith("// ABSENT:"):
+            flags = line.split(":", maxsplit=2)[1].strip().split(" ")
+            for flag in flags:
+                test[2].append([int(flag, 0), -2])
+        elif line.startswith("// CFLAGS:"):
+            test_cflags[test_name] = line.split(":", maxsplit=1)[1].strip()
+        elif line.startswith("// SOLVER-ERROR-ABSENT"):
+            solver_error_absent_tests.add(test_name)
+        elif line.startswith("// EVENT:"):
+            events = line.split(":", maxsplit=2)[1].strip().split(" ")
+            expected_events.setdefault(test_name, []).extend(int(e, 0) for e in events)
+        elif line.startswith("// EVENT-ABSENT:"):
+            events = line.split(":", maxsplit=2)[1].strip().split(" ")
+            absent_events.setdefault(test_name, []).extend(int(e, 0) for e in events)
     tests.append(test)
 
 for file in glob.glob(os.path.join(SCRIPT_DIR, "test", "*.c")):
@@ -166,6 +190,10 @@ def perform_test(stage, *args, seed=None):
     compat_flags = "-Wno-error=implicit-function-declaration"
 
     # Compile with new command format
+    # `// CFLAGS:` adds compiler flags, e.g. -O2 for a test of what only
+    # optimized code does (the pass reusing a checked pointer).
+    if test_cflags.get(test_name):
+        compat_flags += " " + test_cflags[test_name]
     compile_cmd = f"{cc} -g -S -emit-llvm {compat_flags} -o ll/{test_name}.ll {src}"
     run(compile_cmd, cwd=".", env=env)
 
@@ -189,6 +217,10 @@ def perform_test(stage, *args, seed=None):
             taint_options.setdefault('trace_bounds', "1")
             taint_options.setdefault('solve_ub', "1")
 
+        # a poison-flag violation (nsw/nuw/exact) on the seed's made-up values
+        # is a finding, not the end of the run (as the kernel eval runs it)
+        taint_options.setdefault('exit_on_poison', "0")
+
         # Build runtime env with properly categorized options
         runtime_env = {}
         runtime_env.update(taint_options)
@@ -196,7 +228,30 @@ def perform_test(stage, *args, seed=None):
             runtime_env['ucsan_options'] = ucsan_options
 
         m = UcsanManager(f'binary/{test_name}.ucsan', config=ucsan_config, terminate=False, env=runtime_env, adapter=adapter, seed=seed, debug=debug)
-        m.run()
+        solver_errors = []
+
+        class SolverErrorCapture(logging.Handler):
+            def emit(self, record):
+                message = record.getMessage()
+                if "Solver error:" in message:
+                    solver_errors.append(message)
+
+        capture = SolverErrorCapture()
+        if test_name in solver_error_absent_tests:
+            logging.getLogger("manager").addHandler(capture)
+        try:
+            m.run()
+        finally:
+            logging.getLogger("manager").removeHandler(capture)
+        if solver_errors:
+            raise Exception(f"Solver errors during {test_name}: {solver_errors}")
+        for event in expected_events.get(test_name, []):
+            if not m.event_counts.get(event):
+                raise Exception(f"Event {event} never reported during {test_name}")
+        for event in absent_events.get(test_name, []):
+            if m.event_counts.get(event):
+                raise Exception(f"Event {event} reported {m.event_counts[event]} "
+                                f"times during {test_name}, expected none")
         for exit_status in m.exit_status:
             if exit_status > 255:
                 exit_status = exit_status >> 8
@@ -211,6 +266,8 @@ def perform_test(stage, *args, seed=None):
                 expected = "any"
             if expected == -1:
                 expected = "discard"
+            if expected == -2:
+                expected = "absent"
             v = triggered[flag[0]]
             message.append(f"{key}:{v}/{expected}")
         message = ",".join(message)
@@ -218,6 +275,13 @@ def perform_test(stage, *args, seed=None):
 
         for flag in flags:
             if flag[1] == -1:
+                continue
+            if flag[1] == -2:
+                if triggered[flag[0]] != 0:
+                    raise Exception(
+                        f"Flag {flag[0]} triggered "
+                        f"{triggered[flag[0]]} times, expected none"
+                    )
                 continue
             if flag[1] != 0 and triggered[flag[0]] != flag[1]:
                 raise Exception(f"Flag {flag[0]} triggered {triggered[flag[0]]} times, expected {flag[1]}")

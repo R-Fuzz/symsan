@@ -103,6 +103,9 @@ static const std::unordered_map<unsigned, std::pair<unsigned, const char*> > OP_
   {__dfsan::Or,      {rgd::Or, "or"}},
   {__dfsan::Xor,     {rgd::Xor, "xor"}},
   {__dfsan::bitreverse, {rgd::BitReverse, "bitreverse"}},
+  {__dfsan::cttz,    {rgd::Cttz, "cttz"}},
+  {__dfsan::ctlz,    {rgd::Ctlz, "ctlz"}},
+  {__dfsan::ctpop,   {rgd::Ctpop, "ctpop"}},
   // relational comparisons
 #define RELATIONAL_ICMP(cmp) (__dfsan::ICmp | (cmp << 8))
   {RELATIONAL_ICMP(__dfsan::bveq),  {rgd::Equal, "equal"}},
@@ -256,6 +259,9 @@ static const char *dfsan_op_name(uint16_t op) {
     case __dfsan::fp_pow:       return "pow";
     case __dfsan::tlookup:      return "tlookup";
     case __dfsan::bitreverse:   return "bitreverse";
+    case __dfsan::cttz:         return "cttz";
+    case __dfsan::ctlz:         return "ctlz";
+    case __dfsan::ctpop:        return "ctpop";
     case __dfsan::WideConst:    return "wideconst";
     default:                    return "unknown";
   }
@@ -1148,7 +1154,8 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       info->op == __dfsan::fp_log10 || info->op == __dfsan::fp_log1p;
   if (info->op == __dfsan::ZExt || info->op == __dfsan::SExt ||
       info->op == __dfsan::Extract || info->op == __dfsan::Trunc ||
-      info->op == __dfsan::bitreverse ||
+      info->op == __dfsan::bitreverse || info->op == __dfsan::cttz ||
+      info->op == __dfsan::ctlz || info->op == __dfsan::ctpop ||
       is_fp_unary) {
     // Extract carries a bit offset in op2; fp_round carries its rounding-mode
     // selector (fp_rounding_mode) in op1; constrained fp_sqrt carries its

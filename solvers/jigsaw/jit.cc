@@ -330,6 +330,23 @@ static llvm::Value* codegen(llvm::IRBuilder<> &Builder,
       ret = Builder.CreateIntrinsic(llvm::Intrinsic::bitreverse, {Ty}, {c});
       break;
     }
+    case rgd::Cttz:
+    case rgd::Ctlz:
+    case rgd::Ctpop: {
+      // native too; a zero operand gives the width (is_zero_poison false)
+      const AstNode* rc = &node->children(0);
+      llvm::Value* c = codegen(Builder, rc, local_map, arg, value_cache);
+      llvm::Type* Ty = llvm::Type::getIntNTy(Builder.getContext(), node->bits());
+      c = Builder.CreateZExtOrTrunc(c, Ty);
+      if (node->kind() == rgd::Ctpop)
+        ret = Builder.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, c);
+      else
+        ret = Builder.CreateBinaryIntrinsic(node->kind() == rgd::Cttz
+                                                ? llvm::Intrinsic::cttz
+                                                : llvm::Intrinsic::ctlz,
+                                            c, Builder.getFalse());
+      break;
+    }
     case rgd::ZExt: {
 #if DEBUG
       // std::cerr << "ZExt the bits is " << node->bits() << std::endl;

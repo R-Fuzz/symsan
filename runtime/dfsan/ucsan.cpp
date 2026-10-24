@@ -65,7 +65,21 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_set_label(dfsan_label label, void *addr, uint64_t size);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
+                          uint16_t size, uint64_t op1, uint64_t op2);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_copy_shadow(void *dst, void *src, uint64_t size);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_add_constraint(dfsan_label label, uint8_t result);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_trace_ub_check(dfsan_label label, bool r, uint32_t cid,
+                            void *addr);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_verify_input_bytes(const void *addr, uptr n, void *site);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_get_ptr_bounds_label(void *ptr, uint64_t lower, uint64_t upper);
@@ -113,6 +127,8 @@ extern "C" {
 extern char __dso_handle;
 extern char edata;
 extern char end;
+// (the image's start, its code included: see ucsan_int_to_pointer)
+extern char __executable_start __attribute__((weak));
 }
 
 namespace __ucsan {
@@ -123,6 +139,39 @@ bool in_data_section(void *p) {
 
 bool in_bss_section(void *p) {
   return (&edata <= (char*)p && (char*)p <= &end);
+}
+
+// A global byte is symbolized from the seed at its first dereference.  That
+// used to be told by its shadow alone, 0 -- but 0 is also the shadow of a
+// byte the program has written with a concrete value, so a global cleared or
+// stored and then read was symbolized again at the read: a fresh label, and
+// the seed's byte in memory where the seed covers it.  Identity is the
+// label, so a pointer read back that way named a lazily created object
+// instead of what the program stored (an ICMP fixture's skb head,
+// queued_output.head = queued_frame, read back in its push).  A bit per byte
+// of the image's data and bss records that a byte has been symbolized or
+// written by a memset or memcpy (a store is checked first, and that check
+// symbolizes); mapped above the fork point, so a child starts from the
+// parent's.
+static u8 *global_seen;
+
+static void init_global_seen() {
+  uptr n = (uptr)(&end - &__dso_handle) / 8 + 1;
+  global_seen = (u8 *)MmapNoReserveOrDie(n, "UCSan global bytes seen");
+}
+
+static bool global_byte_seen(void *p) {
+  uptr i = (uptr)((char *)p - &__dso_handle);
+  return global_seen[i / 8] & (1 << (i % 8));
+}
+
+static void mark_global_seen(void *p, uptr size) {
+  for (uptr k = 0; k < size; ++k) {
+    char *b = (char *)p + k;
+    if (!in_data_section(b)) break;
+    uptr i = (uptr)(b - &__dso_handle);
+    global_seen[i / 8] |= (u8)(1 << (i % 8));
+  }
 }
 
 }  // namespace __ucsan
@@ -160,9 +209,37 @@ using __sanitizer::GetPageSizeCached;
 using __sanitizer::internal_memcpy;
 using __sanitizer::internal_memset;
 
+static char *container_arena_beg, *container_arena_cur, *container_arena_end;
+
+void __ucsan::container_arena_init() {
+  if (container_arena_beg) return;
+  uptr size = (uptr)1 << 30;
+  container_arena_beg = (char *)MmapNoReserveOrDie(size, "UCSan containers");
+  container_arena_cur = container_arena_beg;
+  container_arena_end = container_arena_beg + size;
+}
+
+void *__ucsan::container_alloc(uptr size) {
+  size = RoundUpTo(Max(size, (uptr)1), 16);
+  if (container_arena_cur &&
+      size <= (uptr)(container_arena_end - container_arena_cur)) {
+    void *p = container_arena_cur;
+    container_arena_cur += size;
+    return p;
+  }
+  return MmapOrDie(RoundUpTo(size, GetPageSizeCached()), "UCSan containers");
+}
+
+void __ucsan::container_free(void *p, uptr size) {
+  if ((char *)p >= container_arena_beg && (char *)p < container_arena_end)
+    return;
+  UnmapOrDie(p, RoundUpTo(RoundUpTo(Max(size, (uptr)1), 16),
+                          GetPageSizeCached()));
+}
+
 void ByteBuffer::destroy() {
   if (buf) {
-    UnmapOrDie(buf, RoundUpTo(cap, GetPageSizeCached()));
+    container_free(buf, cap);
     buf = nullptr;
   }
   len = cap = 0;
@@ -172,21 +249,12 @@ void ByteBuffer::resize(uint32_t new_size) {
   if (new_size > cap) {
     uint32_t new_cap = cap ? cap : 16;
     while (new_cap < new_size) new_cap *= 2;
-    uptr old_alloc = RoundUpTo(cap, GetPageSizeCached());
-    uptr new_alloc = RoundUpTo(new_cap, GetPageSizeCached());
+    unsigned char *new_buf = (unsigned char *)container_alloc(new_cap);
     if (buf) {
-      uptr r = internal_mremap(buf, old_alloc, new_alloc, MREMAP_MAYMOVE, nullptr);
-      if (!internal_iserror(r)) {
-        buf = (unsigned char *)r;
-      } else {
-        unsigned char *new_buf = (unsigned char *)MmapOrDie(new_alloc, "ByteBuffer");
-        __builtin_memcpy(new_buf, buf, len);
-        UnmapOrDie(buf, old_alloc);
-        buf = new_buf;
-      }
-    } else {
-      buf = (unsigned char *)MmapOrDie(new_alloc, "ByteBuffer");
+      __builtin_memcpy(new_buf, buf, len);
+      container_free(buf, cap);
     }
+    buf = new_buf;
     cap = new_cap;
   }
   len = new_size;
@@ -201,7 +269,7 @@ void ObjectStorage::destroy() {
   if (items) {
     for (uint32_t i = 0; i < len; i++)
       items[i].data.destroy();
-    UnmapOrDie(items, RoundUpTo(cap * sizeof(UCSanObject), GetPageSizeCached()));
+    container_free(items, cap * sizeof(UCSanObject));
     items = nullptr;
   }
   len = cap = 0;
@@ -211,16 +279,17 @@ void ObjectStorage::resize(uint32_t new_size) {
   if (new_size > cap) {
     uint32_t new_cap = cap ? cap : 4;
     while (new_cap < new_size) new_cap *= 2;
-    uptr alloc_size = RoundUpTo(new_cap * sizeof(UCSanObject), GetPageSizeCached());
-    UCSanObject *new_items = (UCSanObject *)MmapOrDie(alloc_size, "ObjectStorage");
+    UCSanObject *new_items =
+        (UCSanObject *)container_alloc(new_cap * sizeof(UCSanObject));
     if (items) {
       internal_memcpy(new_items, items, len * sizeof(UCSanObject));
-      UnmapOrDie(items, RoundUpTo(cap * sizeof(UCSanObject), GetPageSizeCached()));
+      container_free(items, cap * sizeof(UCSanObject));
     }
     items = new_items;
     cap = new_cap;
   }
   // Initialize new entries (MmapOrDie zero-fills, but init ByteBuffer explicitly)
+  // (container_alloc zero-fills too)
   for (uint32_t i = len; i < new_size; i++) {
     items[i].offset = 0;
     items[i].data.init();
@@ -252,14 +321,14 @@ UCSanObject& ObjectStorage::emplace_back(const UCSanObject &obj) {
 void ObjectMap::init(uint32_t initial_cap) {
   cap = initial_cap;
   count = 0;
-  uptr alloc_size = RoundUpTo(cap * sizeof(ObjectMapEntry), GetPageSizeCached());
-  entries = (ObjectMapEntry *)MmapOrDie(alloc_size, "ObjectMap");
+  entries = (ObjectMapEntry *)container_alloc(cap * sizeof(ObjectMapEntry));
   // MmapOrDie returns zero-filled, so occupied=0 for all entries
+  // (container_alloc too)
 }
 
 void ObjectMap::destroy() {
   if (entries) {
-    UnmapOrDie(entries, RoundUpTo(cap * sizeof(ObjectMapEntry), GetPageSizeCached()));
+    container_free(entries, cap * sizeof(ObjectMapEntry));
     entries = nullptr;
   }
   cap = count = 0;
@@ -307,14 +376,13 @@ void ObjectMap::grow() {
   uint32_t old_cap = cap;
   ObjectMapEntry *old = entries;
   cap *= 2;
-  uptr alloc_size = RoundUpTo(cap * sizeof(ObjectMapEntry), GetPageSizeCached());
-  entries = (ObjectMapEntry *)MmapOrDie(alloc_size, "ObjectMap");
+  entries = (ObjectMapEntry *)container_alloc(cap * sizeof(ObjectMapEntry));
   count = 0;
   for (uint32_t i = 0; i < old_cap; i++) {
     if (old[i].occupied)
       insert(old[i].key.first, old[i].key.second, old[i].value);
   }
-  UnmapOrDie(old, RoundUpTo(old_cap * sizeof(ObjectMapEntry), GetPageSizeCached()));
+  container_free(old, old_cap * sizeof(ObjectMapEntry));
 }
 
 //===----------------------------------------------------------------------===//
@@ -327,6 +395,8 @@ namespace __ucsan {
 // with preinit_array.
 
 static void ucsan_init_input_struct() {
+  // the containers' memory, before the first of them (see ucsan_containers.h)
+  container_arena_init();
   internal_memset(ucsan_tainted.filename, 0, sizeof(ucsan_tainted.filename));
   ucsan_tainted.fd = -1;
   ucsan_tainted.offset = 0;
@@ -533,6 +603,47 @@ ucsan_label allocate_label() {
 // Memory Helpers
 //===----------------------------------------------------------------------===//
 
+// A lazily created object never moves.  It used to be copied to a larger
+// buffer when an access fell outside it, and a real address already handed
+// out -- a check_pointer result the pass reuses for later accesses
+// (CheckedPtrMap), one hoisted to a dominating block, a pointer a wrapper
+// returned -- kept pointing into the old buffer: writes through it were lost
+// to the object and reads were stale, silently.  Instead each object gets a
+// window twice the object size limit with its offset 0 in the middle, so it
+// can grow either way in place up to the limit, which bounds its total size.
+// Windows come from large no-reserve mappings: only touched pages cost
+// memory.  Returns the window's middle, the object's offset 0.
+//
+// (now: an object does move, to place it at the alignment an access needs,
+// once the pass stopped reusing a check's result across anything that can
+// move it: see align_object.  Growth is still in place.  A window has a page
+// more above its middle, so offset 0 can sit up to a page past it.)
+static char *object_window_cur, *object_window_end;
+
+// Map a chunk of windows if the next window does not fit.  ucsan_init calls it
+// above the fork point, so the first chunk is the parent's and every child
+// uses it rather than mapping its own each run.
+static void reserve_object_windows() {
+  uptr page = GetPageSizeCached();
+  uptr half = RoundUpTo(ucsan_object_size_limit(), page);
+  char *&cur = object_window_cur, *&end = object_window_end;
+  if (!cur || cur + 2 * half + page > end) {
+    uptr chunk = Max((uptr)1 << 30, 2 * half + page);
+    cur = (char *)MmapNoReserveOrDie(chunk, "UCSan object windows");
+    end = cur + chunk;
+  }
+}
+
+static char *object_window() {
+  char *&cur = object_window_cur;
+  uptr page = GetPageSizeCached();
+  uptr half = RoundUpTo(ucsan_object_size_limit(), page);
+  reserve_object_windows();
+  char *mid = cur + half;
+  cur += 2 * half + page;
+  return mid;
+}
+
 void* customized_malloc(uint64_t size) {
   if (size > ucsan_object_size_limit()) {
     UCSAN_OUT("Object size too large: %lu\n", size);
@@ -542,14 +653,6 @@ void* customized_malloc(uint64_t size) {
   uint64_t crafted_size = size + (gap << 1);
   char* ret = (char*)malloc(crafted_size) + gap;
   return (void*)ret;
-}
-
-static inline bool is_writeable(void *p) {
-  int fd = open("/dev/zero", O_RDONLY);
-  if (fd < 0) return false;
-  bool writeable = read(fd, p, 1) == 1;
-  close(fd);
-  return writeable;
 }
 
 //===----------------------------------------------------------------------===//
@@ -651,6 +754,51 @@ out_default:
 // Super Object Label Creation
 //===----------------------------------------------------------------------===//
 
+// The seed bytes that hold a pseudo pointer's value, by (object, offset):
+// where UCSan made a pointer of them (ucsan_load_pointer_shadow) or handed one
+// out (a super-object pointer slot).  SymSan asks, at a poison-flag violation
+// (dfsan.cpp poison_check), whether the violated condition depends on any:
+// then the violation is the seed's placement of pseudo pointers -- whose
+// values only have to satisfy the path's constraints -- and not UB in the
+// program.  Open addressing; a full table records no more (those
+// violations count as the program's, the conservative side).
+static uint64_t placement_keys[1 << 14];
+static unsigned placement_count;
+
+static inline uint64_t placement_key(uint32_t object_id, int64_t offset) {
+  // +1: key 0 is the empty slot
+  return (((uint64_t)object_id << 32) | (uint32_t)offset) + 1;
+}
+
+static void record_placement(uint32_t object_id, int64_t offset, uint64_t n) {
+  const unsigned cap = sizeof(placement_keys) / sizeof(placement_keys[0]);
+  for (uint64_t i = 0; i < n; ++i) {
+    if (placement_count * 4 >= cap * 3)
+      return;
+    uint64_t k = placement_key(object_id, offset + (int64_t)i);
+    unsigned h = (unsigned)(k * 0x9E3779B97F4A7C15ULL >> 50) & (cap - 1);
+    while (placement_keys[h] && placement_keys[h] != k)
+      h = (h + 1) & (cap - 1);
+    if (!placement_keys[h]) {
+      placement_keys[h] = k;
+      ++placement_count;
+    }
+  }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+bool __ucsan_is_placement_byte(uint32_t object_id, int64_t offset) {
+  const unsigned cap = sizeof(placement_keys) / sizeof(placement_keys[0]);
+  uint64_t k = placement_key(object_id, offset);
+  unsigned h = (unsigned)(k * 0x9E3779B97F4A7C15ULL >> 50) & (cap - 1);
+  while (placement_keys[h]) {
+    if (placement_keys[h] == k)
+      return true;
+    h = (h + 1) & (cap - 1);
+  }
+  return false;
+}
+
 object_info create_label_from_super_object(size_t size, bool is_pointer) {
   uint64_t offset = atomic_fetch_add(&ucsan_tainted.arg_used, size, memory_order_relaxed);
   ucsan_label label = allocate_label();
@@ -666,6 +814,7 @@ object_info create_label_from_super_object(size_t size, bool is_pointer) {
     ptr->status = PTR_UNINITIALIZED;
     ptr->obj_label = 0;  // parent object ID (0 = super object)
     ptr->pseudo_base = (void*)offset;  // Repurpose to store offset for lookup
+    record_placement(0, (int64_t)offset, size);  // see record_placement
   } else {
     // Create byte info for super object (object 0)
     ucsan_byte_info *byte = &label_info->byte;
@@ -685,45 +834,155 @@ object_info create_label_from_super_object(size_t size, bool is_pointer) {
 
 using namespace __ucsan;
 
+// Check for out-of-bounds access to global variable (label: its bounds, from
+// ucsan_trace_global)
+static void check_global_bounds(void *p, ucsan_label label, uint64_t size,
+                                bool dereferencing, void *return_addr) {
+  ucsan_label_info *label_info = get_label_info(label);
+  ucsan_obj_info *obj = to_obj_info(label_info);
+  void *base = obj->real_ptr;
+  uint64_t base_addr = (uint64_t)base;
+  uint64_t ptr_addr = (uint64_t)p;
+  uint64_t upper_bound = (uint64_t)obj->upper_bound;
+  uint64_t offset = ptr_addr - base_addr;
+  if (ucsan_flags().trace_bounds &&
+      (ptr_addr < base_addr ||
+       offset > upper_bound ||
+       size > upper_bound - offset)) {
+    UCSAN_OUT("ERROR: Out-of-bounds access to global variable @%p, label=%u, access size=%lu, object size=%u\n",
+              p, label, size, obj->upper_bound);
+    if (dereferencing) {
+      __taint_trace_event_addr(label, EVENT_OOB, 0, return_addr, (uint32_t)obj->upper_bound);
+      exit(exit_reason::EVENT_OOB);
+    }
+  }
+}
+
+// The destination of a memory intrinsic inside a global is not given to
+// ucsan_check_pointer: it needs no symbolizing, it is written.  Its length
+// is still bounded by the global.  __early_make_pgtable memsets
+// early_dynamic_pgts[i] for ptrs_per_p4d * 8 bytes, a symbolized global's
+// value, and wrote gigabytes of shadow past the 256 KB array.
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool dereferencing, uint32_t type_id) {
+void ucsan_check_global_bounds(void *p, ucsan_label label, uint64_t size) {
+  // the destination of a memset or memcpy (UCSanFunction::checkGlobalDest):
+  // written, so never symbolized after (see global_seen)
+  if (in_data_section(p))
+    mark_global_seen(p, Min(size, (uint64_t)ucsan_object_size_limit()));
+  if (label < UCSAN_CONST_OFFSET || label == kUninitializedLabel ||
+      get_label_info(label)->common.op != OP_ALLOCA)
+    return;
+  check_global_bounds(p, label, size, true, __builtin_return_address(0));
+}
+
+// A UC object's real address must have the alignment the access assumes (the
+// IR's align): the code may rely on it (a movaps of a 16-byte aligned member)
+// and fault on an object placed off it.  An object is placed at its first
+// check, so a first check that is not at the object's start (a field reached
+// on a path without a base check) misplaces every field after it; an error
+// here names that, where the program would fault later without a trace.
+//
+// (now: the object is moved instead.  A real address lives only in registers
+// -- memory holds pseudo-pointers -- and the pass reuses a check's result only
+// where no other check or call can run in between, so nothing points into the
+// old window afterwards.  Each object placed by ucsan_check_pointer keeps the
+// alignment its offset 0 has been placed to so far (its log2 plus one, below;
+// 0 for an object it did not place, which never moves); offset 0's
+// residue modulo that is what every access so far needs, and an access that
+// needs a larger alignment, consistent with it, moves the object to a window
+// where offset 0 has both.  An access consistent with none is the code's own
+// misalignment (the BIOS data area's 0x40e and 0x413, both align 2): it stays
+// where it is, and is an error only where the access can fault.)
+static u8 obj_align_log2p1[1 << (sizeof(ucsan_label) * 8)];
+
+// Copies the object to a fresh window with offset 0 d bytes past its middle,
+// shadows (UCSan and SymSan) included.  Returns the new offset 0.
+static char *move_object(ucsan_obj_info *obj, uptr d) {
+  char *old_lo = (char *)obj->real_ptr - obj->lower_bound;
+  uptr size = (uptr)obj->lower_bound + obj->upper_bound;
+  char *base = object_window() + d;
+  char *lo = base - obj->lower_bound;
+  internal_memcpy(lo, old_lo, size);
+  internal_memcpy(ucsan_shadow_for(lo), ucsan_shadow_for(old_lo),
+                  size * sizeof(ucsan_label));
+  __taint_copy_shadow(lo, old_lo, size);
+  UCSAN_OUT("Moved object %u: %p -> %p\n", obj->object_id, obj->real_ptr, base);
+  obj->real_ptr = base;
+  return base;
+}
+
+// Places the object for a dereference of offset off with alignment align
+// (see obj_align_log2p1), moving it if needed.  Returns its offset 0.
+static char *align_object(ucsan_obj_info *obj, ucsan_label obj_label,
+                          int64_t off, uint32_t align, size_t size, void *p,
+                          ucsan_label label) {
+  char *base = (char *)obj->real_ptr;
+  u8 log2p1 = obj_align_log2p1[obj_label];
+  if (align <= 1 || log2p1 == 0)
+    return base;
+  // offset 0 is less than a page past a window's page-aligned middle
+  uptr a = Min((uptr)align, GetPageSizeCached());
+  uptr m = (uptr)1 << (log2p1 - 1);
+  uptr need = (uptr)(-off) & (a - 1);
+  uptr c = (uptr)base & (m - 1);
+  if ((need & (Min(a, m) - 1)) != (c & (Min(a, m) - 1))) {
+    UCSAN_OUT("Misaligned access: offset %ld needs %lu-byte alignment, the "
+              "object's accesses so far %lu-byte with residue %lu\n",
+              off, a, m, c);
+    // only a vector move of 16 bytes or more faults (movaps, movdqa)
+    if (a >= 16 && size >= 16) {
+      Printf("ERROR: UCSan: misaligned access to a UC object: real %p "
+             "(pseudo %p, label %u) is not %u-byte aligned\n",
+             base + off, p, label, align);
+      exit(exit_reason::REASON_MISALIGNED);
+    }
+    return base;
+  }
+  if (a <= m)
+    return base;
+  obj_align_log2p1[obj_label] = (u8)(Log2(a) + 1);
+  if (((uptr)base & (a - 1)) == need)
+    return base;
+  return move_object(obj, need);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool dereferencing, uint32_t type_id, uint32_t align) {
   UCSAN_OUT("%p: label: %d, size: %zu, dereferencing: %d, type_id: %u\n", p, label, size, dereferencing, type_id);
   __ucsan_null_deref_flag = nullptr;
 
   // Global variable handling
-  if (in_data_section(p)) {
+  // Only for a pointer the program got from a global itself: no label, or
+  // the bounds label ucsan_trace_global gives a fixed-size global (OP_ALLOCA).
+  // Any other label is a UC pointer -- a value from seed bytes -- and goes
+  // through the mapping below whatever its value, as it did before the
+  // section test was moved ahead of the label test for the bounds check:
+  // a value the solver picked can land in the image, mid-global and odd
+  // (unregister_nmi_handler's list head `next`, 33 bytes before nmi_desc),
+  // and was taken as a real global address.
+  if (in_data_section(p) &&
+      (label < UCSAN_CONST_OFFSET ||
+       (label != kUninitializedLabel &&
+        get_label_info(label)->common.op == OP_ALLOCA))) {
     // if label is not zero, perform bounds check
     if (label >= UCSAN_CONST_OFFSET) {
-      ucsan_label_info *label_info = get_label_info(label);
-      if (label_info->common.op != OP_ALLOCA) {
-        UCSAN_OUT("WARNING: global variable with non-alloca label %u\n", label);
-      } else {
-        // Check for out-of-bounds access to global variable
-        ucsan_obj_info *obj = to_obj_info(label_info);
-        void *base = obj->real_ptr;
-        uint64_t base_addr = (uint64_t)base;
-        uint64_t ptr_addr = (uint64_t)p;
-        uint64_t upper_bound = (uint64_t)obj->upper_bound;
-        uint64_t offset = ptr_addr - base_addr;
-        if (ucsan_flags().trace_bounds &&
-            (ptr_addr < base_addr ||
-             offset > upper_bound ||
-             size > upper_bound - offset)) {
-          UCSAN_OUT("ERROR: Out-of-bounds access to global variable @%p, label=%u, access size=%lu, object size=%u\n",
-                    p, label, size, obj->upper_bound);
-          if (dereferencing) {
-            __taint_trace_event_addr(label, EVENT_OOB, 0, __builtin_return_address(0), (uint32_t)obj->upper_bound);
-            exit(exit_reason::EVENT_OOB);
-          }
-        }
-      }
+      check_global_bounds(p, label, size, dereferencing,
+                          __builtin_return_address(0));
     } else if (size > ucsan_object_size_limit()) {
       UCSAN_OUT("WARNING: global variable size too large: %lu\n", size);
+      // (an access that large is ended, as for a lazily created object
+      // below: capping only what is symbolized left the access itself at
+      // its size -- rm_map_entry_at's memmove of cache_map_n - idx entries,
+      // both from the seed, materialized and copied gigabytes, a hang)
+      if (dereferencing)
+        exit(exit_reason::REASON_OBJ_OOB);
       size = ucsan_object_size_limit();
     }
     // Symbolize global variable on first access (label == 0)
+    // (and not written or symbolized before: see global_seen)
     ucsan_label *shadow = ucsan_shadow_for(p);
-    if (*shadow == 0 && dereferencing) {
+    if (*shadow == 0 && dereferencing && !global_byte_seen(p)) {
+      mark_global_seen(p, size);
       // only symbolize on deref
       bool sent_data = false;
       uint64_t first_byte_offset = 0;
@@ -743,7 +1002,11 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
         // Initialize from seed data if available
         if (ucsan_tainted.objects->size() && ret.offset < ucsan_tainted.objects->at(0).data.size()) {
           *((char*)p + i) = ucsan_tainted.objects->at(0).data.at(ret.offset);
-        } else if (!in_bss_section(p) && *((char*)p + i) != 0) {
+        } else if (*((char*)p + i) != 0) {
+          // Not gated on in_bss_section(): a BSS global is only zero until
+          // something writes it without updating the shadow (inline asm, an
+          // uninstrumented library), and then the solver's input cache would
+          // assume 0 against a non-zero concrete value.
           sent_data = true;
         }
       }
@@ -766,6 +1029,17 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       if (sent_data) {
         UCSAN_OUT("Sent init data for global variable @%p\n", p);
         __taint_trace_global_var(0, first_byte_offset, size, p);
+        // and keep this run's copy of the seed in step, as the manager puts
+        // the bytes into its seed and the parser's input (GV_TYPE): what
+        // __ucsan_seed_byte reads for verify_inputs.  (Object 0 need not
+        // exist yet: an entry function without arguments, on an empty seed,
+        // makes none -- ucsan_set_label_for_args creates it the same way.)
+        if (!ucsan_tainted.objects->size()) ucsan_tainted.objects->resize(1);
+        auto &data = ucsan_tainted.objects->at(0).data;
+        if (data.size() < first_byte_offset + size)
+          data.resize(first_byte_offset + size);
+        for (uint64_t i = 0; i < size; ++i)
+          data[first_byte_offset + i] = ((uint8_t *)p)[i];
       }
     }
     return p;
@@ -773,6 +1047,14 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
   // if non-global yet without label, can't do much
   if (label < UCSAN_CONST_OFFSET) {
+    // ... except refuse an access larger than any object UCSan would create,
+    // as the lazy-init path below does.  Without an object there is nothing
+    // to bound it by, and a solver-chosen length would otherwise have the
+    // caller (a memset's ucsan_set_label) touch that many bytes of shadow.
+    if (dereferencing && size > ucsan_object_size_limit()) {
+      UCSAN_OUT("Access size too large for an untracked pointer %p: %zu\n", p, size);
+      exit(exit_reason::REASON_OBJ_OOB);
+    }
     // Null dereference checking
     if (dereferencing && ucsan_flags().checker_nullderef) {
       if ((uint64_t)p < size || (uint64_t)p < ucsan_object_size_limit()) {
@@ -802,6 +1084,13 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
   ucsan_label_info *label_info = get_label_info(label);
 
   UCSAN_OUT("label %u: op=%u, trace_bounds=%d\n", label, label_info->common.op, ucsan_flags().trace_bounds);
+
+  // Alloca labels are emitted even when bounds tracing is disabled.  They
+  // describe the concrete stack object; they are not under-constrained
+  // pointer labels and must never fall through to the external-pointer path.
+  // The bounds-enabled path below still performs stack-UAF and OOB checks.
+  if (!ucsan_flags().trace_bounds && label_info->common.op == OP_ALLOCA)
+    return p;
 
   // Bounds checking when trace_bounds is enabled
   if (ucsan_flags().trace_bounds) {
@@ -880,6 +1169,16 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
   if (ptr_info->status == PTR_UNINITIALIZED) {
     UCSAN_OUT("check pointer: uninit pointer\n");
 
+    // The same limit as for an allocated pointer below, and it must come
+    // first: sizes are 32-bit past this point (lookup_object, data.resize),
+    // so 1 << 37 truncates to an empty object that customized_malloc accepts,
+    // and the caller's memset then writes 128 GB of memory and shadow from it
+    // (kvmclock_init_mem, 59 GB RSS before the OOM killer).
+    if (size > ucsan_object_size_limit()) {
+      UCSAN_OUT("Object access size too large: %zu\n", size);
+      exit(exit_reason::REASON_OBJ_OOB);
+    }
+
     uint32_t object_id;
     void *return_addr = __builtin_return_address(0);
     auto& obj = lookup_object(label, 0, return_addr, &object_id, type_id, (uint32_t)size);
@@ -900,10 +1199,18 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     }
     object_size = obj.data.size();
 
+    // Seed data can make an object larger than the size limit
+    if (object_size > ucsan_object_size_limit()) {
+      UCSAN_OUT("Object size too large: %zu\n", object_size);
+      exit(exit_reason::REASON_OBJ_OOB);
+    }
+
     // Create object label
     ucsan_label obj_label = allocate_label();
 
-    void* np = customized_malloc(object_size);
+    // offset 0 at the window's middle (see object_window); np is the lowest
+    // byte, obj.offset below it
+    void* np = object_window() - obj.offset;
     internal_memcpy(np, obj.data.data(), object_size);
 
     ucsan_obj_info *obj_label_info = to_obj_info(get_label_info(obj_label));
@@ -918,26 +1225,46 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     ptr_info->pseudo_base = p;  // Store original pseudo pointer in ptr_info
 
     // Create labels for each byte in the object and set up shadow memory
+    // (for a large object, the object's own label: its bytes get theirs when
+    // first read, see ucsan_labels_on_demand; the SymSan labels are eager)
+    bool on_demand = ucsan_labels_on_demand(object_size);
     for (uint64_t offset = 0; offset < object_size; ++offset) {
-      ucsan_label byte_label = allocate_label();
-
-      ucsan_label_info *byte_info = get_label_info(byte_label);
-      ucsan_byte_info *byte = to_byte_info(byte_info);
-      byte->op = OP_NONE;
-      byte->object_id = object_id;
-      byte->offset = offset - obj.offset;
-
       void *nptr = (void*)((uint64_t)np + offset);
       ucsan_label *shadow = ucsan_shadow_for(nptr);
-      *shadow = byte_label;
+      int64_t rel = (int64_t)offset - (int64_t)obj.offset;
+      if (on_demand) {
+        *shadow = obj_label;
+      } else {
+        ucsan_label byte_label = allocate_label();
+
+        ucsan_label_info *byte_info = get_label_info(byte_label);
+        ucsan_byte_info *byte = to_byte_info(byte_info);
+        byte->op = OP_NONE;
+        byte->object_id = object_id;
+        byte->offset = rel;
+
+        *shadow = byte_label;
+      }
 
       // Bridge to SymSan: use 0-based offset so offsets stay consistent
       // across seed re-executions regardless of obj.offset growth
-      dfsan_label symsan_label = __taint_create_label(object_id, offset, 1);
+      // (now: relative to offset 0 like the UCSan label above, negative below
+      // it.  A 0-based offset is one into the seed as executed, and shifts by
+      // the amount the object has grown backwards: enlargement numbers the
+      // bytes it adds relative to offset 0, so a run that grows the object
+      // mixed the two, and the manager, converting back with the length the
+      // growth had just changed, put solutions on the wrong bytes.  Relative
+      // offsets never move; the parser and the manager take the origin from
+      // the seed.)
+      dfsan_label symsan_label = __taint_create_label(object_id, rel, 1);
       __taint_set_label(symsan_label, nptr, 1);
     }
 
     ptr_info->status = PTR_INITIALIZED;
+    // offset 0 is page aligned, which any first access's alignment is
+    obj_align_log2p1[obj_label] = 1;
+    if (dereferencing)
+      align_object(obj_label_info, obj_label, 0, align, size, p, label);
     return (char*)np + obj.offset;
 
   } else if (ptr_info->status == PTR_INITIALIZED) {
@@ -946,6 +1273,16 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     ucsan_label obj_label = ptr_info->obj_label;
     ucsan_obj_info *obj_label_info = to_obj_info(get_label_info(obj_label));
     uint32_t object_id = obj_label_info->object_id;
+
+    // the object freed through another of its pointer labels: this label's
+    // own op is still OP_EXTERNAL (see ucsan_obj_freed)
+    if (ucsan_flags().trace_bounds && dereferencing &&
+        ucsan_obj_freed(obj_label)) {
+      UCSAN_OUT("ERROR: Heap UAF detected ptr %p, label = %u (object label %u freed)\n",
+                p, label, obj_label);
+      __taint_trace_event_addr(label, EVENT_UAF, 0, __builtin_return_address(0), 0);
+      exit(exit_reason::EVENT_UAF);
+    }
 
     void *obj_base = obj_label_info->real_ptr;
     int64_t pseudo_base = (int64_t)ptr_info->pseudo_base;  // Read from ptr_info
@@ -974,6 +1311,9 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     int64_t upper_bound = (int64_t)obj_label_info->upper_bound;
 
     if (lower_bound <= desired_offset && desired_end <= upper_bound) {
+      if (dereferencing)
+        obj_base = align_object(obj_label_info, obj_label, desired_offset,
+                                align, size, p, label);
       void* target = (void*)((int64_t)obj_base + desired_offset);
       UCSAN_OUT("Fast path: returning %p\n", target);
       return target;
@@ -996,9 +1336,11 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       [new_size]            -> e.g. use container_of access to a larger object
       ---------------------
     */
+    // (now: nothing is copied.  The object keeps its window and its offset 0,
+    // and only the bytes between the old and the new bounds are added, in
+    // place: see object_window.)
 
     // Slow path: need to enlarge object
-    uint64_t original_size = obj_label_info->lower_bound + obj_label_info->upper_bound;
     uint64_t extended_lower = 0;
     uint64_t new_lower_bound = obj_label_info->lower_bound;
 
@@ -1027,63 +1369,53 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       exit(exit_reason::REASON_OBJ_OOB);
     }
 
-    void *np = customized_malloc(new_size);
-    UCSAN_OUT("Enlarged object: np=%p, new_size=%lu\n", np, new_size);
+    // Grow in place (see object_window): offset 0 stays where it is, the new
+    // bytes on either side get labels and zeroes -- the value the manager
+    // gives them in the seed (EVENT_EXTENSION) -- and nothing moves.  Byte
+    // labels are numbered relative to offset 0, as before.
+    char *base = (char *)obj_base;
+    int64_t old_lower = -(int64_t)obj_label_info->lower_bound;
+    int64_t old_upper = (int64_t)obj_label_info->upper_bound;
+    int64_t new_upper = (int64_t)new_size - (int64_t)new_lower_bound;
+    UCSAN_OUT("Enlarged object in place: [%ld, %ld) -> [%ld, %ld)\n",
+              old_lower, old_upper, -(int64_t)new_lower_bound, new_upper);
 
-    // Copy and extend shadow memory
+    // (on demand once the object is large, see ucsan_labels_on_demand)
+    bool on_demand = ucsan_labels_on_demand(new_size);
+    auto label_new_byte = [&](int64_t rel) {
+      void *nptr = base + rel;
+      *(char *)nptr = 0;
+      if (on_demand) {
+        *ucsan_shadow_for(nptr) = obj_label;
+      } else {
+        ucsan_label byte_label = allocate_label();
+        ucsan_label_info *byte_info = get_label_info(byte_label);
+        ucsan_byte_info *byte = to_byte_info(byte_info);
+        byte->op = OP_NONE;
+        byte->object_id = object_id;
+        byte->offset = rel;
+        *ucsan_shadow_for(nptr) = byte_label;
+      }
+
+      // Bridge to SymSan: offset relative to offset 0 (negative below it)
+      dfsan_label symsan_label = __taint_create_label(object_id, rel, 1);
+      __taint_set_label(symsan_label, nptr, 1);
+    };
     // Padding the left lower bounds with new labels
-    for (uint64_t offset = 0; offset < extended_lower; ++offset) {
-      ucsan_label byte_label = allocate_label();
-
-      ucsan_label_info *byte_info = get_label_info(byte_label);
-      ucsan_byte_info *byte = to_byte_info(byte_info);
-      byte->op = OP_NONE;
-      byte->object_id = object_id;
-      byte->offset = (int64_t)offset - (int64_t)new_lower_bound;
-
-      void *nptr = (void*)((uint64_t)np + offset);
-      *ucsan_shadow_for(nptr) = byte_label;
-
-      // Bridge to SymSan: use signed offset (negative for backward extension)
-      dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
-      __taint_set_label(symsan_label, nptr, 1);
-    }
-
-    // Copy shadow memory from original object
-    void *dst_addr = (void*)((int64_t)np + extended_lower);
-    ucsan_label *shadow = ucsan_shadow_for(dst_addr);
-    internal_memcpy(shadow, ucsan_shadow_for(obj_base), original_size * sizeof(ucsan_label));
-
-    // Bridge to SymSan: copy shadow memory
-    __taint_copy_shadow(dst_addr, obj_base, original_size);
-
-    // Copy original data
-    internal_memcpy((char*)np + extended_lower, obj_base, original_size);
-
+    for (int64_t rel = -(int64_t)new_lower_bound; rel < old_lower; ++rel)
+      label_new_byte(rel);
     // Padding the right upper bounds with new labels
-    for (uint64_t offset = extended_lower + original_size; offset < new_size; ++offset) {
-      ucsan_label byte_label = allocate_label();
+    for (int64_t rel = old_upper; rel < new_upper; ++rel)
+      label_new_byte(rel);
 
-      ucsan_label_info *byte_info = get_label_info(byte_label);
-      ucsan_byte_info *byte = to_byte_info(byte_info);
-      byte->op = OP_NONE;
-      byte->object_id = object_id;
-      byte->offset = offset - new_lower_bound;
-
-      void *nptr = (void*)((uint64_t)np + offset);
-      *ucsan_shadow_for(nptr) = byte_label;
-
-      // Bridge to SymSan: offset relative to original pointer base
-      dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
-      __taint_set_label(symsan_label, nptr, 1);
-    }
-
-    // Update object info
+    // Update object info (real_ptr, offset 0, does not change)
     obj_label_info->lower_bound = (uint32_t)new_lower_bound;
-    obj_label_info->upper_bound = (uint32_t)(new_size - new_lower_bound);
-    obj_label_info->real_ptr = (char*)np + new_lower_bound;
+    obj_label_info->upper_bound = (uint32_t)new_upper;
 
-    return (void*)((int64_t)np + desired_offset);
+    if (dereferencing)
+      base = align_object(obj_label_info, obj_label, desired_offset, align,
+                          size, p, label);
+    return (void*)((int64_t)base + desired_offset);
   }
 
   UCSAN_OUT("Unknown pointer state: %d\n", ptr_info->status);
@@ -1233,29 +1565,188 @@ ucsan_label ucsan_combine_label(ucsan_label l1, ucsan_label l2) {
       return l2;
     }
   }
-  // Warn only if pointer is combined with non-zero non-pointer
-  if (l1_is_ptr && l2 != 0 && !l2_is_ptr) {
-    UCSAN_OUT("WARNING: pointer label %u used in binary operation with non-pointer %u\n", l1, l2);
+  // A pointer with a non-pointer operand stays that pointer, as a GEP keeps
+  // its base whatever the index: the kernel rebuilds pointers in integers --
+  // a tag masked off (keyring_ptr_to_key, `p & ~3`), page_address()'s offset
+  // arithmetic, per_cpu_ptr()'s `p + __per_cpu_offset[cpu]` with a
+  // symbolized offset -- and returning 0 here dropped the label, so a NULL
+  // from the seed reached its dereference unlabeled and faulted instead of
+  // being materialized.  (visitCmpInst does the same for a comparison with
+  // null.)  Two pointers still combine to nothing.
+  if (l1_is_ptr && !l2_is_ptr) {
+    if (l2 != 0)
+      UCSAN_OUT("pointer label %u used in binary operation with non-pointer %u\n", l1, l2);
+    return l1;
   }
-  if (l2_is_ptr && l1 != 0 && !l1_is_ptr) {
-    UCSAN_OUT("WARNING: pointer label %u used in binary operation with non-pointer %u\n", l2, l1);
+  if (l2_is_ptr && !l1_is_ptr) {
+    if (l1 != 0)
+      UCSAN_OUT("pointer label %u used in binary operation with non-pointer %u\n", l2, l1);
+    return l2;
   }
 
   // Return 0 - we don't track symbolic expressions in standalone mode
   return 0;
 }
 
+namespace __ucsan {
+
+ucsan_label ucsan_materialize_byte(ucsan_label *ls, void *addr) {
+  ucsan_label l = *ls;
+  if (l < UCSAN_CONST_OFFSET || l == kUninitializedLabel)
+    return l;
+  ucsan_label_info *info = get_label_info(l);
+  if (info->common.op != OP_RESERVED_OBJ)
+    return l;
+  // the object's label: this byte has none yet
+  ucsan_obj_info *obj = to_obj_info(info);
+  ucsan_label byte_label = allocate_label();
+  ucsan_byte_info *byte = to_byte_info(get_label_info(byte_label));
+  byte->op = OP_NONE;
+  byte->object_id = obj->object_id;
+  byte->offset = (int64_t)addr - (int64_t)obj->real_ptr;
+  UCSAN_OUT("materialize: object %u offset %ld -> label %u\n",
+            obj->object_id, (long)byte->offset, byte_label);
+  *ls = byte_label;
+  return byte_label;
+}
+
+}  // namespace __ucsan
+
+// Give every byte of [addr, addr + n) that has no UCSan label yet its label,
+// before its shadow is copied somewhere else: a copied marker would name the
+// source object at the destination's address.  Called by the shadow copies
+// (memcpy/memmove intrinsics, the __dfsw_ copy wrappers).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_materialize_range(void *addr, uint64_t n) {
+  if (!addr)
+    return;
+  ucsan_label *ls = ucsan_shadow_for(addr);
+  for (uint64_t i = 0; i < n; ++i)
+    ucsan_materialize_byte(&ls[i], (char *)addr + i);
+}
+
+// The stores of a lowered `rep stos{w,l,q}`: count elements of elem_size
+// bytes, each the low bytes of value, at addr (a checked pointer; the memset
+// lowered before it has set the shadow).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_fill_pattern(void *addr, uint64_t value, uint64_t elem_size,
+                        uint64_t count) {
+  char *p = (char *)addr;
+  for (uint64_t i = 0; i < count; ++i, p += elem_size)
+    internal_memcpy(p, &value, elem_size);
+}
+
+// The byte of the seed as sent, at `offset` from input's origin: what the
+// parser assumes an input label's byte is (cached_input_byte, with the
+// origins the manager gives it -- the header's per-object origin, len(lvalue),
+// not obj.offset, which the metadata's target_offset may override).  For
+// __taint_verify_input_bytes.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+bool __ucsan_seed_byte(uint32_t input, int64_t offset, uint8_t *out) {
+  const char *buf = ucsan_tainted.buf;
+  if (buf == nullptr || ucsan_tainted.buf_size < sizeof(uint64_t) ||
+      !ucsan_tainted.objects)
+    return false;
+  uint64_t cnt = *(const uint64_t *)buf;
+  if (input >= cnt || input >= ucsan_tainted.objects->size())
+    return false;
+  // the seed's bytes as loaded, plus what this run has told the manager
+  // since (a global's initial value, see the global symbolization); the
+  // origin is the header's
+  const uint32_t *origins = (const uint32_t *)(buf + sizeof(uint64_t));
+  auto &data = ucsan_tainted.objects->at(input).data;
+  int64_t idx = (int64_t)origins[input] + (int32_t)offset;
+  if (idx < 0 || (uint64_t)idx >= data.size())
+    return false;
+  *out = data[idx];
+  return true;
+}
+
+// A pointer made of seed bytes: label0, an (OP_NONE) byte label, is the first
+// of the n bytes that hold the pointer's value, concrete_val (nullptr if not
+// known).  Becomes the pointer's label: a pointer load
+// (ucsan_load_pointer_shadow), or an integer the program turns into a pointer
+// (ucsan_int_to_pointer).
+static ucsan_label seed_bytes_to_pointer(ucsan_label label0, uint64_t n,
+                                         void *concrete_val) {
+  ucsan_label_info *label_info = get_label_info(label0);
+  // the pointer's value is these seed bytes (see record_placement)
+  {
+    ucsan_byte_info *b = to_byte_info(label_info);
+    record_placement(b->object_id, b->offset, n);
+  }
+  // Check if the concrete pointer value points to a symbolize_input object
+  if (__symbolize_addr_map_inited && concrete_val) {
+    uint32_t target_id, target_offset;
+    ucsan_label target_ptr_label;
+    if (__symbolize_addr_map.find(concrete_val, &target_id, &target_offset,
+                                   &target_ptr_label)) {
+      UCSAN_OUT("load_pointer_shadow: symbolize_input hit: target_id=%u, "
+                "target_offset=%u, ptr_label=%u\n",
+                target_id, target_offset, target_ptr_label);
+
+      // Populate obj_map for lookup_object to find later
+      ucsan_byte_info *byte = to_byte_info(label_info);
+      uint32_t parent_id = byte->object_id;
+      int32_t parent_offset = (int32_t)byte->offset;
+      ucsan_tainted.obj_map->insert(parent_id, parent_offset, target_id);
+
+      // Set target's origin
+      if (target_id < ucsan_tainted.objects->size()) {
+        ucsan_tainted.objects->at(target_id).origin = {
+          parent_id, parent_offset, target_offset
+        };
+      }
+
+      // Return the saved ptr_label instead of converting to OP_EXTERNAL
+      if (target_ptr_label) {
+        return target_ptr_label;
+      }
+    }
+  }
+
+  // Default: convert byte label to pointer label
+  ucsan_ptr_info *ptr = to_ptr_info(label_info);
+  ptr->op = OP_EXTERNAL;
+  ptr->status = PTR_UNINITIALIZED;
+  return label0;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_pointer,
-                                      void *concrete_addr) {
+                                      void *concrete_addr, uint64_t unread) {
   if (ls == nullptr) return 0;
 
+  // Only the first byte's label is ever used, and only for a pointer or a
+  // pointer-sized value (below): that is the one byte to label on demand.
+  if (is_pointer || n == sizeof(void*))
+    ucsan_materialize_byte(ls, concrete_addr);
   ucsan_label label0 = ls[0];
+
+  if (ucsan_flags().verify_inputs)
+    __taint_verify_input_bytes(concrete_addr, n, __builtin_return_address(0));
 
   UCSAN_OUT("load_pointer_shadow: *label(%p)=%d is_pointer=%d, size=%lu\n",
             ls, label0, is_pointer, n);
 
   // Allow loading kUninitializedLabel for UBI detection
+  // FIXME: per byte, so a load the compiler widened past what the program
+  // reads is uninitialized as a whole: mode_store's strncmp(_buf, "on", 2)
+  // became a load i16 compared with "on", and with _buf = "\0" its second
+  // byte was never written (a UBI the C does not have).  Exact equality
+  // (defined once initialized bits differ, as MSan has) needs bitwise
+  // initialization state, which is not planned.
+  // (a value is uninitialized when any byte of it its uses read is, not only
+  // the first: a bitfield in the third byte of its access unit was read as
+  // initialized when the first byte had been written.  The bytes no use reads
+  // -- the unit's other fields -- do not count either way.)
+  if (!is_pointer) {
+    for (uint64_t i = 0; i < n; ++i)
+      if (ls[i] == kUninitializedLabel && !(i < 64 && (unread >> i & 1)))
+        return kUninitializedLabel;
+    if (label0 == kUninitializedLabel)
+      return 0;
+  }
   if (label0 == kUninitializedLabel) {
     return label0;
   }
@@ -1263,45 +1754,11 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
   ucsan_label_info *label_info = get_label_info(label0);
 
   if (is_pointer) {
-    if (label0 >= UCSAN_CONST_OFFSET && label_info->common.op == OP_NONE) {
-      // Check if the concrete pointer value points to a symbolize_input object
-      if (__symbolize_addr_map_inited && concrete_addr && n == sizeof(void*)) {
-        void *concrete_val = *(void **)concrete_addr;
-        if (concrete_val) {
-          uint32_t target_id, target_offset;
-          ucsan_label target_ptr_label;
-          if (__symbolize_addr_map.find(concrete_val, &target_id, &target_offset,
-                                         &target_ptr_label)) {
-            UCSAN_OUT("load_pointer_shadow: symbolize_input hit: target_id=%u, "
-                      "target_offset=%u, ptr_label=%u\n",
-                      target_id, target_offset, target_ptr_label);
-
-            // Populate obj_map for lookup_object to find later
-            ucsan_byte_info *byte = to_byte_info(label_info);
-            uint32_t parent_id = byte->object_id;
-            int32_t parent_offset = (int32_t)byte->offset;
-            ucsan_tainted.obj_map->insert(parent_id, parent_offset, target_id);
-
-            // Set target's origin
-            if (target_id < ucsan_tainted.objects->size()) {
-              ucsan_tainted.objects->at(target_id).origin = {
-                parent_id, parent_offset, target_offset
-              };
-            }
-
-            // Return the saved ptr_label instead of converting to OP_EXTERNAL
-            if (target_ptr_label) {
-              return target_ptr_label;
-            }
-          }
-        }
-      }
-
-      // Default: convert byte label to pointer label
-      ucsan_ptr_info *ptr = to_ptr_info(label_info);
-      ptr->op = OP_EXTERNAL;
-      ptr->status = PTR_UNINITIALIZED;
-    }
+    if (label0 >= UCSAN_CONST_OFFSET && label_info->common.op == OP_NONE)
+      return seed_bytes_to_pointer(
+          label0, n,
+          concrete_addr && n == sizeof(void *) ? *(void **)concrete_addr
+                                               : nullptr);
     return label0;
   }
 
@@ -1336,6 +1793,25 @@ void ucsan_store_pointer_shadow(ucsan_label l, ucsan_label *ls, uint64_t n) {
   }
 
   Report("WARNING: storing non-pointer label %d (op=%d) shadow\n", l, label_info->common.op);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_store_rmw_shadow(ucsan_label l, ucsan_label l_load, ucsan_label l_new,
+                            ucsan_label *ls, uint64_t n, uint64_t touched) {
+  UCSAN_OUT("store_rmw_shadow: label=%d, load=%d, new=%d, n=%lu, touched=%lx, ls=%p\n",
+            l, l_load, l_new, n, touched, ls);
+  // An uninitialized load makes the whole value so, but a byte the store
+  // rewrites is written: it takes the new bits' label.  A byte it does not is
+  // stored as it was loaded and keeps its own.
+  ucsan_label w = l_load == kUninitializedLabel ? l_new : l;
+  if (w != 0 && w != kUninitializedLabel) {
+    // a pointer label, which no bitfield holds
+    ucsan_store_pointer_shadow(w, ls, n);
+    return;
+  }
+  for (uint64_t i = 0; i < n; ++i)
+    if (touched & (1ULL << i))
+      ls[i] = w;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1379,15 +1855,25 @@ void* ucsan_set_label_for_args(uint32_t index, uint32_t size_in_bits, uint8_t is
     ucsan_tainted.objects = new ObjectStorage();
   }
 
-  if (ucsan_tainted.objects->size() &&
-      last_offset + size_in_bytes <= ucsan_tainted.objects->at(0).data.size()) {
-    uint64_t result = *((uint64_t*)(ucsan_tainted.objects->at(0).data.data() + last_offset));
+  if (!ucsan_tainted.objects->size()) ucsan_tainted.objects->resize(1);
+  auto &data = ucsan_tainted.objects->at(0).data;
+  // A seed can cover only part of the argument: the solver writes the bytes a
+  // constraint mentions and nothing past them, so `x & 0x101` on an int leaves
+  // a seed that ends two bytes into it.  Take what is there and read the rest
+  // as 0, which is what the parser assumes for bytes past the end.  Requiring
+  // the whole argument used to drop the seed's bytes along with the missing
+  // ones, so the target ran on `given` while the parser evaluated the seed,
+  // and every branch on the argument was rejected as a value mismatch.
+  bool in_seed = last_offset < data.size();
+  if (data.size() < last_offset + size_in_bytes)
+    data.resize(last_offset + size_in_bytes);
+  if (in_seed) {
+    uint64_t result = 0;
+    internal_memcpy(&result, data.data() + last_offset,
+                    size_in_bytes < sizeof(result) ? size_in_bytes : sizeof(result));
     UCSAN_OUT("Returning: 0x%lx\n", result);
     return (void*)result;
   }
-
-  if (!ucsan_tainted.objects->size()) ucsan_tainted.objects->resize(1);
-  ucsan_tainted.objects->at(0).data.resize(last_offset + size_in_bytes);
 
   return (void*)given;
 }
@@ -1508,8 +1994,41 @@ static ucsan_label find_alloca_containing(void *ptr) {
   return 0;
 }
 
+// A label naming an allocation the out-of-scope callee can still write: a
+// heap object the function allocated, or a stack object of a frame that is
+// still live (a popped frame's labels lie between the heap labels and
+// __alloca_stack_top, see the stack UAF check in ucsan_check_pointer).
+static bool is_live_alloca_label(ucsan_label l) {
+  if (l < UCSAN_CONST_OFFSET || l == kUninitializedLabel)
+    return false;
+  ucsan_label last_heap = atomic_load(&__ucsan_last_label, memory_order_relaxed);
+  if (l > last_heap && l < __alloca_stack_top)
+    return false;
+  return get_label_info(l)->common.op == OP_ALLOCA;
+}
+
+static const int kResignMaxDepth = 4;
+static const int kResignMaxObjects = 64;
+
+static ucsan_label resign_alloca_object(ucsan_label label_for_ptr,
+                                        ucsan_label *seen, int *nseen,
+                                        int depth);
+
 static ucsan_label resign_alloca_object(ucsan_label label_for_ptr) {
+  ucsan_label seen[kResignMaxObjects];
+  int nseen = 0;
+  return resign_alloca_object(label_for_ptr, seen, &nseen, 0);
+}
+
+static ucsan_label resign_alloca_object(ucsan_label label_for_ptr,
+                                        ucsan_label *seen, int *nseen,
+                                        int depth) {
   UCSAN_OUT("Resign alloca object\n");
+  for (int i = 0; i < *nseen; ++i)
+    if (seen[i] == label_for_ptr)
+      return label_for_ptr;
+  if (*nseen < kResignMaxObjects)
+    seen[(*nseen)++] = label_for_ptr;
   ucsan_label_info *orig = get_label_info(label_for_ptr);
   ucsan_obj_info *obj_info = to_obj_info(orig);
 
@@ -1526,10 +2045,46 @@ static ucsan_label resign_alloca_object(ucsan_label label_for_ptr) {
   ucsan_label *le = ucsan_shadow_for(upper);
   char *obj_ptr = lower;
 
+  // A run of uninitialized bytes longer than eager_label_size gets one
+  // on-demand marker, as a large lazily created object does (see
+  // ucsan_labels_on_demand): unlzo hands two 40 KB buffers to out-of-scope
+  // callees, and a label per byte exhausted the 16-bit labels.  The bytes
+  // keep the super object offsets, one each, consecutive within the run, so
+  // the marker's real_ptr is placed for addr - real_ptr to be that offset.
+  ucsan_label run_marker = 0;
+  ucsan_label *run_end = lp;
   for (; lp < le; ++lp, ++obj_ptr) {
-    if (*lp == kUninitializedLabel) {
-      // Allocate a byte from super object
-      auto ret = create_label_from_super_object(1, false);
+    if (*lp != kUninitializedLabel)
+      continue;
+    if (lp >= run_end) {
+      run_marker = 0;
+      for (run_end = lp; run_end < le && *run_end == kUninitializedLabel;)
+        ++run_end;
+      uint64_t run_len = run_end - lp;
+      if (ucsan_labels_on_demand(run_len)) {
+        uint64_t base = atomic_load(&ucsan_tainted.arg_used, memory_order_relaxed);
+        run_marker = allocate_label();
+        ucsan_obj_info *marker = to_obj_info(get_label_info(run_marker));
+        marker->op = OP_RESERVED_OBJ;
+        marker->type_id = 0;
+        marker->object_id = 0;  // super object
+        marker->real_ptr = obj_ptr - base;
+        marker->lower_bound = (uint32_t)base;
+        marker->upper_bound = (uint32_t)run_len;
+        UCSAN_OUT("resign alloca run: %p +%lu at super offset %lu, marker %u\n",
+                  obj_ptr, run_len, base, run_marker);
+      }
+    }
+    {
+      object_info ret;
+      if (run_marker) {
+        // the byte's offset, its label given when first read
+        ret.offset = atomic_fetch_add(&ucsan_tainted.arg_used, 1, memory_order_relaxed);
+        ret.label = run_marker;
+      } else {
+        // Allocate a byte from super object
+        ret = create_label_from_super_object(1, false);
+      }
       UCSAN_OUT("resign alloca ret: %u %lu\n", ret.label, ret.offset);
       *lp = ret.label;
 
@@ -1544,6 +2099,30 @@ static ucsan_label resign_alloca_object(ucsan_label label_for_ptr) {
         *obj_ptr = 0;
       }
     }
+  }
+
+  // The callee also writes what it reaches through the object: a buffer whose
+  // address the caller stored in it (i2c_msg.buf, msghdr.msg_name,
+  // printk_record.info).  Resigning only the object passed left that buffer
+  // uninitialized, and the caller's first read of it a UBI.  A stored pointer
+  // carries its allocation's label in all of its shadow bytes
+  // (ucsan_store_pointer_shadow).
+  if (depth >= kResignMaxDepth)
+    return label_for_ptr;
+  char *slot = (char *)RoundUpTo((uptr)lower, sizeof(void *));
+  for (; slot + sizeof(void *) <= upper; slot += sizeof(void *)) {
+    ucsan_label *ls = ucsan_shadow_for(slot);
+    ucsan_label l = ls[0];
+    if (l == label_for_ptr || !is_live_alloca_label(l))
+      continue;
+    bool whole = true;
+    for (uptr i = 1; i < sizeof(void *); ++i)
+      whole &= ls[i] == l;
+    if (!whole)
+      continue;
+    UCSAN_OUT("Resign alloca %u reached through %p in alloca %u\n",
+              l, slot, label_for_ptr);
+    resign_alloca_object(l, seen, nseen, depth + 1);
   }
   return label_for_ptr;
 }
@@ -1565,6 +2144,7 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       UCSAN_OUT("Resign recovered alloca label %u for %p\n", label_for_ptr, ptr);
   }
 
+  bool in_alloca = false;  // the overlay below is inside a live alloca
   if (label_for_ptr != 0) {
     ucsan_label_info *orig = get_label_info(label_for_ptr);
 
@@ -1579,10 +2159,14 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       ucsan_obj_info *obj_info = to_obj_info(orig);
       char *lower = (char *)obj_info->real_ptr - obj_info->lower_bound;
       char *upper = (char *)obj_info->real_ptr + obj_info->upper_bound;
-      if ((char *)ptr >= lower && (char *)ptr < upper)
-        n = (uint64_t)(upper - (char *)ptr);
-      else
-        n = (uint64_t)(upper - lower);
+      // (the overlay writes from ptr, so only a ptr inside the alloca; one
+      // outside it used to overlay the alloca's whole size starting there)
+      if ((char *)ptr < lower || (char *)ptr >= upper) {
+        UCSAN_OUT("Resign alloca: p=%p is outside it, skip\n", ptr);
+        return label_for_ptr;
+      }
+      n = (uint64_t)(upper - (char *)ptr);
+      in_alloca = true;
       UCSAN_OUT("Resign alloca as concrete: p=%p, size=%lu\n", ptr, n);
       // Continue into concrete overlay below.
     } else if (orig->common.op == OP_FREE) {
@@ -1591,22 +2175,45 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
       return label_for_ptr;
     } else {
       // Mark as external pointer
+      // (only a pointer not dereferenced yet -- a byte label, or an external
+      // pointer still uninitialized -- as ucsan_check_pointer would on first
+      // use.  An initialized one keeps its object: lazy init has reused the
+      // fields lookup_object finds the object by, (parent, offset), for
+      // (obj_label, pseudo_base), so marking it uninitialized re-created the
+      // object from a label number and a pseudo pointer: an object the seed
+      // does not have, and the branches on it value mismatches.  An object
+      // label (an unmaterialized byte's marker) is not a pointer at all.)
       ucsan_ptr_info *ptr_info = to_ptr_info(orig);
-      ptr_info->op = OP_EXTERNAL;
-      ptr_info->status = PTR_UNINITIALIZED;
+      if (orig->common.op == OP_NONE ||
+          (orig->common.op == OP_EXTERNAL &&
+           ptr_info->status == PTR_UNINITIALIZED)) {
+        ptr_info->op = OP_EXTERNAL;
+        ptr_info->status = PTR_UNINITIALIZED;
+      }
       return label_for_ptr;
     }
   }
 
   {
-    if (!is_writeable(ptr)) {
-      return UCSAN_CONST_LABEL;
-    }
-
     // No UCSan object and no compile-time size: nothing to overlay. Avoid
     // minting a zero-byte "concrete external" object (opaque-ptr dangle stubs).
     if (n == 0) {
       UCSAN_OUT("Concrete external object: p=%p, size unknown, skip\n", ptr);
+      return UCSAN_CONST_LABEL;
+    }
+
+    // What the overlay may write is known, not probed: the alloca above, or
+    // else -- a pointer with no UCSan label that is in no live alloca -- a
+    // global, the image's writable data (in_data_section, as
+    // ucsan_check_pointer's global model).  Anything else is read-only data
+    // or code, or a value that is no object of ours (a pointer built from
+    // integers), and a callee writes none of it.  The probe this replaces
+    // read /dev/zero into ptr, zeroing the byte it tested -- even when n was
+    // 0 and nothing was overlaid -- behind the labels of a global already
+    // symbolized (init_hugetlbfs_fs's default_hstate_idx).
+    if (!in_alloca &&
+        !(in_data_section(ptr) && in_data_section((char *)ptr + n - 1))) {
+      UCSAN_OUT("Concrete external object: p=%p is not writable data, skip\n", ptr);
       return UCSAN_CONST_LABEL;
     }
 
@@ -1622,20 +2229,40 @@ ucsan_label ucsan_resign_shadow(void *ptr, ucsan_label *orig_label, uint64_t n, 
     auto& object = lookup_object(ret.label, 0, ret_addr, &object_id);
 
     // Set up shadow memory for object bytes
+    // (a large object's bytes get their labels on demand, as a lazily
+    // created object's do, see ucsan_labels_on_demand: serial8250_resume_port
+    // hands an out-of-scope callee a buffer big enough to exhaust the 16-bit
+    // labels one per byte.  The marker is an object label of this object,
+    // offset 0 at ptr, so a byte materializes the label it would have had.)
+    ucsan_label marker = 0;
+    if (ucsan_labels_on_demand(n)) {
+      marker = allocate_label();
+      ucsan_obj_info *obj = to_obj_info(get_label_info(marker));
+      obj->op = OP_RESERVED_OBJ;
+      obj->type_id = 0;
+      obj->object_id = object_id;
+      obj->real_ptr = ptr;
+      obj->lower_bound = 0;
+      obj->upper_bound = (uint32_t)n;
+    }
     ucsan_label *shadow = ucsan_shadow_for(ptr);
     for (uptr i = 0; i < n; ++i) {
-      ucsan_label next_label = allocate_label();
+      if (marker) {
+        shadow[i] = marker;
+      } else {
+        ucsan_label next_label = allocate_label();
 
-      shadow[i] = next_label;
-      ucsan_label_info *new_label_info = get_label_info(next_label);
-      ucsan_byte_info *byte = to_byte_info(new_label_info);
-      byte->op = OP_NONE;
-      byte->object_id = object_id;
-      byte->offset = i;
+        shadow[i] = next_label;
+        ucsan_label_info *new_label_info = get_label_info(next_label);
+        ucsan_byte_info *byte = to_byte_info(new_label_info);
+        byte->op = OP_NONE;
+        byte->object_id = object_id;
+        byte->offset = i;
+      }
 
       // Bridge to SymSan: create symbolic label for this byte and set shadow
       void *byte_addr = (void*)((uint64_t)ptr + i);
-      dfsan_label symsan_label = __taint_create_label(object_id, byte->offset, 1);
+      dfsan_label symsan_label = __taint_create_label(object_id, i, 1);
       __taint_set_label(symsan_label, byte_addr, 1);
     }
 
@@ -1678,19 +2305,272 @@ void* ucsan_wrap_retval(uint64_t size, ucsan_label *ret_label, bool is_ptr, void
   dfsan_label symsan_label = __taint_create_label(0, last_offset, (uint32_t)size);
   __taint_set_retval_tls(retval_tls_index, symsan_label, (uint32_t)bits);
 
-  if (ucsan_tainted.objects->size() &&
-      last_offset + size <= ucsan_tainted.objects->at(0).data.size()) {
-    UCSAN_OUT("offset (%lu + %lu) in the seed\n", last_offset, size);
-    for (uptr i = 0; i < size; ++i) {
-      __ucsan_wrapped_return_tls[i] = ucsan_tainted.objects->at(0).data[last_offset + i];
-    }
-  } else {
-    for (uptr i = 0; i < size; ++i) {
-      __ucsan_wrapped_return_tls[i] = 0;
+  // byte by byte, and 0 past the end of the seed: a seed that covers only part
+  // of the value must still deliver that part (see ucsan_set_label_for_args)
+  uptr seed_size = ucsan_tainted.objects->size() ?
+                   ucsan_tainted.objects->at(0).data.size() : 0;
+  UCSAN_OUT("offset (%lu + %lu), seed has %lu\n", last_offset, size, seed_size);
+  for (uptr i = 0; i < size; ++i) {
+    __ucsan_wrapped_return_tls[i] = last_offset + i < seed_size ?
+        ucsan_tainted.objects->at(0).data[last_offset + i] : 0;
+  }
+  // The caller loads the value as its own type, so a bool is one byte that
+  // must be 0 or 1: LLVM's i1 load leaves the other bits undefined and the
+  // branch tests the whole byte, while SymSan truncates the label to `bits`
+  // (__taint_set_retval_tls).  A seed byte of 2 was a false bool the target
+  // took as true, and the branch on it a value mismatch.
+  if (bits % 8)
+    __ucsan_wrapped_return_tls[size - 1] &= (1u << (bits % 8)) - 1;
+
+  return (void*)__ucsan_wrapped_return_tls;
+}
+
+namespace __ucsan {
+static u64 ucsan_freed_objs[(1u << (8 * sizeof(ucsan_label))) / 64];
+
+bool ucsan_obj_freed(ucsan_label obj_label) {
+  return (ucsan_freed_objs[obj_label / 64] >> (obj_label % 64)) & 1;
+}
+
+void ucsan_mark_obj_freed(ucsan_label obj_label) {
+  ucsan_freed_objs[obj_label / 64] |= 1ULL << (obj_label % 64);
+}
+}  // namespace __ucsan
+
+// A UC pointer: an external pointer, or a byte label (a pointer loaded from
+// a UC object or a global and not dereferenced yet, which ucsan_check_pointer
+// turns into one).  Not a real pointer (no label, an alloca, a global's
+// address).
+static bool is_uc_pointer_label(ucsan_label l) {
+  if (l < UCSAN_CONST_OFFSET || l == kUninitializedLabel)
+    return false;
+  uint16_t op = get_label_info(l)->common.op;
+  return op == OP_EXTERNAL || op == OP_NONE;
+}
+
+// The object of an initialized UC pointer label, or 0
+static ucsan_label uc_pointer_object(ucsan_label l) {
+  if (!is_uc_pointer_label(l))
+    return 0;
+  ucsan_ptr_info *pi = to_ptr_info(get_label_info(l));
+  if (pi->op != OP_EXTERNAL || pi->status != PTR_INITIALIZED)
+    return 0;
+  return pi->obj_label;
+}
+
+// SymSan's opcodes for the index expression (dfsan.h's, from the same .def)
+namespace {
+enum symsan_binary_op : uint16_t {
+#define HANDLE_BINARY_INST(num, opcode, Class) SYMSAN_##opcode = num,
+#define HANDLE_OTHER_INST(num, opcode, Class) SYMSAN_##opcode = num,
+#include "llvm/IR/Instruction.def"
+#undef HANDLE_BINARY_INST
+#undef HANDLE_OTHER_INST
+};
+// dfsan.h's: a comparison's predicate (in the op's high byte), and the UB
+// check kind of an index past its object
+const uint16_t SYMSAN_bveq = 32, SYMSAN_bvugt = 34;
+const uint32_t SYMSAN_ub_index_overflow = 7;
+}  // namespace
+
+// A pointer bound into another's object by a pointer difference (see
+// __dfsw_ucsan_ptr_index).  The pointer label keeps its own number -- its
+// copies in memory and registers are not touched -- and its ptr_info names
+// the other's object, so an object can have more than one pointer label; what
+// a label alone cannot say is that its offset in the object is symbolic:
+// c + i * elem, with i the fresh index (its SymSan label and the value it had).
+// Recorded here, so that a later difference of the two is i again, not a new
+// fresh index.  Bindings are rare (one per unrelated difference that binds).
+struct ucsan_ptr_binding {
+  ucsan_label label;
+  dfsan_label index;
+  int64_t index_value;
+  int64_t elem;
+};
+static ucsan_ptr_binding ucsan_ptr_bindings[64];
+static unsigned ucsan_num_ptr_bindings;
+
+static const ucsan_ptr_binding *find_ptr_binding(ucsan_label l) {
+  for (unsigned i = 0; i < ucsan_num_ptr_bindings; ++i)
+    if (ucsan_ptr_bindings[i].label == l)
+      return &ucsan_ptr_bindings[i];
+  return nullptr;
+}
+
+// `p - q` (UCSanVisitor::visitBinaryOperator): whether the index the program
+// computes from p and q's pseudo-pointers is not the one it means, and
+// __dfsw_ucsan_ptr_index has to give it.  Two UC pointers with no known
+// relation: their pseudo-pointers' difference is any number.  Two pointer
+// labels of the same UC object (one bound into the other's by an earlier
+// difference): their pseudo-pointers have unrelated bases, the difference
+// of their offsets in the object is the one.  Real pointers, and two through
+// the same label, are related as the program has them.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+bool ucsan_ptr_diff_rewrite(void *p, ucsan_label lp, void *q, ucsan_label lq) {
+  bool up = is_uc_pointer_label(lp), uq = is_uc_pointer_label(lq);
+  if (!up && !uq)
+    return false;
+  if (lp == lq)
+    return false;
+  UCSAN_OUT("ptr_diff: %p (label %u) and %p (label %u) need the index\n",
+            p, lp, q, lq);
+  return true;
+}
+
+// The SymSan label of x's offset in its object, as rest + label * scale:
+// 0 for a pointer that is not bound, whose offset is concrete.  Sets *rest
+// to the concrete part, x's offset less the index's.
+static dfsan_label pointer_offset_term(void *x, ucsan_label l, int64_t *rest,
+                                       int64_t *scale) {
+  ucsan_ptr_info *pi = to_ptr_info(get_label_info(l));
+  *rest = (int64_t)x - (int64_t)pi->pseudo_base;
+  *scale = 0;
+  const ucsan_ptr_binding *b = find_ptr_binding(l);
+  if (!b)
+    return 0;
+  *rest -= b->index_value * b->elem;
+  *scale = b->elem;
+  return b->index;
+}
+
+// The element index of two pointer labels of one object: the difference of
+// their offsets in it, divided by elem, concrete and -- when either is bound
+// -- symbolic, in the index it was bound by.  The binding's own subtraction
+// again (counter_show reads `attr - counter_attrs` twice) is exactly the
+// index's label.
+static int64_t same_object_index(int64_t elem, void *p, void *q,
+                                 ucsan_label lp, ucsan_label lq) {
+  int64_t rp, rq, sp, sq;
+  dfsan_label ip = pointer_offset_term(p, lp, &rp, &sp);
+  dfsan_label iq = pointer_offset_term(q, lq, &rq, &sq);
+  ucsan_ptr_info *pi = to_ptr_info(get_label_info(lp));
+  ucsan_ptr_info *qi = to_ptr_info(get_label_info(lq));
+  int64_t diff = ((int64_t)p - (int64_t)pi->pseudo_base) -
+                 ((int64_t)q - (int64_t)qi->pseudo_base);
+  int64_t index = diff / elem;
+  dfsan_label label = 0;
+  // label = (rp - rq) / elem + ip * sp / elem - iq * sq / elem, when every
+  // part is a whole number of elements; otherwise the program's sdiv exact
+  // is poison and the index is left concrete
+  if ((ip || iq) && (rp - rq) % elem == 0 && sp % elem == 0 &&
+      sq % elem == 0) {
+    int64_t ival = 0, jval = 0;
+    if (const ucsan_ptr_binding *b = find_ptr_binding(lp)) ival = b->index_value;
+    if (const ucsan_ptr_binding *b = find_ptr_binding(lq)) jval = b->index_value;
+    int64_t kp = sp / elem, kq = sq / elem;
+    // ip * kp
+    dfsan_label tp = ip && kp != 1
+        ? __taint_union(ip, 0, SYMSAN_Mul, 64, ival, kp) : ip;
+    int64_t vp = ival * kp;
+    dfsan_label tq = iq && kq != 1
+        ? __taint_union(iq, 0, SYMSAN_Mul, 64, jval, kq) : iq;
+    int64_t vq = jval * kq;
+    // tp - tq
+    label = tq ? __taint_union(tp, tq, SYMSAN_Sub, 64, vp, vq) : tp;
+    // + (rp - rq) / elem
+    int64_t c = (rp - rq) / elem;
+    if (label && c)
+      label = __taint_union(label, 0, SYMSAN_Add, 64, vp - vq, c);
+  }
+  __taint_set_retval_tls(0, label, 64);
+  UCSAN_OUT("ptr_diff: same object, index %ld (SymSan label %u)\n",
+            index, label);
+  return index;
+}
+
+// The element index `p - q` that ucsan_ptr_diff_rewrite says the program does
+// not compute.  For two pointer labels of one object, the difference of their
+// offsets (same_object_index).  For two unrelated UC pointers, what the
+// program assumes they are, p == &q[i], with i a fresh symbolic value -- from
+// the super object, as a wrapped return value is -- and its SymSan label in
+// the retval TLS (TaintPass reads it there for a __dfsw_ call from UCSan).  p
+// is then bound into q's object at element i, so that what is written through
+// one is seen through the other, and freeing one frees the other's object;
+// only while p has no object of its own, and only into a UC object (a real q
+// -- lock_classes in match_held_lock -- is not one).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+int64_t __dfsw_ucsan_ptr_index(bool rewrite, int64_t elem, void *p, void *q,
+                               ucsan_label lp, ucsan_label lq) {
+  if (!rewrite)
+    return 0;
+  ucsan_label op = uc_pointer_object(lp);
+  if (op && op == uc_pointer_object(lq))
+    return same_object_index(elem, p, q, lp, lq);
+
+  auto ret = create_label_from_super_object(sizeof(int64_t), false);
+  dfsan_label index_label = __taint_create_label(0, ret.offset, sizeof(int64_t));
+  __taint_set_retval_tls(0, index_label, 64);
+  // byte by byte, 0 past the end of the seed (as ucsan_wrap_retval)
+  uint64_t index = 0;
+  uptr seed_size = ucsan_tainted.objects->size() ?
+                   ucsan_tainted.objects->at(0).data.size() : 0;
+  for (uptr i = 0; i < sizeof(index); ++i)
+    if (ret.offset + i < seed_size)
+      index |= (uint64_t)ucsan_tainted.objects->at(0).data[ret.offset + i] << (8 * i);
+  UCSAN_OUT("ptr_diff: index %ld from offset %lu (element size %ld)\n",
+            (int64_t)index, ret.offset, elem);
+  // i is where p is relative to q: a placement of pseudo pointers, whose
+  // value only has to satisfy the path (see record_placement).  A poison
+  // flag it breaks -- kimage_alloc_control_pages adds to it, nsw, and the
+  // seed's i was INT64_MAX -- is solved back, not the program's overflow.
+  record_placement(0, (int64_t)ret.offset, sizeof(int64_t));
+
+  // p == &q[i] is in q's object, which UCSan bounds
+  // (ucsan_object_size_limit) when q is a UC pointer: |i| * elem is within
+  // it.  Assumed when the seed's i is, as a poison flag that holds is;
+  // otherwise p is not bound below -- its first access would end the run,
+  // REASON_OBJ_OOB, as in i915's do_bit_17_swizzle, where the solver had
+  // picked the pfn for one bit -- and the seed is solved for an i that is, as
+  // a placement that breaks a poison flag is.  (A real q's object is not
+  // UCSan's to bound.)
+  bool in_range = true;
+  if (is_uc_pointer_label(lq)) {
+    int64_t bound = (int64_t)(ucsan_object_size_limit() / (uint64_t)elem);
+    in_range = (uint64_t)((int64_t)index + bound) <= (uint64_t)(2 * bound);
+    // out of range: i + bound >u 2 * bound
+    dfsan_label shifted = __taint_union(index_label, 0, SYMSAN_Add, 64,
+                                        index, bound);
+    dfsan_label out = __taint_union(
+        shifted, 0, (SYMSAN_bvugt << 8) | SYMSAN_ICmp, 64,
+        (int64_t)index + bound, 2 * bound);
+    if (in_range) {
+      __taint_add_constraint(out, 0);
+    } else {
+      dfsan_label holds = __taint_union(
+          out, 0, (SYMSAN_bveq << 8) | SYMSAN_ICmp, 1, 1, 0);
+      __taint_trace_ub_check(holds, 0, SYMSAN_ub_index_overflow,
+                             __builtin_return_address(0));
     }
   }
 
-  return (void*)__ucsan_wrapped_return_tls;
+  if (is_uc_pointer_label(lp) && is_uc_pointer_label(lq)) {
+    ucsan_ptr_info *pi = to_ptr_info(get_label_info(lp));
+    if (pi->op == OP_EXTERNAL && pi->status == PTR_INITIALIZED) {
+      UCSAN_OUT("ptr_diff: %p already has its object, not bound\n", p);
+    } else if (!in_range) {
+      UCSAN_OUT("ptr_diff: index %ld out of any object, %p not bound\n",
+                (int64_t)index, p);
+    } else if (ucsan_num_ptr_bindings == ARRAY_SIZE(ucsan_ptr_bindings)) {
+      UCSAN_OUT("ptr_diff: too many bindings, %p not bound\n", p);
+    } else {
+      // q's object, created now if it was not yet
+      ucsan_check_pointer(q, lq, 1, false, 0, 1);
+      ucsan_ptr_info *qi = to_ptr_info(get_label_info(lq));
+      if (qi->op == OP_EXTERNAL && qi->status == PTR_INITIALIZED) {
+        // p - pseudo_base is p's offset in the object: q's, plus i elements
+        int64_t qoff = (int64_t)q - (int64_t)qi->pseudo_base;
+        pi->op = OP_EXTERNAL;
+        pi->status = PTR_INITIALIZED;
+        pi->obj_label = qi->obj_label;
+        pi->pseudo_base = (void *)((int64_t)p - qoff - (int64_t)index * elem);
+        ucsan_ptr_bindings[ucsan_num_ptr_bindings++] =
+            {lp, index_label, (int64_t)index, elem};
+        UCSAN_OUT("ptr_diff: %p bound to element %ld of %p's object\n",
+                  p, (int64_t)index, q);
+      }
+    }
+  }
+  return (int64_t)index;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1785,6 +2665,107 @@ ucsan_label ucsan_trace_global(uint64_t addr, uint64_t size) {
   return label;
 }
 
+// An array the module declares without a size (`extern const struct
+// io_cold_def io_cold_defs[]`, defined in another file): the weak definition
+// UCSanPass gives it has no bytes, and with no bounds to trace a load from it
+// read whatever lay past it, unlabeled -- io_req_prep_async called the
+// function pointer it found there.  It is an under-constrained object instead,
+// like one a pseudo pointer names: one pointer label per array, whose object
+// check_pointer allocates on first use, from the seed, and grows as it is
+// used.  The array's address stays what it is; check_pointer translates it.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+ucsan_label ucsan_trace_unsized_global(uint64_t addr) {
+  // (a pointer label, not bounds: whether or not trace_bounds is on)
+  if (addr == 0)
+    return 0;
+  // a module declares a handful; past the table, the old untraced behavior
+  static object_info seen[256];  // {label, address}
+  static unsigned nseen;
+  for (unsigned i = 0; i < nseen; ++i)
+    if (seen[i].offset == addr)
+      return seen[i].label;
+  if (nseen == sizeof(seen) / sizeof(seen[0]))
+    return 0;
+  ucsan_label label =
+      create_label_from_super_object(sizeof(void *), /*is_pointer=*/true).label;
+  seen[nseen++] = {label, addr};
+  UCSAN_OUT("ucsan_trace_unsized_global: label=%u, base=%p\n", label,
+            (void *)addr);
+  return label;
+}
+
+// The pointer label of `inttoptr v` (op is v's label, width its bytes): a
+// pointer the program makes of an integer is one it could have loaded.
+//  - v is seed bytes (an OP_NONE byte label, as an integer load of them
+//    gives): a pointer made of them, as ucsan_load_pointer_shadow makes one,
+//    and those bytes are a placement (record_placement).  sg_page()'s
+//    `page_link & ~3` and page_to_virt()'s `vmemmap_base`, loaded as u64.
+//  - v has no label and is not NULL: an address that is no memory of ours --
+//    canonical, but unmapped (a kernel-half address, which no user process
+//    has) -- is a pseudo pointer, whose object check_pointer allocates on
+//    first use and grows as it is used.  Without one the access faulted.  The
+//    label is a fresh pointer slot of the super object, the same one for the
+//    same address (a fixed address is one object, however often the program
+//    computes it), so the object has a place in the seed.  Not: the program's
+//    own memory (the image, a stack, the heap: `(unsigned long)&x` and back),
+//    a small value (NULL plus a field, check_pointer's NULL dereference), an
+//    ERR_PTR, or a non-canonical address -- LIST_POISON and the like, which
+//    exist to fault when dereferenced.  (UCSanPass leaves a constant operand
+//    alone for the same reason: the kernel's constant pointers are those
+//    sentinels.)
+// Any other label is already a pointer's, or UBI's: it stays.
+// An invariant the code relies on (UCSanPass's assumeAsmCallTarget): a seed
+// that breaks it is no input the program can have -- the run ends, nothing
+// wrong with the program (SymSan's __taint_assume, which TaintPass calls
+// before this, has asked for a seed that keeps it).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __dfsw_ucsan_assume(bool holds) {
+  if (holds)
+    return;
+  UCSAN_OUT("assumption broken by the input at %p\n",
+            __builtin_return_address(0));
+  exit(exit_reason::REASON_INVALID_INPUT);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+ucsan_label ucsan_int_to_pointer(uint64_t v, ucsan_label op, uint64_t width) {
+  if (op == kUninitializedLabel)
+    return op;
+  if (op >= UCSAN_CONST_OFFSET) {
+    if (get_label_info(op)->common.op == OP_NONE)
+      return seed_bytes_to_pointer(op, width, (void *)v);
+    return op;
+  }
+  if (op != 0)
+    return op;
+
+  if (v < ucsan_object_size_limit() || v >= (uint64_t)-4095)
+    return 0;
+  // canonical: bits 63..47 all equal
+  uint64_t top = v >> 47;
+  if (top != 0 && top != 0x1ffff)
+    return 0;
+  char *image = &__executable_start ? &__executable_start : &__dso_handle;
+  if (image <= (char *)v && (char *)v <= &end)
+    return 0;
+  if (top == 0 && IsAccessibleMemoryRange((uptr)v, 1))
+    return 0;
+
+  // a handful of fixed addresses per run; past the table, the old behavior
+  static object_info seen[1024];  // {label, address}
+  static unsigned nseen;
+  for (unsigned i = 0; i < nseen; ++i)
+    if (seen[i].offset == v)
+      return seen[i].label;
+  if (nseen == sizeof(seen) / sizeof(seen[0]))
+    return 0;
+  ucsan_label label =
+      create_label_from_super_object(sizeof(void *), /*is_pointer=*/true).label;
+  seen[nseen++] = {label, v};
+  UCSAN_OUT("ucsan_int_to_pointer: label=%u, address=%p\n", label, (void *)v);
+  return label;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_push_stack_frame() {
   // Save current stack top when entering a function
@@ -1833,7 +2814,9 @@ void ucsan_scan_mark_reachable(void *base, uint64_t size) {
           ucsan_label obj_label = ptr_info->obj_label;
           if (obj_label >= UCSAN_CONST_OFFSET) {
             ucsan_label_info *obj_info = get_label_info(obj_label);
-            if (obj_info->common.op == OP_RESERVED_OBJ) {
+            // (a freed object's contents keep nothing reachable)
+            if (ucsan_obj_freed(obj_label)) {
+            } else if (obj_info->common.op == OP_RESERVED_OBJ) {
               ucsan_obj_info *obj = to_obj_info(obj_info);
               // object spans [real_ptr - lower_bound, real_ptr + upper_bound)
               ucsan_scan_mark_reachable((char*)obj->real_ptr - obj->lower_bound,
@@ -1896,7 +2879,9 @@ void ucsan_scan_shadow_for_leaks() {
         ucsan_label obj_label = ptr_info->obj_label;
         if (obj_label >= UCSAN_CONST_OFFSET) {
           ucsan_label_info *obj_info = get_label_info(obj_label);
-          if (obj_info->common.op == OP_RESERVED_OBJ) {
+          // (a freed object's contents keep nothing reachable)
+          if (ucsan_obj_freed(obj_label)) {
+          } else if (obj_info->common.op == OP_RESERVED_OBJ) {
             ucsan_obj_info *obj = to_obj_info(obj_info);
             // object spans [real_ptr - lower_bound, real_ptr + upper_bound)
             ucsan_scan_mark_reachable((char*)obj->real_ptr - obj->lower_bound,
@@ -2016,11 +3001,20 @@ static void ucsan_init_shadow_memory() {
 
   // Initialize alloca stack for bounds tracking
   uptr num_labels = kUnionTableSize / sizeof(ucsan_label_info);
-  __alloca_stack_top = __alloca_stack_bottom = (ucsan_label)(num_labels - 2);
+  // Labels are 16-bit and kUninitializedLabel (0xFFFF) is reserved, so the
+  // table's 174,762 entries cannot all be named.  The cast used to wrap
+  // num_labels - 2 to 43,688, a third of what a label can address, and big
+  // kernel structs (struct kvm_vmx, 40 KB, one label per byte) exhausted it.
+  uptr top = num_labels - 2;
+  if (top > (uptr)kUninitializedLabel - 1)
+    top = (uptr)kUninitializedLabel - 1;
+  __alloca_stack_top = __alloca_stack_bottom = (ucsan_label)top;
 }
 
 static void ucsan_fini_internal() {
-  UCSAN_OUT("UCSan runtime finalized\n");
+  UCSAN_OUT("UCSan runtime finalized (labels used: %u of %u)\n",
+            (unsigned)atomic_load(&__ucsan_last_label, memory_order_relaxed),
+            (unsigned)__alloca_stack_bottom);
 
   if (ucsan_flags().check_memleak) {
     ucsan_scan_shadow_for_leaks();
@@ -2039,6 +3033,26 @@ static void ucsan_fini_internal() {
   ucsan_fini_input_struct();
 }
 
+// UCSanPass lowers %gs:-relative inline asm (the kernel's percpu accesses)
+// to plain memory accesses, which is only the same memory while the %gs base
+// is 0 -- the default for a process that never sets it.  Checked once, so a
+// harness that does set it fails loudly instead of reading the wrong memory.
+static void ucsan_check_gs_base() {
+  uptr base = 0;
+  long ret;
+  // arch_prctl(ARCH_GET_GS, &base); this runtime is not instrumented
+  __asm__ __volatile__("syscall"
+                       : "=a"(ret)
+                       : "a"(158 /* SYS_arch_prctl */), "D"(0x1004 /* ARCH_GET_GS */),
+                         "S"(&base)
+                       : "rcx", "r11", "memory");
+  if (ret == 0 && base != 0) {
+    Report("ERROR: UCSan: %%gs base is %p, but percpu inline asm was lowered "
+           "assuming 0\n", (void *)base);
+    Die();
+  }
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_init() {
   // Initialize input struct first (C-style init for preinit_array safety)
@@ -2046,6 +3060,8 @@ void ucsan_init() {
 
   // Parse options
   ucsan_parse_flags();
+
+  ucsan_check_gs_base();
 
   // Initialize shadow memory and label table
   ucsan_init_shadow_memory();
@@ -2055,17 +3071,57 @@ void ucsan_init() {
     ucsan_init_input(ucsan_flags_data.input_file);
   }
 
-  // Initialize UCSan solver (thoroupy backend)
-  InitializeUCSanSolver();
+  // the first chunk of object windows, once for every run (see object_window)
+  reserve_object_windows();
+
+  // which global bytes have been symbolized or written (see global_seen)
+  init_global_seen();
 
   // Register cleanup callback
+  // (above the fork point in InitializeUCSanSolver, so a child inherits the
+  // registration instead of writing libc's exit list and the die callbacks
+  // again, a few copy-on-write faults each run; the fork server itself only
+  // ever leaves through internal__exit, which runs neither)
   Atexit(ucsan_fini_internal);
   AddDieCallback(ucsan_fini_internal);
+
+  // Initialize UCSan solver (thoroupy backend)
+  InitializeUCSanSolver();
 
   UCSAN_OUT("UCSan runtime initialized\n");
   UCSAN_OUT("  Shadow:      0x%lx - 0x%lx\n", (uint64_t)kShadowBase, (uint64_t)kUnionTableAddr);
   UCSAN_OUT("  UnionTable:  0x%lx (size: 0x%lx)\n", (uint64_t)kUnionTableAddr, (uint64_t)kUnionTableSize);
   UCSAN_OUT("  Max labels:  %lu\n", (uint64_t)(kUnionTableSize / sizeof(ucsan_label_info)));
+}
+
+// A kernel WARN() (a _BUG_FLAGS ud2 with BUGFLAG_WARNING), which UCSanPass
+// replaces with this call: the kernel would report it and continue, so the
+// run continues and the manager gets an EVENT_WARN with the line and flags,
+// at the call site's address.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_trace_warn(const char *file, uint32_t line, uint32_t flags) {
+  UCSAN_OUT("WARN at %s:%u (flags %#x)\n", file ? file : "?", line, flags);
+  __taint_trace_event_addr(0, EVENT_WARN, line, __builtin_return_address(0),
+                           flags);
+}
+
+// VMX: the VMCS the kernel's vmread/vmwrite act on, modeled as memory.
+// UCSanPass lowers `vmread field, dst` to a load from ucsan_vmcs_field(field)
+// and `vmwrite src, field` to a store to it, so a field read before any write
+// is symbolized from the seed on first access, like any global, and a read
+// after a write returns what was written, label included.  A slot per field:
+// the encoding's width (bits 14:13), type (11:10) and index (9:1) select it,
+// and the high-access bit (0) the upper half of a 64-bit field.  Richer VMX
+// semantics (read-only exit information, a VM exit on vmlaunch/vmresume)
+// belong here.
+static u64 ucsan_vmcs[1 << 13];
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void *ucsan_vmcs_field(u64 field) {
+  u64 idx = (((field >> 13) & 3) << 11) | (((field >> 10) & 3) << 9) |
+            ((field >> 1) & 0x1ff);
+  char *slot = (char *)&ucsan_vmcs[idx];
+  return (field & 1) ? slot + 4 : slot;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -2173,11 +3229,31 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_retval_tls, uint32_t, dfsan_label
 // @param size: size in bytes
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_label, dfsan_label, void*, uint64_t) {}
 
+// Make a SymSan expression label (op over l1/op1 and l2/op2)
+// @return: SymSan label (0 when standalone)
+SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_union, dfsan_label, dfsan_label,
+                             uint16_t, uint16_t, uint64_t, uint64_t) {
+  return 0;
+}
+
 // Copy SymSan shadow memory from src to dst
 // @param dst: destination address
 // @param src: source address
 // @param size: size in bytes
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_copy_shadow, void*, void*, uint64_t) {}
+
+// Add a constraint of the path (dfsan.cpp)
+// @return: void (no-op when standalone)
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_add_constraint, dfsan_label, uint8_t) {}
+
+// Ask the solver to make a condition other than r (dfsan.cpp)
+// @return: void (no-op when standalone)
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_ub_check, dfsan_label, bool,
+                             uint32_t, void*) {}
+
+// Check loaded input bytes against the seed (verify_inputs; dfsan.cpp)
+// @return: void (no-op when standalone: no SymSan labels to check)
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_verify_input_bytes, const void*, uptr, void*) {}
 
 // Move SymSan shadow memory from src to dst (handles overlapping regions)
 // @param dst: destination address

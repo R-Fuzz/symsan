@@ -34,6 +34,7 @@ ERROR_EVENTS = {
     'OOB': 152,
     'NULL_DEREF': 153,
     'DOUBLE_FREE': 156,
+    'INVALID_FREE': 158,
     'OOB_UPCAST': 161,
     'PANIC': 171,
 }
@@ -102,6 +103,9 @@ class UcsanManager:
         self._output = output
         self._terminate = terminate
         self.exit_status = list()
+        # every event the target reported, by event id (PIPE_EVENT_TYPE),
+        # whether or not a handler subscribes to it
+        self.event_counts = {}
         self._report_to = decorator_report(report_to)
         self._last_label = 0
         self._last_result = 0
@@ -273,7 +277,7 @@ class UcsanManager:
                         _msg.context = CHECKER_UBI
                         _msg.addr = msg.addr
                         self._event_handlers.handle(_msg)
-                        self._report(CHECKER_UBI)
+                        self._report(CHECKER_UBI, msg.addr)
                         self._stall = True
                         return True
                     self._last_label = msg.label
@@ -396,7 +400,10 @@ class UcsanManager:
                                     result=msg.result,
                                 )
                     except Exception as e:
-                        logger.error(f"Solver error: {e}")
+                        # which kind of condition failed: a UB check carries its
+                        # check id as the bid, a branch its block id
+                        logger.error(f"Solver error: {e} "
+                                     f"[{'ub' if is_ub_solve else 'branch'} {msg.id}]")
                         seed_name = f"./solving-error/{self.binary_path.split('/')[-1]}-{msg.label}-{msg.id}.seed"
                         try:
                             open(seed_name, 'wb').write(pickle.dumps([self._current]))
@@ -406,7 +413,8 @@ class UcsanManager:
                     try:
                         self.solver.add_constraint(msg.label, msg.result)
                     except Exception as e:
-                        logger.error(f"Error adding constraint: {e}")
+                        logger.error(f"Error adding constraint: {e} "
+                                     f"[{'ub' if is_ub_solve else 'branch'} {msg.id}]")
             case PIPE_MSG_TYPE.EXIT_TYPE:
                 logger.info("Finish one seed, exit with code: {}".format(msg.result))
                 # Only report exit status if we haven't already reported a bug for this seed
@@ -517,6 +525,7 @@ class UcsanManager:
                 else:
                     logger.warning(f"Unknown MERRO flag: {msg.flags:#x}")
             case PIPE_MSG_TYPE.EVENT_TYPE:
+                self.event_counts[msg.context] = self.event_counts.get(msg.context, 0) + 1
                 self._event_handlers.handle(msg)
             case PIPE_MSG_TYPE.ADD_CONSTRAINT_TYPE:
                 if msg.label != 0:
@@ -543,7 +552,8 @@ class UcsanManager:
                     for i in range(0, size):
                         self._current[obj_id][offset + i] = buf[i:i+1]
                     # Update solver's input cache with new data
-                    self.solver.update_input(self._current.to_bytes_list())
+                    self.solver.update_input(self._current.to_bytes_list(),
+                                             self._current.origins())
             case PIPE_MSG_TYPE.MINIMIZE_TYPE:
                 if msg.label != 0:
                     try:
@@ -555,7 +565,13 @@ class UcsanManager:
 
         return True
 
-    def _report(self, exit_status):
+    def _report(self, exit_status, addr=0):
+        """addr: the PC of the error itself (the message that reports it); 0
+        for an exit status that carries none, which falls back to the last
+        solved condition.  That fallback used to be the only address: a
+        runtime helper's condition (__taint_solve_bounds' checks) is not the
+        faulting access, and was the right one only while a tail call made
+        its return address the instrumented caller."""
         normalized_status = exit_status if exit_status < 255 else exit_status >> 8
         if normalized_status in self._reported:
             return
@@ -569,7 +585,8 @@ class UcsanManager:
         if self._synth_type_table:
             self._synthesize_unittest(exit_status)
         if self._report_to:
-            self._report_to(exit_status, self._current, self._last_label, self._last_result, self._last_addr, self)
+            self._report_to(exit_status, self._current, self._last_label, self._last_result,
+                            addr if addr else self._last_addr, self)
         if normalized_status in self._stop_on_error:
             status_name = next((k for k, v in ERROR_EVENTS.items() if v == normalized_status), str(normalized_status))
             logger.critical(f"Stopping execution: error event {status_name} ({normalized_status}) matched stop_on_error config")
@@ -603,8 +620,14 @@ class UcsanManager:
                 # negative indices for lvalue and positive for value.
                 # Adjust: flat_offset → UObject_index = flat_offset - len(lvalue)
                 # Extension offsets (negative int32) are already in UObject coords.
-                obj = seed[obj_id]
-                adjusted = offset - len(obj.lvalue) if offset >= 0 else offset
+                # (now: every solver offset is in UObject coords, relative to
+                # where the pointer lands.  The runtime labeled lazily created
+                # bytes 0-based and grown bytes relative, and len(lvalue) here
+                # was the length *after* this run's extensions, so a solution
+                # in the run that grew an object backwards landed that many
+                # bytes low.  insert_bytes/delete_bytes always took the offset
+                # as it is.)
+                adjusted = offset
                 logger.debug(f"Solution: SET obj[{obj_id}][{offset}] (adjusted={adjusted}) = 0x{sol['val']:02x}")
                 seed.set_byte(obj_id, adjusted, sol['val'])
                 solved_bytes.add((obj_id, offset))
@@ -628,8 +651,7 @@ class UcsanManager:
             if obj_id <= 2:
                 continue
             offset = sol['offset']
-            primary = seed[1]
-            adjusted = offset - len(primary.lvalue) if offset >= 0 else offset
+            adjusted = offset  # UObject coords, see above
             logger.debug(
                 f"Mirror SET obj[{obj_id}][{offset}] -> obj[1][{adjusted}] "
                 f"= 0x{sol['val']:02x}"
@@ -661,8 +683,10 @@ class UcsanManager:
                 for sol_obj_id, sol_offset in solved_bytes:
                     if sol_obj_id != obj_idx:
                         continue
-                    adj_src = sol_offset - len(obj.lvalue) if sol_offset >= 0 else sol_offset
-                    adj_dst = sol_offset - len(sib.lvalue) if sol_offset >= 0 else sol_offset
+                    # UObject coords, see above: the same offset from where
+                    # each object's pointer lands
+                    adj_src = sol_offset
+                    adj_dst = sol_offset
                     src_val = obj.value[adj_src] if adj_src >= 0 else obj.lvalue[-adj_src - 1]
                     if adj_dst >= 0:
                         if adj_dst < len(sib.value):
@@ -729,13 +753,19 @@ class UcsanManager:
                     logger.critical(f"[FLIP-DBG] Trace-only target: bid={self._flip_bid}, context={self._flip_original_context:#x}, occurrence={self._flip_original_occurrence}")
 
                 # Reset solver with current seed's input bytes (one per object)
-                self.solver.reset_input(self._current.to_bytes_list())
-                logger.info("Scheduling seed: " + current.__repr__())
+                self.solver.reset_input(self._current.to_bytes_list(),
+                                        self._current.origins())
+                logger.info("Scheduling seed: %r", current)
                 for msg in self.p.get_pipe():
-                    logger.debug("\033[92mrecv msg: " + msg.__repr__() + "\033[0m")
+                    logger.debug("\033[92mrecv msg: %r\033[0m", msg)
                     if not self._handle_msg(msg):
                         self._termination_manager.reset()
                         self._reported.clear()
+                        break
+                    # a stop request (e.g. a time budget) is honored between
+                    # messages: one long trace that keeps producing solutions
+                    # would otherwise run on until its seed ends
+                    if self._stop_requested:
                         break
                     logger.debug("\033[93mwait for next msg\033[0m")
 
@@ -778,7 +808,8 @@ class UcsanManager:
                     logger.critical(f"[FLIP-DBG] === Immediately replaying flip seed: bid={self._flip_bid}, context={self._flip_original_context:#x}, occurrence={self._flip_original_occurrence}, task_id={self._flip_task_id}")
                     self._current = flip_seed
                     self._bug_reported_for_current_seed = False
-                    self.solver.reset_input(flip_seed.to_bytes_list())
+                    self.solver.reset_input(flip_seed.to_bytes_list(),
+                                            flip_seed.origins())
                     self._termination_manager.reset()
                     self.p._pipe.send(flip_seed.to_ticket())
                     for msg in self.p.get_pipe():

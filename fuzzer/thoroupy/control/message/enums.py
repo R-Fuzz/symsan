@@ -18,6 +18,7 @@ class PIPE_EVENT_TYPE:
     EVENT_ASSERTION = 103
     EVENT_TYPE_BIND = 104
     EVENT_COPY_OVERFLOW = 105
+    EVENT_WARN = 106  # kernel WARN(): result = line, id = flags, addr = pc
 
     EVENT_UBI = 150
     EVENT_UAF = 151

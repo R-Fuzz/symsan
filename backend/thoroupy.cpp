@@ -338,6 +338,16 @@ static void fpe_handler(int sig, siginfo_t *si, void *unused)
   Die();
 }
 
+// A trap instruction the instrumentation left in place (ud2, int3) ends the
+// run the way a converted trap does (UCSanPass replaces those with exit(180)).
+// Without a handler the target dies of the signal, and on a host with a piped
+// core_pattern (apport) that reads as a hang, not a failure.
+static void trap_handler(int sig, siginfo_t *si, void *unused)
+{
+  AOUT("Trap (signal %d) at address: %p\n", sig, si->si_addr);
+  internal__exit(180);
+}
+
 void RegisterSegFault () {
 #ifdef __handle_segfualt__
   struct sigaction sa;
@@ -349,6 +359,11 @@ void RegisterSegFault () {
     Die();
   sa.sa_sigaction = fpe_handler;
   if (sigaction(SIGFPE, &sa, NULL) == -1)
+    Die();
+  sa.sa_sigaction = trap_handler;
+  if (sigaction(SIGILL, &sa, NULL) == -1)
+    Die();
+  if (sigaction(SIGTRAP, &sa, NULL) == -1)
     Die();
 #endif
 }
@@ -416,7 +431,18 @@ extern "C" void InitializeUCSanSolver() {
           content = (char*)malloc(payload_size);
           if (!content) internal__exit(1);
 
-          internal_read(__control_pipe_fd, content, payload_size);
+          // a pipe read returns at most what is buffered (64 KB by default),
+          // so a larger seed came in short: the child ran on a truncated
+          // seed and the rest of it was left in the pipe for this loop to
+          // read as tickets, until it read an exit ticket out of the seed
+          // bytes and the manager blocked writing to a fork server that was
+          // gone (it holds the FIFO O_RDWR, so it never sees EPIPE)
+          for (uint64_t got = 0; got < payload_size; ) {
+            uptr n = internal_read(__control_pipe_fd, content + got,
+                                   payload_size - got);
+            if (internal_iserror(n) || n == 0) internal__exit(1);
+            got += n;
+          }
           // free previous allocation if any
           if (ucsan_tainted.buf) free((void*)ucsan_tainted.buf);
 

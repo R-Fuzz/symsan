@@ -1,0 +1,6 @@
+entry: cal
+scope:
+  - cal
+  - sub
+  - irq_enter_rcu
+  - exit

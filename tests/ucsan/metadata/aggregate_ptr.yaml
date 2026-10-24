@@ -1,0 +1,5 @@
+entry: cal
+scope:
+  - cal
+  - pick
+  - exit

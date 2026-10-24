@@ -9,11 +9,118 @@ logger = logging.getLogger(__name__)
 OBJ_LIMIT = 100000
 SIZE_LIMIT = 1000000000
 
+class _ByteList(list):
+    """A UObject's byte list (one 1-byte bytes per element).  Every change
+    drops its owner's cached bytes (UObject._bytes), so the cache is right
+    however the list is changed -- in place, by the manager and the handlers,
+    as well as through UObject.__setitem__."""
+    __slots__ = ("_owner",)
+
+    def __init__(self, items=(), owner=None):
+        super().__init__(items)
+        self._owner = owner
+
+    def _touch(self):
+        if self._owner is not None:
+            self._owner._bytes = None
+
+    def __setitem__(self, i, v):
+        self._touch()
+        super().__setitem__(i, v)
+
+    def __delitem__(self, i):
+        self._touch()
+        super().__delitem__(i)
+
+    def __iadd__(self, other):
+        self._touch()
+        return super().__iadd__(other)
+
+    def __imul__(self, n):
+        self._touch()
+        return super().__imul__(n)
+
+    def append(self, v):
+        self._touch()
+        super().append(v)
+
+    def extend(self, items):
+        self._touch()
+        super().extend(items)
+
+    def insert(self, i, v):
+        self._touch()
+        super().insert(i, v)
+
+    def pop(self, *args):
+        self._touch()
+        return super().pop(*args)
+
+    def remove(self, v):
+        self._touch()
+        super().remove(v)
+
+    def clear(self):
+        self._touch()
+        super().clear()
+
+    def sort(self, *args, **kwargs):
+        self._touch()
+        super().sort(*args, **kwargs)
+
+    def reverse(self):
+        self._touch()
+        super().reverse()
+
+
 class UObject:
+    # bytes(self) is cached in _bytes, and clone() hands it to the copy: the
+    # scheduler hashes every seed it queues, and a seed is hundreds of objects
+    # of which a solution changes a few, so rebuilding every object's bytes for
+    # every queued seed was quadratic (most of the manager's time on a long
+    # trace).  value and lvalue are _ByteLists, which drop the cache on change;
+    # assigning a list to either copies it into one.
     def __init__(self) -> None:
-        self.value = []
-        self.lvalue = []
+        self._bytes = None
+        self._value = _ByteList((), self)
+        self._lvalue = _ByteList((), self)
         self.metadata = UObjectMetadata()
+
+    @property
+    def value(self) -> list:
+        return self._value
+
+    @value.setter
+    def value(self, items) -> None:
+        self._value = _ByteList(items, self)
+        self._bytes = None
+
+    @property
+    def lvalue(self) -> list:
+        return self._lvalue
+
+    @lvalue.setter
+    def lvalue(self, items) -> None:
+        self._lvalue = _ByteList(items, self)
+        self._bytes = None
+
+    # pickled as before, plain lists under "value"/"lvalue", so that old and
+    # new pickles load either way
+    def __getstate__(self):
+        state = {k: v for k, v in self.__dict__.items()
+                 if k not in ("_value", "_lvalue", "_bytes")}
+        state["value"] = list(self._value)
+        state["lvalue"] = list(self._lvalue)
+        return state
+
+    def __setstate__(self, state):
+        state = dict(state)
+        self._bytes = None
+        self._value = _ByteList(state.pop("value", ()), self)
+        self._lvalue = _ByteList(state.pop("lvalue", ()), self)
+        self.__dict__.update(state)
+        if "metadata" not in self.__dict__:
+            self.metadata = UObjectMetadata()
 
     def __setitem__(self, index: int, value: bytes) -> None:
         if index >= 0 and index < OBJ_LIMIT:
@@ -29,7 +136,9 @@ class UObject:
             logger.warning(f"Index {index} out of bounds for UObject, value: {value.hex() if isinstance(value, bytes) else value}")
 
     def __bytes__(self) -> bytes:
-        return b"".join(self.lvalue[::-1]) + b"".join(self.value)
+        if self._bytes is None:
+            self._bytes = b"".join(self._lvalue[::-1]) + b"".join(self._value)
+        return self._bytes
 
     def __repr__(self) -> str:
         return self._compress_hex(self.lvalue[::-1]) + '|' + self._compress_hex(self.value)
@@ -196,8 +305,9 @@ class Seed:
         s = Seed()
         s.objects = [UObject() for _ in self.objects]
         for i, obj in enumerate(self.objects):
-            s[i].value = obj.value[:]
-            s[i].lvalue = obj.lvalue[:]
+            s[i].value = obj.value    # copied by the setter
+            s[i].lvalue = obj.lvalue
+            s[i]._bytes = obj._bytes  # the same bytes until either changes
             # Copy metadata
             s[i].metadata.object_id = obj.metadata.object_id
             s[i].metadata.from_object = obj.metadata.from_object
@@ -241,6 +351,12 @@ class Seed:
     def to_bytes_list(self) -> list:
         """Return list of bytes, one per object (for solver reset)."""
         return [bytes(obj) for obj in self.objects]
+
+    def origins(self) -> list:
+        """Where each object's offset 0 is in its bytes(), the length of its
+        lvalue: solver offsets are relative to it (negative into lvalue), as
+        UObject indices are."""
+        return [len(obj.lvalue) for obj in self.objects]
 
     def to_dict(self) -> "list[dict]":
         for obj in self.objects:

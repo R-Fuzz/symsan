@@ -504,6 +504,7 @@ int main(int argc, char* const argv[]) {
 
   int is_stdin = 0;
   int solve_ub = 0;
+  std::string runtime_opts;
   int debug = 0;
   __parse_only = getenv("SYMSAN_PARSE_ONLY") != nullptr;
   if (!symsan::sweep::open_cond_log("z3")) {
@@ -563,6 +564,19 @@ int main(int argc, char* const argv[]) {
         solve_ub = 1;
     }
 
+    // runtime flags the launcher has no setter for, passed on as given
+    // (symsan_set_runtime_options): the poison-flag model and its opt-in wrap
+    // checks
+    for (const char *key : {"solve_wrap=", "model_poison=", "exit_on_poison="}) {
+      const char *opt = strstr(options, key);
+      if (!opt)
+        continue;
+      size_t len = strcspn(opt, ": ");
+      if (!runtime_opts.empty())
+        runtime_opts += ":";
+      runtime_opts.append(opt, len);
+    }
+
     // check if GEP enumeration is enabled or disabled
     char *enum_gep_opt = strstr(options, "enum_gep=");
     if (enum_gep_opt) {
@@ -584,6 +598,7 @@ int main(int argc, char* const argv[]) {
   symsan_set_debug(debug);
   symsan_set_bounds_check(1);
   symsan_set_solve_ub(solve_ub);
+  symsan_set_runtime_options(runtime_opts.c_str());
 
   // setup z3 parser.  One parser for the whole corpus: restart() per input is
   // what it is for, and rebuilding it would throw away nothing worth keeping

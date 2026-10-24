@@ -33,7 +33,7 @@ class FIFOScheduler(SchedulerBase):
             self._counter += 1
             seed = self._queue.pop(0)
             self._pipe.send(seed.to_ticket())
-            logger.debug(f"Send seed {seed} to pipe")
+            logger.debug("Send seed %s to pipe", seed)
             return seed
 
         elif self._counter == 0:
@@ -56,7 +56,7 @@ class FIFOScheduler(SchedulerBase):
 
 
     def append(self, seed: "Seed", **kwargs) -> None:
-        logger.info(f"Append seed {seed} to queue")
+        logger.info("Append seed %s to queue", seed)
         digest = seed.digest().hexdigest()
         if digest not in self._seeds_hash:
             self._queue.append(seed)
@@ -66,7 +66,7 @@ class FIFOScheduler(SchedulerBase):
                 file_name = f"seeds/seed_{time()}.pickle"
                 with open(file_name, "wb") as f:
                     pickle.dump([seed], f)
-                    logger.info(f"Save seed {seed} to {file_name}")
+                    logger.info("Save seed %s to %s", seed, file_name)
         else:
             logger.debug(f"Duplicate seed skipped (digest={digest[:8]})")
 

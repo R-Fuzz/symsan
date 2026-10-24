@@ -23,6 +23,12 @@ public:
   int restart(std::vector<input_t> &inputs, bool copy_input = false) override;
   /// @brief Update input cache without clearing deps
   int update_input(std::vector<input_t> &inputs, bool copy_input = false);
+  /// @brief Where offset 0 of each input is in its bytes (UCSan: the length of
+  /// the seed object's part below where its pointer lands).  An input's labels
+  /// carry offsets relative to it, negative below it; none given means 0.
+  void set_input_origins(std::vector<uint32_t> origins) {
+    input_origins_ = std::move(origins);
+  }
   int parse_cond(dfsan_label label, bool result, bool add_nested,
                  std::vector<uint64_t> &tasks) override;
   int parse_gep(dfsan_label ptr_label, uptr ptr,
@@ -97,6 +103,22 @@ protected:
 private:
   // Original input cache (stores pointers to input data)
   std::vector<input_t> inputs_cache_;
+  // Origin of each input in inputs_cache_ (see set_input_origins)
+  std::vector<uint32_t> input_origins_;
+
+  // The cached byte at (input, offset), offset relative to the input's origin
+  // (negative below it); false if the input has no such byte.
+  inline bool cached_input_byte(uint32_t input, uint32_t offset,
+                                uint8_t &out) const {
+    if (input >= inputs_cache_.size())
+      return false;
+    int64_t origin = input < input_origins_.size() ? input_origins_[input] : 0;
+    int64_t idx = origin + (int32_t)offset;
+    if (idx < 0 || (uint64_t)idx >= inputs_cache_[input].second)
+      return false;
+    out = inputs_cache_[input].first[idx];
+    return true;
+  }
 
   // Copied input data (when copy_input=true, owns the data)
   std::vector<std::vector<uint8_t>> inputs_copy_;
@@ -284,6 +306,9 @@ private:
   std::unordered_map<dfsan_label, std::string> poison_reason_;
 
   inline void dump_value_cache(dfsan_label label);
+  /// op tree of `label`, `depth` levels deep, for failure messages
+  std::string label_shape(dfsan_label label, int depth);
+  std::string describe_label(dfsan_label label, int depth);
 
   z3::expr read_concrete(dfsan_label label, uint16_t size);
   z3::expr serialize(dfsan_label label, input_dep_set_t &deps);
@@ -301,6 +326,7 @@ private:
   z3::expr build_string_from_label(dfsan_label content_label, input_dep_set_t &deps);
   z3::expr get_byte_expr(uint32_t input, uint32_t offset, input_dep_set_t &deps);
   bool label_contains_indexof(dfsan_label label);
+  bool label_contains_unvalued(dfsan_label label);
 
   // Helper for linking bitvec and string constraints on shared offsets
   void add_string_bitvec_link(offset_t off, z3_task_t *task);

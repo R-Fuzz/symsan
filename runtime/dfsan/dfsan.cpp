@@ -70,7 +70,9 @@ struct taint_socket __dfsan::tainted_socket;
 
 // Hash table
 static const uptr hashtable_size = (1ULL << 32);
-static const size_t hashtable_buckets = (1ULL << 20);
+// The union table's initial slot count: it grows (see union_hashtable.h).
+// It was a fixed (1ULL << 20) buckets.
+static const size_t hashtable_initial_slots = (1ULL << 12);
 // Default-constructed on purpose, so it lands in .bss with no dynamic
 // initializer; dfsan_init calls init() above the fork point.  See the comment
 // on the class -- a sized constructor here would be an .init_array entry, which
@@ -247,6 +249,21 @@ static dfsan_label do_taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid);
 
+// A UB check a runtime helper poses (__taint_union's arithmetic checks,
+// __taint_solve_bounds, __taint_solve_size, the malloc-size and assertion
+// wrappers): __taint_trace_cond(label, r, UndefinedCheck, cid), but at addr,
+// the instrumented code the helper was called from.  __taint_trace_cond's own return address is the helper, or
+// its caller only when the compiler happens to make the call a tail call;
+// the manager keys UB checks on the address and reports the last solved
+// condition's as a witness site.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_trace_ub_check(dfsan_label label, bool r, uint32_t cid,
+                            void *addr);
+
+// a constraint of the path every solver adds (backend/fastgen.cpp)
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_add_constraint(dfsan_label label, uint8_t result);
+
 // Forward declarations for trace callbacks (implemented in solvers)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_event_addr(uint32_t label, uint32_t event_id,
@@ -258,12 +275,140 @@ static inline bool is_wide_const(dfsan_label l) {
   return l != 0 && get_label_info(l)->op == __dfsan::WideConst;
 }
 
+static dfsan_label str_ptr_label(dfsan_label l, uint64_t value);
+
+// Whether a pseudo pointer's value is part of label: any input byte it reads
+// that UCSan made a pointer of (__ucsan_is_placement_byte; plain SymSan has
+// none).  Bounded: past the bound it says no, and the violation counts as the
+// program's, which is the side that reports.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+bool __ucsan_is_placement_byte(uint32_t object_id, int64_t offset);
+
+static bool depends_on_placement(dfsan_label root) {
+  if (root < CONST_OFFSET || root == kInitializingLabel)
+    return false;
+  dfsan_label stack[256];
+  dfsan_label seen[1024];
+  unsigned nstack = 0, nseen = 0;
+  stack[nstack++] = root;
+  while (nstack) {
+    dfsan_label l = stack[--nstack];
+    bool dup = false;
+    for (unsigned i = 0; i < nseen && !dup; ++i)
+      dup = seen[i] == l;
+    if (dup)
+      continue;
+    if (nseen == sizeof(seen) / sizeof(seen[0]))
+      return false;
+    seen[nseen++] = l;
+    dfsan_label_info *info = get_label_info(l);
+    if (info->op == 0 && info->l1 == 0 && info->l2 == 0) {
+      // an input byte: op2 its object, op1 its offset
+      if (__ucsan_is_placement_byte((uint32_t)info->op2.i, (int64_t)info->op1.i))
+        return true;
+      continue;
+    }
+    dfsan_label kids[2] = {info->l1, info->l2};
+    for (dfsan_label c : kids) {
+      if (c < CONST_OFFSET || c == kInitializingLabel)
+        continue;
+      if (nstack == sizeof(stack) / sizeof(stack[0]))
+        return false;
+      stack[nstack++] = c;
+    }
+  }
+  return false;
+}
+
+// A poison-flag condition of an operation (nsw, nuw, exact; see the end of
+// __taint_union): `bad` labels its violation, `violated` says this run
+// violates it.  Held, it is an assumption of the path -- the compiled code
+// relies on it, so a solution that breaks it is one the binary does not
+// compute the model's value for -- sent as a constraint every solver takes
+// (__taint_add_constraint), and with solve_ub also a UB task to break it.
+// Violated, the run has poison the model cannot follow: it is reported, and
+// ends under exit_on_poison.
+// (Not assumed -- solve_wrap's checks of an operation that may wrap -- it is
+// only a UB task, and a wrap is no violation.)
+// Returns whether the operation's result is poison the run goes on with: its
+// label is then dropped (__taint_union returns 0), so what follows uses the
+// value the binary computed, not one the model would have -- sext(add nsw)
+// carried on would be a value mismatch at the next condition.
+static bool poison_check(dfsan_label bad, bool violated, bool assumed,
+                         uint32_t ub_kind, int event, dfsan_label label,
+                         void *ub_addr) {
+  if (!assumed) {
+    if (!violated && bad >= CONST_OFFSET)
+      __taint_trace_ub_check(bad, 0, ub_kind, ub_addr);
+    return false;
+  }
+  if (violated) {
+    // The seed's placement of pseudo pointers, not the program: solve the
+    // condition back to hold -- a UB task, which comes with the path's
+    // constraints -- for a seed that places them consistently, and go on.
+    if (depends_on_placement(bad)) {
+      AOUT("poison (event %d) from a pseudo pointer's placement, label %u\n",
+           event, label);
+      dfsan_label holds = do_taint_union(bad, 0, (bveq << 8) | __dfsan::ICmp,
+                                         1, 1, 0);
+      __taint_trace_ub_check(holds, 0, ub_kind, ub_addr);
+      return true;
+    }
+    AOUT("WARNING: poison (event %d) from label %u\n", event, label);
+    __taint_trace_event_addr(label, event, 0, ub_addr, 0);
+    if (flags().exit_on_poison)
+      internal__exit(event);
+    return true;
+  }
+  if (bad < CONST_OFFSET)
+    return false;
+  __taint_add_constraint(bad, 0);
+  if (flags().solve_ub)
+    __taint_trace_ub_check(bad, 0, ub_kind, ub_addr);
+  return false;
+}
+
+// An invariant the code relies on, as UCSan finds it (an inline asm's
+// indirect call lands on an entry of its block: UCSanPass's
+// assumeAsmCallTarget), label the condition's.  Where it holds, a constraint
+// of the path -- the solver keeps it, as an assumed poison flag; where it
+// does not, the input breaks it: a UB task for an input that keeps it (the
+// run itself ends, in the UCSan runtime).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_assume(dfsan_label label, bool holds) {
+  if (label < CONST_OFFSET)
+    return;
+  if (holds) {
+    __taint_add_constraint(label, 1);
+    return;
+  }
+  AOUT("assumption broken by the input, label %u\n", label);
+  __taint_trace_ub_check(label, 0, ub_assertion_failure,
+                         __builtin_return_address(0));
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2) {
+  // the instrumented operation, for its UB checks (__taint_trace_ub_check)
+  void *ub_addr = __builtin_return_address(0);
   if (!is_valid_op(op)) {
     AOUT("WARNING: invalid op %d\n", op);
     return 0;
+  }
+  // An integer operation's poison flags (nsw, nuw, exact) come in the byte a
+  // comparison keeps its predicate in (TaintPass); they are no part of the
+  // label, only of what is assumed and checked for it below.
+  uint8_t poison = 0;
+  switch (op & 0xff) {
+    case __dfsan::Add: case __dfsan::Sub: case __dfsan::Mul:
+    case __dfsan::Shl: case __dfsan::LShr: case __dfsan::AShr:
+    case __dfsan::UDiv: case __dfsan::SDiv:
+      poison = op >> 8;
+      op &= 0xff;
+      break;
+    default:
+      break;
   }
   if (l1 > l2 && is_commutative(op)) {
     // needs to swap both labels and concretes
@@ -302,6 +447,23 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     return 0;
   if (l1 == kInitializingLabel || l2 == kInitializingLabel)
     return kInitializingLabel;
+
+  // A search's result compared with a pointer other than NULL -- trace_create
+  // _new_event's `p != systems`, p = strstr(systems, system) -- is compared as
+  // the address it is (fstr_ptr): as a position it cannot meet a pointer, and
+  // the parser gave up ("unsupported string comparison").  A comparison with
+  // NULL stays as it is, found or not found.
+  if ((op & 0xff) == __dfsan::ICmp && size == 64 &&
+      !(l1 == 0 && op1 == 0) && !(l2 == 0 && op2 == 0)) {
+    dfsan_label s1 = str_ptr_label(l1, op1), s2 = str_ptr_label(l2, op2);
+    if (s1 != l1 || s2 != l2) {
+      // the other side's bounds label (a stack or heap object's, under
+      // trace_bounds) is no expression: its address is concrete, and the
+      // bounds handling below would drop the comparison
+      l1 = is_bounds_label(s1) ? 0 : s1;
+      l2 = is_bounds_label(s2) ? 0 : s2;
+    }
+  }
 
   // special handling for bounds
   if (is_bounds_label(l1) ||
@@ -482,7 +644,14 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     if (__dfsan_label_info[l1].op == __dfsan::ZExt ||
         __dfsan_label_info[l1].op == __dfsan::SExt) {
       dfsan_label base = __dfsan_label_info[l1].l1;
-      if (size == __dfsan_label_info[base].size) return base;
+      // A comparison's size is its operands' width, not its i1 result's:
+      // trunc(zext(icmp i16) to i32) to i16 is no icmp, and folding it gave
+      // z3 a bool where a bitvector goes ("arguments of the wrong sort",
+      // snd_intel8x0_probe storing a compare into a 16-bit bitfield).
+      uint16_t base_op = __dfsan_label_info[base].op & 0xff;
+      if (size == __dfsan_label_info[base].size &&
+          base_op != __dfsan::ICmp && base_op != __dfsan::FCmp)
+        return base;
     }
   } else if ((op == __dfsan::Xor || op == __dfsan::Sub) && l1 == l2) {
     // x ^ x = 0
@@ -543,7 +712,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         if (orig_op2 != 0) {
           cond = do_taint_union(l2, 0, (bveq << 8) | __dfsan::ICmp, size,
                                 orig_op2, 0);
-          __taint_trace_cond(cond, 0, UndefinedCheck, ub_division_by_zero);
+          __taint_trace_ub_check(cond, 0, ub_division_by_zero, ub_addr);
         } else {
           AOUT("WARNING: division by zero\n");
           __taint_trace_event_addr(l2, EVENT_DIV_BY_ZERO, 0, __builtin_return_address(0), 0);
@@ -578,7 +747,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
             } else {
               cond = c2;
             }
-            __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+            __taint_trace_ub_check(cond, 0, ub_integer_overflow, ub_addr);
           }
         }
         break;
@@ -590,7 +759,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         if (orig_op2 < size) {
           cond = do_taint_union(l2, 0, (bvuge << 8) | __dfsan::ICmp,
                                op_size, orig_op2, size);
-          __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_exponent);
+          __taint_trace_ub_check(cond, 0, ub_shift_exponent, ub_addr);
         }
         // There used to be a second exponent check here, `op2 <s 0`, for a
         // negative exponent.  It was guarded on `(int64_t)orig_op2 >= 0`, and
@@ -630,7 +799,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                 orig_op2, __builtin_clzl(orig_op1) - (64 - size));
           cond = do_taint_union(cond, valid_exp, __dfsan::And, 1, 0,
                                 orig_op2 < size);
-          __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_overflow);
+          __taint_trace_ub_check(cond, 0, ub_shift_overflow, ub_addr);
         }
         // same width bug as the negative-exponent guard above: the sign has to
         // be read at the base's own width, not at 64.
@@ -643,7 +812,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                 get_label_info(l1)->size, orig_op1, 0);
           cond = do_taint_union(cond, valid_exp, __dfsan::And, 1, 0,
                                 orig_op2 < size);
-          __taint_trace_cond(cond, 0, UndefinedCheck, ub_shift_base);
+          __taint_trace_ub_check(cond, 0, ub_shift_base, ub_addr);
         }
         break;
       }
@@ -665,7 +834,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         dfsan_label loss = do_taint_union(l1, 0, (bvuge << 8) | __dfsan::ICmp,
                                           get_label_info(l1)->size, orig_op1,
                                           1UL << size);
-        __taint_trace_cond(loss, 0, UndefinedCheck, ub_unsigned_integer_truncation);
+        __taint_trace_ub_check(loss, 0, ub_unsigned_integer_truncation, ub_addr);
       }
       // -fsanitize=implicit-signed-integer-truncation
       //
@@ -709,7 +878,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                         truncated, 0);
         dfsan_label loss = do_taint_union(se, l1, (bvneq << 8) | __dfsan::ICmp,
                                           old_size, re_ext, orig_op1 & old_mask);
-        __taint_trace_cond(loss, 0, UndefinedCheck, ub_signed_integer_truncation);
+        __taint_trace_ub_check(loss, 0, ub_signed_integer_truncation, ub_addr);
       }
 
       // -fsanitize=implicit-integer-sign-change
@@ -731,10 +900,30 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                                size, orig_op1 & new_mask, 0);
           dfsan_label sign_diff = do_taint_union(src_neg, dst_neg, __dfsan::Xor, 1,
                                                  src_sign ? 1 : 0, dst_sign ? 1 : 0);
-          __taint_trace_cond(sign_diff, 0, UndefinedCheck, ub_integer_sign_change);
+          __taint_trace_ub_check(sign_diff, 0, ub_integer_sign_change, ub_addr);
         }
       }
-    } else if (op == __dfsan::Add) {
+    }
+  }
+
+  // The poison flags (nsw, nuw, exact) of an integer operation: what the
+  // compiled code relies on, assumed on the path and checked (poison_check).
+  // (now: the Add/Sub/Mul checks below were ubsan-style checks of every such
+  // operation, signed and unsigned alike, under solve_ub.  Unsigned wrap is
+  // defined, and so is signed wrap without nsw: the flags say which overflow
+  // is the program's to avoid.)
+  // (and with solve_wrap, the wrap of an Add/Sub/Mul without the flag, as a
+  // UB task only: -fsanitize=unsigned-integer-overflow's opt-in check)
+  const uint8_t assumed = flags().model_poison ? poison : 0;
+  bool poisoned = false;
+  uint8_t wrap = 0;
+  if (flags().solve_wrap &&
+      (op == __dfsan::Add || op == __dfsan::Sub || op == __dfsan::Mul))
+    wrap = (P_NSW | P_NUW) & ~assumed;
+  const bool want_s = (assumed | wrap) & P_NSW, assume_s = assumed & P_NSW;
+  const bool want_u = (assumed | wrap) & P_NUW, assume_u = assumed & P_NUW;
+  if ((assumed || wrap) && ub_width_ok) {
+    if (op == __dfsan::Add) {
       // check for integer overflow
       // -fsanitize=signed-integer-overflow, unsigned-integer-overflow
       //
@@ -751,25 +940,32 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       uint64_t sign_bit = 1ULL << (size - 1);
       bool has_signed_overflow = (overflow_check & sign_bit) != 0;
 
-      if (!has_signed_overflow) {
+      if (!want_s) {
+        // wraps by definition
+      } else {
+        // (built whether or not it is violated: a violation that is the placement's
+        // is solved back to hold, see poison_check)
         // Build symbolic expression: ((l1 ^ label) & (l2 ^ label)) < 0
         dfsan_label xor_l1 = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
         dfsan_label xor_l2 = do_taint_union(l2, label, __dfsan::Xor, size, orig_op2, result);
         dfsan_label and_xors = do_taint_union(xor_l1, xor_l2, __dfsan::And, size, xor1, xor2);
         dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
                                           size, overflow_check, 0);
-        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
-      } else {
-        AOUT("WARNING: signed integer overflow\n");
-        __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
+        if (has_signed_overflow)
+          AOUT("WARNING: signed integer overflow\n");
+        poisoned |= poison_check(cond, has_signed_overflow, assume_s, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
       }
 
       // Unsigned overflow: result < op1 (for any non-zero op2)
       // When adding two unsigned numbers, overflow means result wrapped around
-      if (result >= orig_op1 && (orig_op2 != 0 || l2 != 0)) {
+      if (!want_u) {
+        // wraps by definition
+      } else if (result < orig_op1 || orig_op2 != 0 || l2 != 0) {
+        // (built whether or not it is violated: a violation that is the placement's
+        // is solved back to hold, see poison_check)
         dfsan_label cond = do_taint_union(label, l1, (bvult << 8) | __dfsan::ICmp,
                                           size, result, orig_op1);
-        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+        poisoned |= poison_check(cond, result < orig_op1, assume_u, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
       }
     } else if (op == __dfsan::Mul) {
       // check for integer overflow
@@ -804,7 +1000,11 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         int64_t swide = sa * sb;
         const uint64_t wide_mask =
             wide_size >= 64 ? 0xFFFFFFFFFFFFFFFFUL : (1ULL << wide_size) - 1;
-        if (swide == sr) {
+        if (!want_s) {
+          // wraps by definition
+        } else {
+          // (built whether or not it is violated: a violation that is the placement's
+          // is solved back to hold, see poison_check)
           dfsan_label s1 = l1 ? do_taint_union(l1, 0, __dfsan::SExt, wide_size, orig_op1, 0) : 0;
           dfsan_label s2 = l2 ? do_taint_union(l2, 0, __dfsan::SExt, wide_size, orig_op2, 0) : 0;
           dfsan_label smul = do_taint_union(s1, s2, __dfsan::Mul, wide_size,
@@ -812,21 +1012,24 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           dfsan_label sres = do_taint_union(label, 0, __dfsan::SExt, wide_size, result, 0);
           dfsan_label cond = do_taint_union(smul, sres, (bvneq << 8) | __dfsan::ICmp,
                                             wide_size, swide & wide_mask, sr & wide_mask);
-          __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
-        } else {
-          AOUT("WARNING: signed integer overflow\n");
-          __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
+          if (swide != sr)
+            AOUT("WARNING: signed integer overflow\n");
+          poisoned |= poison_check(cond, swide != sr, assume_s, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
         }
 
         // unsigned: zext(op1) * zext(op2) >u mask
         uint64_t uwide = a * b;
-        if (uwide <= mask) {
+        if (!want_u) {
+          // wraps by definition
+        } else {
+          // (built whether or not it is violated: a violation that is the placement's
+          // is solved back to hold, see poison_check)
           dfsan_label z1 = l1 ? do_taint_union(l1, 0, __dfsan::ZExt, wide_size, orig_op1, 0) : 0;
           dfsan_label z2 = l2 ? do_taint_union(l2, 0, __dfsan::ZExt, wide_size, orig_op2, 0) : 0;
           dfsan_label umul = do_taint_union(z1, z2, __dfsan::Mul, wide_size, a, b);
           dfsan_label cond = do_taint_union(umul, 0, (bvugt << 8) | __dfsan::ICmp,
                                             wide_size, uwide, mask);
-          __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+          poisoned |= poison_check(cond, uwide > mask, assume_u, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
         }
       }
     } else if (op == __dfsan::Sub) {
@@ -847,17 +1050,20 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       uint64_t sign_bit = 1ULL << (size - 1);
       bool has_signed_overflow = (overflow_check & sign_bit) != 0;
 
-      if (!has_signed_overflow) {
+      if (!want_s) {
+        // wraps by definition
+      } else {
+        // (built whether or not it is violated: a violation that is the placement's
+        // is solved back to hold, see poison_check)
         // Build symbolic expression: ((l1 ^ l2) & (l1 ^ label)) < 0
         dfsan_label xor_l1l2 = do_taint_union(l1, l2, __dfsan::Xor, size, orig_op1, orig_op2);
         dfsan_label xor_l1r = do_taint_union(l1, label, __dfsan::Xor, size, orig_op1, result);
         dfsan_label and_xors = do_taint_union(xor_l1l2, xor_l1r, __dfsan::And, size, xor_ab, xor_ar);
         dfsan_label cond = do_taint_union(and_xors, 0, (bvslt << 8) | __dfsan::ICmp,
                                           size, overflow_check, 0);
-        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
-      } else {
-        AOUT("WARNING: signed integer overflow\n");
-        __taint_trace_event_addr(label, EVENT_INT_OVERFLOW, 0, __builtin_return_address(0), 0);
+        if (has_signed_overflow)
+          AOUT("WARNING: signed integer overflow\n");
+        poisoned |= poison_check(cond, has_signed_overflow, assume_s, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
       }
 
       // Unsigned underflow: result > op1 when op2 > 0
@@ -865,14 +1071,95 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       // `orig_op2 != 0` alone skips a symbolic subtrahend that happens to be 0
       // right now, which is exactly the one worth solving for; Add's twin
       // guard already has the `|| l2 != 0` arm.
-      if (result <= orig_op1 && (orig_op2 != 0 || l2 != 0)) {
+      if (!want_u) {
+        // wraps by definition
+      } else if (result > orig_op1 || orig_op2 != 0 || l2 != 0) {
+        // (built whether or not it is violated: a violation that is the placement's
+        // is solved back to hold, see poison_check)
         dfsan_label cond = do_taint_union(label, l1, (bvugt << 8) | __dfsan::ICmp,
                                           size, result, orig_op1);
-        __taint_trace_cond(cond, 0, UndefinedCheck, ub_integer_overflow);
+        poisoned |= poison_check(cond, result > orig_op1, assume_u, ub_integer_overflow, EVENT_INT_OVERFLOW, label, ub_addr);
       }
+    } else if (op == __dfsan::Shl) {
+      // shl nsw/nuw: shifting the result back gives the operand, arithmetic
+      // for nsw and logical for nuw.  An exponent out of range is poison of
+      // its own (the shift-exponent check), with no bits to speak of.
+      const uint64_t mask = size == 64 ? ~0ULL : (1ULL << size) - 1;
+      const uint64_t sh = orig_op2;
+      if (sh < size) {
+        const uint64_t x = orig_op1 & mask;
+        const uint64_t result = (x << sh) & mask;
+        static const uint16_t shl_flags[] = {P_NUW, P_NSW};
+        for (uint16_t f : shl_flags) {
+          if (!(assumed & f))
+            continue;
+          uint64_t back;
+          if (f == P_NUW) {
+            back = result >> sh;
+          } else {
+            int64_t sres = (int64_t)(result << (64 - size)) >> (64 - size);
+            back = (uint64_t)(sres >> sh) & mask;
+          }
+          dfsan_label b = do_taint_union(label, l2,
+                                         f == P_NUW ? __dfsan::LShr : __dfsan::AShr,
+                                         size, result, sh);
+          dfsan_label cond = do_taint_union(b, l1, (bvneq << 8) | __dfsan::ICmp,
+                                            size, back, x);
+          poisoned |= poison_check(cond, back != x, true, ub_shift_overflow,
+                                   EVENT_INT_OVERFLOW, label, ub_addr);
+        }
+      }
+    } else if ((op == __dfsan::UDiv || op == __dfsan::SDiv) &&
+               (assumed & P_EXACT) && orig_op2 != 0) {
+      // udiv/sdiv exact: the remainder is 0.  The compiled code divides by
+      // shifting and multiplying by the inverse, which is the quotient only
+      // then: intel_pmu_drain_pebs_core's (top - at) / 144 of two pseudo
+      // pointers 0x8000000000000000 apart gave 0x3800000000000000.  Assumed,
+      // it keeps pseudo pointers a whole number of elements apart.
+      // (INT_MIN / -1 is the division checks' own.)
+      const uint64_t mask = size == 64 ? ~0ULL : (1ULL << size) - 1;
+      uint64_t rem;
+      if (op == __dfsan::UDiv) {
+        rem = (orig_op1 & mask) % (orig_op2 & mask);
+      } else {
+        int64_t a = (int64_t)(orig_op1 << (64 - size)) >> (64 - size);
+        int64_t b = (int64_t)(orig_op2 << (64 - size)) >> (64 - size);
+        // (anything % -1 is 0, and INT64_MIN % -1 is UB to compute)
+        rem = b == -1 ? 0 : (uint64_t)(a % b) & mask;
+      }
+      // (built whether or not it is violated, see poison_check)
+      dfsan_label r = do_taint_union(l1, l2,
+                                     op == __dfsan::UDiv ? __dfsan::URem
+                                                         : __dfsan::SRem,
+                                     size, orig_op1, orig_op2);
+      dfsan_label cond = do_taint_union(r, 0, (bvneq << 8) | __dfsan::ICmp,
+                                        size, rem, 0);
+      poisoned |= poison_check(cond, rem != 0, true, ub_inexact_division,
+                               EVENT_INEXACT_DIV, label, ub_addr);
+    } else if ((op == __dfsan::LShr || op == __dfsan::AShr) &&
+               (assumed & P_EXACT) && orig_op2 < size) {
+      // lshr/ashr exact: no set bit is shifted out, i.e. shifting the result
+      // back gives the operand
+      const uint64_t mask = size == 64 ? ~0ULL : (1ULL << size) - 1;
+      const uint64_t sh = orig_op2;
+      const uint64_t x = orig_op1 & mask;
+      uint64_t result;
+      if (op == __dfsan::LShr) {
+        result = x >> sh;
+      } else {
+        int64_t sx = (int64_t)(x << (64 - size)) >> (64 - size);
+        result = (uint64_t)(sx >> sh) & mask;
+      }
+      const uint64_t back = (result << sh) & mask;
+      // (built whether or not it is violated, see poison_check)
+      dfsan_label b = do_taint_union(label, l2, __dfsan::Shl, size, result, sh);
+      dfsan_label cond = do_taint_union(b, l1, (bvneq << 8) | __dfsan::ICmp,
+                                        size, back, x);
+      poisoned |= poison_check(cond, back != x, true, ub_inexact_division,
+                               EVENT_INEXACT_DIV, label, ub_addr);
     }
   }
-  return label;
+  return poisoned ? 0 : label;
 }
 
 // If label is zero or kInitializingLabel, return it directly
@@ -925,15 +1212,24 @@ dfsan_label __taint_gep_offset(dfsan_label label, char* result, char* base) {
   return do_taint_union(0, label, __dfsan::Add, info->size, (uint64_t)offset, 0);
 }
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_bits, uint64_t align) {
+// unread (bit i: byte i) are bytes of the load nothing it is used for reads
+// (a bitfield's neighbours, masked off): an uninitialized one is a concrete
+// byte, as its value is, not a reason to make the whole value uninitialized.
+static dfsan_label union_load(const dfsan_label *ls, uptr n, uint64_t size_in_bits,
+                              uint64_t align, uint64_t unread) {
+  auto at = [ls, unread](uptr i) -> dfsan_label {
+    dfsan_label l = ls[i];
+    if (l == kInitializingLabel && i < 64 && (unread >> i & 1))
+      return 0;
+    return l;
+  };
   if ((uptr)ls < 4096) {
     AOUT("WARNING: nullptr deref\n");
     return 0;
   } else if (((uptr)ls & (align - 1)) != 0) {
     AOUT("WARNING: unaligned load %p\n", ls);
   }
-  dfsan_label label0 = ls[0];
+  dfsan_label label0 = at(0);
   if (label0 == kInitializingLabel) return kInitializingLabel;
 
   // for debugging
@@ -950,8 +1246,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   if (is_constant_label(label0) || is_bounds_label(label0)) {
     bool same = true;
     for (uptr i = 1; i < n; i++) {
-      if (ls[i] == kInitializingLabel) return kInitializingLabel;
-      else if (ls[i] != label0) {
+      if (at(i) == kInitializingLabel) return kInitializingLabel;
+      else if (at(i) != label0) {
         same = false;
         break;
       }
@@ -965,8 +1261,8 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   if (label0 >= CONST_OFFSET && is_indexof_op(get_label_info(label0)->op)) {
     bool same = true;
     for (uptr i = 1; i < n; i++) {
-      if (ls[i] == kInitializingLabel) return kInitializingLabel;
-      else if (ls[i] != label0) {
+      if (at(i) == kInitializingLabel) return kInitializingLabel;
+      else if (at(i) != label0) {
         same = false;
         break;
       }
@@ -977,15 +1273,27 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
 
   // shape
   bool shape = true;
-  if (__dfsan_label_info[label0].op != 0) {
+  // label 0 also has op 0, but it is a concrete byte, not input offset 0
+  if (is_constant_label(label0) || __dfsan_label_info[label0].op != 0) {
     // not raw input bytes
     shape = false;
   } else {
+    // Load(label0, n) stands for the n labels from label0 on: the store fast
+    // path breaks it up as label0 + i.  So the bytes must be the next labels,
+    // not only the next offsets of the same input.  Under UCSan they need not
+    // be: an object enlarged after its creation labels its new bytes later
+    // (offset 0 had label N, offset 1 a label thousands on), and a store of
+    // the Load then wrote N+1.. -- unrelated labels -- into the bytes after
+    // the first (bprm_execve's container_of pointer, reloaded as a Concat
+    // of an Add's low bits).
     off_t offset = get_label_info(label0)->op1.i;
+    uint64_t input = get_label_info(label0)->op2.i;
     for (uptr i = 1; i != n; ++i) {
-      dfsan_label next_label = ls[i];
+      dfsan_label next_label = at(i);
       if (next_label == kInitializingLabel) return kInitializingLabel;
-      else if (get_label_info(next_label)->op1.i != offset + i) {
+      dfsan_label_info *next = get_label_info(next_label);
+      if (next_label != label0 + i || next->op != 0 ||
+          next->op1.i != offset + i || next->op2.i != input) {
         shape = false;
         break;
       }
@@ -1010,7 +1318,7 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
     dfsan_label parent = get_label_info(label0)->l1;
     uptr offset = 0;
     for (uptr i = 0; i < n; i++) {
-      dfsan_label next_label = ls[i];
+      dfsan_label next_label = at(i);
       if (next_label == kInitializingLabel) return kInitializingLabel;
       dfsan_label_info *info = get_label_info(next_label);
       if (info->op != Extract || offset != info->op2.i || parent != info->l1) {
@@ -1032,14 +1340,56 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   }
 
   // slowpath
+  // (a byte of a stored pointer carries its bounds label, which is no value:
+  // loaded as part of something else -- an integer overlapping a struct's
+  // pointer field, handle_eject_request's acpi_object -- it is a concrete
+  // byte.  Built into a Concat it was a bounds node in an expression, which
+  // the parser cannot serialize: "invalid label".)
+  auto concrete = [](dfsan_label l) {
+    return is_constant_label(l) || is_bounds_label(l);
+  };
   AOUT("union load slowpath at %p\n", __builtin_return_address(0));
   dfsan_label label = label0;
-  for (uptr i = get_label_info(label0)->size / 8; i < n;) {
-    dfsan_label next_label = ls[i];
+  uptr start = get_label_info(label0)->size / 8;
+  if (concrete(label0)) {
+    // Leading concrete bytes: Concat with l1 == 0 is not a valid node, so the
+    // concrete prefix is folded into op1 of the first Concat with a symbolic
+    // label, whose width the parsers recover as size - l2's size.
+    const char *app = (const char *)app_for(ls);
+    uint64_t prefix = 0;
+    uptr i = 0;
+    for (; i < n && concrete(at(i)); i++) {
+      if (i >= sizeof(prefix)) {
+        Report("WARNING: concrete prefix wider than 64 bits, dropping taint\n");
+        return 0;
+      }
+      prefix |= (uint64_t)(uint8_t)app[i] << (i * 8);
+    }
+    // not all-constant, or fast path 1 would have returned
+    // (but constant and bounds bytes mixed are all concrete)
+    if (i == n)
+      return 0;
+    dfsan_label next_label = at(i);
+    if (next_label == kInitializingLabel) return kInitializingLabel;
+    uint16_t next_size = get_label_info(next_label)->size;
+    if (next_size > (n - i) * 8) {
+      Report("WARNING: partial loading expected=%lu has=%d\n", n-i, next_size);
+      dfsan_label trunc = do_taint_union(next_label, CONST_LABEL, Trunc,
+                                         (n - i) * 8, 0, 0);
+      dfsan_label result = do_taint_union(0, trunc, Concat, n * 8, prefix, 0);
+      if (size_in_bits < n * 8)
+        result = do_taint_union(result, CONST_LABEL, Trunc, size_in_bits, 0, 0);
+      return result;
+    }
+    start = i + next_size / 8;
+    label = do_taint_union(0, next_label, Concat, start * 8, prefix, 0);
+  }
+  for (uptr i = start; i < n;) {
+    dfsan_label next_label = at(i);
     if (next_label == kInitializingLabel) return kInitializingLabel;
     uint16_t next_size = get_label_info(next_label)->size;
     AOUT("next label=%u, size=%u\n", next_label, next_size);
-    if (!is_constant_label(next_label)) {
+    if (!concrete(next_label)) {
       if (next_size <= (n - i) * 8) {
         i += next_size / 8;
         label = do_taint_union(label, next_label, Concat, i * 8, 0, 0);
@@ -1063,6 +1413,18 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   if (size_in_bits < n * 8)
     label = do_taint_union(label, CONST_LABEL, Trunc, size_in_bits, 0, 0);
   return label;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_bits, uint64_t align) {
+  return union_load(ls, n, size_in_bits, align, 0);
+}
+
+// A load whose uses read only some of its bytes (see TaintVisitor::visitLoadInst)
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_union_load_partial(const dfsan_label *ls, uptr n, uint64_t size_in_bits,
+                                       uint64_t align, uint64_t unread) {
+  return union_load(ls, n, size_in_bits, align, unread);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -1130,6 +1492,29 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
   }
 }
 
+// A store of what was loaded from the same address with the bytes in touched
+// (bit i: byte i) rewritten, a bitfield assignment (instrumentation/Bitfield.h).
+// An uninitialized load makes the whole value so, but a byte the store rewrites
+// is written: it takes its byte of l_alt, the value's label with the load's as
+// zero.  A byte it does not is stored as it was loaded and keeps its own.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_store_rmw(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align,
+                       dfsan_label l_load, dfsan_label l_alt, uint64_t touched) {
+  if ((uptr)ls < 4096) {
+    AOUT("WARNING: nullptr deref\n");
+    return;
+  }
+  dfsan_label tmp[64];
+  if (n > sizeof(tmp) / sizeof(tmp[0])) {
+    __taint_union_store(l, ls, n, align);
+    return;
+  }
+  __taint_union_store(l_load == kInitializingLabel ? l_alt : l, tmp, n, 1);
+  for (uptr i = 0; i < n; ++i)
+    if (touched & (1ULL << i))
+      ls[i] = tmp[i];
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __taint_trace_loop_push_stack();
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __taint_trace_loop_pop_stack();
 
@@ -1161,6 +1546,16 @@ dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size,
     __alloca_stack_top -= 1;
     AOUT("label = %d, base = %p, size = %lu, elem_size = %lu\n",
         __alloca_stack_top, (void*)base, size, elem_size);
+    // The bound is in bytes, and its label must be too: l is the element
+    // count's, at the width of the alloca's array size.  __taint_solve_size
+    // compares a byte size with l2 at 64 bits, so for a VLA of ints the
+    // count against 4 * count was a value mismatch.
+    if (l != 0 && l != kInitializingLabel) {
+      if (get_label_info(l)->size < 64)
+        l = do_taint_union(l, 0, ZExt, 64, size, 0);
+      if (elem_size != 1)
+        l = do_taint_union(l, 0, Mul, 64, size, elem_size);
+    }
     dfsan_label_info *info = get_label_info(__alloca_stack_top);
     internal_memset(info, 0, sizeof(dfsan_label_info));
     info->l2    = l;
@@ -1292,26 +1687,41 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
       index, index_label, num_elems, elem_size, current_offset);
 
   // construct bounds solving tasks here
+  //
+  // Each check below is sent with result 0, i.e. "in bounds", so it is only
+  // sent when that is concretely true -- the same guard the arithmetic checks
+  // in __taint_union have.  An index that is already out of bounds is the bug
+  // happening on this very input, and the sanitizer reports it; asking the
+  // solver to make it true is moot, and the recorded 0 would contradict the
+  // recomputed 1, which the parser rejects as a value mismatch.
   uint16_t index_bits = get_label_info(index_label)->size;
   if (num_elems > 0) {
     // array with known size
     //
     // check underflow, index < 0
-    dfsan_label lb = do_taint_union(index_label, 0, (bvslt << 8) | ICmp,
-                                    index_bits, index, 0);
-    // assume the result is false, as bounds check should happen before solving
-    // no flag, no nested
-    __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
+    if (index >= 0) {
+      dfsan_label lb = do_taint_union(index_label, 0, (bvslt << 8) | ICmp,
+                                      index_bits, index, 0);
+      // assume the result is false, as bounds check should happen before solving
+      // no flag, no nested
+      __taint_trace_ub_check(lb, 0, ub_index_underflow, addr);
+    }
 
     // check overflow, index >= num_elems
-    dfsan_label ub = do_taint_union(index_label, 0, (bvsge << 8) | ICmp,
-                                    index_bits, index, num_elems);
-    __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
+    if (index < 0 || (uint64_t)index < num_elems) {
+      dfsan_label ub = do_taint_union(index_label, 0, (bvsge << 8) | ICmp,
+                                      index_bits, index, num_elems);
+      __taint_trace_ub_check(ub, 0, ub_index_overflow, addr);
+    }
   } else {
     // array with unknown size
     dfsan_label_info *bounds_info = get_label_info(ptr_label);
     if (bounds_info->op == __dfsan::Alloca) {
       // bounds information is available, check if allocation size is symbolic
+      // (the only place ptr's value is read.  Under UCSan ptr is the GEP's
+      // unchecked base and may be a pseudo-pointer; an Alloca label implies it
+      // is a real address -- see the ASSUMPTION note in TaintPass's GEP
+      // instrumentation, TaintFunction::visitGEPInst)
       if (index_bits < 64) // extends index to 64 bits
         index_label = do_taint_union(index_label, 0, ZExt, 64, index, 0);
       if (bounds_info->l2 == 0) {
@@ -1320,17 +1730,21 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
         // => index < (lower_bound - current_offset - ptr) / elem_size
         uint64_t lower_bound =
             (bounds_info->op1.i - current_offset - ptr) / elem_size;
-        dfsan_label lb = do_taint_union(index_label, 0, (bvult << 8) | ICmp,
-                                        64, index, lower_bound);
-        __taint_trace_cond(lb, 0, UndefinedCheck, ub_index_underflow);
+        if (!((uint64_t)index < lower_bound)) {
+          dfsan_label lb = do_taint_union(index_label, 0, (bvult << 8) | ICmp,
+                                          64, index, lower_bound);
+          __taint_trace_ub_check(lb, 0, ub_index_underflow, addr);
+        }
 
         // check overflow, (index + 1) * elem_size + current_offset + ptr > upper_bound
         // => index > (upper_bound - current_offset - ptr) / elem_size - 1
         uint64_t upper_bound =
             (bounds_info->op2.i - current_offset - ptr) / elem_size - 1;
-        dfsan_label ub = do_taint_union(index_label, 0, (bvugt << 8) | ICmp,
-                                        64, index, upper_bound);
-        __taint_trace_cond(ub, 0, UndefinedCheck, ub_index_overflow);
+        if (!((uint64_t)index > upper_bound)) {
+          dfsan_label ub = do_taint_union(index_label, 0, (bvugt << 8) | ICmp,
+                                          64, index, upper_bound);
+          __taint_trace_ub_check(ub, 0, ub_index_overflow, addr);
+        }
       } else {
         // index * elem_size + current_offset + (ptr - lower_bound) > array_size * alloc_elem_size
         dfsan_label size_label = elem_size == 1 ? index_label :
@@ -1346,10 +1760,12 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
             do_taint_union(size_label, 0, Add, 64, size, offset);
         size += offset;
         uint64_t alloc_size = bounds_info->op2.i - bounds_info->op1.i;
-        dfsan_label overflow =
-            do_taint_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
-                           64, size, alloc_size);
-        __taint_trace_cond(overflow, 0, UndefinedCheck, ub_integer_to_buffer_overflow);
+        if (!(size > alloc_size)) {
+          dfsan_label overflow =
+              do_taint_union(size_label, bounds_info->l2, (bvugt << 8) | ICmp,
+                             64, size, alloc_size);
+          __taint_trace_ub_check(overflow, 0, ub_integer_to_buffer_overflow, addr);
+        }
       }
     } else {
       // symbolic pointer but no bounds info?
@@ -1357,7 +1773,7 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
            (void*)ptr, ptr_label, addr);
       // FIXME: check if null is possible?
       // dfsan_label null = do_taint_union(ptr_label, 0, bveq, 64, ptr, 0);
-      // __taint_trace_cond(null, 0, UndefinedCheck, ub_null_pointer);
+      // __taint_trace_ub_check(null, 0, ub_null_pointer, addr);
     }
   }
 }
@@ -1424,15 +1840,18 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
           uint64_t min_size = bounds_info->op1.i - ptr;
           dfsan_label underflow = do_taint_union(size_label, 0, (bvult << 8) | ICmp,
                                                  64, size, min_size);
-          __taint_trace_cond(underflow, 0, UndefinedCheck, ub_size_underflow);
+          __taint_trace_ub_check(underflow, 0, ub_size_underflow, addr);
         }
 
         // check overflow: ptr + size > upper_bound
         // => size > upper_bound - ptr
+        // (only while it is concretely false, see __taint_solve_bounds)
         uint64_t max_size = bounds_info->op2.i - ptr;
-        dfsan_label overflow = do_taint_union(size_label, 0, (bvugt << 8) | ICmp,
-                                              64, size, max_size);
-        __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_overflow);
+        if (!(size > max_size)) {
+          dfsan_label overflow = do_taint_union(size_label, 0, (bvugt << 8) | ICmp,
+                                                64, size, max_size);
+          __taint_trace_ub_check(overflow, 0, ub_size_overflow, addr);
+        }
       } else {
         // symbolic allocation size
         // check: size > alloc_size
@@ -1441,10 +1860,12 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
         dfsan_label adjusted_size = (offset == 0 || size_label == 0) ? size_label :
             do_taint_union(size_label, 0, Add, 64, size, offset);
         uint64_t actual_size = size + offset;
-        dfsan_label overflow = do_taint_union(adjusted_size, bounds_info->l2,
-                                              (bvugt << 8) | ICmp, 64,
-                                              actual_size, alloc_size);
-        __taint_trace_cond(overflow, 0, UndefinedCheck, ub_size_to_buffer_overflow);
+        if (!(actual_size > alloc_size)) {
+          dfsan_label overflow = do_taint_union(adjusted_size, bounds_info->l2,
+                                                (bvugt << 8) | ICmp, 64,
+                                                actual_size, alloc_size);
+          __taint_trace_ub_check(overflow, 0, ub_size_to_buffer_overflow, addr);
+        }
       }
     } else if (ptr_label != 0) {
       // symbolic pointer but no bounds info
@@ -1452,7 +1873,7 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
            (void*)ptr, ptr_label, addr);
       // FIXME: check if null is possible
       // dfsan_label null = do_taint_union(ptr_label, 0, bveq, 64, ptr, 0);
-      // __taint_trace_cond(null, 0, UndefinedCheck, ub_null_pointer);
+      // __taint_trace_ub_check(null, 0, ub_null_pointer, addr);
     }
   }
 }
@@ -1555,6 +1976,45 @@ SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
 dfsan_union(dfsan_label l1, dfsan_label l2, uint16_t op, uint16_t size,
             uint64_t op1, uint64_t op2) {
   return __taint_union(l1, l2, op, size, op1, op2);
+}
+
+// The seed byte an input label names, read the way the parser reads it (UCSan
+// provides it; a SymSan-only binary has no seed objects and reads none).
+extern "C" SANITIZER_WEAK_ATTRIBUTE bool __ucsan_seed_byte(uint32_t input,
+                                                           int64_t offset,
+                                                           uint8_t *out);
+
+// Debugging aid for value mismatches (UCSan's verify_inputs): the parser
+// evaluates an input label as the seed byte it names, so a byte in memory
+// that carries one and holds anything else makes every expression over it a
+// value mismatch.  Compare [addr, addr + n) against the seed and report each
+// such byte with the site of the load.  Single-byte input labels only: a
+// wider one (an argument, a return value) is a register value spilled whole,
+// and which of its bytes this is cannot be told from the shadow.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_verify_input_bytes(const void *addr, uptr n, void *site) {
+  static int reports = 0;
+  if (!&__ucsan_seed_byte || addr == nullptr || reports >= 64)
+    return;
+  const dfsan_label *ls = shadow_for(addr);
+  for (uptr i = 0; i < n; ++i) {
+    dfsan_label l = ls[i];
+    if (l < CONST_OFFSET || l == kInitializingLabel)
+      continue;
+    dfsan_label_info *info = get_label_info(l);
+    if (info->op != 0 || info->l1 != 0 || info->l2 != 0 || info->size != 8)
+      continue;
+    uint8_t seed = 0;  // the parser reads a byte past the seed as 0
+    __ucsan_seed_byte((uint32_t)info->op2.i, (int64_t)info->op1.i, &seed);
+    uint8_t mem = ((const uint8_t *)addr)[i];
+    if (mem != seed) {
+      Report("VERIFY-INPUT: site %p addr %p input %u offset %ld label %u: "
+             "seed 0x%02x, memory 0x%02x\n", site, (const char *)addr + i,
+             (uint32_t)info->op2.i, (long)(int64_t)info->op1.i, l, seed, mem);
+      if (++reports >= 64)
+        return;
+    }
+  }
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -2079,6 +2539,49 @@ extern "C" dfsan_label taint_get_str_content_label(const void *addr) {
   return 0;
 }
 
+// The haystack pointer a search ran over, by the search's label: the
+// pointer's own label and its value, for a pointer comparison of the search's
+// result (fstr_ptr, see str_ptr_label).  Direct mapped; a search that lost its
+// slot compares as it did before.
+static struct {
+  dfsan_label search, base_label;
+  uptr base;
+} search_bases[4096];
+
+extern "C" void taint_set_search_base(dfsan_label search, dfsan_label base_label,
+                                      const void *base) {
+  if (search < CONST_OFFSET)
+    return;
+  auto &e = search_bases[search % (sizeof(search_bases) / sizeof(search_bases[0]))];
+  e.search = search;
+  e.base_label = base_label;
+  e.base = (uptr)base;
+}
+
+// l, a search's result or an fstr_off of one, as the pointer it is: fstr_ptr
+// over the haystack pointer.  Anything else, or a search whose haystack is
+// not known, is l unchanged.
+static dfsan_label str_ptr_label(dfsan_label l, uint64_t value) {
+  if (l < CONST_OFFSET || l == kInitializingLabel)
+    return l;
+  dfsan_label_info *info = get_label_info(l);
+  if (!is_indexof_op(info->op))
+    return l;
+  dfsan_label root = info->op == __dfsan::fstr_off ? info->l1 : l;
+  if (root < CONST_OFFSET)
+    return l;
+  auto &e = search_bases[root % (sizeof(search_bases) / sizeof(search_bases[0]))];
+  if (e.search != root)
+    return l;
+  // a haystack that is itself a search's result (drm_mode_parse_cmdline_
+  // options' strchr(option, ...), option = sep + 1) is an address too
+  dfsan_label base_label = str_ptr_label(e.base_label, e.base);
+  // (a bounds label is an object's, not an expression: the base is concrete)
+  if (base_label == kInitializingLabel || is_bounds_label(base_label))
+    base_label = 0;
+  return do_taint_union(l, base_label, __dfsan::fstr_ptr, 64, e.base, value);
+}
+
 extern "C" void taint_set_str_indexof_label(void *addr, dfsan_label label) {
   AOUT("taint_set_str_indexof_label: addr=%p, label=%u\n", addr, label);
 
@@ -2377,7 +2880,7 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   // constructor gets an .init_array entry, and .init_array runs after all of
   // .preinit_array -- i.e. after the fork point below -- so every forked child
   // would build its own table, faulting in the 8MB of buckets each time.
-  __union_table.init(hashtable_buckets);
+  __union_table.init(hashtable_initial_slots, __dfsan_label_info);
 
   // init main thread
   auto num_of_labels = uniontable_size / sizeof(dfsan_label_info);
@@ -2410,6 +2913,15 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   // ring_fd.
   InitializeSymSanEventRing();
 
+  // Register the fini callback to run when the program terminates successfully
+  // or it is killed by the runtime.
+  // (above the fork point, so a child inherits the registration instead of
+  // writing libc's exit list and the die callbacks again each run; the fork
+  // server only ever leaves through internal__exit, which runs neither, and
+  // dfsan_fini runs at exit, after everything below)
+  Atexit(dfsan_fini);
+  AddDieCallback(dfsan_fini);
+
   // The fork server, if one was asked for, has to sit exactly here.  Everything
   // above is input-independent -- the shadow and union mappings, the hashtable
   // allocator, the interceptors -- and is what we want to pay for once and
@@ -2426,11 +2938,6 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   InitializeStringMaps();
 
   InitializeSymSanSolver();
-
-  // Register the fini callback to run when the program terminates successfully
-  // or it is killed by the runtime.
-  Atexit(dfsan_fini);
-  AddDieCallback(dfsan_fini);
 }
 
 #if SANITIZER_CAN_USE_PREINIT_ARRAY
@@ -2459,6 +2966,13 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
                              uint32_t, uint32_t, uint64_t, uint64_t, uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, bool,
                              uint8_t, uint32_t) {}
+// A backend without it (solvers/z3.cpp) still gets the check, at its own
+// address as before.
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_ub_check, dfsan_label label,
+                             bool r, uint32_t cid, void *addr) {
+  (void)addr;
+  __taint_trace_cond(label, r, UndefinedCheck, cid);
+}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop, uint32_t, uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop_push_stack, void) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop_pop_stack, void) {}
@@ -2477,6 +2991,9 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_distance, uint64_t, uint64_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_add_constraint, dfsan_label, uint8_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(bool, __ucsan_is_placement_byte, uint32_t, int64_t) {
+  return false;
+}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_minimize_label, dfsan_label, uint64_t, dfsan_label) {}
 SANITIZER_WEAK_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 }  // extern "C"

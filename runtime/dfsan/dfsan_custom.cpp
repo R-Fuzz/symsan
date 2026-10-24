@@ -410,6 +410,10 @@ static inline uint64_t encode_strchr_op2(uint8_t needle, dfsan_label s_label) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid);
+// a UB check at the instrumented caller's PC (see dfsan.cpp)
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_trace_ub_check(dfsan_label label, bool r, uint32_t cid,
+                            void *addr);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
@@ -421,6 +425,9 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
                         dfsan_label size_label, uint64_t size,
                         uint32_t cid);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_gep_offset(dfsan_label label, char *result, char *base);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_memerr(dfsan_label ptr_label, uptr ptr,
@@ -620,6 +627,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strchr(char *s, int c,
                              content_len,
                              (uint64_t)s,
                              encode_strchr_op2((uint8_t)c, s_label));
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(*ret_label, s_label, s);
 
     // Send concrete haystack content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -673,6 +682,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
                                     content_len,
                                     (uint64_t)s,
                                     (uint64_t)accept);
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(label, s_label, s);
 
     // Send concrete content (haystack or accept)
     if (content_len > 0 && label) {
@@ -2062,7 +2073,10 @@ char *__dfsw_stpcpy(char *dest, const char *src, dfsan_label dest_label,
   if (ret) {
     internal_memcpy(shadow_for(dest), shadow_for(src), sizeof(dfsan_label) * len);
   }
-  *ret_label = dest_label;
+  // the end of the copy, not dest: `stpcpy(buf, s) - buf` (what sprintf(buf,
+  // "%s", s) compiles to, uncore_event_show) was dest_label - dest_label, 0,
+  // for a value of strlen(s)
+  *ret_label = __taint_gep_offset(dest_label, ret, dest);
   return ret;
 }
 
@@ -2461,6 +2475,8 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrchr,
                              content_len,
                              (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(*ret_label, s_label, s);
 
     // Send concrete content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -2502,6 +2518,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strrchr(char *s, int c,
                              content_len,
                              (uint64_t)s,
                              encode_strchr_op2((uint8_t)c, s_label));
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(*ret_label, s_label, s);
 
     // Send concrete haystack content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -2556,6 +2574,8 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
     *ret_label = dfsan_union(bounded_src, c_label, __dfsan::fstrrchr,
                              content_len,
                              (uint64_t)s, encode_strchr_op2((uint8_t)c, s_label));
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(*ret_label, s_label, s);
 
     // Send concrete content if haystack is concrete
     if (content_len > 0 && *ret_label) {
@@ -2605,6 +2625,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
                                     content_len,
                                     (uint64_t)haystack,
                                     (uint64_t)needle);
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(label, haystack_label, haystack);
 
     // Send concrete content (haystack or needle)
     if (content_len > 0 && label) {
@@ -2676,6 +2698,8 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strnstr(char *haystack, char *needle,
                                     content_len,
                                     (uint64_t)haystack,
                                     (uint64_t)needle);
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(label, haystack_label, haystack);
 
     // Send concrete content (haystack or needle)
     if (content_len > 0 && label) {
@@ -2744,6 +2768,8 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
     dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
                                     content_len,
                                     (uint64_t)haystack, (uint64_t)needle);
+    // the haystack pointer, for a comparison of the result (fstr_ptr)
+    taint_set_search_base(label, haystack_label, haystack);
 
     // Send concrete content (haystack or needle)
     if (content_len > 0 && label) {
@@ -3943,7 +3969,9 @@ char *__dfsw_fgets_unlocked(char *s, int size, FILE *stream, dfsan_label s_label
   return ret;
 }
 
-static inline void __taint_check_malloc_size(size_t size, dfsan_label size_label) {
+// addr: the allocation's call site, the wrapper's return address
+static inline void __taint_check_malloc_size(size_t size, dfsan_label size_label,
+                                             void *addr) {
   if (size_label) {
     AOUT("*alloc size: %lu = %d\n", size, size_label);
     // hint solver to minimize allocation size
@@ -3951,7 +3979,7 @@ static inline void __taint_check_malloc_size(size_t size, dfsan_label size_label
     if (flags().solve_ub) {
       // -fsanitize=unsigned-integer-overflow
       dfsan_label os = dfsan_union(0, size_label, (bveq << 8) | ICmp, 64, 0, size);
-      __taint_trace_cond(os, 0, UndefinedCheck, ub_integer_overflow);
+      __taint_trace_ub_check(os, 0, ub_integer_overflow, addr);
     }
   }
 }
@@ -3961,7 +3989,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *
 __dfsw_realloc(void *ptr, size_t new_size,
                dfsan_label ptr_label, dfsan_label new_size_label,
                dfsan_label *ret_label) {
-  __taint_check_malloc_size(new_size, new_size_label);
+  __taint_check_malloc_size(new_size, new_size_label, __builtin_return_address(0));
   void *ret = malloc(new_size);
   *ret_label = 0;
 
@@ -4006,7 +4034,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *
 __dfsw___libc_realloc(void *ptr, size_t new_size,
                       dfsan_label ptr_label, dfsan_label new_size_label,
                       dfsan_label *ret_label) {
-  __taint_check_malloc_size(new_size, new_size_label);
+  __taint_check_malloc_size(new_size, new_size_label, __builtin_return_address(0));
   void *ret = malloc(new_size);
   *ret_label = 0;
   if (ret) {
@@ -4050,17 +4078,20 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_reallocarray(void *ptr, size_t nmemb, size_t new_size,
                           dfsan_label ptr_label, dfsan_label nmemb_label,
                           dfsan_label new_size_label, dfsan_label *ret_label) {
+  // the bound is nmemb * size bytes, so its label is the product's, not the
+  // two factors' (__taint_solve_size compares a byte size with l2)
+  dfsan_label byte_size = 0;
   if (nmemb_label != 0 || new_size_label != 0) {
-    dfsan_label byte_size = dfsan_union(nmemb_label, new_size_label, Mul,
+    byte_size = dfsan_union(nmemb_label, new_size_label, Mul,
         64, nmemb, new_size);
-    __taint_check_malloc_size(nmemb * new_size, byte_size);
+    __taint_check_malloc_size(nmemb * new_size, byte_size, __builtin_return_address(0));
   }
   void *ret = calloc(nmemb, new_size);
   *ret_label = 0;
   if (ret) {
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size * nmemb);
     if (flags().trace_bounds) {
-      dfsan_label bound = dfsan_union(nmemb_label, new_size_label, Alloca, sizeof(ret) * 8,
+      dfsan_label bound = dfsan_union(0, byte_size, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (new_size * nmemb));
       *ret_label = bound;
     }
@@ -4098,16 +4129,19 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw___libc_reallocarray(void *ptr, size_t nmemb, size_t new_size,
                                  dfsan_label ptr_label, dfsan_label nmemb_label,
                                  dfsan_label new_size_label, dfsan_label *ret_label) {
+  // the bound is nmemb * size bytes, so its label is the product's, not the
+  // two factors' (__taint_solve_size compares a byte size with l2)
+  dfsan_label byte_size = 0;
   if (nmemb_label != 0 || new_size_label != 0) {
-    dfsan_label byte_size = dfsan_union(nmemb_label, new_size_label, Mul,
+    byte_size = dfsan_union(nmemb_label, new_size_label, Mul,
         64, nmemb, new_size);
-    __taint_check_malloc_size(nmemb * new_size, byte_size);
+    __taint_check_malloc_size(nmemb * new_size, byte_size, __builtin_return_address(0));
   }
   void *ret = calloc(nmemb, new_size);
   if (ret) {
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size * nmemb);
     if (flags().trace_bounds) {
-      dfsan_label bound = dfsan_union(nmemb_label, new_size_label, Alloca, sizeof(ret) * 8,
+      dfsan_label bound = dfsan_union(0, byte_size, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (new_size * nmemb));
       *ret_label = bound;
     }
@@ -4145,17 +4179,20 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_calloc(size_t nmemb, size_t size,
                     dfsan_label nmemb_label, dfsan_label size_label,
                     dfsan_label *ret_label) {
+  // the bound is nmemb * size bytes, so its label is the product's, not the
+  // two factors' (__taint_solve_size compares a byte size with l2)
+  dfsan_label byte_size = 0;
   if (nmemb_label != 0 || size_label != 0) {
-    dfsan_label byte_size = dfsan_union(nmemb_label, size_label, Mul,
+    byte_size = dfsan_union(nmemb_label, size_label, Mul,
         64, nmemb, size);
-    __taint_check_malloc_size(nmemb * size, byte_size);
+    __taint_check_malloc_size(nmemb * size, byte_size, __builtin_return_address(0));
   }
   void *ret = calloc(nmemb, size);
   *ret_label = 0;
   if (ret) {
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size * nmemb);
     if (flags().trace_bounds) {
-      dfsan_label bound = dfsan_union(nmemb_label, size_label, Alloca, sizeof(ret) * 8,
+      dfsan_label bound = dfsan_union(0, byte_size, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (size * nmemb));
       *ret_label = bound;
       AOUT("nmemb: %lu = %d, size: %lu = %d, addr: %p = %d\n", nmemb, nmemb_label,
@@ -4169,17 +4206,20 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw___libc_calloc(size_t nmemb, size_t size,
                            dfsan_label nmemb_label, dfsan_label size_label,
                            dfsan_label *ret_label) {
+  // the bound is nmemb * size bytes, so its label is the product's, not the
+  // two factors' (__taint_solve_size compares a byte size with l2)
+  dfsan_label byte_size = 0;
   if (nmemb_label != 0 || size_label != 0) {
-    dfsan_label byte_size = dfsan_union(nmemb_label, size_label, Mul,
+    byte_size = dfsan_union(nmemb_label, size_label, Mul,
         64, nmemb, size);
-    __taint_check_malloc_size(nmemb * size, byte_size);
+    __taint_check_malloc_size(nmemb * size, byte_size, __builtin_return_address(0));
   }
   void *ret = calloc(nmemb, size);
   *ret_label = 0;
   if (ret) {
     internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size * nmemb);
     if (flags().trace_bounds) {
-      dfsan_label bound = dfsan_union(nmemb_label, size_label, Alloca, sizeof(ret) * 8,
+      dfsan_label bound = dfsan_union(0, byte_size, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (size * nmemb));
       *ret_label = bound;
       AOUT("nmemb: %lu = %d, size: %lu = %d, addr: %p = %d\n", nmemb, nmemb_label,
@@ -4192,7 +4232,7 @@ void *__dfsw___libc_calloc(size_t nmemb, size_t size,
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_malloc(size_t size, dfsan_label size_label,
                    dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   void *ret = malloc(size);
   *ret_label = 0;
   if (ret) {
@@ -4210,7 +4250,7 @@ void *__dfsw_malloc(size_t size, dfsan_label size_label,
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw___libc_malloc(size_t size, dfsan_label size_label,
                            dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   void *ret = malloc(size);
   *ret_label = 0;
   if (ret) {
@@ -4229,7 +4269,7 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_aligned_alloc(size_t alignment, size_t size,
                            dfsan_label alignment_label, dfsan_label size_label,
                            dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   void *ret = aligned_alloc(alignment, size);
   *ret_label = 0;
   if (ret) {
@@ -4248,7 +4288,7 @@ SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_posix_memalign(void **memptr, size_t alignment, size_t size,
                           dfsan_label memptr_label, dfsan_label alignment_label,
                           dfsan_label size_label, dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   int ret = posix_memalign(memptr, alignment, size);
   *ret_label = 0;
   if (!ret && memptr && *memptr) {
@@ -4265,7 +4305,7 @@ int __dfsw_posix_memalign(void **memptr, size_t alignment, size_t size,
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_valloc(size_t size, dfsan_label size_label, dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   void *ret = valloc(size);
   *ret_label = 0;
   if (ret) {
@@ -4282,7 +4322,7 @@ void *__dfsw_valloc(size_t size, dfsan_label size_label, dfsan_label *ret_label)
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw___libc_valloc(size_t size, dfsan_label size_label, dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   void *ret = valloc(size);
   *ret_label = 0;
   if (ret) {
@@ -4300,7 +4340,7 @@ void *__dfsw___libc_valloc(size_t size, dfsan_label size_label, dfsan_label *ret
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_memalign(size_t alignment, size_t size, dfsan_label alignment_label,
                       dfsan_label size_label, dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   void *ret = memalign(alignment, size);
   *ret_label = 0;
   if (ret) {
@@ -4318,7 +4358,7 @@ void *__dfsw_memalign(size_t alignment, size_t size, dfsan_label alignment_label
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw___libc_memalign(size_t alignment, size_t size, dfsan_label alignment_label,
                              dfsan_label size_label, dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   void *ret = memalign(alignment, size);
   *ret_label = 0;
   if (ret) {
@@ -4335,7 +4375,7 @@ void *__dfsw___libc_memalign(size_t alignment, size_t size, dfsan_label alignmen
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_pvalloc(size_t size, dfsan_label size_label, dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   void *ret = pvalloc(size);
   *ret_label = 0;
   if (ret) {
@@ -4352,7 +4392,7 @@ void *__dfsw_pvalloc(size_t size, dfsan_label size_label, dfsan_label *ret_label
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw___libc_pvalloc(size_t size, dfsan_label size_label, dfsan_label *ret_label) {
-  __taint_check_malloc_size(size, size_label);
+  __taint_check_malloc_size(size, size_label, __builtin_return_address(0));
   void *ret = pvalloc(size);
   *ret_label = 0;
   if (ret) {
@@ -4641,7 +4681,8 @@ __dfsw_assert_cond(bool result,  uint64_t id, dfsan_label result_label, dfsan_la
     __taint_trace_event_addr(0, 103, id, (void *)__builtin_return_address(0), 8);
   } else {
     __taint_trace_event_addr(0, 103, id, (void *)__builtin_return_address(0), 9);
-    __taint_trace_cond(result_label, result, UndefinedCheck, ub_assertion_failure);
+    __taint_trace_ub_check(result_label, result, ub_assertion_failure,
+                           __builtin_return_address(0));
   }
 }
 

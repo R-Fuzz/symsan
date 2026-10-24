@@ -39,6 +39,12 @@ typedef uint32_t dfsan_label;
 #define UCSAN_SAFE_GAP 0x1000
 #define UCSAN_ROUNDUPGAP(x) (((x) + UCSAN_SAFE_GAP - 1) & ~(UCSAN_SAFE_GAP - 1))
 #define UCSAN_OBJECT_SIZE_LIMIT (4096 * 10)
+// An allocation above this fails (returns NULL), as malloc and kmalloc may.
+// The size is often solver-chosen, and a success is paid for up front: every
+// byte's shadow is set to uninitialized, so a 4 GB request touched 8 GB before
+// the program did anything (param_set_charp).  64 MB is 16x the kernel's own
+// KMALLOC_MAX_SIZE.
+#define UCSAN_ALLOC_SIZE_LIMIT (64UL << 20)
 #define UCSAN_MAX_SAVED_STACK_ENTRIES 1024
 
 namespace __ucsan {
@@ -278,6 +284,7 @@ enum ucsan_event_type {
   EVENT_ASSERTION = 103,
   EVENT_TYPE_BIND = 104,
   EVENT_COPY_OVERFLOW = 105,
+  EVENT_WARN = 106,           // a kernel WARN() was hit; the run continues
 };
 
 enum ucsan_assertion_type {
@@ -344,6 +351,12 @@ inline uint64_t ucsan_object_size_limit() {
              : static_cast<uint64_t>(UCSAN_OBJECT_SIZE_LIMIT);
 }
 
+inline uint64_t ucsan_alloc_size_limit() {
+  return ucsan_flags().max_alloc_size > 0
+             ? static_cast<uint64_t>(ucsan_flags().max_alloc_size)
+             : static_cast<uint64_t>(UCSAN_ALLOC_SIZE_LIMIT);
+}
+
 //===----------------------------------------------------------------------===//
 // UCSan Label Management
 //===----------------------------------------------------------------------===//
@@ -382,6 +395,30 @@ void* customized_malloc(uint64_t size);
 bool in_data_section(void *p);
 bool in_bss_section(void *p);
 
+// On-demand UCSan labels.  A lazily created object larger than the
+// eager_label_size flag does not give every byte a label: the shadow of a byte
+// that has none yet holds the object's own label (OP_RESERVED_OBJ), which no
+// byte's shadow holds otherwise, and the byte gets its label -- the same
+// (object_id, offset) an eager one would have had -- the first time something
+// reads it: the load hook, or a shadow copy (see ucsan_materialize_range).  In
+// the kernel eval only 0.2-0.8% of eager object labels were ever read, and
+// labels are 16-bit.
+inline bool ucsan_labels_on_demand(uint64_t object_size) {
+  int eager = ucsan_flags().eager_label_size;
+  return object_size > (uint64_t)(eager > 0 ? eager : 0);
+}
+// *ls, given its byte's label first if it has none yet (addr: the byte)
+ucsan_label ucsan_materialize_byte(ucsan_label *ls, void *addr);
+
+// Freed UC objects, by object label.  An object is reached through
+// ptr label -> ptr_info.obj_label, and more than one pointer label can name
+// the same object (a pointer difference binds one pointer into another's
+// object, see __dfsw_ucsan_ptr_index), so a free that marked only the label
+// it was given left the object live through the others.  Not in the obj_info
+// op: on-demand byte labels are recognized by OP_RESERVED_OBJ.
+bool ucsan_obj_freed(ucsan_label obj_label);
+void ucsan_mark_obj_freed(ucsan_label obj_label);
+
 }  // namespace __ucsan
 
 //===----------------------------------------------------------------------===//
@@ -402,6 +439,10 @@ extern SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint8_t
 // Flag for null dereference checking
 extern void* __ucsan_null_deref_flag;
 
+// Label the bytes of [addr, addr + n) that have none yet, before their shadow
+// is copied (see ucsan_labels_on_demand)
+SANITIZER_INTERFACE_ATTRIBUTE void ucsan_materialize_range(void *addr, uint64_t n);
+
 //===----------------------------------------------------------------------===//
 // Core UCSan Functions
 //===----------------------------------------------------------------------===//
@@ -413,9 +454,13 @@ extern void* __ucsan_null_deref_flag;
 // @param size: access size in bytes
 // @param dereferencing: true if this is a dereference (load/store)
 // @param type_id: compile-time type ID from type table (0 = unknown)
+// @param align: the alignment the access assumes of p (the IR's align, 1 =
+//               none); a UC object is moved to have it, and one access that
+//               no placement satisfies along with the earlier ones, and that
+//               can fault, is an error (REASON_MISALIGNED)
 // @return: resolved real pointer (may differ from p for pseudo-pointers)
 SANITIZER_INTERFACE_ATTRIBUTE
-void* ucsan_check_pointer(void* p, __ucsan::ucsan_label label, size_t size, bool dereferencing, uint32_t type_id);
+void* ucsan_check_pointer(void* p, __ucsan::ucsan_label label, size_t size, bool dereferencing, uint32_t type_id, uint32_t align);
 
 // Inverse of ucsan_check_pointer: translate a real (materialized) pointer back
 // into the UC pseudo-pointer space, using the pointer's label to find the
@@ -434,12 +479,21 @@ void ucsan_check_ptr_arg(__ucsan::ucsan_label *label, uint32_t arg_index, void* 
 
 // Load shadow for pointer type
 SANITIZER_INTERFACE_ATTRIBUTE
+// @param unread: bytes (bit i: byte i) of a non-pointer value no use reads
 __ucsan::ucsan_label ucsan_load_pointer_shadow(__ucsan::ucsan_label *ls, uint64_t n, bool is_pointer,
-                                               void *concrete_addr);
+                                               void *concrete_addr, uint64_t unread);
 
 // Store shadow for pointer type
 SANITIZER_INTERFACE_ATTRIBUTE
 void ucsan_store_pointer_shadow(__ucsan::ucsan_label l, __ucsan::ucsan_label *ls, uint64_t n);
+
+// Store the shadow of a bitfield assignment, a store of what was loaded from
+// the same address with the bytes in touched (bit i: byte i) rewritten: l is
+// the stored value's label, l_load the load's, and l_new the new bits'
+SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_store_rmw_shadow(__ucsan::ucsan_label l, __ucsan::ucsan_label l_load,
+                            __ucsan::ucsan_label l_new, __ucsan::ucsan_label *ls,
+                            uint64_t n, uint64_t touched);
 
 // Set label for a memory region
 // @param label: the label to set

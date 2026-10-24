@@ -21,8 +21,16 @@ python3 test.py                   # run the whole suite
 ```
 
 `test/*.c`/`test/*.cpp` are the test sources, each annotated with a
-`// METADATA:`/`// ENV:`/`// FLAG:`/`// DISCARD:` header consumed by
+`// METADATA:`/`// ENV:`/`// FLAG:`/`// DISCARD:`/`// ABSENT:` header consumed by
 `test.py`; `metadata/*.yaml` are the referenced UCSan entry/scope configs.
+`ABSENT` asserts that an exit status is never observed during exploration.
+`EVENT: <id>...` asserts that the target reports each event (`PIPE_EVENT_TYPE`,
+e.g. 106 for a kernel WARN) at least once.
+`CFLAGS: <flags>` adds compiler flags (e.g. `-O2`, for what only optimized code
+does, such as the pass reusing a checked pointer).
+`SOLVER-ERROR-ABSENT` asserts that the manager reports no solver parse error;
+pair it with `DISCARD` when an exit status may be reached but is not the
+property under test.
 `seeds/create_*_seed.py` are standalone generators for concrete seed files
 used with `test.py run_seed` to reproduce a specific path. `ll/` and
 `binary/` are build outputs (`test.py clean` removes them).

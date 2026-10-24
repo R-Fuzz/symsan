@@ -34,6 +34,24 @@ UCSAN_FLAG(int, max_obj_size, 0,
            "Maximum object size for lazy initialization "
            "(0 = use UCSAN_OBJECT_SIZE_LIMIT).")
 
+UCSAN_FLAG(int, eager_label_size, 64,
+           "Lazily created objects up to this many bytes get a UCSan label for "
+           "every byte when they are created; a larger one labels a byte when "
+           "it is first read as (the start of) a pointer-sized value, which is "
+           "all the load hook uses.  SymSan labels are always created eagerly. "
+           "A large value turns on-demand labels off.")
+
+UCSAN_FLAG(int, max_alloc_size, 0,
+           "Largest allocation (malloc/calloc/realloc and the kernel allocators "
+           "that wrap them) that succeeds; a larger one returns NULL "
+           "(0 = use UCSAN_ALLOC_SIZE_LIMIT).")
+
+UCSAN_FLAG(bool, verify_inputs, false,
+           "Debugging aid for value mismatches: on every load, compare each "
+           "byte carrying a SymSan input label with the seed byte that label "
+           "names, read the way the parser reads it, and report a byte that "
+           "differs (VERIFY-INPUT, with the load's site).")
+
 UCSAN_FLAG(const char *, input_file, "",
            "Input file containing seed objects.")
 

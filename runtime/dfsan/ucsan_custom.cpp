@@ -87,7 +87,7 @@ static ucsan_label create_alloca_label(void *ptr, size_t size, bool set_uninitia
 __attribute__((visibility("default")))
 void *__dfsw_malloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size != 0 && size < UINT32_MAX) {
+  if (size != 0 && size <= ucsan_alloc_size_limit()) {
     ret = __libc_malloc(size);
   }
   UCSAN_OUT("__dfsw_malloc(%zu) = %p\n", size, ret);
@@ -96,24 +96,34 @@ void *__dfsw_malloc(size_t size, ucsan_label size_label, ucsan_label *ret_label)
   return ret;
 }
 
+// The kernel's zeroing allocations (kzalloc, kcalloc, kmalloc_array and
+// friends with __GFP_ZERO) arrive here as a kmalloc with __GFP_ZERO in flags.
+// Their memory is initialized, to zero, like calloc's: painted uninitialized,
+// a read of a field the caller relies on being zero (ext4's kcalloc'ed
+// path[].p_bh) was a UBI that is not one.
+static const unsigned int kGfpZero = 0x100;  // ___GFP_ZERO, include/linux/gfp_types.h
+
+static void *kmalloc_flags(size_t size, unsigned int flags,
+                           ucsan_label size_label, ucsan_label *ret_label);
+
 __attribute__((visibility("default")))
 void *__dfsw_kmalloc_large(size_t size, unsigned int flags,
                            ucsan_label size_label, ucsan_label flags_label,
                            ucsan_label *ret_label) {
-  return __dfsw_malloc(size, size_label, ret_label);
+  return kmalloc_flags(size, flags, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
 void *__dfsw___kmalloc(size_t size, unsigned int flags,
                        ucsan_label size_label, ucsan_label flags_label,
                        ucsan_label *ret_label) {
-  return __dfsw_malloc(size, size_label, ret_label);
+  return kmalloc_flags(size, flags, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
 void *__dfsw_kmalloc(size_t size, unsigned int flags, ucsan_label size_label,
                      ucsan_label flags_label, ucsan_label *ret_label) {
-  return __dfsw_malloc(size, size_label, ret_label);
+  return kmalloc_flags(size, flags, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
@@ -121,13 +131,20 @@ void *__dfsw_calloc(size_t nmemb, size_t size, ucsan_label nmemb_label,
                     ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = nullptr;
   size_t total_size = nmemb * size;
-  if (total_size != 0 && total_size < UINT32_MAX) {
+  if (total_size != 0 && total_size <= ucsan_alloc_size_limit()) {
     ret = __libc_calloc(nmemb, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
   // (calloc zeros memory, but we still want to detect reads before writes)
   *ret_label = create_alloca_label(ret, total_size, false);
   return ret;
+}
+
+static void *kmalloc_flags(size_t size, unsigned int flags,
+                           ucsan_label size_label, ucsan_label *ret_label) {
+  if (flags & kGfpZero)
+    return __dfsw_calloc(1, size, 0, size_label, ret_label);
+  return __dfsw_malloc(size, size_label, ret_label);
 }
 
 __attribute__((visibility("default")))
@@ -168,7 +185,7 @@ void *__dfsw_realloc(void *ptr, size_t size, ucsan_label ptr_label,
 
   // don't actually free the buffer
   void *ret = nullptr;
-  if (size != 0 && size < UINT32_MAX) {
+  if (size != 0 && size <= ucsan_alloc_size_limit()) {
     ret = __libc_malloc(size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -179,7 +196,9 @@ void *__dfsw_realloc(void *ptr, size_t size, ucsan_label ptr_label,
     // Copy data from old buffer to new buffer (up to min of old/new size)
     size_t copy_size = old_size < size ? old_size : size;
     internal_memcpy(ret, ptr, copy_size);
-    // Copy UCSan shadow memory from old to new
+    // Copy UCSan shadow memory from old to new (bytes labeled on demand get
+    // their labels first: see ucsan_materialize_range)
+    ucsan_materialize_range(ptr, copy_size);
     ucsan_label *sdest = ucsan_shadow_for(ret);
     const ucsan_label *ssrc = ucsan_shadow_for(ptr);
     internal_memcpy((void *)sdest, (const void *)ssrc, copy_size * sizeof(ucsan_label));
@@ -203,6 +222,33 @@ void __dfsw_free(void *ptr, ucsan_label ptr_label) {
   // Mark buffer as freed for UAF detection
   if (ptr && ptr_label > UCSAN_CONST_LABEL) {
     ucsan_label_info *info = get_label_info(ptr_label);
+    // A UC object can have more than one pointer label (see
+    // ucsan_obj_freed): mark the object, which the others reach, as well as
+    // this label.  Freed through another one already, this is a double free.
+    if (info->common.op == OP_EXTERNAL &&
+        to_ptr_info(info)->status == PTR_INITIALIZED) {
+      ucsan_label obj_label = to_ptr_info(info)->obj_label;
+      if (ucsan_obj_freed(obj_label)) {
+        UCSAN_OUT("WARNING: double free detected for ptr %p, label %d (object label %d)\n",
+                  ptr, ptr_label, obj_label);
+        __taint_trace_event_addr(ptr_label, EVENT_DOUBLE_FREE, 0, __builtin_return_address(0), 0);
+        exit(exit_reason::EVENT_DOUBLE_FREE);
+      }
+      // ptr is the checked address.  Bytes of the object below it -- known
+      // because something accessed them -- make it an address inside the
+      // object, not its start (a pointer bound to an element, freed).  Below
+      // all known bytes it is the start: under UC the object extends down to
+      // wherever it is freed from (container_of, then kfree).
+      ucsan_obj_info *obj = to_obj_info(get_label_info(obj_label));
+      int64_t off = (int64_t)ptr - (int64_t)obj->real_ptr;
+      if (off > -(int64_t)obj->lower_bound && off <= (int64_t)obj->upper_bound) {
+        UCSAN_OUT("WARNING: invalid free of ptr %p, label %d: offset %ld in object label %d\n",
+                  ptr, ptr_label, off, obj_label);
+        __taint_trace_event_addr(ptr_label, EVENT_INVALID_FREE, 0, __builtin_return_address(0), 0);
+        exit(exit_reason::EVENT_INVALID_FREE);
+      }
+      ucsan_mark_obj_freed(obj_label);
+    }
     if (info->common.op == OP_ALLOCA || info->common.op == OP_EXTERNAL) {
       info->common.op = OP_FREE;
     } else if (info->common.op == OP_FREE) {
@@ -222,7 +268,7 @@ void *__dfsw_memalign(size_t alignment, size_t size,
                       ucsan_label alignment_label, ucsan_label size_label,
                       ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size > 0 && size < UINT32_MAX) {
+  if (size > 0 && size <= ucsan_alloc_size_limit()) {
     ret = aligned_alloc(alignment, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -235,7 +281,7 @@ void *__dfsw_aligned_alloc(size_t alignment, size_t size,
                            ucsan_label alignment_label, ucsan_label size_label,
                            ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size > 0 && size < UINT32_MAX) {
+  if (size > 0 && size <= ucsan_alloc_size_limit()) {
     ret = aligned_alloc(alignment, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -248,7 +294,7 @@ void *__dfsw_aligned_alloc(size_t alignment, size_t size,
 __attribute__((visibility("default")))
 void *__dfsw_valloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size > 0 && size < UINT32_MAX) {
+  if (size > 0 && size <= ucsan_alloc_size_limit()) {
     ret = aligned_alloc(PAGE_SIZE, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -259,7 +305,7 @@ void *__dfsw_valloc(size_t size, ucsan_label size_label, ucsan_label *ret_label)
 __attribute__((visibility("default")))
 void *__dfsw_pvalloc(size_t size, ucsan_label size_label, ucsan_label *ret_label) {
   void *ret = nullptr;
-  if (size > 0 && size < UINT32_MAX) {
+  if (size > 0 && size <= ucsan_alloc_size_limit()) {
     ret = aligned_alloc(PAGE_SIZE, size);
   }
   // Create bounds label (sets shadow to kUninitializedLabel for UBI)
@@ -337,7 +383,9 @@ void *__dfsw_memcpy(void *dest, const void *src, size_t n,
                     ucsan_label dest_label, ucsan_label src_label,
                     ucsan_label n_label, ucsan_label *ret_label) {
   *ret_label = dest_label;
-  // Copy UCSan shadow memory from src to dest
+  // Copy UCSan shadow memory from src to dest (bytes labeled on demand get
+  // their labels first: see ucsan_materialize_range)
+  ucsan_materialize_range((void *)src, n);
   ucsan_label *sdest = ucsan_shadow_for(dest);
   const ucsan_label *ssrc = ucsan_shadow_for(src);
   internal_memcpy((void *)sdest, (const void *)ssrc, n * sizeof(ucsan_label));
@@ -352,6 +400,7 @@ void *__dfsw_memmove(void *dest, const void *src, size_t n,
                      ucsan_label dest_label, ucsan_label src_label,
                      ucsan_label n_label, ucsan_label *ret_label) {
   *ret_label = dest_label;
+  ucsan_materialize_range((void *)src, n);  // see ucsan_materialize_range
   ucsan_label *sdest = ucsan_shadow_for(dest);
   const ucsan_label *ssrc = ucsan_shadow_for(src);
   internal_memmove((void *)sdest, (const void *)ssrc, n * sizeof(ucsan_label));
@@ -401,6 +450,7 @@ unsigned long __dfsw__copy_from_user(void *to, const void *from, unsigned long n
     if (ptr_info->op != OP_EXTERNAL) {
       UCSAN_OUT("WARNING: copy_from_user: from_label %d is not external, op %d\n", from_label, ptr_info->op);
     }
+    ucsan_materialize_range((void *)from, n);  // see ucsan_materialize_range
     ucsan_label *sdest = ucsan_shadow_for(to);
     const ucsan_label *ssrc = ucsan_shadow_for(from);
     internal_memcpy((void *)sdest, (const void *)ssrc, n * sizeof(ucsan_label));
@@ -461,7 +511,11 @@ __dfsw_assert_freed(void *ptr, uint64_t id, ucsan_label ptr_label, ucsan_label i
   }
   ucsan_label_info *info = get_label_info(ptr_label);
   ucsan_obj_info *obj = to_obj_info(info);
-  if (obj->op != OP_FREE) {
+  // or its object freed through another of its pointer labels
+  bool obj_freed = info->common.op == OP_EXTERNAL &&
+                   to_ptr_info(info)->status == PTR_INITIALIZED &&
+                   ucsan_obj_freed(to_ptr_info(info)->obj_label);
+  if (obj->op != OP_FREE && !obj_freed) {
     UCSAN_OUT("ERROR: assertion %lu failure: ptr %p, label %d, op %d\n", id, ptr, ptr_label, obj->op);
     __taint_trace_event_addr(ptr_label, EVENT_ASSERTION, id, ptr, ASSERTION_FREED_FAILED);
     return;
@@ -611,7 +665,7 @@ __dfsw_assume_allocated(void *ptr, size_t size, uint64_t id, ucsan_label ptr_lab
       // size is concrete, we set a concrete bound by malloc
       void *new_ptr = __dfsw_malloc(size, size_label, ret_label);
       if (new_ptr) {
-        void *old_ptr = ucsan_check_pointer(ptr, ptr_label, size, true, 0);
+        void *old_ptr = ucsan_check_pointer(ptr, ptr_label, size, true, 0, 1);
         ucsan_label dummy;
         __dfsw_memcpy(new_ptr, old_ptr, size, *ret_label, ptr_label, size_label, &dummy);
         return new_ptr;
@@ -642,6 +696,10 @@ __dfsw_assume_freed(void *ptr, uint64_t id, ucsan_label ptr_label,
   }
   // otherwise we just mark it as freed
   // internal_memset(info, 0, sizeof(*info));
+  // (its object too, for its other pointer labels: see __dfsw_free)
+  if (info->common.op == OP_EXTERNAL &&
+      to_ptr_info(info)->status == PTR_INITIALIZED)
+    ucsan_mark_obj_freed(to_ptr_info(info)->obj_label);
   info->common.op = OP_FREE;
   *ret_label = ptr_label;
   return ptr;
