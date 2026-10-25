@@ -55,6 +55,11 @@ UCSAN_FLAG(bool, verify_inputs, false,
 UCSAN_FLAG(const char *, input_file, "",
            "Input file containing seed objects.")
 
+UCSAN_FLAG(bool, concrete_globals, false,
+           "Leave global variables concrete: their contents are the program's "
+           "own (a unit test's fresh process), not unknown state that a global "
+           "is symbolized from on its first read.")
+
 UCSAN_FLAG(bool, disable_loop_bounds, false,
            "Disable loop unrolling bounds.")
 

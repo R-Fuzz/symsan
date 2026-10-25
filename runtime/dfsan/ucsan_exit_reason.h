@@ -1,5 +1,6 @@
 enum exit_reason {
   /* internal */
+  REASON_TIMEOUT = 121,       // the seed ran longer than seed_timeout (TAINT_OPTIONS)
   REASON_INVALID_INPUT = 122, // the input breaks an invariant the code relies on (__dfsw_ucsan_assume)
   REASON_LOOP_OOB = 123,
   REASON_OBJ_OOB = 124,

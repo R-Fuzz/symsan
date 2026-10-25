@@ -12,6 +12,28 @@ fun:realloc=custom
 fun:reallocarray=custom
 fun:valloc=custom
 
+# C++ operator new/delete (malloc/free with C++'s contract; see ucsan_custom.cpp)
+fun:_Znwm=custom
+fun:_Znam=custom
+fun:_ZnwmRKSt9nothrow_t=custom
+fun:_ZnamRKSt9nothrow_t=custom
+fun:_ZnwmSt11align_val_t=custom
+fun:_ZnamSt11align_val_t=custom
+fun:_ZnwmSt11align_val_tRKSt9nothrow_t=custom
+fun:_ZnamSt11align_val_tRKSt9nothrow_t=custom
+fun:_ZdlPv=custom
+fun:_ZdaPv=custom
+fun:_ZdlPvm=custom
+fun:_ZdaPvm=custom
+fun:_ZdlPvRKSt9nothrow_t=custom
+fun:_ZdaPvRKSt9nothrow_t=custom
+fun:_ZdlPvSt11align_val_t=custom
+fun:_ZdaPvSt11align_val_t=custom
+fun:_ZdlPvmSt11align_val_t=custom
+fun:_ZdaPvmSt11align_val_t=custom
+fun:_ZdlPvSt11align_val_tRKSt9nothrow_t=custom
+fun:_ZdaPvSt11align_val_tRKSt9nothrow_t=custom
+
 # libc internal versions
 fun:__libc_calloc=custom
 fun:__libc_free=custom

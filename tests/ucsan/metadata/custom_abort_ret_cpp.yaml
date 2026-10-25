@@ -1,0 +1,12 @@
+entry: "entry(int*)"
+scope:
+  - "exit"
+custom:
+  make_check_op_string:
+    ref_name: abort
+    arg_maps: []
+  # check_op_message<int>, a linkonce_odr in a comdat (KO_USE_NATIVE_LIBCXX:
+  # libstdc++'s std::__cxx11::string)
+  _Z16check_op_messageIiEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEET_S7_:
+    ref_name: abort
+    arg_maps: []

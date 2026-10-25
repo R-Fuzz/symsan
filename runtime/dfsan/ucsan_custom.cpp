@@ -289,6 +289,102 @@ void *__dfsw_aligned_alloc(size_t alignment, size_t size,
   return ret;
 }
 
+// C++ operator new/delete.  Without these they were out-of-scope declarations,
+// so each got a dangle stub: new returned an under-constrained pseudo-pointer
+// rather than memory, and delete did nothing, and a std::set's nodes broke the
+// invariants of v8's RegionAllocator in nearly every run.
+//
+// They are malloc/free with C++'s contract: new(0) still returns a unique
+// object, and the throwing forms never return null.  When the allocation is
+// refused (over ucsan_alloc_size_limit) the real one would throw bad_alloc,
+// which no caller expects; a null here would only turn into a NULL_DEREF the
+// program never had.  So the seed is invalid input, as an allocation it cannot
+// make.  The nothrow forms return null, as specified.
+static void *cxx_new(size_t size, size_t alignment, bool nothrow,
+                     ucsan_label size_label, ucsan_label *ret_label) {
+  if (size == 0)
+    size = 1;
+  void *ret = alignment
+      ? __dfsw_aligned_alloc(alignment, size, 0, size_label, ret_label)
+      : __dfsw_malloc(size, size_label, ret_label);
+  if (!ret && !nothrow) {
+    UCSAN_OUT("operator new(%zu) refused, as bad_alloc\n", size);
+    _exit(REASON_INVALID_INPUT);
+  }
+  return ret;
+}
+
+#define CXX_NEW(name, nothrow)                                                \
+  __attribute__((visibility("default"))) void *__dfsw_##name(                 \
+      size_t size, ucsan_label size_label, ucsan_label *ret_label) {          \
+    return cxx_new(size, 0, nothrow, size_label, ret_label);                  \
+  }
+#define CXX_NEW_NOTHROW(name)                                                 \
+  __attribute__((visibility("default"))) void *__dfsw_##name(                 \
+      size_t size, const void *tag, ucsan_label size_label,                   \
+      ucsan_label tag_label, ucsan_label *ret_label) {                        \
+    return cxx_new(size, 0, true, size_label, ret_label);                     \
+  }
+#define CXX_NEW_ALIGNED(name)                                                 \
+  __attribute__((visibility("default"))) void *__dfsw_##name(                 \
+      size_t size, size_t alignment, ucsan_label size_label,                  \
+      ucsan_label alignment_label, ucsan_label *ret_label) {                  \
+    return cxx_new(size, alignment, false, size_label, ret_label);            \
+  }
+#define CXX_NEW_ALIGNED_NOTHROW(name)                                         \
+  __attribute__((visibility("default"))) void *__dfsw_##name(                 \
+      size_t size, size_t alignment, const void *tag, ucsan_label size_label, \
+      ucsan_label alignment_label, ucsan_label tag_label,                     \
+      ucsan_label *ret_label) {                                               \
+    return cxx_new(size, alignment, true, size_label, ret_label);             \
+  }
+CXX_NEW(_Znwm, false)                          // new(size_t)
+CXX_NEW(_Znam, false)                          // new[](size_t)
+CXX_NEW_NOTHROW(_ZnwmRKSt9nothrow_t)           // new(size_t, nothrow_t)
+CXX_NEW_NOTHROW(_ZnamRKSt9nothrow_t)           // new[](size_t, nothrow_t)
+CXX_NEW_ALIGNED(_ZnwmSt11align_val_t)          // new(size_t, align_val_t)
+CXX_NEW_ALIGNED(_ZnamSt11align_val_t)          // new[](size_t, align_val_t)
+CXX_NEW_ALIGNED_NOTHROW(_ZnwmSt11align_val_tRKSt9nothrow_t)
+CXX_NEW_ALIGNED_NOTHROW(_ZnamSt11align_val_tRKSt9nothrow_t)
+#undef CXX_NEW
+#undef CXX_NEW_NOTHROW
+#undef CXX_NEW_ALIGNED
+#undef CXX_NEW_ALIGNED_NOTHROW
+
+// operator delete in all its forms is free(ptr): the size, alignment and
+// nothrow arguments say nothing free needs.
+#define CXX_DELETE(name)                                                      \
+  __attribute__((visibility("default"))) void __dfsw_##name(                  \
+      void *ptr, ucsan_label ptr_label) {                                     \
+    __dfsw_free(ptr, ptr_label);                                              \
+  }
+#define CXX_DELETE2(name)                                                     \
+  __attribute__((visibility("default"))) void __dfsw_##name(                  \
+      void *ptr, uptr arg, ucsan_label ptr_label, ucsan_label arg_label) {    \
+    __dfsw_free(ptr, ptr_label);                                              \
+  }
+#define CXX_DELETE3(name)                                                     \
+  __attribute__((visibility("default"))) void __dfsw_##name(                  \
+      void *ptr, uptr arg1, uptr arg2, ucsan_label ptr_label,                 \
+      ucsan_label arg1_label, ucsan_label arg2_label) {                       \
+    __dfsw_free(ptr, ptr_label);                                              \
+  }
+CXX_DELETE(_ZdlPv)                             // delete(void *)
+CXX_DELETE(_ZdaPv)                             // delete[](void *)
+CXX_DELETE2(_ZdlPvm)                           // delete(void *, size_t)
+CXX_DELETE2(_ZdaPvm)                           // delete[](void *, size_t)
+CXX_DELETE2(_ZdlPvRKSt9nothrow_t)              // delete(void *, nothrow_t)
+CXX_DELETE2(_ZdaPvRKSt9nothrow_t)              // delete[](void *, nothrow_t)
+CXX_DELETE2(_ZdlPvSt11align_val_t)             // delete(void *, align_val_t)
+CXX_DELETE2(_ZdaPvSt11align_val_t)             // delete[](void *, align_val_t)
+CXX_DELETE3(_ZdlPvmSt11align_val_t)            // delete(void *, size_t, align_val_t)
+CXX_DELETE3(_ZdaPvmSt11align_val_t)            // delete[](void *, size_t, align_val_t)
+CXX_DELETE3(_ZdlPvSt11align_val_tRKSt9nothrow_t)
+CXX_DELETE3(_ZdaPvSt11align_val_tRKSt9nothrow_t)
+#undef CXX_DELETE
+#undef CXX_DELETE2
+#undef CXX_DELETE3
+
 #define PAGE_SIZE 4096
 
 __attribute__((visibility("default")))
@@ -715,6 +811,18 @@ SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
 __dfsw_abort(void) {
   UCSAN_OUT("ABORT\n");
   _exit(EVENT_PANIC);
+}
+
+// A fatal check the harness makes, not the code under test: a unit test's
+// fixture CHECKs what an out-of-scope dependency returned
+// (CHECK_NOT_NULL(platform_.get())), which is an assumption about it.  A seed
+// that breaks it is no input the program can have (as __dfsw_ucsan_assume),
+// not a PANIC.  Mapped to with `custom: {ref_name: ucsan_invalid_input}`.
+SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
+__dfsw_ucsan_invalid_input(void) {
+  UCSAN_OUT("assumption broken by the input at %p\n",
+            __builtin_return_address(0));
+  _exit(exit_reason::REASON_INVALID_INPUT);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void

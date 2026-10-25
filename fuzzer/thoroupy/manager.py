@@ -27,6 +27,8 @@ from typing import Callable, NoReturn, Optional
 UNION_TABLE_SIZE = 0x7f000000 # FIXME: will mmap failed if set to 0x80000000
 
 CHECKER_UBI = 150
+# runtime/dfsan/ucsan_exit_reason.h: the input breaks an invariant the code relies on
+REASON_INVALID_INPUT = 122
 
 ERROR_EVENTS = {
     'UBI': 150,
@@ -418,7 +420,18 @@ class UcsanManager:
             case PIPE_MSG_TYPE.EXIT_TYPE:
                 logger.info("Finish one seed, exit with code: {}".format(msg.result))
                 # Only report exit status if we haven't already reported a bug for this seed
-                if msg.result != 0 and not self._bug_reported_for_current_seed:
+                # (and not an input the program cannot have: the runtime's
+                # REASON_INVALID_INPUT, a broken assumption -- __dfsw_ucsan_assume,
+                # a unit test harness's own CHECK -- is no finding)
+                status = msg.result if msg.result < 255 else msg.result >> 8
+                if status == REASON_INVALID_INPUT:
+                    logger.info("Seed is invalid input (a broken assumption)")
+                    # still an exit status (a test asserts the assumption
+                    # ends the run), only not a bug: no seed, no report
+                    if status not in self._reported:
+                        self._reported.add(status)
+                        self.exit_status.append(msg.result)
+                elif msg.result != 0 and not self._bug_reported_for_current_seed:
                     self._report(msg.result)
                 self._event_handlers.on_seed_done()
                 self.solver.ResetCache()

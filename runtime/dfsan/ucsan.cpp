@@ -981,7 +981,8 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
     // Symbolize global variable on first access (label == 0)
     // (and not written or symbolized before: see global_seen)
     ucsan_label *shadow = ucsan_shadow_for(p);
-    if (*shadow == 0 && dereferencing && !global_byte_seen(p)) {
+    if (*shadow == 0 && dereferencing && !ucsan_flags().concrete_globals &&
+        !global_byte_seen(p)) {
       mark_global_seen(p, size);
       // only symbolize on deref
       bool sent_data = false;

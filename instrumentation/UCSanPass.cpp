@@ -1130,9 +1130,19 @@ void UCSan::initializeCustomFunctionTypes() {
   CustomFuncTypes["free"] = FunctionType::get(Type::getVoidTy(*Ctx), {VoidPtrTy}, false);
   CustomFuncTypes["realloc"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, Int64Ty}, false);
   CustomFuncTypes["calloc"] = FunctionType::get(VoidPtrTy, {Int64Ty, Int64Ty}, false);
+  // an allocator that never returns null (v8's Zone::Allocate fatal-OOMs):
+  // throwing operator new's contract, so a refused size is invalid input
+  // rather than a null the program could never see
+  CustomFuncTypes["_Znwm"] = FunctionType::get(VoidPtrTy, {Int64Ty}, false);
   CustomFuncTypes["strdup"] = FunctionType::get(VoidPtrTy, {VoidPtrTy}, false);
   CustomFuncTypes["strndup"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, Int64Ty}, false);
   CustomFuncTypes["exit"] = FunctionType::get(Type::getVoidTy(*Ctx), {Int32Ty}, false);
+  // a program's own fatal-error reporter (V8_Fatal) mapped to abort: PANIC
+  CustomFuncTypes["abort"] = FunctionType::get(Type::getVoidTy(*Ctx), {}, false);
+  // the same reporter called by a unit test's harness: an assumption about a
+  // dependency, so a seed that breaks it is invalid input, not a PANIC
+  CustomFuncTypes["ucsan_invalid_input"] =
+      FunctionType::get(Type::getVoidTy(*Ctx), {}, false);
 
   // String copy functions
   CustomFuncTypes["strcpy"] = FunctionType::get(VoidPtrTy, {VoidPtrTy, VoidPtrTy}, false);
@@ -1992,13 +2002,30 @@ Function *UCSan::buildDangleFunction(Function *F) {
   // Get return address for tracking
   auto RetAddr = IRB.CreateCall(LLVMReturnAddrFn, {ConstantInt::get(Int32Ty, 0)}, "retaddr");
 
+  // An sret argument is the function's return value: out of scope, the
+  // function writes it, so its bytes are as under-constrained as a returned
+  // scalar.  Left alone it stayed the caller's uninitialized temporary, and its
+  // first read a UBI (v8's NewDefaultPlatform returns a unique_ptr through
+  // sret: CHECK_NOT_NULL(platform_.get()) branched on uninitialized memory).
+  bool has_sret = false;
+  for (unsigned i = 0, e = FT->getNumParams(); i != e; ++i)
+    has_sret |= F->hasParamAttribute(i, Attribute::StructRet);
+
   // Process pointer arguments if needed
-  if (resign_ptrargs || checker_ubi) {
+  if (resign_ptrargs || checker_ubi || has_sret) {
     unsigned ArgOffset = 0;
     unsigned n = FT->getNumParams();
 
     for (auto arg = NewF->arg_begin(); n != 0; ++arg, --n) {
-      if (arg->getType()->isPointerTy()) {
+      bool is_sret = F->hasParamAttribute(arg->getArgNo(), Attribute::StructRet);
+      if (is_sret && !resign_ptrargs) {
+        Value *shadow = UF.getArgTLS(arg->getType(), ArgOffset, IRB);
+        Type *RetTy = F->getParamStructRetType(arg->getArgNo());
+        ConstantInt *CI = ConstantInt::get(
+            Int64Ty, RetTy && RetTy->isSized() ? DL.getTypeAllocSize(RetTy) : 0);
+        Value *BCI = IRB.CreatePointerCast(&*arg, VoidPtrTy);
+        IRB.CreateCall(UCResignShadowFn, {BCI, shadow, CI, RetAddr});
+      } else if (arg->getType()->isPointerTy() && (resign_ptrargs || checker_ubi)) {
         // F is an out-of-scope declaration (that's the point of a dangle
         // wrapper) with no body, and arg is a fresh stub argument with no
         // uses of its own - there's no pointee type to recover here under
@@ -2417,7 +2444,14 @@ Function *UCSan::getCustomFunction(const Function *F) {
   }
 
   // Handle return value
-  if (!F->getReturnType()->isVoidTy()) {
+  if (!F->getReturnType()->isVoidTy() &&
+      RefedFuncType->getReturnType()->isVoidTy()) {
+    // a value-returning function mapped to a void model, i.e. a failure path
+    // mapped to abort/exit (v8's MakeCheckOpString builds a failed CHECK's
+    // message): the model does not return
+    IRB.CreateCall(RefedFunc, Args);
+    IRB.CreateRet(PoisonValue::get(F->getReturnType()));
+  } else if (!F->getReturnType()->isVoidTy()) {
     Value *retvaltls = UF.getRetvalTLS(F->getReturnType(), IRB);
     Args.push_back(retvaltls);
 
@@ -6232,6 +6266,18 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
 
 }
 
+// The first point where a call's result is available: after a call, or at the
+// head of an invoke's normal destination, split off from it when other blocks
+// reach it too.  An invoke ends its block, so it has no next instruction.
+static Instruction *afterCall(CallBase &CB, DominatorTree &DT) {
+  auto *II = dyn_cast<InvokeInst>(&CB);
+  if (!II)
+    return CB.getNextNode();
+  if (II->getNormalDest()->getSinglePredecessor())
+    return &*II->getNormalDest()->getFirstInsertionPt();
+  return &SplitEdge(II->getParent(), II->getNormalDest(), &DT)->front();
+}
+
 bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
   IRBuilder<> IRB(&CB);
   Value *Shadow = nullptr;
@@ -6289,7 +6335,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
           // No ucsan return shadow from the wrapper; set zero.
           UF.setShadow(&CB, UF.UC.getZeroShadow(&CB));
         } else {
-          IRB.SetInsertPoint(CB.getNextNode());
+          IRB.SetInsertPoint(afterCall(CB, UF.DT));
           LoadInst *LI = IRB.CreateAlignedLoad(UF.UC.getShadowTy(&CB),
               UF.getRetvalTLS(CB.getType(), IRB),
               ShadowTLSAlignment, "_autoret");
@@ -6452,7 +6498,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
         // (e.g. p - c == index) is preserved. The symsan taint label is
         // carried separately through the __dfsw_ retval TLS (different shadow
         // memory), so rewriting the pointer value here does not affect it.
-        IRBuilder<> AfterIRB(CB.getNextNode());
+        IRBuilder<> AfterIRB(afterCall(CB, UF.DT));
         // Only emit (and mark nosanitize) a cast when one is actually needed.
         // CreateBitCast returns &CB unchanged when the types already match, and
         // marking that nosanitize would suppress TaintPass on the real call.
@@ -6492,10 +6538,6 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
   case UCSan::WK_Custom:
   {
     // Call the __dfsw_ wrapper with shadow arguments
-    CallInst *CI = dyn_cast<CallInst>(&CB);
-    if (!CI)
-      return false;
-
     auto FName = F->getName();
     bool IsContractPrim = (FName).starts_with("assume_") || (FName).starts_with("assert_");
 
@@ -6602,10 +6644,18 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     // Add any remaining vararg arguments
     append_range(Args, drop_begin(CB.args(), FT->getNumParams()));
 
-    CallInst *CustomCI = IRB.CreateCall(CustomF, Args);
-    CustomCI->setCallingConv(CI->getCallingConv());
+    // An invoke (C++ `new` under -fexceptions) stays one, to the same
+    // destinations: it was left to call the real function, whose object
+    // UCSan never saw.
+    CallBase *CustomCI;
+    if (auto *II = dyn_cast<InvokeInst>(&CB))
+      CustomCI = IRB.CreateInvoke(CustomF, II->getNormalDest(),
+                                  II->getUnwindDest(), Args);
+    else
+      CustomCI = IRB.CreateCall(CustomF, Args);
+    CustomCI->setCallingConv(CB.getCallingConv());
     CustomCI->setAttributes(TransformFunctionAttributes(
-        CustomFn, *UF.UC.Ctx, CI->getAttributes()));
+        CustomFn, *UF.UC.Ctx, CB.getAttributes()));
     UF.UC.markNosanitize(CustomCI);
 
     // Update the parameter attributes of the custom call instruction to
@@ -6619,16 +6669,18 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       }
     }
 
+    CB.replaceAllUsesWith(CustomCI);
+    CB.eraseFromParent();
+
     // Load the return value shadow
     if (!RetTy->isVoidTy()) {
+        IRB.SetInsertPoint(afterCall(*CustomCI, UF.DT));
         LoadInst *LabelLoad =
             IRB.CreateLoad(UF.UC.getShadowTy(RetTy), UF.LabelReturnAlloca);
         UF.UC.markNosanitize(LabelLoad);
         UF.setShadow(CustomCI, LabelLoad);
       }
 
-      CI->replaceAllUsesWith(CustomCI);
-      CI->eraseFromParent();
       return true;
     }
   }
@@ -7172,6 +7224,17 @@ void UCSanVisitor::visitSelectInst(SelectInst &I) {
   Value *ShadowSel;
   if (TrueShadow == FalseShadow) {
     ShadowSel = TrueShadow;
+  } else if (I.getCondition()->getType()->isVectorTy()) {
+    // A vector's shadow is one label (getShadowTy), and a vector condition
+    // picks per lane, so the result holds lanes of both: their labels
+    // combined, as for a binary op.  A select of the scalar shadows on the
+    // vector condition was invalid IR (llc: "selected values for vector
+    // select must be vectors").
+    IRBuilder<> IRB(&I);
+    CallInst *C =
+        IRB.CreateCall(UF.UC.UCCombineLabelFn, {TrueShadow, FalseShadow});
+    UF.UC.markNosanitize(C);
+    ShadowSel = C;
   } else {
     ShadowSel = SelectInst::Create(I.getCondition(), TrueShadow, FalseShadow, "", &I);
   }
@@ -7734,6 +7797,18 @@ bool UCSan::runImpl(Module &M) {
   lowerAsmStringIO(M, AsmCallees);
   declareAsmCallees(M, AsmCallees);
 
+  // A call through a function alias (C++'s complete-object C1/D1 constructor
+  // and destructor, aliases of the base-object C2/D2) has no called function,
+  // so it was handled as an indirect call.  A non-interposable alias is the
+  // aliasee's address, so its uses name the aliasee directly; the alias stays,
+  // for other modules that reference it.
+  for (GlobalAlias &GA : M.aliases()) {
+    auto *F = dyn_cast<Function>(GA.getAliaseeObject());
+    if (!F || GA.isInterposable() || GA.getValueType() != F->getValueType())
+      continue;
+    GA.replaceAllUsesWith(F);
+  }
+
   // Filter functions based on scope
   for (Function &F : M) {
     if (F.isIntrinsic()) continue;
@@ -7766,9 +7841,13 @@ bool UCSan::runImpl(Module &M) {
     // is a declaration that must resolve against the real definition, in libc
     // or the runtime, which the wrapper calls.  It cannot keep the module's
     // hidden visibility or dso_local: the linker refuses a hidden undefined
-    // symbol, and will not bind one to a shared library.
+    // symbol, and will not bind one to a shared library.  Nor can it stay in a
+    // comdat: a C++ template instantiation (linkonce_odr, v8's
+    // MakeCheckOpString<int, int> mapped to abort) is in one, and the verifier
+    // rejects a declaration in a comdat.
     auto dropBody = [](Function &F) {
       F.deleteBody();
+      F.setComdat(nullptr);
       F.setVisibility(GlobalValue::DefaultVisibility);
       F.setDSOLocal(false);
     };

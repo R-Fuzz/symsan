@@ -47,6 +47,9 @@ DFSAN_FLAG(size_t, ring_size, 0, "event ring capacity in bytes, a power of two "
 DFSAN_FLAG(const char *, pipe_name, "", "communication pipe filename.")
 DFSAN_FLAG(int, control_pipe_fd, -1, "control pipe fd.")
 DFSAN_FLAG(const char *, control_pipe_name, "", "control pipe filename.")
+DFSAN_FLAG(int, seed_timeout, 0,
+           "seconds a fork server child may run one seed before it ends with "
+           "REASON_TIMEOUT (121); 0: no limit.")
 DFSAN_FLAG(bool, forksrv, false,
            "run as an AFL-style fork server on fds 198/199, forking once per "
            "input instead of being exec'd once per input.")

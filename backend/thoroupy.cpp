@@ -348,6 +348,16 @@ static void trap_handler(int sig, siginfo_t *si, void *unused)
   internal__exit(180);
 }
 
+// A seed's own run may be unbounded in effect: a symbolic length the solver
+// made 2^31 drives a loop through millions of traced iterations (v8's
+// BitVector zeroing 2^25 words), and the fork server waited on it for the
+// whole budget.  seed_timeout ends it as REASON_TIMEOUT, as a fuzzer's
+// per-input timeout does; the next seed goes on.
+static void timeout_handler(int sig) {
+  AOUT("Seed timed out after %d s\n", flags().seed_timeout);
+  internal__exit(exit_reason::REASON_TIMEOUT);
+}
+
 void RegisterSegFault () {
 #ifdef __handle_segfualt__
   struct sigaction sa;
@@ -424,6 +434,10 @@ extern "C" void InitializeUCSanSolver() {
         if (pid == 0) { // child
           __instance_id = ticket.instance_id;
           __session_id = ticket.session_id;
+          if (flags().seed_timeout > 0) {
+            signal(SIGALRM, timeout_handler);
+            alarm(flags().seed_timeout);
+          }
 
           if (ticket.msg_type == 1) return; // no payload
           payload_size = ticket.payload_size;

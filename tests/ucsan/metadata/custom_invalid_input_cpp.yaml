@@ -1,0 +1,7 @@
+entry: "entry(int*)"
+scope:
+  - "exit"
+custom:
+  harness_check_failed:
+    ref_name: ucsan_invalid_input
+    arg_maps: []
