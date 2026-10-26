@@ -25,6 +25,7 @@ extern "C" {
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 
 #include <stdexcept>
 #include <string>
@@ -57,6 +58,12 @@ void warn(const char *fmt, ...) {
   fprintf(stderr, "[symsan] ");
   vfprintf(stderr, fmt, args);
   va_end(args);
+}
+
+uint64_t monotonic_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 } // namespace
@@ -187,7 +194,35 @@ trace_result_t TraceSession::run(int fd, EventHandler &handler) {
 
   num_events_ = 0;
 
-  while (symsan_read_event(&msg, sizeof(msg), timeout_ms_) == sizeof(msg)) {
+  // timeout_ms_ bounds the whole trace, not the wait for each event: a target
+  // looping on an input that emits an event every few seconds never trips a
+  // per-event timeout, and the deadloop guard below only looks after 8192
+  // events.  So every read gets what is left of one deadline, and a read that
+  // runs it out is killed by the launcher like any other timed-out read.
+  uint64_t deadline = timeout_ms_ ? monotonic_ms() + timeout_ms_ : 0;
+
+  while (true) {
+    unsigned wait_ms = 0; // 0 blocks indefinitely
+    if (deadline) {
+      uint64_t now = monotonic_ms();
+      if (now >= deadline) {
+        warn("trace exceeded %u ms, break\n", timeout_ms_);
+        timedout = true;
+        break;
+      }
+      wait_ms = (unsigned)(deadline - now);
+    }
+    if (symsan_read_event(&msg, sizeof(msg), wait_ms) != sizeof(msg)) {
+      // the launcher kills the child when a read times out; with the wait
+      // capped by the deadline, that only happens once the trace is over time
+      int status;
+      if (deadline && symsan_get_exit_status(&status) == 1) {
+        warn("trace exceeded %u ms, break\n", timeout_ms_);
+        timedout = true;
+      }
+      break;
+    }
+
     switch (msg.msg_type) {
       // conditional branch
       case cond_type:

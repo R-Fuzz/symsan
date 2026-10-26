@@ -405,6 +405,10 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   }
   // clear O_CLOEXEC flag
   fcntl(g_config.shm_fd, F_SETFD, fcntl(g_config.shm_fd, F_GETFD) & ~FD_CLOEXEC);
+  // children receive the table by fd (shm_fd= in SYMSAN_ENV), so the name is not
+  // needed past this point: unlink it now, or a SIGTERM/SIGKILL'd driver leaks the
+  // whole union table in /dev/shm until tmpfs fills up (SIGBUS / ENOMEM later)
+  shm_unlink(g_config.shm_name);
   // mmap the shm
   g_config.label_info = mmap(NULL, uniontable_size, PROT_READ, MAP_SHARED,
       g_config.shm_fd, 0);
@@ -626,14 +630,90 @@ static int cov_map_create(size_t size) {
    for the overwrite flag would leave it in place and the traced process would
    count its edges into the map the fuzzer reads its coverage out of --
    corrupting the fuzzer's picture of the target with the concolic executor's
-   footprints, silently and in the direction that looks like progress. */
-static void cov_map_export(void) {
-  if (g_config.cov_shm_id == -1) {
+   footprints, silently and in the direction that looks like progress.
+
+   The child is made with vfork() (see child_reset_signals), and a vfork child
+   borrows our memory until it execs, so it cannot setenv() -- that would edit
+   (and maybe realloc) our own environment.  Instead the whole environment the
+   child gets is built here, in the parent: ours, less LD_PRELOAD (don't preload
+   anything) and less the entries we replace, plus TAINT_OPTIONS and the map.
+   Free it with free_child_envp() once the child has exec'd. */
+static char **build_child_envp(const char *taint_options) {
+  char shm_id[32] = "";
+  if (g_config.cov_shm_id != -1) {
+    snprintf(shm_id, sizeof(shm_id), "__AFL_SHM_ID=%d", g_config.cov_shm_id);
+  }
+
+  size_t n = 0;
+  while (environ[n] != NULL) n++;
+  char **envp = (char **)calloc(n + 3, sizeof(char *));
+  if (envp == NULL) {
+    return NULL;
+  }
+
+  size_t k = 0;
+  for (size_t i = 0; i < n; i++) {
+    const char *e = environ[i];
+    if (strncmp(e, "LD_PRELOAD=", 11) == 0 ||
+        strncmp(e, "TAINT_OPTIONS=", 14) == 0 ||
+        (shm_id[0] && strncmp(e, "__AFL_SHM_ID=", 13) == 0)) {
+      continue;
+    }
+    envp[k++] = (char *)e; // borrowed; only the two below are ours
+  }
+  envp[k++] = alloc_printf("TAINT_OPTIONS=%s", taint_options);
+  envp[k] = shm_id[0] ? strdup(shm_id) : NULL;
+  if (envp[k - 1] == NULL || (shm_id[0] && envp[k] == NULL)) {
+    free(envp[k - 1]);
+    free(envp[k]);
+    free(envp);
+    return NULL;
+  }
+  return envp;
+}
+
+static void free_child_envp(char **envp) {
+  if (envp == NULL) {
     return;
   }
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%d", g_config.cov_shm_id);
-  setenv("__AFL_SHM_ID", buf, 1);
+  // only the entries build_child_envp() appended are owned, and they are last
+  size_t n = 0;
+  while (envp[n] != NULL) n++;
+  for (size_t i = 0; i < n; i++) {
+    if (strncmp(envp[i], "TAINT_OPTIONS=", 14) == 0) {
+      free(envp[i]);
+      if (envp[i + 1] != NULL) free(envp[i + 1]); // __AFL_SHM_ID, if any
+      break;
+    }
+  }
+  free(envp);
+}
+
+/* fork() of a launcher embedded in a big process -- symsan-fuzz runs at tens
+   of GB of address space -- has been refused with ENOMEM with seven of them
+   running side by side: fork() duplicates the whole address space (page
+   tables, and the commit charge of every private writable mapping) only for
+   execve() to throw it away.  vfork() copies nothing, at the price that the child runs on
+   our memory and our stack until it execs.  So, as glibc's posix_spawn does:
+   the parent blocks every signal across the vfork(), and the child puts any
+   handler of ours back to the default before unmasking, so that no signal can
+   run our handler on our memory in the child.  posix_spawn itself is no
+   option: it cannot set the core rlimit or the personality below. */
+static void child_reset_signals(void) {
+  struct sigaction dfl;
+  memset(&dfl, 0, sizeof(dfl));
+  dfl.sa_handler = SIG_DFL;
+  sigemptyset(&dfl.sa_mask);
+  for (int sig = 1; sig < NSIG; sig++) {
+    struct sigaction old;
+    if (sigaction(sig, NULL, &old) == 0 && old.sa_handler != SIG_DFL &&
+        old.sa_handler != SIG_IGN) {
+      sigaction(sig, &dfl, NULL);
+    }
+  }
+  sigset_t set;
+  sigemptyset(&set);
+  sigprocmask(SIG_SETMASK, &set, NULL);
 }
 
 /* Build the TAINT_OPTIONS string for the child.  Its own function because the
@@ -704,18 +784,21 @@ static int forksrv_spawn(void) {
     return SYMSAN_NO_MEMORY;
   }
 
-  g_config.forksrv_pid = fork();
-  if (g_config.forksrv_pid < 0) {
+  char **envp = build_child_envp((char*)g_config.symsan_env);
+  if (envp == NULL) {
     close(ctl[0]); close(ctl[1]);
     close(st[0]); close(st[1]);
-    return g_config.forksrv_pid;
+    return SYMSAN_NO_MEMORY;
   }
 
-  if (g_config.forksrv_pid == 0) {
+  sigset_t all, saved;
+  sigfillset(&all);
+  sigprocmask(SIG_SETMASK, &all, &saved);
+  pid_t pid = vfork();
+
+  if (pid == 0) {
     // clear signal handlers and masks
-    sigset_t set;
-    sigemptyset(&set);
-    sigprocmask(SIG_SETMASK, &set, NULL);
+    child_reset_signals();
 
     // disable core dump as shadow mem is toooooo large
     //
@@ -742,21 +825,30 @@ static int forksrv_spawn(void) {
     close(ctl[0]); close(ctl[1]);
     close(st[0]); close(st[1]);
 
-    setenv("TAINT_OPTIONS", (char*)g_config.symsan_env, 1);
+    // TAINT_OPTIONS, the coverage map and the LD_PRELOAD removal are all in
+    // envp, built before the vfork() (see build_child_envp).
+    //
     // The fork server attaches once, in dfsan_init, ahead of the fork point, so
     // every child it goes on to make shares this one segment.  That is what we
     // want -- the launcher zeroes it per run -- but it does mean the size is
     // fixed here and symsan_set_cov_map_size() cannot move it afterwards.
-    cov_map_export();
-    unsetenv("LD_PRELOAD"); // don't preload anything
     if (!g_config.enable_debug) {
       close(1);
       close(2);
       dup2(g_config.dev_null_fd, 1);
       dup2(g_config.dev_null_fd, 2);
     }
-    execv(g_config.symsan_bin, g_config.argv);
+    execve(g_config.symsan_bin, g_config.argv, envp);
     _exit(1); // only reached if execv failed
+  }
+
+  sigprocmask(SIG_SETMASK, &saved, NULL);
+  free_child_envp(envp);
+  g_config.forksrv_pid = pid;
+  if (g_config.forksrv_pid < 0) {
+    close(ctl[0]); close(ctl[1]);
+    close(st[0]); close(st[1]);
+    return g_config.forksrv_pid;
   }
 
   close(ctl[0]);
@@ -1240,12 +1332,22 @@ int symsan_run(int fd) {
     }
   }
 
-  g_config.symsan_pid = fork();
-  if (g_config.symsan_pid == 0) {
+  char **envp = build_child_envp((char*)g_config.symsan_env);
+  if (envp == NULL) {
+    close(g_config.pipefds[0]);
+    close(g_config.pipefds[1]);
+    g_config.pipefds[0] = -1;
+    g_config.pipefds[1] = -1;
+    return SYMSAN_NO_MEMORY;
+  }
+
+  sigset_t all, saved;
+  sigfillset(&all);
+  sigprocmask(SIG_SETMASK, &all, &saved);
+  pid_t pid = vfork();
+  if (pid == 0) {
     // clear signal handlers and masks
-    sigset_t set;
-    sigemptyset(&set);
-    sigprocmask(SIG_SETMASK, &set, NULL);
+    child_reset_signals();
 
     // disable core dump as shadow mem is toooooo large
     //
@@ -1264,9 +1366,8 @@ int symsan_run(int fd) {
     child_disable_aslr();
 
     close(g_config.pipefds[0]); // close the read fd
-    setenv("TAINT_OPTIONS", (char*)g_config.symsan_env, 1);
-    cov_map_export();
-    unsetenv("LD_PRELOAD"); // don't preload anything
+    // TAINT_OPTIONS, the coverage map and the LD_PRELOAD removal are all in
+    // envp, built before the vfork() (see build_child_envp)
     if (g_config.is_input_sdtin) {
       close(0);
       lseek(fd, 0, SEEK_SET);
@@ -1275,15 +1376,25 @@ int symsan_run(int fd) {
     if (!g_config.enable_debug) {
       close(1);
       close(2);
-      int dev_null_fd = open("/dev/null", O_RDWR);
       dup2(g_config.dev_null_fd, 1);
       dup2(g_config.dev_null_fd, 2);
     }
-    ret = execv(g_config.symsan_bin, g_config.argv);
-    return ret;
-  } else if (g_config.symsan_pid < 0) {
+    execve(g_config.symsan_bin, g_config.argv, envp);
+    // never return: a vfork() child is running on our stack frame
+    _exit(1);
+  }
+
+  sigprocmask(SIG_SETMASK, &saved, NULL);
+  free_child_envp(envp);
+  g_config.symsan_pid = pid;
+  if (g_config.symsan_pid < 0) {
+    // keep vfork()'s errno: callers report it (TraceSession::run's warning)
+    int err = errno;
     close(g_config.pipefds[0]);
     close(g_config.pipefds[1]);
+    g_config.pipefds[0] = -1;
+    g_config.pipefds[1] = -1;
+    errno = err;
     return g_config.symsan_pid;
   }
 

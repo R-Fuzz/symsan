@@ -45,7 +45,8 @@ cd symsan/ && mkdir -p build && \
 
 You need to compile two binaries: one for normal fuzzing and one for symbolic tracing
 
-For the normal fuzzing binary, you can set `AFL_LLVM_CMPLOG=0` to disable `cmplog` as the plugin does a similar job.
+For the normal fuzzing binary, leave `AFL_LLVM_CMPLOG` (and `AFL_CMPLOG`) unset to keep `cmplog` off, as the plugin does a similar job.
+afl-cc only checks whether the variable is set, so `AFL_LLVM_CMPLOG=0` turns `cmplog` *on*.
 Please refer to the AFL++ manual for building options.
 
 For the symbolic tracing binary, set the following env options

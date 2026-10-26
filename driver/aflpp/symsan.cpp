@@ -172,7 +172,9 @@ static bool start_session(my_mutator_t *data) {
   }
 
   data->config.use_stdin = data->afl->fsrv.use_stdin;
-  data->config.timeout_ms = std::min(MIN_TIMEOUT, data->afl->fsrv.exec_tmout);
+  // A floor, not a cap: timeout_ms bounds the whole trace, so min() would give
+  // every traced run at most 50 ms no matter what -t says.
+  data->config.timeout_ms = std::max(MIN_TIMEOUT, data->afl->fsrv.exec_tmout);
 
   if (data->session.init(data->config) != 0) {
     WARNF("Failed to init the symsan session\n");
