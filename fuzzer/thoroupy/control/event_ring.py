@@ -84,8 +84,10 @@ class RingChannel:
         # aarch64, which is the property __atomic_load_n(..., ACQUIRE) rests
         # on too -- there is no weaker-ordered CPU underneath either target
         # for a single aligned word.
-        head = struct.unpack_from('<Q', self._mm, _HEAD_OFFSET)[0]
-        return head >> symsan.RING_SHIFT
+        # But struct.unpack_from('<Q') is no 8-byte read: CPython assembles a
+        # standard-size '<Q' a byte at a time.  So the load is native code's,
+        # one aligned word, as that reasoning assumed.
+        return symsan.ring_load_head(self._addr)
 
     def _take(self, size: int) -> Optional[bytes]:
         """Copy `size` bytes out if the ring already has them; else None.
@@ -102,6 +104,12 @@ class RingChannel:
         immediately, no different from any other spurious wake). See
         include/symsan_ring.h's packing note for why the futex ABI makes
         exactly this race safe.
+
+        (That reasoning was about the plain store this used to be.  Tail is now
+        advanced by an atomic RMW (symsan.ring_advance_tail), as launch.c's
+        ring_take() does: the store was struct.pack_into('<Q'), which CPython
+        does a byte at a time, so it was never the one 8-byte store the
+        reasoning assumed.)
         """
         used = self._head_bytes() - self._tail
         if used < size:
@@ -116,7 +124,12 @@ class RingChannel:
             data = bytes(self._mm[base + off: base + self._capacity])
             data += bytes(self._mm[base: base + (size - first)])
         self._tail += size
-        struct.pack_into('<Q', self._mm, _TAIL_OFFSET, self._tail << symsan.RING_SHIFT)
+        # An atomic advance, not a store: struct.pack_into('<Q') wrote tail a
+        # byte at a time, so the producer could read it torn -- more room than
+        # there was -- and overwrite records not yet read (head ran a whole
+        # ring ahead of tail on a long trace, and the records read after were
+        # misaligned).  The advance also wakes a producer blocked for room.
+        symsan.ring_advance_tail(self._addr, size)
         return data
 
     def _read_exact(self, size: int) -> bytes:

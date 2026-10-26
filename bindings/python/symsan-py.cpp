@@ -26,6 +26,7 @@ extern "C" {
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <errno.h>
 
 #define PY_SSIZE_T_CLEAN
@@ -338,6 +339,46 @@ static PyObject* RingDisarmHead(PyObject *self, PyObject *args) {
   }
   struct symsan_ring_hdr *ring = (struct symsan_ring_hdr *)(uintptr_t)addr;
   symsan_ring_disarm(&ring->head);
+  Py_RETURN_NONE;
+}
+
+// The head cursor's byte count, loaded with acquire as one 8-byte access.
+// The consumer used to read it with struct.unpack_from('<Q'), which CPython
+// does a byte at a time: a load racing the producer's advance could see a
+// mix of old and new bytes.
+// Usage: nbytes = ring_load_head(addr)
+static PyObject* RingLoadHead(PyObject *self, PyObject *args) {
+  unsigned long long addr = 0;
+  if (!PyArg_ParseTuple(args, "K", &addr)) {
+    return NULL;
+  }
+  struct symsan_ring_hdr *ring = (struct symsan_ring_hdr *)(uintptr_t)addr;
+  return PyLong_FromUnsignedLongLong(
+      symsan_ring_bytes(symsan_ring_load_head_acq(ring)));
+}
+
+// Free `nbytes` the consumer has copied out: advance tail atomically, and
+// wake the producer if it was blocked for room, as driver/launcher/launch.c's
+// ring_take() does.  The consumer used to store tail with
+// struct.pack_into('<Q'), a byte at a time: the producer, reading tail to see
+// how much room it has (and setting WAITING on it with an RMW), could see a
+// torn value and overwrite records not yet read -- head ran more than a whole
+// ring ahead of tail on a long trace (v8's BoundedAddRemoveAndCopyFrom), and
+// the manager then read misaligned records (an unknown msg_type).  Nor did
+// it ever wake a blocked producer, which then sat out its futex timeout.
+// Usage: ring_advance_tail(addr, nbytes)
+static PyObject* RingAdvanceTail(PyObject *self, PyObject *args) {
+  unsigned long long addr = 0, nbytes = 0;
+  if (!PyArg_ParseTuple(args, "KK", &addr, &nbytes)) {
+    return NULL;
+  }
+  struct symsan_ring_hdr *ring = (struct symsan_ring_hdr *)(uintptr_t)addr;
+  uint64_t prev = symsan_ring_advance(&ring->tail, nbytes);
+  if (prev & SYMSAN_RING_WAITING) {
+    symsan_ring_disarm(&ring->tail);
+    syscall(SYS_futex, symsan_ring_futex_word(&ring->tail),
+            SYMSAN_FUTEX_WAKE, 1, NULL, NULL, 0);
+  }
   Py_RETURN_NONE;
 }
 
@@ -921,6 +962,8 @@ static PyMethodDef SymSanMethods[] = {
   {"ring_init", RingInit, METH_VARARGS, "initialize a symsan_ring_hdr at an already-mapped address"},
   {"ring_arm_head", RingArmHead, METH_VARARGS, "atomically set the WAITING bit on a ring's head cursor"},
   {"ring_disarm_head", RingDisarmHead, METH_VARARGS, "clear the WAITING bit on a ring's head cursor"},
+  {"ring_load_head", RingLoadHead, METH_VARARGS, "a ring's head byte count, as one acquire load"},
+  {"ring_advance_tail", RingAdvanceTail, METH_VARARGS, "advance a ring's tail atomically, waking a producer blocked for room"},
   {NULL, NULL, 0, NULL}  /* Sentinel */
 };
 
