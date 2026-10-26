@@ -4453,11 +4453,12 @@ void __dfsw___libc_free(void *ptr, dfsan_label ptr_label) {
 #endif // USE_UCSAN_CUSTOM
 
 static dfsan_label taint_getc(int fd, off_t offset, int ret) {
+  dfsan_label label = 0;
   if (ret != EOF && taint_get_file(fd)) {
-    dfsan_label label = label = dfsan_union(get_label_for(fd, offset), CONST_LABEL, ZExt, 32, 0, 0);
+    label = dfsan_union(get_label_for(fd, offset), CONST_LABEL, ZExt, 32, 0, 0);
     AOUT("%d label is readed by fgetc\n", label);
   }
-  return 0;
+  return label;  // was `return 0`: every fgetc/getc/getchar result came back untainted
 }
 
 #ifndef USE_UCSAN_CUSTOM
