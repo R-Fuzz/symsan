@@ -55,7 +55,8 @@ struct TraceConfig {
   /// argv for the child; argv[0] is conventionally the target path
   std::vector<std::string> args;
   /// per-run timeout in milliseconds passed to the first read of each event;
-  /// 0 means block indefinitely
+  /// 0 means block indefinitely.  It bounds the whole trace: each read waits
+  /// only for what is left of it, and the target is killed when it runs out.
   unsigned timeout_ms = 0;
   bool debug = false;
   bool bounds_check = false;
@@ -83,7 +84,8 @@ struct TraceConfig {
 enum trace_result_t {
   /// the target ran to completion and the event pipe reached EOF
   TRACE_OK = 0,
-  /// the deadloop guard fired; the target has been terminated
+  /// the deadloop guard fired, or the trace ran past timeout_ms; the target
+  /// has been terminated
   TRACE_TIMEOUT,
   /// the target could not be launched
   TRACE_LAUNCH_ERROR,
