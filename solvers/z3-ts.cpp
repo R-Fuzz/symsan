@@ -3402,6 +3402,69 @@ void Z3AstParser::register_string_range(uint32_t input, uint32_t start,
   }
 }
 
+// The target (task[0]) with as much of the path (the nested constraints) as
+// holds with it, for a task whose nested constraints are unsat.  The optimistic
+// model is the target's alone, so z3's defaults (0) replace every input the
+// target reads and the path the input took with them: v8's BitVector CopyFrom
+// asks DCHECK_EQ(v.len, w.len) on a path with v.len > 64 and w.len <= 64, and
+// got v.len = w.len = 0, never both > 64 (the copy constructor's heap path).
+// So the conflicting constraint latest on the path is dropped until the rest
+// holds: the unsat core's member of the highest AST id, as the deps are kept
+// unordered and an id is given when the constraint is made.  At most `rounds`
+// checks; false (m unchanged) if none holds.
+// The rounds relax_nested may spend: SYMSAN_RELAX_ROUNDS, 8 by default (0 turns
+// it off and keeps the target's model alone).
+static unsigned relax_rounds() {
+  static int n = -1;
+  if (n < 0) {
+    const char *e = getenv("SYMSAN_RELAX_ROUNDS");
+    n = e ? atoi(e) : 8;
+  }
+  return n;
+}
+
+static bool relax_nested(z3::solver &solver, z3_task_t *task, unsigned rounds,
+                         z3::model &m) {
+  z3::context &ctx = solver.ctx();
+  std::vector<z3::expr> guards;
+  std::unordered_map<unsigned, size_t> guard_of;  // guard's id -> task index
+  solver.push();
+  solver.add(task->at(0));
+  for (size_t i = 1; i < task->size(); i++) {
+    z3::expr g = ctx.bool_const(("nested!" + std::to_string(i)).c_str());
+    solver.add(z3::implies(g, task->at(i)));
+    guard_of.emplace(g.id(), i);
+    guards.push_back(g);
+  }
+  bool found = false;
+  for (unsigned r = 0; r < rounds && !guards.empty(); r++) {
+    z3::expr_vector assumptions(ctx);
+    for (auto &g : guards) assumptions.push_back(g);
+    z3::check_result res = solver.check(assumptions);
+    if (res == z3::sat) {
+      m = solver.get_model();
+      found = true;
+      break;
+    }
+    if (res != z3::unsat) break;
+    z3::expr_vector core = solver.unsat_core();
+    if (core.empty()) break;
+    unsigned drop = 0, latest = 0;
+    for (unsigned k = 0; k < core.size(); k++) {
+      auto it = guard_of.find(core[k].id());
+      if (it == guard_of.end()) continue;
+      unsigned id = task->at(it->second).id();
+      if (!drop || id > latest) { drop = core[k].id(); latest = id; }
+    }
+    if (!drop) break;
+    guards.erase(std::remove_if(guards.begin(), guards.end(),
+                                [&](const z3::expr &g) { return g.id() == drop; }),
+                 guards.end());
+  }
+  solver.pop();
+  return found;
+}
+
 Z3ParserSolver::solving_status
 Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solutions) {
   solving_status ret = unknown_error;
@@ -3479,6 +3542,10 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
         }
         // pop nested constraints so solver is clean for optimization below
         solver.pop();
+        // nested unsat: not the target's model alone, but the target with the
+        // path it does not conflict with
+        if (ret == opt_sat_nested_unsat)
+          relax_nested(solver, task.get(), relax_rounds(), m);
       } else {
         ret = nested_sat; // XXX: upgrade to nested_sat?
       }
