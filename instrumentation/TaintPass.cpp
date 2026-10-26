@@ -2878,6 +2878,14 @@ Value *TaintFunction::getShadowForTLSArgument(Argument *A) {
     if (ArgOffset + Size > ArgTLSSize)
       break; // ArgTLS overflows, uses a zero shadow.
 
+    // A byval parameter points to this function's own copy, made by the
+    // call, not to the caller's object: the caller's label is the bounds of
+    // its own object, so a field read through the copy was checked against
+    // them (an OOB on an in-bounds access, v8's ForRange closures).  The copy
+    // is a real object on this frame, as UCSanPass's shadow for it says.
+    if (FArg.hasByValAttr())
+      break;
+
     Instruction *ArgTLSPos = &*F->getEntryBlock().begin();
     IRBuilder<> IRB(ArgTLSPos);
     Value *ArgShadowPtr = getArgTLS(FArg.getType(), ArgOffset, IRB);

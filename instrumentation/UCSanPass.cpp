@@ -428,6 +428,9 @@ class UCSan {
   ConstantInt *ShadowPtrMul;
   Constant *ArgTLS;
   Constant *RetvalTLS;
+  // __ucsan_byval_src: each byval argument's source, by argument number
+  Constant *ByvalSrcTLS;
+  static const unsigned kByvalSrcSlots = 8;
 
   // Runtime function types
   FunctionType *UCCheckPointerFnTy;
@@ -442,6 +445,7 @@ class UCSan {
   FunctionType *UCResignShadowFnTy;
   FunctionType *UCWrapRetvalFnTy;
   FunctionType *UCSetLabelFnTy;
+  FunctionType *UCByvalCopyFnTy;
   FunctionType *UCTraceBBFnTy;
   FunctionType *UCTraceAllocaFnTy;
   FunctionType *UCTraceGlobalFnTy;
@@ -470,6 +474,7 @@ class UCSan {
   FunctionCallee UCResignShadowFn;
   FunctionCallee UCWrapRetvalFn;
   FunctionCallee UCSetLabelFn;
+  FunctionCallee UCByvalCopyFn;
   FunctionCallee UCTraceBBFn;
   FunctionCallee UCTraceAllocaFn;
   FunctionCallee UCTraceGlobalFn;
@@ -952,6 +957,16 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCSetLabelFn = M.getOrInsertFunction("ucsan_set_label", UCSetLabelFnTy);
   F = dyn_cast<Function>(UCSetLabelFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+
+  // void ucsan_byval_copy(void*, i64, i32)
+  UCByvalCopyFnTy = FunctionType::get(
+    Type::getVoidTy(*Ctx),
+    {VoidPtrTy, Int64Ty, Int32Ty},
+    false);
+  UCByvalCopyFn = M.getOrInsertFunction("ucsan_byval_copy", UCByvalCopyFnTy);
+  F = dyn_cast<Function>(UCByvalCopyFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -6723,6 +6738,51 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
     CB.setArgOperand(I, UF.checkPointer(Arg, Size, true, IRB));
   }
 
+  // The callee's ucsan_byval_copy gives each byval copy its source's shadow:
+  // the source goes in __ucsan_byval_src[I] just before the call, and is
+  // cleared after it, so a callee that does not take it (one that is not
+  // instrumented, through an indirect call) leaves none for the next call.
+  if (!F || !F->isDeclaration()) {
+    bool Stored = false;
+    for (unsigned I = 0, N = std::min<unsigned>(CB.arg_size(),
+                                                UCSan::kByvalSrcSlots);
+         I != N; ++I) {
+      if (!CB.isByValArgument(I))
+        continue;
+      Type *Ty = CB.getParamByValType(I);
+      if (!Ty || !Ty->isSized())
+        continue;
+      IRBuilder<> IRB(&CB);
+      Value *Slot = IRB.CreateConstGEP2_32(
+          ArrayType::get(UF.UC.VoidPtrTy, UCSan::kByvalSrcSlots), UF.UC.ByvalSrcTLS, 0, I);
+      UF.UC.markNosanitize(IRB.CreateStore(CB.getArgOperand(I), Slot));
+      Stored = true;
+    }
+    if (Stored) {
+      Instruction *After = nullptr;
+      if (auto *II = dyn_cast<InvokeInst>(&CB))
+        After = &*II->getNormalDest()->getFirstInsertionPt();
+      else if (!isa<CallBrInst>(CB))
+        After = CB.getNextNode();
+      if (After) {
+        IRBuilder<> IRB(After);
+        for (unsigned I = 0, N = std::min<unsigned>(CB.arg_size(),
+                                                    UCSan::kByvalSrcSlots);
+             I != N; ++I) {
+          if (!CB.isByValArgument(I))
+            continue;
+          Type *Ty = CB.getParamByValType(I);
+          if (!Ty || !Ty->isSized())
+            continue;
+          Value *Slot = IRB.CreateConstGEP2_32(
+              ArrayType::get(UF.UC.VoidPtrTy, UCSan::kByvalSrcSlots), UF.UC.ByvalSrcTLS, 0, I);
+          UF.UC.markNosanitize(IRB.CreateStore(
+              Constant::getNullValue(UF.UC.VoidPtrTy), Slot));
+        }
+      }
+    }
+  }
+
   // Callee may call ucsan_resign_shadow which changes pointer state;
   // invalidate all cached check_pointer results so subsequent accesses
   // go through ucsan_check_pointer again for lazy re-initialization.
@@ -7767,6 +7827,13 @@ bool UCSan::runImpl(Module &M) {
     G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
   }
 
+  Type *ByvalSrcTLSTy = ArrayType::get(VoidPtrTy, kByvalSrcSlots);
+  ByvalSrcTLS = Mod->getOrInsertGlobal("__ucsan_byval_src", ByvalSrcTLSTy);
+  if (GlobalVariable *G = dyn_cast<GlobalVariable>(ByvalSrcTLS)) {
+    Changed |= G->getThreadLocalMode() != GlobalVariable::InitialExecTLSModel;
+    G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
+  }
+
   Type *RetvalTLSTy = ArrayType::get(Int64Ty, kRetvalTLSSize / 8);
   RetvalTLS = Mod->getOrInsertGlobal("__ucsan_retval_tls", RetvalTLSTy);
   if (GlobalVariable *G = dyn_cast<GlobalVariable>(RetvalTLS)) {
@@ -8062,15 +8129,18 @@ bool UCSan::runImpl(Module &M) {
     // A byval parameter's memory is the copy the call made, on this frame's
     // stack, where the shadow is whatever an earlier frame left: the copy's
     // values are concrete here (the call copied the bytes, not their labels).
+    // So ucsan_byval_copy gives it the shadow of the caller's object, which an
+    // instrumented caller left in __ucsan_byval_src; without one it is
+    // cleared, as it always was (a pseudo-pointer the object held was lost).
     for (Argument &A : F->args()) {
       if (!A.hasByValAttr() || !A.getParamByValType()->isSized())
         continue;
       Value *Len = ConstantInt::get(
           Int64Ty, Mod->getDataLayout().getTypeAllocSize(A.getParamByValType()));
-      CallInst *Clear = EntryIRB.CreateCall(
-          UCSetLabelFn, {ConstantInt::get(PrimitiveShadowTy, 0),
-                         EntryIRB.CreatePointerCast(&A, VoidPtrTy), Len});
-      markNosanitize(Clear);
+      CallInst *Copy = EntryIRB.CreateCall(
+          UCByvalCopyFn, {EntryIRB.CreatePointerCast(&A, VoidPtrTy), Len,
+                          ConstantInt::get(Int32Ty, A.getArgNo())});
+      markNosanitize(Copy);
     }
 
     // UCSanVisitor may create new basic blocks, which confuses df_iterator.

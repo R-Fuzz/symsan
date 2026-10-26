@@ -193,6 +193,13 @@ SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL ucsan_label
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint8_t
     __ucsan_wrapped_return_tls[UCSAN_TLS_SIZE];
 
+// The object each byval argument is copied from, by argument number (the
+// first kUCSanByvalSlots), stored by an instrumented caller just before the
+// call and taken by the callee's ucsan_byval_copy.
+static const unsigned kUCSanByvalSlots = 8;
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL void
+    *__ucsan_byval_src[kUCSanByvalSlots];
+
 void* __ucsan_null_deref_flag = nullptr;
 
 }  // extern "C"
@@ -1826,6 +1833,33 @@ void ucsan_set_label(ucsan_label label, void *addr, uint64_t size) {
   for (uint64_t i = 0; i < size; ++i) {
     shadow[i] = label;
   }
+}
+
+// A byval parameter's memory is the copy the call made, on the callee's
+// frame: the call copied the bytes, not their labels, and that shadow is
+// whatever an earlier frame left.  So the callee's prologue gives the copy its
+// source's shadow, as a memcpy would (the source is the caller's, from
+// __ucsan_byval_src).  Clearing it instead, as this used to, lost what the
+// object held: a closure's captured pointer, a pseudo-pointer, read back as an
+// address of 0's label and faulted (NULL_DEREF on v8's BitVector::ForRange).
+// Without a source (an uninstrumented caller) the copy is concrete.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void ucsan_byval_copy(void *copy, uint64_t size, uint32_t argno) {
+  void *src = nullptr;
+  if (argno < kUCSanByvalSlots) {
+    src = __ucsan_byval_src[argno];
+    __ucsan_byval_src[argno] = nullptr;
+  }
+  UCSAN_OUT("ucsan_byval_copy: copy=%p, src=%p, size=%lu, arg=%u\n", copy, src,
+            size, argno);
+  if (!src) {
+    ucsan_set_label(0, copy, size);
+    return;
+  }
+  ucsan_materialize_range(src, size);
+  internal_memcpy((void *)ucsan_shadow_for(copy), (const void *)ucsan_shadow_for(src),
+                  size * sizeof(ucsan_label));
+  __taint_copy_shadow(copy, src, size);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE

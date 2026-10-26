@@ -1,0 +1,4 @@
+entry: "entry(int*)"
+scope:
+  - "use(Big)"
+  - "exit"
