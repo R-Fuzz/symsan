@@ -91,6 +91,21 @@ static inline uint32_t xxhash(uint32_t h1, uint32_t h2, uint32_t h3) {
   return h32;
 }
 
+// Set by timeout_handler: the seed ran past seed_timeout.  The exit waits for
+// one of the hooks below, which the program enters between the runtime's
+// records, never inside one.  Exiting in the handler itself could land between
+// the two halves of a record the runtime emits in two writes (a global's
+// header, then its bytes), and the manager then read the next record as the
+// missing half (an unknown msg_type).
+static volatile sig_atomic_t __seed_timed_out = 0;
+
+static inline void check_seed_timeout() {
+  if (__seed_timed_out) {
+    AOUT("Seed timed out after %d s\n", flags().seed_timeout);
+    internal__exit(exit_reason::REASON_TIMEOUT);
+  }
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_loop_push_stack() {
   __loop_depth_stack_current[__loop_depth_stack_top] = __current_loop_depth;
@@ -115,6 +130,7 @@ __taint_trace_loop_pop_stack() {
 // enforce __stack_threshold, then nest the loop-depth stack like before.
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_push_stack_frame(uint64_t func_guid) {
+  check_seed_timeout();
   uint64_t hash =
       xxhash(func_guid & 0xFFFFFFFFu, (func_guid >> 32) & 0xFFFFFFFFu, 0) %
       STACK_FRAME_COUNTER_SIZE;
@@ -164,6 +180,7 @@ __taint_pop_stack_frame(uint64_t func_guid) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_loop(uint32_t bid, int depth) {
+  check_seed_timeout();
   void *addr = __builtin_return_address(0);
 
   if (ucsan_flags().disable_loop_bounds) {
@@ -269,6 +286,7 @@ __taint_trace_event_addr(dfsan_label label, uint32_t event_id, uint64_t info,
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_bb(uint32_t function_index, uint32_t bb_index) {
+  check_seed_timeout();
   AOUT("bb: %u %llu\n", function_index, bb_index);
 
   if (__pipe_fd < 0)
@@ -353,8 +371,17 @@ static void trap_handler(int sig, siginfo_t *si, void *unused)
 // BitVector zeroing 2^25 words), and the fork server waited on it for the
 // whole budget.  seed_timeout ends it as REASON_TIMEOUT, as a fuzzer's
 // per-input timeout does; the next seed goes on.
+//
+// The handler only marks the seed (check_seed_timeout exits at the next hook).
+// A seed that reaches no hook -- blocked in a syscall, or in one long runtime
+// call -- gets a second alarm a second later, and that one exits here: nothing
+// is mid-record while the program sits in a syscall.
 static void timeout_handler(int sig) {
-  AOUT("Seed timed out after %d s\n", flags().seed_timeout);
+  if (!__seed_timed_out) {
+    __seed_timed_out = 1;
+    alarm(1);
+    return;
+  }
   internal__exit(exit_reason::REASON_TIMEOUT);
 }
 
