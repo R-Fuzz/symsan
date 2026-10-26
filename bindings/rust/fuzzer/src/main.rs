@@ -169,8 +169,8 @@ fn map_size() -> usize {
 ///
 /// Returns `(persistent, deferred)`.
 fn afl_target_modes(program: impl AsRef<Path>) -> (bool, bool) {
-    const PERSIST_SIG: &[u8] = b"##SIG_AFL_PERSISTENT##";
-    const DEFER_SIG: &[u8] = b"##SIG_AFL_DEFER_FORKSRV##";
+    const PERSIST_SIG: &[u8] = b"##SIG_AFL_PERSISTENT##\0"; // NUL included, as afl-fuzz does (strlen+1)
+    const DEFER_SIG: &[u8] = b"##SIG_AFL_DEFER_FORKSRV##\0";
 
     let program = program.as_ref();
     let contains = |data: &[u8], sig: &[u8]| data.windows(sig.len()).any(|w| w == sig);
