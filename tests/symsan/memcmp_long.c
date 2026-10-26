@@ -15,7 +15,7 @@
 //
 // RUN: rm -rf %t.out
 // RUN: mkdir -p %t.out
-// RUN: python3 -c 'print("A"*96)' > %t.bin
+// RUN: python3 -c 'print("A"*300)' > %t.bin
 // RUN: clang -o %t.uninstrumented %s
 // RUN: %t.uninstrumented %t.bin 64 | FileCheck --check-prefix=CHECK-ORIG %s
 
@@ -35,6 +35,20 @@
 // RUN: env KO_USE_FASTGEN=1 %ko-clang -DN=96 -o %t.fg96 %s
 // RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg96 %t.bin
 // RUN: %t.uninstrumented %t.out/id-0-0-0 96 | FileCheck --check-prefix=CHECK-GEN %s
+
+// 256 bytes and past it.  The parser rebuilds the concrete side of the memcmp
+// byte by byte, and its loop counter was a uint8_t: i < 256 never fails, so a
+// 256-byte compare never finished parsing -- z3 concatenated terms until the
+// fuzzer ran out of memory (a 256-byte std::equal in v8's BitVector).
+// RUN: rm -rf %t.out && mkdir -p %t.out
+// RUN: env KO_USE_FASTGEN=1 %ko-clang -DN=256 -o %t.fg256 %s
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg256 %t.bin
+// RUN: %t.uninstrumented %t.out/id-0-0-0 256 | FileCheck --check-prefix=CHECK-GEN %s
+
+// RUN: rm -rf %t.out && mkdir -p %t.out
+// RUN: env KO_USE_FASTGEN=1 %ko-clang -DN=300 -o %t.fg300 %s
+// RUN: env TAINT_OPTIONS="taint_file=%t.bin output_dir=%t.out" %fgtest %t.fg300 %t.bin
+// RUN: %t.uninstrumented %t.out/id-0-0-0 300 | FileCheck --check-prefix=CHECK-GEN %s
 
 // The z3 arm, which builds the same record through a different backend.
 // RUN: rm -rf %t.out && mkdir -p %t.out
@@ -64,7 +78,7 @@ int main(int argc, char **argv) {
   size_t n = N;
   if (argc > 2) n = (size_t)atoi(argv[2]);
 
-  char buf[96];
+  char buf[300];
   FILE *fp = chk_fopen(argv[1], "rb");
   chk_fread(buf, 1, sizeof(buf), fp);
   fclose(fp);
@@ -72,9 +86,10 @@ int main(int argc, char **argv) {
   // 96 distinct nonzero bytes.  Nonzero because a zero needle is satisfied by
   // a short read, and distinct so that no prefix of the answer can stand in
   // for the rest of it.
-  char needle[96];
+  // (300 now, for the 256-byte arms: distinct within each 255-byte run.)
+  char needle[300];
   for (size_t i = 0; i < sizeof(needle); i++)
-    needle[i] = (char)(i + 1);
+    needle[i] = (char)(i % 255 + 1);
 
   if (memcmp(buf, needle, n) == 0) {
     // CHECK-GEN: Good

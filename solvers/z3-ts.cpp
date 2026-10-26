@@ -406,7 +406,7 @@ z3::expr Z3AstParser::read_concrete(dfsan_label label, uint16_t size) {
   }
 
   z3::expr val = context_.bv_val(itr->second[0], 8);
-  for (uint8_t i = 1; i < size; i++) {
+  for (uint16_t i = 1; i < size; i++) {
     val = z3::concat(context_.bv_val(itr->second[i], 8), val);
   }
   return val;
