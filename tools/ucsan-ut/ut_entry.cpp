@@ -33,6 +33,7 @@
 //          arguments or parameters), as cg_scope.py matches
 //   prints the __ucsan_ut_assume.N names it declared, one per fatal reporter
 //   (each to be mapped to ucsan_invalid_input)
+// ut-entry --bare < NAMES: the bare-name rule alone, for testing it
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/InstIterator.h"
@@ -46,6 +47,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <set>
 #include <string>
@@ -56,24 +58,113 @@ using namespace llvm;
 static std::vector<std::string> FatalPrefixes, HelperPrefixes;
 static std::set<std::string> FatalNames;
 
-// as cg_scope.py: "R ns::C<T>::f<U>(int) const" -> "ns::C::f"
+static bool endsWith(const std::string &S, const std::string &X) {
+  return S.size() >= X.size() && S.compare(S.size() - X.size(), X.size(), X) == 0;
+}
+
+// as the scripts' ut_names.py: "R ns::C<T>::f<U>(int) const" -> "ns::C::f".
+// The name is found from the end: the parameter list is the last top-level
+// "(...)" (before cv/ref qualifiers and a requires-clause), and the name is the
+// last top-level word before it, or "operator T" for a conversion operator.
 static std::string bare(std::string D) {
   for (const char *P : {"virtual thunk to ", "non-virtual thunk to "})
     if (D.rfind(P, 0) == 0) D = D.substr(strlen(P));
   for (size_t I; (I = D.find("(anonymous namespace)::")) != std::string::npos;)
     D.erase(I, strlen("(anonymous namespace)::"));
-  std::string Out;
+  // a clone's suffix, " (.ut_entry)"; an allow entry's "NAME("
+  if (endsWith(D, ")")) {
+    size_t I = D.rfind(" (.");
+    if (I != std::string::npos && D.find_first_of("()", I + 2) == D.size() - 1)
+      D.resize(I);
+  }
+  if (endsWith(D, "(")) D.pop_back();
+  // operator names that hold a bracket are kept whole while brackets count
+  std::vector<std::string> Ops;
+  static const char *OpNames[] = {"<<=", ">>=", "<=>", "<<", ">>", "<=", ">=",
+                                  "->*", "->",  "<",   ">",  "()", "[]"};
+  std::string P;
+  for (size_t I = 0; I < D.size();) {
+    if (D.compare(I, 8, "operator") == 0) {
+      bool Hit = false;
+      for (const char *O : OpNames)
+        if (D.compare(I + 8, strlen(O), O) == 0) {
+          P += "operator\x01" + std::to_string(Ops.size()) + "\x01";
+          Ops.push_back(O);   // the placeholder keeps "operator"
+          I += 8 + strlen(O);
+          Hit = true;
+          break;
+        }
+      if (Hit) continue;
+    }
+    P += D[I++];
+  }
+  D = P;
+  for (size_t I; (I = D.find("[abi:")) != std::string::npos;)
+    D.erase(I, D.find(']', I) - I + 1);
   int Depth = 0;
-  for (char C : D) {
+  for (size_t I = 0; I < D.size(); ++I) {
+    char C = D[I];
+    if (C == '(' || C == '<') ++Depth;
+    else if (C == ')' || C == '>') --Depth;
+    else if (Depth == 0 && D.compare(I, 10, " requires ") == 0) { D.resize(I); break; }
+  }
+  std::string S = D;
+  while (!S.empty() && S.back() == ' ') S.pop_back();
+  for (bool More = true; More;) {
+    More = false;
+    for (const char *Q : {" const", " volatile", " &&", " &", " noexcept"})
+      if (endsWith(S, Q)) {
+        S.resize(S.size() - strlen(Q));
+        More = true;
+        break;
+      }
+  }
+  if (endsWith(S, ")")) {
+    int D2 = 0;
+    for (size_t J = S.size(); J-- > 0;) {
+      if (S[J] == ')') ++D2;
+      else if (S[J] == '(' && --D2 == 0) { S.resize(J); break; }
+    }
+  }
+  std::string T;
+  Depth = 0;
+  for (char C : S) {
     if (C == '<') { ++Depth; continue; }
     if (C == '>') { Depth = Depth > 0 ? Depth - 1 : 0; continue; }
-    if (Depth == 0) Out += C;
+    if (Depth == 0) T += C;
   }
-  size_t I = Out.find('(');
-  if (I != std::string::npos && I > 0) Out.resize(I);
-  I = Out.rfind(' ');
-  if (I != std::string::npos) Out = Out.substr(I + 1);
-  return Out;
+  std::vector<std::string> Words;
+  std::string Cur;
+  Depth = 0;
+  for (char C : T) {
+    if (C == '(') ++Depth;
+    else if (C == ')') --Depth;
+    if (C == ' ' && Depth == 0) {
+      if (!Cur.empty()) Words.push_back(Cur);
+      Cur.clear();
+    } else {
+      Cur += C;
+    }
+  }
+  if (!Cur.empty()) Words.push_back(Cur);
+  std::string Name = Words.empty() ? T : Words.back();
+  for (size_t I = 0; I < Words.size(); ++I)
+    if (Words[I] == "operator" || endsWith(Words[I], "::operator")) {
+      Name = Words[I];
+      for (size_t K = I + 1; K < Words.size(); ++K) Name += " " + Words[K];
+      break;
+    }
+  std::string R;
+  for (size_t I = 0; I < Name.size();) {
+    if (Name[I] == '\x01') {
+      size_t E = Name.find('\x01', I + 1);
+      R += Ops[std::stoul(Name.substr(I + 1, E - I - 1))];
+      I = E + 1;
+    } else {
+      R += Name[I++];
+    }
+  }
+  return R;
 }
 
 static std::string bareOf(const Function &F) {
@@ -174,6 +265,11 @@ struct Specializer {
 };
 
 int main(int argc, char **argv) {
+  // the bare-name rule alone, one demangled name per line (to test it)
+  if (argc == 2 && std::string(argv[1]) == "--bare") {
+    for (std::string L; std::getline(std::cin, L);) outs() << bare(L) << "\n";
+    return 0;
+  }
   if (argc < 4) {
     errs() << "usage: ut-entry IN.bc OUT.bc ALLOW [--fatal M]... "
               "[--fatal-prefix N]... [--helper-prefix N]...\n";

@@ -105,6 +105,14 @@ def main():
     ap.add_argument("--workdir", default=".")
     ap.add_argument("--budget", type=float, default=60.0)
     ap.add_argument("--loop-threshold", type=int, default=5)
+    ap.add_argument("--seed-timeout", type=int, default=0,
+                    help="seconds one seed may run (TAINT_OPTIONS seed_timeout; "
+                         "exit 121); 0: no limit")
+    ap.add_argument("--blocks-out", default="",
+                    help="write the (function index, bb id) pairs executed")
+    ap.add_argument("--ucsan-option", action="append", default=[],
+                    metavar="NAME=VALUE",
+                    help="extra UCSAN_OPTIONS flag (e.g. concrete_globals=1)")
     args = ap.parse_args()
 
     # Resolve before the chdir.  It must also exist: the manager forks and then
@@ -150,8 +158,13 @@ def main():
     # checker_nullderef: a NULL the program itself dereferences is reported
     # (a finding, EVENT_NULL_DEREF), not left to fault, so what is left as a
     # SIGSEGV is a UCSan/SymSan failure and not a NULL the kernel code returned
+    if args.seed_timeout:
+        env["seed_timeout"] = str(args.seed_timeout)
     env["ucsan_options"] = {"checker_nullderef": "1", "checker_ubi": "1",
                             "trace_bounds": "1", "no_enlarge": "1"}
+    for opt in args.ucsan_option:
+        k, _, v = opt.partition("=")
+        env["ucsan_options"][k] = v
 
     m = None
     try:
@@ -179,6 +192,10 @@ def main():
             tm = getattr(m, "_termination_manager", None)
             result["blocks"] = len(getattr(tm, "blocks", ()))
             result["directions"] = len(getattr(tm, "directions", ()))
+            if args.blocks_out:
+                with open(args.blocks_out, "w") as f:
+                    for fi, bb in sorted(getattr(tm, "blocks", ())):
+                        f.write("%d %d\n" % (fi, bb))
         result["proc_died"] = cap.proc_died
         result["errors"] = cap.errors
         result["target_tail"] = cap.tail.decode(errors="replace")
