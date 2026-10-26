@@ -405,6 +405,10 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   }
   // clear O_CLOEXEC flag
   fcntl(g_config.shm_fd, F_SETFD, fcntl(g_config.shm_fd, F_GETFD) & ~FD_CLOEXEC);
+  // children receive the table by fd (shm_fd= in SYMSAN_ENV), so the name is not
+  // needed past this point: unlink it now, or a SIGTERM/SIGKILL'd driver leaks the
+  // whole union table in /dev/shm until tmpfs fills up (SIGBUS / ENOMEM later)
+  shm_unlink(g_config.shm_name);
   // mmap the shm
   g_config.label_info = mmap(NULL, uniontable_size, PROT_READ, MAP_SHARED,
       g_config.shm_fd, 0);
