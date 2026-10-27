@@ -1347,6 +1347,32 @@ static Type *getUnderlyingObjectType(Value *Ptr) {
   return nullptr;
 }
 
+// The bytes from Ptr to the end of the alloca/global it points into, for
+// checking a pointer argument: getUnderlyingObjectType's whole object only
+// when Ptr is its start.  An interior pointer (&temp.array[i], a union
+// member, a base subobject) checked with the whole object's size overran it
+// by its offset, a false OOB (v8's SmallMap::ConvertToRealMap passing
+// temp.array[i] to unordered_map::insert); a variable offset checks nothing
+// (0).  ObjTy is the object's type when Ptr is its start, else null.
+static uint64_t getUnderlyingObjectSizeFrom(Value *Ptr, const DataLayout &DL,
+                                            Type *&ObjTy) {
+  ObjTy = nullptr;
+  Type *T = getUnderlyingObjectType(Ptr);
+  if (!T || !T->isSized())
+    return 0;
+  APInt Off(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+  Value *Base = Ptr->stripAndAccumulateConstantOffsets(
+      DL, Off, /*AllowNonInbounds=*/true);
+  if (Base != getUnderlyingObject(Ptr))
+    return 0;
+  uint64_t Size = DL.getTypeAllocSize(T);
+  if (Off.isNegative() || Off.getZExtValue() >= Size)
+    return 0;
+  if (Off.isZero())
+    ObjTy = T;
+  return Size - Off.getZExtValue();
+}
+
 uint32_t UCSan::getOrCreatePointerTypeID(Type *PointeeTy) {
   std::string Key = "ptr->" + getTypeKey(PointeeTy);
   auto It = TypeIDMap.find(Key);
@@ -6474,13 +6500,11 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
         } else {
           // Opaque pointers carry no pointee type on (*I) itself; trace back
           // to its underlying allocation instead.
-          Type *PointeeTy = getUnderlyingObjectType(*I);
-          if (PointeeTy && PointeeTy->isSized()) {
-            sizeArg = ConstantInt::get(UF.UC.Int64Ty, DL.getTypeAllocSize(PointeeTy));
+          Type *PointeeTy;
+          sizeArg = ConstantInt::get(
+              UF.UC.Int64Ty, getUnderlyingObjectSizeFrom(*I, DL, PointeeTy));
+          if (PointeeTy)
             TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
-          } else {
-            sizeArg = ConstantInt::get(UF.UC.Int64Ty, 0);
-          }
         }
 
         // Capture shadow before checkPointer resolves the pointer
@@ -6633,13 +6657,11 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
         // Opaque pointers carry no pointee type on T itself; trace back
         // to the underlying allocation instead.
         auto DL = getDataLayout();
-        Type *PointeeTy = getUnderlyingObjectType(*I);
+        Type *PointeeTy;
         uint32_t TypeID = 0;
-        uint64_t PointeeSize = 0;
-        if (PointeeTy && PointeeTy->isSized()) {
-          PointeeSize = DL.getTypeAllocSize(PointeeTy);
+        uint64_t PointeeSize = getUnderlyingObjectSizeFrom(*I, DL, PointeeTy);
+        if (PointeeTy)
           TypeID = UF.UC.getOrCreateTypeID(PointeeTy);
-        }
         Value *sizeArg = ConstantInt::get(UF.UC.Int64Ty, PointeeSize);
         if (LenVal) {
           sizeArg = LenVal;
