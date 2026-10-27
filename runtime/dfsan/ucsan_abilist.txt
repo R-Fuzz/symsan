@@ -43,6 +43,9 @@ fun:__cxa_guard_acquire=custom
 fun:__cxa_guard_release=custom
 fun:__cxa_guard_abort=custom
 
+# libc++'s hash-table bucket count, from its library (ucsan_custom.cpp)
+fun:_ZNSt3__112__next_primeEm=custom
+
 # libc internal versions
 fun:__libc_calloc=custom
 fun:__libc_free=custom

@@ -6,6 +6,7 @@
 #include "ucsan_platform.h"
 #include "ucsan.h"
 
+#include <execinfo.h>
 #include <malloc.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -427,6 +428,24 @@ void __dfsw___cxa_guard_abort(uint64_t *guard, ucsan_label guard_label) {
   ((volatile uint8_t *)guard)[1] = 0;
   *(ucsan_shadow_for(guard) + 1) = 0;
   __taint_set_label(0, (uint8_t *)guard + 1, 1);
+}
+
+// std::__next_prime, libc++'s hash-table bucket count (the smallest prime
+// >= n), is in libc++'s library, not its headers: as a stub it returned a
+// symbolic count, and a seed with 0 left an unordered_map's bucket list null
+// for the insert that indexes it.  A bucket count is no input: computed
+// concretely, from n's concrete value.
+__attribute__((visibility("default")))
+size_t __dfsw__ZNSt3__112__next_primeEm(size_t n, ucsan_label n_label,
+                                        ucsan_label *ret_label) {
+  *ret_label = 0;
+  if (n <= 2) return 2;
+  for (n |= 1;; n += 2) {
+    bool prime = true;
+    for (size_t d = 3; d <= n / d; d += 2)
+      if (n % d == 0) { prime = false; break; }
+    if (prime) return n;
+  }
 }
 
 #define PAGE_SIZE 4096
@@ -854,6 +873,13 @@ __dfsw_panic(char *reason, ucsan_label reason_label) {
 SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
 __dfsw_abort(void) {
   UCSAN_OUT("ABORT\n");
+  // which check failed: a v8 DCHECK's reporter is mapped here, and the exit
+  // code alone does not say where (symbolize with llvm-symbolizer)
+  if (__ucsan::ucsan_debug) {
+    void *frames[16];
+    int n = backtrace(frames, 16);
+    for (int i = 1; i < n; i++) Printf("[UCSAN]   #%d %p\n", i, frames[i]);
+  }
   _exit(EVENT_PANIC);
 }
 
