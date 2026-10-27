@@ -1619,6 +1619,11 @@ void __taint_check_bounds(dfsan_label addr_label, uptr addr,
                           dfsan_label size_label, uint64_t size) {
   if (flags().trace_bounds) {
     void *retaddr = __builtin_return_address(0);
+    // a length of 0 touches nothing on this run, whatever its label: libc++
+    // relocates an empty vector with memcpy(dst, nullptr, 0), its begin()
+    // still null
+    if (size == 0)
+      return;
     if (addr == 0) {
       AOUT("WARNING: null ptr deref %p = %d @%p\n", (void*)addr, addr_label, retaddr);
       __taint_trace_memerr(addr_label, addr, size_label, size, F_MEMERR_NULL, retaddr);

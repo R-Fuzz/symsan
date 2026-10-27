@@ -737,8 +737,12 @@ struct UCSanFunction {
   bool reusableCheck(Instruction *Checked, Instruction *Pos);
   // Alignment: what the access assumes of the address (the IR's align),
   // which the runtime holds a UC object's real address to
+  // ExactSize: Size is the access's byte count (a memcpy's length), so a run
+  // where it is 0 dereferences nothing: memcpy(dst, nullptr, 0) is no null
+  // dereference.  (Elsewhere a size of 0 means unknown, as strlen's.)
   Value *checkPointer(Value *Ptr, Value *Size, bool dereference, IRBuilder<> &IRB,
-                      uint32_t TypeID = 0, MaybeAlign Alignment = std::nullopt);
+                      uint32_t TypeID = 0, MaybeAlign Alignment = std::nullopt,
+                      bool ExactSize = false);
   void checkGlobalDest(Value *Dest, Value *Length, IRBuilder<> &IRB);
   void recordPointerLoadSummary(LoadInst &LI);
   void recordMemoryAccessSummary(Value *Ptr, uint64_t AccessSize, bool IsWrite,
@@ -2617,7 +2621,7 @@ bool UCSanFunction::reusableCheck(Instruction *Checked, Instruction *Pos) {
 
 Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
                                     IRBuilder<> &IRB, uint32_t TypeID,
-                                    MaybeAlign Alignment) {
+                                    MaybeAlign Alignment, bool ExactSize) {
   Type *Ty = Ptr->getType();
   Value *SPtr = Ptr->stripPointerCasts();
   bool cacheable = isa<Constant>(Size);
@@ -2808,7 +2812,13 @@ Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
     if (ExtSize != Size) {
       UC.markNosanitize(ExtSize);
     }
-    ConstantInt *Deref = ConstantInt::get(UC.Int1Ty, dereference);
+    Value *Deref = ConstantInt::get(UC.Int1Ty, dereference);
+    if (ExactSize && !isa<Constant>(ExtSize)) {
+      // libc++ relocates an empty vector with memcpy(dst, begin(), 0), its
+      // begin() still null
+      Deref = IRB.CreateICmpNE(ExtSize, ConstantInt::get(UC.Int64Ty, 0));
+      UC.markNosanitize(Deref);
+    }
     ConstantInt *TypeIDVal = ConstantInt::get(UC.Int32Ty, TypeID);
     ConstantInt *AlignVal = ConstantInt::get(UC.Int32Ty,
                                              Alignment.valueOrOne().value());
@@ -3133,17 +3143,18 @@ void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
 
   // Check source and destination pointers
   Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
-                               I.getSourceAlign());
+                               I.getSourceAlign(), true);
   // check the destination pointer, if it's a global variable,
   // no need to call check pointer to symbolize, as it's the dest.
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
-    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign());
+    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign(), true);
     // the destination's check can move the object the source points into
     // (when it is the same one, see align_object in ucsan.cpp): the source
     // is checked again, with no alignment, which never moves anything
     if (I.getDestAlign().valueOrOne() > 1)
-      src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0);
+      src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
+                            std::nullopt, true);
   } else {
     UF.checkGlobalDest(dest, Length, IRB);
   }
@@ -3188,7 +3199,7 @@ void UCSanVisitor::visitMemSetInst(MemSetInst &I) {
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
     // Check destination pointer
-    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign());
+    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign(), true);
     I.setDest(dest);
   } else {
     UF.checkGlobalDest(dest, Length, IRB);
@@ -3211,17 +3222,18 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
 
   // Check source and destination pointers
   Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
-                               I.getSourceAlign());
+                               I.getSourceAlign(), true);
   // check the destination pointer, if it's a global variable,
   // no need to call check pointer to symbolize, as it's the dest.
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
-    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign());
+    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign(), true);
     // the destination's check can move the object the source points into
     // (when it is the same one, see align_object in ucsan.cpp): the source
     // is checked again, with no alignment, which never moves anything
     if (I.getDestAlign().valueOrOne() > 1)
-      src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0);
+      src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
+                            std::nullopt, true);
   } else {
     UF.checkGlobalDest(dest, Length, IRB);
   }
