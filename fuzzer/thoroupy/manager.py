@@ -108,6 +108,8 @@ class UcsanManager:
         # every event the target reported, by event id (PIPE_EVENT_TYPE),
         # whether or not a handler subscribes to it
         self.event_counts = {}
+        # and where: (event id, the reporting site's return address)
+        self.event_sites = {}
         self._report_to = decorator_report(report_to)
         self._last_label = 0
         self._last_result = 0
@@ -539,6 +541,8 @@ class UcsanManager:
                     logger.warning(f"Unknown MERRO flag: {msg.flags:#x}")
             case PIPE_MSG_TYPE.EVENT_TYPE:
                 self.event_counts[msg.context] = self.event_counts.get(msg.context, 0) + 1
+                site = (msg.context, msg.addr)
+                self.event_sites[site] = self.event_sites.get(site, 0) + 1
                 self._event_handlers.handle(msg)
             case PIPE_MSG_TYPE.ADD_CONSTRAINT_TYPE:
                 if msg.label != 0:

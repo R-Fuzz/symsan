@@ -7,7 +7,8 @@
 // is an API call; it is recorded with its owner, the outermost class enclosing
 // the callee (a nested Iterator belongs to its BitVector), or for a free
 // function the file that declares it.  gtest (::testing) and the standard
-// library are not APIs under test.
+// library are not APIs under test.  A class an API call returns by value is
+// kept as one of the test's values: its code runs in the API and in the test.
 //
 // Then, for each owner class, its shape: members with their access, nested
 // classes, friends (debug info has none of these: clang emits no
@@ -134,6 +135,10 @@ public:
     std::string File = fileOf(SM, Src->getLocation());
     if (isLibrary(F)) return;
     if (isTestFile(File)) {
+      // a class the test defines (an element type that counts its copies): all
+      // of it is the harness, its implicit destructor and operators included
+      if (const CXXRecordDecl *O = ownerOf(Src))
+        if (isTestFile(fileOf(SM, O->getLocation()))) TestRecords.insert(O);
       // test code is transparent: walk into its definition
       const FunctionDecl *Def = nullptr;
       if (F->hasBody(Def) && Seen.insert(Def).second && Seen.size() < 2000) {
@@ -147,6 +152,12 @@ public:
     if (F->isImplicit() && !isa<CXXConstructorDecl>(F) &&
         !isa<CXXDestructorDecl>(F) && !isa<CXXMethodDecl>(F))
       return;
+    // a class the API returns by value (VectorOf's Vector): its constructor
+    // runs inside the API, and the test goes on to use the value
+    if (const CXXRecordDecl *V = F->getReturnType()->getAsCXXRecordDecl())
+      if (!isLibrary(V))
+        if (const CXXRecordDecl *O = ownerOf(V))
+          if (!isTestFile(fileOf(SM, O->getLocation()))) Values.insert(qname(O));
     Call C;
     C.callee = qname(Src);
     C.kind = Kind;
@@ -180,6 +191,9 @@ public:
     if (auto *F = dyn_cast<FunctionDecl>(E->getDecl())) callee(F, "addr", E->getBeginLoc());
     return true;
   }
+
+  std::set<const CXXRecordDecl *> TestRecords;
+  std::set<std::string> Values;
 
 private:
   ASTContext &Ctx;
@@ -272,6 +286,18 @@ public:
           Bodies.push_back(M);
         return true;
       }
+      // the classes the test file defines (an element type, a counter): the
+      // harness, though the unit is what constructs them (resize() does)
+      std::vector<const CXXRecordDecl *> Records;
+      bool VisitCXXRecordDecl(CXXRecordDecl *R) {
+        if (R->isThisDeclarationADefinition() && !R->isLambda() &&
+            !isa<ClassTemplateSpecializationDecl>(R) &&
+            isa<NamespaceDecl, TranslationUnitDecl>(R->getDeclContext()) &&
+            SM->isInMainFile(SM->getExpansionLoc(R->getLocation())) &&
+            !derivesFromTestingTest(R))
+          Records.push_back(R);
+        return true;
+      }
     } TB;
     TB.SM = &SM;
     TB.TraverseDecl(Ctx.getTranslationUnitDecl());
@@ -304,6 +330,10 @@ public:
               Next = BR->getDefinition();
         R = Next;
       }
+      std::set<std::string> More;
+      for (const CXXRecordDecl *R : W.TestRecords) More.insert(qname(R));
+      for (const CXXRecordDecl *R : TB.Records) More.insert(qname(R));
+      for (const std::string &N : More) TestClasses.push_back(N);
       auto Emit = [](const std::set<Call> &S) {
         llvm::json::Array A;
         for (const Call &C : S)
@@ -317,6 +347,11 @@ public:
                            {"calls", Emit(Calls)}, {"fixture_calls", Emit(FixCalls)},
                            {"helpers", (int64_t)Seen.size() - 1},
                            {"test_classes", std::move(TestClasses)},
+                           {"values", [&] {
+                              llvm::json::Array A;
+                              for (const std::string &V : W.Values) A.push_back(V);
+                              return A;
+                            }()},
                            {"test_fns", [&] {
                               llvm::json::Array A;
                               for (const FunctionDecl *F : Seen)

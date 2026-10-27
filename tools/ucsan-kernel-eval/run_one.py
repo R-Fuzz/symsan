@@ -183,8 +183,13 @@ def main():
     finally:
         result["elapsed"] = round(time.time() - start, 2)
         if m is not None:
-            result["exit_counts"] = dict(collections.Counter(str(s) for s in m.exit_status))
+            # an internal exit (122, 123) is kept as its wait status, as
+            # run_policy.py reads it
+            result["exit_counts"] = dict(collections.Counter(
+                str(s >> 8 if s > 255 else s) for s in m.exit_status))
             result["events"] = {str(k): v for k, v in m.event_counts.items()}
+            result["event_sites"] = {"%d@%#x" % k: v for k, v in
+                                     sorted(getattr(m, "event_sites", {}).items())}
             result["seeds"] = getattr(m.scheduler, "_counter", 0)
             # coverage, what the run achieved (a seed count is not: see
             # TerminationManager): basic blocks executed and symbolic branch
