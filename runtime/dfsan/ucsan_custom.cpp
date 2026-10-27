@@ -385,6 +385,50 @@ CXX_DELETE3(_ZdaPvSt11align_val_tRKSt9nothrow_t)
 #undef CXX_DELETE2
 #undef CXX_DELETE3
 
+// The Itanium guard of a function-local static (`static T t;` in a function).
+// libc++abi's, so out of scope, and as stubs their return value was symbolic:
+// a seed where __cxa_guard_acquire returned 0 skipped the static's
+// constructor, and the program used it zero-initialized.  The run is one
+// thread, so the guard is its first byte: 0 until the constructor has run.
+// The byte release writes is the program's own state, so it is concrete.
+// The second byte is pending while the constructor runs, as in libc++abi's
+// InitByteNoThreads: an acquire that finds it set is the constructor reaching
+// its own static again, which libc++abi aborts on (recursive initialization).
+__attribute__((visibility("default")))
+int __dfsw___cxa_guard_acquire(uint64_t *guard, ucsan_label guard_label,
+                               ucsan_label *ret_label) {
+  volatile uint8_t *g = (volatile uint8_t *)guard;
+  *ret_label = 0;
+  if (g[0] != 0)
+    return 0;
+  if (g[1] != 0) {
+    UCSAN_OUT("__cxa_guard_acquire detected recursive initialization of %p\n",
+              guard);
+    _exit(EVENT_PANIC);
+  }
+  g[1] = 1;
+  return 1;
+}
+
+__attribute__((visibility("default")))
+void __dfsw___cxa_guard_release(uint64_t *guard, ucsan_label guard_label) {
+  volatile uint8_t *g = (volatile uint8_t *)guard;
+  g[0] = 1;
+  g[1] = 0;
+  ucsan_label *shadow = ucsan_shadow_for(guard);
+  shadow[0] = shadow[1] = 0;
+  __taint_set_label(0, guard, 2);
+}
+
+// the constructor threw: the static is not initialized, the next acquire
+// tries again
+__attribute__((visibility("default")))
+void __dfsw___cxa_guard_abort(uint64_t *guard, ucsan_label guard_label) {
+  ((volatile uint8_t *)guard)[1] = 0;
+  *(ucsan_shadow_for(guard) + 1) = 0;
+  __taint_set_label(0, (uint8_t *)guard + 1, 1);
+}
+
 #define PAGE_SIZE 4096
 
 __attribute__((visibility("default")))

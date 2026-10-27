@@ -156,7 +156,8 @@ def perform_test(stage, *args, seed=None):
     # Categorize ENV variables into UCSAN vs TAINT options
     # UCSAN flags (from ucsan_flags.inc)
     ucsan_flags = {'debug', 'trace_object', 'checker_nullderef', 'no_upcast',
-                   'trace_bounds', 'no_enlarge', 'max_obj_size', 'input_file'}
+                   'trace_bounds', 'no_enlarge', 'max_obj_size', 'input_file',
+                   'concrete_globals'}
     # Map old ucsan option names to KO_ compile env vars
     ucsan_to_ko = {'trace_bb': 'KO_TRACE_BB'}
 

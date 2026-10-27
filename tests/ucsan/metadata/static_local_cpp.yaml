@@ -1,0 +1,5 @@
+entry: "entry(int*)"
+scope:
+  - "reg()"
+  - "Registry::Registry()"
+  - "exit"

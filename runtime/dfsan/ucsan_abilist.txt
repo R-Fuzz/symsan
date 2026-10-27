@@ -34,6 +34,15 @@ fun:_ZdaPvmSt11align_val_t=custom
 fun:_ZdlPvSt11align_val_tRKSt9nothrow_t=custom
 fun:_ZdaPvSt11align_val_tRKSt9nothrow_t=custom
 
+# The Itanium guard of a function-local static (ucsan_custom.cpp).  As stubs
+# their return value was symbolic, and a seed where __cxa_guard_acquire
+# returned 0 skipped the static's constructor (tests/ucsan/test/static_local.cpp).
+# Not uninstrumented: a combined build's TaintPass then wants the instrumented
+# libc++abi's __cxa_guard_acquire.taint, which nothing links.
+fun:__cxa_guard_acquire=custom
+fun:__cxa_guard_release=custom
+fun:__cxa_guard_abort=custom
+
 # libc internal versions
 fun:__libc_calloc=custom
 fun:__libc_free=custom
