@@ -3151,6 +3151,10 @@ static int format_buffer(char *str, size_t size, const char *fmt,
           }
           //dfsan_set_label(*va_labels++, formatter.str_cur(),
           //                formatter.num_written_bytes(retval));
+          // (concrete, then: not the label the buffer had, which for a
+          // fresh stack buffer is kInitializingLabel)
+          dfsan_set_label(0, formatter.str_cur(),
+                          formatter.num_written_bytes(retval));
           end_fmt = true;
           break;
 
@@ -3169,6 +3173,10 @@ static int format_buffer(char *str, size_t size, const char *fmt,
           }
           //dfsan_set_label(*va_labels++, formatter.str_cur(),
           //                formatter.num_written_bytes(retval));
+          // (concrete, then: not the label the buffer had, which for a
+          // fresh stack buffer is kInitializingLabel)
+          dfsan_set_label(0, formatter.str_cur(),
+                          formatter.num_written_bytes(retval));
           end_fmt = true;
           break;
 
@@ -3176,6 +3184,10 @@ static int format_buffer(char *str, size_t size, const char *fmt,
           retval = formatter.format(va_arg(ap, int));
           //dfsan_set_label(*va_labels++, formatter.str_cur(),
           //                formatter.num_written_bytes(retval));
+          // (concrete, then: not the label the buffer had, which for a
+          // fresh stack buffer is kInitializingLabel)
+          dfsan_set_label(0, formatter.str_cur(),
+                          formatter.num_written_bytes(retval));
           end_fmt = true;
           break;
 
@@ -3194,6 +3206,10 @@ static int format_buffer(char *str, size_t size, const char *fmt,
           retval = formatter.format(va_arg(ap, void *));
           //dfsan_set_label(*va_labels++, formatter.str_cur(),
           //                formatter.num_written_bytes(retval));
+          // (concrete, then: not the label the buffer had, which for a
+          // fresh stack buffer is kInitializingLabel)
+          dfsan_set_label(0, formatter.str_cur(),
+                          formatter.num_written_bytes(retval));
           end_fmt = true;
           break;
 
@@ -3485,6 +3501,20 @@ int __dfsw_snprintf(char *str, size_t size, const char *format,
   va_start(ap, ret_label);
   int ret = format_buffer(str, size, format, va_labels, ret_label, ap);
   va_end(ap);
+  *ret_label = 0;
+  return ret;
+}
+
+// libc++'s number formatting (__libcpp_snprintf_l) calls vsnprintf.
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw_vsnprintf(char *str, size_t size, const char *format, va_list ap,
+                     dfsan_label str_label, dfsan_label size_label,
+                     dfsan_label format_label, dfsan_label ap_label,
+                     dfsan_label *ret_label) {
+  va_list aq;
+  va_copy(aq, ap);
+  int ret = format_buffer(str, size, format, nullptr, ret_label, aq);
+  va_end(aq);
   *ret_label = 0;
   return ret;
 }
