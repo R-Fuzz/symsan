@@ -7971,6 +7971,12 @@ bool UCSan::runImpl(Module &M) {
       } else if (WK == WK_Uninstrumented) {
         // Leave the function as is, but add to UnwrappedFnMap
         UnwrappedFnMap[&F] = &F;
+        // A body here is library code the module compiled itself (its own
+        // copy of a function libc++.a defines, ucsan_libcxx_abilist.txt):
+        // TaintPass's only, as the archive's, so its stores update UCSan's
+        // shadow as the archive's do (-taint-ucsan-lib).
+        if (!F.isDeclaration())
+          F.addFnAttr("ucsan-lib");
       } else if (WK == WK_Custom || WK == WK_AutoCustom) {
         if (!F.isDeclaration()) dropBody(F);
         UnwrappedFnMap[&F] = &F;

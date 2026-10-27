@@ -211,9 +211,15 @@ static void add_runtime() {
     // libc++abi/libunwind is kept concrete via the abilist (the unwinder and
     // __cxa_*/personality functions are marked uninstrumented) so exceptions
     // unwind correctly while the STL stays instrumented for taint tracking.
-    cc_params[cc_par_cnt++] = alloc_printf("%s/libc++.a", obj_path);
-    cc_params[cc_par_cnt++] = alloc_printf("%s/libc++abi.a", obj_path);
-    cc_params[cc_par_cnt++] = alloc_printf("%s/libunwind.a", obj_path);
+    // Under UCSan, its build whose stores also update UCSan's shadow
+    // (-taint-ucsan-lib), when installed.
+    const char *suffix = "";
+    if (use_ucsan &&
+        !access(alloc_printf("%s/libc++-ucsan.a", obj_path), R_OK))
+      suffix = "-ucsan";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libc++%s.a", obj_path, suffix);
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libc++abi%s.a", obj_path, suffix);
+    cc_params[cc_par_cnt++] = alloc_printf("%s/libunwind%s.a", obj_path, suffix);
     // ...and nothing else.  -stdlib=libc++ (added below for the headers) also
     // makes clang's own driver append -lc++ -lc++abi to the end of the link
     // line, which with the -Wl,--no-as-needed below records a DT_NEEDED on the
@@ -297,6 +303,12 @@ static void add_taint_pass() {
   if (use_ucsan) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] = "-taint-with-ucsan=true";
+  }
+
+  // building a library to be linked under UCSan (libcxx/rebuild.sh --ucsan)
+  if (getenv("KO_UCSAN_LIB")) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = "-taint-ucsan-lib=true";
   }
 
   if (is_cxx && use_native_cxx) {

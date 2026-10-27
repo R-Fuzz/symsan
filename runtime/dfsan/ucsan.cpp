@@ -1657,6 +1657,28 @@ void ucsan_fill_pattern(void *addr, uint64_t value, uint64_t elem_size,
     internal_memcpy(p, &value, elem_size);
 }
 
+// The stores of a library built for UCSan (TaintPass -taint-ucsan-lib, the
+// libc++-ucsan.a archives): its code is not UCSanPass's, so its writes would
+// leave UCSan's shadow as it was -- an in-scope stack object or a malloc'd
+// block it fills in would stay uninitialized, and the first in-scope read of
+// it a false UBI.  The bytes it writes are initialized; any other label they
+// hold (a UC pointer the library only moved) is kept.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_lib_store(void *addr, uptr size) {
+  ucsan_label *ls = ucsan_shadow_for(addr);
+  for (uptr i = 0; i < size; ++i)
+    if (ls[i] == kUninitializedLabel)
+      ls[i] = 0;
+}
+
+// ...and its memcpy/memmove intrinsics copy the shadow, as __dfsw_memmove.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_lib_memtransfer(void *dest, void *src, uptr size) {
+  ucsan_materialize_range(src, size);
+  internal_memmove(ucsan_shadow_for(dest), ucsan_shadow_for(src),
+                   size * sizeof(ucsan_label));
+}
+
 // The byte of the seed as sent, at `offset` from input's origin: what the
 // parser assumes an input label's byte is (cached_input_byte, with the
 // origins the manager gives it -- the header's per-object origin, len(lvalue),

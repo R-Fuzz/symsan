@@ -332,6 +332,15 @@ static cl::opt<bool> ClWithUCSan(
     cl::desc("Performs under-constrained symbolic execution."),
     cl::Hidden, cl::init(false));
 
+// A library built to be linked under UCSan (libcxx/rebuild.sh --ucsan): its
+// code is only TaintPass's, so its stores and memcpys also update UCSan's
+// shadow through __ucsan_lib_store/__ucsan_lib_memtransfer, which only the
+// UCSan runtimes define.  Hence a separate build, not a flag of the runtime.
+static cl::opt<bool> ClUCSanLib(
+    "taint-ucsan-lib",
+    cl::desc("Mark the bytes stores write initialized in UCSan's shadow."),
+    cl::Hidden, cl::init(false));
+
 // SYMSAN specific flag. Upstream DFSan conservatively stores a zero shadow on
 // atomic stores (and CAS/RMW) to avoid shadow data races. That loses the
 // symbolic expression of the stored value. Concolic targets are typically
@@ -602,6 +611,8 @@ class Taint {
   FunctionCallee TaintDebugFn;
   FunctionCallee TaintMinimizeLabelFn;
   FunctionCallee TaintAssumeFn;
+  FunctionCallee UCSanLibStoreFn;
+  FunctionCallee UCSanLibMemTransferFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
   /// Read-only global arrays eligible to be treated as lookup tables, mapped to
   /// {num_elements, element_size}.  Computed once, before anything is
@@ -685,6 +696,8 @@ class Taint {
   std::vector<std::string> DocumentedIds;
 
   void initializeRuntimeFunctions(Module &M);
+  void insertUCSanLibStore(Instruction *I);
+  void initializeUCSanLibFunctions(Module &M);
   void initializeCallbackFunctions(Module &M);
   bool initializeModule(Module &M);
 
@@ -746,6 +759,9 @@ struct TaintFunction {
   DenseSet<Instruction *> SkipInsts;
   std::vector<Value *> NonZeroChecks;
   bool AvoidNewBlocks;
+  // Library code under UCSan (-taint-ucsan-lib, "ucsan-lib") is not
+  // loop-bounded: the bound is for the code UCSan explores.
+  bool TraceLoop = ClTraceLoop;
   std::hash<std::string> HashFn;
 
   struct CachedShadow {
@@ -2316,6 +2332,9 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     TaintRuntimeFunctions.insert(TaintAssumeFn.getCallee()->stripPointerCasts());
   }
 
+  if (ClUCSanLib)
+    initializeUCSanLibFunctions(M);
+
   TaintRuntimeFunctions.insert(
       TaintUnionFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -2510,6 +2529,56 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintSolveSizeFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintSolveStrBoundsFn.getCallee()->stripPointerCasts());
+}
+
+// __ucsan_lib_store/__ucsan_lib_memtransfer: declared only for a module
+// that calls them (-taint-ucsan-lib, or a "ucsan-lib" function).
+void Taint::initializeUCSanLibFunctions(Module &M) {
+  AttributeList AL;
+  AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+  UCSanLibStoreFn = Mod->getOrInsertFunction(
+      "__ucsan_lib_store", AL, Type::getVoidTy(*Ctx),
+      PointerType::getUnqual(*Ctx), IntptrTy);
+  UCSanLibMemTransferFn = Mod->getOrInsertFunction(
+      "__ucsan_lib_memtransfer", AL, Type::getVoidTy(*Ctx),
+      PointerType::getUnqual(*Ctx), PointerType::getUnqual(*Ctx), IntptrTy);
+  TaintRuntimeFunctions.insert(
+      UCSanLibStoreFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      UCSanLibMemTransferFn.getCallee()->stripPointerCasts());
+}
+
+// -taint-ucsan-lib: the bytes I writes, for UCSan's shadow (see ClUCSanLib).
+void Taint::insertUCSanLibStore(Instruction *I) {
+  const DataLayout &DL = I->getModule()->getDataLayout();
+  Value *Ptr = nullptr, *Size = nullptr;
+  if (auto *SI = dyn_cast<StoreInst>(I)) {
+    Ptr = SI->getPointerOperand();
+    Size = ConstantInt::get(IntptrTy,
+        DL.getTypeStoreSize(SI->getValueOperand()->getType()));
+  } else if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
+    Ptr = RMW->getPointerOperand();
+    Size = ConstantInt::get(IntptrTy,
+        DL.getTypeStoreSize(RMW->getValOperand()->getType()));
+  } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
+    Ptr = CX->getPointerOperand();
+    Size = ConstantInt::get(IntptrTy,
+        DL.getTypeStoreSize(CX->getNewValOperand()->getType()));
+  } else if (auto *MTI = dyn_cast<MemTransferInst>(I)) {
+    IRBuilder<> IRB(I);
+    IRB.CreateCall(UCSanLibMemTransferFn,
+                   {MTI->getDest(), MTI->getSource(),
+                    IRB.CreateZExtOrTrunc(MTI->getLength(), IntptrTy)});
+    return;
+  } else if (auto *MSI = dyn_cast<MemSetInst>(I)) {
+    Ptr = MSI->getDest();
+    Size = MSI->getLength();
+  } else {
+    return;
+  }
+  IRBuilder<> IRB(I);
+  IRB.CreateCall(UCSanLibStoreFn,
+                 {Ptr, IRB.CreateZExtOrTrunc(Size, IntptrTy)});
 }
 
 bool Taint::runImpl(Module &M) {
@@ -2761,6 +2830,12 @@ bool Taint::runImpl(Module &M) {
     TaintFunction TF(*this, F, FnsWithNativeABI.count(F),
                      FnsWithForceZeroLabel.count(F));
 
+    // -taint-ucsan-lib, or library code UCSanPass left to TaintPass alone
+    bool UCSanLib = ClUCSanLib || F->hasFnAttribute("ucsan-lib");
+    if (UCSanLib && !UCSanLibStoreFn)
+      initializeUCSanLibFunctions(*F->getParent());
+    TF.TraceLoop = ClTraceLoop && !UCSanLib;
+
     // TaintVisitor may create new basic blocks, which confuses df_iterator.
     // Build a copy of the list before iterating over it.
     SmallVector<BasicBlock *, 4> BBList(depth_first(&F->getEntryBlock()));
@@ -2768,7 +2843,7 @@ bool Taint::runImpl(Module &M) {
 
     for (BasicBlock *BB : BBList) {
       // check for loop header
-      if (ClTraceLoop && TF.LI) {
+      if (TF.TraceLoop && TF.LI) {
         Loop *L = TF.LI->getLoopFor(BB);
         if (L) {
           auto *Header = L->getHeader();
@@ -2815,6 +2890,9 @@ bool Taint::runImpl(Module &M) {
             TF.handleUCSanCall(CI, Next);
           }
         }
+        if (UCSanLib && !TF.SkipInsts.count(Inst) &&
+            !Inst->getMetadata("nosanitize"))
+          insertUCSanLibStore(Inst);
         if (!TF.SkipInsts.count(Inst) && !Inst->getMetadata("nosanitize"))
           TaintVisitor(TF).visit(Inst);
         if (IsTerminator)
@@ -6638,7 +6716,7 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   // get operand
   Value *Shadow = getShadow(Condition);
   uint8_t flag = 0;
-  if (ClTraceLoop && isa<BranchInst>(I)) {
+  if (TraceLoop && isa<BranchInst>(I)) {
     // check loop exit and latch
     BasicBlock *BB = I->getParent();
     Loop *L = LI->getLoopFor(BB);

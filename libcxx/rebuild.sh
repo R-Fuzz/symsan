@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 #
-# usage: rebuild.sh path_to_ko_clang
+# usage: rebuild.sh path_to_ko_clang [--ucsan]
+#
+# --ucsan builds into build_ucsan instead: the copy linked under UCSan, whose
+# stores also mark the bytes they write initialized in UCSan's shadow
+# (KO_UCSAN_LIB, TaintPass -taint-ucsan-lib).  Installed as libc++-ucsan.a etc.
 
-if [[ $# -ne 1 ]]; then
-    echo "Usage: ${0} path_to_ko_clang" 1>&2
+if [[ $# -ne 1 && ( $# -ne 2 || "$2" != "--ucsan" ) ]]; then
+    echo "Usage: ${0} path_to_ko_clang [--ucsan]" 1>&2
     exit 1
+fi
+BUILD_DIR=build_taint
+if [[ $# -eq 2 ]]; then
+    BUILD_DIR=build_ucsan
 fi
 
 BIN_PATH=$(readlink -f "$0")
@@ -65,11 +73,11 @@ if [ -f "$ASPACE" ]; then
   sed -i 's|^#if defined(DLFO_STRUCT_HAS_EH_DBASE) & defined(_LIBUNWIND_SUPPORT_DWARF_INDEX)|#if 0 /* symsan: force dl_iterate_phdr; _dl_find_object bypasses DFSan */ \&\& defined(DLFO_STRUCT_HAS_EH_DBASE) \& defined(_LIBUNWIND_SUPPORT_DWARF_INDEX)|' "$ASPACE"
 fi
 
-mkdir -p build_taint
-rm -rf build_taint/*
+mkdir -p $BUILD_DIR
+rm -rf $BUILD_DIR/*
 
 export KO_CONFIG=1
-cmake -G Ninja -S $LLVM_SRC/runtimes -B build_taint \
+cmake -G Ninja -S $LLVM_SRC/runtimes -B $BUILD_DIR \
     -DLLVM_TARGETS_TO_BUILD=X86 -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX} \
     -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
@@ -79,5 +87,8 @@ cmake -G Ninja -S $LLVM_SRC/runtimes -B build_taint \
     -DLLVM_DISTRIBUTION_COMPONENTS="cxx;cxxabi;unwind"
 
 unset KO_CONFIG
-ninja -C build_taint cxx cxxabi unwind
+if [[ $BUILD_DIR == build_ucsan ]]; then
+    export KO_UCSAN_LIB=1
+fi
+ninja -C $BUILD_DIR cxx cxxabi unwind
 
