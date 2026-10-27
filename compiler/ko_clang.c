@@ -312,6 +312,14 @@ static void add_ucsan_pass() {
   cc_params[cc_par_cnt++] = "-mllvm";
   cc_params[cc_par_cnt++] =
       alloc_printf("-ucsan-abilist=%s/ucsan_abilist.txt", obj_path);
+  // the instrumented libc++ is linked (combined C++): its library functions
+  // run as their .taint copies, not as out-of-scope stubs, and its data is
+  // its own (libcxx/ucsan_abilist.sh)
+  if (is_cxx && !use_ucsan_only && !use_native_cxx) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] =
+        alloc_printf("-ucsan-abilist=%s/ucsan_libcxx_abilist.txt", obj_path);
+  }
 
   if (getenv("KO_NO_TRACE_BOUND")) {
     cc_params[cc_par_cnt++] = "-mllvm";

@@ -185,6 +185,13 @@ class UCSanABIList {
     return SCL->inSection("taint", "fun", Name, Category);
   }
 
+  /// Returns whether the global variable is listed (global:NAME) in the
+  /// given category.
+  bool isIn(const GlobalVariable &GV, StringRef Category) const {
+    if (!SCL) return false;
+    return SCL->inSection("taint", "global", GV.getName(), Category);
+  }
+
   /// Returns the 0-indexed argument that holds the byte count for the named
   /// function, or -1 if none is listed.  Probes categories size0..size7.
   int getSizeArgIdx(StringRef Name) const {
@@ -8329,9 +8336,13 @@ bool UCSan::runImpl(Module &M) {
     // (an extern_weak one too: the kernel declares what only its final link
     // defines -- kallsyms_num_syms, kallsyms_offsets -- __weak, and left
     // undefined its address is 0, which kallsyms_lookup_names read through)
+    // (not one a library linked in defines, listed `global:` uninstrumented:
+    // a weak zero definition would keep the linker from taking the library's,
+    // as libc++'s basic_ostringstream VTT, and its vptrs were null)
     if (GV.isDeclaration() &&
         (GV.hasExternalLinkage() || GV.hasExternalWeakLinkage()) &&
-        !AsmDefined.contains(GV.getName())) {
+        !AsmDefined.contains(GV.getName()) &&
+        !ABIList.isIn(GV, "uninstrumented")) {
       GV.setLinkage(GlobalValue::WeakAnyLinkage);
       GV.setInitializer(Constant::getNullValue(GV.getValueType()));
     }

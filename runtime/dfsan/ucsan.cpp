@@ -14,12 +14,14 @@
 
 #include "ucsan.h"
 #include "ucsan_containers.h"
+#include "sanitizer_common/sanitizer_allocator_internal.h"
 #include "sanitizer_common/sanitizer_atomic.h"
 #include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_file.h"
 #include "sanitizer_common/sanitizer_flag_parser.h"
 #include "sanitizer_common/sanitizer_flags.h"
 #include "sanitizer_common/sanitizer_libc.h"
+#include "sanitizer_common/sanitizer_placement_new.h"
 #include "sanitizer_common/sanitizer_posix.h"
 
 #include <stdio.h>
@@ -401,6 +403,17 @@ namespace __ucsan {
 // NOTE: ucsan_input uses C-style initialization to avoid constructor ordering issues
 // with preinit_array.
 
+// The runtime's own objects come from sanitizer_common's internal allocator,
+// not operator new: the program's operator new is the one it links (with the
+// instrumented libc++, only its .taint copy exists).
+template <typename T> static T *internal_new() {
+  return new (InternalAlloc(sizeof(T))) T();
+}
+template <typename T> static void internal_delete(T *p) {
+  p->~T();
+  InternalFree(p);
+}
+
 static void ucsan_init_input_struct() {
   // the containers' memory, before the first of them (see ucsan_containers.h)
   container_arena_init();
@@ -416,10 +429,10 @@ static void ucsan_init_input_struct() {
   ucsan_tainted.buf_size = 0;
   // Allocate C++ objects with constructors dynamically to avoid ordering issues
   if (!ucsan_tainted.objects) {
-    ucsan_tainted.objects = new ObjectStorage();
+    ucsan_tainted.objects = internal_new<ObjectStorage>();
   }
   if (!ucsan_tainted.obj_map) {
-    ucsan_tainted.obj_map = new ObjectMap();
+    ucsan_tainted.obj_map = internal_new<ObjectMap>();
     ucsan_tainted.obj_map->init();
   }
   ucsan_tainted.arg_used.val_dont_use = 0;
@@ -428,12 +441,12 @@ static void ucsan_init_input_struct() {
 static void ucsan_fini_input_struct() {
   if (ucsan_tainted.objects) {
     ucsan_tainted.objects->destroy();
-    delete ucsan_tainted.objects;
+    internal_delete(ucsan_tainted.objects);
     ucsan_tainted.objects = nullptr;
   }
   if (ucsan_tainted.obj_map) {
     ucsan_tainted.obj_map->destroy();
-    delete ucsan_tainted.obj_map;
+    internal_delete(ucsan_tainted.obj_map);
     ucsan_tainted.obj_map = nullptr;
   }
 }
@@ -513,7 +526,7 @@ uint64_t ucsan_input::load(const char *buf, size_t file_size) {
 
   // Initialize objects storage
   if (!ucsan_tainted.objects) {
-    ucsan_tainted.objects = new ObjectStorage();
+    ucsan_tainted.objects = internal_new<ObjectStorage>();
   }
   ucsan_tainted.objects->clear();
 
@@ -1887,7 +1900,7 @@ void* ucsan_set_label_for_args(uint32_t index, uint32_t size_in_bits, uint8_t is
 
   // Ensure objects is allocated
   if (!ucsan_tainted.objects) {
-    ucsan_tainted.objects = new ObjectStorage();
+    ucsan_tainted.objects = internal_new<ObjectStorage>();
   }
 
   if (!ucsan_tainted.objects->size()) ucsan_tainted.objects->resize(1);
@@ -1927,7 +1940,7 @@ void __ucsan_symbolize_input(void *ptr, size_t size, int id) {
 
   // Ensure objects storage is allocated and large enough
   if (!ucsan_tainted.objects) {
-    ucsan_tainted.objects = new ObjectStorage();
+    ucsan_tainted.objects = internal_new<ObjectStorage>();
   }
   while (ucsan_tainted.objects->size() <= object_id) {
     UCSanObject empty;
@@ -1947,7 +1960,7 @@ void __ucsan_symbolize_input(void *ptr, size_t size, int id) {
 
   // Ensure obj_map is initialized
   if (!ucsan_tainted.obj_map) {
-    ucsan_tainted.obj_map = new ObjectMap();
+    ucsan_tainted.obj_map = internal_new<ObjectMap>();
     ucsan_tainted.obj_map->init();
   }
 
