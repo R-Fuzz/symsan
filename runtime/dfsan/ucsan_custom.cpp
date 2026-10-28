@@ -1,5 +1,7 @@
 // UCSan custom function wrappers for standalone mode
 // Provides minimal malloc/free wrappers with bounds tracking
+// (and in the combined runtime too, with the __dfsl_ adapters at the end for
+// library code; which wrapper each caller gets: README.md)
 
 #include "sanitizer_common/sanitizer_internal_defs.h"
 #include "sanitizer_common/sanitizer_common.h"
@@ -35,6 +37,8 @@ extern "C" {
   void __taint_set_label(u32 label, void *addr, u64 size);
   dfsan_label __taint_get_ptr_bounds_label(void *ptr, u64 lower, u64 upper);
   void __taint_set_retval_tls(u32 index, dfsan_label label, u32 size_in_bits);
+  // (dfsan.cpp's: combined runtime only, see the __dfsl_ adapters)
+  dfsan_label __taint_get_retval_tls(u32 index);
   dfsan_label __taint_extend_label(dfsan_label label, bool sign_extend,
                                    uint16_t new_size_in_bits);
 
@@ -1387,5 +1391,134 @@ __attribute__((visibility("default")))
 int __dfsw_getchar(ucsan_label *ret_label) {
   return file_getc(get_file_state(), ret_label);
 }
+
+// ===== __dfsl_ adapters =====
+// Only in the combined runtime (USE_UCSAN_CUSTOM), the one configuration with
+// code that is TaintPass's alone linked beside UCSan's: UCSan alone has no
+// TaintPass code, SymSan alone has dfsan_custom.cpp's __dfsw_ wrappers.
+#ifdef USE_UCSAN_CUSTOM
+// The functions above take UCSan's labels (16-bit), as UCSanPass calls them.
+// Code that is only TaintPass's -- libc++.a under UCSan, built with
+// -taint-ucsan-lib, or a body UCSanPass left to TaintPass ("ucsan-lib") --
+// calls a function ucsan_abilist.txt lists `custom` through its __dfsl_
+// adapter instead (TaintPass's -taint-ucsan-abilist): dfsan's ABI, 32-bit
+// labels and a 32-bit result label, as a __dfsw_ wrapper of dfsan_custom.cpp
+// would take.  It calls UCSan's wrapper with no UCSan labels (library code
+// keeps none), and the result's dfsan label is the one UCSan's sets in the
+// retval TLS, the label an in-scope call reads.  (Called as __dfsw_, UCSan's
+// wrote its 16-bit label into the low half of the caller's 32-bit slot:
+// operator new's malloc result got 0xffff000b.)  The slot is cleared first:
+// not every path of UCSan's sets it (file_getc's EOF).  The design, and adding
+// an adapter (an undefined __dfsl_<name> at link time): README.md.
+#define DFSL_CALL(ret_label, call)                                             \
+  ({                                                                           \
+    __taint_set_retval_tls(0, 0, 64);                                          \
+    ucsan_label l;                                                             \
+    auto ret = (call);                                                         \
+    *(ret_label) = __taint_get_retval_tls(0);                                  \
+    ret;                                                                       \
+  })
+
+__attribute__((visibility("default")))
+void *__dfsl_malloc(size_t size, dfsan_label size_label,
+                    dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_malloc(size, 0, &l));
+}
+
+__attribute__((visibility("default")))
+void *__dfsl_calloc(size_t nmemb, size_t size, dfsan_label nmemb_label,
+                    dfsan_label size_label, dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_calloc(nmemb, size, 0, 0, &l));
+}
+
+__attribute__((visibility("default")))
+void *__dfsl_realloc(void *ptr, size_t size, dfsan_label ptr_label,
+                     dfsan_label size_label, dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_realloc(ptr, size, 0, 0, &l));
+}
+
+__attribute__((visibility("default")))
+void *__dfsl_aligned_alloc(size_t alignment, size_t size,
+                           dfsan_label alignment_label, dfsan_label size_label,
+                           dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_aligned_alloc(alignment, size, 0, 0, &l));
+}
+
+// (with no UCSan label, UCSan's free does nothing: it never frees)
+__attribute__((visibility("default")))
+void __dfsl_free(void *ptr, dfsan_label ptr_label) {
+  __dfsw_free(ptr, 0);
+}
+
+__attribute__((visibility("default")))
+int __dfsl_open(const char *path, int oflags, dfsan_label path_label,
+                dfsan_label oflags_label, dfsan_label *va_labels,
+                dfsan_label *ret_label, ...) {
+  return DFSL_CALL(ret_label, __dfsw_open(path, oflags, 0, 0, nullptr, &l));
+}
+
+__attribute__((visibility("default")))
+int __dfsl_openat(int dirfd, const char *path, int oflags,
+                  dfsan_label dirfd_label, dfsan_label path_label,
+                  dfsan_label oflags_label, dfsan_label *va_labels,
+                  dfsan_label *ret_label, ...) {
+  return DFSL_CALL(ret_label, __dfsw_openat(dirfd, path, oflags, 0, 0, 0, nullptr, &l));
+}
+
+__attribute__((visibility("default")))
+FILE *__dfsl_fopen(const char *filename, const char *mode,
+                   dfsan_label filename_label, dfsan_label mode_label,
+                   dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_fopen(filename, mode, 0, 0, &l));
+}
+
+__attribute__((visibility("default")))
+int __dfsl_close(int fd, dfsan_label fd_label, dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_close(fd, 0, &l));
+}
+
+__attribute__((visibility("default")))
+int __dfsl_fclose(FILE *stream, dfsan_label stream_label,
+                  dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_fclose(stream, 0, &l));
+}
+
+__attribute__((visibility("default")))
+ssize_t __dfsl_read(int fd, void *buf, size_t count, dfsan_label fd_label,
+                    dfsan_label buf_label, dfsan_label count_label,
+                    dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_read(fd, buf, count, 0, 0, 0, &l));
+}
+
+__attribute__((visibility("default")))
+size_t __dfsl_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
+                    dfsan_label ptr_label, dfsan_label size_label,
+                    dfsan_label nmemb_label, dfsan_label stream_label,
+                    dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_fread(ptr, size, nmemb, stream, 0, 0, 0, 0, &l));
+}
+
+__attribute__((visibility("default")))
+int __dfsl_fseek(FILE *stream, long offset, int whence,
+                 dfsan_label stream_label, dfsan_label offset_label,
+                 dfsan_label whence_label, dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_fseek(stream, offset, whence, 0, 0, 0, &l));
+}
+
+__attribute__((visibility("default")))
+int __dfsl_fseeko(FILE *stream, off_t offset, int whence,
+                  dfsan_label stream_label, dfsan_label offset_label,
+                  dfsan_label whence_label, dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_fseeko(stream, offset, whence, 0, 0, 0, &l));
+}
+
+__attribute__((visibility("default")))
+int __dfsl_getc(FILE *stream, dfsan_label stream_label,
+                dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_getc(stream, 0, &l));
+}
+
+#undef DFSL_CALL
+#endif // USE_UCSAN_CUSTOM
 
 } // extern "C"

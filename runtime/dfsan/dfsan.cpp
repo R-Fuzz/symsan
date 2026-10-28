@@ -3050,6 +3050,14 @@ void __taint_set_retval_tls(uint32_t index, dfsan_label label, uint32_t size_in_
   __dfsan_retval_tls[index] = label;
 }
 
+// ... and read it back (ucsan_custom.cpp's __dfsl_ adapters, combined runtime
+// only: no weak stub in ucsan.cpp)
+SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_get_retval_tls(uint32_t index) {
+  if (index >= kRetvalTlsSize / sizeof(dfsan_label)) return 0;
+  return __dfsan_retval_tls[index];
+}
+
 // Zero the argument/return-value TLS.  Custom function wrappers that invoke an
 // instrumented callback directly (e.g. dl_iterate_phdr, pthread_create) use
 // this to give the callback zero-labelled arguments now that the trampoline

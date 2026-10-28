@@ -50,6 +50,10 @@ docker build -t symsan .
 The repo contains instrumented libc++ and libc++abi to support C++ programs.
 To rebuild these libraries from source, execute the `rebuild.sh` script in the
 `libcxx` directory.
+`rebuild.sh <ko-clang> --ucsan` builds the copy linked under UCSan
+(`libc++-ucsan.a`); how its calls into libc reach UCSan's wrappers is in
+[runtime/dfsan/README.md](runtime/dfsan/README.md), with the three runtimes
+(SymSan alone, UCSan alone, together).
 
 **NOTE**: because the in-process solving module (`solver/z3.cpp`) uses Z3's C++ API
 and STL containers, so itself depends on the C++ libs. Due to such dependencies,

@@ -1162,6 +1162,9 @@ __dfsw_strlen(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
 
 // When USE_UCSAN_CUSTOM is defined, ucsan_custom.cpp provides these functions
 // which handle both UCSan and SymSan shadow memory via the bridge.
+// (With UCSan's ABI, as UCSanPass calls them: library code, TaintPass's
+// alone, calls the ones ucsan_abilist.txt lists `custom` as __dfsl_, see
+// README.md.)
 #ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE
 void *__dfsw_memcpy(void *dest, const void *src, size_t n,

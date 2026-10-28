@@ -94,6 +94,8 @@ foreach(arch ${DFSAN_SUPPORTED_ARCH})
   # Combined library (SymSan + UCSan)
   # USE_UCSAN_CUSTOM tells dfsan_custom.cpp to skip definitions
   # that are provided by ucsan_custom.cpp (e.g., __dfsw_memcpy)
+  # (and marks the combined build: what needs both halves goes under it, so
+  # that each runs alone; see README.md)
   set(DFSAN_COMBINED_CFLAGS ${DFSAN_CFLAGS} -DUSE_UCSAN_CUSTOM)
   add_compiler_rt_runtime(dfsan_rt
     STATIC

@@ -341,6 +341,19 @@ static cl::opt<bool> ClUCSanLib(
     cl::desc("Mark the bytes stores write initialized in UCSan's shadow."),
     cl::Hidden, cl::init(false));
 
+// UCSan's abilist (ucsan_abilist.txt): under UCSan, the runtime's __dfsw_
+// wrapper of a function it lists `custom` is ucsan_custom.cpp's, which takes
+// UCSan's (16-bit) labels -- the ABI of the calls UCSanPass makes.  Library
+// code (above) calls the function's __dfsl_ adapter instead, which takes
+// dfsan's, as a __dfsw_ wrapper would, and calls UCSan's.  (libc++.a's
+// operator new got the 16-bit label of __dfsw_malloc's result in the low half
+// of a 32-bit one, 0xffff000b, and __taint_union read past the label table.)
+// Which wrapper each caller gets, per runtime: runtime/dfsan/README.md.
+static cl::list<std::string> ClUCSanABIListFiles(
+    "taint-ucsan-abilist",
+    cl::desc("UCSan's abilist: its custom functions' library wrappers are __dfsl_"),
+    cl::Hidden);
+
 // SYMSAN specific flag. Upstream DFSan conservatively stores a zero shadow on
 // atomic stores (and CAS/RMW) to avoid shadow data races. That loses the
 // symbolic expression of the stored value. Concolic targets are typically
@@ -623,6 +636,9 @@ class Taint {
   Constant *CallStack;
   MDNode *ColdCallWeights;
   TaintABIList ABIList;
+  // -taint-ucsan-abilist, if given
+  TaintABIList UCSanABIList;
+  bool HasUCSanABIList = false;
   DenseMap<Value *, Function *> UnwrappedFnMap;
   AttributeMask ReadOnlyNoneAttrs;
 
@@ -762,6 +778,9 @@ struct TaintFunction {
   // Library code under UCSan (-taint-ucsan-lib, "ucsan-lib") is not
   // loop-bounded: the bound is for the code UCSan explores.
   bool TraceLoop = ClTraceLoop;
+  // ... and calls UCSan's custom functions through their __dfsl_ adapters
+  // (see ClUCSanABIListFiles)
+  bool UCSanLib = false;
   std::hash<std::string> HashFn;
 
   struct CachedShadow {
@@ -950,6 +969,13 @@ Taint::Taint(
   // FIXME: should we propagate vfs::FileSystem to this constructor?
   ABIList.set(
       SpecialCaseList::createOrDie(AllABIListFiles, *vfs::getRealFileSystem()));
+  if (!ClUCSanABIListFiles.empty()) {
+    std::vector<std::string> UCSanABIListFiles(ClUCSanABIListFiles.begin(),
+                                               ClUCSanABIListFiles.end());
+    UCSanABIList.set(SpecialCaseList::createOrDie(UCSanABIListFiles,
+                                                  *vfs::getRealFileSystem()));
+    HasUCSanABIList = true;
+  }
 }
 
 FunctionType *Taint::getArgsFunctionType(FunctionType *T) {
@@ -2835,6 +2861,7 @@ bool Taint::runImpl(Module &M) {
     if (UCSanLib && !UCSanLibStoreFn)
       initializeUCSanLibFunctions(*F->getParent());
     TF.TraceLoop = ClTraceLoop && !UCSanLib;
+    TF.UCSanLib = UCSanLib;
 
     // TaintVisitor may create new basic blocks, which confuses df_iterator.
     // Build a copy of the list before iterating over it.
@@ -6009,7 +6036,11 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
 
     FunctionType *FT = F->getFunctionType();
     TransformedFunction CustomFn = TF.TT.getCustomFunctionType(FT);
-    std::string CustomFName = "__dfsw_";
+    std::string CustomFName =
+        TF.UCSanLib && TF.TT.HasUCSanABIList &&
+                TF.TT.UCSanABIList.isIn(*F, "custom")
+            ? "__dfsl_"
+            : "__dfsw_";
     CustomFName += F->getName();
     FunctionCallee CustomF =
         TF.TT.Mod->getOrInsertFunction(CustomFName, CustomFn.TransformedType);

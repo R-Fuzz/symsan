@@ -311,6 +311,17 @@ static void add_taint_pass() {
     cc_params[cc_par_cnt++] = "-taint-ucsan-lib=true";
   }
 
+  // library code linked beside UCSan, combined (the above, or a body UCSanPass
+  // leaves to TaintPass) calls UCSan's custom functions through their
+  // dfsan-ABI __dfsl_ adapters (ucsan_custom.cpp, combined runtime only).
+  // (TaintPass runs with METADATA only when combined: KO_USE_UCSAN_ONLY has
+  // none, and KO_USE_SYMSAN_ONLY excludes METADATA.)
+  if (use_ucsan || getenv("KO_UCSAN_LIB")) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] =
+        alloc_printf("-taint-ucsan-abilist=%s/ucsan_abilist.txt", obj_path);
+  }
+
   if (is_cxx && use_native_cxx) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] =
