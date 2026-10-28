@@ -117,6 +117,8 @@ fun:__kmalloc=custom
 fun:kmalloc=custom
 fun:panic=custom
 fun:abort=custom
+# libc++'s abort (a throw, without exceptions); its own body is libc++.a's
+fun:_ZNSt3__122__libcpp_verbose_abortEPKcz=custom
 fun:__assert_fail=custom
 fun:_copy_from_user=custom
 fun:printk=discard

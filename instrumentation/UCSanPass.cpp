@@ -6915,8 +6915,27 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
     llvm::sort(Wrapped, [](Function *A, Function *B) {
       return A->getName() < B->getName();
     });
+    // Only a concrete pointer is compared.  A symbolic one -- a slot of an
+    // object UCSan made up, such as a vtable's -- is an unknown callee, for
+    // visitIndirectCallBase; as a traced comparison it was a branch the
+    // solver flipped to any of these, and v8's unit tests ran libc++'s
+    // ~basic_ostream (WK_Uninstrumented) on a made-up v8::Platform.
+    Value *Concrete = nullptr;
+    if (!Wrapped.empty()) {
+      IRBuilder<> IRB(&CB);
+      Concrete = IRB.CreateICmpEQ(UF.getShadow(CB.getCalledOperand()),
+                                  UF.UC.ZeroPrimitiveShadow);
+      UF.UC.markNosanitize(Concrete);
+    }
     for (Function *W : Wrapped) {
       CallBase &Direct = promoteCallWithIfThenElse(CB, W);
+      auto *BI = cast<BranchInst>(
+          Direct.getParent()->getSinglePredecessor()->getTerminator());
+      UF.UC.markNosanitize(BI->getCondition());
+      Value *Taken = BinaryOperator::CreateAnd(BI->getCondition(), Concrete,
+                                               "", BI);
+      UF.UC.markNosanitize(Taken);
+      BI->setCondition(Taken);
       UF.DT.recalculate(*UF.F);
       SmallVector<PHINode *, 1> Phis;
       for (User *U : Direct.users())

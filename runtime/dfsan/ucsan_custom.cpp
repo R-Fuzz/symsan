@@ -887,6 +887,23 @@ __dfsw_abort(void) {
   _exit(EVENT_PANIC);
 }
 
+// std::__libcpp_verbose_abort, libc++'s abort: without exceptions, a libc++
+// header's throw (vector's __throw_length_error) calls it.  libc++.a
+// defines it, and its body formats the message to stderr, which in a v8
+// unit test segfaulted first.  The message is printed only with debug.
+SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
+__dfsw__ZNSt3__122__libcpp_verbose_abortEPKcz(const char *format,
+                                              ucsan_label format_label,
+                                              ucsan_label *va_labels, ...) {
+  if (__ucsan::ucsan_debug && format) {
+    va_list ap;
+    va_start(ap, va_labels);
+    vfprintf(stderr, format, ap);
+    va_end(ap);
+  }
+  __dfsw_abort();
+}
+
 // A fatal check the harness makes, not the code under test: a unit test's
 // fixture CHECKs what an out-of-scope dependency returned
 // (CHECK_NOT_NULL(platform_.get())), which is an assumption about it.  A seed
