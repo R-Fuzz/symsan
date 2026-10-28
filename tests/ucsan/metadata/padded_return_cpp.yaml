@@ -1,4 +1,0 @@
-entry: "entry(int*)"
-scope:
-  - "make(unsigned long)"
-  - "exit"

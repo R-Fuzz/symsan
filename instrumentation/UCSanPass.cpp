@@ -766,11 +766,9 @@ private:
   Value *loadPrimitiveShadow(Value *Addr, uint64_t Size, Align Align,
                              Type *Ty, IRBuilder<> &IRB, uint64_t Unread = 0);
   /// Loads shadow recursively for aggregate types
-  /// (Unread: bytes of the whole load no use reads, Off: SubTy's offset in it)
   Value *loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                              Type *SubTy, Value *Addr, uint64_t Size,
-                             Align Align, IRBuilder<> &IRB,
-                             uint64_t Unread = 0, uint64_t Off = 0);
+                             Align Align, IRBuilder<> &IRB);
   /// Stores an aggregate shadow label
   void storeShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                             Type *SubTy, Value *Addr, uint64_t Size,
@@ -1792,8 +1790,7 @@ Value *UCSanFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size, Align Alig
 /// Recursive helper to load shadow for aggregate types.
 Value *UCSanFunction::loadShadowRecursive(
     Value *Shadow, SmallVector<unsigned, 4> &Indices, Type *SubTy,
-    Value *Addr, uint64_t Size, Align InstAlign, IRBuilder<> &IRB,
-    uint64_t Unread, uint64_t Off) {
+    Value *Addr, uint64_t Size, Align InstAlign, IRBuilder<> &IRB) {
   auto &DL = F->getParent()->getDataLayout();
 
   if (!isa<ArrayType>(SubTy) && !isa<StructType>(SubTy)) {
@@ -1801,11 +1798,7 @@ Value *UCSanFunction::loadShadowRecursive(
     assert(Size >= SubSize);
     InstAlign = Align(std::min(InstAlign.value(), (uint64_t)(DL).getABITypeAlign(SubTy).value()));
     // load a primitive shadow from address
-    uint64_t SubUnread = Off < 64 ? Unread >> Off : 0;
-    if (SubSize < 64)
-      SubUnread &= (uint64_t(1) << SubSize) - 1;
-    Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, InstAlign, SubTy,
-                                                 IRB, SubUnread);
+    Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, InstAlign, SubTy, IRB);
     // then insert the primitive shadow into the sub-field
     Value *Insert = IRB.CreateInsertValue(Shadow, PrimitiveShadow, Indices);
     UC.markNosanitize(Insert);
@@ -1824,8 +1817,7 @@ Value *UCSanFunction::loadShadowRecursive(
       Value *SubAddr = IRB.CreateConstGEP2_32(AT, Addr, 0, Idx);
       UC.markNosanitize(SubAddr);
       Shadow = loadShadowRecursive(Shadow, Indices, ElemTy,
-                                   SubAddr, Size - Offset, InstAlign, IRB,
-                                   Unread, Off + Offset);
+                                   SubAddr, Size - Offset, InstAlign, IRB);
       Indices.pop_back();
     }
     return Shadow;
@@ -1843,8 +1835,7 @@ Value *UCSanFunction::loadShadowRecursive(
       Value *SubAddr = IRB.CreateConstGEP2_32(ST, Addr, 0, Idx);
       UC.markNosanitize(SubAddr);
       Shadow = loadShadowRecursive(Shadow, Indices, ElemTy,
-                                   SubAddr, Size - Offset, InstAlign, IRB,
-                                   Unread, Off + Offset);
+                                   SubAddr, Size - Offset, InstAlign, IRB);
       Indices.pop_back();
     }
     return Shadow;
@@ -1898,8 +1889,7 @@ Value *UCSanFunction::loadShadow(Value *Addr, uint64_t Size, Align Align,
   SmallVector<unsigned, 4> Indices;
   Type *ShadowTy = UC.getShadowTy(Ty);
   Value *Shadow = UndefValue::get(ShadowTy);
-  Shadow = loadShadowRecursive(Shadow, Indices, Ty, Addr, Size, ShadowAlign, IRB,
-                               Unread);
+  Shadow = loadShadowRecursive(Shadow, Indices, Ty, Addr, Size, ShadowAlign, IRB);
   return Shadow;
 }
 
@@ -3080,12 +3070,6 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
   uint32_t TypeID = PointeeTy ? UF.UC.getOrCreatePointerTypeID(PointeeTy)
                               : UF.UC.getOrCreateTypeID(Ty);
 
-  // (before checkPointer replaces the pointer the object is found from;
-  // recorded on LI for TaintPass, which sees only the checked pointer)
-  uint64_t Padding = symsan::paddingBytes(LI);
-  if (Padding)
-    symsan::setPaddingBytes(LI, Padding);
-
   // Check and replace pointer
   IRBuilder<> IRB(&LI);
   Ptr = UF.checkPointer(Ptr, Size, true, IRB, TypeID, LI.getAlign());
@@ -3093,9 +3077,9 @@ void UCSanVisitor::visitLoadInst(LoadInst &LI) {
 
   // a value is uninitialized when a byte its uses read is, and the bytes
   // of a bitfield's access unit outside its fields are not read (see
-  // Bitfield.h), nor is the padding of the struct it is loaded from
+  // Bitfield.h)
   Value *Shadow = UF.loadShadow(Ptr, StoreSize, LI.getAlign(), Ty, &LI,
-                                symsan::unreadBytes(LI) | Padding);
+                                symsan::unreadBytes(LI));
   if (!UF.UC.isZeroShadow(Shadow))
     UF.NonZeroChecks.push_back(Shadow);
 

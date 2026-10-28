@@ -27,7 +27,6 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/KnownBits.h"
 
-#include <algorithm>
 #include <cstdint>
 
 namespace symsan {
@@ -201,90 +200,6 @@ inline uint64_t unreadBytes(llvm::LoadInst &LI) {
     if (Read.extractBits(8, I * 8).isZero())
       Unread |= uint64_t(1) << I;
   return Unread;
-}
-
-// The bytes of [Lo, Hi) that no field of Ty (laid out at Base) covers: its
-// padding, as a mask of bit (byte - Lo).
-inline uint64_t paddingIn(llvm::Type *Ty, uint64_t Base, uint64_t Lo,
-                          uint64_t Hi, const llvm::DataLayout &DL) {
-  using namespace llvm;
-  uint64_t Size = DL.getTypeAllocSize(Ty);
-  if (Base >= Hi || Base + Size <= Lo)
-    return 0;
-  if (auto *ST = dyn_cast<StructType>(Ty)) {
-    const StructLayout *SL = DL.getStructLayout(ST);
-    // the struct's bytes in range, less what its fields cover
-    uint64_t Pad = 0;
-    for (uint64_t B = std::max(Base, Lo); B < std::min(Base + Size, Hi); ++B)
-      Pad |= uint64_t(1) << (B - Lo);
-    for (unsigned I = 0, E = ST->getNumElements(); I != E; ++I) {
-      Type *ETy = ST->getElementType(I);
-      uint64_t EOff = Base + SL->getElementOffset(I);
-      uint64_t EStore = DL.getTypeStoreSize(ETy);
-      for (uint64_t B = std::max(EOff, Lo); B < std::min(EOff + EStore, Hi); ++B)
-        Pad &= ~(uint64_t(1) << (B - Lo));
-      Pad |= paddingIn(ETy, EOff, Lo, Hi, DL);
-    }
-    return Pad;
-  }
-  if (auto *AT = dyn_cast<ArrayType>(Ty)) {
-    uint64_t ESize = DL.getTypeAllocSize(AT->getElementType());
-    if (ESize == 0)
-      return 0;
-    uint64_t Pad = 0;
-    uint64_t First = Lo > Base ? (Lo - Base) / ESize : 0;
-    for (uint64_t I = First; I < AT->getNumElements() && Base + I * ESize < Hi; ++I)
-      Pad |= paddingIn(AT->getElementType(), Base + I * ESize, Lo, Hi, DL);
-    return Pad;
-  }
-  // a scalar's bytes past its store size (x86_fp80's six) are padding too
-  uint64_t Pad = 0;
-  for (uint64_t B = std::max(Base + DL.getTypeStoreSize(Ty), Lo);
-       B < std::min(Base + Size, Hi); ++B)
-    Pad |= uint64_t(1) << (B - Lo);
-  return Pad;
-}
-
-// UCSanPass replaces a load's pointer with the checked one, from which the
-// object is no longer found: what it found is kept on the load for TaintPass
-inline void setPaddingBytes(llvm::LoadInst &LI, uint64_t Padding) {
-  using namespace llvm;
-  LLVMContext &C = LI.getContext();
-  LI.setMetadata("symsan.padding",
-                 MDNode::get(C, ConstantAsMetadata::get(ConstantInt::get(
-                                    Type::getInt64Ty(C), Padding))));
-}
-
-// The bytes of what LI loads that are padding of the stack object or global
-// it loads from.  A struct returned in registers is loaded a word at a time:
-// MagicNumbersForDivision<uint64_t>, {i64, i32, i8}, comes back as {i64, i64},
-// its second word shift, add and three bytes nothing writes, and those made
-// the whole word, so shift, uninitialized for the caller's comparison.
-inline uint64_t paddingBytes(llvm::LoadInst &LI) {
-  using namespace llvm;
-  // what UCSanPass found before it replaced the pointer
-  if (MDNode *MD = LI.getMetadata("symsan.padding"))
-    return mdconst::extract<ConstantInt>(MD->getOperand(0))->getZExtValue();
-  const DataLayout &DL = LI.getModule()->getDataLayout();
-  // an integer word, or the {i64, i64} aggregate itself (at -O0)
-  if (!LI.getType()->isIntegerTy() && !LI.getType()->isAggregateType())
-    return 0;
-  uint64_t Bytes = DL.getTypeStoreSize(LI.getType());
-  if (Bytes > 64)
-    return 0;
-  APInt Off(DL.getIndexTypeSizeInBits(LI.getPointerOperandType()), 0);
-  Value *Obj = LI.getPointerOperand()->stripAndAccumulateConstantOffsets(
-      DL, Off, /*AllowNonInbounds=*/true);
-  Type *ObjTy = nullptr;
-  if (auto *AI = dyn_cast<AllocaInst>(Obj))
-    ObjTy = AI->isArrayAllocation() ? nullptr : AI->getAllocatedType();
-  else if (auto *GV = dyn_cast<GlobalVariable>(Obj))
-    ObjTy = GV->getValueType();
-  if (!ObjTy || !ObjTy->isSized() || Off.isNegative() ||
-      Off.getZExtValue() + Bytes > DL.getTypeAllocSize(ObjTy))
-    return 0;
-  uint64_t Lo = Off.getZExtValue();
-  return paddingIn(ObjTy, 0, Lo, Lo + Bytes, DL);
 }
 
 } // namespace symsan

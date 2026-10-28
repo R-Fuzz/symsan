@@ -893,11 +893,9 @@ private:
                              uint64_t Align, IRBuilder<> &IRB,
                              uint64_t Unread = 0);
   /// Loads shadow recursively for aggregate types
-  /// (Unread: bytes of the whole load no use reads, Off: SubTy's offset in it)
   Value *loadShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                              Type *SubTy, Value *Addr, uint64_t Size,
-                             uint64_t Align, IRBuilder<> &IRB,
-                             uint64_t Unread = 0, uint64_t Off = 0);
+                             uint64_t Align, IRBuilder<> &IRB);
   /// Stores an aggregate shadow label
   void storeShadowRecursive(Value *Shadow, SmallVector<unsigned, 4> &Indices,
                             Type *SubShadowTy, Value *ShadowAddr, uint64_t Size,
@@ -4628,8 +4626,7 @@ Value *TaintFunction::loadPrimitiveShadow(Value *Addr, uint64_t Size,
 
 Value *TaintFunction::loadShadowRecursive(
     Value *Shadow, SmallVector<unsigned, 4> &Indices, Type *SubTy,
-    Value *Addr, uint64_t Size, uint64_t Align, IRBuilder<> &IRB,
-    uint64_t Unread, uint64_t Off) {
+    Value *Addr, uint64_t Size, uint64_t Align, IRBuilder<> &IRB) {
   auto &DL = F->getParent()->getDataLayout();
 
   if (!isa<ArrayType>(SubTy) && !isa<StructType>(SubTy)) {
@@ -4638,11 +4635,7 @@ Value *TaintFunction::loadShadowRecursive(
     uint64_t SubSizeInBits = DL.getTypeSizeInBits(SubTy);
     Align = std::min(Align, (uint64_t)(DL).getABITypeAlign(SubTy).value());
     // load a primitive shadow from address
-    uint64_t SubUnread = Off < 64 ? Unread >> Off : 0;
-    if (SubSize < 64)
-      SubUnread &= (uint64_t(1) << SubSize) - 1;
-    Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, SubSizeInBits,
-                                                 Align, IRB, SubUnread);
+    Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, SubSizeInBits, Align, IRB);
     // then insert the primitive shadow into the sub-field
     return IRB.CreateInsertValue(Shadow, PrimitiveShadow, Indices);
   }
@@ -4658,8 +4651,7 @@ Value *TaintFunction::loadShadowRecursive(
       // get the address of the array element
       Value *SubAddr = IRB.CreateConstGEP2_32(AT, Addr, 0, Idx);
       Shadow = loadShadowRecursive(Shadow, Indices, ElemTy,
-                                   SubAddr, Size - Offset, Align, IRB,
-                                   Unread, Off + Offset);
+                                   SubAddr, Size - Offset, Align, IRB);
       Indices.pop_back();
     }
     return Shadow;
@@ -4676,8 +4668,7 @@ Value *TaintFunction::loadShadowRecursive(
       // get the address of the struct field
       Value *SubAddr = IRB.CreateConstGEP2_32(ST, Addr, 0, Idx);
       Shadow = loadShadowRecursive(Shadow, Indices, ElemTy,
-                                   SubAddr, Size - Offset, Align, IRB,
-                                   Unread, Off + Offset);
+                                   SubAddr, Size - Offset, Align, IRB);
       Indices.pop_back();
     }
     return Shadow;
@@ -4730,8 +4721,7 @@ Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size,
   SmallVector<unsigned, 4> Indices;
   Type *ShadowTy = TT.getShadowTy(T);
   Value *Shadow = UndefValue::get(ShadowTy);
-  Shadow = loadShadowRecursive(Shadow, Indices, T, Addr, Size, ShadowAlign, IRB,
-                               Unread);
+  Shadow = loadShadowRecursive(Shadow, Indices, T, Addr, Size, ShadowAlign, IRB);
   return Shadow;
 }
 
@@ -4974,12 +4964,10 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
   }
 
   // the bytes of a bitfield's access unit outside the fields it is read for
-  // may never have been written, and are not read (see Bitfield.h), nor is
-  // the padding of the struct it is loaded from
+  // may never have been written, and are not read (see Bitfield.h)
   if (!Shadow)
     Shadow = TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
-                           LI.getAlign(), Pos,
-                           symsan::unreadBytes(LI) | symsan::paddingBytes(LI));
+                           LI.getAlign(), Pos, symsan::unreadBytes(LI));
 #if 0
   //FIXME: tainted pointer
   if (ClCombinePointerLabelsOnLoad) {
