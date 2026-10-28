@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <cstring>
 #include <malloc.h>
+#include <ucontext.h>
 
 #define __handle_segfualt__
 #define LOOP_COUNTER_SIZE 1024
@@ -329,7 +330,7 @@ __taint_trace_global_var(uint32_t obj_id, uint64_t offset, uint64_t size, void *
   return;
 }
 
-static void segfault_handler(int sig, siginfo_t *si, void *unused)
+static void segfault_handler(int sig, siginfo_t *si, void *ctx)
 {
   if (__ucsan_null_deref_flag) {
       AOUT("Poential Null dereference detected\n");
@@ -337,6 +338,10 @@ static void segfault_handler(int sig, siginfo_t *si, void *unused)
       internal__exit(EVENT_NULL_DEREF);
   }
   AOUT("Segmentation fault at address: %p, access type: %d\n", si->si_addr, si->si_code);
+  // (and where: llvm-symbolizer --obj=<binary> <pc>, a UCSan binary being
+  // linked at its address)
+  AOUT("Segmentation fault pc: %p\n",
+       (void *)((ucontext_t *)ctx)->uc_mcontext.gregs[REG_RIP]);
   Die();
 }
 
