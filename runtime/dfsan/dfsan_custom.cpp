@@ -3195,6 +3195,11 @@ static int format_buffer(char *str, size_t size, const char *fmt,
           char *arg = va_arg(ap, char *);
           retval = formatter.format(arg);
           va_labels++;
+          // (glibc prints a null %s as "(null)": concrete, no shadow to copy)
+          if (arg == nullptr)
+            dfsan_set_label(0, formatter.str_cur(),
+                            formatter.num_written_bytes(retval));
+          else
           internal_memcpy(shadow_for(formatter.str_cur()), shadow_for(arg),
                           sizeof(dfsan_label) *
                               formatter.num_written_bytes(retval));
@@ -3477,6 +3482,25 @@ static int scan_buffer(char *str, size_t size, const char *fmt,
   return formatter.num_scanned;
 }
 
+#ifdef USE_UCSAN_CUSTOM
+extern "C" void ucsan_set_label(uint16_t label, void *addr, uint64_t size);
+#endif
+
+// Under UCSan (ucsan_abilist.txt lists the sprintf family `taint`), the bytes
+// a sprintf wrote are written for UCSan too, and as concrete as they are
+// here: an in-scope buffer (v8's operator<<(ostream&, AsHex) formatting into
+// a stack char[]) otherwise stayed uninitialized.  size bounds what it wrote.
+static void ucsan_mark_formatted(char *str, size_t size, int ret) {
+#ifdef USE_UCSAN_CUSTOM
+  if (ret < 0 || size == 0)
+    return;
+  size_t n = (size_t)ret + 1 < size ? (size_t)ret + 1 : size;
+  ucsan_set_label(0, str, n);
+#else
+  (void)str; (void)size; (void)ret;
+#endif
+}
+
 extern "C" {
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_sprintf(char *str, const char *format, dfsan_label str_label,
@@ -3489,6 +3513,7 @@ int __dfsw_sprintf(char *str, const char *format, dfsan_label str_label,
   int ret = format_buffer(str, INT32_MAX, format, va_labels, ret_label, ap);
   va_end(ap);
   *ret_label = 0;
+  ucsan_mark_formatted(str, INT32_MAX, ret);
   return ret;
 }
 
@@ -3502,6 +3527,7 @@ int __dfsw_snprintf(char *str, size_t size, const char *format,
   int ret = format_buffer(str, size, format, va_labels, ret_label, ap);
   va_end(ap);
   *ret_label = 0;
+  ucsan_mark_formatted(str, size, ret);
   return ret;
 }
 
@@ -3516,6 +3542,7 @@ int __dfsw_vsnprintf(char *str, size_t size, const char *format, va_list ap,
   int ret = format_buffer(str, size, format, nullptr, ret_label, aq);
   va_end(aq);
   *ret_label = 0;
+  ucsan_mark_formatted(str, size, ret);
   return ret;
 }
 

@@ -85,6 +85,12 @@ fun:strstr=taint
 fun:strnstr=taint
 fun:memmem=taint
 
+# the sprintf family (dfsan_custom.cpp's format_buffer); vsprintf has no
+# wrapper and stays a stub
+fun:sprintf=taint
+fun:snprintf=taint
+fun:vsnprintf=taint
+
 fun:htonl=taint
 fun:htons=taint
 fun:ntohl=taint
@@ -170,6 +176,11 @@ fun:printf=ignore
 fun:vprintf=ignore
 # (not snprintf/sprintf/vsnprintf/vsprintf: they write the buffer they are
 # given, so their stubs resign it like any out-of-scope callee's)
+# (now: sprintf, snprintf and vsnprintf are `taint`, above: TaintPass's
+# wrappers format concretely, and mark what they write in UCSan's shadow.
+# Without resign (-r, wrong for unit tests) a stub left the buffer
+# uninitialized, and the library code it was handed to (v8's
+# operator<<(ostream&, AsHex), `os << buf`) branched on it.)
 fun:fwrite=ignore
 fun:fwrite_unlocked=ignore
 fun:fflush=ignore

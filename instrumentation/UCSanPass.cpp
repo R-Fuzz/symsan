@@ -6474,6 +6474,42 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     Value *DstShadow = nullptr, *SrcShadow = nullptr;
     Value *DstBound = ConstantInt::get(UF.UC.Int64Ty, 0);
 
+    // A pointer argument whose use is the callee's to decide (a library
+    // function's, a variadic one) is checked only when it is not null: null
+    // is a value such a callee takes, not a dereference of it.  (libc++'s
+    // stringbuf has no put area until something is written, so the str() of
+    // an empty ostringstream is basic_string::__init(nullptr, 0), libc++.a's:
+    // a false 153.  And snprintf's "%p" of a null pointer.)  The mem/str
+    // functions' own pointers are still checked as dereferenced.
+    auto checkUnlessNull = [&](Value *P, Value *Size, uint32_t TypeID) -> Value * {
+      if (isKnownNonZero(P, DL))
+        return UF.checkPointer(P, Size, true, IRB, TypeID);
+      // (null by its value *and* unlabeled: an under-constrained pointer's
+      // value is only what the path so far asked of it, and it still names
+      // an object, created here: resign_sprintf's name, 0 in the first run)
+      Value *NotNull = IRB.CreateICmpNE(
+          P, ConstantPointerNull::get(cast<PointerType>(P->getType())));
+      UF.UC.markNosanitize(NotNull);
+      Value *Labeled = IRB.CreateICmpNE(UF.getShadow(P),
+                                        UF.UC.ZeroPrimitiveShadow);
+      UF.UC.markNosanitize(Labeled);
+      Value *Check = IRB.CreateOr(NotNull, Labeled);
+      UF.UC.markNosanitize(Check);
+      // (CB, and the block's terminator with its BBID, go to the tail)
+      Instruction *ThenTerm = SplitBlockAndInsertIfThen(Check, &CB, false);
+      BasicBlock *ThenBB = ThenTerm->getParent();
+      BasicBlock *HeadBB = ThenBB->getSinglePredecessor();
+      UF.DT.recalculate(*UF.F);
+      IRBuilder<> ThenIRB(ThenTerm);
+      Value *Checked = UF.checkPointer(P, Size, true, ThenIRB, TypeID);
+      IRB.SetInsertPoint(&CB);
+      PHINode *Phi = IRB.CreatePHI(P->getType(), 2);
+      Phi->addIncoming(Checked, ThenTerm->getParent());
+      Phi->addIncoming(P, HeadBB);
+      UF.UC.markNosanitize(Phi);
+      return Phi;
+    };
+
     auto *I = CB.arg_begin();
     for (unsigned N = FT->getNumParams(); N != 0; ++I, --N) {
       unsigned ArgIdx = FT->getNumParams() - N;
@@ -6536,7 +6572,9 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
 
         Value *rptr = *I;
         if (!skipCheckPointer) {
-          rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
+          rptr = IsMemOrStrFn
+                     ? UF.checkPointer(*I, sizeArg, true, IRB, TypeID)
+                     : checkUnlessNull(*I, sizeArg, TypeID);
         }
         CB.setArgOperand(ArgIdx, rptr);
 
@@ -6545,6 +6583,19 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
           if (ArgIdx == 0) ResolvedDst = rptr;
           else if (ArgIdx == 1) ResolvedSrc = rptr;
         }
+      }
+    }
+
+    // The variadic ones too (snprintf's %s arguments are dereferenced): as
+    // typeless bytes of unknown length, like a string function's.
+    if (FT->isVarArg()) {
+      for (unsigned ArgIdx = FT->getNumParams(); ArgIdx < CB.arg_size();
+           ++ArgIdx) {
+        Value *A = CB.getArgOperand(ArgIdx);
+        if (!A->getType()->isPointerTy() || isa<ConstantPointerNull>(A))
+          continue;
+        CB.setArgOperand(ArgIdx, checkUnlessNull(
+            A, ConstantInt::get(UF.UC.Int64Ty, 0), 0));
       }
     }
 
