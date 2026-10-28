@@ -1140,6 +1140,25 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
+  // The runtime takes and returns its labels as uint16_t (and its flags as
+  // bool/uint8_t), and clang compiles it assuming the caller zero-extended
+  // them (ucsan_combine_label compares l1 with `cmp $0xffff, %edi`), so a
+  // label passed without zeroext could carry junk high bits and an uninit
+  // label would be missed.  Every small integer here is unsigned.
+  for (Value *V : UCRuntimeFunctions) {
+    Function *RF = dyn_cast<Function>(V);
+    if (!RF || RF->isIntrinsic())
+      continue;
+    auto IsSmall = [](Type *T) {
+      return T->isIntegerTy() && T->getIntegerBitWidth() < 32;
+    };
+    if (IsSmall(RF->getReturnType()))
+      RF->addRetAttr(Attribute::ZExt);
+    for (Argument &A : RF->args())
+      if (IsSmall(A.getType()))
+        RF->addParamAttr(A.getArgNo(), Attribute::ZExt);
+  }
+
   // __ucsan_symbolize_input: declared in user source code, not emitted by pass.
   // Register as runtime function to prevent dangle wrapping.
   // Arg shadow is stored to __ucsan_arg_tls automatically by visitCallBase.
