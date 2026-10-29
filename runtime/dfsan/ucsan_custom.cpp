@@ -1109,6 +1109,24 @@ int __dfsw_openat(int dirfd, const char *path, int oflags,
   return fake_fd;
 }
 
+// The *64 twins are the same calls on LP64 (glibc aliases them).
+__attribute__((visibility("default")))
+int __dfsw_open64(const char *path, int oflags, ucsan_label path_label,
+                  ucsan_label oflags_label, ucsan_label *va_labels,
+                  ucsan_label *ret_label, ...) {
+  return __dfsw_open(path, oflags, path_label, oflags_label, va_labels,
+                     ret_label);
+}
+
+__attribute__((visibility("default")))
+int __dfsw_openat64(int dirfd, const char *path, int oflags,
+                    ucsan_label dirfd_label, ucsan_label path_label,
+                    ucsan_label oflags_label, ucsan_label *va_labels,
+                    ucsan_label *ret_label, ...) {
+  return __dfsw_openat(dirfd, path, oflags, dirfd_label, path_label,
+                       oflags_label, va_labels, ret_label);
+}
+
 __attribute__((visibility("default")))
 FILE *__dfsw_fopen(const char *filename, const char *mode,
                    ucsan_label filename_label, ucsan_label mode_label,
@@ -1486,6 +1504,28 @@ __attribute__((visibility("default")))
 FILE *__dfsl_fopen(const char *filename, const char *mode,
                    dfsan_label filename_label, dfsan_label mode_label,
                    dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_fopen(filename, mode, 0, 0, &l));
+}
+
+__attribute__((visibility("default")))
+int __dfsl_open64(const char *path, int oflags, dfsan_label path_label,
+                  dfsan_label oflags_label, dfsan_label *va_labels,
+                  dfsan_label *ret_label, ...) {
+  return DFSL_CALL(ret_label, __dfsw_open(path, oflags, 0, 0, nullptr, &l));
+}
+
+__attribute__((visibility("default")))
+int __dfsl_openat64(int dirfd, const char *path, int oflags,
+                    dfsan_label dirfd_label, dfsan_label path_label,
+                    dfsan_label oflags_label, dfsan_label *va_labels,
+                    dfsan_label *ret_label, ...) {
+  return DFSL_CALL(ret_label, __dfsw_openat(dirfd, path, oflags, 0, 0, 0, nullptr, &l));
+}
+
+__attribute__((visibility("default")))
+FILE *__dfsl_fopen64(const char *filename, const char *mode,
+                     dfsan_label filename_label, dfsan_label mode_label,
+                     dfsan_label *ret_label) {
   return DFSL_CALL(ret_label, __dfsw_fopen(filename, mode, 0, 0, &l));
 }
 

@@ -134,7 +134,9 @@ fun:strdup=copystr
 
 # I/O open/close (fake handles, no real libc I/O)
 fun:open=custom
+fun:open64=custom
 fun:openat=custom
+fun:openat64=custom
 fun:close=custom
 fun:fopen=custom
 fun:fopen64=custom
