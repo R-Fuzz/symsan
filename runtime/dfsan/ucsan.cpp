@@ -1806,10 +1806,18 @@ ucsan_label ucsan_load_pointer_shadow(ucsan_label *ls, uint64_t n, bool is_point
   }
 
   // Load pointer but not as pointer type
+  // (or as a 32-bit one: a compressed pointer, v8's tagged field, is the low
+  // half of a pointer stored as an i32 and decompressed as `base | zext(raw)`;
+  // its label is the object's identity whatever the concrete bits, and
+  // dropping it here left the decompressed map pointer unlabeled -- a null
+  // deref on `map->instance_type`.  Only a resolved pointer: seed bytes
+  // (OP_NONE) read as an i32 are an integer.  The upper half of a stored
+  // pointer reads the same label, as the store writes it to every byte.)
   if (label0 >= UCSAN_CONST_OFFSET &&
       (label_info->common.op == OP_EXTERNAL || label_info->common.op == OP_NONE ||
        label_info->common.op == OP_ALLOCA || label_info->common.op == OP_FREE) &&
-      n == sizeof(void*)) {
+      (n == sizeof(void*) ||
+       (n == sizeof(uint32_t) && label_info->common.op != OP_NONE))) {
     return label0;
   }
 
@@ -1830,7 +1838,8 @@ void ucsan_store_pointer_shadow(ucsan_label l, ucsan_label *ls, uint64_t n) {
       label_info->common.op == OP_NONE ||
       label_info->common.op == OP_ALLOCA ||
       label_info->common.op == OP_FREE) {
-    assert(n == sizeof(void*));
+    // a pointer, or a compressed one (see ucsan_load_pointer_shadow)
+    assert(n == sizeof(void*) || n == sizeof(uint32_t));
     for (uint64_t i = 0; i < n; ++i) ls[i] = l;
     return;
   }
