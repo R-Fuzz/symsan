@@ -1806,6 +1806,24 @@ static void normalizeBoolLoads(Function &F) {
   }
 }
 
+// Where a function's exit code goes before its terminator: the ret itself, or
+// the musttail call ahead of it, which only an optional bitcast may separate
+// from the ret (partition_alloc's allocator-shim dispatch,
+// DelegatedAllocFn, ends in one; code put after it fails the verifier).  The
+// visitor, which runs after this, puts the call's own argument shadows right
+// before it, so after this code.
+static Instruction *getExitInsertPoint(Instruction *Term) {
+  if (!isa<ReturnInst>(Term))
+    return Term;
+  Instruction *Prev = Term->getPrevNode();
+  if (Prev && isa<BitCastInst>(Prev))
+    Prev = Prev->getPrevNode();
+  if (auto *CI = dyn_cast_or_null<CallInst>(Prev))
+    if (CI->isMustTailCall())
+      return CI;
+  return Term;
+}
+
 void Taint::addContextRecording(Function &F) {
   // Most code from Angora
   BasicBlock *BB = &F.getEntryBlock();
@@ -1839,7 +1857,7 @@ void Taint::addContextRecording(Function &F) {
     BasicBlock *BB = &*FI;
     Instruction *Inst = BB->getTerminator();
     if (isa<ReturnInst>(Inst) || isa<ResumeInst>(Inst)) {
-      IRB.SetInsertPoint(Inst);
+      IRB.SetInsertPoint(getExitInsertPoint(Inst));
       SCS = IRB.CreateStore(LCS, CallStack);
       SCS->setMetadata(Mod->getMDKindID("nosanitize"), MDNode::get(*Ctx, std::nullopt));
     }
@@ -1862,7 +1880,7 @@ void Taint::addFrameTracing(Function &F) {
     BasicBlock *BB = &*FI;
     Instruction *Inst = BB->getTerminator();
     if (isa<ReturnInst>(Inst) || isa<ResumeInst>(Inst)) {
-      IRB.SetInsertPoint(Inst);
+      IRB.SetInsertPoint(getExitInsertPoint(Inst));
       IRB.CreateCall(TaintPopStackFrameFn,
                      {ConstantInt::get(Int64Ty, F.getGUID())});
     }
@@ -5363,6 +5381,16 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
     }
   }
 
+  // A vector GEP (the loop vectorizer's `getelementptr T, ptr %p, <2 x i64>`,
+  // v8's turboshaft Graph::AllocateNewBlocks) is a vector of pointers: its
+  // indices are vectors, which the bounds/trace calls below take as i64, and
+  // __taint_gep_offset's bitcast of <2 x ptr> to ptr is invalid IR.  It keeps
+  // the base's shadow, its offsets untraced.
+  if (I->getType()->isVectorTy()) {
+    setShadow(I, Shadow);
+    return;
+  }
+
   Type *POTy = I->getPointerOperandType();
   Type *ETy = POTy;
   for (auto &Idx: I->indices()) {
@@ -6308,7 +6336,11 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
 
   // bswap: decompose into Extract-per-byte then Concat in reverse order.
   // __taint_union(l1=low, l2=high, Concat) → z3::concat(high, low) (little-endian)
-  if (IId == Intrinsic::bswap) {
+  // (A vector bswap -- v8's SIMD byte reversal -- falls through and drops the
+  // shadow, as the unary bit ops below do: getIntegerBitWidth() is a
+  // cast<IntegerType>, and on a vector it crashed opt.)
+  if (IId == Intrinsic::bswap &&
+      CB.getArgOperand(0)->getType()->isIntegerTy()) {
     Value *Shadow = TF.getShadow(CB.getArgOperand(0));
     unsigned TotalBits = CB.getArgOperand(0)->getType()->getIntegerBitWidth();
     unsigned NumBytes = TotalBits / 8;
@@ -6470,17 +6502,25 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
       // fma / fmuladd (3 operands) are handled above by decomposition.
       default: break;
     }
-    if (FpOp != 0 && CB.getType()->isFloatingPointTy()) {
+    // A binary op wider than 64 bits (fp80/fp128 minnum, copysign) is left
+    // unmodeled: its concrete operand would ride truncated in a 64-bit slot,
+    // a wrong constant in the AST (combineShadows has WideConst for that; this
+    // path does not).  A unary one's operand value is unused, the solver
+    // rebuilding it from the label.
+    if (FpOp != 0 && CB.getType()->isFloatingPointTy() &&
+        !(IsBinary && CB.getType()->getPrimitiveSizeInBits() > 64)) {
       IRBuilder<> IRB(&CB);
       auto &DL = CB.getModule()->getDataLayout();
       uint64_t Size = DL.getTypeSizeInBits(CB.getType());
       // FP operands are bitcast to same-width integers before the union call,
-      // matching combineShadows().
+      // matching combineShadows().  (Any FP type: an x86_fp80 is an i80, the
+      // low 64 bits its significand, as there; a trunc straight from the
+      // float type, absl's long double formatting's fabs, is invalid IR.)
       auto FpToInt = [&](Value *V) -> Value * {
         Type *Ty = V->getType();
-        if (Ty->isHalfTy())        V = IRB.CreateBitCast(V, TF.TT.Int16Ty);
-        else if (Ty->isFloatTy())  V = IRB.CreateBitCast(V, TF.TT.Int32Ty);
-        else if (Ty->isDoubleTy()) V = IRB.CreateBitCast(V, TF.TT.Int64Ty);
+        if (Ty->isFloatingPointTy())
+          V = IRB.CreateBitCast(
+              V, IntegerType::get(CB.getContext(), Ty->getPrimitiveSizeInBits()));
         return IRB.CreateZExtOrTrunc(V, TF.TT.Int64Ty);
       };
       Value *Op = ConstantInt::get(TF.TT.Int16Ty, FpOp);
