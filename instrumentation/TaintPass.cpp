@@ -5143,10 +5143,13 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
       symsan::matchRMWStore(SI, [](Instruction &I) {
         if (I.getMetadata("nosanitize"))
           return true;
+        // (and UCSan's: library code's __ucsan_lib_store before each store
+        // writes UCSan's shadow, not the program's memory)
         auto *CB = dyn_cast<CallBase>(&I);
         Function *Callee = CB ? CB->getCalledFunction() : nullptr;
         return Callee && (Callee->getName().starts_with("__taint_") ||
-                          Callee->getName().starts_with("__dfsan_"));
+                          Callee->getName().starts_with("__dfsan_") ||
+                          Callee->getName().starts_with("__ucsan_"));
       }, RMW)) {
     Value *Alt = TF.TT.ZeroPrimitiveShadow;
     for (auto [BO, Idx] : RMW.Chain) {
