@@ -65,11 +65,33 @@ SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE void f(__VA_ARGS__);
 
 static off_t current_stdin_offset = 0;
 
+// The label table entry of a label a wrapper only inspects (is it a string op,
+// how wide is it), or nullptr for one that has none: a constant, and
+// kInitializingLabel.  That is what an uninitialized byte reads as, not an
+// entry -- dfsan_get_label_info() Die()s on it, as "out of labels", which is
+// what dfsan_check_label takes it for.  dfsan_read_label keeps it out of the
+// content labels the wrappers read, but not out of their arguments: the label
+// of a pointer or a length computed from an uninitialized value, a use
+// __taint_check_bounds has reported already (and goes on from when
+// exit_on_memerror is off).  v8's Interpreter::Initialize compared a short
+// std::string whose header byte libc++ had read as part of an 8-byte word:
+// data() selected on is_long, bcmp's pointer and length labels were
+// kInitializingLabel, and the run died in get_str_label_n.
+static inline dfsan_label_info *label_info(dfsan_label label) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) return nullptr;
+  return dfsan_get_label_info(label);
+}
+
+// whether a label is a string op's result (see label_info)
+static inline bool is_string_op_label(dfsan_label label) {
+  dfsan_label_info *info = label_info(label);
+  return info && is_string_op(info->op);
+}
+
 // Get the concrete string length represented by a taint label.
 // Returns 0 if the length cannot be determined.
 static size_t get_label_string_length(dfsan_label label) {
-  if (label < CONST_OFFSET) return 0;
-  dfsan_label_info *info = dfsan_get_label_info(label);
+  dfsan_label_info *info = label_info(label);
   if (!info) return 0;
 
   if (info->op == __dfsan::Load) {
@@ -105,8 +127,7 @@ static inline dfsan_label get_str_label_n(const void *s, dfsan_label s_label,
 
   // 2. Check if pointer label itself is a content-type string op (for chaining)
   // Only chain on fsubstr/fstrcat, NOT indexOf ops (fstrchr, fstrrchr, etc.)
-  if (s_label >= CONST_OFFSET) {
-    dfsan_label_info *info = dfsan_get_label_info(s_label);
+  if (dfsan_label_info *info = label_info(s_label)) {
     AOUT("get_str_label_n: step 2 s_label op=%u, is_content=%d\n",
          info ? info->op : 0, info ? is_content_string_op(info->op) : 0);
     if (info && is_content_string_op(info->op)) {
@@ -131,8 +152,7 @@ static inline dfsan_label get_str_label_n(const void *s, dfsan_label s_label,
       } else if (is_indexof_op(start_info->op)) {
         // Case 3b: Direct indexOf - only if s_label confirms indexOf origin
         // This distinguishes memchr(t1,...) from memchr(buf,...) when t1==buf
-        dfsan_label_info *s_info = (s_label >= CONST_OFFSET) ?
-                                    dfsan_get_label_info(s_label) : nullptr;
+        dfsan_label_info *s_info = label_info(s_label);
         if (s_info && is_indexof_op(s_info->op)) {
           indexOf_label = start_label;
         }
@@ -187,7 +207,7 @@ static inline dfsan_label get_str_label_n(const void *s, dfsan_label s_label,
   // This ensures string theory operations (strchr, memrchr, etc.) see the full
   // buffer even when the symbolic length is smaller than the actual object.
   if (n_label != 0 && s_label != 0) {
-    dfsan_label_info *info = dfsan_get_label_info(s_label);
+    dfsan_label_info *info = label_info(s_label);
     if (info && info->op == __dfsan::Alloca) {
       uint64_t lower = info->op1.i;
       uint64_t upper = info->op2.i;
@@ -332,8 +352,9 @@ static inline dfsan_label net16_label(dfsan_label label) {
 // same value.
 static inline dfsan_label case_fold_label(dfsan_label c_label, uint16_t op,
                                           uint64_t mask) {
-  if (c_label == 0)
-    return 0;
+  // (an uninitialized character stays one: see label_info)
+  if (c_label == 0 || c_label == kInitializingLabel)
+    return c_label;
   dfsan_label_info *info = dfsan_get_label_info(c_label);
   if ((info->op == __dfsan::ZExt || info->op == __dfsan::SExt) && info->l1) {
     dfsan_label base = info->l1;
@@ -433,6 +454,21 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_memerr(dfsan_label ptr_label, uptr ptr,
                           dfsan_label size_label, uint64_t size,
                           uint16_t flag, void *addr);
+
+// The object a free or a realloc under trace_bounds marks freed, by its
+// pointer's label.  kInitializingLabel names none (see label_info): the
+// pointer was computed from an uninitialized value, a use reported the way
+// __taint_check_bounds reports a dereference of one.
+static dfsan_label_info *released_object(dfsan_label ptr_label, void *ptr,
+                                         void *addr) {
+  if (ptr_label == kInitializingLabel) {
+    AOUT("WARNING: uninitialized pointer freed %p @%p\n", ptr, addr);
+    __taint_trace_memerr(ptr_label, (uptr)ptr, 0, 0, F_MEMERR_UBI, addr);
+    if (flags().exit_on_memerror) Die();
+    return nullptr;
+  }
+  return dfsan_get_label_info(ptr_label);
+}
 
 extern "C" {
 SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
@@ -727,8 +763,8 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
   }
 
   // Check if either side is a string op - use string theory comparison
-  bool l1_is_string_op = (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
-  bool l2_is_string_op = (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
+  bool l1_is_string_op = is_string_op_label(l1);
+  bool l2_is_string_op = is_string_op_label(l2);
 
   uint16_t op = (l1_is_string_op || l2_is_string_op) ? __dfsan::fstrcmp : __dfsan::fmemcmp;
   dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
@@ -758,8 +794,8 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   }
 
   // Check if either side is a string op - use string theory comparison
-  bool l1_is_string_op = (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
-  bool l2_is_string_op = (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
+  bool l1_is_string_op = is_string_op_label(l1);
+  bool l2_is_string_op = is_string_op_label(l2);
 
   uint16_t op = (l1_is_string_op || l2_is_string_op) ? __dfsan::fstrcmp : __dfsan::fmemcmp;
   dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
@@ -782,10 +818,8 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
 // therefore put the entire family out of reach of the fuzzing path, including
 // the common case that is plainly just a memcmp.
 static inline uint16_t str_cmp_op(dfsan_label l1, dfsan_label l2) {
-  bool l1_is_string_op =
-      (l1 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l1)->op));
-  bool l2_is_string_op =
-      (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
+  bool l1_is_string_op = is_string_op_label(l1);
+  bool l2_is_string_op = is_string_op_label(l2);
   return (l1_is_string_op || l2_is_string_op) ? __dfsan::fstrcmp
                                               : __dfsan::fmemcmp;
 }
@@ -838,7 +872,10 @@ static inline size_t str_cmp_len(const char *s1, const char *s2, dfsan_label l1,
 // fall back to fstrcmp, which is exactly what this code did before fmemcmp was
 // an option.
 static inline bool cmp_label_fits(dfsan_label l, size_t n) {
-  return l == 0 || dfsan_get_label_info(l)->size == n * 8;
+  // (kInitializingLabel has no width, and the comparison's label is it
+  // whichever op is built: see label_info)
+  dfsan_label_info *info = label_info(l);
+  return !info || info->size == n * 8;
 }
 
 static inline uint16_t str_cmp_operands(const char *s1, const char *s2, size_t n,
@@ -2454,7 +2491,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memchr(void *s, int c, size_t n,
     // Skip if get_str_label_n already returned an fsubstr (avoids nesting).
     dfsan_label bounded_src = src_label;
     if (src_label != 0 && n_label != 0) {
-      dfsan_label_info *src_info = dfsan_get_label_info(src_label);
+      dfsan_label_info *src_info = label_info(src_label);
       if (src_info && !is_content_string_op(src_info->op)) {
         bounded_src = dfsan_union(src_label, n_label, __dfsan::fsubstr,
                                   sizeof(void*) * 8, (uint64_t)n, 0);
@@ -2558,7 +2595,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memrchr(const void *s, int c, size_t 
     // Skip if get_str_label_n already returned an fsubstr (avoids nesting).
     dfsan_label bounded_src = src_label;
     if (src_label != 0 && n_label != 0) {
-      dfsan_label_info *src_info = dfsan_get_label_info(src_label);
+      dfsan_label_info *src_info = label_info(src_label);
       if (src_info && !is_content_string_op(src_info->op)) {
         bounded_src = dfsan_union(src_label, n_label, __dfsan::fsubstr,
                                   sizeof(void*) * 8, (uint64_t)n, 0);
@@ -2740,7 +2777,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void *__dfsw_memmem(const void *haystack, size_t h
   // variable beyond the actual symbolized region when it increases haystacklen.
   // Skip if get_str_label_n already returned an fsubstr (avoids nesting).
   if (src_label != 0 && haystacklen_label != 0) {
-    dfsan_label_info *src_info = dfsan_get_label_info(src_label);
+    dfsan_label_info *src_info = label_info(src_label);
     if (src_info && !is_content_string_op(src_info->op)) {
       src_label = dfsan_union(src_label, haystacklen_label, __dfsan::fsubstr,
                               sizeof(void*) * 8, (uint64_t)haystacklen, 0);
@@ -4072,8 +4109,11 @@ __dfsw_realloc(void *ptr, size_t new_size,
     }
     if (flags().trace_bounds) {
       // mark old buffer as freed without truely free it
-      dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-      if (info->op != Alloca) {
+      dfsan_label_info *info =
+          released_object(ptr_label, ptr, __builtin_return_address(0));
+      if (!info) {
+        // (reported)
+      } else if (info->op != Alloca) {
         AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
         // Die();
       } else info->op = Free;
@@ -4116,8 +4156,11 @@ __dfsw___libc_realloc(void *ptr, size_t new_size,
     }
     if (flags().trace_bounds) {
       // mark old buffer as freed without truely free it
-      dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-      if (info->op != Alloca) {
+      dfsan_label_info *info =
+          released_object(ptr_label, ptr, __builtin_return_address(0));
+      if (!info) {
+        // (reported)
+      } else if (info->op != Alloca) {
         AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
         // Die();
       } else info->op = Free;
@@ -4167,8 +4210,11 @@ void *__dfsw_reallocarray(void *ptr, size_t nmemb, size_t new_size,
     }
     if (flags().trace_bounds) {
       // mark old buffer as freed without truely free it
-      dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-      if (info->op != Alloca) {
+      dfsan_label_info *info =
+          released_object(ptr_label, ptr, __builtin_return_address(0));
+      if (!info) {
+        // (reported)
+      } else if (info->op != Alloca) {
         AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
         // Die();
       } else info->op = Free;
@@ -4217,8 +4263,11 @@ void *__dfsw___libc_reallocarray(void *ptr, size_t nmemb, size_t new_size,
     }
     if (flags().trace_bounds) {
       // mark old buffer as freed without truely free it
-      dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-      if (info->op != Alloca) {
+      dfsan_label_info *info =
+          released_object(ptr_label, ptr, __builtin_return_address(0));
+      if (!info) {
+        // (reported)
+      } else if (info->op != Alloca) {
         AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
         // Die();
       } else info->op = Free;
@@ -4472,8 +4521,11 @@ SANITIZER_INTERFACE_ATTRIBUTE void __dfsw_free(void *ptr, dfsan_label ptr_label)
     // don't really free, a hacky way to avoid reusing the address
     // just mark as freed
     AOUT("addr: %p = %d\n", ptr, ptr_label);
-    dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-    if (info->op == Alloca) {
+    dfsan_label_info *info =
+        released_object(ptr_label, ptr, __builtin_return_address(0));
+    if (!info) {
+      // (reported)
+    } else if (info->op == Alloca) {
       info->op = Free;
     } else if (info->op == Free) {
       void *addr = __builtin_return_address(0);
@@ -4505,8 +4557,11 @@ void __dfsw___libc_free(void *ptr, dfsan_label ptr_label) {
     // don't really free, a hacky way to avoid reusing the address
     // just mark as freed
     AOUT("addr: %p = %d\n", ptr, ptr_label);
-    dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-    if (info->op == Alloca) {
+    dfsan_label_info *info =
+        released_object(ptr_label, ptr, __builtin_return_address(0));
+    if (!info) {
+      // (reported)
+    } else if (info->op == Alloca) {
       info->op = Free;
     } else if (info->op == Free) {
       void *addr = __builtin_return_address(0);

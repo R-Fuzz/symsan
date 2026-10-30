@@ -405,6 +405,16 @@ __taint_trace_memcmp(dfsan_label label) {
   if (label == 0)
     return;
 
+  // a comparison that read uninitialized bytes (the custom functions pass it
+  // on, see dfsan_custom.cpp's label_info): no entry to look up, as in
+  // backend/fastgen.cpp
+  if (label == kInitializingLabel) {
+    AOUT("WARNING: uninitialized label %u @%p\n", label,
+         __builtin_return_address(0));
+    if (flags().exit_on_memerror) Die();
+    return;
+  }
+
   dfsan_label_info *info = dfsan_get_label_info(label);
 
   AOUT("tainted memcmp: %d, size: %d\n", label, info->size);

@@ -2634,7 +2634,9 @@ extern "C" dfsan_label taint_get_str_indexof_label(const void *addr) {
 // by walking through PtrToInt, Sub, Add operations.
 // Returns the string op label if found, 0 otherwise.
 extern "C" dfsan_label taint_find_string_op_source(dfsan_label label) {
-  if (label < CONST_OFFSET) return 0;
+  // (kInitializingLabel, a length computed from an uninitialized value, has
+  // no entry to walk: dfsan_get_label_info Die()s on it)
+  if (label < CONST_OFFSET || label == kInitializingLabel) return 0;
 
   dfsan_label_info *info = dfsan_get_label_info(label);
   uint16_t op = info->op;
@@ -2665,7 +2667,8 @@ extern "C" dfsan_label taint_find_string_op_source(dfsan_label label) {
 // Walks through Concat chains and Load operations to find the starting input.
 // Returns the base label, or 0 if not found.
 extern "C" dfsan_label taint_get_base_input_label(dfsan_label label) {
-  if (label < CONST_OFFSET) return 0;
+  // (nor here: see taint_find_string_op_source)
+  if (label < CONST_OFFSET || label == kInitializingLabel) return 0;
 
   dfsan_label_info *info = dfsan_get_label_info(label);
 
