@@ -54,3 +54,34 @@ custom:
     ref_name: ucsan_invalid_input
     arg_maps: []
 ```
+
+## run.py: exploring an entry
+
+```bash
+PYTHONPATH=b4/lib/symsan venv/bin/python tools/ucsan-ut/run.py BINARY \
+    --workdir DIR [--budget SECONDS] [--trace-only] [--seed FILE] \
+    [--target BID [--target-result 0|1]] [--loop-threshold N] \
+    [--ucsan-option K=V]... [--taint-option K=V]... [--config JSON] \
+    [--symbolize] [--bbtrace]
+```
+
+This runs the entry under `UcsanManager` (fuzzer/thoroupy) and writes
+`DIR/result.json`. It records each seed that ran, with its exit status and its
+objects' bytes, and the exit statuses and events. It also records the event
+sites, symbolized with `--symbolize`, the coverage (blocks and directions) and
+the tail of the target's output. The manager's log is `DIR/run.log`, and the
+seed of each finding is saved under `DIR/blocking/`.
+
+The defaults are what a UT entry needs: `concrete_globals`, the UBI and null
+checkers, and `exit_on_memerror=0`. Without that last one, SymSan's first
+uninitialized-shadow branch in library code ends the trace.
+
+`--target BID` names a branch to debug. The run then logs its label, the
+solver's answers, and whether replaying them flips it, in `result.json`'s
+`flip`. Block ids are `100000 + n` for the entry's n-th block, and
+`(i + 2) * 100000 + n` for the function at index i (from 0) of the scope
+YAML's `scope` list.
+
+Pass the instrumented binary itself, not a wrapper script such as one under
+gdb. The manager watches the process it started, so a wrapper that exits after
+the first child looks like a dead target, and the run stops after one seed.
