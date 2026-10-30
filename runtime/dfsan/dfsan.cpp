@@ -271,8 +271,11 @@ void __taint_trace_event_addr(uint32_t label, uint32_t event_id,
 
 // A WideConst leaf is a constant that happens to need a real label to hold its
 // 128 bits, so it carries no more symbolic content than a small literal does.
+// (kInitializingLabel is no label to look up: an uninitialized wide operand
+// reached this before __taint_union's check for it, wide_mul_uninit.c)
 static inline bool is_wide_const(dfsan_label l) {
-  return l != 0 && get_label_info(l)->op == __dfsan::WideConst;
+  return l != 0 && l != kInitializingLabel &&
+         get_label_info(l)->op == __dfsan::WideConst;
 }
 
 static dfsan_label str_ptr_label(dfsan_label l, uint64_t value);
