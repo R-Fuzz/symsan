@@ -1750,9 +1750,29 @@ __dfsw_strncpy(char *s1, const char *s2, size_t n, dfsan_label s1_label,
   return s1;
 }
 
-#ifndef USE_UCSAN_CUSTOM
+// The file I/O wrappers.  In the combined runtime (USE_UCSAN_CUSTOM) UCSan
+// owns their __dfsw_ names: in-scope code reads one simulated, symbolic file.
+// Library code (TaintPass alone) calls them as __dfsl_, and its adapter in
+// ucsan_custom.cpp hands a handle UCSan did not make -- v8's /dev/urandom,
+// opened while setting up a fixture -- to these, compiled as __dfsr_ ("real"):
+// real I/O, labeled only for the taint_file, which a UCSan run has none of.
+// The same code is SymSan's own __dfsw_ wrappers alone.  See README.md.
+#ifdef USE_UCSAN_CUSTOM
+#define DFSW_FILE(name) __dfsr_##name
+#else
+#define DFSW_FILE(name) __dfsw_##name
+#endif
+
+// open's third argument, there only when oflags need one (glibc's
+// __OPEN_NEEDS_MODE); the va_list itself used to be passed as the mode.
+static int open_mode(int oflags, va_list args) {
+  if ((oflags & O_CREAT) || (oflags & O_TMPFILE) == O_TMPFILE)
+    return va_arg(args, int);
+  return 0;
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t
-__dfsw_pread(int fd, void *buf, size_t count, off_t offset,
+DFSW_FILE(pread)(int fd, void *buf, size_t count, off_t offset,
              dfsan_label fd_label, dfsan_label buf_label,
              dfsan_label count_label, dfsan_label offset_label,
              dfsan_label *ret_label) {
@@ -1775,7 +1795,7 @@ __dfsw_pread(int fd, void *buf, size_t count, off_t offset,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t
-__dfsw_pread64(int fd, void *buf, size_t count, off_t offset,
+DFSW_FILE(pread64)(int fd, void *buf, size_t count, off_t offset,
                dfsan_label fd_label, dfsan_label buf_label,
                dfsan_label count_label, dfsan_label offset_label,
                dfsan_label *ret_label) {
@@ -1798,7 +1818,7 @@ __dfsw_pread64(int fd, void *buf, size_t count, off_t offset,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t
-__dfsw_read(int fd, void *buf, size_t count,
+DFSW_FILE(read)(int fd, void *buf, size_t count,
              dfsan_label fd_label, dfsan_label buf_label,
              dfsan_label count_label,
              dfsan_label *ret_label) {
@@ -1823,7 +1843,6 @@ __dfsw_read(int fd, void *buf, size_t count,
   }
   return ret;
 }
-#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_clock_gettime(clockid_t clk_id,
                                                        struct timespec *tp,
@@ -3647,14 +3666,13 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __dfsw___sanitizer_cov_trace_const_cmp8,
                              void) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __dfsw___sanitizer_cov_trace_switch, void) {}
 
-#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_open(const char *path, int oflags, dfsan_label path_label,
+DFSW_FILE(open)(const char *path, int oflags, dfsan_label path_label,
             dfsan_label flag_label, dfsan_label *va_labels,
             dfsan_label *ret_label, ...) {
   va_list args;
   va_start(args, ret_label);
-  int fd = open(path, oflags, args);
+  int fd = open(path, oflags, open_mode(oflags, args));
   va_end(args);
 
   if (fd)
@@ -3664,12 +3682,12 @@ __dfsw_open(const char *path, int oflags, dfsan_label path_label,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_openat(int dirfd, const char *path, int oflags, dfsan_label dirfd_label,
+DFSW_FILE(openat)(int dirfd, const char *path, int oflags, dfsan_label dirfd_label,
               dfsan_label path_label, dfsan_label flag_label,
               dfsan_label *va_labels, dfsan_label *ret_label, ...) {
   va_list args;
   va_start(args, ret_label);
-  int fd = openat(dirfd, path, oflags, args);
+  int fd = openat(dirfd, path, oflags, open_mode(oflags, args));
   va_end(args);
 
   if (fd)
@@ -3685,12 +3703,12 @@ __dfsw_openat(int dirfd, const char *path, int oflags, dfsan_label dirfd_label,
 // bytes in it.  Written out rather than forwarded because the varargs cannot
 // be passed along; the bodies mirror their siblings above, quirk for quirk.
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_open64(const char *path, int oflags, dfsan_label path_label,
+DFSW_FILE(open64)(const char *path, int oflags, dfsan_label path_label,
               dfsan_label flag_label, dfsan_label *va_labels,
               dfsan_label *ret_label, ...) {
   va_list args;
   va_start(args, ret_label);
-  int fd = open(path, oflags, args);
+  int fd = open(path, oflags, open_mode(oflags, args));
   va_end(args);
 
   if (fd)
@@ -3700,13 +3718,13 @@ __dfsw_open64(const char *path, int oflags, dfsan_label path_label,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_openat64(int dirfd, const char *path, int oflags,
+DFSW_FILE(openat64)(int dirfd, const char *path, int oflags,
                 dfsan_label dirfd_label, dfsan_label path_label,
                 dfsan_label flag_label, dfsan_label *va_labels,
                 dfsan_label *ret_label, ...) {
   va_list args;
   va_start(args, ret_label);
-  int fd = openat(dirfd, path, oflags, args);
+  int fd = openat(dirfd, path, oflags, open_mode(oflags, args));
   va_end(args);
 
   if (fd)
@@ -3716,7 +3734,7 @@ __dfsw_openat64(int dirfd, const char *path, int oflags,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE FILE *
-__dfsw_fopen(const char *filename, const char *mode,
+DFSW_FILE(fopen)(const char *filename, const char *mode,
              dfsan_label filename_label, dfsan_label mode_label,
              dfsan_label *ret_label) {
   FILE *ret = fopen(filename, mode);
@@ -3729,7 +3747,7 @@ __dfsw_fopen(const char *filename, const char *mode,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE FILE *
-__dfsw_fopen64(const char *filename, const char *mode,
+DFSW_FILE(fopen64)(const char *filename, const char *mode,
                dfsan_label filename_label, dfsan_label mode_label,
                dfsan_label *ret_label) {
   FILE *ret = fopen64(filename, mode);
@@ -3742,7 +3760,7 @@ __dfsw_fopen64(const char *filename, const char *mode,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE FILE *
-__dfsw_freopen(const char *filename, const char *mode,
+DFSW_FILE(freopen)(const char *filename, const char *mode,
                FILE *stream, dfsan_label filename_label,
                dfsan_label mode_label, dfsan_label stream_label,
                dfsan_label *ret_label) {
@@ -3755,34 +3773,32 @@ __dfsw_freopen(const char *filename, const char *mode,
 
 // fopen64 has had an abilist entry all along; freopen64 is its missing twin.
 SANITIZER_INTERFACE_ATTRIBUTE FILE *
-__dfsw_freopen64(const char *filename, const char *mode,
+DFSW_FILE(freopen64)(const char *filename, const char *mode,
                  FILE *stream, dfsan_label filename_label,
                  dfsan_label mode_label, dfsan_label stream_label,
                  dfsan_label *ret_label) {
-  return __dfsw_freopen(filename, mode, stream, filename_label, mode_label,
+  return DFSW_FILE(freopen)(filename, mode, stream, filename_label, mode_label,
                         stream_label, ret_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_close(int fd, dfsan_label fd_label, dfsan_label *ret_label) {
+DFSW_FILE(close)(int fd, dfsan_label fd_label, dfsan_label *ret_label) {
   taint_close_file(fd);
   *ret_label = 0;
   return close(fd);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_fclose(FILE *fp, dfsan_label fp_label, dfsan_label *ret_label) {
+DFSW_FILE(fclose)(FILE *fp, dfsan_label fp_label, dfsan_label *ret_label) {
   int fd = fileno(fp);
   int ret = fclose(fp);
   if (!ret) taint_close_file(fd);
   *ret_label = 0;
   return ret;
 }
-#endif // USE_UCSAN_CUSTOM
 
-#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE size_t
-__dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
+DFSW_FILE(fread)(void *ptr, size_t size, size_t nmemb, FILE *stream,
              dfsan_label ptr_label, dfsan_label size_label,
              dfsan_label nmemb_label, dfsan_label stream_label,
              dfsan_label *ret_label) {
@@ -3831,7 +3847,7 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE size_t
-__dfsw_fread_unlocked(
+DFSW_FILE(fread_unlocked)(
              void *ptr, size_t size, size_t nmemb, FILE *stream,
              dfsan_label ptr_label, dfsan_label size_label,
              dfsan_label nmemb_label, dfsan_label stream_label,
@@ -3879,7 +3895,6 @@ __dfsw_fread_unlocked(
   }
   return ret;
 }
-#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE ssize_t
 __dfsw_getline(char **lineptr, size_t *n, FILE *stream,
@@ -4586,9 +4601,8 @@ static dfsan_label taint_getc(int fd, off_t offset, int ret) {
   return label;  // was `return 0`: every fgetc/getc/getchar result came back untainted
 }
 
-#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_fgetc(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
+DFSW_FILE(fgetc)(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
   int fd = fileno(stream);
   off_t offset = ftell(stream);
   int ret = fgetc(stream);
@@ -4597,7 +4611,7 @@ __dfsw_fgetc(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_fgetc_unlocked(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
+DFSW_FILE(fgetc_unlocked)(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
   int fd = fileno(stream);
   off_t offset = ftell(stream);
   int ret = fgetc(stream);
@@ -4606,7 +4620,7 @@ __dfsw_fgetc_unlocked(FILE *stream, dfsan_label stream_label, dfsan_label *ret_l
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_getc(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
+DFSW_FILE(getc)(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
   int fd = fileno(stream);
   off_t offset = ftell(stream);
   int ret = getc(stream);
@@ -4615,7 +4629,7 @@ __dfsw_getc(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_getc_unlocked(FILE *stream, dfsan_label stream_label,
+DFSW_FILE(getc_unlocked)(FILE *stream, dfsan_label stream_label,
                      dfsan_label *ret_label) {
   int fd = fileno(stream);
   off_t offset = ftell(stream);
@@ -4625,7 +4639,7 @@ __dfsw_getc_unlocked(FILE *stream, dfsan_label stream_label,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw__IO_getc(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
+DFSW_FILE(_IO_getc)(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
   int fd = fileno(stream);
   off_t offset = ftell(stream);
   int ret = getc(stream);
@@ -4634,13 +4648,12 @@ __dfsw__IO_getc(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) 
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_getchar(dfsan_label *ret_label) {
+DFSW_FILE(getchar)(dfsan_label *ret_label) {
   off_t offset = ftell(stdin);
   int ret = getchar();
   *ret_label = taint_getc(0, offset, ret);
   return ret;
 }
-#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE size_t
 __dfsw_mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps,
@@ -4745,9 +4758,8 @@ __dfsw_lseek64(int fd, off64_t offset, int whence, dfsan_label fd_label,
   return ret;
 }
 
-#ifndef USE_UCSAN_CUSTOM
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_fseek(FILE *stream, long offset, int whence, dfsan_label stream_label,
+DFSW_FILE(fseek)(FILE *stream, long offset, int whence, dfsan_label stream_label,
              dfsan_label offset_label, dfsan_label whence_label,
              dfsan_label *ret_label) {
   int fd = fileno(stream);
@@ -4763,7 +4775,7 @@ __dfsw_fseek(FILE *stream, long offset, int whence, dfsan_label stream_label,
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE int
-__dfsw_fseeko(FILE *stream, off_t offset, int whence, dfsan_label stream_label,
+DFSW_FILE(fseeko)(FILE *stream, off_t offset, int whence, dfsan_label stream_label,
              dfsan_label offset_label, dfsan_label whence_label,
              dfsan_label *ret_label) {
   int fd = fileno(stream);
@@ -4777,7 +4789,6 @@ __dfsw_fseeko(FILE *stream, off_t offset, int whence, dfsan_label stream_label,
   }
   return ret;
 }
-#endif // USE_UCSAN_CUSTOM
 
 SANITIZER_INTERFACE_ATTRIBUTE int
 __dfsw_fseeko64(FILE *stream, off64_t offset, int whence, dfsan_label stream_label,

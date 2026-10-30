@@ -53,6 +53,22 @@ dfsan's ABI and calls UCSan's `__dfsw_X`.  Library code and in-scope code
 therefore share one heap (UCSan's) and one simulated file.  A `FILE*`
 in-scope code got from UCSan's `fopen` is a handle libc++ can read from.
 
+File I/O is the exception: library code's own files are real.  A library
+`open`/`fopen` is a real one, and a read, seek or close goes to UCSan's
+wrapper only for a handle UCSan's made (an fd from 1000, a `FILE*` from
+0xFAFE0000) or stdin (fd 0, unless library code opened fd 0 itself because
+stdin was closed).  Any other handle goes to dfsan_custom.cpp's wrapper,
+which the combined runtime compiles as `__dfsr_X` ("real"), since UCSan owns
+the `__dfsw_` name: real I/O, labeled only for the `taint_file`, which a UCSan
+run has none of.  The bytes read are initialized in UCSan's shadow too.  v8's
+fixture, setting up an Isolate out of scope, seeds its random number
+generators from `/dev/urandom`; read as UCSan's simulated file, the seeds
+were symbolic, and so were the mmap hints derived from them, and the solver
+spent its time there.  In-scope code is not dispatched: UCSan's `read`
+reads its simulated file whatever the fd, a real one library code opened
+included.  A C++ program in scope whose input is a file read through
+`std::ifstream` (libc++.a's `basic_filebuf`) now reads the real file.
+
 The adapter passes no UCSan labels: library code keeps none.  It returns the
 dfsan label UCSan's wrapper set in retval TLS slot 0, which is the label an
 in-scope call reads.  It clears the slot first, because not every path of

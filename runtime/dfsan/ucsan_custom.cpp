@@ -10,6 +10,7 @@
 
 #include <execinfo.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <malloc.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1011,8 +1012,10 @@ static ucsan_file_state __ucsan_file = {0, 0, 0, -1, -1, nullptr};
 // Counter for synthetic fd/FILE* values returned by our open/fopen wrappers.
 // Start above the usual stdio fds and at a recognizable bit pattern for
 // FILE* so accidental dereferences fault loudly instead of returning data.
-static int __ucsan_fake_fd_counter = 1000;
-static uintptr_t __ucsan_fake_file_counter = 0xFAFE0000;
+static const int kFirstFakeFd = 1000;
+static const uintptr_t kFirstFakeFile = 0xFAFE0000;
+static int __ucsan_fake_fd_counter = kFirstFakeFd;
+static uintptr_t __ucsan_fake_file_counter = kFirstFakeFile;
 
 static off_t concrete_file_size(const char *path) {
   if (!path) return -1;
@@ -1552,20 +1555,125 @@ void __dfsl_free(void *ptr, dfsan_label ptr_label) {
   __dfsw_free(ptr, 0);
 }
 
+// The file I/O adapters.  UCSan's wrappers simulate one symbolic file, and a
+// handle they made goes back to them: libc++ reading a FILE* in-scope code
+// got from fopen.  So does stdin, which UCSan reads as that file too.  Every
+// other handle is a real file library code opened -- v8's fixture seeds its
+// RandomNumberGenerator from /dev/urandom, and its page allocator's mmap hints
+// were symbolic -- and goes to dfsan_custom.cpp's wrappers, as __dfsr_: real
+// I/O, labeled only for the taint_file.  Library opens are all real.
+// FIXME: in-scope code is not dispatched: UCSan's read reads its simulated
+// file whatever the fd, a real one library code opened included.
+
+// The fds library code opened for real: fd 0 among them, when the process
+// started with stdin closed (the test harness), is not stdin.
+static uint64_t __ucsan_lib_real_fds[kFirstFakeFd / 64 + 1];
+
+static void lib_real_fd(int fd, bool open) {
+  if (fd < 0 || fd >= kFirstFakeFd)
+    return;
+  uint64_t bit = uint64_t(1) << (fd % 64);
+  if (open)
+    __ucsan_lib_real_fds[fd / 64] |= bit;
+  else
+    __ucsan_lib_real_fds[fd / 64] &= ~bit;
+}
+
+static bool ucsan_file_fd(int fd) {
+  if (fd == 0)
+    return !(__ucsan_lib_real_fds[0] & 1);
+  return fd >= kFirstFakeFd && fd < __ucsan_fake_fd_counter;
+}
+
+static bool ucsan_file_stream(FILE *stream) {
+  uintptr_t v = (uintptr_t)stream;
+  return stream == stdin ||
+         (v >= kFirstFakeFile && v < __ucsan_fake_file_counter);
+}
+
+// open's third argument, there only when oflags need one (glibc's
+// __OPEN_NEEDS_MODE)
+static int open_mode(int oflags, va_list args) {
+  if ((oflags & O_CREAT) || (oflags & O_TMPFILE) == O_TMPFILE)
+    return va_arg(args, int);
+  return 0;
+}
+
+// dfsan_custom.cpp's wrappers, as the combined runtime names them
+ssize_t __dfsr_pread64(int fd, void *buf, size_t count, off_t offset,
+                       dfsan_label fd_label, dfsan_label buf_label,
+                       dfsan_label count_label, dfsan_label offset_label,
+                       dfsan_label *ret_label);
+int __dfsr_open(const char *path, int oflags, dfsan_label path_label,
+                dfsan_label flag_label, dfsan_label *va_labels,
+                dfsan_label *ret_label, ...);
+int __dfsr_openat(int dirfd, const char *path, int oflags,
+                  dfsan_label dirfd_label, dfsan_label path_label,
+                  dfsan_label flag_label, dfsan_label *va_labels,
+                  dfsan_label *ret_label, ...);
+int __dfsr_open64(const char *path, int oflags, dfsan_label path_label,
+                  dfsan_label flag_label, dfsan_label *va_labels,
+                  dfsan_label *ret_label, ...);
+int __dfsr_openat64(int dirfd, const char *path, int oflags,
+                    dfsan_label dirfd_label, dfsan_label path_label,
+                    dfsan_label flag_label, dfsan_label *va_labels,
+                    dfsan_label *ret_label, ...);
+FILE *__dfsr_fopen(const char *filename, const char *mode,
+                   dfsan_label filename_label, dfsan_label mode_label,
+                   dfsan_label *ret_label);
+FILE *__dfsr_fopen64(const char *filename, const char *mode,
+                     dfsan_label filename_label, dfsan_label mode_label,
+                     dfsan_label *ret_label);
+int __dfsr_close(int fd, dfsan_label fd_label, dfsan_label *ret_label);
+int __dfsr_fclose(FILE *fp, dfsan_label fp_label, dfsan_label *ret_label);
+ssize_t __dfsr_read(int fd, void *buf, size_t count, dfsan_label fd_label,
+                    dfsan_label buf_label, dfsan_label count_label,
+                    dfsan_label *ret_label);
+size_t __dfsr_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
+                    dfsan_label ptr_label, dfsan_label size_label,
+                    dfsan_label nmemb_label, dfsan_label stream_label,
+                    dfsan_label *ret_label);
+int __dfsr_fseek(FILE *stream, long offset, int whence,
+                 dfsan_label stream_label, dfsan_label offset_label,
+                 dfsan_label whence_label, dfsan_label *ret_label);
+int __dfsr_fseeko(FILE *stream, off_t offset, int whence,
+                  dfsan_label stream_label, dfsan_label offset_label,
+                  dfsan_label whence_label, dfsan_label *ret_label);
+int __dfsr_getc(FILE *stream, dfsan_label stream_label,
+                dfsan_label *ret_label);
+
+// A real read's bytes are concrete, initialized ones in UCSan's shadow too.
+static void concrete_read(void *buf, ssize_t n) {
+  if (buf && n > 0)
+    internal_memset(ucsan_shadow_for(buf), 0, n * sizeof(ucsan_label));
+}
+
 __attribute__((visibility("default")))
 ssize_t __dfsl_pread64(int fd, void *buf, size_t count, off_t offset,
                        dfsan_label fd_label, dfsan_label buf_label,
                        dfsan_label count_label, dfsan_label offset_label,
                        dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label,
-                   __dfsw_pread64(fd, buf, count, offset, 0, 0, 0, 0, &l));
+  if (ucsan_file_fd(fd))
+    return DFSL_CALL(ret_label,
+                     __dfsw_pread64(fd, buf, count, offset, 0, 0, 0, 0, &l));
+  ssize_t n = __dfsr_pread64(fd, buf, count, offset, fd_label, buf_label,
+                             count_label, offset_label, ret_label);
+  concrete_read(buf, n);
+  return n;
 }
 
 __attribute__((visibility("default")))
 int __dfsl_open(const char *path, int oflags, dfsan_label path_label,
                 dfsan_label oflags_label, dfsan_label *va_labels,
                 dfsan_label *ret_label, ...) {
-  return DFSL_CALL(ret_label, __dfsw_open(path, oflags, 0, 0, nullptr, &l));
+  va_list args;
+  va_start(args, ret_label);
+  int mode = open_mode(oflags, args);
+  va_end(args);
+  int fd = __dfsr_open(path, oflags, path_label, oflags_label, va_labels,
+                       ret_label, mode);
+  lib_real_fd(fd, true);
+  return fd;
 }
 
 __attribute__((visibility("default")))
@@ -1573,21 +1681,38 @@ int __dfsl_openat(int dirfd, const char *path, int oflags,
                   dfsan_label dirfd_label, dfsan_label path_label,
                   dfsan_label oflags_label, dfsan_label *va_labels,
                   dfsan_label *ret_label, ...) {
-  return DFSL_CALL(ret_label, __dfsw_openat(dirfd, path, oflags, 0, 0, 0, nullptr, &l));
+  va_list args;
+  va_start(args, ret_label);
+  int mode = open_mode(oflags, args);
+  va_end(args);
+  int fd = __dfsr_openat(dirfd, path, oflags, dirfd_label, path_label,
+                         oflags_label, va_labels, ret_label, mode);
+  lib_real_fd(fd, true);
+  return fd;
 }
 
 __attribute__((visibility("default")))
 FILE *__dfsl_fopen(const char *filename, const char *mode,
                    dfsan_label filename_label, dfsan_label mode_label,
                    dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_fopen(filename, mode, 0, 0, &l));
+  FILE *f = __dfsr_fopen(filename, mode, filename_label, mode_label, ret_label);
+  if (f)
+    lib_real_fd(fileno(f), true);
+  return f;
 }
 
 __attribute__((visibility("default")))
 int __dfsl_open64(const char *path, int oflags, dfsan_label path_label,
                   dfsan_label oflags_label, dfsan_label *va_labels,
                   dfsan_label *ret_label, ...) {
-  return DFSL_CALL(ret_label, __dfsw_open(path, oflags, 0, 0, nullptr, &l));
+  va_list args;
+  va_start(args, ret_label);
+  int mode = open_mode(oflags, args);
+  va_end(args);
+  int fd = __dfsr_open64(path, oflags, path_label, oflags_label, va_labels,
+                         ret_label, mode);
+  lib_real_fd(fd, true);
+  return fd;
 }
 
 __attribute__((visibility("default")))
@@ -1595,32 +1720,54 @@ int __dfsl_openat64(int dirfd, const char *path, int oflags,
                     dfsan_label dirfd_label, dfsan_label path_label,
                     dfsan_label oflags_label, dfsan_label *va_labels,
                     dfsan_label *ret_label, ...) {
-  return DFSL_CALL(ret_label, __dfsw_openat(dirfd, path, oflags, 0, 0, 0, nullptr, &l));
+  va_list args;
+  va_start(args, ret_label);
+  int mode = open_mode(oflags, args);
+  va_end(args);
+  int fd = __dfsr_openat64(dirfd, path, oflags, dirfd_label, path_label,
+                           oflags_label, va_labels, ret_label, mode);
+  lib_real_fd(fd, true);
+  return fd;
 }
 
 __attribute__((visibility("default")))
 FILE *__dfsl_fopen64(const char *filename, const char *mode,
                      dfsan_label filename_label, dfsan_label mode_label,
                      dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_fopen(filename, mode, 0, 0, &l));
+  FILE *f =
+      __dfsr_fopen64(filename, mode, filename_label, mode_label, ret_label);
+  if (f)
+    lib_real_fd(fileno(f), true);
+  return f;
 }
 
 __attribute__((visibility("default")))
 int __dfsl_close(int fd, dfsan_label fd_label, dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_close(fd, 0, &l));
+  if (ucsan_file_fd(fd))
+    return DFSL_CALL(ret_label, __dfsw_close(fd, 0, &l));
+  lib_real_fd(fd, false);
+  return __dfsr_close(fd, fd_label, ret_label);
 }
 
 __attribute__((visibility("default")))
 int __dfsl_fclose(FILE *stream, dfsan_label stream_label,
                   dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_fclose(stream, 0, &l));
+  if (ucsan_file_stream(stream))
+    return DFSL_CALL(ret_label, __dfsw_fclose(stream, 0, &l));
+  lib_real_fd(fileno(stream), false);
+  return __dfsr_fclose(stream, stream_label, ret_label);
 }
 
 __attribute__((visibility("default")))
 ssize_t __dfsl_read(int fd, void *buf, size_t count, dfsan_label fd_label,
                     dfsan_label buf_label, dfsan_label count_label,
                     dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_read(fd, buf, count, 0, 0, 0, &l));
+  if (ucsan_file_fd(fd))
+    return DFSL_CALL(ret_label, __dfsw_read(fd, buf, count, 0, 0, 0, &l));
+  ssize_t n = __dfsr_read(fd, buf, count, fd_label, buf_label, count_label,
+                          ret_label);
+  concrete_read(buf, n);
+  return n;
 }
 
 __attribute__((visibility("default")))
@@ -1628,27 +1775,43 @@ size_t __dfsl_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
                     dfsan_label ptr_label, dfsan_label size_label,
                     dfsan_label nmemb_label, dfsan_label stream_label,
                     dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_fread(ptr, size, nmemb, stream, 0, 0, 0, 0, &l));
+  if (ucsan_file_stream(stream))
+    return DFSL_CALL(ret_label,
+                     __dfsw_fread(ptr, size, nmemb, stream, 0, 0, 0, 0, &l));
+  size_t n = __dfsr_fread(ptr, size, nmemb, stream, ptr_label, size_label,
+                          nmemb_label, stream_label, ret_label);
+  concrete_read(ptr, n * size);
+  return n;
 }
 
 __attribute__((visibility("default")))
 int __dfsl_fseek(FILE *stream, long offset, int whence,
                  dfsan_label stream_label, dfsan_label offset_label,
                  dfsan_label whence_label, dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_fseek(stream, offset, whence, 0, 0, 0, &l));
+  if (ucsan_file_stream(stream))
+    return DFSL_CALL(ret_label,
+                     __dfsw_fseek(stream, offset, whence, 0, 0, 0, &l));
+  return __dfsr_fseek(stream, offset, whence, stream_label, offset_label,
+                      whence_label, ret_label);
 }
 
 __attribute__((visibility("default")))
 int __dfsl_fseeko(FILE *stream, off_t offset, int whence,
                   dfsan_label stream_label, dfsan_label offset_label,
                   dfsan_label whence_label, dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_fseeko(stream, offset, whence, 0, 0, 0, &l));
+  if (ucsan_file_stream(stream))
+    return DFSL_CALL(ret_label,
+                     __dfsw_fseeko(stream, offset, whence, 0, 0, 0, &l));
+  return __dfsr_fseeko(stream, offset, whence, stream_label, offset_label,
+                       whence_label, ret_label);
 }
 
 __attribute__((visibility("default")))
 int __dfsl_getc(FILE *stream, dfsan_label stream_label,
                 dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_getc(stream, 0, &l));
+  if (ucsan_file_stream(stream))
+    return DFSL_CALL(ret_label, __dfsw_getc(stream, 0, &l));
+  return __dfsr_getc(stream, stream_label, ret_label);
 }
 
 #undef DFSL_CALL
