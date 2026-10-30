@@ -9,6 +9,7 @@
 #include "ucsan.h"
 
 #include <execinfo.h>
+#include <dlfcn.h>
 #include <malloc.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -152,6 +153,17 @@ static void *kmalloc_flags(size_t size, unsigned int flags,
   return __dfsw_malloc(size, size_label, ret_label);
 }
 
+// The C library's malloc_usable_size, which knows every object the wrappers
+// here hand out (all are __libc_malloc's).  The program's own wins the link
+// when it has one: v8's PartitionAlloc malloc shim defines malloc_usable_size,
+// and asked about a __libc_malloc object it hit PA_NOTREACHED.
+static size_t libc_malloc_usable_size(void *ptr) {
+  static size_t (*real)(void *) = nullptr;
+  if (!real)
+    real = (size_t (*)(void *))dlsym(RTLD_NEXT, "malloc_usable_size");
+  return real ? real(ptr) : 0;
+}
+
 __attribute__((visibility("default")))
 void *__dfsw_realloc(void *ptr, size_t size, ucsan_label ptr_label,
                      ucsan_label size_label, ucsan_label *ret_label) {
@@ -184,7 +196,7 @@ void *__dfsw_realloc(void *ptr, size_t size, ucsan_label ptr_label,
         UCSAN_OUT("WARNING: realloc ptr_label %d is not alloca, op %d\n", ptr_label, old_info->common.op);
       }
     } else {
-      old_size = malloc_usable_size(ptr);
+      old_size = libc_malloc_usable_size(ptr);
     }
   }
 
@@ -266,6 +278,38 @@ void __dfsw_free(void *ptr, ucsan_label ptr_label) {
   }
   // don't actually free the buffer, to capture UAFs
   // __libc_free(ptr);
+}
+
+// An object the wrappers allocated has, to UCSan, the size it was asked for:
+// that is its bounds, so using any slack past it is out of bounds.  Returning
+// it keeps malloc_usable_size's contract (at least the size asked for).
+__attribute__((visibility("default")))
+size_t __dfsw_malloc_usable_size(void *ptr, ucsan_label ptr_label,
+                                 ucsan_label *ret_label) {
+  size_t size = 0;
+  *ret_label = 0;
+  __taint_set_retval_tls(0, 0, sizeof(size_t) * 8);
+  if (!ptr) return 0;
+  if (ptr_label > UCSAN_CONST_LABEL) {
+    ucsan_label_info *info = get_label_info(ptr_label);
+    if (info->common.op == OP_ALLOCA) {
+      ucsan_obj_info *obj = to_obj_info(info);
+      size = obj->upper_bound - obj->lower_bound;
+    } else if (info->common.op == OP_EXTERNAL &&
+               to_ptr_info(info)->status == PTR_INITIALIZED) {
+      // (as realloc's: a UC object's size is its known extent)
+      ucsan_obj_info *obj =
+          to_obj_info(get_label_info(to_ptr_info(info)->obj_label));
+      size = obj->lower_bound + obj->upper_bound;
+    } else {
+      UCSAN_OUT("WARNING: malloc_usable_size ptr_label %d, op %d\n",
+                ptr_label, info->common.op);
+    }
+  } else {
+    size = libc_malloc_usable_size(ptr);
+  }
+  UCSAN_OUT("__dfsw_malloc_usable_size(%p) = %zu\n", ptr, size);
+  return size;
 }
 
 __attribute__((visibility("default")))
@@ -1477,6 +1521,13 @@ void *__dfsl_aligned_alloc(size_t alignment, size_t size,
                            dfsan_label alignment_label, dfsan_label size_label,
                            dfsan_label *ret_label) {
   return DFSL_CALL(ret_label, __dfsw_aligned_alloc(alignment, size, 0, 0, &l));
+}
+
+// (library code's objects have no UCSan label: the C library's size)
+__attribute__((visibility("default")))
+size_t __dfsl_malloc_usable_size(void *ptr, dfsan_label ptr_label,
+                                 dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw_malloc_usable_size(ptr, 0, &l));
 }
 
 // (with no UCSan label, UCSan's free does nothing: it never frees)

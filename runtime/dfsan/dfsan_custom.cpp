@@ -4489,6 +4489,16 @@ SANITIZER_INTERFACE_ATTRIBUTE void __dfsw_free(void *ptr, dfsan_label ptr_label)
   }
 }
 
+// custom, not uninstrumented, for UCSan's sake (library code under UCSan
+// calls UCSan's through its __dfsl_ adapter, see ucsan_custom.cpp); here it is
+// the program's, the same allocator as the wrappers' malloc
+SANITIZER_INTERFACE_ATTRIBUTE
+size_t __dfsw_malloc_usable_size(void *ptr, dfsan_label ptr_label,
+                                 dfsan_label *ret_label) {
+  *ret_label = 0;
+  return malloc_usable_size(ptr);
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE
 void __dfsw___libc_free(void *ptr, dfsan_label ptr_label) {
   if (ptr && flags().trace_bounds) {

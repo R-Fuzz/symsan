@@ -68,6 +68,7 @@ fun:aligned_alloc=custom
 fun:calloc=custom
 fun:free=custom
 fun:malloc=custom
+fun:malloc_usable_size=custom
 fun:memalign=custom
 fun:posix_memalign=custom
 fun:pvalloc=custom
