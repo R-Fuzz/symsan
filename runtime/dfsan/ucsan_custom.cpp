@@ -531,9 +531,17 @@ int __dfsw_posix_memalign(void **memptr, size_t alignment, size_t size,
     ucsan_label alloca_label = create_alloca_label(*memptr, size, true);
     ucsan_label *shadow = ucsan_shadow_for(memptr);
     *shadow = alloca_label;  // Label for the pointer itself
+    // Bridge to SymSan: create_alloca_label left the object's bounds label in
+    // the retval TLS, but it is the stored pointer's (as dfsan_custom.cpp's
+    // posix_memalign), not the int result's.  (Combined only: UCSan alone
+    // has no SymSan labels.)
+#ifdef USE_UCSAN_CUSTOM
+    __taint_set_label(__taint_get_retval_tls(0), memptr, sizeof(*memptr));
+#endif
   } else {
     *ret_label = UCSAN_CONST_LABEL;
   }
+  __taint_set_retval_tls(0, 0, sizeof(int) * 8);
   return result;
 }
 
@@ -1530,10 +1538,27 @@ size_t __dfsl_malloc_usable_size(void *ptr, dfsan_label ptr_label,
   return DFSL_CALL(ret_label, __dfsw_malloc_usable_size(ptr, 0, &l));
 }
 
+__attribute__((visibility("default")))
+int __dfsl_posix_memalign(void **memptr, size_t alignment, size_t size,
+                          dfsan_label memptr_label, dfsan_label alignment_label,
+                          dfsan_label size_label, dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label,
+                   __dfsw_posix_memalign(memptr, alignment, size, 0, 0, 0, &l));
+}
+
 // (with no UCSan label, UCSan's free does nothing: it never frees)
 __attribute__((visibility("default")))
 void __dfsl_free(void *ptr, dfsan_label ptr_label) {
   __dfsw_free(ptr, 0);
+}
+
+__attribute__((visibility("default")))
+ssize_t __dfsl_pread64(int fd, void *buf, size_t count, off_t offset,
+                       dfsan_label fd_label, dfsan_label buf_label,
+                       dfsan_label count_label, dfsan_label offset_label,
+                       dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label,
+                   __dfsw_pread64(fd, buf, count, offset, 0, 0, 0, 0, &l));
 }
 
 __attribute__((visibility("default")))
