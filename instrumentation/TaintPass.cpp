@@ -764,6 +764,10 @@ struct TaintFunction {
   Value *RetvalTLSPtr = nullptr;
   AllocaInst *LabelReturnAlloca = nullptr;
   DenseMap<Value *, Value *> ValShadowMap;
+  // (load, user): the shadow of the load's bytes that user reads, when it
+  // reads fewer than the load's other users (visitLoadInst); the user is
+  // visited with it in place of the load's
+  DenseMap<std::pair<Value *, Instruction *>, Value *> UseShadowMap;
   DenseMap<AllocaInst *, AllocaInst *> AllocaShadowMap;
 
   struct PHIFixupElement {
@@ -2936,8 +2940,23 @@ bool Taint::runImpl(Module &M) {
         if (UCSanLib && !TF.SkipInsts.count(Inst) &&
             !Inst->getMetadata("nosanitize"))
           insertUCSanLibStore(Inst);
-        if (!TF.SkipInsts.count(Inst) && !Inst->getMetadata("nosanitize"))
+        if (!TF.SkipInsts.count(Inst) && !Inst->getMetadata("nosanitize")) {
+          // a load's user that reads fewer of its bytes is visited with their
+          // shadow in place of the load's (UseShadowMap)
+          SmallVector<std::pair<Value *, Value *>, 2> Restore;
+          if (!TF.UseShadowMap.empty())
+            for (Value *Op : Inst->operands()) {
+              auto It = TF.UseShadowMap.find({Op, Inst});
+              if (It == TF.UseShadowMap.end())
+                continue;
+              Value *&S = TF.ValShadowMap[Op];
+              Restore.push_back({Op, S});
+              S = It->second;
+            }
           TaintVisitor(TF).visit(Inst);
+          for (auto &[Op, S] : llvm::reverse(Restore))
+            TF.ValShadowMap[Op] = S;
+        }
         if (IsTerminator)
           break;
         Inst = Next;
@@ -4983,9 +5002,27 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
 
   // the bytes of a bitfield's access unit outside the fields it is read for
   // may never have been written, and are not read (see Bitfield.h)
-  if (!Shadow)
+  if (!Shadow) {
+    uint64_t Unread = symsan::unreadBytes(LI);
     Shadow = TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
-                           LI.getAlign(), Pos, symsan::unreadBytes(LI));
+                           LI.getAlign(), Pos, Unread);
+    // and a user that reads fewer of them than the others gets the shadow of
+    // just those, loaded here, from the memory this load read
+    SmallDenseMap<uint64_t, Value *, 2> ByUnread;
+    for (User *U : LI.users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI || UI->getMetadata("nosanitize"))
+        continue;
+      uint64_t UseUnread = symsan::unreadBytes(LI, UI);
+      if ((UseUnread & ~Unread) == 0)
+        continue;
+      Value *&Narrow = ByUnread[UseUnread];
+      if (!Narrow)
+        Narrow = TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
+                               LI.getAlign(), Pos, UseUnread);
+      TF.UseShadowMap[{&LI, UI}] = Narrow;
+    }
+  }
 #if 0
   //FIXME: tainted pointer
   if (ClCombinePointerLabelsOnLoad) {
