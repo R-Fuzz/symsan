@@ -777,6 +777,9 @@ struct TaintFunction {
   // for a store that writes the loaded value back unchanged (visitLoadInst)
   DenseMap<Value *, Value *> MovedShadowMap;
   DenseMap<AllocaInst *, AllocaInst *> AllocaShadowMap;
+  // static allocas whose shadow in memory is marked when the function is
+  // entered, and their sizes: cleared again when it returns
+  SmallVector<std::pair<AllocaInst *, Value *>, 4> FrameAllocas;
 
   struct PHIFixupElement {
     PHINode *Phi;
@@ -3018,6 +3021,24 @@ bool Taint::runImpl(Module &M) {
            ++Val) {
         P.ShadowPhi->setIncomingValue(
             Val, TF.getShadow(P.Phi->getIncomingValue(Val)));
+      }
+    }
+
+    // A frame's locals were marked uninitialized when it was entered, and
+    // the marking outlives it: uninstrumented code that later writes that
+    // stack writes no shadow, so what it wrote was uninitialized to an
+    // instrumented callee that read it -- v8's builtins (generated code) put
+    // a runtime function's arguments on the stack, and the runtime function's
+    // first look at them was a UBI.  So a frame clears its locals' shadow
+    // when it returns: the stack below a live frame has none.
+    if (!TF.FrameAllocas.empty()) {
+      for (BasicBlock &BB : *F) {
+        Instruction *Term = BB.getTerminator();
+        if (!Term || !(isa<ReturnInst>(Term) || isa<ResumeInst>(Term)))
+          continue;
+        IRBuilder<> IRB(getExitInsertPoint(Term));
+        for (auto &[AI, Size] : TF.FrameAllocas)
+          IRB.CreateCall(TaintSetLabelFn, {ZeroPrimitiveShadow, AI, Size});
       }
     }
 
@@ -5753,6 +5774,8 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
                      {Init,
                       IRB.CreateBitCast(&I, PointerType::getUnqual(*TF.TT.Ctx)),
                       Size});
+      if (I.isStaticAlloca())
+        TF.FrameAllocas.push_back({&I, Size});
     }
   }
 }
