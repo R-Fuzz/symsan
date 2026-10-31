@@ -91,6 +91,9 @@ fun:memmem=taint
 fun:sprintf=taint
 fun:snprintf=taint
 fun:vsnprintf=taint
+fun:__sprintf_chk=taint
+fun:__snprintf_chk=taint
+fun:__vsnprintf_chk=taint
 
 fun:htonl=taint
 fun:htons=taint

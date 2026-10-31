@@ -3376,6 +3376,17 @@ static int format_buffer(char *str, size_t size, const char *fmt,
     formatter.str_off += retval;
   }
 
+  // The terminating NUL, which the last chunk's snprintf wrote (or, for an
+  // empty format, nothing did), is concrete too: it kept the label the buffer
+  // had, kInitializingLabel for a fresh stack buffer, and the caller that
+  // checks it (v8's FormattedString: DCHECK_EQ('\0', message[n])) read it
+  // as uninitialized.
+  if (size > 0) {
+    size_t end = formatter.str_off < size ? formatter.str_off : size - 1;
+    str[end] = '\0';
+    dfsan_set_label(0, str + end, 1);
+  }
+
   *ret_label = 0;
 
   // Number of bytes written in total.
@@ -3666,6 +3677,58 @@ int __dfsw_vsnprintf(char *str, size_t size, const char *format, va_list ap,
   va_end(aq);
   *ret_label = 0;
   ucsan_mark_formatted(str, size, ret);
+  return ret;
+}
+
+// The _FORTIFY_SOURCE forms (glibc's bits/stdio2.h), as the plain ones: they
+// were uninstrumented, so what they wrote kept no labels and, under UCSan,
+// stayed uninitialized (v8's OS::SNPrintF is __vsnprintf_chk at -O2; its
+// caller's DCHECK_EQ('\0', message[n]) was a UBI).  slen, the destination's
+// size as the compiler knew it, is not checked: format_buffer writes no more
+// than the size it is given.
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw___sprintf_chk(char *str, int flag, size_t slen, const char *format,
+                         dfsan_label str_label, dfsan_label flag_label,
+                         dfsan_label slen_label, dfsan_label format_label,
+                         dfsan_label *va_labels, dfsan_label *ret_label, ...) {
+  va_list ap;
+  va_start(ap, ret_label);
+  size_t size = slen < INT32_MAX ? slen : INT32_MAX;
+  int ret = format_buffer(str, size, format, va_labels, ret_label, ap);
+  va_end(ap);
+  *ret_label = 0;
+  ucsan_mark_formatted(str, size, ret);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw___snprintf_chk(char *str, size_t maxlen, int flag, size_t slen,
+                          const char *format, dfsan_label str_label,
+                          dfsan_label maxlen_label, dfsan_label flag_label,
+                          dfsan_label slen_label, dfsan_label format_label,
+                          dfsan_label *va_labels, dfsan_label *ret_label, ...) {
+  va_list ap;
+  va_start(ap, ret_label);
+  int ret = format_buffer(str, maxlen, format, va_labels, ret_label, ap);
+  va_end(ap);
+  *ret_label = 0;
+  ucsan_mark_formatted(str, maxlen, ret);
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw___vsnprintf_chk(char *str, size_t maxlen, int flag, size_t slen,
+                           const char *format, va_list ap,
+                           dfsan_label str_label, dfsan_label maxlen_label,
+                           dfsan_label flag_label, dfsan_label slen_label,
+                           dfsan_label format_label, dfsan_label ap_label,
+                           dfsan_label *ret_label) {
+  va_list aq;
+  va_copy(aq, ap);
+  int ret = format_buffer(str, maxlen, format, nullptr, ret_label, aq);
+  va_end(aq);
+  *ret_label = 0;
+  ucsan_mark_formatted(str, maxlen, ret);
   return ret;
 }
 

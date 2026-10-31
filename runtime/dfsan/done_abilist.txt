@@ -516,6 +516,10 @@ fun:gettimeofday=custom
 fun:sprintf=custom
 fun:snprintf=custom
 fun:vsnprintf=custom
+# their _FORTIFY_SOURCE forms (bits/stdio2.h)
+fun:__sprintf_chk=custom
+fun:__snprintf_chk=custom
+fun:__vsnprintf_chk=custom
 
 # scanf-like (glibc redirects sscanf -> __isoc99_sscanf / __isoc23_sscanf)
 fun:sscanf=custom
