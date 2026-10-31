@@ -567,6 +567,16 @@ class Taint {
   // (must match dfsan.cpp's kTaintByvalSlots)
   Constant *ByvalSrcTLS;
   static const unsigned kByvalSrcSlots = 8;
+  // a moved value's labels, one per byte, across a call (see
+  // TaintFunction::getMovedBytes; must match dfsan.cpp's kTaintMovedBytes and
+  // kTaintMovedArgSlots)
+  Constant *MovedRetTLS;
+  Constant *MovedRetTagTLS;
+  Constant *MovedArgTLS;
+  Constant *MovedArgTagTLS;
+  Constant *MovedArgMaskTLS;
+  static const unsigned kMovedBytes = 16;
+  static const unsigned kMovedArgSlots = 8;
   FunctionType *TaintUnionFnTy;
   FunctionType *TaintGetWideFnTy;
   FunctionType *TaintUnionLoadFnTy;
@@ -775,11 +785,19 @@ struct TaintFunction {
   DenseMap<std::pair<Value *, Instruction *>, Value *> UseShadowMap;
   // load -> the shadow of each byte it read (<Size x label>), loaded with it,
   // for a store that writes the loaded value back unchanged (visitLoadInst)
-  DenseMap<Value *, Value *> MovedShadowMap;
+  // (and a moved value's, from a call, an argument or a struct: with an i1
+  // that says whether they are there, see MovedBytes)
+  DenseMap<Value *, std::pair<Value *, Value *>> MovedShadowMap;
   DenseMap<AllocaInst *, AllocaInst *> AllocaShadowMap;
   // static allocas whose shadow in memory is marked when the function is
   // entered, and their sizes: cleared again when it returns
   SmallVector<std::pair<AllocaInst *, Value *>, 4> FrameAllocas;
+  // an argument's labels, one per byte, as the caller left them for it, and
+  // whether it did (see getMovedBytes)
+  DenseMap<Argument *, std::pair<Value *, Value *>> MovedArgs;
+  // the returns, for the labels of a moved value's bytes (see
+  // writeMovedReturns)
+  SmallVector<ReturnInst *, 2> Returns;
 
   struct PHIFixupElement {
     PHINode *Phi;
@@ -846,6 +864,22 @@ struct TaintFunction {
 
   Value *getShadow(Value *V);
   void setShadow(Instruction *I, Value *Shadow);
+  // moved values: the labels of each byte of a value that is stored, returned
+  // or passed on unchanged (see visitLoadInst)
+  unsigned movedSize(Type *T) const;
+  bool hasMoveUse(Value *V) const;
+  // the labels of a moved value's bytes (Bytes, a <size x label>), when Valid
+  // (an i1, or null when they always are)
+  struct MovedBytes {
+    Value *Valid = nullptr;
+    Value *Bytes = nullptr;
+    explicit operator bool() const { return Bytes; }
+  };
+  MovedBytes getMovedBytes(Value *V);
+  MovedBytes movedOrConcrete(Value *V, IRBuilderBase &IRB);
+  void setMovedBytes(Value *V, Value *Valid, Value *Bytes);
+  void readMovedArgs();
+  void writeMovedReturns();
 
   /// Handle nosanitize __dfsw_* calls from UCSan:
   /// emit minimize hints for alloc size args and load retval TLS for non-void.
@@ -2682,6 +2716,15 @@ bool Taint::runImpl(Module &M) {
   ByvalSrcTLS = GetOrInsertGlobal(
       "__taint_byval_src",
       ArrayType::get(PointerType::getUnqual(*Ctx), kByvalSrcSlots));
+  Type *MovedTy = FixedVectorType::get(PrimitiveShadowTy, kMovedBytes);
+  MovedRetTLS = GetOrInsertGlobal("__taint_moved_ret", MovedTy);
+  MovedRetTagTLS = GetOrInsertGlobal("__taint_moved_ret_tag",
+                                     PointerType::getUnqual(*Ctx));
+  MovedArgTLS = GetOrInsertGlobal("__taint_moved_arg",
+                                  ArrayType::get(MovedTy, kMovedArgSlots));
+  MovedArgTagTLS = GetOrInsertGlobal("__taint_moved_arg_tag",
+                                     PointerType::getUnqual(*Ctx));
+  MovedArgMaskTLS = GetOrInsertGlobal("__taint_moved_arg_mask", Int64Ty);
 
   initializeCallbackFunctions(M);
   initializeRuntimeFunctions(M);
@@ -2930,6 +2973,7 @@ bool Taint::runImpl(Module &M) {
             {&A, Len, ConstantInt::get(Int32Ty, A.getArgNo())});
         TF.SkipInsts.insert(Copy);
       }
+      TF.readMovedArgs();
     }
 
     // TaintVisitor may create new basic blocks, which confuses df_iterator.
@@ -3023,6 +3067,8 @@ bool Taint::runImpl(Module &M) {
             Val, TF.getShadow(P.Phi->getIncomingValue(Val)));
       }
     }
+
+    TF.writeMovedReturns();
 
     // A frame's locals were marked uninitialized when it was entered, and
     // the marking outlives it: uninstrumented code that later writes that
@@ -3143,6 +3189,192 @@ Value *TaintFunction::getShadow(Value *V) {
 void TaintFunction::setShadow(Instruction *I, Value *Shadow) {
   assert(!ValShadowMap.count(I));
   ValShadowMap[I] = Shadow;
+}
+
+namespace {
+// an IRBuilder whose instructions the visitor skips: for code put where the
+// visitor has yet to go (a function's entry, an invoke's normal destination)
+struct SkipIRBuilder : IRBuilder<ConstantFolder, IRBuilderCallbackInserter> {
+  SkipIRBuilder(TaintFunction &TF, Instruction *Pos)
+      : IRBuilder<ConstantFolder, IRBuilderCallbackInserter>(
+            Pos->getContext(), ConstantFolder(),
+            IRBuilderCallbackInserter(
+                [&TF](Instruction *I) { TF.SkipInsts.insert(I); })) {
+    SetInsertPoint(Pos);
+  }
+};
+} // namespace
+
+// the N labels of Bytes from Off
+static Value *subBytes(IRBuilderBase &IRB, Value *Bytes, unsigned Off,
+                       unsigned N) {
+  if (Off == 0 && N == cast<FixedVectorType>(Bytes->getType())->getNumElements())
+    return Bytes;
+  SmallVector<int, 16> Mask;
+  for (unsigned I = 0; I != N; ++I)
+    Mask.push_back(Off + I);
+  return IRB.CreateShuffleVector(Bytes, Mask);
+}
+
+// Bytes, with the labels of Sub from Off
+static Value *insertBytes(IRBuilderBase &IRB, Value *Bytes, Value *Sub,
+                          unsigned Off) {
+  unsigned N = cast<FixedVectorType>(Bytes->getType())->getNumElements();
+  unsigned SubN = cast<FixedVectorType>(Sub->getType())->getNumElements();
+  if (Off == 0 && SubN == N)
+    return Sub;
+  SmallVector<int, 16> Widen, Mask;
+  for (unsigned I = 0; I != N; ++I) {
+    Widen.push_back(I < SubN ? int(I) : PoisonMaskElem);
+    Mask.push_back(I >= Off && I < Off + SubN ? int(N + I - Off) : int(I));
+  }
+  return IRB.CreateShuffleVector(Bytes, IRB.CreateShuffleVector(Sub, Widen),
+                                 Mask);
+}
+
+// A value stored, returned or passed on unchanged is moved, and a move copies
+// each byte's label, as memcpy does: the value's own label is the union of
+// its bytes' (see visitLoadInst).  The labels of a moved value's bytes, a
+// <size x label>, come from the load that read it (MovedShadowMap), through
+// insertvalue and extractvalue, and across a call: a return's in
+// __taint_moved_ret (writeMovedReturns, visitCallBase), arguments' in
+// __taint_moved_arg (visitCallBase, readMovedArgs).  It is kept for a scalar
+// of 2 to kMovedBytes bytes, and a struct of scalars of that size.
+unsigned TaintFunction::movedSize(Type *T) const {
+  const DataLayout &DL = F->getParent()->getDataLayout();
+  if (!T->isSized() || isa<ScalableVectorType>(T))
+    return 0;
+  uint64_t Size;
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    for (Type *E : ST->elements())
+      if (E->isAggregateType() || !E->isSized() || isa<ScalableVectorType>(E))
+        return 0;
+    Size = DL.getTypeAllocSize(T);
+  } else if (T->isAggregateType()) {
+    return 0;
+  } else {
+    Size = DL.getTypeStoreSize(T);
+  }
+  return Size >= 2 && Size <= Taint::kMovedBytes ? Size : 0;
+}
+
+bool TaintFunction::hasMoveUse(Value *V) const {
+  for (const Use &U : V->uses()) {
+    auto *UI = dyn_cast<Instruction>(U.getUser());
+    if (!UI || UI->getMetadata("nosanitize"))
+      continue;
+    if (auto *SI = dyn_cast<StoreInst>(UI)) {
+      if (U.getOperandNo() == 0 && !SI->isAtomic())
+        return true;
+    } else if (isa<ReturnInst>(UI) || isa<ExtractValueInst>(UI) ||
+               isa<InsertValueInst>(UI)) {
+      return true;
+    } else if (auto *CB = dyn_cast<CallBase>(UI)) {
+      if (CB->isArgOperand(&U) && !CB->isInlineAsm() &&
+          !isa<IntrinsicInst>(CB) &&
+          CB->getArgOperandNo(&U) < Taint::kMovedArgSlots)
+        return true;
+    }
+  }
+  return false;
+}
+
+// The labels of V's bytes when it is moved: a load's, or a call's, an
+// argument's or a struct's, valid when what was called, the caller or the
+// struct's parts left them.  When they are not, V's bytes have no labels of
+// their own but V's label's, and those are not V's label copied: a store
+// gives each byte its part of a symbolic label (union_store's Extract), so a
+// moved value that may not be one is also stored as a value is (see
+// visitStoreInst).  A fallback of V's label in every byte gave each byte of
+// an int argument a 2-bit label, and the callee's next load of it never
+// advanced past its first byte (v8 FixedDtoaTest: 66M labels in one load).
+TaintFunction::MovedBytes TaintFunction::getMovedBytes(Value *V) {
+  auto It = MovedShadowMap.find(V);
+  if (It != MovedShadowMap.end())
+    return {It->second.first, It->second.second};
+  if (auto *A = dyn_cast<Argument>(V)) {
+    auto AIt = MovedArgs.find(A);
+    if (AIt != MovedArgs.end())
+      return {AIt->second.first, AIt->second.second};
+  }
+  return {};
+}
+
+// V's moved bytes, or else its label's when it is 0: a concrete value's bytes
+// are concrete (for a part of a struct, see visitInsertValueInst)
+TaintFunction::MovedBytes TaintFunction::movedOrConcrete(Value *V,
+                                                         IRBuilderBase &IRB) {
+  if (MovedBytes M = getMovedBytes(V))
+    return M;
+  const DataLayout &DL = F->getParent()->getDataLayout();
+  Type *T = V->getType();
+  Value *Zero = Constant::getNullValue(FixedVectorType::get(
+      TT.PrimitiveShadowTy, isa<StructType>(T) ? DL.getTypeAllocSize(T)
+                                               : DL.getTypeStoreSize(T)));
+  Value *Shadow = getShadow(V);
+  if (isa<UndefValue>(V) || TT.isZeroShadow(Shadow))
+    return {nullptr, Zero};
+  auto *ST = dyn_cast<StructType>(V->getType());
+  if (!ST)
+    return {IRB.CreateIsNull(Shadow), Zero};
+  Value *Valid = IRB.getTrue();
+  for (unsigned I = 0, N = ST->getNumElements(); I != N; ++I)
+    if (DL.getTypeStoreSize(ST->getElementType(I)) != 0)
+      Valid = IRB.CreateAnd(
+          Valid, IRB.CreateIsNull(IRB.CreateExtractValue(Shadow, {I})));
+  return {Valid, Zero};
+}
+
+// V's bytes are Bytes when Valid (null: always); never, when it is false
+void TaintFunction::setMovedBytes(Value *V, Value *Valid, Value *Bytes) {
+  if (auto *C = dyn_cast_or_null<ConstantInt>(Valid)) {
+    if (C->isZero())
+      return;
+    Valid = nullptr;
+  }
+  MovedShadowMap[V] = {Valid, Bytes};
+}
+
+// a and b, either null for true
+static Value *andValid(IRBuilderBase &IRB, Value *A, Value *B) {
+  if (!A || !B)
+    return A ? A : B;
+  return IRB.CreateAnd(A, B);
+}
+
+// The labels the caller left for this function's moved arguments' bytes:
+// taken at entry, before a call this function makes overwrites them, and the
+// tag cleared, so a call back in from code that is not instrumented takes
+// none.
+void TaintFunction::readMovedArgs() {
+  if (IsNativeABI || IsForceZeroLabels)
+    return;
+  SmallVector<Argument *, 4> Args;
+  for (Argument &A : F->args())
+    if (A.getArgNo() < Taint::kMovedArgSlots && !A.hasByValAttr() &&
+        !isa<StructType>(A.getType()) && movedSize(A.getType()) &&
+        hasMoveUse(&A))
+      Args.push_back(&A);
+  if (Args.empty())
+    return;
+  SkipIRBuilder IRB(*this, &*F->getEntryBlock().getFirstInsertionPt());
+  PointerType *PtrTy = PointerType::getUnqual(F->getContext());
+  Value *Tag = IRB.CreateLoad(PtrTy, TT.MovedArgTagTLS);
+  Value *Mine = IRB.CreateICmpEQ(Tag, F);
+  Value *Mask = IRB.CreateLoad(TT.Int64Ty, TT.MovedArgMaskTLS);
+  IRB.CreateStore(ConstantPointerNull::get(PtrTy), TT.MovedArgTagTLS);
+  auto *MovedTy = FixedVectorType::get(TT.PrimitiveShadowTy, Taint::kMovedBytes);
+  Type *SlotsTy = ArrayType::get(MovedTy, Taint::kMovedArgSlots);
+  for (Argument *A : Args) {
+    unsigned I = A->getArgNo();
+    Value *Left = IRB.CreateICmpNE(IRB.CreateAnd(Mask, 1ULL << I),
+                                   ConstantInt::get(TT.Int64Ty, 0));
+    Value *Bytes = IRB.CreateAlignedLoad(
+        MovedTy, IRB.CreateConstGEP2_32(SlotsTy, TT.MovedArgTLS, 0, I),
+        Align(4));
+    MovedArgs[A] = {IRB.CreateAnd(Mine, Left),
+                    subBytes(IRB, Bytes, 0, movedSize(A->getType()))};
+  }
 }
 
 bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
@@ -5112,25 +5344,25 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
   // optional<pair<Segment, FreelistHead>> as two i64s, and the freelist's
   // length, uninitialized from then on, spread to every table allocation.
   // So the bytes' labels are loaded here, with the value, for the store.
-  if (LI.isAtomic() || LI.isVolatile() || Size < 2 || Size > 16 ||
-      LI.getType()->isAggregateType() || TF.TT.isZeroShadow(Shadow))
+  // The same for a value returned or passed on unchanged, to the function
+  // that stores it (see TaintFunction::getMovedBytes): v8's
+  // UnoptimizedCompileFlags is returned as {i64, i64}, loaded from the
+  // function's frame, and goes on to ParseInfo's constructor as two i64s.
+  if (LI.isAtomic() || LI.isVolatile() || TF.movedSize(LI.getType()) != Size ||
+      TF.TT.isZeroShadow(Shadow))
     return;
   if (auto *AI = dyn_cast<AllocaInst>(LI.getPointerOperand()))
     if (TF.AllocaShadowMap.count(AI))
       return;
-  bool Moved = false;
-  for (User *U : LI.users())
-    if (auto *SI = dyn_cast<StoreInst>(U))
-      if (SI->getValueOperand() == &LI && !SI->isAtomic() &&
-          !SI->getMetadata("nosanitize"))
-        Moved = true;
-  if (!Moved)
+  if (!TF.hasMoveUse(&LI))
     return;
   IRBuilder<> IRB(Pos);
   Type *BytesTy = FixedVectorType::get(TF.TT.PrimitiveShadowTy, Size);
-  TF.MovedShadowMap[&LI] = IRB.CreateAlignedLoad(
-      BytesTy, TF.TT.getShadowAddress(LI.getPointerOperand(), IRB),
-      TF.getShadowAlign(LI.getAlign()));
+  TF.setMovedBytes(&LI, nullptr,
+                   IRB.CreateAlignedLoad(
+                       BytesTy,
+                       TF.TT.getShadowAddress(LI.getPointerOperand(), IRB),
+                       TF.getShadowAlign(LI.getAlign())));
 }
 
 void TaintFunction::storeShadowRecursive(
@@ -5302,15 +5534,24 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
   }
 
   // a move: each byte keeps its label (see visitLoadInst)
-  auto Moved = TF.MovedShadowMap.find(Val);
   auto *DstAI = dyn_cast<AllocaInst>(SI.getPointerOperand());
-  if (Moved != TF.MovedShadowMap.end() && !SI.isAtomic() &&
-      !(DstAI && TF.AllocaShadowMap.count(DstAI))) {
-    IRBuilder<> IRB(&SI);
-    IRB.CreateAlignedStore(Moved->second,
-                           TF.TT.getShadowAddress(SI.getPointerOperand(), IRB),
-                           TF.getShadowAlign(SI.getAlign()));
-    return;
+  if (!SI.isAtomic() && !(DstAI && TF.AllocaShadowMap.count(DstAI))) {
+    if (TaintFunction::MovedBytes M = TF.getMovedBytes(Val)) {
+      // (stored as a value first when they may not be there)
+      if (M.Valid)
+        TF.storeShadow(SI.getPointerOperand(), VT, Size, SI.getAlign(),
+                       Shadow, &SI);
+      IRBuilder<> IRB(&SI);
+      Value *ShadowAddr = TF.TT.getShadowAddress(SI.getPointerOperand(), IRB);
+      Align ShadowAlign = TF.getShadowAlign(SI.getAlign());
+      Value *Bytes = M.Bytes;
+      if (M.Valid)
+        Bytes = IRB.CreateSelect(
+            M.Valid, Bytes,
+            IRB.CreateAlignedLoad(Bytes->getType(), ShadowAddr, ShadowAlign));
+      IRB.CreateAlignedStore(Bytes, ShadowAddr, ShadowAlign);
+      return;
+    }
   }
 
   TF.storeShadow(SI.getPointerOperand(), VT, Size, SI.getAlign(), Shadow, &SI);
@@ -5683,6 +5924,17 @@ void TaintVisitor::visitExtractValueInst(ExtractValueInst &I) {
   Value *AggShadow = TF.getShadow(Agg);
   Value *ResShadow = IRB.CreateExtractValue(AggShadow, I.getIndices());
   TF.setShadow(&I, ResShadow);
+
+  // a field of a moved value is one (see TaintFunction::getMovedBytes)
+  auto *ST = dyn_cast<StructType>(Agg->getType());
+  unsigned Size = TF.movedSize(I.getType());
+  if (!ST || I.getNumIndices() != 1 || !Size || !TF.movedSize(ST))
+    return;
+  if (TaintFunction::MovedBytes M = TF.getMovedBytes(Agg)) {
+    uint64_t Off =
+        getDataLayout().getStructLayout(ST)->getElementOffset(I.getIndices()[0]);
+    TF.setMovedBytes(&I, M.Valid, subBytes(IRB, M.Bytes, Off, Size));
+  }
 }
 
 void TaintVisitor::visitInsertValueInst(InsertValueInst &I) {
@@ -5691,6 +5943,22 @@ void TaintVisitor::visitInsertValueInst(InsertValueInst &I) {
   Value *InsShadow = TF.getShadow(I.getInsertedValueOperand());
   Value *Res = IRB.CreateInsertValue(AggShadow, InsShadow, I.getIndices());
   TF.setShadow(&I, Res);
+
+  // a struct made of a moved value is one (see TaintFunction::getMovedBytes)
+  auto *ST = dyn_cast<StructType>(I.getType());
+  if (!ST || I.getNumIndices() != 1 || !TF.movedSize(ST))
+    return;
+  Value *Agg = I.getAggregateOperand();
+  Value *Ins = I.getInsertedValueOperand();
+  if (!TF.getMovedBytes(Agg) && !TF.getMovedBytes(Ins))
+    return;
+  // (a part that is not moved has bytes of its own only when concrete)
+  TaintFunction::MovedBytes A = TF.movedOrConcrete(Agg, IRB);
+  TaintFunction::MovedBytes B = TF.movedOrConcrete(Ins, IRB);
+  const DataLayout &DL = getDataLayout();
+  uint64_t Off = DL.getStructLayout(ST)->getElementOffset(I.getIndices()[0]);
+  TF.setMovedBytes(&I, andValid(IRB, A.Valid, B.Valid),
+                   insertBytes(IRB, A.Bytes, B.Bytes, Off));
 }
 
 Value *TaintFunction::visitAllocaInst(AllocaInst *I, Value *ArraySize,
@@ -5901,6 +6169,8 @@ static bool isAMustTailRetVal(Value *RetVal) {
 
 void TaintVisitor::visitReturnInst(ReturnInst &RI) {
   Value *RV = RI.getReturnValue();
+  if (!TF.IsNativeABI && RV)
+    TF.Returns.push_back(&RI);
   if (!TF.IsNativeABI && RV) {
     // Don't emit the instrumentation for musttail call returns.
     if (isAMustTailRetVal(RV))
@@ -5915,6 +6185,38 @@ void TaintVisitor::visitReturnInst(ReturnInst &RI) {
       // shadows are set to zero.
       IRB.CreateAlignedStore(S, TF.getRetvalTLS(RT, IRB), ShadowTLSAlignment);
     }
+  }
+}
+
+// A function that returns a moved value leaves the labels of its bytes in
+// __taint_moved_ret, tagged with itself, for its caller (see visitCallBase).
+// Its other returns clear the tag: a caller would take the bytes an earlier
+// call left.  A function that never returns one leaves the tag alone, since
+// no caller takes a tag of another.
+void TaintFunction::writeMovedReturns() {
+  if (IsNativeABI || IsForceZeroLabels || Returns.empty() ||
+      !movedSize(F->getReturnType()))
+    return;
+  SmallVector<std::pair<Instruction *, MovedBytes>, 2> Writes;
+  bool Moved = false;
+  for (ReturnInst *RI : Returns) {
+    Value *RV = RI->getReturnValue();
+    Instruction *Pos = getExitInsertPoint(RI);
+    MovedBytes M = isAMustTailRetVal(RV) ? MovedBytes() : getMovedBytes(RV);
+    Writes.push_back({Pos, M});
+    Moved |= bool(M);
+  }
+  if (!Moved)
+    return;
+  PointerType *PtrTy = PointerType::getUnqual(F->getContext());
+  for (auto &[Pos, M] : Writes) {
+    IRBuilder<> IRB(Pos);
+    Value *Tag = ConstantPointerNull::get(PtrTy);
+    if (M) {
+      IRB.CreateAlignedStore(M.Bytes, TT.MovedRetTLS, Align(4));
+      Tag = M.Valid ? IRB.CreateSelect(M.Valid, F, Tag) : (Value *)F;
+    }
+    IRB.CreateStore(Tag, TT.MovedRetTagTLS);
   }
 }
 
@@ -6882,6 +7184,41 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
     ArgOffset += alignTo(Size, ShadowTLSAlignment);
   }
 
+  // the labels of moved arguments' bytes, for a callee that takes them (see
+  // TaintFunction::readMovedArgs), tagged with it
+  if (!isa<CallBrInst>(CB)) {
+    auto *MovedTy =
+        FixedVectorType::get(TF.TT.PrimitiveShadowTy, Taint::kMovedBytes);
+    Type *SlotsTy = ArrayType::get(MovedTy, Taint::kMovedArgSlots);
+    uint64_t Mask = 0;
+    Value *ValidMask = nullptr;
+    for (unsigned I = 0, N = std::min<unsigned>(FT->getNumParams(),
+                                                 Taint::kMovedArgSlots);
+         I != N; ++I) {
+      if (CB.isByValArgument(I))
+        continue;
+      TaintFunction::MovedBytes M = TF.getMovedBytes(CB.getArgOperand(I));
+      if (!M)
+        continue;
+      IRB.CreateAlignedStore(
+          M.Bytes, IRB.CreateConstGEP2_32(SlotsTy, TF.TT.MovedArgTLS, 0, I),
+          Align(4));
+      if (!M.Valid) {
+        Mask |= 1ULL << I;
+        continue;
+      }
+      Value *Bit = IRB.CreateShl(IRB.CreateZExt(M.Valid, TF.TT.Int64Ty), I);
+      ValidMask = ValidMask ? IRB.CreateOr(ValidMask, Bit) : Bit;
+    }
+    if (Mask || ValidMask) {
+      Value *V = ConstantInt::get(TF.TT.Int64Ty, Mask);
+      if (ValidMask)
+        V = Mask ? IRB.CreateOr(V, ValidMask) : ValidMask;
+      IRB.CreateStore(V, TF.TT.MovedArgMaskTLS);
+      IRB.CreateStore(CB.getCalledOperand(), TF.TT.MovedArgTagTLS);
+    }
+  }
+
   Instruction *Next = nullptr;
   if (!CB.getType()->isVoidTy()) {
     // For UCSan-checked indirect calls, find the PHINode introduced by UCSanPass.
@@ -6934,6 +7271,21 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       TF.SkipInsts.insert(LI);
       TF.setShadow(ShadowTarget, LI);
       TF.NonZeroChecks.push_back(LI);
+
+      // a moved return value's bytes, if what was called left them (see
+      // TaintFunction::writeMovedReturns)
+      if (ShadowTarget == &CB && TF.movedSize(CB.getType()) &&
+          TF.hasMoveUse(&CB)) {
+        SkipIRBuilder MIRB(TF, Next);
+        unsigned N = TF.movedSize(CB.getType());
+        Value *Tag = MIRB.CreateLoad(PointerType::getUnqual(CB.getContext()),
+                                     TF.TT.MovedRetTagTLS);
+        Value *Bytes = MIRB.CreateAlignedLoad(
+            FixedVectorType::get(TF.TT.PrimitiveShadowTy, N),
+            TF.TT.MovedRetTLS, Align(4));
+        TF.setMovedBytes(&CB, MIRB.CreateICmpEQ(Tag, CB.getCalledOperand()),
+                         Bytes);
+      }
     }
   }
 }

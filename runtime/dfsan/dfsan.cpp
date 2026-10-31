@@ -100,6 +100,23 @@ static const unsigned kTaintByvalSlots = 8;
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL void
     *__taint_byval_src[kTaintByvalSlots];
 
+// A moved value's labels, one per byte, across a call (TaintPass, "moved
+// bytes"): a return's in __taint_moved_ret, tagged with the function that
+// returned; arguments' in __taint_moved_arg[argno] (the first
+// kTaintMovedArgSlots, those set in __taint_moved_arg_mask), tagged with the
+// callee.  A reader whose tag is not what it called (or itself) takes none:
+// an uninstrumented function in between leaves another's tag.  Must match
+// TaintPass's kMovedBytes and kMovedArgSlots.
+static const unsigned kTaintMovedBytes = 16;
+static const unsigned kTaintMovedArgSlots = 8;
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL dfsan_label
+    __taint_moved_ret[kTaintMovedBytes];
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL void *__taint_moved_ret_tag;
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL dfsan_label
+    __taint_moved_arg[kTaintMovedArgSlots][kTaintMovedBytes];
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL void *__taint_moved_arg_tag;
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u64 __taint_moved_arg_mask;
+
 SANITIZER_INTERFACE_ATTRIBUTE uptr __dfsan_shadow_ptr_mask;
 
 // On Linux/x86_64, memory is laid out as follows:
