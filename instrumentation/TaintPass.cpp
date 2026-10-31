@@ -563,6 +563,10 @@ class Taint {
   ConstantInt *ShadowPtrMul;
   Constant *ArgTLS;
   Constant *RetvalTLS;
+  // __taint_byval_src: each byval argument's source, by argument number
+  // (must match dfsan.cpp's kTaintByvalSlots)
+  Constant *ByvalSrcTLS;
+  static const unsigned kByvalSrcSlots = 8;
   FunctionType *TaintUnionFnTy;
   FunctionType *TaintGetWideFnTy;
   FunctionType *TaintUnionLoadFnTy;
@@ -624,6 +628,7 @@ class Taint {
   FunctionCallee TaintDebugFn;
   FunctionCallee TaintMinimizeLabelFn;
   FunctionCallee TaintAssumeFn;
+  FunctionCallee TaintByvalCopyFn;
   FunctionCallee UCSanLibStoreFn;
   FunctionCallee UCSanLibMemTransferFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
@@ -937,6 +942,7 @@ public:
   void visitAtomicCmpXchgInst(AtomicCmpXchgInst &I);
   void visitReturnInst(ReturnInst &RI);
   void visitCallBase(CallBase &CB);
+  void storeByvalSources(CallBase &CB);
   void visitPHINode(PHINode &PN);
   void visitExtractElementInst(ExtractElementInst &I);
   void visitInsertElementInst(InsertElementInst &I);
@@ -2575,6 +2581,17 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintSolveSizeFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintSolveStrBoundsFn.getCallee()->stripPointerCasts());
+  {
+    // void __taint_byval_copy(void *copy, u64 size, u32 argno)
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
+    TaintByvalCopyFn = Mod->getOrInsertFunction(
+        "__taint_byval_copy", AL, Type::getVoidTy(*Ctx),
+        PointerType::getUnqual(*Ctx), Int64Ty, Int32Ty);
+  }
+  TaintRuntimeFunctions.insert(
+      TaintByvalCopyFn.getCallee()->stripPointerCasts());
 }
 
 // __ucsan_lib_store/__ucsan_lib_memtransfer: declared only for a module
@@ -2656,6 +2673,9 @@ bool Taint::runImpl(Module &M) {
       GetOrInsertGlobal("__dfsan_retval_tls",
                         ArrayType::get(Int64Ty, RetvalTLSSize / 8));
   CallStack = GetOrInsertGlobal("__taint_trace_callstack", Int32Ty);
+  ByvalSrcTLS = GetOrInsertGlobal(
+      "__taint_byval_src",
+      ArrayType::get(PointerType::getUnqual(*Ctx), kByvalSrcSlots));
 
   initializeCallbackFunctions(M);
   initializeRuntimeFunctions(M);
@@ -2882,6 +2902,29 @@ bool Taint::runImpl(Module &M) {
       initializeUCSanLibFunctions(*F->getParent());
     TF.TraceLoop = ClTraceLoop && !UCSanLib;
     TF.UCSanLib = UCSanLib;
+
+    // A byval parameter points to the copy the call made, on this frame's
+    // stack: the backend copied the bytes, not their shadow, so the copy's
+    // shadow is whatever an earlier frame left there -- under trace_bounds
+    // often kInitializingLabel, and the first branch on a field Die()d as
+    // an uninitialized read (v8's CanonicalHashing::Add(CanonicalType)).
+    // __taint_byval_copy gives it the shadow of the object an instrumented
+    // caller left in __taint_byval_src (see visitCallBase), or clears it.
+    // UCSanPass does the same for UCSan's shadow (ucsan_byval_copy).
+    if (!F->getName().starts_with("dfsw$")) {
+      IRBuilder<> EntryIRB(&*F->getEntryBlock().getFirstInsertionPt());
+      for (Argument &A : F->args()) {
+        if (!A.hasByValAttr() || !A.getParamByValType()->isSized())
+          continue;
+        Value *Len = ConstantInt::get(
+            Int64Ty, F->getParent()->getDataLayout().getTypeAllocSize(
+                         A.getParamByValType()));
+        CallInst *Copy = EntryIRB.CreateCall(
+            TaintByvalCopyFn,
+            {&A, Len, ConstantInt::get(Int32Ty, A.getArgNo())});
+        TF.SkipInsts.insert(Copy);
+      }
+    }
 
     // TaintVisitor may create new basic blocks, which confuses df_iterator.
     // Build a copy of the list before iterating over it.
@@ -6601,6 +6644,50 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
   // Other intrinsics: symbolic propagation not yet implemented — skip.
 }
 
+// The callee's __taint_byval_copy gives each byval copy its source's shadow:
+// the source goes in __taint_byval_src[I] just before the call, and is
+// cleared after it, so a callee that does not take it (one that is not
+// instrumented) leaves none for the next call.  A declaration counts: the
+// callee is often instrumented in another module (libc++.a, another TU).
+void TaintVisitor::storeByvalSources(CallBase &CB) {
+  unsigned N = std::min<unsigned>(CB.arg_size(), Taint::kByvalSrcSlots);
+  auto IsSource = [&](unsigned I) {
+    if (!CB.isByValArgument(I))
+      return false;
+    Type *Ty = CB.getParamByValType(I);
+    return Ty && Ty->isSized();
+  };
+  Type *SlotsTy =
+      ArrayType::get(PointerType::getUnqual(CB.getContext()),
+                     Taint::kByvalSrcSlots);
+  bool Stored = false;
+  for (unsigned I = 0; I != N; ++I) {
+    if (!IsSource(I))
+      continue;
+    IRBuilder<> IRB(&CB);
+    Value *Slot = IRB.CreateConstGEP2_32(SlotsTy, TF.TT.ByvalSrcTLS, 0, I);
+    TF.SkipInsts.insert(IRB.CreateStore(CB.getArgOperand(I), Slot));
+    Stored = true;
+  }
+  if (!Stored || CB.isMustTailCall())
+    return;
+  Instruction *After = nullptr;
+  if (auto *II = dyn_cast<InvokeInst>(&CB))
+    After = &*II->getNormalDest()->getFirstInsertionPt();
+  else if (!isa<CallBrInst>(CB))
+    After = CB.getNextNode();
+  if (!After)
+    return;
+  IRBuilder<> IRB(After);
+  Value *Null = ConstantPointerNull::get(PointerType::getUnqual(CB.getContext()));
+  for (unsigned I = 0; I != N; ++I) {
+    if (!IsSource(I))
+      continue;
+    Value *Slot = IRB.CreateConstGEP2_32(SlotsTy, TF.TT.ByvalSrcTLS, 0, I);
+    TF.SkipInsts.insert(IRB.CreateStore(Null, Slot));
+  }
+}
+
 void TaintVisitor::visitCallBase(CallBase &CB) {
   if (CB.isInlineAsm()) {
     // FIXME: inline asm
@@ -6676,6 +6763,8 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
   // instrument them.
   if (F == TF.TT.TaintVarargWrapperFn.getCallee()->stripPointerCasts())
     return;
+
+  storeByvalSources(CB);
 
   IRBuilder<> IRB(&CB);
 

@@ -92,6 +92,14 @@ SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL dfsan_label
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL dfsan_label
     __dfsan_arg_tls[kArgTlsSize / sizeof(dfsan_label)];
 
+// The object each byval argument is copied from, by argument number (the
+// first kTaintByvalSlots), stored by an instrumented caller just before the
+// call and taken by the callee's __taint_byval_copy.  Must match TaintPass's
+// kByvalSrcSlots.
+static const unsigned kTaintByvalSlots = 8;
+SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL void
+    *__taint_byval_src[kTaintByvalSlots];
+
 SANITIZER_INTERFACE_ATTRIBUTE uptr __dfsan_shadow_ptr_mask;
 
 // On Linux/x86_64, memory is laid out as follows:
@@ -3093,6 +3101,26 @@ void __taint_copy_shadow(void *dst, void *src, uint64_t size) {
   if (str_label != 0) {
     taint_set_str_content_label(dst, str_label);
   }
+}
+
+// A byval argument's copy is made by the backend, so nothing instrumented
+// writes its shadow: what is there is the stack's stale shadow, often
+// kInitializingLabel under trace_bounds.  TaintPass calls this in the callee's
+// entry block, once per byval argument, and the caller stored the object it
+// copies from in __taint_byval_src[argno] (taken here, so a later call from
+// an uninstrumented caller does not see it).  With no source -- the caller
+// is uninstrumented, or argno is past the slots -- the copy is concrete.
+SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_byval_copy(void *copy, uint64_t size, uint32_t argno) {
+  void *src = nullptr;
+  if (argno < kTaintByvalSlots) {
+    src = __taint_byval_src[argno];
+    __taint_byval_src[argno] = nullptr;
+  }
+  if (src)
+    __taint_copy_shadow(copy, src, size);
+  else
+    dfsan_set_label(0, copy, size);
 }
 
 // Move SymSan shadow memory from src to dst (handles overlapping regions)
