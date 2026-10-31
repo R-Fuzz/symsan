@@ -773,6 +773,9 @@ struct TaintFunction {
   // reads fewer than the load's other users (visitLoadInst); the user is
   // visited with it in place of the load's
   DenseMap<std::pair<Value *, Instruction *>, Value *> UseShadowMap;
+  // load -> the shadow of each byte it read (<Size x label>), loaded with it,
+  // for a store that writes the loaded value back unchanged (visitLoadInst)
+  DenseMap<Value *, Value *> MovedShadowMap;
   DenseMap<AllocaInst *, AllocaInst *> AllocaShadowMap;
 
   struct PHIFixupElement {
@@ -5078,6 +5081,35 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
     TF.NonZeroChecks.push_back(Shadow);
 
   TF.setShadow(&LI, Shadow);
+
+  // A value stored back unchanged is a move, and a move copies each byte's
+  // label, as memcpy does: the value's one label (the union of its bytes')
+  // would give every byte the same.  A word that moves a padded struct reads
+  // padding with the fields, and padding is uninitialized: the union is
+  // kInitializingLabel, and the store marked the fields' bytes uninitialized
+  // too -- v8's ExternalEntityTable::TryExtend copies an
+  // optional<pair<Segment, FreelistHead>> as two i64s, and the freelist's
+  // length, uninitialized from then on, spread to every table allocation.
+  // So the bytes' labels are loaded here, with the value, for the store.
+  if (LI.isAtomic() || LI.isVolatile() || Size < 2 || Size > 16 ||
+      LI.getType()->isAggregateType() || TF.TT.isZeroShadow(Shadow))
+    return;
+  if (auto *AI = dyn_cast<AllocaInst>(LI.getPointerOperand()))
+    if (TF.AllocaShadowMap.count(AI))
+      return;
+  bool Moved = false;
+  for (User *U : LI.users())
+    if (auto *SI = dyn_cast<StoreInst>(U))
+      if (SI->getValueOperand() == &LI && !SI->isAtomic() &&
+          !SI->getMetadata("nosanitize"))
+        Moved = true;
+  if (!Moved)
+    return;
+  IRBuilder<> IRB(Pos);
+  Type *BytesTy = FixedVectorType::get(TF.TT.PrimitiveShadowTy, Size);
+  TF.MovedShadowMap[&LI] = IRB.CreateAlignedLoad(
+      BytesTy, TF.TT.getShadowAddress(LI.getPointerOperand(), IRB),
+      TF.getShadowAlign(LI.getAlign()));
 }
 
 void TaintFunction::storeShadowRecursive(
@@ -5245,6 +5277,18 @@ void TaintVisitor::visitStoreInst(StoreInst &SI) {
                                      TF.getShadowAlign(SI.getAlign()).value()),
                     TF.getShadow(RMW.Load), Alt,
                     ConstantInt::get(TF.TT.Int64Ty, RMW.Touched)});
+    return;
+  }
+
+  // a move: each byte keeps its label (see visitLoadInst)
+  auto Moved = TF.MovedShadowMap.find(Val);
+  auto *DstAI = dyn_cast<AllocaInst>(SI.getPointerOperand());
+  if (Moved != TF.MovedShadowMap.end() && !SI.isAtomic() &&
+      !(DstAI && TF.AllocaShadowMap.count(DstAI))) {
+    IRBuilder<> IRB(&SI);
+    IRB.CreateAlignedStore(Moved->second,
+                           TF.TT.getShadowAddress(SI.getPointerOperand(), IRB),
+                           TF.getShadowAlign(SI.getAlign()));
     return;
   }
 
