@@ -1920,6 +1920,70 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_pthread_join(pthread_t thread,
   return ret;
 }
 
+// pthread_getattr_np and the pthread_attr_t getters write through their
+// pointers in libc.  As discard (or unlisted) they left that memory's shadow
+// as it was: under trace_bounds a stack variable's is kInitializingLabel, and
+// v8's Stack::ObtainCurrentThreadStackStart read the base and size
+// pthread_attr_getstack had written as uninitialized.
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_pthread_getattr_np(pthread_t thread, pthread_attr_t *attr,
+                          dfsan_label thread_label, dfsan_label attr_label,
+                          dfsan_label *ret_label) {
+  int ret = pthread_getattr_np(thread, attr);
+  if (ret == 0)
+    dfsan_set_label(0, attr, sizeof(*attr));
+  *ret_label = 0;
+  return ret;
+}
+
+#define PTHREAD_ATTR_GETTER(name, type)                                        \
+  SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_##name(                             \
+      const pthread_attr_t *attr, type *out, dfsan_label attr_label,           \
+      dfsan_label out_label, dfsan_label *ret_label) {                         \
+    int ret = name(attr, out);                                                 \
+    if (ret == 0)                                                              \
+      dfsan_set_label(0, out, sizeof(*out));                                   \
+    *ret_label = 0;                                                            \
+    return ret;                                                                \
+  }
+PTHREAD_ATTR_GETTER(pthread_attr_getdetachstate, int)
+PTHREAD_ATTR_GETTER(pthread_attr_getguardsize, size_t)
+PTHREAD_ATTR_GETTER(pthread_attr_getinheritsched, int)
+PTHREAD_ATTR_GETTER(pthread_attr_getschedparam, struct sched_param)
+PTHREAD_ATTR_GETTER(pthread_attr_getschedpolicy, int)
+PTHREAD_ATTR_GETTER(pthread_attr_getscope, int)
+PTHREAD_ATTR_GETTER(pthread_attr_getstacksize, size_t)
+#undef PTHREAD_ATTR_GETTER
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_pthread_attr_getstack(const pthread_attr_t *attr, void **stackaddr,
+                             size_t *stacksize, dfsan_label attr_label,
+                             dfsan_label stackaddr_label,
+                             dfsan_label stacksize_label,
+                             dfsan_label *ret_label) {
+  int ret = pthread_attr_getstack(attr, stackaddr, stacksize);
+  if (ret == 0) {
+    dfsan_set_label(0, stackaddr, sizeof(*stackaddr));
+    dfsan_set_label(0, stacksize, sizeof(*stacksize));
+  }
+  *ret_label = 0;
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_pthread_attr_getaffinity_np(const pthread_attr_t *attr,
+                                   size_t cpusetsize, cpu_set_t *cpuset,
+                                   dfsan_label attr_label,
+                                   dfsan_label cpusetsize_label,
+                                   dfsan_label cpuset_label,
+                                   dfsan_label *ret_label) {
+  int ret = pthread_attr_getaffinity_np(attr, cpusetsize, cpuset);
+  if (ret == 0)
+    dfsan_set_label(0, cpuset, cpusetsize);
+  *ret_label = 0;
+  return ret;
+}
+
 struct dl_iterate_phdr_info {
   int (*callback)(struct dl_phdr_info *info, size_t size, void *data);
   void *data;
