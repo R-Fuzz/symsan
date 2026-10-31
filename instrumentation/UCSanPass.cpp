@@ -8109,6 +8109,83 @@ bool UCSan::runImpl(Module &M) {
     }
   }
 
+  // Library code (a body left `uninstrumented`, "ucsan-lib") that calls a
+  // function the YAML maps to a custom with no arguments -- a fatal reporter
+  // (V8_Dcheck, MakeCheckOpString -> abort), an assumption
+  // (ucsan_invalid_input) -- calls its wrapper, as in-scope code does: a
+  // DCHECK failing in library code is the same PANIC.  TaintPass sees only a
+  // declaration, and called its instrumented name, which nothing defines.
+  // (A custom that takes arguments reads their labels from UCSan's TLS, which
+  // library code does not write: those calls are left alone.)
+  for (auto &[Name, Entry] : Scope.custom) {
+    Function *F = M.getFunction(Name);
+    if (!F || !Entry.arg_maps.empty() ||
+        getWrapperKind(F) != WK_AutoCustom)
+      continue;
+    SmallVector<CallBase *, 4> LibCalls;
+    for (User *U : F->users())
+      if (auto *CB = dyn_cast<CallBase>(U))
+        if (CB->getCalledOperand() == F &&
+            CB->getFunction()->hasFnAttribute("ucsan-lib"))
+          LibCalls.push_back(CB);
+    if (LibCalls.empty())
+      continue;
+    Function *Wrapper = getCustomFunction(F);
+    if (!Wrapper)
+      continue;
+    for (CallBase *CB : LibCalls)
+      CB->setCalledFunction(Wrapper);
+  }
+
+  // Library code that calls in-scope code (directly, or indirectly: a
+  // std::function, a vtable) passes it concrete values: their UCSan labels
+  // are 0.  An in-scope function reads its arguments' labels from UCSan's
+  // TLS, which library code (TaintPass's alone) never writes, so it got what
+  // an earlier call left there -- an alloca's label on a library frame's
+  // std::string, then an OOB at the string's first access (v8 UTs whose
+  // out-of-scope callees run as library code: gtest's death tests,
+  // CallOnce's lambda).
+  {
+    SmallPtrSet<Function *, 32> InScope(FnsToInstrument.begin(),
+                                        FnsToInstrument.end());
+    const DataLayout &DL = M.getDataLayout();
+    for (Function &F : M) {
+      if (F.isDeclaration() || !F.hasFnAttribute("ucsan-lib"))
+        continue;
+      SmallVector<CallBase *, 16> Calls;
+      for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || CB->isInlineAsm())
+          continue;
+        Function *Callee = CB->getCalledFunction();
+        if (Callee ? InScope.count(Callee)
+                   : !isa<Function>(CB->getCalledOperand()->stripPointerCasts()))
+          Calls.push_back(CB);
+      }
+      for (CallBase *CB : Calls) {
+        IRBuilder<> IRB(CB);
+        FunctionType *FT = CB->getFunctionType();
+        unsigned ArgOffset = 0;
+        for (Type *T : FT->params()) {
+          Type *ShadowTy = getShadowTy(T);
+          unsigned Size = DL.getTypeAllocSize(ShadowTy);
+          if (ArgOffset + Size > ArgTLSSize)
+            break;
+          Value *Base = IRB.CreatePointerCast(ArgTLS, IntptrTy);
+          if (ArgOffset)
+            Base = IRB.CreateAdd(Base, ConstantInt::get(IntptrTy, ArgOffset));
+          Value *Ptr = IRB.CreateIntToPtr(Base, PointerType::get(ShadowTy, 0));
+          for (Value *V : {Base, Ptr})
+            if (auto *VI = dyn_cast<Instruction>(V))
+              markNosanitize(VI);
+          markNosanitize(IRB.CreateAlignedStore(Constant::getNullValue(ShadowTy),
+                                                Ptr, ShadowTLSAlignment));
+          ArgOffset += alignTo(Size, ShadowTLSAlignment);
+        }
+      }
+    }
+  }
+
   // Build dangle wrappers for out-of-scope functions
   // (now: a function the module's own top-level asm defines keeps its
   // address, and only its direct calls go to the wrapper.  Its address names
