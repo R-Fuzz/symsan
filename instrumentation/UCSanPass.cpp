@@ -8274,6 +8274,21 @@ bool UCSan::runImpl(Module &M) {
           markFunctionNosanitize(F);
         continue;
       }
+      // Library code ("ucsan-lib") calls the function itself, a declaration
+      // TaintPass resolves as it would without UCSan (its abilist: libc's
+      // own, or a custom wrapper): its callees run, they are not UCSan's to
+      // model.  The stub, which writes none of their effects, had v8's
+      // Thread::Start, as library code under a UT, find pthread_create's
+      // thread unset, and CHECK.
+      if (F->isDeclaration()) {
+        F->removeDeadConstantUsers();
+        F->replaceUsesWithIf(dangle, [](Use &U) {
+          auto *I = dyn_cast<Instruction>(U.getUser());
+          return !I || !I->getFunction()->hasFnAttribute("ucsan-lib");
+        });
+        if (!F->use_empty())
+          continue;
+      }
       F->replaceAllUsesWith(dangle);
       F->eraseFromParent();
     }
