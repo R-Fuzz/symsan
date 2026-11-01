@@ -5982,13 +5982,19 @@ Value *TaintFunction::visitAllocaInst(AllocaInst *I, Value *ArraySize,
 }
 
 void TaintVisitor::visitAllocaInst(AllocaInst &I) {
+  // (each load and store of the shadow's own type: the promoted shadow is one
+  // slot of it, and an access of another was one past it -- clang returns an
+  // __int128 at -O0 by storing it to an i128 alloca and loading { i64, i64 },
+  // whose second label was a stack word nothing wrote)
+  Type *ShadowTy = TF.TT.getShadowTy(I.getAllocatedType());
   bool AllLoadsStores = true;
   for (User *U : I.users()) {
-    if (isa<LoadInst>(U)) {
+    if (isa<LoadInst>(U) && TF.TT.getShadowTy(U) == ShadowTy) {
       continue;
     }
     if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-      if (SI->getPointerOperand() == &I) {
+      if (SI->getPointerOperand() == &I &&
+          TF.TT.getShadowTy(SI->getValueOperand()) == ShadowTy) {
         continue;
       }
     }
@@ -5998,8 +6004,8 @@ void TaintVisitor::visitAllocaInst(AllocaInst &I) {
   }
   if (AllLoadsStores) {
     IRBuilder<> IRB(&I);
-    AllocaInst *AI = IRB.CreateAlloca(TF.TT.getShadowTy(I.getAllocatedType()),
-                                      I.getArraySize(), I.getName() + ".taint");
+    AllocaInst *AI = IRB.CreateAlloca(ShadowTy, I.getArraySize(),
+                                      I.getName() + ".taint");
     TF.AllocaShadowMap[&I] = AI;
     if (ClTraceBound) {
       // set shadow to uninit

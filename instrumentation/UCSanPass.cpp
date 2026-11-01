@@ -7163,13 +7163,17 @@ void UCSanVisitor::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
 void UCSanVisitor::visitAllocaInst(AllocaInst &I) {
   Type *T = I.getAllocatedType();
   bool isArray = I.isArrayAllocation() || T->isArrayTy() || T->isStructTy();
+  // (each load and store of the shadow's own type, as in TaintPass: an
+  // __int128 returned at -O0 is an i128 stored and { i64, i64 } loaded)
+  Type *ShadowTy = UF.UC.getShadowTy(T);
   bool AllLoadsStores = true;
   for (User *U : I.users()) {
-    if (isa<LoadInst>(U)) {
+    if (isa<LoadInst>(U) && UF.UC.getShadowTy(U) == ShadowTy) {
       continue;
     }
     if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-      if (SI->getPointerOperand() == &I) {
+      if (SI->getPointerOperand() == &I &&
+          UF.UC.getShadowTy(SI->getValueOperand()) == ShadowTy) {
         continue;
       }
     }
@@ -7179,13 +7183,14 @@ void UCSanVisitor::visitAllocaInst(AllocaInst &I) {
   }
   if (AllLoadsStores) {
     IRBuilder<> IRB(&I);
-    AllocaInst *AI = IRB.CreateAlloca(UF.UC.getShadowTy(T), I.getArraySize(),
+    AllocaInst *AI = IRB.CreateAlloca(ShadowTy, I.getArraySize(),
                                       I.getName() + ".ucsan");
     UF.UC.markNosanitize(AI);
     UF.AllocaShadowMap[&I] = AI;
     if (getenv("KO_CHECKER_UBI")) {
       // Set shadow to kUninitializedLabel for UBI detection
-      StoreInst *SI = IRB.CreateStore(UF.UC.UninitPrimitiveShadow, AI);
+      // (every element's: a struct's shadow is one label per field)
+      StoreInst *SI = IRB.CreateStore(UF.UC.getUninitShadow(T), AI);
       UF.UC.markNosanitize(SI);
     }
   } else {
