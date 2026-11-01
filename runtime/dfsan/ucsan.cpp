@@ -2864,6 +2864,20 @@ void ucsan_pop_stack_frame() {
   // Restore stack top when exiting a function
   // This automatically frees all stack allocation labels created in this function
   if (__current_saved_stack_index > 0) {
+    ucsan_label saved = __saved_alloca_stack_top[__current_saved_stack_index];
+    // The frame's locals' shadow dies with it, as TaintPass's does: library
+    // (UCSan-uninstrumented) code that reuses the stack writes no shadow, and
+    // an in-scope callee reading what it wrote read the dead frame's
+    // pointer labels, a freed or since reused label (v8's torque ToString,
+    // library code, streamed into a std::stringstream on its stack, and
+    // libc++'s in-scope __pad_and_output found the stream's rdbuf an OOB
+    // pointer), or its uninitialized marking
+    for (ucsan_label l = __alloca_stack_top; l < saved; ++l) {
+      ucsan_obj_info *obj = to_obj_info(get_label_info(l));
+      if (obj->op == OP_ALLOCA && obj->real_ptr)
+        internal_memset(ucsan_shadow_for(obj->real_ptr), 0,
+                        (uptr)obj->upper_bound * sizeof(ucsan_label));
+    }
     __alloca_stack_top = __saved_alloca_stack_top[__current_saved_stack_index--];
     UCSAN_OUT("ucsan_pop_stack_frame: restored index=%d, stack_top=%u\n",
               __current_saved_stack_index, __alloca_stack_top);

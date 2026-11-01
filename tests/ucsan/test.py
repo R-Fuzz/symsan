@@ -94,7 +94,9 @@ def parse_test(file, test_name):
             for flag in flags:
                 test[2].append([int(flag, 0), -2])
         elif line.startswith("// CFLAGS:"):
-            test_cflags[test_name] = line.split(":", maxsplit=1)[1].strip()
+            # %S: this directory (the build runs in OUT_DIR), as in lit
+            test_cflags[test_name] = line.split(":", maxsplit=1)[1].strip() \
+                .replace("%S", SCRIPT_DIR)
         elif line.startswith("// SOLVER-ERROR-ABSENT"):
             solver_error_absent_tests.add(test_name)
         elif line.startswith("// EVENT:"):

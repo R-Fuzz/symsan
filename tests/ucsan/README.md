@@ -27,7 +27,9 @@ python3 test.py                   # run the whole suite
 `EVENT: <id>...` asserts that the target reports each event (`PIPE_EVENT_TYPE`,
 e.g. 106 for a kernel WARN) at least once.
 `CFLAGS: <flags>` adds compiler flags (e.g. `-O2`, for what only optimized code
-does, such as the pass reusing a checked pointer).
+does, such as the pass reusing a checked pointer); `%S` in them is this
+directory, e.g. `-mllvm -ucsan-abilist=%S/metadata/X.abilist` to run a function
+as library code (`fun:f=uninstrumented`).
 `SOLVER-ERROR-ABSENT` asserts that the manager reports no solver parse error;
 pair it with `DISCARD` when an exit status may be reached but is not the
 property under test.
