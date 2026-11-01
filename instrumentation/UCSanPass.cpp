@@ -6255,6 +6255,18 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
       ArgOffset += alignTo(Size, ShadowTLSAlignment);
       Args.push_back(Arg);
     }
+    if (auto *II = dyn_cast<InvokeInst>(&CB)) {
+      // An invoke ends its block, so the call made in its place is an invoke
+      // too, to the merge block, and unwinds where it did.  It was a call,
+      // the merge block's terminator went with the invoke, and -fexceptions
+      // code (libc++'s __put_character_sequence from v8's torque, calling a
+      // facet's virtual widen) was a broken module.
+      BasicBlock *ThenBB = TB->getParent();
+      retTB = IRB_TB.CreateInvoke(CB.getFunctionType(), FPtr, curBB,
+                                  II->getUnwindDest(), Args);
+      TB->eraseFromParent();
+      II->getUnwindDest()->replacePhiUsesWith(curBB, ThenBB);
+    } else
     retTB = IRB_TB.CreateCall(
         CB.getFunctionType(),
         FPtr,
@@ -6340,6 +6352,17 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
       UF.NonZeroChecks.push_back(LI);
     }
     CB.replaceAllUsesWith(RetPhiNode);
+  }
+  // the merge block goes on where the invoke's normal path did
+  if (auto *II = dyn_cast<InvokeInst>(&CB)) {
+    BranchInst *BI = BranchInst::Create(II->getNormalDest());
+    BI->setDebugLoc(CB.getDebugLoc());
+    if (BBID)
+      BI->setMetadata(BBIDName, BBID);
+    CB.eraseFromParent();
+    BI->insertInto(curBB, curBB->end());
+    UF.DT.recalculate(*UF.F);
+    return;
   }
   CB.eraseFromParent();
 

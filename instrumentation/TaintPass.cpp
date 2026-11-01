@@ -7242,7 +7242,12 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       }
     }
 
-    if (InvokeInst *II = dyn_cast<InvokeInst>(&CB)) {
+    // (an invoke's too: UCSanPass's merge block is its normal destination,
+    // and a load on the edge to it does not dominate the PHINode's uses)
+    if (RetPhiNode) {
+      // Load shadow after the PHINode
+      Next = RetPhiNode->getParent()->getFirstNonPHI();
+    } else if (InvokeInst *II = dyn_cast<InvokeInst>(&CB)) {
       if (II->getNormalDest()->getSinglePredecessor()) {
         Next = &II->getNormalDest()->front();
       } else {
@@ -7252,12 +7257,7 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
       }
     } else {
       assert(CB.getIterator() != CB.getParent()->end());
-      if (RetPhiNode) {
-        // Load shadow after the PHINode
-        Next = RetPhiNode->getParent()->getFirstNonPHI();
-      } else {
-        Next = CB.getNextNode();
-      }
+      Next = CB.getNextNode();
     }
 
     // Don't emit the epilogue for musttail call returns.
