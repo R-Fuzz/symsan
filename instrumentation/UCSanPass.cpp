@@ -8537,10 +8537,30 @@ bool UCSan::runImpl(Module &M) {
     // (not one a library linked in defines, listed `global:` uninstrumented:
     // a weak zero definition would keep the linker from taking the library's,
     // as libc++'s basic_ostringstream VTT, and its vptrs were null)
+    // (nor one library code -- "ucsan-lib", run concretely -- reads: a
+    // weak zero definition in the executable also takes the place of the
+    // shared library's, as libc's stdout, and v8's PrintF, library code
+    // under a UT, passed vfprintf a null FILE)
+    auto UsedByLib = [](GlobalVariable &GV) {
+      SmallVector<User *, 8> Worklist(GV.users().begin(), GV.users().end());
+      SmallPtrSet<User *, 8> Visited;
+      while (!Worklist.empty()) {
+        User *U = Worklist.pop_back_val();
+        if (!Visited.insert(U).second)
+          continue;
+        if (auto *I = dyn_cast<Instruction>(U)) {
+          if (I->getFunction()->hasFnAttribute("ucsan-lib"))
+            return true;
+        } else if (isa<Constant>(U) && !isa<GlobalValue>(U)) {
+          Worklist.append(U->user_begin(), U->user_end());
+        }
+      }
+      return false;
+    };
     if (GV.isDeclaration() &&
         (GV.hasExternalLinkage() || GV.hasExternalWeakLinkage()) &&
         !AsmDefined.contains(GV.getName()) &&
-        !ABIList.isIn(GV, "uninstrumented")) {
+        !ABIList.isIn(GV, "uninstrumented") && !UsedByLib(GV)) {
       GV.setLinkage(GlobalValue::WeakAnyLinkage);
       GV.setInitializer(Constant::getNullValue(GV.getValueType()));
     }
