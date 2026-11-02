@@ -3175,6 +3175,12 @@ Value *TaintFunction::getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB) {
     Module *M = F->getParent();
     auto &DL = M->getDataLayout();
     uint64_t size = T->isSized() ? DL.getTypeAllocSize(T) : 1; // FIXME: default size?
+    // An array of unknown bound (`extern T a[]`, [0 x T]) has no bounds: its
+    // size is the linker's, as for cppgc's GCInfo table, the gc_info_section
+    // __start_gc_info_section begins.  Bounds [a, a) made every read of it an
+    // OOB (HeapObjectHeader::Finalize, at every v8 Isolate's teardown).
+    if (size == 0)
+      return TT.ZeroPrimitiveShadow;
     Value *Size = ConstantInt::get(TT.Int64Ty, size);
     Value *Addr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
     return IRB.CreateCall(TT.TaintTraceGlobalFn, {Addr, Size});
