@@ -1,0 +1,7 @@
+entry: "cal(int*)"
+scope:
+  - "touch(int*)"
+  - "Counter::~Counter()"
+  - "Gauge::~Gauge()"
+  - "counter()"
+  - "exit"

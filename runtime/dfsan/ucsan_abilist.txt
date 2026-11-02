@@ -13,6 +13,10 @@ fun:realloc=custom
 fun:reallocarray=custom
 fun:valloc=custom
 
+# a static object's destructor, registered for exit to call (uninstrumented:
+# its argument's label, see ucsan_custom.cpp)
+fun:__cxa_atexit=custom
+
 # C++ operator new/delete (malloc/free with C++'s contract; see ucsan_custom.cpp)
 fun:_Znwm=custom
 fun:_Znam=custom

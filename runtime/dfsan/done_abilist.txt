@@ -252,7 +252,6 @@ fun:_ZN9libunwind*=uninstrumented
 fun:__assert_fail=discard
 fun:__cmsg_nxthdr=discard
 fun:__ctype_b_loc=discard
-fun:__cxa_atexit=discard
 fun:__errno_location=discard
 fun:__newlocale=discard
 fun:__sbrk=discard
@@ -635,6 +634,8 @@ fun:pthread_setspecific=discard
 
 # Functions that take a callback (wrap the callback manually).
 fun:pthread_create=custom
+# (exit calls the destructor: dfsan_custom.cpp, ucsan_custom.cpp)
+fun:__cxa_atexit=custom
 
 # Functions that produce output does not depend on the input (need to zero the
 # shadow manually).

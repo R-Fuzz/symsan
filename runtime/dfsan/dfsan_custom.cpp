@@ -1908,6 +1908,40 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_pthread_create(
   return rv;
 }
 
+// A destructor __cxa_atexit registers (a static object's) is called by exit,
+// which is not instrumented: it read its `this` label from whatever the last
+// call left in the args TLS.  It is registered through a callback that
+// clears it first, as pthread_create's.  (Combined: ucsan_custom.cpp's, which
+// UCSan's labels need too.)
+#ifndef USE_UCSAN_CUSTOM
+struct cxa_atexit_info {
+  void (*fn)(void *);
+  void *arg;
+};
+static const unsigned kMaxCxaAtexit = 1024;
+static cxa_atexit_info cxa_atexit_infos[kMaxCxaAtexit];
+static unsigned cxa_atexit_count;
+
+static void cxa_atexit_cb(void *p) {
+  cxa_atexit_info *info = (cxa_atexit_info *)p;
+  dfsan_clear_thread_local_state();
+  info->fn(info->arg);
+}
+
+extern "C" int __cxa_atexit(void (*fn)(void *), void *arg, void *dso);
+
+SANITIZER_INTERFACE_ATTRIBUTE int __dfsw___cxa_atexit(
+    void (*fn)(void *), void *arg, void *dso, dfsan_label fn_label,
+    dfsan_label arg_label, dfsan_label dso_label, dfsan_label *ret_label) {
+  *ret_label = 0;
+  unsigned i = __atomic_fetch_add(&cxa_atexit_count, 1, __ATOMIC_RELAXED);
+  if (i >= kMaxCxaAtexit)
+    return __cxa_atexit(fn, arg, dso);
+  cxa_atexit_infos[i] = {fn, arg};
+  return __cxa_atexit(cxa_atexit_cb, &cxa_atexit_infos[i], dso);
+}
+#endif
+
 SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_pthread_join(pthread_t thread,
                                                       void **retval,
                                                       dfsan_label thread_label,

@@ -30,6 +30,7 @@ extern "C" {
   // [[deprecated]] void *pvalloc(size_t size);
   void *aligned_alloc(size_t alignment, size_t size);
   int posix_memalign(void **memptr, size_t alignment, size_t size);
+  int __cxa_atexit(void (*fn)(void *), void *arg, void *dso);
 
   // SymSan bridge functions (weak stubs in ucsan.cpp, strong in dfsan.cpp)
   dfsan_label __taint_create_label(uint32_t object_id, uint64_t offset,
@@ -1482,6 +1483,51 @@ int __dfsw_getchar(ucsan_label *ret_label) {
   return file_getc(get_file_state(), ret_label);
 }
 
+// A destructor __cxa_atexit registers (a static object's: libc++'s
+// std::vector of gtest's g_argvs, or a function-local static) is called by
+// exit, which is not instrumented: an in-scope one read its `this` label
+// from whatever the last call left in __ucsan_arg_tls, a freed stack label
+// (a stack UAF report after the test had finished).  It is registered
+// through a trampoline that hands it the label it was registered with (0
+// from library code), as dfsan_custom.cpp's pthread_create clears dfsan's
+// TLS for its start routine.
+namespace {
+struct ucsan_atexit_entry {
+  void (*fn)(void *);
+  void *arg;
+  ucsan_label arg_label;
+};
+const unsigned kMaxAtexitEntries = 1024;
+ucsan_atexit_entry ucsan_atexit_entries[kMaxAtexitEntries];
+unsigned ucsan_atexit_count;
+}  // namespace
+
+#ifdef USE_UCSAN_CUSTOM
+void dfsan_clear_thread_local_state();
+#endif
+
+static void ucsan_atexit_trampoline(void *p) {
+  ucsan_atexit_entry *e = (ucsan_atexit_entry *)p;
+  internal_memset(__ucsan_arg_tls, 0, sizeof(__ucsan_arg_tls));
+  __ucsan_arg_tls[0] = e->arg_label;
+#ifdef USE_UCSAN_CUSTOM
+  dfsan_clear_thread_local_state();
+#endif
+  e->fn(e->arg);
+}
+
+__attribute__((visibility("default")))
+int __dfsw___cxa_atexit(void (*fn)(void *), void *arg, void *dso,
+                        ucsan_label fn_label, ucsan_label arg_label,
+                        ucsan_label dso_label, ucsan_label *ret_label) {
+  *ret_label = 0;
+  unsigned i = __atomic_fetch_add(&ucsan_atexit_count, 1, __ATOMIC_RELAXED);
+  if (i >= kMaxAtexitEntries)
+    return __cxa_atexit(fn, arg, dso);
+  ucsan_atexit_entries[i] = {fn, arg, arg_label};
+  return __cxa_atexit(ucsan_atexit_trampoline, &ucsan_atexit_entries[i], dso);
+}
+
 // ===== __dfsl_ adapters =====
 // Only in the combined runtime (USE_UCSAN_CUSTOM), the one configuration with
 // code that is TaintPass's alone linked beside UCSan's: UCSan alone has no
@@ -1812,6 +1858,13 @@ int __dfsl_getc(FILE *stream, dfsan_label stream_label,
   if (ucsan_file_stream(stream))
     return DFSL_CALL(ret_label, __dfsw_getc(stream, 0, &l));
   return __dfsr_getc(stream, stream_label, ret_label);
+}
+
+__attribute__((visibility("default")))
+int __dfsl___cxa_atexit(void (*fn)(void *), void *arg, void *dso,
+                        dfsan_label fn_label, dfsan_label arg_label,
+                        dfsan_label dso_label, dfsan_label *ret_label) {
+  return DFSL_CALL(ret_label, __dfsw___cxa_atexit(fn, arg, dso, 0, 0, 0, &l));
 }
 
 #undef DFSL_CALL
