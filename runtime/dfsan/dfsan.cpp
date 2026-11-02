@@ -2066,9 +2066,31 @@ dfsan_label dfsan_create_label(uint64_t input_id, uint64_t offset, uint32_t size
   return label;
 }
 
+// Clearing a large range's labels: its shadow's whole pages go back to the OS
+// (the shadow is private anonymous memory, so they read as zero again), as
+// upstream DFSan's ReleaseOrClearShadows does.  The loop below reads every
+// label: for v8's cppgc cage, munmap'd 8 GB at a time, that was 32 GB of
+// shadow faulted in page by page, minutes before V8::Initialize returned.
+static bool ReleaseShadow(void *addr, uptr size) {
+  uptr beg = (uptr)shadow_for(addr);
+  uptr end = beg + size * sizeof(dfsan_label);
+  // (one stretch of shadow only: the range does not cross a mask boundary)
+  if (end - beg < common_flags()->clear_shadow_mmap_threshold ||
+      (uptr)shadow_for((char *)addr + size - 1) + sizeof(dfsan_label) != end)
+    return false;
+  uptr page = GetPageSizeCached();
+  uptr beg_aligned = RoundUpTo(beg, page), end_aligned = RoundDownTo(end, page);
+  if (beg_aligned >= end_aligned) return false;
+  internal_memset((void *)beg, 0, beg_aligned - beg);
+  internal_memset((void *)end_aligned, 0, end - end_aligned);
+  ReleaseMemoryPagesToOS(beg_aligned, end_aligned);
+  return true;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __dfsan_set_label(dfsan_label label, void *addr, uptr size) {
   if (addr == 0) return;
+  if (label == 0 && ReleaseShadow(addr, size)) return;
   for (dfsan_label *labelp = shadow_for(addr); size != 0; --size, ++labelp) {
     // Don't write the label if it is already the value we need it to be.
     // In a program where most addresses are not labeled, it is common that
