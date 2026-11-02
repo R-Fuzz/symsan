@@ -53,6 +53,9 @@ static int __loop_depth_stack_current[LOOP_COUNTER_SIZE];
 static int __loop_depth_stack_base[LOOP_COUNTER_SIZE];
 static int __loop_depth_stack_previous[LOOP_COUNTER_SIZE];
 static int __loop_depth_stack_top = 0;
+// frames pushed past the top of the loop-depth stack (a call chain deeper
+// than LOOP_COUNTER_SIZE, once recursion is unbounded): counted, not saved
+static int __loop_depth_stack_overflow = 0;
 static int __base_loop_depth = 0;
 
 // Per-function recursion depth (keyed by TaintPass F.getGUID()), analogous to
@@ -109,6 +112,10 @@ static inline void check_seed_timeout() {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_loop_push_stack() {
+  if (__loop_depth_stack_top >= LOOP_COUNTER_SIZE) {
+    __loop_depth_stack_overflow++;
+    return;
+  }
   __loop_depth_stack_current[__loop_depth_stack_top] = __current_loop_depth;
   __loop_depth_stack_base[__loop_depth_stack_top] = __base_loop_depth;
   __loop_depth_stack_previous[__loop_depth_stack_top] = __previous_loop_depth;
@@ -120,6 +127,12 @@ __taint_trace_loop_push_stack() {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_loop_pop_stack() {
+  if (__loop_depth_stack_overflow) {
+    __loop_depth_stack_overflow--;
+    return;
+  }
+  if (__loop_depth_stack_top == 0)
+    return;
   __loop_depth_stack_top--;
   __current_loop_depth = __loop_depth_stack_current[__loop_depth_stack_top];
   __base_loop_depth = __loop_depth_stack_base[__loop_depth_stack_top];

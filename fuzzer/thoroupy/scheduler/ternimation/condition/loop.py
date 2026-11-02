@@ -163,7 +163,8 @@ class _NestManager():
         return sig not in self._visited_exit
 
 class Loop(TerminationConditionBase):
-    def __init__(self, manager, threshold=10, reset_nest=False, trace_branch=False, skip_solve=False) -> None:
+    def __init__(self, manager, threshold=10, reset_nest=False, trace_branch=False, skip_solve=False,
+                 stack_threshold=None) -> None:
         global TRACE_BRANCH
         super().__init__(manager)
         # self.loops = defaultdict(_LoopCounter)
@@ -174,6 +175,20 @@ class Loop(TerminationConditionBase):
         self._last_cid = 0
         self._nest = _NestManager()
         TRACE_BRANCH = trace_branch
+        # stack_threshold: the runtime's per-function recursion bound (exit
+        # 125), 0 for none; unset keeps the runtime's (20).  A harness that
+        # decides how its loops run decides how deep it recurses too: a
+        # 64K-entry std::map's destroy() recurses ~32 deep (v8's
+        # ConstantArrayBuilderTest.AllocateAllEntries, once its loops ran).
+        if stack_threshold is not None and self._manager:
+            stack_threshold = int(stack_threshold)
+            ticket = UcsanTicket()
+            ticket.payload_size = 4
+            ticket.msg_type = 0x4
+            self._manager.pipe.send(ticket)
+            self._manager.pipe.send(
+                (stack_threshold if stack_threshold > 0 else 0x7fffffff)
+                .to_bytes(4, "little"))
 
     @property
     def threshold(self):
