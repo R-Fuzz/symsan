@@ -640,6 +640,7 @@ class Taint {
   FunctionCallee TaintAssumeFn;
   FunctionCallee TaintByvalCopyFn;
   FunctionCallee UCSanLibStoreFn;
+  FunctionCallee UCSanLibStorePtrFn;
   FunctionCallee UCSanLibMemTransferFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
   /// Read-only global arrays eligible to be treated as lookup tables, mapped to
@@ -2642,11 +2643,16 @@ void Taint::initializeUCSanLibFunctions(Module &M) {
   UCSanLibStoreFn = Mod->getOrInsertFunction(
       "__ucsan_lib_store", AL, Type::getVoidTy(*Ctx),
       PointerType::getUnqual(*Ctx), IntptrTy);
+  UCSanLibStorePtrFn = Mod->getOrInsertFunction(
+      "__ucsan_lib_store_ptr", AL, Type::getVoidTy(*Ctx),
+      PointerType::getUnqual(*Ctx), IntptrTy);
   UCSanLibMemTransferFn = Mod->getOrInsertFunction(
       "__ucsan_lib_memtransfer", AL, Type::getVoidTy(*Ctx),
       PointerType::getUnqual(*Ctx), PointerType::getUnqual(*Ctx), IntptrTy);
   TaintRuntimeFunctions.insert(
       UCSanLibStoreFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      UCSanLibStorePtrFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       UCSanLibMemTransferFn.getCallee()->stripPointerCasts());
 }
@@ -2657,8 +2663,17 @@ void Taint::insertUCSanLibStore(Instruction *I) {
   Value *Ptr = nullptr, *Size = nullptr;
   if (auto *SI = dyn_cast<StoreInst>(I)) {
     Ptr = SI->getPointerOperand();
+    // a pointer stored is handed over: the label a pointer the library only
+    // moved keeps is kept for it alone (see __ucsan_lib_store_ptr)
+    Value *V = SI->getValueOperand();
+    if (V->getType()->isPointerTy() &&
+        DL.getTypeStoreSize(V->getType()) == DL.getPointerSize()) {
+      IRBuilder<> IRB(I);
+      IRB.CreateCall(UCSanLibStorePtrFn, {Ptr, IRB.CreatePtrToInt(V, IntptrTy)});
+      return;
+    }
     Size = ConstantInt::get(IntptrTy,
-        DL.getTypeStoreSize(SI->getValueOperand()->getType()));
+        DL.getTypeStoreSize(V->getType()));
   } else if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
     Ptr = RMW->getPointerOperand();
     Size = ConstantInt::get(IntptrTy,

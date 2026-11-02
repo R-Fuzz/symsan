@@ -1671,6 +1671,33 @@ void __ucsan_lib_store(void *addr, uptr size) {
       ls[i] = 0;
 }
 
+// ...and a pointer it stores, v: the label there is kept for a pointer the
+// library moved, one into the label's object (or just past it), and not for
+// another.  A concrete object's label (a malloc'd block's, a local's) over a
+// pointer elsewhere is what an in-scope store left in the slot before the
+// library wrote its own pointer, which has none: absl's raw_hash_set,
+// library code under a v8 UT, resized its table, and the in-scope find
+// checked the new control bytes against the old, smaller block's bounds, an
+// OOB.  The slot is the new pointer's, concrete.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_lib_store_ptr(void *addr, uptr v) {
+  ucsan_label *ls = ucsan_shadow_for(addr);
+  ucsan_label l = ls[0];
+  if (l != 0 && l != kUninitializedLabel) {
+    ucsan_label_info *info = get_label_info(l);
+    if (info->common.op == OP_ALLOCA) {
+      ucsan_obj_info *obj = to_obj_info(info);
+      uptr lower = (uptr)obj->real_ptr - obj->lower_bound;
+      uptr upper = (uptr)obj->real_ptr + obj->upper_bound;
+      if (v < lower || v > upper) {
+        internal_memset(ls, 0, sizeof(void *) * sizeof(ucsan_label));
+        return;
+      }
+    }
+  }
+  __ucsan_lib_store(addr, sizeof(void *));
+}
+
 // ...and its memcpy/memmove intrinsics copy the shadow, as __dfsw_memmove.
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __ucsan_lib_memtransfer(void *dest, void *src, uptr size) {
