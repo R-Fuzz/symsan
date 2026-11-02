@@ -147,19 +147,32 @@ class Capture(logging.Handler):
 
 
 def symbolize(binary, addrs):
-    """addr -> its frames, innermost first, as "function file:line"
-    (llvm-addr2line-18 -i; one call per address, since its output has no
-    separator between one address's inlined frames and the next's)."""
+    """addr -> its frames, innermost first, as "function file:line".
+    One llvm-symbolizer-18 call for all of them: its JSON output is a line
+    per address, inlined frames included (addr2line's text output has no
+    separator between one address's frames and the next's, and a call per
+    address loads the debug info of a 1 GB binary each time)."""
+    if not addrs:
+        return {}
+    try:
+        out = subprocess.run(
+            ["llvm-symbolizer-18", "--obj=" + binary, "--output-style=JSON",
+             "-C", "-i"],
+            input="".join("%#x\n" % a for a in addrs),
+            capture_output=True, text=True, timeout=1800).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
     result = {}
-    for a in addrs:
+    for line in out.splitlines():
         try:
-            out = subprocess.run(
-                ["llvm-addr2line-18", "-f", "-C", "-i", "-e", binary, "%#x" % a],
-                capture_output=True, text=True, timeout=120).stdout.splitlines()
-        except (OSError, subprocess.TimeoutExpired):
+            rec = json.loads(line)
+            addr = "%#x" % int(rec["Address"], 16)
+        except (ValueError, KeyError, TypeError):
             continue
-        result["%#x" % a] = ["%s %s" % (out[j], out[j + 1])
-                             for j in range(0, len(out) - 1, 2)]
+        result[addr] = ["%s %s:%s" % (f.get("FunctionName", "??"),
+                                      f.get("FileName", "??"),
+                                      f.get("Line", 0))
+                        for f in rec.get("Symbol", [])]
     return result
 
 
@@ -190,7 +203,7 @@ def main():
     ap.add_argument("--bbtrace", action="store_true",
                     help="write the (function, block) trace to bbtrace.txt")
     ap.add_argument("--symbolize", action="store_true",
-                    help="symbolize the event sites (llvm-addr2line-18)")
+                    help="symbolize the event sites (llvm-symbolizer-18)")
     args = ap.parse_args()
 
     # The manager forks and execve()s the binary; if that fails the child goes

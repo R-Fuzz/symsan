@@ -6,7 +6,7 @@ its values are explored instead of fixed. Written for v8's unittests (built
 with clang-18 into bitcode), but neither tool knows about v8.
 
 ```bash
-tools/ucsan-ut/build.sh OUTDIR    # ut-entry and ut-unit, with clang++-18 / llvm-config-18
+tools/ucsan-ut/build.sh OUTDIR    # ut-entry, ut-strip, ut-cg and ut-unit, with clang++-18 / llvm-config-18
 ```
 
 Override the compiler with `CXX` and the LLVM install with `LLVM_CONFIG`.
@@ -54,6 +54,45 @@ custom:
     ref_name: ucsan_invalid_input
     arg_maps: []
 ```
+
+## ut-strip: library code from a prebuilt archive
+
+```bash
+ut-strip IN.bc OUT.bc DEFS KEEP && opt-18 -passes=globaldce OUT.bc -o OUT.bc
+```
+
+Library code (what the scope calls out of it, run concretely under TaintPass)
+can come from an archive built once: each object of the library TaintPass'd
+on its own as library code (`-taint-ucsan-lib`), its definitions made weak.
+Then a test's module needs no copy of it. Linking the library's bitcode for
+the scope analysis brings in everything the test reaches, which for a v8
+Isolate test is all of v8.
+
+`DEFS` lists the symbols the archive defines, a function's without `.taint`.
+`KEEP` lists the scope. Each definition in `DEFS` but not in `KEEP` becomes a
+declaration, and each alias of one becomes a declaration too. The scope's
+copies stay. They are UCSan's and strong, so they win over the archive's weak
+ones, also for library code's calls into the scope.
+
+A static constructor the archive defines is dropped from the module's
+`llvm.global_ctors` (and `llvm.global_dtors`). Its object's own `.init_array`
+runs it whenever that object is linked in, so a second entry would construct
+the same global twice. gmock's `g_gmock_implicit_sequence` then created two
+pthread keys and failed the second `pthread_key_delete` at exit.
+
+## ut-cg: call graph facts for the scope
+
+```bash
+ut-cg IN.bc > OUT.cg
+```
+
+This prints what the scope script needs from a module, one fact per line:
+definitions with their source file, size and noreturn attribute,
+declarations, aliases, what each global's initializer and each function
+names, direct callees, the number of indirect call sites, and the classes a
+function allocas. Names are spelled as `llvm-dis` spells them. Reading these
+facts from bitcode instead of parsing `llvm-dis` text with regexes took the
+scope step of a v8 Isolate test from about 20 minutes to under a minute.
 
 ## run.py: exploring an entry
 
