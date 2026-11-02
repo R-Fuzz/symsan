@@ -61,6 +61,10 @@ expected_events = {}
 absent_events = {}
 # test -> extra compiler flags (`// CFLAGS:`)
 test_cflags = {}
+# test -> library sources under test/lib/ (`// LIB:`), each built on its own
+# as library code (KO_UCSAN_LIB: TaintPass -taint-ucsan-lib, as a prebuilt
+# archive's objects are) and linked into the test's binary
+test_libs = {}
 
 sys.path.append(os.path.join(SCRIPT_DIR, "..", "..", "fuzzer", "thoroupy"))
 
@@ -97,6 +101,9 @@ def parse_test(file, test_name):
             # %S: this directory (the build runs in OUT_DIR), as in lit
             test_cflags[test_name] = line.split(":", maxsplit=1)[1].strip() \
                 .replace("%S", SCRIPT_DIR)
+        elif line.startswith("// LIB:"):
+            test_libs.setdefault(test_name, []).extend(
+                line.split(":", maxsplit=1)[1].split())
         elif line.startswith("// SOLVER-ERROR-ABSENT"):
             solver_error_absent_tests.add(test_name)
         elif line.startswith("// EVENT:"):
@@ -200,7 +207,18 @@ def perform_test(stage, *args, seed=None):
     compile_cmd = f"{cc} -g -S -emit-llvm {compat_flags} -o ll/{test_name}.ll {src}"
     run(compile_cmd, cwd=".", env=env)
 
-    compile_binary_cmd = f"{cc} -g {compat_flags} -o binary/{test_name}.ucsan {src}"
+    lib_objs = ""
+    for i, lib in enumerate(test_libs.get(test_name, [])):
+        obj = f"binary/{test_name}.lib{i}.o"
+        # TaintPass's alone, as libcxx/rebuild.sh --ucsan builds: no METADATA
+        # (UCSanPass), nor the test's CFLAGS, which may be UCSanPass's options
+        lib_env = dict(env or os.environ, KO_UCSAN_LIB="1")
+        lib_env.pop("METADATA", None)
+        run(f"{cc} -g -c -Wno-error=implicit-function-declaration -o {obj} "
+            f"{os.path.join(SCRIPT_DIR, 'test', 'lib', lib)}", cwd=".", env=lib_env)
+        lib_objs += " " + obj
+
+    compile_binary_cmd = f"{cc} -g {compat_flags} -o binary/{test_name}.ucsan {src}{lib_objs}"
     run(compile_binary_cmd, cwd=".", env=env)
 
     stage.set_value('Compiled')

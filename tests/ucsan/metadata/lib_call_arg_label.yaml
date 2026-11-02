@@ -1,0 +1,6 @@
+entry: cal
+scope:
+  - cal
+  - touch
+  - use
+  - exit

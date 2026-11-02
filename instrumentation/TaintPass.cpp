@@ -567,6 +567,11 @@ class Taint {
   // (must match dfsan.cpp's kTaintByvalSlots)
   Constant *ByvalSrcTLS;
   static const unsigned kByvalSrcSlots = 8;
+  // UCSan's argument labels (ucsan.cpp's __ucsan_arg_tls: an i16 per scalar,
+  // 2-aligned, UCSAN_TLS_SIZE bytes), which -taint-ucsan-lib code zeroes
+  // before its calls (see clearUCSanArgLabels)
+  Constant *UCSanArgTLS = nullptr;
+  static const unsigned kUCSanArgTLSSize = 800;
   // a moved value's labels, one per byte, across a call (see
   // TaintFunction::getMovedBytes; must match dfsan.cpp's kTaintMovedBytes and
   // kTaintMovedArgSlots)
@@ -984,6 +989,7 @@ public:
   void visitReturnInst(ReturnInst &RI);
   void visitCallBase(CallBase &CB);
   void storeByvalSources(CallBase &CB);
+  void clearUCSanArgLabels(CallBase &CB);
   void visitPHINode(PHINode &PN);
   void visitExtractElementInst(ExtractElementInst &I);
   void visitInsertElementInst(InsertElementInst &I);
@@ -2655,6 +2661,10 @@ void Taint::initializeUCSanLibFunctions(Module &M) {
       UCSanLibStorePtrFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       UCSanLibMemTransferFn.getCallee()->stripPointerCasts());
+  UCSanArgTLS = Mod->getOrInsertGlobal(
+      "__ucsan_arg_tls", ArrayType::get(Int64Ty, kUCSanArgTLSSize / 8));
+  if (auto *G = dyn_cast<GlobalVariable>(UCSanArgTLS))
+    G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
 }
 
 // -taint-ucsan-lib: the bytes I writes, for UCSan's shadow (see ClUCSanLib).
@@ -7084,6 +7094,54 @@ void TaintVisitor::storeByvalSources(CallBase &CB) {
   }
 }
 
+// A library built under -taint-ucsan-lib (a prebuilt archive of a project's
+// objects, libc++-ucsan.a) calls UCSan code: a function the test's scope keeps
+// (its strong copy wins over the archive's weak one), a vtable's or a
+// std::function's in-scope target.  Its arguments are concrete, so their UCSan
+// labels are 0; but UCSan code reads them from __ucsan_arg_tls, which
+// TaintPass's code never wrote, and got what an earlier call left there:
+// another object's label for v8's Isolate::New's `this`, then an OOB in
+// Isolate::InitializeCounters.  Which callee is in scope is the test's to
+// say, not the library's, so every call's slots are zeroed, as UCSanPass does
+// for library code in the module, where it knows which callees are in scope.
+void TaintVisitor::clearUCSanArgLabels(CallBase &CB) {
+  // (not the runtimes' own calls this pass made: __taint_push_stack_frame)
+  if (Function *F = CB.getCalledFunction()) {
+    StringRef N = F->getName();
+    for (StringRef P : {"__taint_", "__dfsan_", "__ucsan_", "dfsan_", "ucsan_"})
+      if (N.starts_with(P))
+        return;
+  }
+  // (an i16 per scalar, aggregates flattened: UCSan's getShadowTy)
+  std::function<unsigned(Type *)> Leaves = [&](Type *T) -> unsigned {
+    if (auto *AT = dyn_cast<ArrayType>(T))
+      return AT->getNumElements() * Leaves(AT->getElementType());
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      unsigned N = 0;
+      for (Type *E : ST->elements())
+        N += Leaves(E);
+      return N;
+    }
+    return 1;
+  };
+  unsigned Size = 0;
+  for (Type *T : CB.getFunctionType()->params()) {
+    unsigned S = 2 * Leaves(T);
+    if (Size + S > Taint::kUCSanArgTLSSize)
+      break;
+    Size += S;
+  }
+  if (!Size)
+    return;
+  IRBuilder<> IRB(&CB);
+  Type *I16 = IRB.getInt16Ty();
+  for (unsigned Off = 0; Off < Size; Off += 2) {
+    Value *P = IRB.CreateConstGEP1_32(I16, TF.TT.UCSanArgTLS, Off / 2);
+    TF.SkipInsts.insert(
+        IRB.CreateAlignedStore(ConstantInt::get(I16, 0), P, Align(2)));
+  }
+}
+
 void TaintVisitor::visitCallBase(CallBase &CB) {
   if (CB.isInlineAsm()) {
     // FIXME: inline asm
@@ -7160,6 +7218,9 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
   if (F == TF.TT.TaintVarargWrapperFn.getCallee()->stripPointerCasts())
     return;
 
+  // (in the module, UCSanPass zeroes the slots of in-scope callees' calls)
+  if (ClUCSanLib && TF.TT.UCSanArgTLS)
+    clearUCSanArgLabels(CB);
   storeByvalSources(CB);
 
   IRBuilder<> IRB(&CB);
