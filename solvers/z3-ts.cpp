@@ -2754,6 +2754,15 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
         value_cache_.emplace_back(icmp_result);
         value_unknown_.emplace_back(operands_unknown ? 1 : 0);
 #endif
+        // An i1 against a constant: the constant side was made a Bool above
+        // (info->size == 1), but a labeled i1 can be a 1-bit vector (a trunc
+        // to i1), and `<` on the two is no expression at all (cache_expr).
+        // Compare them as 1-bit vectors, the Bool side as ite(b, 1, 0).
+        if (op1.is_bool() != op2.is_bool()) {
+          for (z3::expr *e : {&op1, &op2})
+            if (e->is_bool())
+              *e = z3::ite(*e, context_.bv_val(1, 1), context_.bv_val(0, 1));
+        }
         // Cache the expression AFTER updating value_cache to maintain consistency
         // if an exception is thrown above
         cache_expr(l, get_cmd(op1, op2, info->op >> 8));

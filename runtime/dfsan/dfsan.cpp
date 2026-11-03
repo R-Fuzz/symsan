@@ -853,7 +853,10 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   __union_table.insert(&__dfsan_label_info[label], label);
 
   if (flags().solve_ub && ub_width_ok) {
-    if (op == __dfsan::Trunc && l1) {
+    // (not to i1: no conversion truncates to a bool -- C's is `!= 0` -- and a
+    // trunc to i1 is codegen reading a byte it knows is 0 or 1, a bool
+    // bitfield's `and 1`; tests/symsan/ubsan_trunc_bool.c)
+    if (op == __dfsan::Trunc && l1 && size > 1) {
       // check for data loss, after the new label is created
       // -fsanitize=implicit-unsigned-integer-truncation
       // old_vale >= (1 << new_size)

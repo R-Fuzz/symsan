@@ -245,6 +245,13 @@ private:
       throw z3::exception("missing or adding too many expressions");
     }
     Z3_ast ast = e;
+    // z3++'s operators answer operands of sorts they do not take (`<` on a
+    // Bool and a bitvector) with an assert(false), which a release build
+    // skips: a null AST and no exception.  Cached, it was a hole that a later
+    // lookup could only call "cannot find cached expression"; thrown here, the
+    // label is poisoned with a reason (serialize's catch).
+    if (ast == nullptr)
+      throw z3::exception("operands of sorts the operator does not take");
     Z3_inc_ref(context_, ast); // increment reference count
     expr_cache_.emplace_back(ast);
   }
