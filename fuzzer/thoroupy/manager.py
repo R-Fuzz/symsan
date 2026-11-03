@@ -533,6 +533,11 @@ class UcsanManager:
             case PIPE_MSG_TYPE.MERRO_TYPE:
                 event_type = MEMERR_TO_EVENT.get(msg.flags)
                 if event_type is not None:
+                    # counted with the events: a SymSan memory error (an OOB
+                    # under trace_bounds) had no site in the result otherwise
+                    self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
+                    site = (event_type, msg.addr)
+                    self.event_sites[site] = self.event_sites.get(site, 0) + 1
                     _msg = lambda: None
                     _msg.context = event_type
                     _msg.addr = msg.addr
