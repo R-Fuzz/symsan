@@ -805,6 +805,9 @@ struct TaintFunction {
   // the returns, for the labels of a moved value's bytes (see
   // writeMovedReturns)
   SmallVector<ReturnInst *, 2> Returns;
+  // the entry's loads of the arguments' labels, which consumeArgTLS's
+  // clearing follows
+  SmallPtrSet<Instruction *, 8> ArgTLSLoads;
 
   struct PHIFixupElement {
     PHINode *Phi;
@@ -865,6 +868,9 @@ struct TaintFunction {
   ///
   /// Shadow = ArgTLS+ArgOffset.
   Value *getArgTLS(Type *T, unsigned ArgOffset, IRBuilder<> &IRB);
+
+  /// Zeroes the arguments' labels in ArgTLS once the entry has read them.
+  void consumeArgTLS();
 
   /// Computes the shadow address for a retval.
   Value *getRetvalTLS(Type *T, IRBuilder<> &IRB);
@@ -3128,6 +3134,9 @@ bool Taint::runImpl(Module &M) {
     // Hoist bounds checks out of loops
     if (ClTraceBound && ClHoistBoundsChecks)
       TF.hoistBoundsChecks();
+
+    // last: no argument's label is read after this
+    TF.consumeArgTLS();
   }
 
   flushDocumentedIds();
@@ -3181,11 +3190,47 @@ Value *TaintFunction::getShadowForTLSArgument(Argument *A) {
     Instruction *ArgTLSPos = &*F->getEntryBlock().begin();
     IRBuilder<> IRB(ArgTLSPos);
     Value *ArgShadowPtr = getArgTLS(FArg.getType(), ArgOffset, IRB);
-    return IRB.CreateAlignedLoad(TT.getShadowTy(&FArg), ArgShadowPtr,
-                                 ShadowTLSAlignment);
+    LoadInst *LI = IRB.CreateAlignedLoad(TT.getShadowTy(&FArg), ArgShadowPtr,
+                                         ShadowTLSAlignment);
+    ArgTLSLoads.insert(LI);
+    return LI;
   }
 
   return TT.getZeroShadow(A);
+}
+
+// An argument's labels in ArgTLS are its call's alone, so the entry zeroes
+// them once it has read them.  Uninstrumented code writes none: a function it
+// calls read whatever the last instrumented call left there.  v8's builtins
+// call runtime functions, and Runtime_LoadNoFeedbackIC_Miss's Isolate* had
+// ~HandleScope's CloseScope(isolate, prev_next, prev_limit)'s prev_limit
+// label, the bounds of a handle block: every isolate field it read was an OOB.
+// What an instrumented caller passes to uninstrumented code it calls
+// indirectly (v8's JSEntry stub) is still there for the first function that
+// code calls; nothing here can tell such a call from any other.
+void TaintFunction::consumeArgTLS() {
+  if (IsNativeABI)
+    return;
+  // after the entry's loads: getShadowForTLSArgument puts them at its start
+  BasicBlock &Entry = F->getEntryBlock();
+  BasicBlock::iterator Pos = Entry.begin();
+  for (auto It = Entry.begin(); It != Entry.end(); ++It)
+    if (ArgTLSLoads.count(&*It))
+      Pos = std::next(It);
+  IRBuilder<> IRB(&Entry, Pos);
+  const DataLayout &DL = F->getParent()->getDataLayout();
+  unsigned ArgOffset = 0;
+  for (auto &FArg : F->args()) {
+    if (!FArg.getType()->isSized())
+      continue;
+    unsigned Size = DL.getTypeAllocSize(TT.getShadowTy(&FArg));
+    if (ArgOffset + Size > ArgTLSSize)
+      break;
+    IRB.CreateAlignedStore(TT.getZeroShadow(&FArg),
+                           getArgTLS(FArg.getType(), ArgOffset, IRB),
+                           ShadowTLSAlignment);
+    ArgOffset += alignTo(Size, ShadowTLSAlignment);
+  }
 }
 
 Value *TaintFunction::getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB) {
