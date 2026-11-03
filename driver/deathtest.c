@@ -41,6 +41,14 @@
             A pipe would have given it EPIPE the moment we died; here it has to
             give up on its own.  Expect the run to end rather than wedge the
             fork server, and the launcher to be usable afterwards.
+            Now: a consumer that stops reading but lives is only slow, and the
+            producer waits for it as a pipe would.  Expect the whole run once
+            it reads again, ended by its own timeout.
+
+    dead    The consumer is killed while the producer is blocked on a full
+            ring.  Expect the traced child to end within a few seconds: the
+            event pipe's read end died with the consumer, and the producer
+            asks it on every slice of its wait.
 
   Each case runs under an alarm, so a regression shows up as HUNG with the case
   named rather than as whatever the harness does when a test never finishes.
@@ -105,11 +113,10 @@ static int fail(const char *what) {
    its child, not ours.  The launcher does not hand out that pid and has no
    reason to, so read it back off /proc rather than widening the API for a
    test. */
-static pid_t find_forkserver(void) {
+static pid_t find_child_of(pid_t me) {
   DIR *proc = opendir("/proc");
   if (proc == NULL) return -1;
 
-  pid_t me = getpid();
   pid_t found = -1;
   struct dirent *e;
 
@@ -144,6 +151,25 @@ static pid_t find_forkserver(void) {
 
   closedir(proc);
   return found;
+}
+
+static pid_t find_forkserver(void) { return find_child_of(getpid()); }
+
+/* Whether a pid is gone: exited, or a zombie nobody has reaped yet (its parent,
+   the fork server, may itself be on its way out). */
+static int pid_gone(pid_t pid) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+  FILE *f = fopen(path, "r");
+  if (f == NULL) return 1;
+  char line[512];
+  char *got = fgets(line, sizeof(line), f);
+  fclose(f);
+  if (got == NULL) return 1;
+  char *close = strrchr(line, ')');
+  char state = 0;
+  if (close == NULL || sscanf(close + 1, " %c", &state) != 1) return 1;
+  return state == 'Z' || state == 'X';
 }
 
 /* Set up the launcher the way every front-end does, plus the fork server, which
@@ -281,7 +307,14 @@ static int case_server(const char *target, const char *input) {
 /* A consumer that stops reading with the ring far too small to hold the run.
    The producer blocks on a full ring and has to give up by itself: there is no
    EPIPE for shared memory, and a producer that waits forever takes the fork
-   server down with it, since the server is inside waitpid(). */
+   server down with it, since the server is inside waitpid().
+
+   It no longer gives up on a consumer that is only slow.  thoroupy's manager
+   solves in the thread that drains the ring, a v8 constraint took longer than
+   the ~10s of patience, and the trace died (exit 1) under a live consumer.  So
+   the producer asks the event pipe whether its consumer still holds the read
+   end, and waits as long as it does, as a pipe write would have; case_dead is
+   the consumer that does not. */
 static int case_stuck(const char *target, const char *input) {
   if (launcher_start(target, input) < 0) return 1;
 
@@ -291,8 +324,12 @@ static int case_stuck(const char *target, const char *input) {
   // exhausts its patience -- which is ~10s, kFullRingWaitNsec times
   // kFullRingMaxWaits in backend/solver_common.cpp.  From the target's side
   // this is indistinguishable from a consumer that has died.
+  // (No longer: the read end of our pipe tells it we are alive.)
   sleep(13);
 
+  // Then read again: the rest of the run comes through, and it ends the way
+  // case_child's does, by our own timeout on a target gone quiet.  A producer
+  // that had given up leaves only what the ring held, 4096 bytes, ~113 events.
   int last = 0;
   uint64_t began = now_ms();
   long events = drain(2000, 20000, &last);
@@ -301,6 +338,9 @@ static int case_stuck(const char *target, const char *input) {
   if (last > 0) return fail("run never ended");
   printf("stuck: %ld events after the stall, then %d after %llums\n", events,
          last, (unsigned long long)took);
+  if (events <= 4096 / EVENT_SIZE)
+    return fail("the producer gave up on a consumer that was only slow");
+  if (last != -1) return fail("expected -1 on the timeout");
 
   // Whatever happened to the run, the fork server must still be there.
   if (launcher_run() != 0) return fail("launcher unusable after the stall");
@@ -312,9 +352,64 @@ static int case_stuck(const char *target, const char *input) {
   return 0;
 }
 
+/* The consumer killed while the producer is blocked on a full ring.  Its read
+   end of the event pipe closes with it, and the producer must notice that by
+   itself and end the trace: the fork server it would otherwise hold up has
+   nobody left to report to either.  The consumer here is a child of ours, so
+   the pipe's read end dies with it and we hold none. */
+static int case_dead(const char *target, const char *input) {
+  int pids[2];
+  if (pipe2(pids, O_CLOEXEC) != 0) return fail("pipe2");
+
+  pid_t consumer = fork();
+  if (consumer < 0) return fail("fork");
+  if (consumer == 0) {
+    close(pids[0]);
+    if (launcher_start(target, input) < 0) _exit(1);
+    if (launcher_run() != 0) _exit(1);
+    pid_t server = find_forkserver(), traced = -1;
+    for (int i = 0; i < 200 && server > 0 && traced <= 0; i++) {
+      traced = find_child_of(server);
+      if (traced <= 0) usleep(10 * 1000);
+    }
+    pid_t both[2] = {server, traced};
+    if (write(pids[1], both, sizeof(both)) != sizeof(both)) _exit(1);
+    // read nothing, ever
+    for (;;) pause();
+  }
+
+  close(pids[1]);
+  pid_t both[2] = {-1, -1};
+  if (read(pids[0], both, sizeof(both)) != sizeof(both) || both[1] <= 0) {
+    kill(consumer, SIGKILL);
+    waitpid(consumer, NULL, 0);
+    return fail("could not find the traced child");
+  }
+  pid_t server = both[0], traced = both[1];
+
+  // Long enough that the producer has filled the ring and is asleep on it.
+  usleep(1500 * 1000);
+  kill(consumer, SIGKILL);
+  waitpid(consumer, NULL, 0);
+
+  // Well under the ~10s budget a producer with no pipe to ask still has.
+  uint64_t began = now_ms();
+  while (!pid_gone(traced) && now_ms() - began < 5000) usleep(50 * 1000);
+  uint64_t took = now_ms() - began;
+  int gone = pid_gone(traced);
+  kill(traced, SIGKILL);
+  kill(server, SIGKILL);
+
+  if (!gone) return fail("the producer is still waiting on a dead consumer");
+  printf("dead: the traced child ended %llums after its consumer\n",
+         (unsigned long long)took);
+  printf("PASS dead\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc < 4) {
-    fprintf(stderr, "Usage: %s <child|server|stuck> target input\n", argv[0]);
+    fprintf(stderr, "Usage: %s <child|server|stuck|dead> target input\n", argv[0]);
     return 2;
   }
 
@@ -329,6 +424,7 @@ int main(int argc, char **argv) {
   if (!strcmp(g_case, "child")) return case_child(target, input);
   if (!strcmp(g_case, "server")) return case_server(target, input);
   if (!strcmp(g_case, "stuck")) return case_stuck(target, input);
+  if (!strcmp(g_case, "dead")) return case_dead(target, input);
 
   fprintf(stderr, "unknown case %s\n", g_case);
   return 2;

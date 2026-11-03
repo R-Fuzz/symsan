@@ -37,6 +37,10 @@
 // RUN: env SYMSAN_RING_SIZE=4096 TAINT_OPTIONS="output_dir=%t.out" %deathtest stuck %t.fg %t.bin | FileCheck %s --check-prefix=STUCK
 // STUCK: PASS stuck
 
+// The consumer is killed while the producer is blocked on that full ring.
+// RUN: env SYMSAN_RING_SIZE=4096 TAINT_OPTIONS="output_dir=%t.out" %deathtest dead %t.fg %t.bin | FileCheck %s --check-prefix=DEAD
+// DEAD: PASS dead
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

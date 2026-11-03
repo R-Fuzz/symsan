@@ -20,6 +20,7 @@
 
 #include "symsan_ring.h"
 
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -53,6 +54,13 @@ static struct symsan_ring_hdr *__event_ring = nullptr;
 // enough of them to rule out a live-but-slow consumer.  What we must not do is
 // wait forever: with a pipe a dead consumer gives the producer EPIPE, and the
 // fork server hanging on a dead driver is far worse than one lost trace.
+//
+// Ten seconds turned out not to rule one out: thoroupy's manager solves a
+// branch in the same thread that drains the ring, and one v8 constraint can
+// take longer than that, so a live consumer's trace died (exit 1) halfway.
+// So each slice now *asks* whether anyone still holds the read end of the
+// event pipe (ring_consumer_alive), and we give up on the first no, as a pipe
+// write would have; the budget below is left for a producer with no pipe.
 static const long kFullRingWaitNsec = 250 * 1000 * 1000;  // 250ms
 static const int kFullRingMaxWaits = 40;                  // ~10s in total
 
@@ -68,6 +76,19 @@ static inline void ring_futex_wait(uint32_t *word, uint32_t expect) {
   // inside an .inc we cannot reach from here.  forkserver.cpp already calls
   // libc fork()/waitpid(), so libc is fair game in this directory.
   syscall(SYS_futex, word, SYMSAN_FUTEX_WAIT, expect, &ts, nullptr, 0);
+}
+
+// Whether the consumer is still there.  The ring carries the events, but the
+// event pipe stays open beside it (the doorbell, and the fallback), and only
+// the consumer holds its read end: launch.c's child closes its copy before the
+// exec, and thoroupy's manager opens its FIFO itself.  Once every read end is
+// closed, the kernel reports POLLERR on the write end -- the fact a pipe write
+// learns as EPIPE, asked without writing anything into the stream.
+static bool ring_consumer_alive() {
+  struct pollfd p = { __pipe_fd, POLLOUT, 0 };
+  if (poll(&p, 1, 0) < 0)
+    return true;   // (EINTR) ask again after the next budget
+  return !(p.revents & (POLLERR | POLLHUP | POLLNVAL));
 }
 
 // Block until the ring has room for `size` bytes.  Returns false if the
@@ -114,9 +135,12 @@ static bool ring_wait_for_room(struct symsan_ring_hdr *ring, uint64_t head,
     if (now != last_tail) {
       last_tail = now;
       stalls = 0;
-    } else {
-      ++stalls;
+    } else if (__pipe_fd < 0) {
+      ++stalls;            // nobody to ask: the budget decides
+    } else if (!ring_consumer_alive()) {
+      return false;
     }
+    // else slow, not gone: a pipe would have blocked us as long
   }
 
   return false;
@@ -250,8 +274,7 @@ void __taint_emit(const void *buf, size_t size) {
     // stream for the rest of the run, which is exactly what a pipe's own
     // back-pressure protects us from today.
     if (!ring_wait_for_room(ring, head, size)) {
-      Printf("FATAL: event ring full for %d seconds, consumer is gone\n",
-             (int)((kFullRingWaitNsec / 1000000000.0) * kFullRingMaxWaits));
+      Printf("FATAL: event ring full, consumer is gone\n");
       Die();
     }
   }
