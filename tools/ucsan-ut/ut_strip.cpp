@@ -25,6 +25,13 @@
 // the module's references are the archive's, and an internal function in the
 // scope is UCSan's for library code too.  (Private symbols -- string literals
 // -- stay: a copy of a constant is the constant.)
+//
+// ut-strip --extern IN.bc OUT.bc NAMES: the named internal definitions made
+// external, names kept: the entry (gen_entry.py, its own module) calls a
+// test's TestBody, factory and destructor directly, and a test class in an
+// anonymous namespace has them internal.  llvm-link does not bind a
+// declaration to an internal definition; it renames the definition (.N) and
+// the entry's calls stay undefined.
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/LLVMContext.h"
@@ -73,12 +80,36 @@ static int promote(const char *In, const char *Out, const std::string &Tag) {
   return 0;
 }
 
+static int externalize(const char *In, const char *Out, const char *Names) {
+  std::unordered_set<std::string> S;
+  if (!readNames(Names, S)) return 1;
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  std::unique_ptr<Module> M = parseIRFile(In, Err, Ctx);
+  if (!M) { Err.print("ut-strip", errs()); return 1; }
+  for (GlobalValue &G : M->global_values())
+    if (G.hasLocalLinkage() && !G.isDeclaration() &&
+        S.count(G.getName().str())) {
+      G.setLinkage(GlobalValue::ExternalLinkage);
+      G.setVisibility(GlobalValue::DefaultVisibility);
+    }
+  if (verifyModule(*M, &errs())) return 1;
+  std::error_code EC;
+  raw_fd_ostream OS(Out, EC);
+  if (EC) { errs() << Out << ": " << EC.message() << "\n"; return 1; }
+  WriteBitcodeToFile(*M, OS);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc == 5 && std::string(argv[1]) == "--promote")
     return promote(argv[2], argv[3], argv[4]);
+  if (argc == 5 && std::string(argv[1]) == "--extern")
+    return externalize(argv[2], argv[3], argv[4]);
   if (argc != 5) {
     errs() << "usage: ut-strip IN.bc OUT.bc DEFS KEEP\n"
-              "       ut-strip --promote IN.bc OUT.bc TAG\n";
+              "       ut-strip --promote IN.bc OUT.bc TAG\n"
+              "       ut-strip --extern IN.bc OUT.bc NAMES\n";
     return 1;
   }
   std::unordered_set<std::string> Defs, Keep;
