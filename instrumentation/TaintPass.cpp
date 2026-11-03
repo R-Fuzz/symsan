@@ -647,6 +647,7 @@ class Taint {
   FunctionCallee UCSanLibStoreFn;
   FunctionCallee UCSanLibStorePtrFn;
   FunctionCallee UCSanLibMemTransferFn;
+  FunctionCallee UCSanLibFrameExitFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
   /// Read-only global arrays eligible to be treated as lookup tables, mapped to
   /// {num_elements, element_size}.  Computed once, before anything is
@@ -2659,8 +2660,13 @@ void Taint::initializeUCSanLibFunctions(Module &M) {
       UCSanLibStoreFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       UCSanLibStorePtrFn.getCallee()->stripPointerCasts());
+  UCSanLibFrameExitFn = Mod->getOrInsertFunction(
+      "__ucsan_lib_frame_exit", AL, Type::getVoidTy(*Ctx),
+      PointerType::getUnqual(*Ctx), IntptrTy);
   TaintRuntimeFunctions.insert(
       UCSanLibMemTransferFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      UCSanLibFrameExitFn.getCallee()->stripPointerCasts());
   UCSanArgTLS = Mod->getOrInsertGlobal(
       "__ucsan_arg_tls", ArrayType::get(Int64Ty, kUCSanArgTLSSize / 8));
   if (auto *G = dyn_cast<GlobalVariable>(UCSanArgTLS))
@@ -3101,15 +3107,21 @@ bool Taint::runImpl(Module &M) {
     // instrumented callee that read it -- v8's builtins (generated code) put
     // a runtime function's arguments on the stack, and the runtime function's
     // first look at them was a UBI.  So a frame clears its locals' shadow
-    // when it returns: the stack below a live frame has none.
+    // when it returns: the stack below a live frame has none.  Library code
+    // under UCSan clears UCSan's shadow there too (__ucsan_lib_frame_exit):
+    // a custom wrapper's out-parameter, or an in-scope callee storing through
+    // a pointer to a local, left a UC object's label in it.
     if (!TF.FrameAllocas.empty()) {
       for (BasicBlock &BB : *F) {
         Instruction *Term = BB.getTerminator();
         if (!Term || !(isa<ReturnInst>(Term) || isa<ResumeInst>(Term)))
           continue;
         IRBuilder<> IRB(getExitInsertPoint(Term));
-        for (auto &[AI, Size] : TF.FrameAllocas)
+        for (auto &[AI, Size] : TF.FrameAllocas) {
           IRB.CreateCall(TaintSetLabelFn, {ZeroPrimitiveShadow, AI, Size});
+          if (TF.UCSanLib)
+            IRB.CreateCall(UCSanLibFrameExitFn, {AI, Size});
+        }
       }
     }
 

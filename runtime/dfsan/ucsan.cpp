@@ -1706,6 +1706,19 @@ void __ucsan_lib_memtransfer(void *dest, void *src, uptr size) {
                    size * sizeof(ucsan_label));
 }
 
+// ...and a frame of it returns: its locals' UCSan shadow dies with it, as
+// SymSan's does (TaintPass's frame exit).  A UCSan writer can leave a label
+// there -- a custom wrapper's out-parameter (posix_memalign's memptr, v8's
+// AlignedAlloc local, given the new block's object label), an in-scope callee
+// storing through a pointer to the local -- and code that reuses the stack
+// without instrumentation writes no shadow: v8's builtins put a runtime
+// function's arguments there, and the in-scope runtime function read the
+// dead local's object label over a heap pointer, an OOB.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_lib_frame_exit(void *addr, uptr size) {
+  internal_memset(ucsan_shadow_for(addr), 0, size * sizeof(ucsan_label));
+}
+
 // The byte of the seed as sent, at `offset` from input's origin: what the
 // parser assumes an input label's byte is (cached_input_byte, with the
 // origins the manager gives it -- the header's per-object origin, len(lvalue),
