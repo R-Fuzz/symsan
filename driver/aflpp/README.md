@@ -6,6 +6,10 @@
 walkthrough. This AFL++ custom-mutator plugin predates it and is kept as a
 C++-native alternative; the two share the same solver ladder (i2s → jigsaw → z3).
 
+For a step-by-step walkthrough of this plugin — building, the `SYMSAN_*`
+knobs, the SymSan-only mode, and troubleshooting — see
+[HYBRID_FUZZING.md](HYBRID_FUZZING.md).
+
 ## HowTo
 
 A quick guide to how to use the plugin:
