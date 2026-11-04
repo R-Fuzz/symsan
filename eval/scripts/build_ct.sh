@@ -17,6 +17,9 @@ esac
 for r in $ROLES; do
  ( set -e; role_env $r
    if [ $r = gcov ]; then export CFLAGS="--coverage -g -O0 -fsanitize=address" CXXFLAGS="--coverage -g -O0 -fsanitize=address" LDFLAGS="--coverage -fsanitize=address"; fi
+   # NB: ko-clang tests KO_DONT_OPTIMIZE for presence, not value, so =0 *keeps*
+   # the -g -O0 above (no -O3) -- unlike the seven ConcoLLMic subjects, whose
+   # symsan builds get ko-clang's -O3.  The 2026-11-03 baseline ran this way.
    [ $r = symsan ] && export KO_DONT_OPTIMIZE=0
    rm -rf $r; cp -r orig $r; cd $r; L=$S/build-$r.log; : > $L
    cmk() { mkdir -p build && cd build; if [ $r = symsan ]; then KO_CONFIG=1 cmake .. -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_BUILD_TYPE=None -DBUILD_SHARED_LIBS=OFF "$@" >>$L 2>&1; else cmake .. -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_BUILD_TYPE=None -DBUILD_SHARED_LIBS=OFF "$@" >>$L 2>&1; fi; make -j3 "${MK[@]}" >>$L 2>&1; cd ..; }

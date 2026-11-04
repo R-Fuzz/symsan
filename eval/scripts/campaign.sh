@@ -1,11 +1,15 @@
 #!/bin/bash
 # campaign.sh [REPEATS=5] [DURATION_SEC=3600] [JOBFILE] [OUTPREFIX]
 # Sequential repeats of batch.sh. Each repeat writes to OUTPREFIX-rN.
+# JOBFILE may be a bare name (cmo-i2s) for $EVAL/jobs/<name>.txt; OUTPREFIX
+# then defaults to $EVAL/runs/<name>.
 source /workspace/concollmic-eval/scripts/env.sh
 REPEATS=${1:-5}
 DUR=${2:-3600}
 JOBS=${3:-$EVAL/jobs/tier1.txt}
-PREFIX=${4:-$EVAL/runs/tier1}
+if [[ "$JOBS" != */* ]]; then JOBS=$EVAL/jobs/${JOBS%.txt}.txt; fi
+DEFAULT_PREFIX=$EVAL/runs/$(basename "$JOBS" .txt)
+PREFIX=${4:-$DEFAULT_PREFIX}
 # Parallel launch runs rq-only on cores 4-6; skip the queued copy on the
 # nohavoc (cores 1-3) container only.
 if [ -f "$EVAL/runs/.skip-rq-only" ] && [[ "$PREFIX" == *rq-only* ]] && \

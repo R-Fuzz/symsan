@@ -13,8 +13,9 @@ fetch() {
   krep) [ -d orig ] || { git clone -q https://github.com/davidesantangelo/krep.git orig && cd orig && git checkout -q 9c4d41c && patch -p1 < $ART/krep/Makefile.diff && patch -p1 < $ART/krep/krep.diff; cd ..; };;
   woff2) [ -d orig ] || { git clone -q --recursive https://github.com/google/woff2.git orig && cd orig && git reset -q --hard 0f4d304faa1c62994536dc73510305c7357da8d4 && (cd brotli && git reset -q --hard 533843e3546cd24c8344eaa899c6b0b681c8d222); cd ..; };;
   oggenc) [ -d orig ] || { git clone -q https://github.com/xiph/vorbis-tools.git orig && git -C orig reset -q --hard 235540c05ad3f9cdc673ca09c237c9a9b5bda6eb; }
-          [ -d ogg-src ] || git clone -q https://gitlab.xiph.org/xiph/ogg.git ogg-src
-          [ -d vorbis-src ] || git clone -q https://gitlab.xiph.org/xiph/vorbis.git vorbis-src
+          # The HEADs the 2026-11-03 eval cloned (recorded in *.commit, not pinned then).
+          [ -d ogg-src ] || { git clone -q https://gitlab.xiph.org/xiph/ogg.git ogg-src && git -C ogg-src checkout -q ${OGG_REV:-06a5e0262cdc28aa4ae6797627a783b5010440f0}; }
+          [ -d vorbis-src ] || { git clone -q https://gitlab.xiph.org/xiph/vorbis.git vorbis-src && git -C vorbis-src checkout -q ${VORBIS_REV:-1b75110b5a2754ba1931d82dd83cb822b266a21d}; }
           git -C ogg-src rev-parse HEAD > ogg.commit; git -C vorbis-src rev-parse HEAD > vorbis.commit;;
  esac
 }

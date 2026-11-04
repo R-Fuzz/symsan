@@ -14,7 +14,10 @@ echo "jobs=${#lines[@]} par=$PAR to=$TO" | tee -a "$LOG"
 
 run_one() {
   local subj=$1 fk=$2 qhost=$3
-  local q=${qhost/\/home\/csong\/symsan\/eval/\/workspace\/concollmic-eval}
+  # A job file written on the host may name queues by host path: with
+  # SYMSAN_EVAL_HOST_DIR set to the host's eval/, those map to the container's.
+  local q=$qhost
+  if [ -n "${SYMSAN_EVAL_HOST_DIR:-}" ]; then q=${qhost/#$SYMSAN_EVAL_HOST_DIR//workspace/concollmic-eval}; fi
   local info="$OUT/${subj}__${fk}.info"
   if [ -f "$info" ] && [ -s "$info" ]; then
     echo "SKIP $subj $fk" | tee -a "$LOG"

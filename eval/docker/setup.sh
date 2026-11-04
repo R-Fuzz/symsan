@@ -77,6 +77,25 @@ status() {
   done
 }
 
+# Fail unless every subject has its harness binary in each of $ROLES.  The
+# build scripts log FAIL and carry on, so this is what stops an image build.
+verify() {
+  source "$EVAL/scripts/subjects.sh"
+  local s r bad=0
+  for s in "${CC_SUBS[@]}" "${CT_SUBS[@]}"; do
+    subj "$s"
+    for r in ${ROLES:-symsan afl cmplog gcov}; do
+      if [ -x "$SRC/$r/$BIN" ]; then
+        printf '  ok      %-12s %-7s %s\n' "$s" "$r" "$BIN"
+      else
+        printf '  MISSING %-12s %-7s %s\n' "$s" "$r" "$SRC/$r/$BIN"
+        bad=1
+      fi
+    done
+  done
+  return $bad
+}
+
 cmd=${1:-all}
 shift || true
 case $cmd in
@@ -85,6 +104,7 @@ case $cmd in
   subjects)  build_subjects "$@" ;;
   subject)   build_one_subject "${1:?subject name}" ;;
   status)    status ;;
+  verify)    verify ;;
   all)       build_symsan; build_rust; build_subjects ;;
-  *) echo "usage: $0 [symsan|rust|subjects [NAME...]|subject NAME|status|all]" >&2; exit 1 ;;
+  *) echo "usage: $0 [symsan|rust|subjects [NAME...]|subject NAME|status|verify|all]" >&2; exit 1 ;;
 esac

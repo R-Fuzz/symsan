@@ -2,10 +2,13 @@
 """Load unique_gcov/*.info (lcov) and report exclusive / shared covered lines."""
 from __future__ import annotations
 import csv
+import os
 from pathlib import Path
 from collections import defaultdict
 
-OUT = Path("/home/csong/symsan/eval/runs/unique_gcov")
+# UNIQUE_GCOV_DIR, else eval/runs/unique_gcov next to this script.
+OUT = Path(os.environ.get("UNIQUE_GCOV_DIR",
+                          Path(__file__).resolve().parent.parent / "runs" / "unique_gcov"))
 # also accept container path remap when run inside docker
 if not OUT.exists():
     OUT = Path("/workspace/concollmic-eval/runs/unique_gcov")
