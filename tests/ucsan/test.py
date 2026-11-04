@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-build_folder = "/home/csong/fuzzing/symsan/b4"
 import subprocess
 import os
 import sys
@@ -8,9 +7,15 @@ import argparse
 import shutil
 import logging
 
+# The SymSan install to test: SYMSAN_BUILD_DIR, else the repository's build/.
+build_folder = os.environ.get(
+    "SYMSAN_BUILD_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "build"))
+build_folder = os.path.abspath(build_folder)
+
 # Test sources (test/, metadata/) are read from here regardless of cwd; build
 # outputs go under the build tree instead (see OUT_DIR), mirroring how lit
-# keeps tests/symsan's outputs under b4/tests/symsan rather than the source dir.
+# keeps tests/symsan's outputs under build/tests/symsan rather than the source dir.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 common_env = {

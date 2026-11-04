@@ -60,14 +60,14 @@ Output (all logs are size-capped; nothing here is a full log):
 A rerun resumes: functions already in results.tsv are skipped (--fresh to redo).
 
 Long runs (the whole kernel is ~57k functions, hours at --jobs 8):
-  * SYMSAN_HOME=<copy of b4/bin + b4/lib> runs against a frozen build, so a
+  * SYMSAN_HOME=<copy of build/bin + build/lib> runs against a frozen build, so a
     rebuild or `make install` mid-run cannot change the results.  ucsan_opt and
     ko-clang find their libraries relative to themselves, so the copy is enough.
   * --mem-limit-gb (default 6) kills a function's processes above that RSS and
     records "memory-limit".  Without it a runaway target (one reached 59 GB, see
     HANDOFF-ucsan-unbounded-memops.md) is an outage of the whole machine.
   * --retest DIR reruns only what failed in an earlier --out DIR; use it, without
-    SYMSAN_HOME, to check a fix against the installed b4/.
+    SYMSAN_HOME, to check a fix against the installed build/.
   * the driver has no wall-clock limit of its own; run it in tmux, not as a
     tool-limited background job (those stop after 2 hours).
 """
@@ -88,7 +88,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-SYMSAN = os.environ.get("SYMSAN_HOME", os.path.join(REPO, "b4"))
+SYMSAN = os.environ.get("SYMSAN_HOME", os.path.join(REPO, "build"))
 UCSAN_OPT = os.path.join(SYMSAN, "bin", "ucsan_opt")
 RUN_ONE = os.path.join(HERE, "run_one.py")
 VENV_PY = os.path.join(REPO, "venv", "bin", "python")
@@ -825,7 +825,7 @@ def main():
 
     for p in (UCSAN_OPT, RUN_ONE):
         if not os.path.exists(p):
-            sys.exit("missing %s (run `make install` in b4?)" % p)
+            sys.exit("missing %s (run `make install` in build/?)" % p)
 
     lst = os.path.join(a.root, a.list or "bclist")
     with open(lst) as f:

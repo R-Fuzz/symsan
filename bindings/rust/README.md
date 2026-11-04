@@ -528,10 +528,12 @@ cargo doc --open -p symsan        # the safe API, with the FFI reasoning
 ```
 
 `build.rs` links against the install prefix in `SYMSAN_BUILD_DIR`. If that is
-unset it looks for an install in a build directory under the repository root
-(`build`, or one of a few developer-local names), so set it whenever your
-install lives anywhere else. It panics if set but wrong, rather than silently
-linking a different build than you meant.
+unset it uses `<symsan>/build`, else any directory directly under the
+repository root holding `lib/symsan/libsymsan_c.so` -- the most recently
+installed one if there are several, with a cargo warning naming the others.
+Set it whenever your install lives outside the repository, or to pick among
+several. It panics if set but wrong, rather than silently linking a different
+build than you meant.
 
 LibAFL comes from git, at the rev pinned in the workspace `Cargo.toml`.
 

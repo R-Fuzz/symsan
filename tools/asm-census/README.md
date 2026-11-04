@@ -21,7 +21,7 @@ tools/asm-census/run.sh --instrumented ~/fast/linux/linux-6.8.2/bclist /tmp/asm-
 ```
 
 `--instrumented` first runs UCSanPass and TaintPass over each file (from
-`SYMSAN_LIB`, default the `b4` install), with every function the file defines
+`SYMSAN_LIB`, default the `build/` install), with every function the file defines
 in scope, and takes the census of the inline asm they leave.  A file the
 passes fail on is listed in `failed.txt`, so this is also the kernel
 regression check for the passes.  The kernel run takes about half a minute.

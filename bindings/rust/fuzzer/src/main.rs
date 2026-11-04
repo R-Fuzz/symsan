@@ -15,7 +15,7 @@
 //! afl-clang-fast -o target.afl target.c
 //!
 //! # the one SymSan traces, for constraints
-//! KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -o target.symsan target.c
+//! KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/build/bin/ko-clang -o target.symsan target.c
 //! ```
 //!
 //! Then:

@@ -14,7 +14,7 @@ the target) cannot be stopped from in here; the driver kills the process group
 and calls that a hang.
 
 Run it with the venv python (needs pyelftools, PyYAML, psutil) and
-b4/lib/symsan on PYTHONPATH (the `symsan` extension module).
+build/lib/symsan on PYTHONPATH (the `symsan` extension module).
 """
 import argparse
 import collections
