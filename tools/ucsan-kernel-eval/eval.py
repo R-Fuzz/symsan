@@ -60,6 +60,8 @@ Output (all logs are size-capped; nothing here is a full log):
 A rerun resumes: functions already in results.tsv are skipped (--fresh to redo).
 
 Long runs (the whole kernel is ~57k functions, hours at --jobs 8):
+  * --build-dir DIR (or SYMSAN_HOME=DIR) picks the SymSan install; default
+    <repo>/build.
   * SYMSAN_HOME=<copy of build/bin + build/lib> runs against a frozen build, so a
     rebuild or `make install` mid-run cannot change the results.  ucsan_opt and
     ko-clang find their libraries relative to themselves, so the copy is enough.
@@ -90,6 +92,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 SYMSAN = os.environ.get("SYMSAN_HOME", os.path.join(REPO, "build"))
 UCSAN_OPT = os.path.join(SYMSAN, "bin", "ucsan_opt")
+
+
+def set_symsan(path):
+    """--build-dir: also exported as SYMSAN_HOME, so pool workers (whatever their
+    start method) and the repro.sh files see the same install."""
+    global SYMSAN, UCSAN_OPT
+    SYMSAN = os.path.abspath(path)
+    UCSAN_OPT = os.path.join(SYMSAN, "bin", "ucsan_opt")
+    os.environ["SYMSAN_HOME"] = SYMSAN
 RUN_ONE = os.path.join(HERE, "run_one.py")
 VENV_PY = os.path.join(REPO, "venv", "bin", "python")
 LLVM_DIS = os.environ.get("LLVM_DIS", "llvm-dis-18")
@@ -807,7 +818,11 @@ def main():
     ap.add_argument("--retest", default=None, metavar="DIR",
                     help="only the functions that failed in an earlier --out DIR (to check a fix)")
     ap.add_argument("--summarize-only", action="store_true")
+    ap.add_argument("--build-dir", default=None, metavar="DIR",
+                    help="SymSan install prefix (default: $SYMSAN_HOME, else <repo>/build)")
     a = ap.parse_args()
+    if a.build_dir:
+        set_symsan(a.build_dir)
 
     a.out = os.path.abspath(a.out)
     os.makedirs(a.out, exist_ok=True)
@@ -825,7 +840,7 @@ def main():
 
     for p in (UCSAN_OPT, RUN_ONE):
         if not os.path.exists(p):
-            sys.exit("missing %s (run `make install` in build/?)" % p)
+            sys.exit("missing %s (run `make install`, or pass --build-dir?)" % p)
 
     lst = os.path.join(a.root, a.list or "bclist")
     with open(lst) as f:

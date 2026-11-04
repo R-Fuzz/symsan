@@ -7,6 +7,7 @@ it has a wall-clock budget, and everything the driver needs to classify the run
 goes into <workdir>/result.json instead of a log to be read by hand.
 
   run_one.py <binary> [--workdir DIR] [--budget SECONDS] [--loop-threshold N]
+             [--build-dir DIR]
 
 The budget is soft: when it runs out the manager is told to stop after the seed
 in flight, and "budget_exhausted" is set.  A seed that never returns (a hang in
@@ -14,7 +15,8 @@ the target) cannot be stopped from in here; the driver kills the process group
 and calls that a hang.
 
 Run it with the venv python (needs pyelftools, PyYAML, psutil) and
-build/lib/symsan on PYTHONPATH (the `symsan` extension module).
+build/lib/symsan on PYTHONPATH (the `symsan` extension module), or name the
+install with --build-dir.
 """
 import argparse
 import collections
@@ -105,7 +107,12 @@ def main():
     ap.add_argument("--workdir", default=".")
     ap.add_argument("--budget", type=float, default=60.0)
     ap.add_argument("--loop-threshold", type=int, default=5)
+    ap.add_argument("--build-dir", default=None, metavar="DIR",
+                    help="SymSan install prefix whose lib/symsan holds the `symsan` "
+                         "module (default: whatever PYTHONPATH finds)")
     args = ap.parse_args()
+    if args.build_dir:
+        sys.path.insert(0, os.path.join(os.path.abspath(args.build_dir), "lib", "symsan"))
 
     # Resolve before the chdir.  It must also exist: the manager forks and then
     # execve()s, and if that fails the *child* carries on running the manager's
