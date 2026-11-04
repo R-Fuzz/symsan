@@ -97,7 +97,7 @@ scope step of a v8 Isolate test from about 20 minutes to under a minute.
 ## run.py: exploring an entry
 
 ```bash
-PYTHONPATH=b4/lib/symsan venv/bin/python tools/ucsan-ut/run.py BINARY \
+venv/bin/python tools/ucsan-ut/run.py BINARY --build-dir build \
     --workdir DIR [--budget SECONDS] [--trace-only] [--seed FILE] \
     [--target BID [--target-result 0|1]] [--loop-threshold N] \
     [--ucsan-option K=V]... [--taint-option K=V]... [--config JSON] \

@@ -16,8 +16,8 @@ BINARY is the instrumented program itself, not a wrapper script: the manager
 watches the process it started, and a wrapper (gdb, say) that exits after the
 first child is a dead target to it -- it stops after one seed.
 
-Run it with the venv python and b4/lib/symsan on PYTHONPATH (the `symsan`
-extension module), as tests/ucsan/test.py.
+Run it with the venv python and build/lib/symsan on PYTHONPATH (the `symsan`
+extension module), as tests/ucsan/test.py, or name the install with --build-dir.
 """
 import argparse
 import collections
@@ -179,6 +179,9 @@ def symbolize(binary, addrs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("binary")
+    ap.add_argument("--build-dir", default=None, metavar="DIR", type=os.path.abspath,
+                    help="SymSan install prefix whose lib/symsan holds the `symsan` "
+                         "module (default: whatever PYTHONPATH finds)")
     ap.add_argument("--workdir", default=".")
     ap.add_argument("--budget", type=float, default=0,
                     help="seconds; the manager stops after the seed in flight "
@@ -268,6 +271,8 @@ def main():
     start = time.time()
     events = collections.Counter()
     m = None
+    if args.build_dir:
+        sys.path.insert(0, os.path.join(os.path.abspath(args.build_dir), "lib", "symsan"))
     try:
         from manager import UcsanManager
         m = UcsanManager(binary, seed=seed, config=config["ucsan_config"],
