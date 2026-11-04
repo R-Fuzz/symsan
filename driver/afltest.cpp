@@ -477,6 +477,9 @@ static int run_one(char *program, char *input, int is_stdin) {
     close(input_fd);
     return -1;
   }
+  if (__token_file) {
+    __tokens.set_input(reinterpret_cast<const uint8_t *>(input_buf), input_size);
+  }
 
   // grow the output buffer if this seed is longer than any before it.  RGD
   // solvers write the full (possibly grown) input; give some headroom for

@@ -29,11 +29,12 @@ scale, read.**
 
 Build and install SymSan first — the Rust crates and the target instrumentation
 both need the installed toolchain (`ko-clang`, the runtime, the passes). Follow
-the top-level [`README.md`](../../README.md#compilation); in this repo the
-install tree is `b4/`:
+the top-level [`README.md`](../../README.md#compilation). Below, `$SYMSAN` is the
+install prefix you gave CMake (`CMAKE_INSTALL_PREFIX`):
 
 ```shell
-cd b4 && make -j && make install
+cd /path/to/build && make -j && make install
+export SYMSAN=/path/to/install
 ```
 
 ## 2. Build the Rust fuzzer
@@ -46,9 +47,12 @@ The fuzzer lives in `bindings/rust/`. It is a normal Cargo workspace:
 
 ```shell
 cd bindings/rust
-cargo build --release
+SYMSAN_BUILD_DIR=$SYMSAN cargo build --release
 # binary at bindings/rust/target/release/symsan-fuzz
 ```
+
+`SYMSAN_BUILD_DIR` tells `build.rs` which install to link against (see the
+README's build notes).
 
 ## 3. Build the target — twice (or three times)
 
@@ -68,10 +72,10 @@ afl-clang-fast target.c -o target.afl
 process (Fastgen) backend; the stage requires it:
 
 ```shell
-KO_CC=clang-18 KO_USE_FASTGEN=1 b4/bin/ko-clang target.c -o target.symsan
+KO_CC=clang-18 KO_USE_FASTGEN=1 $SYMSAN/bin/ko-clang target.c -o target.symsan
 ```
 
-For C++, use `KO_CXX=clang++-18` and `b4/bin/ko-clang++` (see CLAUDE.md / README).
+For C++, use `KO_CXX=clang++-18` and `$SYMSAN/bin/ko-clang++` (see the top-level README).
 
 **c. (optional) cmplog build (`target.cmplog`)** — only if you want the LibAFL
 input-to-state baseline to A/B against SymSan:
@@ -112,10 +116,25 @@ Useful first-run flags (full list: `symsan-fuzz --help` and the README):
 | `-t, --timeout` | 1200 ms | per-exec timeout for the coverage target |
 | `--symsan-timeout` | 60000 ms | per-trace timeout for the concolic target |
 | `--symsan-budget` | 0 (off) | cap wall-time spent in the concolic stage |
+| `--symsan-tokens` | off | add the bytes the target compares its input against to the fuzzer's dictionary (case-folded keyword compares included).  Also tries RedQueen-style apply-at-site mutations: each compared constant written over the input bytes it was compared with.  The stage only runs these for an input whose trace also queued a solving task. |
 | `-d, --debug-child` | off | let the target's stderr through (otherwise `/dev/null`) |
 
 `-d` is the first thing to reach for when a target "does nothing" — its stderr is
 suppressed by default.
+
+The configuration the [2026-11-03 baseline](../../eval/results/2026-11-03/README.md)
+ran (its `lafl-i2` arm; `lafl-jg` drops `--symsan-no-jigsaw`):
+
+```shell
+symsan-fuzz -i ./seeds -o ./out \
+  --symsan-timeout 200 --symsan-no-jigsaw --symsan-tokens \
+  --symsan ./target.symsan \
+  -- ./target.afl @@
+```
+
+There, `--symsan-timeout 200` replaced the 60000 ms default.  With the default,
+an input that makes the concolic build loop held up the whole stage for a
+minute at a time.
 
 ## 5. Production coverage sharing — `--branch-map`
 
@@ -188,6 +207,12 @@ tools/magma/campaign.sh --timeout 24h --repeat 3 --workers 8 libpng
 It builds the target(s), wires `--branch-map`, pins one instance per worker, and
 collects the runs. See `tools/magma/campaign.sh --help` for `--build-line`,
 `--solve-ub`, and arm selection.
+
+For coverage rather than bugs, [`eval/`](../../eval/README.md) is a
+self-contained Docker setup.  It runs 15 subjects in seven arms (LibAFL and
+AFL++, each with and without SymSan, plus CmpLog/RedQueen) and measures gcov
+line coverage per trial.  It also ships the baseline numbers to compare
+against.
 
 ## 8. Read the results
 

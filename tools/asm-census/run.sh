@@ -9,7 +9,7 @@
 # Writes <outdir>/all.jsonl and prints the summary.
 #
 # --instrumented runs UCSanPass and TaintPass over each file first (from
-# SYMSAN_LIB, default the b4 install) and takes the census of what inline asm
+# SYMSAN_LIB, default the build/ install) and takes the census of what inline asm
 # they leave.  Every function the file defines is put in scope, so every asm
 # site is visited; a file the passes fail on (invalid IR) is listed in
 # <outdir>/failed.txt.  Each file writes its own part, so the parallel runs
@@ -28,7 +28,7 @@ LLVM_CONFIG="${LLVM_CONFIG:-llvm-config-18}"
 OPT="${OPT:-opt-18}"
 NM="${NM:-llvm-nm-18}"
 CXX="${CXX:-clang++-18}"
-SYMSAN_LIB="${SYMSAN_LIB:-$HERE/../../b4/lib/symsan}"
+SYMSAN_LIB="${SYMSAN_LIB:-$HERE/../../build/lib/symsan}"
 
 mkdir -p "$OUT/parts" "$OUT/meta"
 rm -f "$OUT"/parts/*.jsonl "$OUT/err.log" "$OUT/failed.txt" "$OUT/skipped.txt"

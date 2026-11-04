@@ -11,7 +11,7 @@
 //! The library itself is *not* built here.  It comes out of the CMake build,
 //! which needs LLVM 18, Z3 and a compiler-rt bootstrap; reimplementing that in
 //! a build script would be a second thing to keep in sync. Run
-//! `cd b4 && make -j && make install` first.
+//! `cd build && make -j && make install` first.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -19,9 +19,14 @@ use std::path::{Path, PathBuf};
 /// Locate the symsan install prefix -- the directory holding `lib/symsan/`.
 ///
 /// `SYMSAN_BUILD_DIR` wins if set.  Otherwise we look for the conventional
-/// build directories next to the repository root, newest layout first.  (Per
-/// CLAUDE.md the current one is `b4`; `b3`/`b2` are older LLVM versions kept
-/// around, so try `b4` first and fall back rather than guessing wrong.)
+/// in-tree build directory, `build/` next to the repository root.
+///
+/// Failing that, an install is recognised by what it holds, not by its name:
+/// any directory directly under the repository root with
+/// `lib/symsan/libsymsan_c.so`.  Several builds may be kept around (one per
+/// LLVM version, say); then the most recently installed library wins and a
+/// cargo warning names it and the others, so the guess is never silent.  Set
+/// SYMSAN_BUILD_DIR to take the guess out entirely.
 fn find_symsan_build(repo_root: &Path) -> Option<PathBuf> {
     if let Ok(dir) = env::var("SYMSAN_BUILD_DIR") {
         let p = PathBuf::from(dir);
@@ -39,13 +44,37 @@ fn find_symsan_build(repo_root: &Path) -> Option<PathBuf> {
         );
     }
 
-    for candidate in ["b4", "b3", "b2", "build"] {
+    for candidate in ["build"] {
         let p = repo_root.join(candidate);
         if p.join("lib/symsan").is_dir() {
             return Some(p);
         }
     }
-    None
+
+    // Any other in-tree install, newest `make install` first.
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(repo_root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter_map(|p| {
+            let lib = p.join("lib/symsan/libsymsan_c.so");
+            let mtime = std::fs::metadata(&lib).ok()?.modified().ok()?;
+            Some((mtime, p))
+        })
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    let (_, chosen) = found.first()?.clone();
+    if found.len() > 1 {
+        let others: Vec<String> =
+            found[1..].iter().map(|(_, p)| p.display().to_string()).collect();
+        println!(
+            "cargo:warning=symsan: using {} (newest install); also found {}. \
+             Set SYMSAN_BUILD_DIR to pick one.",
+            chosen.display(),
+            others.join(", ")
+        );
+    }
+    Some(chosen)
 }
 
 fn main() {
@@ -69,7 +98,7 @@ fn main() {
     let build_dir = find_symsan_build(&repo_root).unwrap_or_else(|| {
         panic!(
             "cannot find a symsan build under {}. Build it first \
-             (`cd b4 && make -j && make install`), or point SYMSAN_BUILD_DIR \
+             (`cd build && make -j && make install`), or point SYMSAN_BUILD_DIR \
              at the install prefix.",
             repo_root.display()
         )
@@ -122,6 +151,8 @@ fn main() {
         .expect("failed to write bindings.rs");
 
     println!("cargo:rerun-if-env-changed=SYMSAN_BUILD_DIR");
+    // A fresh `make install` re-runs the search, so a newer install is seen.
+    println!("cargo:rerun-if-changed={}", lib_dir.join("libsymsan_c.so").display());
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed={}", include_dir.join("launch.h").display());
 }

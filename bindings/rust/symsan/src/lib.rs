@@ -67,7 +67,7 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
-/// The SymSan install prefix this crate was linked against, e.g. `.../b4`.
+/// The SymSan install prefix this crate was linked against, e.g. `.../build`.
 ///
 /// `bin/ko-clang` and `lib/symsan/` live under it. Baked in by `build.rs`, so
 /// a front-end can find the toolchain that matches the runtime it is talking
@@ -1383,9 +1383,27 @@ impl Session {
     /// How many solvers are in the ladder. Multiplied by the task count, this
     /// bounds how many times [`next_solution`](Session::next_solution) can
     /// return something.
+    ///
+    /// Plus [`rq_pending`](Session::rq_pending): with
+    /// [`Config::collect_tokens`], the apply-at-site buffers come out of
+    /// `next_solution` after the ladder.
     pub fn num_solvers(&self) -> usize {
         // SAFETY: valid handle.
         unsafe { sys::symsan_session_num_solvers(self.raw.as_ptr()) }
+    }
+
+    /// Apply-at-site (RedQueen-style) buffers the last
+    /// [`trace`](Session::trace) built that
+    /// [`next_solution`](Session::next_solution) has not returned yet. Only
+    /// nonzero with [`Config::collect_tokens`].
+    ///
+    /// Not implied by the task count: a trace that queued nothing -- every
+    /// branch already seen -- can still have compared input bytes against a
+    /// constant they did not equal. Drain `next_solution` when either is
+    /// nonzero; the next `trace` replaces these.
+    pub fn rq_pending(&self) -> usize {
+        // SAFETY: valid handle.
+        unsafe { sys::symsan_session_num_rq_pending(self.raw.as_ptr()) }
     }
 
     /// Name of the solver at ladder position `index`, or `None` past the end.

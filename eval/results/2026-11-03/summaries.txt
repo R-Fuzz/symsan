@@ -1,0 +1,550 @@
+== aflpp-i2s-r1 ==
+bc-aflpp-i2s | cov(l%,l,b%,b)=45.4,2126,40.4,1034,0 | maxStatsGap=0s | execs_done=4168368 corpus_count=2399 edges_found=1065  symsan_q=160
+confetti-aflpp-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=0s | execs_done=11603323 corpus_count=619 edges_found=308  symsan_q=77
+jansson-aflpp-i2s | cov(l%,l,b%,b)=47.0,1210,39.3,650,0 | maxStatsGap=0s | execs_done=10881790 corpus_count=989 edges_found=517  symsan_q=62
+json-c-aflpp-i2s | cov(l%,l,b%,b)=40.9,1102,34.7,631,0 | maxStatsGap=0s | execs_done=8624057 corpus_count=788 edges_found=440  symsan_q=151
+krep-aflpp-i2s | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=5452489 corpus_count=76 edges_found=149  symsan_q=0
+libexpat-aflpp-i2s | cov(l%,l,b%,b)=37.6,2913,40.8,2206,0 | maxStatsGap=0s | execs_done=9727265 corpus_count=6075 edges_found=3719  symsan_q=734
+libmatheval-aflpp-i2s | cov(l%,l,b%,b)=65.1,880,57.6,343,0 | maxStatsGap=0s | execs_done=11027999 corpus_count=633 edges_found=274  symsan_q=81
+libxml2-aflpp-i2s | cov(l%,l,b%,b)=10.9,7601,10.0,6283,0 | maxStatsGap=0s | execs_done=6982123 corpus_count=5699 edges_found=4190  symsan_q=737
+libyaml-aflpp-i2s | cov(l%,l,b%,b)=73.3,1920,67.8,2908,0 | maxStatsGap=0s | execs_done=11334616 corpus_count=3258 edges_found=1547  symsan_q=537
+mujs-aflpp-i2s | cov(l%,l,b%,b)=53.4,4948,50.6,2918,0 | maxStatsGap=0s | execs_done=5640472 corpus_count=4748 edges_found=3788  symsan_q=906
+oggenc-aflpp-i2s | cov(l%,l,b%,b)=21.4,342,16.3,174,0 | maxStatsGap=0s | execs_done=112033 corpus_count=512 edges_found=1475  symsan_q=23
+quickjs-aflpp-i2s | cov(l%,l,b%,b)=33.1,14618,28.8,7172,0 | maxStatsGap=0s | execs_done=4350344 corpus_count=7189 edges_found=6756  symsan_q=801
+sqlite-aflpp-i2s | cov(l%,l,b%,b)=31.5,15065,25.1,8018,0 | maxStatsGap=0s | execs_done=6770613 corpus_count=4255 edges_found=7129  symsan_q=1798
+unqlite-aflpp-i2s | cov(l%,l,b%,b)=24.0,5225,25.4,3418,0 | maxStatsGap=0s | execs_done=3159075 corpus_count=3562 edges_found=2802  symsan_q=612
+woff2-aflpp-i2s | cov(l%,l,b%,b)=24.5,2206,15.7,1645,0 | maxStatsGap=0s | execs_done=2631778 corpus_count=1323 edges_found=1235  symsan_q=91
+== aflpp-i2s-r2 ==
+bc-aflpp-i2s | cov(l%,l,b%,b)=45.4,2122,40.2,1029,0 | maxStatsGap=0s | execs_done=4057316 corpus_count=2367 edges_found=1052  symsan_q=157
+confetti-aflpp-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=0s | execs_done=12064631 corpus_count=630 edges_found=308  symsan_q=84
+jansson-aflpp-i2s | cov(l%,l,b%,b)=47.0,1209,39.5,653,0 | maxStatsGap=0s | execs_done=9841692 corpus_count=1010 edges_found=517  symsan_q=73
+json-c-aflpp-i2s | cov(l%,l,b%,b)=40.8,1099,34.5,627,0 | maxStatsGap=0s | execs_done=9109479 corpus_count=791 edges_found=439  symsan_q=157
+krep-aflpp-i2s | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=5309125 corpus_count=69 edges_found=149  symsan_q=0
+libexpat-aflpp-i2s | cov(l%,l,b%,b)=37.5,2905,40.5,2194,0 | maxStatsGap=0s | execs_done=9638700 corpus_count=6110 edges_found=3703  symsan_q=811
+libmatheval-aflpp-i2s | cov(l%,l,b%,b)=65.1,880,57.8,344,0 | maxStatsGap=0s | execs_done=10922002 corpus_count=684 edges_found=274  symsan_q=81
+libxml2-aflpp-i2s | cov(l%,l,b%,b)=10.4,7256,9.5,5925,0 | maxStatsGap=0s | execs_done=6681451 corpus_count=5534 edges_found=3976  symsan_q=760
+libyaml-aflpp-i2s | cov(l%,l,b%,b)=73.3,1922,68.1,2919,0 | maxStatsGap=0s | execs_done=10477569 corpus_count=3208 edges_found=1545  symsan_q=573
+mujs-aflpp-i2s | cov(l%,l,b%,b)=53.9,4993,50.7,2925,0 | maxStatsGap=0s | execs_done=5529022 corpus_count=4681 edges_found=3809  symsan_q=1087
+oggenc-aflpp-i2s | cov(l%,l,b%,b)=21.4,341,15.9,170,0 | maxStatsGap=0s | execs_done=125584 corpus_count=538 edges_found=1476  symsan_q=19
+quickjs-aflpp-i2s | cov(l%,l,b%,b)=32.9,14514,28.5,7110,0 | maxStatsGap=0s | execs_done=4284475 corpus_count=7336 edges_found=6720  symsan_q=802
+sqlite-aflpp-i2s | cov(l%,l,b%,b)=31.9,15278,25.7,8194,0 | maxStatsGap=0s | execs_done=7099615 corpus_count=4551 edges_found=7236  symsan_q=1789
+unqlite-aflpp-i2s | cov(l%,l,b%,b)=24.3,5275,25.8,3474,0 | maxStatsGap=0s | execs_done=2865471 corpus_count=3576 edges_found=2846  symsan_q=777
+woff2-aflpp-i2s | cov(l%,l,b%,b)=24.2,2178,15.3,1609,0 | maxStatsGap=0s | execs_done=2796011 corpus_count=1267 edges_found=1226  symsan_q=71
+== aflpp-i2s-r3 ==
+bc-aflpp-i2s | cov(l%,l,b%,b)=45.1,2111,40.0,1023,0 | maxStatsGap=0s | execs_done=3533685 corpus_count=2293 edges_found=1062  symsan_q=151
+confetti-aflpp-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=0s | execs_done=11971342 corpus_count=604 edges_found=301  symsan_q=98
+jansson-aflpp-i2s | cov(l%,l,b%,b)=46.5,1197,39.3,650,0 | maxStatsGap=0s | execs_done=10175839 corpus_count=917 edges_found=519  symsan_q=70
+json-c-aflpp-i2s | cov(l%,l,b%,b)=40.8,1099,34.4,625,0 | maxStatsGap=0s | execs_done=9469386 corpus_count=736 edges_found=438  symsan_q=163
+krep-aflpp-i2s | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=5232534 corpus_count=76 edges_found=149  symsan_q=0
+libexpat-aflpp-i2s | cov(l%,l,b%,b)=37.2,2881,40.3,2183,0 | maxStatsGap=0s | execs_done=9583938 corpus_count=5993 edges_found=3724  symsan_q=806
+libmatheval-aflpp-i2s | cov(l%,l,b%,b)=65.2,881,57.6,343,0 | maxStatsGap=0s | execs_done=10906791 corpus_count=681 edges_found=274  symsan_q=85
+libxml2-aflpp-i2s | cov(l%,l,b%,b)=11.2,7824,10.3,6459,0 | maxStatsGap=0s | execs_done=7104802 corpus_count=5739 edges_found=4301  symsan_q=841
+libyaml-aflpp-i2s | cov(l%,l,b%,b)=73.3,1922,67.3,2886,0 | maxStatsGap=0s | execs_done=10724574 corpus_count=3311 edges_found=1521  symsan_q=539
+mujs-aflpp-i2s | cov(l%,l,b%,b)=53.7,4971,51.1,2950,0 | maxStatsGap=0s | execs_done=5591448 corpus_count=4817 edges_found=3746  symsan_q=1127
+oggenc-aflpp-i2s | cov(l%,l,b%,b)=22.3,356,17.0,182,0 | maxStatsGap=0s | execs_done=122461 corpus_count=576 edges_found=1478  symsan_q=33
+quickjs-aflpp-i2s | cov(l%,l,b%,b)=34.7,15342,30.1,7516,0 | maxStatsGap=0s | execs_done=4221822 corpus_count=7439 edges_found=7166  symsan_q=579
+sqlite-aflpp-i2s | cov(l%,l,b%,b)=31.3,15005,25.0,7980,0 | maxStatsGap=0s | execs_done=6940886 corpus_count=4728 edges_found=7155  symsan_q=1991
+unqlite-aflpp-i2s | cov(l%,l,b%,b)=24.0,5213,25.3,3404,0 | maxStatsGap=0s | execs_done=2927557 corpus_count=3422 edges_found=2804  symsan_q=629
+woff2-aflpp-i2s | cov(l%,l,b%,b)=24.9,2240,16.0,1683,0 | maxStatsGap=0s | execs_done=2705504 corpus_count=1359 edges_found=1258  symsan_q=112
+== aflpp-i2s-r4 ==
+bc-aflpp-i2s | cov(l%,l,b%,b)=43.0,2010,37.5,960,0 | maxStatsGap=0s | execs_done=4076203 corpus_count=2335 edges_found=997  symsan_q=187
+confetti-aflpp-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=0s | execs_done=11919455 corpus_count=631 edges_found=308  symsan_q=110
+jansson-aflpp-i2s | cov(l%,l,b%,b)=47.0,1211,39.6,654,0 | maxStatsGap=0s | execs_done=10294561 corpus_count=947 edges_found=520  symsan_q=57
+json-c-aflpp-i2s | cov(l%,l,b%,b)=41.1,1109,34.8,633,0 | maxStatsGap=0s | execs_done=8875813 corpus_count=809 edges_found=441  symsan_q=153
+krep-aflpp-i2s | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=5813449 corpus_count=74 edges_found=149  symsan_q=0
+libexpat-aflpp-i2s | cov(l%,l,b%,b)=37.5,2906,40.4,2189,0 | maxStatsGap=0s | execs_done=9595752 corpus_count=6074 edges_found=3731  symsan_q=901
+libmatheval-aflpp-i2s | cov(l%,l,b%,b)=65.3,883,58.0,345,0 | maxStatsGap=0s | execs_done=10937972 corpus_count=691 edges_found=275  symsan_q=62
+libxml2-aflpp-i2s | cov(l%,l,b%,b)=11.2,7861,10.4,6544,0 | maxStatsGap=0s | execs_done=7065095 corpus_count=5959 edges_found=4330  symsan_q=783
+libyaml-aflpp-i2s | cov(l%,l,b%,b)=71.7,1878,67.1,2876,0 | maxStatsGap=0s | execs_done=10942769 corpus_count=3218 edges_found=1517  symsan_q=568
+mujs-aflpp-i2s | cov(l%,l,b%,b)=53.5,4952,50.1,2892,0 | maxStatsGap=0s | execs_done=5529068 corpus_count=4635 edges_found=3664  symsan_q=1045
+oggenc-aflpp-i2s | cov(l%,l,b%,b)=21.4,342,16.3,174,0 | maxStatsGap=0s | execs_done=107010 corpus_count=509 edges_found=1463  symsan_q=22
+quickjs-aflpp-i2s | cov(l%,l,b%,b)=35.3,15605,30.2,7543,0 | maxStatsGap=0s | execs_done=4235161 corpus_count=7437 edges_found=7255  symsan_q=723
+sqlite-aflpp-i2s | cov(l%,l,b%,b)=31.7,15199,25.2,8047,0 | maxStatsGap=0s | execs_done=6727191 corpus_count=4251 edges_found=7165  symsan_q=2022
+unqlite-aflpp-i2s | cov(l%,l,b%,b)=24.6,5352,25.6,3452,0 | maxStatsGap=0s | execs_done=2792086 corpus_count=3605 edges_found=2944  symsan_q=561
+woff2-aflpp-i2s | cov(l%,l,b%,b)=24.3,2187,15.5,1626,0 | maxStatsGap=0s | execs_done=2754460 corpus_count=1307 edges_found=1236  symsan_q=79
+== aflpp-i2s-r5 ==
+bc-aflpp-i2s | cov(l%,l,b%,b)=44.8,2095,39.9,1020,0 | maxStatsGap=0s | execs_done=3731612 corpus_count=2152 edges_found=1048  symsan_q=134
+confetti-aflpp-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=0s | execs_done=11904554 corpus_count=611 edges_found=308  symsan_q=89
+jansson-aflpp-i2s | cov(l%,l,b%,b)=46.8,1205,39.4,651,0 | maxStatsGap=0s | execs_done=10164487 corpus_count=975 edges_found=518  symsan_q=74
+json-c-aflpp-i2s | cov(l%,l,b%,b)=41.0,1106,34.7,631,0 | maxStatsGap=0s | execs_done=9171492 corpus_count=777 edges_found=442  symsan_q=151
+krep-aflpp-i2s | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=5967085 corpus_count=75 edges_found=149  symsan_q=0
+libexpat-aflpp-i2s | cov(l%,l,b%,b)=37.6,2915,40.6,2196,0 | maxStatsGap=0s | execs_done=9657200 corpus_count=6103 edges_found=3707  symsan_q=787
+libmatheval-aflpp-i2s | cov(l%,l,b%,b)=65.2,881,57.6,343,0 | maxStatsGap=0s | execs_done=10872128 corpus_count=667 edges_found=274  symsan_q=94
+libxml2-aflpp-i2s | cov(l%,l,b%,b)=11.3,7913,10.4,6515,0 | maxStatsGap=0s | execs_done=7060103 corpus_count=5925 edges_found=4366  symsan_q=793
+libyaml-aflpp-i2s | cov(l%,l,b%,b)=73.3,1922,67.6,2899,0 | maxStatsGap=0s | execs_done=10800043 corpus_count=3205 edges_found=1535  symsan_q=664
+mujs-aflpp-i2s | cov(l%,l,b%,b)=53.4,4943,50.9,2937,0 | maxStatsGap=0s | execs_done=5493464 corpus_count=4492 edges_found=3680  symsan_q=986
+oggenc-aflpp-i2s | cov(l%,l,b%,b)=21.4,342,16.3,174,0 | maxStatsGap=0s | execs_done=115603 corpus_count=529 edges_found=1471  symsan_q=33
+quickjs-aflpp-i2s | cov(l%,l,b%,b)=33.3,14706,29.2,7274,0 | maxStatsGap=0s | execs_done=4282371 corpus_count=7541 edges_found=6835  symsan_q=794
+sqlite-aflpp-i2s | cov(l%,l,b%,b)=32.0,15316,25.8,8226,0 | maxStatsGap=0s | execs_done=6800906 corpus_count=4617 edges_found=7285  symsan_q=1854
+unqlite-aflpp-i2s | cov(l%,l,b%,b)=24.1,5246,25.6,3445,0 | maxStatsGap=0s | execs_done=3166744 corpus_count=3688 edges_found=2843  symsan_q=750
+woff2-aflpp-i2s | cov(l%,l,b%,b)=24.0,2158,14.6,1530,0 | maxStatsGap=0s | execs_done=2459755 corpus_count=1184 edges_found=1179  symsan_q=83
+== cmo-i2s-r1 ==
+bc-cmo-i2s | cov(l%,l,b%,b)=36.5,1706,31.2,798,0 | maxStatsGap=0s | execs_done=204521 corpus_count=796 edges_found=808  symsan_q=795
+confetti-cmo-i2s | cov(l%,l,b%,b)=62.0,600,47.6,301,0 | maxStatsGap=0s | execs_done=435333 corpus_count=279 edges_found=252  symsan_q=278
+jansson-cmo-i2s | cov(l%,l,b%,b)=41.4,1067,32.8,542,0 | maxStatsGap=0s | execs_done=46379 corpus_count=131 edges_found=379  symsan_q=130
+json-c-cmo-i2s | cov(l%,l,b%,b)=37.8,1018,30.6,557,0 | maxStatsGap=0s | execs_done=144023 corpus_count=298 edges_found=390  symsan_q=297
+krep-cmo-i2s | cov(l%,l,b%,b)=22.6,398,14.6,202,0 | maxStatsGap=0s | execs_done=24 corpus_count=3 edges_found=133  symsan_q=2
+libexpat-cmo-i2s | cov(l%,l,b%,b)=25.2,1953,17.6,952,0 | maxStatsGap=0s | execs_done=45910 corpus_count=301 edges_found=855  symsan_q=300
+libmatheval-cmo-i2s | cov(l%,l,b%,b)=49.4,668,42.9,255,0 | maxStatsGap=0s | execs_done=2448 corpus_count=54 edges_found=205  symsan_q=53
+libxml2-cmo-i2s | cov(l%,l,b%,b)=9.7,6775,8.6,5369,0 | maxStatsGap=0s | execs_done=706127 corpus_count=1699 edges_found=3387  symsan_q=1698
+libyaml-cmo-i2s | cov(l%,l,b%,b)=69.6,1823,53.2,2279,0 | maxStatsGap=0s | execs_done=175060 corpus_count=926 edges_found=1196  symsan_q=925
+mujs-cmo-i2s | cov(l%,l,b%,b)=47.4,4389,42.3,2440,0 | maxStatsGap=0s | execs_done=1710049 corpus_count=1340 edges_found=2711  symsan_q=1339
+oggenc-cmo-i2s | cov(l%,l,b%,b)=20.8,332,15.5,166,0 | maxStatsGap=0s | execs_done=2009 corpus_count=72 edges_found=1427  symsan_q=70
+quickjs-cmo-i2s | cov(l%,l,b%,b)=13.6,6003,8.9,2213,0 | maxStatsGap=0s | execs_done=7 corpus_count=1 edges_found=2105  symsan_q=0
+sqlite-cmo-i2s | cov(l%,l,b%,b)=27.6,13196,21.1,6733,0 | maxStatsGap=0s | execs_done=3342724 corpus_count=1603 edges_found=5693  symsan_q=1602
+unqlite-cmo-i2s | cov(l%,l,b%,b)=23.5,5113,23.7,3191,0 | maxStatsGap=0s | execs_done=1793793 corpus_count=2000 edges_found=2531  symsan_q=1999
+woff2-cmo-i2s | cov(l%,l,b%,b)=20.2,1813,10.2,1071,0 | maxStatsGap=0s | execs_done=4819 corpus_count=103 edges_found=820  symsan_q=112
+== cmo-i2s-r2 ==
+bc-cmo-i2s | cov(l%,l,b%,b)=36.6,1712,31.4,804,0 | maxStatsGap=0s | execs_done=217942 corpus_count=822 edges_found=815  symsan_q=821
+confetti-cmo-i2s | cov(l%,l,b%,b)=62.0,600,47.6,301,0 | maxStatsGap=0s | execs_done=433939 corpus_count=278 edges_found=253  symsan_q=277
+jansson-cmo-i2s | cov(l%,l,b%,b)=41.4,1067,32.8,542,0 | maxStatsGap=0s | execs_done=51934 corpus_count=135 edges_found=377  symsan_q=134
+json-c-cmo-i2s | cov(l%,l,b%,b)=37.8,1018,30.6,557,0 | maxStatsGap=0s | execs_done=156895 corpus_count=293 edges_found=390  symsan_q=292
+krep-cmo-i2s | cov(l%,l,b%,b)=22.6,398,14.6,202,0 | maxStatsGap=0s | execs_done=24 corpus_count=3 edges_found=133  symsan_q=2
+libexpat-cmo-i2s | cov(l%,l,b%,b)=25.2,1949,17.6,950,0 | maxStatsGap=0s | execs_done=48152 corpus_count=302 edges_found=847  symsan_q=301
+libmatheval-cmo-i2s | cov(l%,l,b%,b)=49.3,666,42.5,253,0 | maxStatsGap=0s | execs_done=2542 corpus_count=55 edges_found=204  symsan_q=54
+libxml2-cmo-i2s | cov(l%,l,b%,b)=9.9,6909,8.7,5434,0 | maxStatsGap=0s | execs_done=713113 corpus_count=1811 edges_found=3439  symsan_q=1810
+libyaml-cmo-i2s | cov(l%,l,b%,b)=68.8,1803,53.7,2301,0 | maxStatsGap=0s | execs_done=254377 corpus_count=1066 edges_found=1213  symsan_q=1065
+mujs-cmo-i2s | cov(l%,l,b%,b)=47.6,4407,42.5,2455,0 | maxStatsGap=0s | execs_done=1824510 corpus_count=1352 edges_found=2733  symsan_q=1351
+oggenc-cmo-i2s | cov(l%,l,b%,b)=20.8,332,15.5,166,0 | maxStatsGap=0s | execs_done=1973 corpus_count=71 edges_found=1430  symsan_q=69
+quickjs-cmo-i2s | cov(l%,l,b%,b)=29.5,13029,24.8,6175,0 | maxStatsGap=0s | execs_done=2800226 corpus_count=3493 edges_found=5610  symsan_q=3492
+sqlite-cmo-i2s | cov(l%,l,b%,b)=27.6,13213,21.1,6752,0 | maxStatsGap=0s | execs_done=3576781 corpus_count=1700 edges_found=5673  symsan_q=1699
+unqlite-cmo-i2s | cov(l%,l,b%,b)=23.4,5091,23.5,3172,0 | maxStatsGap=0s | execs_done=1845647 corpus_count=2025 edges_found=2559  symsan_q=2024
+woff2-cmo-i2s | cov(l%,l,b%,b)=20.2,1818,10.3,1078,0 | maxStatsGap=0s | execs_done=5243 corpus_count=109 edges_found=828  symsan_q=117
+== cmo-i2s-r3 ==
+bc-cmo-i2s | cov(l%,l,b%,b)=36.3,1699,31.0,794,0 | maxStatsGap=0s | execs_done=217211 corpus_count=803 edges_found=809  symsan_q=802
+confetti-cmo-i2s | cov(l%,l,b%,b)=62.0,600,47.6,301,0 | maxStatsGap=0s | execs_done=437117 corpus_count=279 edges_found=252  symsan_q=278
+jansson-cmo-i2s | cov(l%,l,b%,b)=41.5,1069,33.1,547,0 | maxStatsGap=0s | execs_done=47994 corpus_count=133 edges_found=385  symsan_q=132
+json-c-cmo-i2s | cov(l%,l,b%,b)=37.8,1018,30.6,557,0 | maxStatsGap=0s | execs_done=161585 corpus_count=298 edges_found=390  symsan_q=297
+krep-cmo-i2s | cov(l%,l,b%,b)=22.6,398,14.6,202,0 | maxStatsGap=0s | execs_done=24 corpus_count=3 edges_found=133  symsan_q=2
+libexpat-cmo-i2s | cov(l%,l,b%,b)=25.2,1951,17.6,952,0 | maxStatsGap=0s | execs_done=44889 corpus_count=297 edges_found=847  symsan_q=296
+libmatheval-cmo-i2s | cov(l%,l,b%,b)=49.3,666,42.5,253,0 | maxStatsGap=0s | execs_done=2485 corpus_count=54 edges_found=204  symsan_q=53
+libxml2-cmo-i2s | cov(l%,l,b%,b)=9.7,6785,8.6,5406,0 | maxStatsGap=0s | execs_done=668485 corpus_count=1746 edges_found=3413  symsan_q=1745
+libyaml-cmo-i2s | cov(l%,l,b%,b)=69.0,1809,54.5,2338,0 | maxStatsGap=0s | execs_done=204370 corpus_count=970 edges_found=1214  symsan_q=969
+mujs-cmo-i2s | cov(l%,l,b%,b)=46.7,4328,41.8,2413,0 | maxStatsGap=0s | execs_done=1641462 corpus_count=1268 edges_found=2627  symsan_q=1267
+oggenc-cmo-i2s | cov(l%,l,b%,b)=20.8,332,15.5,166,0 | maxStatsGap=0s | execs_done=1404 corpus_count=51 edges_found=1428  symsan_q=49
+quickjs-cmo-i2s | cov(l%,l,b%,b)=28.9,12777,24.2,6038,0 | maxStatsGap=0s | execs_done=2699411 corpus_count=3609 edges_found=5491  symsan_q=3608
+sqlite-cmo-i2s | cov(l%,l,b%,b)=26.8,12822,20.4,6512,0 | maxStatsGap=0s | execs_done=3130820 corpus_count=1519 edges_found=5468  symsan_q=1518
+unqlite-cmo-i2s | cov(l%,l,b%,b)=23.1,5014,22.9,3092,0 | maxStatsGap=0s | execs_done=1826781 corpus_count=1993 edges_found=2560  symsan_q=1992
+woff2-cmo-i2s | cov(l%,l,b%,b)=19.8,1775,10.0,1046,0 | maxStatsGap=0s | execs_done=5188 corpus_count=109 edges_found=804  symsan_q=119
+== cmo-i2s-r4 ==
+bc-cmo-i2s | cov(l%,l,b%,b)=36.4,1701,31.1,796,0 | maxStatsGap=0s | execs_done=194418 corpus_count=793 edges_found=806  symsan_q=792
+confetti-cmo-i2s | cov(l%,l,b%,b)=62.0,600,47.6,301,0 | maxStatsGap=0s | execs_done=415335 corpus_count=273 edges_found=253  symsan_q=272
+jansson-cmo-i2s | cov(l%,l,b%,b)=41.0,1057,32.5,537,0 | maxStatsGap=0s | execs_done=50161 corpus_count=133 edges_found=375  symsan_q=132
+json-c-cmo-i2s | cov(l%,l,b%,b)=37.8,1018,30.7,558,0 | maxStatsGap=0s | execs_done=151537 corpus_count=309 edges_found=390  symsan_q=308
+krep-cmo-i2s | cov(l%,l,b%,b)=22.6,398,14.6,202,0 | maxStatsGap=0s | execs_done=24 corpus_count=3 edges_found=133  symsan_q=2
+libexpat-cmo-i2s | cov(l%,l,b%,b)=25.3,1959,17.8,961,0 | maxStatsGap=0s | execs_done=38639 corpus_count=293 edges_found=855  symsan_q=292
+libmatheval-cmo-i2s | cov(l%,l,b%,b)=49.4,668,42.9,255,0 | maxStatsGap=0s | execs_done=2552 corpus_count=55 edges_found=205  symsan_q=54
+libxml2-cmo-i2s | cov(l%,l,b%,b)=9.7,6789,8.6,5403,0 | maxStatsGap=0s | execs_done=686536 corpus_count=1765 edges_found=3412  symsan_q=1764
+libyaml-cmo-i2s | cov(l%,l,b%,b)=70.4,1846,53.9,2312,0 | maxStatsGap=0s | execs_done=215394 corpus_count=1004 edges_found=1227  symsan_q=1003
+mujs-cmo-i2s | cov(l%,l,b%,b)=47.1,4365,42.5,2453,0 | maxStatsGap=0s | execs_done=1970601 corpus_count=1388 edges_found=2742  symsan_q=1387
+oggenc-cmo-i2s | cov(l%,l,b%,b)=20.8,332,15.5,166,0 | maxStatsGap=0s | execs_done=1718 corpus_count=62 edges_found=1430  symsan_q=60
+quickjs-cmo-i2s | cov(l%,l,b%,b)=30.5,13452,25.9,6450,0 | maxStatsGap=0s | execs_done=3173284 corpus_count=3877 edges_found=5851  symsan_q=3876
+sqlite-cmo-i2s | cov(l%,l,b%,b)=27.0,12947,20.6,6580,0 | maxStatsGap=0s | execs_done=3924758 corpus_count=1789 edges_found=5507  symsan_q=1788
+unqlite-cmo-i2s | cov(l%,l,b%,b)=23.4,5091,23.6,3185,0 | maxStatsGap=0s | execs_done=2057617 corpus_count=2169 edges_found=2565  symsan_q=2168
+woff2-cmo-i2s | cov(l%,l,b%,b)=20.3,1824,10.3,1078,0 | maxStatsGap=0s | execs_done=5489 corpus_count=111 edges_found=823  symsan_q=124
+== cmo-i2s-r5 ==
+bc-cmo-i2s | cov(l%,l,b%,b)=36.1,1687,30.9,792,0 | maxStatsGap=0s | execs_done=202232 corpus_count=803 edges_found=808  symsan_q=802
+confetti-cmo-i2s | cov(l%,l,b%,b)=62.0,600,47.6,301,0 | maxStatsGap=0s | execs_done=421433 corpus_count=264 edges_found=252  symsan_q=263
+jansson-cmo-i2s | cov(l%,l,b%,b)=41.5,1069,32.7,541,0 | maxStatsGap=0s | execs_done=46942 corpus_count=132 edges_found=380  symsan_q=131
+json-c-cmo-i2s | cov(l%,l,b%,b)=37.8,1018,30.6,557,0 | maxStatsGap=0s | execs_done=150541 corpus_count=303 edges_found=390  symsan_q=302
+krep-cmo-i2s | cov(l%,l,b%,b)=22.6,398,14.6,202,0 | maxStatsGap=0s | execs_done=24 corpus_count=3 edges_found=133  symsan_q=2
+libexpat-cmo-i2s | cov(l%,l,b%,b)=25.2,1955,17.6,955,0 | maxStatsGap=0s | execs_done=47538 corpus_count=298 edges_found=860  symsan_q=297
+libmatheval-cmo-i2s | cov(l%,l,b%,b)=49.4,668,42.9,255,0 | maxStatsGap=0s | execs_done=2739 corpus_count=58 edges_found=205  symsan_q=57
+libxml2-cmo-i2s | cov(l%,l,b%,b)=9.8,6827,8.7,5439,0 | maxStatsGap=0s | execs_done=670822 corpus_count=1746 edges_found=3433  symsan_q=1745
+libyaml-cmo-i2s | cov(l%,l,b%,b)=67.8,1776,52.6,2253,0 | maxStatsGap=0s | execs_done=165390 corpus_count=885 edges_found=1184  symsan_q=884
+mujs-cmo-i2s | cov(l%,l,b%,b)=48.3,4468,44.0,2540,0 | maxStatsGap=0s | execs_done=2247491 corpus_count=1547 edges_found=2979  symsan_q=1546
+oggenc-cmo-i2s | cov(l%,l,b%,b)=20.8,332,15.5,166,0 | maxStatsGap=0s | execs_done=1801 corpus_count=65 edges_found=1430  symsan_q=63
+quickjs-cmo-i2s | cov(l%,l,b%,b)=29.0,12813,24.3,6065,0 | maxStatsGap=0s | execs_done=2647526 corpus_count=3713 edges_found=5547  symsan_q=3712
+sqlite-cmo-i2s | cov(l%,l,b%,b)=27.0,12938,20.6,6586,0 | maxStatsGap=0s | execs_done=3314529 corpus_count=1600 edges_found=5538  symsan_q=1599
+unqlite-cmo-i2s | cov(l%,l,b%,b)=23.7,5146,24.0,3230,0 | maxStatsGap=0s | execs_done=1899754 corpus_count=2023 edges_found=2559  symsan_q=2022
+woff2-cmo-i2s | cov(l%,l,b%,b)=19.8,1776,10.0,1048,0 | maxStatsGap=0s | execs_done=5000 corpus_count=108 edges_found=804  symsan_q=119
+== cmplog-r1 ==
+bc-afl-cmplog | cov(l%,l,b%,b)=48.2,2255,42.4,1086,0 | maxStatsGap=0s | execs_done=2979111 corpus_count=2179 edges_found=905  symsan_q=0
+confetti-afl-cmplog | cov(l%,l,b%,b)=63.4,614,51.1,323,0 | maxStatsGap=0s | execs_done=9259693 corpus_count=471 edges_found=250  symsan_q=0
+jansson-afl-cmplog | cov(l%,l,b%,b)=47.0,1209,39.4,651,0 | maxStatsGap=0s | execs_done=9362665 corpus_count=1012 edges_found=584  symsan_q=0
+json-c-afl-cmplog | cov(l%,l,b%,b)=41.2,1110,34.9,634,0 | maxStatsGap=0s | execs_done=7282211 corpus_count=827 edges_found=548  symsan_q=0
+krep-afl-cmplog | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=5055879 corpus_count=79 edges_found=152  symsan_q=0
+libexpat-afl-cmplog | cov(l%,l,b%,b)=37.1,2874,39.4,2131,0 | maxStatsGap=0s | execs_done=7656063 corpus_count=5334 edges_found=3445  symsan_q=0
+libmatheval-afl-cmplog | cov(l%,l,b%,b)=65.3,883,57.8,344,0 | maxStatsGap=0s | execs_done=10108591 corpus_count=653 edges_found=280  symsan_q=0
+libxml2-afl-cmplog | cov(l%,l,b%,b)=10.0,6981,9.0,5631,0 | maxStatsGap=0s | execs_done=4639901 corpus_count=5070 edges_found=3901  symsan_q=0
+libyaml-afl-cmplog | cov(l%,l,b%,b)=70.9,1857,65.5,2807,0 | maxStatsGap=0s | execs_done=9578260 corpus_count=3609 edges_found=1645  symsan_q=0
+mujs-afl-cmplog | cov(l%,l,b%,b)=53.9,4993,50.9,2939,0 | maxStatsGap=0s | execs_done=4180238 corpus_count=4234 edges_found=2519  symsan_q=0
+oggenc-afl-cmplog | cov(l%,l,b%,b)=21.4,342,16.2,173,0 | maxStatsGap=0s | execs_done=138942 corpus_count=687 edges_found=1506  symsan_q=0
+quickjs-afl-cmplog | cov(l%,l,b%,b)=32.3,14285,27.7,6912,0 | maxStatsGap=0s | execs_done=3058977 corpus_count=6983 edges_found=5914  symsan_q=0
+sqlite-afl-cmplog | cov(l%,l,b%,b)=32.9,15742,25.8,8239,0 | maxStatsGap=0s | execs_done=5654401 corpus_count=4418 edges_found=6694  symsan_q=0
+unqlite-afl-cmplog | cov(l%,l,b%,b)=23.8,5178,24.8,3339,0 | maxStatsGap=0s | execs_done=1758439 corpus_count=3004 edges_found=2539  symsan_q=0
+woff2-afl-cmplog | cov(l%,l,b%,b)=23.5,2116,14.8,1560,0 | maxStatsGap=0s | execs_done=2216656 corpus_count=1260 edges_found=1908  symsan_q=0
+== cmplog-r2 ==
+bc-afl-cmplog | cov(l%,l,b%,b)=45.5,2127,40.4,1033,0 | maxStatsGap=0s | execs_done=2715079 corpus_count=2071 edges_found=857  symsan_q=0
+confetti-afl-cmplog | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=0s | execs_done=9645839 corpus_count=387 edges_found=237  symsan_q=0
+jansson-afl-cmplog | cov(l%,l,b%,b)=46.6,1200,39.6,654,0 | maxStatsGap=0s | execs_done=8624536 corpus_count=1017 edges_found=583  symsan_q=0
+json-c-afl-cmplog | cov(l%,l,b%,b)=41.4,1117,35.0,637,0 | maxStatsGap=0s | execs_done=7125673 corpus_count=858 edges_found=550  symsan_q=0
+krep-afl-cmplog | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=6126911 corpus_count=73 edges_found=152  symsan_q=0
+libexpat-afl-cmplog | cov(l%,l,b%,b)=37.7,2919,40.3,2180,0 | maxStatsGap=0s | execs_done=8287592 corpus_count=5703 edges_found=3543  symsan_q=0
+libmatheval-afl-cmplog | cov(l%,l,b%,b)=65.3,883,58.0,345,0 | maxStatsGap=0s | execs_done=9764736 corpus_count=644 edges_found=280  symsan_q=0
+libxml2-afl-cmplog | cov(l%,l,b%,b)=10.2,7115,9.1,5726,0 | maxStatsGap=0s | execs_done=4844987 corpus_count=5129 edges_found=3943  symsan_q=0
+libyaml-afl-cmplog | cov(l%,l,b%,b)=68.4,1794,62.2,2668,0 | maxStatsGap=0s | execs_done=9785880 corpus_count=3469 edges_found=1570  symsan_q=0
+mujs-afl-cmplog | cov(l%,l,b%,b)=52.4,4853,49.9,2877,0 | maxStatsGap=0s | execs_done=4223729 corpus_count=4077 edges_found=2465  symsan_q=0
+oggenc-afl-cmplog | cov(l%,l,b%,b)=21.4,342,16.3,174,0 | maxStatsGap=0s | execs_done=151779 corpus_count=715 edges_found=1493  symsan_q=0
+quickjs-afl-cmplog | cov(l%,l,b%,b)=32.2,14242,27.8,6933,0 | maxStatsGap=0s | execs_done=3149395 corpus_count=6777 edges_found=5925  symsan_q=0
+sqlite-afl-cmplog | cov(l%,l,b%,b)=31.5,15071,24.9,7965,0 | maxStatsGap=0s | execs_done=5501141 corpus_count=4412 edges_found=6501  symsan_q=0
+unqlite-afl-cmplog | cov(l%,l,b%,b)=23.8,5181,25.2,3391,0 | maxStatsGap=0s | execs_done=1952849 corpus_count=3134 edges_found=2541  symsan_q=0
+woff2-afl-cmplog | cov(l%,l,b%,b)=24.5,2204,15.1,1582,0 | maxStatsGap=0s | execs_done=2105723 corpus_count=1218 edges_found=1996  symsan_q=0
+== cmplog-r3 ==
+bc-afl-cmplog | cov(l%,l,b%,b)=46.4,2171,41.2,1055,0 | maxStatsGap=0s | execs_done=2659642 corpus_count=2103 edges_found=869  symsan_q=0
+confetti-afl-cmplog | cov(l%,l,b%,b)=63.4,614,51.1,323,0 | maxStatsGap=0s | execs_done=9632260 corpus_count=469 edges_found=250  symsan_q=0
+jansson-afl-cmplog | cov(l%,l,b%,b)=47.1,1214,39.7,656,0 | maxStatsGap=0s | execs_done=9525028 corpus_count=994 edges_found=586  symsan_q=0
+json-c-afl-cmplog | cov(l%,l,b%,b)=40.8,1099,34.4,626,0 | maxStatsGap=0s | execs_done=7906185 corpus_count=839 edges_found=543  symsan_q=0
+krep-afl-cmplog | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=6473152 corpus_count=72 edges_found=152  symsan_q=0
+libexpat-afl-cmplog | cov(l%,l,b%,b)=35.3,2735,37.8,2046,0 | maxStatsGap=0s | execs_done=8030670 corpus_count=5206 edges_found=3355  symsan_q=0
+libmatheval-afl-cmplog | cov(l%,l,b%,b)=64.9,878,57.6,343,0 | maxStatsGap=0s | execs_done=9822352 corpus_count=645 edges_found=278  symsan_q=0
+libxml2-afl-cmplog | cov(l%,l,b%,b)=10.2,7110,9.2,5742,0 | maxStatsGap=0s | execs_done=4878107 corpus_count=5014 edges_found=3947  symsan_q=0
+libyaml-afl-cmplog | cov(l%,l,b%,b)=68.4,1794,62.2,2665,0 | maxStatsGap=0s | execs_done=9847518 corpus_count=3348 edges_found=1567  symsan_q=0
+mujs-afl-cmplog | cov(l%,l,b%,b)=52.7,4881,49.8,2875,0 | maxStatsGap=0s | execs_done=4190356 corpus_count=4190 edges_found=2459  symsan_q=0
+oggenc-afl-cmplog | cov(l%,l,b%,b)=21.4,342,16.3,174,0 | maxStatsGap=0s | execs_done=118874 corpus_count=619 edges_found=1493  symsan_q=0
+quickjs-afl-cmplog | cov(l%,l,b%,b)=31.4,13868,27.1,6760,0 | maxStatsGap=0s | execs_done=3101070 corpus_count=7082 edges_found=5805  symsan_q=0
+sqlite-afl-cmplog | cov(l%,l,b%,b)=31.7,15171,25.0,7991,0 | maxStatsGap=0s | execs_done=5326427 corpus_count=4532 edges_found=6521  symsan_q=0
+unqlite-afl-cmplog | cov(l%,l,b%,b)=23.5,5099,23.8,3206,0 | maxStatsGap=0s | execs_done=1653843 corpus_count=2844 edges_found=2529  symsan_q=0
+woff2-afl-cmplog | cov(l%,l,b%,b)=23.4,2106,13.3,1400,0 | maxStatsGap=0s | execs_done=2405564 corpus_count=1088 edges_found=1808  symsan_q=0
+== cmplog-r4 ==
+bc-afl-cmplog | cov(l%,l,b%,b)=46.6,2181,41.4,1060,0 | maxStatsGap=0s | execs_done=2391300 corpus_count=2032 edges_found=872  symsan_q=0
+confetti-afl-cmplog | cov(l%,l,b%,b)=63.4,614,51.1,323,0 | maxStatsGap=0s | execs_done=4393358 corpus_count=463 edges_found=249  symsan_q=0
+jansson-afl-cmplog | cov(l%,l,b%,b)=46.4,1196,39.2,648,0 | maxStatsGap=0s | execs_done=10046720 corpus_count=942 edges_found=581  symsan_q=0
+json-c-afl-cmplog | cov(l%,l,b%,b)=40.9,1102,34.5,628,0 | maxStatsGap=0s | execs_done=7365673 corpus_count=826 edges_found=544  symsan_q=0
+krep-afl-cmplog | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=5978425 corpus_count=77 edges_found=152  symsan_q=0
+libexpat-afl-cmplog | cov(l%,l,b%,b)=36.0,2787,38.4,2081,0 | maxStatsGap=0s | execs_done=8176356 corpus_count=5270 edges_found=3380  symsan_q=0
+libmatheval-afl-cmplog | cov(l%,l,b%,b)=65.3,883,57.8,344,0 | maxStatsGap=0s | execs_done=10415986 corpus_count=624 edges_found=280  symsan_q=0
+libxml2-afl-cmplog | cov(l%,l,b%,b)=10.4,7258,9.3,5858,0 | maxStatsGap=0s | execs_done=5620825 corpus_count=5563 edges_found=4012  symsan_q=0
+libyaml-afl-cmplog | cov(l%,l,b%,b)=73.0,1913,68.3,2927,0 | maxStatsGap=0s | execs_done=10125875 corpus_count=3628 edges_found=1726  symsan_q=0
+mujs-afl-cmplog | cov(l%,l,b%,b)=52.8,4886,49.4,2849,0 | maxStatsGap=0s | execs_done=4192320 corpus_count=4074 edges_found=2417  symsan_q=0
+oggenc-afl-cmplog | cov(l%,l,b%,b)=22.4,358,17.8,190,0 | maxStatsGap=0s | execs_done=150483 corpus_count=637 edges_found=1511  symsan_q=0
+quickjs-afl-cmplog | cov(l%,l,b%,b)=31.9,14084,27.5,6869,0 | maxStatsGap=0s | execs_done=3384660 corpus_count=7224 edges_found=5855  symsan_q=0
+sqlite-afl-cmplog | cov(l%,l,b%,b)=33.4,15974,25.9,8273,0 | maxStatsGap=0s | execs_done=5476967 corpus_count=4503 edges_found=6751  symsan_q=0
+unqlite-afl-cmplog | cov(l%,l,b%,b)=24.0,5210,25.0,3368,0 | maxStatsGap=0s | execs_done=1934024 corpus_count=3149 edges_found=2569  symsan_q=0
+woff2-afl-cmplog | cov(l%,l,b%,b)=23.9,2150,14.5,1520,0 | maxStatsGap=0s | execs_done=1951746 corpus_count=1166 edges_found=1870  symsan_q=0
+== cmplog-r5 ==
+bc-afl-cmplog | cov(l%,l,b%,b)=45.2,2115,39.8,1018,0 | maxStatsGap=0s | execs_done=3329813 corpus_count=2047 edges_found=844  symsan_q=0
+confetti-afl-cmplog | cov(l%,l,b%,b)=63.4,614,51.1,323,0 | maxStatsGap=0s | execs_done=9308061 corpus_count=444 edges_found=250  symsan_q=0
+jansson-afl-cmplog | cov(l%,l,b%,b)=46.3,1192,39.2,648,0 | maxStatsGap=0s | execs_done=7061909 corpus_count=901 edges_found=576  symsan_q=0
+json-c-afl-cmplog | cov(l%,l,b%,b)=41.1,1109,34.7,631,0 | maxStatsGap=0s | execs_done=8210532 corpus_count=817 edges_found=546  symsan_q=0
+krep-afl-cmplog | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=0s | execs_done=4759534 corpus_count=78 edges_found=152  symsan_q=0
+libexpat-afl-cmplog | cov(l%,l,b%,b)=37.0,2871,39.5,2138,0 | maxStatsGap=0s | execs_done=9367427 corpus_count=5535 edges_found=3500  symsan_q=0
+libmatheval-afl-cmplog | cov(l%,l,b%,b)=65.3,883,58.0,345,0 | maxStatsGap=0s | execs_done=10741934 corpus_count=661 edges_found=280  symsan_q=0
+libxml2-afl-cmplog | cov(l%,l,b%,b)=10.3,7189,9.3,5812,0 | maxStatsGap=0s | execs_done=5854657 corpus_count=5909 edges_found=3996  symsan_q=0
+libyaml-afl-cmplog | cov(l%,l,b%,b)=73.0,1913,68.6,2943,0 | maxStatsGap=0s | execs_done=11129444 corpus_count=3805 edges_found=1739  symsan_q=0
+mujs-afl-cmplog | cov(l%,l,b%,b)=53.1,4913,50.3,2905,0 | maxStatsGap=0s | execs_done=4707807 corpus_count=4400 edges_found=2481  symsan_q=0
+oggenc-afl-cmplog | cov(l%,l,b%,b)=21.4,342,16.2,173,0 | maxStatsGap=0s | execs_done=125630 corpus_count=600 edges_found=1491  symsan_q=0
+quickjs-afl-cmplog | cov(l%,l,b%,b)=33.6,14861,28.5,7104,0 | maxStatsGap=0s | execs_done=3288842 corpus_count=7017 edges_found=6093  symsan_q=0
+sqlite-afl-cmplog | cov(l%,l,b%,b)=33.5,16060,26.8,8551,0 | maxStatsGap=0s | execs_done=5780675 corpus_count=4692 edges_found=6929  symsan_q=0
+unqlite-afl-cmplog | cov(l%,l,b%,b)=23.7,5151,24.9,3351,0 | maxStatsGap=0s | execs_done=1634022 corpus_count=3009 edges_found=2536  symsan_q=0
+woff2-afl-cmplog | cov(l%,l,b%,b)=24.1,2162,14.1,1487,0 | maxStatsGap=0s | execs_done=2370255 corpus_count=1158 edges_found=1862  symsan_q=0
+== rq-only-r1 ==
+bc-afl-rq-only | cov(l%,l,b%,b)=22.1,1035,17.2,439,0 | maxStatsGap=0s | execs_done=6059 corpus_count=117 edges_found=375  symsan_q=0
+confetti-afl-rq-only | cov(l%,l,b%,b)=53.6,519,37.3,236,0 | maxStatsGap=0s | execs_done=17810 corpus_count=123 edges_found=183  symsan_q=0
+jansson-afl-rq-only | cov(l%,l,b%,b)=37.8,974,27.4,453,0 | maxStatsGap=0s | execs_done=7237 corpus_count=66 edges_found=364  symsan_q=0
+json-c-afl-rq-only | cov(l%,l,b%,b)=32.2,867,23.4,426,0 | maxStatsGap=0s | execs_done=15846 corpus_count=87 edges_found=375  symsan_q=0
+krep-afl-rq-only | cov(l%,l,b%,b)=23.1,407,15.1,209,0 | maxStatsGap=0s | execs_done=459 corpus_count=14 edges_found=147  symsan_q=0
+libexpat-afl-rq-only | cov(l%,l,b%,b)=26.4,2043,15.7,850,0 | maxStatsGap=0s | execs_done=55009 corpus_count=274 edges_found=848  symsan_q=0
+libmatheval-afl-rq-only | cov(l%,l,b%,b)=37.4,506,29.2,174,0 | maxStatsGap=0s | execs_done=156 corpus_count=10 edges_found=152  symsan_q=0
+libxml2-afl-rq-only | cov(l%,l,b%,b)=8.3,5833,6.4,3990,0 | maxStatsGap=0s | execs_done=113237 corpus_count=717 edges_found=2630  symsan_q=0
+libyaml-afl-rq-only | cov(l%,l,b%,b)=30.7,804,17.9,769,0 | maxStatsGap=0s | execs_done=1346 corpus_count=54 edges_found=380  symsan_q=0
+mujs-afl-rq-only | cov(l%,l,b%,b)=34.3,3180,25.9,1495,0 | maxStatsGap=0s | execs_done=30113 corpus_count=205 edges_found=1236  symsan_q=0
+oggenc-afl-rq-only | cov(l%,l,b%,b)=19.8,316,13.9,149,0 | maxStatsGap=0s | execs_done=11600 corpus_count=151 edges_found=1280  symsan_q=0
+quickjs-afl-rq-only | cov(l%,l,b%,b)=18.3,8066,13.6,3393,0 | maxStatsGap=0s | execs_done=66577 corpus_count=687 edges_found=2824  symsan_q=0
+sqlite-afl-rq-only | cov(l%,l,b%,b)=22.5,10784,16.1,5150,0 | maxStatsGap=0s | execs_done=38492 corpus_count=246 edges_found=4171  symsan_q=0
+unqlite-afl-rq-only | cov(l%,l,b%,b)=18.4,3994,15.9,2148,0 | maxStatsGap=0s | execs_done=38660 corpus_count=420 edges_found=1536  symsan_q=0
+woff2-afl-rq-only | cov(l%,l,b%,b)=21.0,1891,10.9,1144,0 | maxStatsGap=0s | execs_done=136763 corpus_count=445 edges_found=1531  symsan_q=0
+== rq-only-r2 ==
+bc-afl-rq-only | cov(l%,l,b%,b)=22.9,1073,17.8,456,0 | maxStatsGap=0s | execs_done=5216 corpus_count=126 edges_found=388  symsan_q=0
+confetti-afl-rq-only | cov(l%,l,b%,b)=53.6,519,37.3,236,0 | maxStatsGap=0s | execs_done=13735 corpus_count=121 edges_found=183  symsan_q=0
+jansson-afl-rq-only | cov(l%,l,b%,b)=37.7,972,27.3,452,0 | maxStatsGap=0s | execs_done=6631 corpus_count=62 edges_found=365  symsan_q=0
+json-c-afl-rq-only | cov(l%,l,b%,b)=32.1,865,23.0,419,0 | maxStatsGap=0s | execs_done=14890 corpus_count=85 edges_found=370  symsan_q=0
+krep-afl-rq-only | cov(l%,l,b%,b)=23.1,407,15.1,209,0 | maxStatsGap=0s | execs_done=517 corpus_count=15 edges_found=147  symsan_q=0
+libexpat-afl-rq-only | cov(l%,l,b%,b)=26.4,2048,15.7,852,0 | maxStatsGap=0s | execs_done=51985 corpus_count=271 edges_found=848  symsan_q=0
+libmatheval-afl-rq-only | cov(l%,l,b%,b)=37.3,504,29.1,173,0 | maxStatsGap=0s | execs_done=144 corpus_count=9 edges_found=151  symsan_q=0
+libxml2-afl-rq-only | cov(l%,l,b%,b)=8.3,5771,6.2,3914,0 | maxStatsGap=0s | execs_done=111663 corpus_count=751 edges_found=2593  symsan_q=0
+libyaml-afl-rq-only | cov(l%,l,b%,b)=28.1,736,16.3,697,0 | maxStatsGap=0s | execs_done=1250 corpus_count=51 edges_found=344  symsan_q=0
+mujs-afl-rq-only | cov(l%,l,b%,b)=34.3,3174,26.1,1505,0 | maxStatsGap=0s | execs_done=34317 corpus_count=194 edges_found=1243  symsan_q=0
+oggenc-afl-rq-only | cov(l%,l,b%,b)=19.8,316,13.9,149,0 | maxStatsGap=0s | execs_done=11659 corpus_count=153 edges_found=1280  symsan_q=0
+quickjs-afl-rq-only | cov(l%,l,b%,b)=17.9,7891,13.1,3275,0 | maxStatsGap=0s | execs_done=53386 corpus_count=611 edges_found=2744  symsan_q=0
+sqlite-afl-rq-only | cov(l%,l,b%,b)=22.5,10795,16.2,5168,0 | maxStatsGap=0s | execs_done=51509 corpus_count=278 edges_found=4176  symsan_q=0
+unqlite-afl-rq-only | cov(l%,l,b%,b)=18.5,4019,16.1,2164,0 | maxStatsGap=0s | execs_done=36687 corpus_count=426 edges_found=1547  symsan_q=0
+woff2-afl-rq-only | cov(l%,l,b%,b)=21.3,1912,11.2,1173,0 | maxStatsGap=0s | execs_done=122088 corpus_count=458 edges_found=1551  symsan_q=0
+== rq-only-r3 ==
+bc-afl-rq-only | cov(l%,l,b%,b)=24.2,1131,18.9,484,0 | maxStatsGap=0s | execs_done=9219 corpus_count=161 edges_found=413  symsan_q=0
+confetti-afl-rq-only | cov(l%,l,b%,b)=53.6,519,37.3,236,0 | maxStatsGap=0s | execs_done=13357 corpus_count=120 edges_found=183  symsan_q=0
+jansson-afl-rq-only | cov(l%,l,b%,b)=37.8,974,27.3,452,0 | maxStatsGap=0s | execs_done=7511 corpus_count=65 edges_found=363  symsan_q=0
+json-c-afl-rq-only | cov(l%,l,b%,b)=32.0,864,23.0,418,0 | maxStatsGap=0s | execs_done=15397 corpus_count=88 edges_found=372  symsan_q=0
+krep-afl-rq-only | cov(l%,l,b%,b)=23.1,407,15.1,209,0 | maxStatsGap=0s | execs_done=449 corpus_count=14 edges_found=147  symsan_q=0
+libexpat-afl-rq-only | cov(l%,l,b%,b)=26.2,2028,15.5,841,0 | maxStatsGap=0s | execs_done=52319 corpus_count=250 edges_found=839  symsan_q=0
+libmatheval-afl-rq-only | cov(l%,l,b%,b)=37.3,504,29.1,173,0 | maxStatsGap=0s | execs_done=62 corpus_count=4 edges_found=151  symsan_q=0
+libxml2-afl-rq-only | cov(l%,l,b%,b)=8.2,5742,6.1,3825,0 | maxStatsGap=0s | execs_done=113510 corpus_count=728 edges_found=2574  symsan_q=0
+libyaml-afl-rq-only | cov(l%,l,b%,b)=27.6,723,16.3,699,0 | maxStatsGap=0s | execs_done=1448 corpus_count=57 edges_found=339  symsan_q=0
+mujs-afl-rq-only | cov(l%,l,b%,b)=35.3,3272,27.2,1567,0 | maxStatsGap=0s | execs_done=45663 corpus_count=250 edges_found=1282  symsan_q=0
+oggenc-afl-rq-only | cov(l%,l,b%,b)=19.8,316,13.9,149,0 | maxStatsGap=0s | execs_done=10741 corpus_count=156 edges_found=1294  symsan_q=0
+quickjs-afl-rq-only | cov(l%,l,b%,b)=17.8,7878,13.2,3284,0 | maxStatsGap=0s | execs_done=57339 corpus_count=649 edges_found=2753  symsan_q=0
+sqlite-afl-rq-only | cov(l%,l,b%,b)=22.7,10873,16.3,5205,0 | maxStatsGap=0s | execs_done=47795 corpus_count=276 edges_found=4217  symsan_q=0
+unqlite-afl-rq-only | cov(l%,l,b%,b)=18.6,4052,16.2,2188,0 | maxStatsGap=0s | execs_done=37520 corpus_count=412 edges_found=1552  symsan_q=0
+woff2-afl-rq-only | cov(l%,l,b%,b)=20.9,1876,10.8,1131,0 | maxStatsGap=0s | execs_done=127063 corpus_count=392 edges_found=1525  symsan_q=0
+== rq-only-r4 ==
+bc-afl-rq-only | cov(l%,l,b%,b)=23.0,1074,18.2,465,0 | maxStatsGap=0s | execs_done=6223 corpus_count=124 edges_found=391  symsan_q=0
+confetti-afl-rq-only | cov(l%,l,b%,b)=53.6,519,37.3,236,0 | maxStatsGap=0s | execs_done=19117 corpus_count=113 edges_found=183  symsan_q=0
+jansson-afl-rq-only | cov(l%,l,b%,b)=37.6,967,27.0,447,0 | maxStatsGap=0s | execs_done=6075 corpus_count=59 edges_found=361  symsan_q=0
+json-c-afl-rq-only | cov(l%,l,b%,b)=31.5,848,22.9,416,0 | maxStatsGap=0s | execs_done=17062 corpus_count=99 edges_found=369  symsan_q=0
+krep-afl-rq-only | cov(l%,l,b%,b)=23.1,407,15.1,209,0 | maxStatsGap=0s | execs_done=469 corpus_count=14 edges_found=147  symsan_q=0
+libexpat-afl-rq-only | cov(l%,l,b%,b)=26.4,2045,15.7,852,0 | maxStatsGap=0s | execs_done=58364 corpus_count=281 edges_found=856  symsan_q=0
+libmatheval-afl-rq-only | cov(l%,l,b%,b)=37.3,504,29.1,173,0 | maxStatsGap=0s | execs_done=127 corpus_count=8 edges_found=151  symsan_q=0
+libxml2-afl-rq-only | cov(l%,l,b%,b)=8.2,5738,6.0,3789,0 | maxStatsGap=0s | execs_done=114530 corpus_count=693 edges_found=2549  symsan_q=0
+libyaml-afl-rq-only | cov(l%,l,b%,b)=27.3,715,16.0,687,0 | maxStatsGap=0s | execs_done=1116 corpus_count=45 edges_found=329  symsan_q=0
+mujs-afl-rq-only | cov(l%,l,b%,b)=34.3,3172,26.0,1500,0 | maxStatsGap=0s | execs_done=27099 corpus_count=201 edges_found=1234  symsan_q=0
+oggenc-afl-rq-only | cov(l%,l,b%,b)=19.8,316,13.9,149,0 | maxStatsGap=0s | execs_done=14940 corpus_count=151 edges_found=1294  symsan_q=0
+quickjs-afl-rq-only | cov(l%,l,b%,b)=17.8,7878,13.2,3295,0 | maxStatsGap=0s | execs_done=56753 corpus_count=639 edges_found=2762  symsan_q=0
+sqlite-afl-rq-only | cov(l%,l,b%,b)=22.5,10792,16.2,5161,0 | maxStatsGap=0s | execs_done=42594 corpus_count=258 edges_found=4173  symsan_q=0
+unqlite-afl-rq-only | cov(l%,l,b%,b)=18.4,4010,15.9,2139,0 | maxStatsGap=0s | execs_done=38009 corpus_count=414 edges_found=1526  symsan_q=0
+woff2-afl-rq-only | cov(l%,l,b%,b)=20.9,1877,10.8,1132,0 | maxStatsGap=0s | execs_done=130732 corpus_count=439 edges_found=1529  symsan_q=0
+== rq-only-r5 ==
+bc-afl-rq-only | cov(l%,l,b%,b)=24.9,1163,19.4,497,0 | maxStatsGap=0s | execs_done=7322 corpus_count=146 edges_found=414  symsan_q=0
+confetti-afl-rq-only | cov(l%,l,b%,b)=54.2,525,38.3,242,0 | maxStatsGap=0s | execs_done=19438 corpus_count=122 edges_found=189  symsan_q=0
+jansson-afl-rq-only | cov(l%,l,b%,b)=37.5,966,26.9,445,0 | maxStatsGap=0s | execs_done=6480 corpus_count=57 edges_found=359  symsan_q=0
+json-c-afl-rq-only | cov(l%,l,b%,b)=31.3,843,22.6,411,0 | maxStatsGap=0s | execs_done=15149 corpus_count=88 edges_found=367  symsan_q=0
+krep-afl-rq-only | cov(l%,l,b%,b)=23.1,407,15.1,209,0 | maxStatsGap=0s | execs_done=492 corpus_count=15 edges_found=147  symsan_q=0
+libexpat-afl-rq-only | cov(l%,l,b%,b)=26.5,2053,15.8,854,0 | maxStatsGap=0s | execs_done=53576 corpus_count=269 edges_found=852  symsan_q=0
+libmatheval-afl-rq-only | cov(l%,l,b%,b)=37.1,502,28.7,171,0 | maxStatsGap=0s | execs_done=133 corpus_count=8 edges_found=149  symsan_q=0
+libxml2-afl-rq-only | cov(l%,l,b%,b)=8.3,5789,6.3,3945,0 | maxStatsGap=0s | execs_done=115878 corpus_count=757 edges_found=2607  symsan_q=0
+libyaml-afl-rq-only | cov(l%,l,b%,b)=27.3,715,15.9,681,0 | maxStatsGap=0s | execs_done=1080 corpus_count=45 edges_found=325  symsan_q=0
+mujs-afl-rq-only | cov(l%,l,b%,b)=34.3,3176,26.2,1512,0 | maxStatsGap=0s | execs_done=27831 corpus_count=193 edges_found=1240  symsan_q=0
+oggenc-afl-rq-only | cov(l%,l,b%,b)=19.8,316,13.9,149,0 | maxStatsGap=0s | execs_done=11481 corpus_count=159 edges_found=1279  symsan_q=0
+quickjs-afl-rq-only | cov(l%,l,b%,b)=17.8,7860,13.1,3270,0 | maxStatsGap=0s | execs_done=53606 corpus_count=601 edges_found=2734  symsan_q=0
+sqlite-afl-rq-only | cov(l%,l,b%,b)=22.5,10786,16.1,5143,0 | maxStatsGap=0s | execs_done=38071 corpus_count=258 edges_found=4166  symsan_q=0
+unqlite-afl-rq-only | cov(l%,l,b%,b)=18.5,4032,16.0,2160,0 | maxStatsGap=0s | execs_done=41895 corpus_count=422 edges_found=1545  symsan_q=0
+woff2-afl-rq-only | cov(l%,l,b%,b)=21.1,1894,11.0,1151,0 | maxStatsGap=0s | execs_done=148946 corpus_count=463 edges_found=1542  symsan_q=0
+== tier1-r1 ==
+bc-libafl-havoc | cov(l%,l,b%,b)=41.3,1930,35.7,914,0 | maxStatsGap=67s | run time: 59m-59s corpus: 921 objectives: 0 executions: 263176 shared_mem: 916 
+bc-libafl-i2s | cov(l%,l,b%,b)=40.5,1894,34.9,892,0 | maxStatsGap=721s | run time: 59m-53s corpus: 749 objectives: 0 executions: 231551 finds_symsan: 392 corpus shared_mem: 908 
+bc-libafl-jig | cov(l%,l,b%,b)=40.7,1903,35.1,899,0 | maxStatsGap=740s | 
+confetti-libafl-havoc | cov(l%,l,b%,b)=63.3,613,50.9,322,0 | maxStatsGap=16s | run time: 59m-48s corpus: 492 objectives: 0 executions: 10559054 shared_mem: 329 
+confetti-libafl-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=16s | run time: 59m-49s corpus: 398 objectives: 0 executions: 10730383 shared_mem: 308 finds_symsan: 168 corpus 
+confetti-libafl-jig | cov(l%,l,b%,b)=63.4,614,51.1,323,0 | maxStatsGap=16s | run time: 59m-54s corpus: 471 objectives: 0 executions: 10561486 finds_symsan: 206 corpus shared_mem: 330 
+jansson-libafl-havoc | cov(l%,l,b%,b)=46.3,1192,39.0,645,0 | maxStatsGap=16s | run time: 59m-48s corpus: 667 objectives: 0 executions: 9792689 shared_mem: 509 
+jansson-libafl-i2s | cov(l%,l,b%,b)=46.9,1207,39.4,651,0 | maxStatsGap=16s | run time: 59m-48s corpus: 628 objectives: 0 executions: 10033567 shared_mem: 515 finds_symsan: 151 corpus 
+jansson-libafl-jig | cov(l%,l,b%,b)=46.1,1188,39.1,646,0 | maxStatsGap=16s | run time: 59m-52s corpus: 661 objectives: 0 executions: 9824731 finds_symsan: 166 corpus shared_mem: 513 
+json-c-libafl-havoc | cov(l%,l,b%,b)=40.6,1095,34.2,621,0 | maxStatsGap=16s | run time: 59m-48s corpus: 548 objectives: 0 executions: 10597096 shared_mem: 435 
+json-c-libafl-i2s | cov(l%,l,b%,b)=40.5,1093,34.2,621,0 | maxStatsGap=16s | run time: 59m-51s corpus: 558 objectives: 0 executions: 9631351 finds_symsan: 278 corpus shared_mem: 434 
+json-c-libafl-jig | cov(l%,l,b%,b)=40.7,1098,34.4,625,0 | maxStatsGap=16s | run time: 59m-54s corpus: 592 objectives: 0 executions: 9609612 shared_mem: 436 finds_symsan: 318 corpus 
+krep-libafl-havoc | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-48s corpus: 59 objectives: 0 executions: 9162935 shared_mem: 148 
+krep-libafl-i2s | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-49s corpus: 60 objectives: 0 executions: 9028003 finds_symsan: 1 corpus shared_mem: 148 
+krep-libafl-jig | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-49s corpus: 58 objectives: 0 executions: 8980498 shared_mem: 148 finds_symsan: 1 corpus 
+libexpat-libafl-havoc | cov(l%,l,b%,b)=34.4,2662,35.8,1939,0 | maxStatsGap=16s | run time: 59m-49s corpus: 3554 objectives: 0 executions: 9597197 shared_mem: 2995 
+libexpat-libafl-i2s | cov(l%,l,b%,b)=36.0,2788,37.2,2015,0 | maxStatsGap=16s | run time: 59m-49s corpus: 3841 objectives: 0 executions: 9337702 shared_mem: 3133 finds_symsan: 1164 corpus 
+libexpat-libafl-jig | cov(l%,l,b%,b)=35.8,2772,38.1,2064,0 | maxStatsGap=15s | run time: 59m-49s corpus: 3918 objectives: 0 executions: 9569947 finds_symsan: 1233 corpus shared_mem: 3302 
+libmatheval-libafl-havoc | cov(l%,l,b%,b)=51.6,697,44.7,266,0 | maxStatsGap=16s | run time: 59m-48s corpus: 280 objectives: 0 executions: 10063547 shared_mem: 214 
+libmatheval-libafl-i2s | cov(l%,l,b%,b)=51.3,693,44.4,264,0 | maxStatsGap=16s | run time: 59m-49s corpus: 325 objectives: 0 executions: 9868058 shared_mem: 212 finds_symsan: 177 corpus 
+libmatheval-libafl-jig | cov(l%,l,b%,b)=51.3,693,44.4,264,0 | maxStatsGap=16s | run time: 59m-49s corpus: 323 objectives: 0 executions: 9962346 shared_mem: 212 finds_symsan: 160 corpus 
+libxml2-libafl-havoc | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=16s | run time: 59m-50s corpus: 3501 objectives: 0 executions: 6367251 shared_mem: 3555 
+libxml2-libafl-i2s | cov(l%,l,b%,b)=11.3,7925,10.4,6515,0 | maxStatsGap=15s | run time: 59m-58s corpus: 4202 objectives: 0 executions: 5900815 finds_symsan: 1743 corpus shared_mem: 4259 
+libxml2-libafl-jig | cov(l%,l,b%,b)=10.7,7467,9.8,6143,0 | maxStatsGap=15s | run time: 59m-57s corpus: 4024 objectives: 0 executions: 5666000 finds_symsan: 1795 corpus shared_mem: 4073 
+libyaml-libafl-havoc | cov(l%,l,b%,b)=68.3,1789,59.8,2562,0 | maxStatsGap=16s | run time: 59m-48s corpus: 1946 objectives: 0 executions: 10876743 shared_mem: 1363 
+libyaml-libafl-i2s | cov(l%,l,b%,b)=71.6,1876,65.8,2819,0 | maxStatsGap=16s | run time: 59m-58s corpus: 2434 objectives: 0 executions: 10820352 finds_symsan: 1392 corpus shared_mem: 1507 
+libyaml-libafl-jig | cov(l%,l,b%,b)=72.1,1890,66.2,2838,0 | maxStatsGap=16s | run time: 59m-51s corpus: 2514 objectives: 0 executions: 9736723 shared_mem: 1499 finds_symsan: 1481 corpus 
+mujs-libafl-havoc | cov(l%,l,b%,b)=48.3,4476,44.2,2551,0 | maxStatsGap=16s | run time: 59m-52s corpus: 3280 objectives: 0 executions: 4862811 shared_mem: 3178 
+mujs-libafl-i2s | cov(l%,l,b%,b)=50.2,4646,46.6,2689,0 | maxStatsGap=15s | run time: 59m-58s corpus: 3281 objectives: 0 executions: 5243622 finds_symsan: 2308 corpus shared_mem: 3329 
+mujs-libafl-jig | cov(l%,l,b%,b)=50.4,4663,46.9,2709,0 | maxStatsGap=13s | run time: 59m-46s corpus: 3404 objectives: 0 executions: 5182124 shared_mem: 3395 finds_symsan: 2191 corpus 
+oggenc-libafl-havoc | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=33s | run time: 59m-56s corpus: 108 objectives: 18 executions: 24514 shared_mem: 1422 
+oggenc-libafl-i2s | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=33s | run time: 59m-47s corpus: 132 objectives: 35 executions: 24130 finds_symsan: 54 corpus shared_mem: 1529 
+oggenc-libafl-jig | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=33s | run time: 59m-36s corpus: 135 objectives: 34 executions: 28127 shared_mem: 1531 finds_symsan: 83 corpus 
+quickjs-libafl-havoc | cov(l%,l,b%,b)=30.4,13406,25.7,6400,0 | maxStatsGap=16s | run time: 59m-53s corpus: 3935 objectives: 0 executions: 4015756 shared_mem: 5872 
+quickjs-libafl-i2s | cov(l%,l,b%,b)=28.2,12457,23.3,5804,0 | maxStatsGap=8s | 
+quickjs-libafl-jig | cov(l%,l,b%,b)=28.2,12439,23.2,5790,0 | maxStatsGap=9s | run time: 59m-58s corpus: 2454 objectives: 0 executions: 4261087 finds_symsan: 2000 corpus shared_mem: 5278 
+sqlite-libafl-havoc | cov(l%,l,b%,b)=28.0,13390,21.6,6884,0 | maxStatsGap=16s | run time: 59m-49s corpus: 2513 objectives: 0 executions: 7081890 shared_mem: 5967 
+sqlite-libafl-i2s | cov(l%,l,b%,b)=31.6,15124,25.4,8098,0 | maxStatsGap=13s | run time: 59m-58s corpus: 3108 objectives: 0 executions: 5918058 shared_mem: 7130 finds_symsan: 2804 corpus 
+sqlite-libafl-jig | cov(l%,l,b%,b)=30.9,14784,24.3,7759,0 | maxStatsGap=15s | 
+unqlite-libafl-havoc | cov(l%,l,b%,b)=21.4,4648,21.6,2905,0 | maxStatsGap=18s | run time: 59m-55s corpus: 1366 objectives: 351 executions: 234778 shared_mem: 2404 
+unqlite-libafl-i2s | cov(l%,l,b%,b)=23.3,5069,24.0,3235,0 | maxStatsGap=19s | run time: 59m-57s corpus: 1773 objectives: 748 executions: 1099489 shared_mem: 2668 finds_symsan: 1066 corpus 
+unqlite-libafl-jig | cov(l%,l,b%,b)=23.8,5180,24.6,3310,0 | maxStatsGap=21s | run time: 59m-57s corpus: 1736 objectives: 711 executions: 883559 shared_mem: 2665 finds_symsan: 1063 corpus 
+woff2-libafl-havoc | cov(l%,l,b%,b)=21.4,1921,11.3,1186,0 | maxStatsGap=17s | run time: 59m-49s corpus: 280 objectives: 0 executions: 339510 shared_mem: 920 
+woff2-libafl-i2s | cov(l%,l,b%,b)=21.8,1963,11.7,1229,0 | maxStatsGap=17s | run time: 59m-56s corpus: 282 objectives: 0 executions: 344396 finds_symsan: 86 corpus shared_mem: 968 
+woff2-libafl-jig | cov(l%,l,b%,b)=22.8,2049,12.6,1323,0 | maxStatsGap=17s | run time: 59m-58s corpus: 358 objectives: 0 executions: 344673 finds_symsan: 118 corpus shared_mem: 1013 
+== tier1-r2 ==
+bc-libafl-havoc | cov(l%,l,b%,b)=41.1,1921,35.5,908,0 | maxStatsGap=52s | run time: 35m-12s corpus: 857 objectives: 0 executions: 182404 shared_mem: 916 
+bc-libafl-i2s | cov(l%,l,b%,b)=40.7,1902,35.1,897,0 | maxStatsGap=337s | run time: 37m-58s corpus: 862 objectives: 0 executions: 303954 shared_mem: 926 finds_symsan: 444 corpus 
+bc-libafl-jig | cov(l%,l,b%,b)=40.6,1897,34.6,886,0 | maxStatsGap=581s | 
+confetti-libafl-havoc | cov(l%,l,b%,b)=63.3,613,50.9,322,0 | maxStatsGap=16s | run time: 33m-57s corpus: 429 objectives: 0 executions: 5681416 shared_mem: 328 
+confetti-libafl-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=16s | run time: 37m-35s corpus: 421 objectives: 0 executions: 6392050 finds_symsan: 193 corpus shared_mem: 308 
+confetti-libafl-jig | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=16s | run time: 32m-27s corpus: 421 objectives: 0 executions: 5457797 finds_symsan: 208 corpus shared_mem: 307 
+jansson-libafl-havoc | cov(l%,l,b%,b)=45.9,1183,38.5,637,0 | maxStatsGap=16s | run time: 59m-47s corpus: 649 objectives: 0 executions: 11990915 shared_mem: 505 
+jansson-libafl-i2s | cov(l%,l,b%,b)=46.5,1198,39.0,644,0 | maxStatsGap=16s | run time: 59m-48s corpus: 655 objectives: 0 executions: 11790165 shared_mem: 511 finds_symsan: 158 corpus 
+jansson-libafl-jig | cov(l%,l,b%,b)=46.5,1198,38.8,642,0 | maxStatsGap=16s | run time: 59m-56s corpus: 558 objectives: 0 executions: 3848492 finds_symsan: 147 corpus shared_mem: 511 
+json-c-libafl-havoc | cov(l%,l,b%,b)=40.7,1098,34.2,622,0 | maxStatsGap=16s | run time: 59m-49s corpus: 583 objectives: 0 executions: 9693514 shared_mem: 436 
+json-c-libafl-i2s | cov(l%,l,b%,b)=40.9,1103,34.4,626,0 | maxStatsGap=16s | run time: 59m-53s corpus: 587 objectives: 0 executions: 9596054 finds_symsan: 314 corpus shared_mem: 437 
+json-c-libafl-jig | cov(l%,l,b%,b)=40.6,1095,34.2,622,0 | maxStatsGap=17s | run time: 59m-48s corpus: 598 objectives: 0 executions: 9651272 finds_symsan: 335 corpus shared_mem: 435 
+krep-libafl-havoc | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-49s corpus: 62 objectives: 0 executions: 9241143 shared_mem: 148 
+krep-libafl-i2s | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=16s | run time: 59m-49s corpus: 63 objectives: 0 executions: 8305874 finds_symsan: 2 corpus shared_mem: 149 
+krep-libafl-jig | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-49s corpus: 62 objectives: 0 executions: 8931120 shared_mem: 148 finds_symsan: 2 corpus 
+libexpat-libafl-havoc | cov(l%,l,b%,b)=34.2,2650,36.1,1955,0 | maxStatsGap=16s | run time: 59m-49s corpus: 3500 objectives: 0 executions: 8984280 shared_mem: 3008 
+libexpat-libafl-i2s | cov(l%,l,b%,b)=34.9,2701,36.8,1993,0 | maxStatsGap=16s | run time: 59m-58s corpus: 3972 objectives: 0 executions: 8930009 shared_mem: 3272 finds_symsan: 1223 corpus 
+libexpat-libafl-jig | cov(l%,l,b%,b)=36.8,2851,38.6,2091,0 | maxStatsGap=16s | run time: 59m-51s corpus: 3947 objectives: 0 executions: 8883028 finds_symsan: 1305 corpus shared_mem: 3299 
+libmatheval-libafl-havoc | cov(l%,l,b%,b)=52.5,710,45.9,273,0 | maxStatsGap=16s | run time: 59m-48s corpus: 262 objectives: 0 executions: 9396847 shared_mem: 216 
+libmatheval-libafl-i2s | cov(l%,l,b%,b)=51.6,697,44.7,266,0 | maxStatsGap=16s | run time: 40m-19s corpus: 327 objectives: 0 executions: 5976167 finds_symsan: 161 corpus shared_mem: 214 
+libmatheval-libafl-jig | cov(l%,l,b%,b)=52.5,710,45.9,273,0 | maxStatsGap=16s | run time: 59m-49s corpus: 345 objectives: 0 executions: 9516142 shared_mem: 216 finds_symsan: 181 corpus 
+libxml2-libafl-havoc | cov(l%,l,b%,b)=9.6,6704,8.4,5267,0 | maxStatsGap=16s | run time: 59m-51s corpus: 3390 objectives: 0 executions: 5953001 shared_mem: 3421 
+libxml2-libafl-i2s | cov(l%,l,b%,b)=10.8,7557,9.9,6201,0 | maxStatsGap=15s | run time: 59m-56s corpus: 3776 objectives: 0 executions: 5412012 shared_mem: 4051 finds_symsan: 1631 corpus 
+libxml2-libafl-jig | cov(l%,l,b%,b)=11.2,7816,10.3,6449,0 | maxStatsGap=15s | run time: 59m-54s corpus: 4087 objectives: 0 executions: 5422885 shared_mem: 4203 finds_symsan: 1709 corpus 
+libyaml-libafl-havoc | cov(l%,l,b%,b)=68.3,1789,60.4,2590,0 | maxStatsGap=16s | run time: 59m-48s corpus: 1952 objectives: 0 executions: 10561432 shared_mem: 1374 
+libyaml-libafl-i2s | cov(l%,l,b%,b)=72.1,1890,67.0,2872,0 | maxStatsGap=15s | run time: 59m-55s corpus: 2437 objectives: 0 executions: 10381895 finds_symsan: 1410 corpus shared_mem: 1513 
+libyaml-libafl-jig | cov(l%,l,b%,b)=72.1,1890,66.0,2829,0 | maxStatsGap=16s | run time: 59m-57s corpus: 2433 objectives: 0 executions: 10461711 finds_symsan: 1413 corpus shared_mem: 1508 
+mujs-libafl-havoc | cov(l%,l,b%,b)=49.5,4581,45.3,2616,0 | maxStatsGap=16s | run time: 59m-52s corpus: 3475 objectives: 0 executions: 4901263 shared_mem: 3285 
+mujs-libafl-i2s | cov(l%,l,b%,b)=51.0,4718,47.5,2741,0 | maxStatsGap=15s | 
+mujs-libafl-jig | cov(l%,l,b%,b)=50.9,4715,47.5,2742,0 | maxStatsGap=15s | run time: 59m-59s corpus: 3513 objectives: 0 executions: 5137900 shared_mem: 3463 finds_symsan: 2283 corpus 
+oggenc-libafl-havoc | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=29s | run time: 59m-57s corpus: 144 objectives: 18 executions: 33457 shared_mem: 1474 
+oggenc-libafl-i2s | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=31s | run time: 59m-39s corpus: 131 objectives: 35 executions: 30371 shared_mem: 1505 finds_symsan: 62 corpus 
+oggenc-libafl-jig | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=28s | run time: 59m-43s corpus: 143 objectives: 34 executions: 35988 shared_mem: 1532 finds_symsan: 91 corpus 
+quickjs-libafl-havoc | cov(l%,l,b%,b)=29.8,13167,25.0,6235,0 | maxStatsGap=16s | run time: 59m-56s corpus: 3847 objectives: 0 executions: 4041452 shared_mem: 5716 
+quickjs-libafl-i2s | cov(l%,l,b%,b)=28.1,12432,23.2,5781,0 | maxStatsGap=8s | run time: 59m-58s corpus: 2400 objectives: 0 executions: 4025612 finds_symsan: 1980 corpus shared_mem: 5275 
+quickjs-libafl-jig | cov(l%,l,b%,b)=28.2,12448,23.4,5829,0 | maxStatsGap=7s | 
+sqlite-libafl-havoc | cov(l%,l,b%,b)=28.2,13520,21.6,6912,0 | maxStatsGap=16s | run time: 59m-50s corpus: 2423 objectives: 0 executions: 7077746 shared_mem: 5992 
+sqlite-libafl-i2s | cov(l%,l,b%,b)=31.1,14911,24.9,7958,0 | maxStatsGap=15s | run time: 59m-58s corpus: 2857 objectives: 0 executions: 6127818 finds_symsan: 2433 corpus shared_mem: 6882 
+sqlite-libafl-jig | cov(l%,l,b%,b)=29.7,14222,23.6,7532,0 | maxStatsGap=15s | 
+unqlite-libafl-havoc | cov(l%,l,b%,b)=21.4,4648,21.6,2910,0 | maxStatsGap=17s | run time: 59m-57s corpus: 1425 objectives: 380 executions: 288871 shared_mem: 2387 
+unqlite-libafl-i2s | cov(l%,l,b%,b)=23.5,5110,24.4,3290,0 | maxStatsGap=97s | run time: 59m-59s corpus: 1999 objectives: 828 executions: 1175806 finds_symsan: 1250 corpus shared_mem: 2701 
+unqlite-libafl-jig | cov(l%,l,b%,b)=23.7,5148,24.1,3254,0 | maxStatsGap=17s | run time: 59m-57s corpus: 1775 objectives: 746 executions: 899781 finds_symsan: 1068 corpus shared_mem: 2655 
+woff2-libafl-havoc | cov(l%,l,b%,b)=21.4,1922,11.2,1180,0 | maxStatsGap=17s | run time: 59m-57s corpus: 269 objectives: 0 executions: 370693 shared_mem: 910 
+woff2-libafl-i2s | cov(l%,l,b%,b)=21.8,1962,11.7,1231,0 | maxStatsGap=16s | run time: 59m-51s corpus: 302 objectives: 0 executions: 397609 shared_mem: 957 finds_symsan: 82 corpus 
+woff2-libafl-jig | cov(l%,l,b%,b)=22.8,2051,12.5,1310,0 | maxStatsGap=17s | run time: 59m-50s corpus: 334 objectives: 0 executions: 385876 shared_mem: 1009 finds_symsan: 113 corpus 
+== tier1-r3 ==
+bc-libafl-havoc | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=72s | run time: 59m-13s corpus: 774 objectives: 0 executions: 178907 shared_mem: 890 
+bc-libafl-i2s | cov(l%,l,b%,b)=40.4,1889,34.5,884,0 | maxStatsGap=502s | 
+bc-libafl-jig | cov(l%,l,b%,b)=40.7,1902,35.0,895,0 | maxStatsGap=563s | run time: 59m-33s corpus: 1052 objectives: 0 executions: 558598 finds_symsan: 526 corpus shared_mem: 927 
+confetti-libafl-havoc | cov(l%,l,b%,b)=62.5,605,48.1,304,0 | maxStatsGap=16s | run time: 59m-50s corpus: 447 objectives: 0 executions: 9479515 shared_mem: 307 
+confetti-libafl-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=16s | run time: 59m-55s corpus: 417 objectives: 0 executions: 9398158 finds_symsan: 189 corpus shared_mem: 308 
+confetti-libafl-jig | cov(l%,l,b%,b)=63.4,614,51.1,323,0 | maxStatsGap=16s | run time: 59m-56s corpus: 459 objectives: 0 executions: 9971005 shared_mem: 330 finds_symsan: 215 corpus 
+jansson-libafl-havoc | cov(l%,l,b%,b)=45.7,1176,38.5,636,0 | maxStatsGap=16s | run time: 59m-53s corpus: 589 objectives: 0 executions: 4489484 shared_mem: 501 
+jansson-libafl-i2s | cov(l%,l,b%,b)=46.6,1201,39.2,648,0 | maxStatsGap=16s | run time: 59m-49s corpus: 635 objectives: 0 executions: 8927925 finds_symsan: 174 corpus shared_mem: 514 
+jansson-libafl-jig | cov(l%,l,b%,b)=46.1,1186,38.8,641,0 | maxStatsGap=16s | run time: 59m-54s corpus: 541 objectives: 0 executions: 3882785 finds_symsan: 151 corpus shared_mem: 510 
+json-c-libafl-havoc | cov(l%,l,b%,b)=40.7,1098,34.3,624,0 | maxStatsGap=16s | run time: 59m-48s corpus: 592 objectives: 0 executions: 9697039 shared_mem: 436 
+json-c-libafl-i2s | cov(l%,l,b%,b)=40.0,1078,33.6,611,0 | maxStatsGap=16s | run time: 59m-53s corpus: 559 objectives: 0 executions: 9754103 finds_symsan: 299 corpus shared_mem: 426 
+json-c-libafl-jig | cov(l%,l,b%,b)=40.5,1093,34.2,621,0 | maxStatsGap=16s | run time: 59m-54s corpus: 589 objectives: 0 executions: 9767330 finds_symsan: 329 corpus shared_mem: 434 
+krep-libafl-havoc | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-49s corpus: 56 objectives: 0 executions: 7485549 shared_mem: 148 
+krep-libafl-i2s | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=179s | run time: 59m-49s corpus: 63 objectives: 0 executions: 7419227 shared_mem: 148 finds_symsan: 1 corpus 
+krep-libafl-jig | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=179s | run time: 59m-45s corpus: 62 objectives: 0 executions: 7391276 shared_mem: 148 finds_symsan: 2 corpus 
+libexpat-libafl-havoc | cov(l%,l,b%,b)=34.0,2633,35.8,1938,0 | maxStatsGap=16s | run time: 59m-57s corpus: 3454 objectives: 0 executions: 7906127 shared_mem: 3001 
+libexpat-libafl-i2s | cov(l%,l,b%,b)=35.9,2783,37.3,2018,0 | maxStatsGap=16s | run time: 59m-59s corpus: 3675 objectives: 0 executions: 8202339 shared_mem: 3146 finds_symsan: 1120 corpus 
+libexpat-libafl-jig | cov(l%,l,b%,b)=36.6,2838,38.1,2060,0 | maxStatsGap=15s | run time: 59m-51s corpus: 3716 objectives: 0 executions: 8356911 finds_symsan: 1180 corpus shared_mem: 3119 
+libmatheval-libafl-havoc | cov(l%,l,b%,b)=54.1,732,49.6,295,0 | maxStatsGap=16s | run time: 59m-48s corpus: 290 objectives: 0 executions: 9880422 shared_mem: 217 
+libmatheval-libafl-i2s | cov(l%,l,b%,b)=51.6,697,44.7,266,0 | maxStatsGap=16s | run time: 59m-49s corpus: 324 objectives: 0 executions: 9805185 shared_mem: 214 finds_symsan: 147 corpus 
+libmatheval-libafl-jig | cov(l%,l,b%,b)=51.3,693,44.4,264,0 | maxStatsGap=16s | run time: 59m-49s corpus: 332 objectives: 0 executions: 9776934 finds_symsan: 171 corpus shared_mem: 212 
+libxml2-libafl-havoc | cov(l%,l,b%,b)=9.7,6787,8.6,5367,0 | maxStatsGap=16s | run time: 59m-53s corpus: 3481 objectives: 0 executions: 5976319 shared_mem: 3504 
+libxml2-libafl-i2s | cov(l%,l,b%,b)=10.7,7495,9.8,6132,0 | maxStatsGap=16s | run time: 59m-58s corpus: 3914 objectives: 0 executions: 5180859 finds_symsan: 1695 corpus shared_mem: 4019 
+libxml2-libafl-jig | cov(l%,l,b%,b)=10.6,7407,9.7,6086,0 | maxStatsGap=15s | run time: 59m-55s corpus: 3954 objectives: 0 executions: 5596810 finds_symsan: 1629 corpus shared_mem: 4037 
+libyaml-libafl-havoc | cov(l%,l,b%,b)=68.3,1789,59.7,2559,0 | maxStatsGap=16s | run time: 59m-49s corpus: 1968 objectives: 0 executions: 8789871 shared_mem: 1373 
+libyaml-libafl-i2s | cov(l%,l,b%,b)=72.3,1894,66.4,2845,0 | maxStatsGap=16s | run time: 59m-59s corpus: 2460 objectives: 0 executions: 9930508 finds_symsan: 1422 corpus shared_mem: 1518 
+libyaml-libafl-jig | cov(l%,l,b%,b)=71.6,1876,66.8,2864,0 | maxStatsGap=16s | run time: 59m-52s corpus: 2439 objectives: 0 executions: 9808910 shared_mem: 1510 finds_symsan: 1402 corpus 
+mujs-libafl-havoc | cov(l%,l,b%,b)=48.8,4522,44.9,2590,0 | maxStatsGap=16s | run time: 59m-59s corpus: 3317 objectives: 0 executions: 4647904 shared_mem: 3302 
+mujs-libafl-i2s | cov(l%,l,b%,b)=51.0,4726,47.1,2717,0 | maxStatsGap=15s | run time: 59m-57s corpus: 3099 objectives: 0 executions: 4812894 finds_symsan: 2117 corpus shared_mem: 3398 
+mujs-libafl-jig | cov(l%,l,b%,b)=50.0,4625,46.7,2693,0 | maxStatsGap=15s | 
+oggenc-libafl-havoc | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=29s | run time: 59m-54s corpus: 112 objectives: 17 executions: 29693 shared_mem: 1426 
+oggenc-libafl-i2s | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=29s | run time: 59m-54s corpus: 135 objectives: 34 executions: 31605 shared_mem: 1526 finds_symsan: 60 corpus 
+oggenc-libafl-jig | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=29s | run time: 59m-59s corpus: 161 objectives: 34 executions: 37651 shared_mem: 1533 finds_symsan: 96 corpus 
+quickjs-libafl-havoc | cov(l%,l,b%,b)=30.6,13536,25.9,6462,0 | maxStatsGap=16s | run time: 59m-58s corpus: 3911 objectives: 0 executions: 3965838 shared_mem: 5905 
+quickjs-libafl-i2s | cov(l%,l,b%,b)=27.9,12318,23.0,5736,0 | maxStatsGap=7s | 
+quickjs-libafl-jig | cov(l%,l,b%,b)=28.2,12467,23.3,5817,0 | maxStatsGap=8s | 
+sqlite-libafl-havoc | cov(l%,l,b%,b)=28.5,13652,22.0,7009,0 | maxStatsGap=16s | run time: 59m-57s corpus: 2354 objectives: 0 executions: 6435836 shared_mem: 6071 
+sqlite-libafl-i2s | cov(l%,l,b%,b)=29.4,14054,23.1,7375,0 | maxStatsGap=10s | run time: 59m-59s corpus: 2789 objectives: 0 executions: 5300500 shared_mem: 6370 finds_symsan: 2501 corpus 
+sqlite-libafl-jig | cov(l%,l,b%,b)=31.2,14915,24.6,7863,0 | maxStatsGap=15s | run time: 59m-59s corpus: 2747 objectives: 0 executions: 5258765 finds_symsan: 2318 corpus shared_mem: 6850 
+unqlite-libafl-havoc | cov(l%,l,b%,b)=21.2,4605,21.3,2865,0 | maxStatsGap=17s | run time: 59m-59s corpus: 1458 objectives: 360 executions: 249196 shared_mem: 2373 
+unqlite-libafl-i2s | cov(l%,l,b%,b)=23.4,5084,24.1,3251,0 | maxStatsGap=217s | run time: 59m-59s corpus: 1819 objectives: 683 executions: 1057018 finds_symsan: 1064 corpus shared_mem: 2679 
+unqlite-libafl-jig | cov(l%,l,b%,b)=23.6,5134,24.2,3259,0 | maxStatsGap=40s | run time: 59m-59s corpus: 1783 objectives: 730 executions: 879664 finds_symsan: 1071 corpus shared_mem: 2643 
+woff2-libafl-havoc | cov(l%,l,b%,b)=21.2,1906,11.1,1162,0 | maxStatsGap=172s | run time: 59m-52s corpus: 263 objectives: 0 executions: 309917 shared_mem: 901 
+woff2-libafl-i2s | cov(l%,l,b%,b)=21.8,1962,11.7,1230,0 | maxStatsGap=170s | run time: 59m-44s corpus: 312 objectives: 0 executions: 320134 finds_symsan: 89 corpus shared_mem: 962 
+woff2-libafl-jig | cov(l%,l,b%,b)=22.7,2037,12.5,1311,0 | maxStatsGap=172s | run time: 59m-50s corpus: 316 objectives: 0 executions: 329128 shared_mem: 998 finds_symsan: 108 corpus 
+== tier1-r4 ==
+bc-libafl-havoc | cov(l%,l,b%,b)=40.9,1915,35.6,910,0 | maxStatsGap=68s | run time: 59m-48s corpus: 918 objectives: 0 executions: 384174 shared_mem: 919 
+bc-libafl-i2s | cov(l%,l,b%,b)=40.3,1884,34.3,879,0 | maxStatsGap=1195s | run time: 59m-59s corpus: 713 objectives: 0 executions: 187043 finds_symsan: 382 corpus shared_mem: 894 
+bc-libafl-jig | cov(l%,l,b%,b)=40.6,1897,34.9,893,0 | maxStatsGap=447s | 
+confetti-libafl-havoc | cov(l%,l,b%,b)=63.3,613,50.9,322,0 | maxStatsGap=16s | run time: 59m-48s corpus: 476 objectives: 0 executions: 9102007 shared_mem: 329 
+confetti-libafl-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=16s | run time: 59m-49s corpus: 416 objectives: 0 executions: 9348102 finds_symsan: 186 corpus shared_mem: 308 
+confetti-libafl-jig | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=16s | run time: 59m-53s corpus: 447 objectives: 0 executions: 9283226 finds_symsan: 208 corpus shared_mem: 308 
+jansson-libafl-havoc | cov(l%,l,b%,b)=45.4,1170,38.5,637,0 | maxStatsGap=16s | run time: 59m-53s corpus: 562 objectives: 0 executions: 4116698 shared_mem: 504 
+jansson-libafl-i2s | cov(l%,l,b%,b)=46.6,1200,39.1,647,0 | maxStatsGap=16s | run time: 59m-56s corpus: 521 objectives: 0 executions: 3899528 shared_mem: 514 finds_symsan: 146 corpus 
+jansson-libafl-jig | cov(l%,l,b%,b)=46.3,1192,38.8,641,0 | maxStatsGap=16s | run time: 59m-53s corpus: 447 objectives: 0 executions: 2057082 shared_mem: 508 finds_symsan: 134 corpus 
+json-c-libafl-havoc | cov(l%,l,b%,b)=40.4,1089,34.0,618,0 | maxStatsGap=16s | run time: 59m-49s corpus: 519 objectives: 0 executions: 9369963 shared_mem: 432 
+json-c-libafl-i2s | cov(l%,l,b%,b)=40.6,1095,34.2,621,0 | maxStatsGap=16s | run time: 59m-55s corpus: 557 objectives: 0 executions: 8886078 shared_mem: 435 finds_symsan: 300 corpus 
+json-c-libafl-jig | cov(l%,l,b%,b)=40.7,1096,34.3,623,0 | maxStatsGap=16s | run time: 59m-50s corpus: 584 objectives: 0 executions: 9200031 shared_mem: 435 finds_symsan: 308 corpus 
+krep-libafl-havoc | cov(l%,l,b%,b)=23.7,417,15.7,217,0 | maxStatsGap=16s | run time: 59m-49s corpus: 59 objectives: 0 executions: 8134211 shared_mem: 149 
+krep-libafl-i2s | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-49s corpus: 57 objectives: 0 executions: 7902131 shared_mem: 148 finds_symsan: 2 corpus 
+krep-libafl-jig | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-49s corpus: 54 objectives: 0 executions: 7476239 finds_symsan: 1 corpus shared_mem: 148 
+libexpat-libafl-havoc | cov(l%,l,b%,b)=33.8,2620,35.7,1933,0 | maxStatsGap=16s | run time: 59m-59s corpus: 3413 objectives: 0 executions: 8314749 shared_mem: 3018 
+libexpat-libafl-i2s | cov(l%,l,b%,b)=35.3,2738,36.7,1986,0 | maxStatsGap=16s | run time: 59m-54s corpus: 3491 objectives: 0 executions: 7931397 shared_mem: 2983 finds_symsan: 1045 corpus 
+libexpat-libafl-jig | cov(l%,l,b%,b)=36.1,2799,37.9,2052,0 | maxStatsGap=16s | run time: 59m-55s corpus: 3719 objectives: 0 executions: 8009299 finds_symsan: 1134 corpus shared_mem: 3146 
+libmatheval-libafl-havoc | cov(l%,l,b%,b)=54.0,730,48.1,286,0 | maxStatsGap=16s | run time: 59m-49s corpus: 274 objectives: 0 executions: 8662165 shared_mem: 219 
+libmatheval-libafl-i2s | cov(l%,l,b%,b)=52.5,710,45.9,273,0 | maxStatsGap=16s | run time: 59m-49s corpus: 345 objectives: 0 executions: 9071458 finds_symsan: 165 corpus shared_mem: 216 
+libmatheval-libafl-jig | cov(l%,l,b%,b)=51.6,697,44.7,266,0 | maxStatsGap=16s | run time: 59m-51s corpus: 354 objectives: 0 executions: 8546539 shared_mem: 214 finds_symsan: 189 corpus 
+libxml2-libafl-havoc | cov(l%,l,b%,b)=9.6,6743,8.6,5374,0 | maxStatsGap=16s | run time: 59m-51s corpus: 3471 objectives: 0 executions: 5763697 shared_mem: 3552 
+libxml2-libafl-i2s | cov(l%,l,b%,b)=11.2,7833,10.3,6423,0 | maxStatsGap=15s | run time: 59m-58s corpus: 4232 objectives: 0 executions: 5568011 shared_mem: 4218 finds_symsan: 1751 corpus 
+libxml2-libafl-jig | cov(l%,l,b%,b)=10.4,7291,9.6,6029,0 | maxStatsGap=15s | run time: 59m-54s corpus: 3968 objectives: 0 executions: 5274273 finds_symsan: 1682 corpus shared_mem: 3991 
+libyaml-libafl-havoc | cov(l%,l,b%,b)=68.3,1789,60.4,2588,0 | maxStatsGap=16s | run time: 59m-49s corpus: 1983 objectives: 0 executions: 9325177 shared_mem: 1379 
+libyaml-libafl-i2s | cov(l%,l,b%,b)=71.6,1876,66.2,2837,0 | maxStatsGap=16s | run time: 59m-58s corpus: 2360 objectives: 0 executions: 9520444 shared_mem: 1506 finds_symsan: 1371 corpus 
+libyaml-libafl-jig | cov(l%,l,b%,b)=72.1,1890,64.9,2784,0 | maxStatsGap=15s | run time: 59m-57s corpus: 2383 objectives: 0 executions: 8633898 finds_symsan: 1385 corpus shared_mem: 1484 
+mujs-libafl-havoc | cov(l%,l,b%,b)=49.5,4586,45.4,2617,0 | maxStatsGap=16s | run time: 59m-59s corpus: 3247 objectives: 0 executions: 4536336 shared_mem: 3273 
+mujs-libafl-i2s | cov(l%,l,b%,b)=50.6,4682,46.4,2680,0 | maxStatsGap=14s | run time: 59m-58s corpus: 3228 objectives: 0 executions: 4968284 shared_mem: 3344 finds_symsan: 2113 corpus 
+mujs-libafl-jig | cov(l%,l,b%,b)=50.8,4703,46.6,2686,0 | maxStatsGap=15s | 
+oggenc-libafl-havoc | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=29s | run time: 59m-52s corpus: 139 objectives: 18 executions: 29282 shared_mem: 1436 
+oggenc-libafl-i2s | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=31s | run time: 59m-57s corpus: 119 objectives: 34 executions: 28562 finds_symsan: 49 corpus shared_mem: 1512 
+oggenc-libafl-jig | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=29s | run time: 59m-50s corpus: 162 objectives: 34 executions: 35854 finds_symsan: 96 corpus shared_mem: 1531 
+quickjs-libafl-havoc | cov(l%,l,b%,b)=30.1,13276,25.5,6353,0 | maxStatsGap=15s | run time: 59m-59s corpus: 3726 objectives: 0 executions: 3916238 shared_mem: 5778 
+quickjs-libafl-i2s | cov(l%,l,b%,b)=28.1,12416,23.1,5774,0 | maxStatsGap=8s | run time: 59m-57s corpus: 2395 objectives: 0 executions: 4019707 shared_mem: 5270 finds_symsan: 2015 corpus 
+quickjs-libafl-jig | cov(l%,l,b%,b)=28.1,12394,23.2,5786,0 | maxStatsGap=8s | 
+sqlite-libafl-havoc | cov(l%,l,b%,b)=27.9,13341,21.4,6831,0 | maxStatsGap=16s | run time: 59m-51s corpus: 2251 objectives: 0 executions: 5851256 shared_mem: 5871 
+sqlite-libafl-i2s | cov(l%,l,b%,b)=29.4,14081,23.3,7429,0 | maxStatsGap=15s | run time: 59m-59s corpus: 2923 objectives: 0 executions: 5103893 finds_symsan: 2413 corpus shared_mem: 6359 
+sqlite-libafl-jig | cov(l%,l,b%,b)=28.9,13841,22.7,7241,0 | maxStatsGap=12s | 
+unqlite-libafl-havoc | cov(l%,l,b%,b)=21.5,4670,21.3,2874,0 | maxStatsGap=18s | run time: 59m-57s corpus: 1359 objectives: 381 executions: 267480 shared_mem: 2380 
+unqlite-libafl-i2s | cov(l%,l,b%,b)=23.4,5091,23.8,3210,0 | maxStatsGap=19s | run time: 59m-59s corpus: 1765 objectives: 697 executions: 1000931 finds_symsan: 1160 corpus shared_mem: 2628 
+unqlite-libafl-jig | cov(l%,l,b%,b)=23.4,5095,23.7,3189,0 | maxStatsGap=51s | run time: 59m-52s corpus: 1589 objectives: 605 executions: 707925 shared_mem: 2621 finds_symsan: 962 corpus 
+woff2-libafl-havoc | cov(l%,l,b%,b)=21.3,1911,11.2,1177,0 | maxStatsGap=17s | run time: 59m-49s corpus: 266 objectives: 0 executions: 365738 shared_mem: 908 
+woff2-libafl-i2s | cov(l%,l,b%,b)=21.9,1970,11.8,1240,0 | maxStatsGap=17s | run time: 59m-58s corpus: 294 objectives: 0 executions: 389452 finds_symsan: 81 corpus shared_mem: 965 
+woff2-libafl-jig | cov(l%,l,b%,b)=21.8,1960,11.7,1225,0 | maxStatsGap=16s | run time: 59m-57s corpus: 316 objectives: 0 executions: 388045 shared_mem: 952 finds_symsan: 114 corpus 
+== tier1-r5 ==
+bc-libafl-havoc | cov(l%,l,b%,b)=40.3,1887,35.0,895,0 | maxStatsGap=61s | run time: 59m-45s corpus: 829 objectives: 0 executions: 236015 shared_mem: 903 
+bc-libafl-i2s | cov(l%,l,b%,b)=40.5,1893,34.9,893,0 | maxStatsGap=627s | 
+bc-libafl-jig | cov(l%,l,b%,b)=40.8,1908,35.1,899,0 | maxStatsGap=520s | run time: 59m-59s corpus: 870 objectives: 0 executions: 269295 shared_mem: 922 finds_symsan: 431 corpus 
+confetti-libafl-havoc | cov(l%,l,b%,b)=62.5,605,48.4,306,0 | maxStatsGap=16s | run time: 59m-49s corpus: 459 objectives: 0 executions: 8689414 shared_mem: 307 
+confetti-libafl-i2s | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=16s | run time: 59m-49s corpus: 426 objectives: 0 executions: 8908164 shared_mem: 308 finds_symsan: 187 corpus 
+confetti-libafl-jig | cov(l%,l,b%,b)=62.6,606,48.6,307,0 | maxStatsGap=16s | run time: 59m-50s corpus: 423 objectives: 0 executions: 8978862 shared_mem: 308 finds_symsan: 194 corpus 
+jansson-libafl-havoc | cov(l%,l,b%,b)=45.4,1169,38.2,632,0 | maxStatsGap=16s | run time: 59m-53s corpus: 562 objectives: 0 executions: 3975681 shared_mem: 501 
+jansson-libafl-i2s | cov(l%,l,b%,b)=44.9,1156,38.1,630,0 | maxStatsGap=16s | run time: 59m-49s corpus: 443 objectives: 0 executions: 2194819 finds_symsan: 133 corpus shared_mem: 501 
+jansson-libafl-jig | cov(l%,l,b%,b)=45.0,1159,37.9,626,0 | maxStatsGap=16s | run time: 59m-48s corpus: 429 objectives: 0 executions: 2252794 shared_mem: 502 finds_symsan: 127 corpus 
+json-c-libafl-havoc | cov(l%,l,b%,b)=40.6,1095,34.1,620,0 | maxStatsGap=16s | run time: 59m-49s corpus: 517 objectives: 0 executions: 9482928 shared_mem: 435 
+json-c-libafl-i2s | cov(l%,l,b%,b)=40.4,1089,34.0,619,0 | maxStatsGap=16s | run time: 59m-52s corpus: 590 objectives: 0 executions: 9297351 shared_mem: 433 finds_symsan: 316 corpus 
+json-c-libafl-jig | cov(l%,l,b%,b)=40.6,1095,34.2,621,0 | maxStatsGap=16s | run time: 59m-52s corpus: 567 objectives: 0 executions: 10003212 finds_symsan: 310 corpus shared_mem: 435 
+krep-libafl-havoc | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-49s corpus: 58 objectives: 0 executions: 8328752 shared_mem: 148 
+krep-libafl-i2s | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-49s corpus: 55 objectives: 0 executions: 7390483 finds_symsan: 1 corpus shared_mem: 148 
+krep-libafl-jig | cov(l%,l,b%,b)=23.7,417,15.6,216,0 | maxStatsGap=16s | run time: 59m-50s corpus: 55 objectives: 0 executions: 8261992 shared_mem: 148 finds_symsan: 1 corpus 
+libexpat-libafl-havoc | cov(l%,l,b%,b)=34.5,2676,36.1,1956,0 | maxStatsGap=16s | run time: 59m-50s corpus: 3483 objectives: 0 executions: 9051885 shared_mem: 2995 
+libexpat-libafl-i2s | cov(l%,l,b%,b)=35.4,2741,36.5,1978,0 | maxStatsGap=16s | run time: 59m-51s corpus: 3553 objectives: 0 executions: 7858990 shared_mem: 2979 finds_symsan: 1031 corpus 
+libexpat-libafl-jig | cov(l%,l,b%,b)=35.1,2722,37.3,2019,0 | maxStatsGap=16s | run time: 59m-56s corpus: 3954 objectives: 0 executions: 8454380 finds_symsan: 1249 corpus shared_mem: 3300 
+libmatheval-libafl-havoc | cov(l%,l,b%,b)=51.3,693,44.4,264,0 | maxStatsGap=16s | run time: 59m-49s corpus: 267 objectives: 0 executions: 8374278 shared_mem: 212 
+libmatheval-libafl-i2s | cov(l%,l,b%,b)=51.6,697,44.7,266,0 | maxStatsGap=16s | run time: 59m-51s corpus: 315 objectives: 0 executions: 8212671 shared_mem: 214 finds_symsan: 157 corpus 
+libmatheval-libafl-jig | cov(l%,l,b%,b)=51.6,697,44.7,266,0 | maxStatsGap=16s | run time: 59m-49s corpus: 319 objectives: 0 executions: 8752215 shared_mem: 214 finds_symsan: 149 corpus 
+libxml2-libafl-havoc | cov(l%,l,b%,b)=9.8,6856,8.7,5427,0 | maxStatsGap=16s | run time: 59m-53s corpus: 3559 objectives: 0 executions: 5897789 shared_mem: 3600 
+libxml2-libafl-i2s | cov(l%,l,b%,b)=11.4,7946,10.4,6520,0 | maxStatsGap=14s | run time: 59m-59s corpus: 4169 objectives: 0 executions: 5445664 finds_symsan: 1801 corpus shared_mem: 4277 
+libxml2-libafl-jig | cov(l%,l,b%,b)=11.4,7973,10.4,6518,0 | maxStatsGap=15s | run time: 59m-59s corpus: 4115 objectives: 0 executions: 5562948 shared_mem: 4289 finds_symsan: 1769 corpus 
+libyaml-libafl-havoc | cov(l%,l,b%,b)=68.2,1788,60.2,2582,0 | maxStatsGap=16s | run time: 59m-48s corpus: 2038 objectives: 0 executions: 9678186 shared_mem: 1373 
+libyaml-libafl-i2s | cov(l%,l,b%,b)=73.2,1918,66.9,2869,0 | maxStatsGap=15s | run time: 59m-55s corpus: 2483 objectives: 0 executions: 8783179 finds_symsan: 1443 corpus shared_mem: 1514 
+libyaml-libafl-jig | cov(l%,l,b%,b)=72.1,1890,66.3,2842,0 | maxStatsGap=16s | run time: 59m-49s corpus: 2494 objectives: 0 executions: 10371917 finds_symsan: 1456 corpus shared_mem: 1511 
+mujs-libafl-havoc | cov(l%,l,b%,b)=48.7,4508,44.8,2583,0 | maxStatsGap=16s | run time: 59m-52s corpus: 3230 objectives: 0 executions: 4670315 shared_mem: 3205 
+mujs-libafl-i2s | cov(l%,l,b%,b)=50.2,4645,47.0,2712,0 | maxStatsGap=15s | run time: 59m-55s corpus: 3391 objectives: 0 executions: 4893255 finds_symsan: 2172 corpus shared_mem: 3353 
+mujs-libafl-jig | cov(l%,l,b%,b)=50.9,4709,47.6,2745,0 | maxStatsGap=15s | 
+oggenc-libafl-havoc | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=44s | run time: 59m-37s corpus: 102 objectives: 17 executions: 27423 shared_mem: 1377 
+oggenc-libafl-i2s | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=30s | run time: 59m-46s corpus: 134 objectives: 34 executions: 29756 shared_mem: 1530 finds_symsan: 59 corpus 
+oggenc-libafl-jig | cov(l%,l,b%,b)=,,,,0 | maxStatsGap=31s | run time: 59m-58s corpus: 143 objectives: 35 executions: 32011 finds_symsan: 87 corpus shared_mem: 1507 
+quickjs-libafl-havoc | cov(l%,l,b%,b)=30.4,13428,25.7,6402,0 | maxStatsGap=16s | run time: 59m-57s corpus: 3991 objectives: 0 executions: 4051619 shared_mem: 5888 
+quickjs-libafl-i2s | cov(l%,l,b%,b)=28.0,12368,23.2,5779,0 | maxStatsGap=8s | 
+quickjs-libafl-jig | cov(l%,l,b%,b)=27.7,12246,22.9,5705,0 | maxStatsGap=7s | 
+sqlite-libafl-havoc | cov(l%,l,b%,b)=28.1,13461,21.7,6913,0 | maxStatsGap=16s | run time: 59m-55s corpus: 2387 objectives: 0 executions: 6039518 shared_mem: 5975 
+sqlite-libafl-i2s | cov(l%,l,b%,b)=30.3,14523,24.1,7688,0 | maxStatsGap=11s | run time: 59m-57s corpus: 2597 objectives: 0 executions: 5066716 shared_mem: 6625 finds_symsan: 2268 corpus 
+sqlite-libafl-jig | cov(l%,l,b%,b)=30.5,14603,24.0,7654,0 | maxStatsGap=12s | run time: 59m-56s corpus: 2708 objectives: 0 executions: 5192252 shared_mem: 6595 finds_symsan: 2332 corpus 
+unqlite-libafl-havoc | cov(l%,l,b%,b)=20.9,4543,21.0,2826,0 | maxStatsGap=18s | run time: 59m-59s corpus: 1320 objectives: 409 executions: 241577 shared_mem: 2330 
+unqlite-libafl-i2s | cov(l%,l,b%,b)=23.5,5116,23.9,3217,0 | maxStatsGap=47s | run time: 59m-56s corpus: 1514 objectives: 550 executions: 625276 shared_mem: 2594 finds_symsan: 939 corpus 
+unqlite-libafl-jig | cov(l%,l,b%,b)=23.8,5178,24.4,3286,0 | maxStatsGap=90s | run time: 59m-55s corpus: 1560 objectives: 583 executions: 696859 finds_symsan: 958 corpus shared_mem: 2658 
+woff2-libafl-havoc | cov(l%,l,b%,b)=21.1,1895,11.0,1158,0 | maxStatsGap=16s | run time: 59m-53s corpus: 271 objectives: 0 executions: 371076 shared_mem: 896 
+woff2-libafl-i2s | cov(l%,l,b%,b)=21.8,1960,11.7,1229,0 | maxStatsGap=16s | run time: 59m-45s corpus: 283 objectives: 0 executions: 382788 shared_mem: 955 finds_symsan: 84 corpus 
+woff2-libafl-jig | cov(l%,l,b%,b)=21.8,1958,11.7,1227,0 | maxStatsGap=16s | run time: 59m-55s corpus: 323 objectives: 0 executions: 370586 finds_symsan: 108 corpus shared_mem: 954 

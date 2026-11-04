@@ -44,7 +44,7 @@ fn build_target(out_dir: &Path) -> PathBuf {
     let ko_clang = Path::new(symsan::BUILD_DIR).join("bin/ko-clang");
     assert!(
         ko_clang.is_file(),
-        "{} is missing; run `cd b4 && make -j && make install` first",
+        "{} is missing; run `cd build && make -j && make install` first",
         ko_clang.display()
     );
 

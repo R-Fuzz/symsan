@@ -3,7 +3,7 @@
 ## This does not try to teach cmake about the Rust dependency graph -- it just
 ## shells out to cargo, which already tracks it. The one thing cmake has to
 ## supply is SYMSAN_BUILD_DIR, so build.rs links against *this* build rather
-## than whichever of b2/b3/b4 it would otherwise find first.
+## than whichever in-tree install build.rs would otherwise find.
 
 find_program(CARGO_EXECUTABLE cargo)
 if (NOT CARGO_EXECUTABLE)

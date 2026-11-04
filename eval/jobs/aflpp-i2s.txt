@@ -1,0 +1,15 @@
+libyaml aflpp-i2s
+libmatheval aflpp-i2s
+bc aflpp-i2s
+confetti aflpp-i2s
+krep aflpp-i2s
+woff2 aflpp-i2s
+oggenc aflpp-i2s
+libxml2 aflpp-i2s
+libexpat aflpp-i2s
+sqlite aflpp-i2s
+unqlite aflpp-i2s
+mujs aflpp-i2s
+quickjs aflpp-i2s
+json-c aflpp-i2s
+jansson aflpp-i2s

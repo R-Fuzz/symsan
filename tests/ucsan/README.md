@@ -6,7 +6,7 @@ while the UCSan suite explores paths -- it drives the engine round a scheduler
 with a termination policy and a seed corpus, and judges the set of paths and
 reports that come out.  It has its own Python harness (`test.py`), which
 depends on `fuzzer/thoroupy` (`UcsanManager`) and a build installed under
-`b4/` (see the top-level `CLAUDE.md`).
+`build/` (or wherever `SYMSAN_BUILD_DIR` names).
 
 `lit.local.cfg` empties `config.suffixes` for this directory, so `lit tests`
 walks past it rather than trying to run its contents as lit tests.

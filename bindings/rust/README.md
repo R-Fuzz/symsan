@@ -15,15 +15,16 @@ LibAFL, that is the crate you want.
 ## Quick start
 
 ```bash
-# 1. build SymSan itself (this is what produces libsymsan_c.so)
-cd <symsan>/b4 && make -j && make install
+# 1. build SymSan itself (this is what produces libsymsan_c.so); <prefix> is
+#    the CMAKE_INSTALL_PREFIX you configured it with
+cd <build> && make -j && make install
 
-# 2. build the Rust side
-cd <symsan>/bindings/rust && cargo build --release
+# 2. build the Rust side against that install
+cd <symsan>/bindings/rust && SYMSAN_BUILD_DIR=<prefix> cargo build --release
 
 # 3. instrument your target -- twice, see below
 afl-clang-fast -o target.afl target.c
-KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -o target.symsan target.c
+KO_CC=clang-18 KO_USE_FASTGEN=1 <prefix>/bin/ko-clang -o target.symsan target.c
 
 # 4. fuzz
 ./target/release/symsan-fuzz \
@@ -171,7 +172,7 @@ same pass writes the `.bmap` — which edge each side of each branch reaches —
 which is the part `--branch-map` reads.
 
 ```bash
-L=<symsan>/b4/lib/symsan
+L=<prefix>/lib/symsan
 
 # one link: the coverage binary *and* target.afl.0.5.precodegen.bc
 AFL_LLVM_LTO_STARTID=4096 <aflpp>/afl-clang-lto \
@@ -183,7 +184,7 @@ opt-18 -load-pass-plugin=$L/TaintPass.so -passes=taint \
     -taint-with-afl=1 -taint-branch-map=$PWD/target.bmap \
     target.afl.0.5.precodegen.bc -o target.taint.bc
 llc-18 -relocation-model=pic -filetype=obj target.taint.bc -o target.taint.o
-KO_CC=clang-18 KO_USE_FASTGEN=1 <symsan>/b4/bin/ko-clang -o target.symsan target.taint.o
+KO_CC=clang-18 KO_USE_FASTGEN=1 <prefix>/bin/ko-clang -o target.symsan target.taint.o
 
 ./target/release/symsan-fuzz -i ./seeds -o ./out \
     --symsan ./target.symsan --branch-map ./target.bmap -- ./target.afl @@
@@ -261,13 +262,13 @@ agreement structural rather than something to be measured — which is exactly
 what makes a disagreement here worth chasing: it is a bug in the map, not a
 build that drifted.
 
-**2. Check one input against `afl-showmap`.** `b4/bin/covcheck` traces an input
+**2. Check one input against `afl-showmap`.** `<prefix>/bin/covcheck` traces an input
 through the SymSan build and checks every branch direction it took against the
 edges the fuzzer's build recorded for the same bytes:
 
 ```bash
 <aflpp>/afl-showmap -o showmap.out -- ./target.afl input
-<symsan>/b4/bin/covcheck -m target.bmap -c showmap.out -i input -- ./target.symsan @@
+<prefix>/bin/covcheck -m target.bmap -c showmap.out -i input -- ./target.symsan @@
 ```
 
 It exits non-zero on a contradiction. `tests/fuzzing/branch_map_join.c` in the
@@ -526,12 +527,15 @@ cargo clippy --workspace --all-targets
 cargo doc --open -p symsan        # the safe API, with the FFI reasoning
 ```
 
-`build.rs` finds SymSan by trying `b4`, `b3`, `b2`, `build` under the repository
-root. Point `SYMSAN_BUILD_DIR` at an install prefix to override; it panics if
-set but wrong, rather than silently linking a different build than you meant.
+`build.rs` links against the install prefix in `SYMSAN_BUILD_DIR`. If that is
+unset it uses `<symsan>/build`, else any directory directly under the
+repository root holding `lib/symsan/libsymsan_c.so` -- the most recently
+installed one if there are several, with a cargo warning naming the others.
+Set it whenever your install lives outside the repository, or to pick among
+several. It panics if set but wrong, rather than silently linking a different
+build than you meant.
 
-The LibAFL checkout is a path dependency on `../../../libafl`, i.e. a sibling of
-the symsan repo. Change it in the workspace `Cargo.toml` if yours is elsewhere.
+LibAFL comes from git, at the rev pinned in the workspace `Cargo.toml`.
 
 ### A note on the tests
 

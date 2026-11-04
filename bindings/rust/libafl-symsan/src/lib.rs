@@ -1460,8 +1460,17 @@ where
         // Logged unconditionally, including the zero: a stage that traces every
         // entry and solves nothing looks exactly like a stage that never ran,
         // and the two have completely different causes.
-        log::debug!("symsan: corpus entry {corpus_id} produced {tasks} tasks");
-        if tasks != 0 {
+        let rq = self.session.rq_pending();
+        log::debug!(
+            "symsan: corpus entry {corpus_id} produced {tasks} tasks, {rq} apply-at-site inputs"
+        );
+        // Not `tasks != 0` alone: with tokens on, the apply-at-site buffers
+        // come out of next_solution() after the ladder, and a trace that
+        // queued no task (every branch already seen) can still have built
+        // some.  The next trace() replaces them, so they are drained here or
+        // never.  Neither has a current_target(), so the loop records no flip
+        // for them and report_target() is a no-op.
+        if tasks != 0 || rq != 0 {
 
             let mut produced = 0usize;
             while let Some(solution) = self.session.next_solution() {

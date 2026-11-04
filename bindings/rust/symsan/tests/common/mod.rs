@@ -135,7 +135,7 @@ pub fn build(afl_clang_lto: &Path, out_dir: &Path, source: &Path, stem: &str, cf
     let pass = lib.join("TaintPass.so");
     assert!(
         pass.is_file(),
-        "{} is missing; run `cd b4 && make -j && make install` first",
+        "{} is missing; run `cd build && make -j && make install` first",
         pass.display()
     );
     run(
@@ -170,7 +170,7 @@ pub fn build(afl_clang_lto: &Path, out_dir: &Path, source: &Path, stem: &str, cf
     let ko_clang = Path::new(symsan::BUILD_DIR).join("bin/ko-clang");
     assert!(
         ko_clang.is_file(),
-        "{} is missing; run `cd b4 && make -j && make install` first",
+        "{} is missing; run `cd build && make -j && make install` first",
         ko_clang.display()
     );
     run(
@@ -197,7 +197,7 @@ pub fn build_symsan(out_dir: &Path, source: &Path, stem: &str, cflags: &[&str]) 
     let ko_clang = Path::new(symsan::BUILD_DIR).join("bin/ko-clang");
     assert!(
         ko_clang.is_file(),
-        "{} is missing; run `cd b4 && make -j && make install` first",
+        "{} is missing; run `cd build && make -j && make install` first",
         ko_clang.display()
     );
     run(

@@ -1,0 +1,15 @@
+libyaml afl-cmplog
+libmatheval afl-cmplog
+bc afl-cmplog
+confetti afl-cmplog
+krep afl-cmplog
+woff2 afl-cmplog
+oggenc afl-cmplog
+libxml2 afl-cmplog
+libexpat afl-cmplog
+sqlite afl-cmplog
+unqlite afl-cmplog
+mujs afl-cmplog
+quickjs afl-cmplog
+json-c afl-cmplog
+jansson afl-cmplog
