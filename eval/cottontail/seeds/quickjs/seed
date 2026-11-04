@@ -1,0 +1,4 @@
+var a = [1, 2, 3];
+function f(x) { return x * 2; }
+var o = {k: "v", n: a.map(f)};
+console.log(JSON.stringify(o));

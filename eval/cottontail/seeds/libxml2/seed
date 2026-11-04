@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE note [<!ENTITY e "x">]>
+<note id="1" xmlns:a="urn:a"><to>Tove</to><a:from>Jani &e;</a:from><![CDATA[x<y]]><!-- c --><?pi data?></note>

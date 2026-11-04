@@ -1,0 +1,15 @@
+libyaml afl-rq-only
+libmatheval afl-rq-only
+bc afl-rq-only
+confetti afl-rq-only
+krep afl-rq-only
+woff2 afl-rq-only
+oggenc afl-rq-only
+libxml2 afl-rq-only
+libexpat afl-rq-only
+sqlite afl-rq-only
+unqlite afl-rq-only
+mujs afl-rq-only
+quickjs afl-rq-only
+json-c afl-rq-only
+jansson afl-rq-only

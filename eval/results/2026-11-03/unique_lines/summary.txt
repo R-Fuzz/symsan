@@ -1,0 +1,45 @@
+=== UNIQUE gcov lines (median trial, lcov) ===
+subject           i2s       cm      cmo       rq  lafl-i2 | U    i2s U     cm U    cmo U     rq Ulafl-i2  shared_all
+confetti          606      614      600      519      606 |        0        8        0        0        0  519
+    i2s vs cm: only_i2s=0 only_cm=8 both=606
+    i2s vs cmo: only_i2s=6 only_cmo=0 both=600
+    cmo vs rq: only_cmo=81 only_rq=0 both=519
+    i2s vs lafl-i2: only_i2s=0 only_lafl-i2=0 both=606
+    cm vs lafl-i2: only_cm=8 only_lafl-i2=0 both=606
+jansson          1215     1206     1073      980     1206 |        0        5        0        0        0  976
+    i2s vs cm: only_i2s=14 only_cm=5 both=1201
+    i2s vs cmo: only_i2s=142 only_cmo=0 both=1073
+    cmo vs rq: only_cmo=97 only_rq=4 both=976
+    i2s vs lafl-i2: only_i2s=9 only_lafl-i2=0 both=1206
+    cm vs lafl-i2: only_cm=14 only_lafl-i2=14 both=1192
+json-c           1102     1109     1018      866     1093 |        0        7        0        0        0  866
+    i2s vs cm: only_i2s=0 only_cm=7 both=1102
+    i2s vs cmo: only_i2s=84 only_cmo=0 both=1018
+    cmo vs rq: only_cmo=152 only_rq=0 both=866
+    i2s vs lafl-i2: only_i2s=9 only_lafl-i2=0 both=1093
+    cm vs lafl-i2: only_cm=16 only_lafl-i2=0 both=1093
+krep              417      417      398      407      417 |        0        0        0        0        0  398
+    i2s vs cm: only_i2s=0 only_cm=0 both=417
+    i2s vs cmo: only_i2s=19 only_cmo=0 both=398
+    cmo vs rq: only_cmo=0 only_rq=9 both=398
+    i2s vs lafl-i2: only_i2s=0 only_lafl-i2=0 both=417
+    cm vs lafl-i2: only_cm=0 only_lafl-i2=0 both=417
+libmatheval       881      883      668      504      697 |        0        2        0        0        0  504
+    i2s vs cm: only_i2s=0 only_cm=2 both=881
+    i2s vs cmo: only_i2s=213 only_cmo=0 both=668
+    cmo vs rq: only_cmo=164 only_rq=0 both=504
+    i2s vs lafl-i2: only_i2s=184 only_lafl-i2=0 both=697
+    cm vs lafl-i2: only_cm=186 only_lafl-i2=0 both=697
+oggenc            342      342      332      316      350 |        0        0        0        0       15  313
+    i2s vs cm: only_i2s=0 only_cm=0 both=342
+    i2s vs cmo: only_i2s=10 only_cmo=0 both=332
+    cmo vs rq: only_cmo=19 only_rq=3 both=313
+    i2s vs lafl-i2: only_i2s=7 only_lafl-i2=15 both=335
+    cm vs lafl-i2: only_cm=7 only_lafl-i2=15 both=335
+
+=== SUM exclusive lines over 6 subjects (vs all others present) ===
+  i2s       covered_sum=  4563  exclusive_sum=     0
+  cm        covered_sum=  4571  exclusive_sum=    22
+  cmo       covered_sum=  4089  exclusive_sum=     0
+  rq        covered_sum=  3592  exclusive_sum=     0
+  lafl-i2   covered_sum=  4369  exclusive_sum=    15

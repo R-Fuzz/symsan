@@ -1,0 +1,15 @@
+libyaml cmo-i2s
+libmatheval cmo-i2s
+bc cmo-i2s
+confetti cmo-i2s
+krep cmo-i2s
+woff2 cmo-i2s
+oggenc cmo-i2s
+libxml2 cmo-i2s
+libexpat cmo-i2s
+sqlite cmo-i2s
+unqlite cmo-i2s
+mujs cmo-i2s
+quickjs cmo-i2s
+json-c cmo-i2s
+jansson cmo-i2s
