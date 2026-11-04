@@ -438,6 +438,15 @@ public:
   /// Length of the solver ladder; trace() times this is the largest number of
   /// next_solution() calls that can return a buffer.
   size_t num_solvers() const { return solvers_.size(); }
+  /// RedQueen-style apply-at-site mutations still waiting after the last trace.
+  /// Included in the front-end's fuzz_count so they are actually requested.
+  size_t num_rq_pending() const {
+    return rq_idx_ < rq_bufs_.size() ? rq_bufs_.size() - rq_idx_ : 0;
+  }
+  /// Compare-site smashes this trace recorded (input slice vs constant run).
+  const std::vector<symsan::TokenCollector::Smash> &smashes() const {
+    return tokens_.smashes();
+  }
   /// Name of the solver at ladder position @p index, or nullptr past the end.
   /// The per-position counters in ConcolicStats are unreadable without this:
   /// position 0 is i2s in a default run and jigsaw in one started with
@@ -518,6 +527,13 @@ private:
                                           uint32_t id, bool neg_direction,
                                           uint32_t context);
 
+  /// Build apply-at-site buffers from this trace's smashes: write the constant
+  /// run onto the compared bytes, and search-replace other copies of the
+  /// input-side run.  Same shape as AFL++ its_fuzz overwrite, not a lengthen.
+  void build_rq_mutations();
+  /// Next unused apply-at-site buffer, or null once they are drained.
+  const uint8_t *next_rq(size_t *size);
+
   /// The next queued task whose target is still worth solving, or null.
   ///
   /// Re-asks the coverage manager about each task before returning it, which
@@ -588,6 +604,9 @@ private:
 
   /// dictionary tokens, only touched when config_.collect_tokens is set
   symsan::TokenCollector tokens_;
+  /// apply-at-site mutations for the current trace, built by build_rq_mutations()
+  std::vector<std::vector<uint8_t>> rq_bufs_;
+  size_t rq_idx_ = 0;
 
   ConcolicStats stats_;
   std::map<uint64_t, uint64_t> task_size_dist_;

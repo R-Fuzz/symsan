@@ -485,6 +485,7 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   // still be queued.  Overwriting would silently re-point their Reads at
   // another seed's bytes.
   input_ = std::make_shared<std::vector<uint8_t>>(buf, buf + buf_size);
+  if (config_.collect_tokens) tokens_.set_input(input_->data(), input_->size());
 
   // clear all caches
   std::vector<symsan::input_t> inputs;
@@ -520,6 +521,7 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   // token one trace late, and never hand it the last trace's at all.  Before
   // the error return for the same reason.
   tokens_.end_input();
+  if (config_.collect_tokens) build_rq_mutations();
   if (ret == symsan::TRACE_LAUNCH_ERROR) {
     return -1;
   }
@@ -538,6 +540,42 @@ int ConcolicSession::trace(const uint8_t *buf, size_t buf_size) {
   }
 
   return (int)(queued_ - queued_before);
+}
+
+void ConcolicSession::build_rq_mutations() {
+  rq_bufs_.clear();
+  rq_idx_ = 0;
+  if (!input_ || input_->empty()) return;
+
+  static constexpr size_t kMaxRq = 64;
+  const auto &smashes = tokens_.smashes();
+  for (const auto &s : smashes) {
+    if (rq_bufs_.size() >= kMaxRq) break;
+    if (s.repl.empty() || s.found == s.repl) continue;
+    if ((size_t)s.offset + s.repl.size() > input_->size()) continue;
+
+    std::vector<uint8_t> smash = *input_;
+    memcpy(smash.data() + s.offset, s.repl.data(), s.repl.size());
+    rq_bufs_.push_back(std::move(smash));
+
+    if (s.found.size() < 2) continue;
+    for (size_t i = 0; i + s.found.size() <= input_->size(); ++i) {
+      if (rq_bufs_.size() >= kMaxRq) break;
+      if (i == s.offset) continue;
+      if (memcmp(input_->data() + i, s.found.data(), s.found.size()) != 0) {
+        continue;
+      }
+      std::vector<uint8_t> other = *input_;
+      memcpy(other.data() + i, s.repl.data(), s.repl.size());
+      rq_bufs_.push_back(std::move(other));
+    }
+  }
+}
+
+const uint8_t *ConcolicSession::next_rq(size_t *size) {
+  if (rq_idx_ >= rq_bufs_.size()) return nullptr;
+  *size = rq_bufs_[rq_idx_].size();
+  return rq_bufs_[rq_idx_++].data();
 }
 
 const uint8_t *ConcolicSession::next_solution(size_t *size) {
@@ -562,7 +600,7 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
     while (task_mgr_->get_next_task() != nullptr) {}
     cur_task_ = nullptr;
     mutation_state_ = MUTATION_INVALID;
-    return nullptr;
+    return next_rq(size);
   }
 
   // NOTE: driver/aflpp/symsan.cpp made exactly one (task, solver) attempt per
@@ -601,7 +639,7 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
       cur_task_ = next_pending_task();
       if (!cur_task_) {
         mutation_state_ = MUTATION_INVALID;
-        return nullptr;
+        return next_rq(size);
       }
       // reset the state.  The solver index is not reset: it lives on the task
       // now, and a task coming back out of the queue is resuming its ladder.
@@ -637,7 +675,7 @@ const uint8_t *ConcolicSession::next_solution(size_t *size) {
         cur_task_ = next_pending_task();
         if (!cur_task_) {
           mutation_state_ = MUTATION_INVALID;
-          return nullptr;
+          return next_rq(size);
         }
       }
     }
