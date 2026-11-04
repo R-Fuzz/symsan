@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-build_folder = "/home/csong/fuzzing/symsan/b4"
 import subprocess
 import os
 import sys
@@ -8,9 +7,17 @@ import argparse
 import shutil
 import logging
 
+# The SymSan install to test: -p/--build-dir, else SYMSAN_BUILD_DIR, else the
+# repository's build/.  (Everything derived from it is re-derived by
+# set_build_folder() once the command line is parsed.)
+build_folder = os.environ.get(
+    "SYMSAN_BUILD_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "build"))
+build_folder = os.path.abspath(build_folder)
+
 # Test sources (test/, metadata/) are read from here regardless of cwd; build
 # outputs go under the build tree instead (see OUT_DIR), mirroring how lit
-# keeps tests/symsan's outputs under b4/tests/symsan rather than the source dir.
+# keeps tests/symsan's outputs under build/tests/symsan rather than the source dir.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 common_env = {
@@ -64,8 +71,16 @@ test_cflags = {}
 
 sys.path.append(os.path.join(SCRIPT_DIR, "..", "..", "fuzzer", "thoroupy"))
 
-from manager import UcsanManager
-from utils.process import populate_gdb
+# thoroupy imports the `symsan` extension module, which lives in the install
+# under test, so these are imported only once the build folder is known.
+UcsanManager = None
+populate_gdb = None
+
+def import_thoroupy():
+    global UcsanManager, populate_gdb
+    sys.path.insert(0, os.path.join(build_folder, "lib", "symsan"))
+    from manager import UcsanManager
+    from utils.process import populate_gdb
 
 adapter = None
 
@@ -112,12 +127,17 @@ for file in glob.glob(os.path.join(SCRIPT_DIR, "test", "*.c")):
 for file in glob.glob(os.path.join(SCRIPT_DIR, "test", "*.cpp")):
     parse_test(file, os.path.basename(file)[:-4] + "_cpp")
 
-ko_clang = f"{build_folder}/bin/ko-clang"
-ko_clangxx = f"{build_folder}/bin/ko-clang++"
-# Build outputs (ll/, binary/, and whatever the manager drops relative to cwd
-# e.g. solving-error/, blocking/) live under the build tree, keyed off the
-# same build_folder ko-clang/ko-clang++ already resolve against.
-OUT_DIR = os.path.join(build_folder, "tests", "ucsan")
+def set_build_folder(path):
+    global build_folder, ko_clang, ko_clangxx, OUT_DIR
+    build_folder = os.path.abspath(path)
+    ko_clang = f"{build_folder}/bin/ko-clang"
+    ko_clangxx = f"{build_folder}/bin/ko-clang++"
+    # Build outputs (ll/, binary/, and whatever the manager drops relative to cwd
+    # e.g. solving-error/, blocking/) live under the build tree, keyed off the
+    # same build_folder ko-clang/ko-clang++ already resolve against.
+    OUT_DIR = os.path.join(build_folder, "tests", "ucsan")
+
+set_build_folder(build_folder)
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -126,10 +146,10 @@ YELLOW = "\033[33m"
 RESET = "\033[0;0m"
 colored = lambda color, text: f"{color}{text}{RESET}"
 
-def run(cmd, cwd=build_folder, env=common_env):
+def run(cmd, cwd=None, env=common_env):
     if isinstance(cmd, str):
         cmd = cmd.split(" ")
-    return subprocess.run(cmd, check=True, cwd=cwd, env=env)
+    return subprocess.run(cmd, check=True, cwd=cwd or build_folder, env=env)
 
 class Proxy():
     def __init__(self, value = "", color = ""):
@@ -295,7 +315,9 @@ def perform_test(stage, *args, seed=None):
 if __name__ == "__main__":
     target = None
     args = argparse.ArgumentParser()
-    args.add_argument("-p", help="The build folder", default=build_folder)
+    args.add_argument("-p", "--build-dir", dest="p", metavar="DIR", default=build_folder,
+                      help="The build folder: the SymSan install prefix (default: "
+                           "$SYMSAN_BUILD_DIR, else <repo>/build; now %(default)s)")
     args.add_argument("-q", help="Quiet mode", action="store_true")
     args.add_argument("-v", '--verbose', help="Verbose", action="count", default=0)
     args.add_argument("-s", help="Stop immediately on error", action="store_true")
@@ -330,7 +352,7 @@ if __name__ == "__main__":
 
     args = args.parse_args()
 
-    build_folder = args.p if args.p else build_folder
+    set_build_folder(args.p if args.p else build_folder)
 
     levels = [logging.WARNING, logging.INFO, logging.DEBUG]
     level = levels[min(args.verbose, len(levels) - 1)]
@@ -365,6 +387,7 @@ if __name__ == "__main__":
         print(f"{colored(RED, 'ERROR')}: ko-clang not found at {ko_clang}")
         print(f"Please build symsan first or specify correct build folder with -p")
         sys.exit(1)
+    import_thoroupy()
 
     # Everything the manager itself drops relative to cwd (solving-error/,
     # blocking/, etc.) lands under OUT_DIR too, not the source tree.

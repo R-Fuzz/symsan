@@ -479,6 +479,15 @@ TransformFunctionAttributes(const TransformedFunction& TransformedFunction,
                             ArrayRef(ArgumentAttributes));
 }
 
+/// A read-only integer array that loads at a symbolic index should become
+/// tlookup.  ByteOffset is where the array starts inside its owning global
+/// (0 for a bare global array; offsetof(field) for a struct field).
+struct ReadOnlyTableDesc {
+  uint64_t ByteOffset;
+  uint64_t NumElements;
+  uint64_t ElemSize;
+};
+
 class Taint {
   friend struct TaintFunction;
   friend class TaintVisitor;
@@ -603,12 +612,15 @@ class Taint {
   FunctionCallee TaintMinimizeLabelFn;
   FunctionCallee TaintAssumeFn;
   SmallPtrSet<Value *, 16> TaintRuntimeFunctions;
-  /// Read-only global arrays eligible to be treated as lookup tables, mapped to
-  /// {num_elements, element_size}.  Computed once, before anything is
-  /// instrumented, because the instrumentation itself passes globals to runtime
-  /// calls (see getShadowForGlobal) and GlobalStatus then reports them as
-  /// unanalyzable.  Populated by findReadOnlyTables().
-  DenseMap<const GlobalVariable *, std::pair<uint64_t, uint64_t>> ReadOnlyTables;
+  /// Read-only global arrays eligible to be treated as lookup tables.  Computed
+  /// once, before anything is instrumented, because the instrumentation itself
+  /// passes globals to runtime calls (see getShadowForGlobal) and GlobalStatus
+  /// then reports them as unanalyzable.  Populated by findReadOnlyTables().
+  ///
+  /// Read-only integer arrays (bare globals or fields of const global structs)
+  /// eligible for tlookup; each GV maps to one ReadOnlyTableDesc per table.
+  DenseMap<const GlobalVariable *, SmallVector<ReadOnlyTableDesc, 2>>
+      ReadOnlyTables;
   Constant *CallStack;
   MDNode *ColdCallWeights;
   TaintABIList ABIList;
@@ -5173,9 +5185,9 @@ void TaintVisitor::visitLandingPadInst(LandingPadInst &LPI) {
   TF.setShadow(&LPI, TF.TT.getZeroShadow(&LPI));
 }
 
-// Is GV a lookup table we can safely treat as a constant array?
+// Is GV never written (in this module, and no other TU can write it)?
 //
-// Note we deliberately do NOT use GV->isConstant(): tables are routinely
+// Note we deliberately do NOT use GV->isConstant() alone: tables are routinely
 // declared plain `static` rather than `const` (e.g. `static uint8_t hex[16]`),
 // and at -O0 GlobalOpt never runs to infer constancy, so isConstant() would
 // silently miss the common case.  GlobalStatus is the analysis GlobalOpt itself
@@ -5184,40 +5196,109 @@ void TaintVisitor::visitLandingPadInst(LandingPadInst &LPI) {
 // NotStored only tells us the global is never written *in this module*, so it
 // is sufficient only when no other module can reach it -- hence the linkage
 // check.  An external non-const global could be written from another TU.
-static bool isReadOnlyLookupTable(const GlobalVariable *GV, const DataLayout &DL,
-                                  uint64_t &NumElements, uint64_t &ElemSize) {
+//
+// Prefer GV->isConstant() when set: that is an IR invariant (stores are UB),
+// and it survives address-escapes that make GlobalStatus bail out.  Expat's
+// `static const struct normal_encoding latin1_encoding` is memcpy'd into
+// unknown-encoding buffers; analyzeGlobal then returns "unanalyzable" and we
+// would skip the type[256] table even though the GV itself is never stored.
+//
+// Plain `static` (non-const) tables still need GlobalStatus -- at -O0
+// GlobalOpt has not inferred constancy.  NotStored only covers this module, so
+// require local linkage for the non-const path (an external non-const GV could
+// be written from another TU).
+static bool isNeverStoredGlobal(const GlobalVariable *GV) {
   if (!GV->hasInitializer() || GV->isDeclaration())
     return false;
+  if (GV->isConstant())
+    return true;
   // A non-const global with external linkage could be written from another
   // translation unit, so "no stores in this module" would not be sound.
-  if (!GV->hasLocalLinkage() && !GV->isConstant())
+  if (!GV->hasLocalLinkage())
     return false;
 
   GlobalStatus GS;
   if (GlobalStatus::analyzeGlobal(GV, GS))
     return false; // analysis bailed out; assume the worst
-  if (GS.StoredType != GlobalStatus::NotStored)
-    return false;
+  return GS.StoredType == GlobalStatus::NotStored;
+}
 
-  ArrayType *ATy = dyn_cast<ArrayType>(GV->getValueType());
-  if (!ATy)
+// Clang sometimes packs a `[256 x i8]` constant with a large zero tail as
+// `<{ [123 x i8], [133 x i8] }>` inside the global's value type, while GEPs
+// still type the field as `[256 x i8]`.  Treat a struct that is only a run of
+// same-width integer arrays as one logical table spanning the whole run.
+static bool tryMergeIntegerArrayStruct(Type *Ty, uint64_t BaseOffset,
+                                       const DataLayout &DL,
+                                       SmallVectorImpl<ReadOnlyTableDesc> &Out) {
+  auto *STy = dyn_cast<StructType>(Ty);
+  if (!STy || STy->getNumElements() == 0)
     return false;
-  Type *ETy = ATy->getElementType();
-  // Only integer elements: the loaded value has to fit in a label's 64-bit
-  // value slot, and i2s inverts by scanning for an exact integer match.
-  if (!ETy->isIntegerTy() || ETy->getIntegerBitWidth() > 64)
+  Type *ElemTy = nullptr;
+  uint64_t TotalElems = 0;
+  uint64_t ElemSize = 0;
+  for (unsigned i = 0, e = STy->getNumElements(); i < e; ++i) {
+    auto *ATy = dyn_cast<ArrayType>(STy->getElementType(i));
+    if (!ATy)
+      return false;
+    Type *ETy = ATy->getElementType();
+    if (!ETy->isIntegerTy() || ETy->getIntegerBitWidth() > 64)
+      return false;
+    uint64_t ES = DL.getTypeAllocSize(ETy);
+    if (!ElemTy) {
+      ElemTy = ETy;
+      ElemSize = ES;
+    } else if (ETy != ElemTy || ES != ElemSize) {
+      return false;
+    }
+    TotalElems += ATy->getNumElements();
+  }
+  if (TotalElems == 0 || ElemSize == 0 ||
+      TotalElems * ElemSize > ClMaxTableBytes)
     return false;
-
-  NumElements = ATy->getNumElements();
-  ElemSize = DL.getTypeAllocSize(ETy);
-  if (NumElements == 0 || ElemSize == 0)
-    return false;
-  if (NumElements * ElemSize > ClMaxTableBytes)
-    return false;
+  Out.push_back({BaseOffset, TotalElems, ElemSize});
   return true;
 }
 
-/// Find the read-only global arrays worth treating as lookup tables.
+// Collect integer array subobjects of Ty that fit in ClMaxTableBytes.  Walks
+// nested structs so a field like normal_encoding::type[256] (expat) is found
+// even though the global's value type is a StructType, not an ArrayType.
+static void collectReadOnlyArrayFields(Type *Ty, uint64_t BaseOffset,
+                                       const DataLayout &DL,
+                                       SmallVectorImpl<ReadOnlyTableDesc> &Out) {
+  if (auto *ATy = dyn_cast<ArrayType>(Ty)) {
+    Type *ETy = ATy->getElementType();
+    // Only integer elements: the loaded value has to fit in a label's 64-bit
+    // value slot, and i2s inverts by scanning for an exact integer match.
+    if (ETy->isIntegerTy() && ETy->getIntegerBitWidth() <= 64) {
+      uint64_t NumElements = ATy->getNumElements();
+      uint64_t ElemSize = DL.getTypeAllocSize(ETy);
+      if (NumElements > 0 && ElemSize > 0 &&
+          NumElements * ElemSize <= ClMaxTableBytes)
+        Out.push_back({BaseOffset, NumElements, ElemSize});
+    }
+    // Array-of-struct: still walk elements in case of nested tables.  Rare,
+    // and bounded by ClMaxTableBytes on each leaf.
+    if (ETy->isAggregateType()) {
+      for (uint64_t i = 0, e = ATy->getNumElements(); i < e; ++i)
+        collectReadOnlyArrayFields(ETy, BaseOffset + i * DL.getTypeAllocSize(ETy),
+                                   DL, Out);
+    }
+    return;
+  }
+  if (auto *STy = dyn_cast<StructType>(Ty)) {
+    // Prefer a merged view of clang's split-constant array packing (see above)
+    // over recording the fragments, which would never match a [256 x i8] GEP.
+    if (tryMergeIntegerArrayStruct(Ty, BaseOffset, DL, Out))
+      return;
+    const StructLayout *SL = DL.getStructLayout(STy);
+    for (unsigned i = 0, e = STy->getNumElements(); i < e; ++i)
+      collectReadOnlyArrayFields(STy->getElementType(i),
+                                 BaseOffset + SL->getElementOffset(i), DL, Out);
+  }
+}
+
+/// Find the read-only integer arrays worth treating as lookup tables -- both
+/// bare global arrays and array fields inside readonly global structs.
 ///
 /// Must run before any instrumentation: getShadowForGlobal() passes a global's
 /// address to __taint_trace_global, and GlobalStatus::analyzeGlobal() gives up
@@ -5228,10 +5309,125 @@ void Taint::findReadOnlyTables(Module &M) {
     return;
   const DataLayout &DL = M.getDataLayout();
   for (GlobalVariable &GV : M.globals()) {
-    uint64_t NumElements = 0, ElemSize = 0;
-    if (isReadOnlyLookupTable(&GV, DL, NumElements, ElemSize))
-      ReadOnlyTables[&GV] = {NumElements, ElemSize};
+    if (!isNeverStoredGlobal(&GV))
+      continue;
+    SmallVector<ReadOnlyTableDesc, 2> Fields;
+    collectReadOnlyArrayFields(GV.getValueType(), /*BaseOffset=*/0, DL, Fields);
+    if (!Fields.empty())
+      ReadOnlyTables[&GV] = std::move(Fields);
   }
+}
+
+// Among the tables registered for GV, the one whose first element sits at
+// ByteOffset (the GEP CurrentOffset just before a symbolic array index).
+static const ReadOnlyTableDesc *
+matchReadOnlyTable(const GlobalVariable *GV, uint64_t ByteOffset,
+                   const DenseMap<const GlobalVariable *,
+                                  SmallVector<ReadOnlyTableDesc, 2>> &Tables) {
+  auto It = Tables.find(GV);
+  if (It == Tables.end())
+    return nullptr;
+  for (const ReadOnlyTableDesc &D : It->second)
+    if (D.ByteOffset == ByteOffset)
+      return &D;
+  return nullptr;
+}
+
+// Constant offset from GV to V, looking through select/phi of pointers that
+// share the same offset into the same GV (or into different GVs -- caller
+// checks each leaf).  Used so Base = select(gep @A,0,field, gep @B,0,field)
+// still resolves to offsetof(field).
+static bool tableOffsetFromGV(Value *V, const GlobalVariable *GV,
+                              const DataLayout &DL, int64_t &Off) {
+  int64_t ConstOff = 0;
+  Value *Base = GetPointerBaseWithConstantOffset(V, ConstOff, DL);
+  if (ConstOff < 0)
+    return false;
+  if (auto *G = dyn_cast<GlobalVariable>(Base)) {
+    if (G != GV)
+      return false;
+    Off = ConstOff;
+    return true;
+  }
+  if (auto *Sel = dyn_cast<SelectInst>(Base)) {
+    // Arms may point at *different* encoding globals; only the arm(s) that
+    // resolve to GV contribute.  If both do, they must agree on the offset.
+    int64_t OffT = 0, OffF = 0;
+    bool OkT = tableOffsetFromGV(Sel->getTrueValue(), GV, DL, OffT);
+    bool OkF = tableOffsetFromGV(Sel->getFalseValue(), GV, DL, OffF);
+    if (OkT && OkF && OffT != OffF)
+      return false;
+    if (!OkT && !OkF)
+      return false;
+    Off = (OkT ? OffT : OffF) + ConstOff;
+    return true;
+  }
+  if (auto *PHI = dyn_cast<PHINode>(Base)) {
+    bool Have = false;
+    int64_t Off0 = 0;
+    for (unsigned i = 0, e = PHI->getNumIncomingValues(); i < e; ++i) {
+      int64_t OffI = 0;
+      if (!tableOffsetFromGV(PHI->getIncomingValue(i), GV, DL, OffI))
+        continue;
+      if (!Have) {
+        Off0 = OffI;
+        Have = true;
+      } else if (OffI != Off0) {
+        return false;
+      }
+    }
+    if (!Have)
+      return false;
+    Off = Off0 + ConstOff;
+    return true;
+  }
+  return false;
+}
+
+// P1: every underlying object of Base must be a GlobalVariable that carries
+// the same table subobject.  ByteOffsetInBase is the extra offset from Base to
+// the array element type (0 when Base already points at the field).  Rejects
+// loads/calls (glibc ctype via __ctype_b_loc), heap encodings, and mixed
+// layouts.
+static const ReadOnlyTableDesc *matchTableThroughPointer(
+    Value *Base, uint64_t ByteOffsetInBase, const DataLayout &DL, LoopInfo *LI,
+    const DenseMap<const GlobalVariable *,
+                   SmallVector<ReadOnlyTableDesc, 2>> &Tables) {
+  SmallVector<const Value *, 4> Objs;
+  getUnderlyingObjects(Base, Objs, LI);
+  if (Objs.empty())
+    return nullptr;
+
+  const ReadOnlyTableDesc *Found = nullptr;
+  for (const Value *Obj : Objs) {
+    auto *GV = dyn_cast<GlobalVariable>(Obj->stripPointerCasts());
+    if (!GV)
+      return nullptr;
+    int64_t OffFromGV = 0;
+    // Prefer offset(Base → GV) so select(gep @E,0,field, ...) yields
+    // offsetof(field); fall back to ByteOffsetInBase alone when Base is the
+    // GV itself (OffFromGV == 0).
+    if (!tableOffsetFromGV(Base, GV, DL, OffFromGV)) {
+      // Base may be the GV directly with the field offset only in the
+      // indexing GEP's CurrentOffset.
+      if (getUnderlyingObject(Base)->stripPointerCasts() != GV)
+        return nullptr;
+      OffFromGV = 0;
+    }
+    if (OffFromGV < 0)
+      return nullptr;
+    uint64_t TableOff = (uint64_t)OffFromGV + ByteOffsetInBase;
+    const ReadOnlyTableDesc *D = matchReadOnlyTable(GV, TableOff, Tables);
+    if (!D)
+      return nullptr;
+    if (!Found) {
+      Found = D;
+    } else if (Found->NumElements != D->NumElements ||
+               Found->ElemSize != D->ElemSize) {
+      return nullptr;
+    }
+  }
+  return Found;
 }
 
 void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
@@ -5342,13 +5538,33 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
             // glibc's ctype tables are reached via __ctype_b_loc(), so the base
             // is a load rather than a global and they are skipped -- which is
             // what keeps this from firing on every isupper()/tolower().
-            auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(Base));
-            auto TblItr = GV ? TT.ReadOnlyTables.find(GV)
-                             : TT.ReadOnlyTables.end();
-            if (TblItr != TT.ReadOnlyTables.end()) {
-              Value *TablePtr = IRB.CreatePtrToInt(GV, TT.Int64Ty);
-              TableGEPs[I] = {IndexShadow, Index, TablePtr,
-                              TblItr->second.first, TblItr->second.second};
+            //
+            // If this GEP indexes a read-only table (bare global array, array
+            // field of a const global struct, or a pointer that only aliases
+            // such globals -- e.g. expat's BYTE_TYPE(enc, p)), remember it so
+            // the load can be symbolized.  glibc ctype via __ctype_b_loc() has
+            // a load/call as underlying object and is skipped, which keeps
+            // this from firing on every isupper()/tolower().
+            //
+            // CurrentOffset is the byte offset of the array *within* the GEP
+            // base (0 for a bare array; offsetof(field) for a struct field).
+            // TablePtr must be the address of the first element so the runtime
+            // can memcpy the right slice -- base + CurrentOffset, not the GV
+            // address alone.
+            const DataLayout &DL =
+                I->getModule()->getDataLayout();
+            const ReadOnlyTableDesc *Tbl = matchTableThroughPointer(
+                Base, CurrentOffset, DL, LI, TT.ReadOnlyTables);
+            if (Tbl) {
+              // Address of element 0: GEP base + offset within that base.
+              Value *BaseInt =
+                  IRB.CreatePtrToInt(I->getPointerOperand(), TT.Int64Ty);
+              Value *TablePtr = BaseInt;
+              if (CurrentOffset != 0)
+                TablePtr = IRB.CreateAdd(
+                    BaseInt, ConstantInt::get(TT.Int64Ty, CurrentOffset));
+              TableGEPs[I] = {IndexShadow, Index, TablePtr, Tbl->NumElements,
+                              Tbl->ElemSize};
             }
           }
         } else {

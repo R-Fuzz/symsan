@@ -1,0 +1,4 @@
+$a = [1, 2, 3];
+$b = {name: "x", v: 42};
+foreach($a as $x){ print $x; }
+if ($b.v > 10) { print $b.name; }

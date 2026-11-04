@@ -94,16 +94,33 @@ with `-DAFLPP_PATH=<path to a built AFL++>` and run `lit tests` to include them.
 
 * `KO_DONT_OPTIMIZE` don't override the optimization level to `O3`.
 
-### Hybrid Fuzzing
+## Hybrid Fuzzing
 
 SymSan needs a driver to perform hybrid fuzzing, like [FastGen](https://github.com/R-Fuzz/fastgen).
-It could also be used as a custom mutator for [AFL++](https://github.com/AFLplusplus/AFLplusplus)
-(check the [plugin readme](driver/aflpp/README.md)).
+This repository has two, which share one concolic session and solver ladder
+(i2s → JIGSAW → Z3):
+
+| front end | how-to | reference |
+|---|---|---|
+| **LibAFL**: the `symsan-fuzz` binary, SymSan as a LibAFL stage | [bindings/rust/HYBRID_FUZZING.md](bindings/rust/HYBRID_FUZZING.md) | [bindings/rust/README.md](bindings/rust/README.md) |
+| **AFL++**: `libSymSanMutator.so`, SymSan as a custom mutator | [driver/aflpp/HYBRID_FUZZING.md](driver/aflpp/HYBRID_FUZZING.md) | [driver/aflpp/README.md](driver/aflpp/README.md) |
+
+Each how-to goes from source to a running campaign: build SymSan and the
+fuzzer, build the target twice (a fuzzing build and a SymSan build), run,
+tune, and read the results.
+
+To measure a change, or to compare against published numbers, use
+[`eval/`](eval/README.md).  It is a self-contained Docker setup that runs
+both front ends against 15 C/C++ subjects and measures gcov line coverage.
+It includes a [5 × 1 h baseline](eval/results/2026-11-03/README.md) of seven
+configurations and the scripts that reproduce it.
 
 The recommended path is the LibAFL integration under `bindings/rust/`. See the
 [hybrid fuzzing how-to](bindings/rust/HYBRID_FUZZING.md) for an end-to-end
 walkthrough (build, run, scale, read results), and the
 [reference README](bindings/rust/README.md) for the details.
+SymSan can also be used as a custom mutator for [AFL++](https://github.com/AFLplusplus/AFLplusplus)
+(check the [plugin readme](driver/aflpp/README.md)).
 
 Check out our integration with Magma to see how to compile and run targets:
 [aflplusplus_symsan](https://github.com/R-Fuzz/magma/tree/mazerunner/fuzzers/aflplusplus_symsan).

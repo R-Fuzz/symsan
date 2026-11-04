@@ -731,6 +731,11 @@ size_t symsan_session_num_solvers(const symsan_session_t *s) {
   return s->session.num_solvers();
 }
 
+size_t symsan_session_num_rq_pending(const symsan_session_t *s) {
+  if (!s || !s->initialized) return 0;
+  return s->session.num_rq_pending();
+}
+
 const char *symsan_session_solver_name(const symsan_session_t *s, size_t index) {
   if (!s || !s->initialized) return nullptr;
   return s->session.solver_name(index);

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mutation-test union_folds.c against the folds it claims to cover.
 
-Usage:  tests/symsan/union_folds_mutations.py [--build-dir b4] [--only SUBSTR]
+Usage:  tests/symsan/union_folds_mutations.py [--build-dir build] [--only SUBSTR]
         tests/symsan/union_folds_mutations.py --check-anchors   (fast, no build)
 
 union_folds.c asserts the *label* __taint_union() hands back for a synthetic
@@ -253,8 +253,8 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--build-dir", default="b4",
-                    help="build directory, relative to the repo root (default: b4)")
+    ap.add_argument("--build-dir", default="build",
+                    help="build directory, relative to the repo root (default: build)")
     ap.add_argument("--jobs", "-j", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--only", metavar="SUBSTR",
                     help="run only mutations whose name contains SUBSTR")

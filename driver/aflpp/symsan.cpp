@@ -53,7 +53,7 @@ extern "C" {
 
 struct my_mutator_t {
   my_mutator_t() = delete;
-  my_mutator_t(const afl_state_t *afl) :
+  my_mutator_t(afl_state_t *afl) :
     afl(afl), out_dir(NULL), out_file(NULL), cur_queue_entry(NULL),
     log_fd(2), session_started(false) {}
 
@@ -62,7 +62,7 @@ struct my_mutator_t {
     ck_free(out_file);
   }
 
-  const afl_state_t *afl;
+  afl_state_t *afl;
   char *out_dir;
   char *out_file;
   u8* cur_queue_entry;
@@ -184,6 +184,70 @@ static bool start_session(my_mutator_t *data) {
   return true;
 }
 
+/// maybe_add_auto() is a local symbol in afl-fuzz, so a plugin cannot call it.
+/// Same sink: a_extras[] / auto_dict_entries, which havoc overlay/insert uses.
+static void add_auto_extra(afl_state_t *afl, const uint8_t *mem, size_t len) {
+  if (len < 2 || len > MAX_AUTO_EXTRA) return;
+
+  size_t i;
+  for (i = 1; i < len; ++i) {
+    if (mem[i] != mem[0]) break;
+  }
+  if (i == len) return;
+
+  for (u32 j = 0; j < afl->a_extras_cnt; ++j) {
+    if (afl->a_extras[j].len == len &&
+        memcmp(afl->a_extras[j].data, mem, len) == 0) {
+      afl->a_extras[j].hit_cnt++;
+      return;
+    }
+  }
+  if (afl->a_extras_cnt >= MAX_AUTO_EXTRAS) return;
+
+  memcpy(afl->a_extras[afl->a_extras_cnt].data, mem, len);
+  afl->a_extras[afl->a_extras_cnt].len = (u32)len;
+  afl->a_extras[afl->a_extras_cnt].hit_cnt = 0;
+  ++afl->a_extras_cnt;
+  afl->auto_changed = 1;
+}
+
+/// Move comparands this trace interned into AFL++'s auto extras.
+/// The session already dedups and reports each token once.
+static void drain_tokens(my_mutator_t *data) {
+  if (!data->config.collect_tokens) return;
+
+  rgd::ConcolicSession::Token buf[64];
+  size_t n;
+  while ((n = data->session.take_tokens(buf, 64)) > 0) {
+    for (size_t i = 0; i < n; ++i) {
+      add_auto_extra(data->afl, buf[i].data, buf[i].size);
+    }
+  }
+}
+
+/// CmpLog's extras are n-grams cut from the file around a compare, not just
+/// the constant.  Take [offset-8, offset+repl+16], clipped to 8..MAX_AUTO_EXTRA.
+static void harvest_phrases(my_mutator_t *data, const u8 *buf, size_t buf_size) {
+  if (!data->config.collect_tokens || !buf || buf_size < 8) return;
+
+  for (const auto &s : data->session.smashes()) {
+    add_auto_extra(data->afl, (const uint8_t *)s.found.data(), s.found.size());
+    add_auto_extra(data->afl, (const uint8_t *)s.repl.data(), s.repl.size());
+    if ((size_t)s.offset >= buf_size) continue;
+    size_t left = s.offset > 8 ? (size_t)s.offset - 8 : 0;
+    size_t right = (size_t)s.offset + s.repl.size();
+    if (right < buf_size) {
+      size_t extra = buf_size - right;
+      if (extra > 16) extra = 16;
+      right += extra;
+    } else {
+      right = buf_size;
+    }
+    if (right > left + MAX_AUTO_EXTRA) right = left + MAX_AUTO_EXTRA;
+    if (right - left >= 8) add_auto_extra(data->afl, buf + left, right - left);
+  }
+}
+
 /// @brief the trace stage for symsan
 /// @param data the custom mutator state
 /// @param buf input buffer
@@ -212,9 +276,12 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   if (data->session.trace(buf, buf_size) < 0) {
     return 0;
   }
+  drain_tokens(data);
+  harvest_phrases(data, buf, buf_size);
 
   // to be conservative, we return the maximum number of possible mutations
-  return (u32)(data->session.num_pending_tasks() * data->session.num_solvers());
+  return (u32)(data->session.num_pending_tasks() * data->session.num_solvers() +
+               data->session.num_rq_pending());
 }
 
 extern "C"

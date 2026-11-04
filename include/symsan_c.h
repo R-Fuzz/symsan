@@ -660,8 +660,20 @@ void symsan_session_print_stats(const symsan_session_t *s, int fd);
 size_t symsan_session_num_pending_tasks(const symsan_session_t *s);
 
 /** Length of the solver ladder.  trace() times this bounds how many times
- *  next_solution() can return a buffer. */
+ *  next_solution() can return a buffer.
+ *
+ *  Plus symsan_session_num_rq_pending(): with collect_tokens on, the
+ *  apply-at-site buffers come out of next_solution() after the ladder. */
 size_t symsan_session_num_solvers(const symsan_session_t *s);
+
+/** Apply-at-site (RedQueen-style) buffers the last trace() built and
+ *  next_solution() has not yet returned.  Only nonzero with collect_tokens.
+ *
+ *  Independent of the task count: a trace that queued no task -- every branch
+ *  already seen -- can still have compared input bytes against a constant they
+ *  did not equal.  A front-end that drains next_solution() only when trace()
+ *  returned tasks loses these, because the next trace() replaces them. */
+size_t symsan_session_num_rq_pending(const symsan_session_t *s);
 
 /** Name of the solver at ladder position @p index ("i2s", "jigsaw", "z3"), or
  *  NULL past the end.  Static storage; not owned by the caller.  This is what

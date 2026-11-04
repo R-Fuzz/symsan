@@ -94,7 +94,7 @@ instrumentation append the same shape of line for each branch *it* names,
 `cid=` in place of `edgeID=` plus a `kind=` saying `br`, `switch`, `switch-case`
 or `select`. On a shared-namespace build the `cid=` values are edge ids, so the
 two files line up directly: every target in the `.bmap` should appear here under
-the branch its source location names. `b4/bin/covcheck` is the dynamic version,
+the branch its source location names. `build/bin/covcheck` is the dynamic version,
 against `afl-showmap` as ground truth; see the SymSan tree's
 `bindings/rust/README.md`.
 

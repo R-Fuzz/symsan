@@ -53,6 +53,14 @@ public:
   // condition the parser gave up on is one whose constants are worth having.
   static constexpr size_t kScanBudget = 256;
 
+  /// One RedQueen-style smash: the file held @c found at @c offset, the
+  /// compare's constant run was @c repl.  Apply-at-site writes @c repl there.
+  struct Smash {
+    uint32_t offset;
+    std::string found;
+    std::string repl;
+  };
+
   /// Point the collector at the union table so scan_cond() can walk it.
   /// @param label_base   base of the shared union table
   /// @param table_bytes  its size in bytes
@@ -62,6 +70,23 @@ public:
     label_count_ = table_bytes / sizeof(dfsan_label_info);
     if (max_tokens) max_tokens_ = max_tokens;
   }
+
+  /// The input this trace is about, so emit_run() can intern the file slice
+  /// the compare walked (CmpLog's extras are input n-grams, not just the
+  /// constant) and record a smash when the two differ.
+  void set_input(const uint8_t *buf, size_t size) {
+    // A copy: afltest munmaps the seed before end_input() flushes the last
+    // run, and a smash has to keep its found/repl bytes after the caller
+    // moves on to the next file.
+    if (buf && size) input_copy_.assign(buf, buf + size);
+    else input_copy_.clear();
+    input_ = input_copy_.empty() ? nullptr : input_copy_.data();
+    input_size_ = input_copy_.size();
+    smashes_.clear();
+  }
+
+  /// Apply-at-site records from the input just ended.  Valid until set_input().
+  const std::vector<Smash> &smashes() const { return smashes_; }
 
   /// Intern @p size bytes at @p buf, if they pass the filters.
   void add(const uint8_t *buf, size_t size) {
@@ -121,7 +146,7 @@ public:
   bool single_byte_source(dfsan_label label, uint32_t *input_id,
                           uint64_t *offset) const {
     // Bounded because a malformed table would otherwise be a hang, and because
-    // a legitimate chain is one or two casts deep.
+    // a legitimate chain is one or two casts deep, plus a case-fold mask.
     for (int depth = 0; depth < 8; ++depth) {
       if (label == CONST_LABEL || label >= label_count_) return false;
       const dfsan_label_info *info = &label_base_[label];
@@ -141,6 +166,28 @@ public:
       if (op == __dfsan::ZExt || op == __dfsan::SExt || op == __dfsan::Trunc ||
           op == __dfsan::BitCast) {
         label = info->l1;
+        continue;
+      }
+      // Case fold, not arithmetic.  sqlite's keywordCode walks
+      // `(z[j] & ~0x20) == zKW[j]`; glibc-style toupper/tolower are
+      // `c & 0x5f` / `c | 0x20`.  The file still holds the character -- the
+      // mask only chooses a case -- so this is the same channel as a raw
+      // `buf[i] == 'C'`.  A real computation (add, length, hash) still
+      // returns false below and stays out of the dictionary.
+      if (op == __dfsan::And || op == __dfsan::Or) {
+        dfsan_label other = CONST_LABEL;
+        uint64_t cst = 0;
+        if (info->l1 == CONST_LABEL && info->l2 != CONST_LABEL) {
+          cst = info->op1.i;
+          other = info->l2;
+        } else if (info->l2 == CONST_LABEL && info->l1 != CONST_LABEL) {
+          cst = info->op2.i;
+          other = info->l1;
+        } else {
+          return false;
+        }
+        if (!is_case_fold_mask(op, cst, info->size)) return false;
+        label = other;
         continue;
       }
       return false;
@@ -242,6 +289,7 @@ public:
     }
     flush_run();
     run_input_ = input_id;
+    run_start_ = offset;
     run_next_ = offset + 1;
     run_.assign(1, c);
   }
@@ -393,6 +441,38 @@ private:
   void emit_run(size_t begin, size_t end) {
     if (end - begin < kMinTokenSize) return;
     add(run_.data() + begin, end - begin);
+    if (!input_) return;
+    const uint64_t off = run_start_ + begin;
+    const size_t n = end - begin;
+    if (off + n > input_size_) return;
+    // The bytes the file actually held.  Equal to the constant when the
+    // compare already matched; the interesting case is the case-fold walk,
+    // where the file has "create" and the constant run is "CREATE".
+    add(input_ + off, n);
+    if (smashes_.size() >= kMaxSmashes) return;
+    if (memcmp(input_ + off, run_.data() + begin, n) == 0) return;
+    Smash s;
+    s.offset = (uint32_t)off;
+    s.found.assign(reinterpret_cast<const char *>(input_ + off), n);
+    s.repl.assign(reinterpret_cast<const char *>(run_.data() + begin), n);
+    smashes_.push_back(std::move(s));
+  }
+
+  /// True when @p cst is only a case-fold mask at @p bits, not a computation.
+  /// And: clear bit 5 (`0xdf`, `0x5f`, or `~0x20` at the compare width).
+  /// Or: set bit 5 (`0x20`).  Anything else is arithmetic and stays filtered.
+  static bool is_case_fold_mask(uint16_t op, uint64_t cst, uint16_t bits) {
+    if (bits == 0 || bits > 64) return false;
+    const uint64_t wmask =
+        bits == 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
+    cst &= wmask;
+    if (op == __dfsan::And) {
+      return cst == 0xdf || cst == 0x5f || cst == (wmask & ~0x20ull);
+    }
+    if (op == __dfsan::Or) {
+      return cst == 0x20;
+    }
+    return false;
   }
 
   // True when every byte of @p n's low @p width bytes is the same.  Rules out
@@ -413,6 +493,7 @@ private:
   dfsan_label_info *label_base_ = nullptr;
   size_t label_count_ = 0;
   size_t max_tokens_ = 4096;
+  static constexpr size_t kMaxSmashes = 64;
   /// Interned so that the pointers take() hands out stay valid: an
   /// unordered_set never moves an element once inserted.
   std::unordered_set<std::string> tokens_;
@@ -426,7 +507,13 @@ private:
   /// there is no run, which no real offset can equal.
   std::vector<uint8_t> run_;
   uint32_t run_input_ = 0;
+  uint64_t run_start_ = 0;
   uint64_t run_next_ = UINT64_MAX;
+
+  const uint8_t *input_ = nullptr;
+  size_t input_size_ = 0;
+  std::vector<uint8_t> input_copy_;
+  std::vector<Smash> smashes_;
 };
 
 } // namespace symsan
