@@ -464,6 +464,7 @@ class UCSan {
 
   // Runtime functions
   FunctionCallee UCCheckPointerFn;
+  FunctionCallee UCCheckLibArgFn;     // a library callee's argument's check
   FunctionCallee UCUncheckPointerFn;
   FunctionCallee UCCheckPointerArgFn;
   FunctionCallee UCCheckUBIFn;
@@ -750,6 +751,9 @@ struct UCSanFunction {
   Value *checkPointer(Value *Ptr, Value *Size, bool dereference, IRBuilder<> &IRB,
                       uint32_t TypeID = 0, MaybeAlign Alignment = std::nullopt,
                       bool ExactSize = false);
+  Value *checkPointerUnlessNull(Value *P, Value *Size, uint32_t TypeID,
+                                CallBase &CB, IRBuilder<> &IRB,
+                                bool LibArg = false);
   void checkGlobalDest(Value *Dest, Value *Length, IRBuilder<> &IRB);
   void recordPointerLoadSummary(LoadInst &LI);
   void recordMemoryAccessSummary(Value *Ptr, uint64_t AccessSize, bool IsWrite,
@@ -823,6 +827,7 @@ private:
   // Returns false when this is an invoke of a custom function.
   bool visitWrappedCallBase(Function *F, CallBase &CB);
   void visitIndirectCallBase(Value *CV, CallBase &CB);
+  void zeroRetvalTLS(Type *RT, IRBuilder<> &IRB);
   void visitInlineAsm(InlineAsm *IA, CallBase &CB);
 };
 
@@ -837,6 +842,10 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
     false);
   UCCheckPointerFn = M.getOrInsertFunction("ucsan_check_pointer", UCCheckPointerFnTy);
   F = dyn_cast<Function>(UCCheckPointerFn.getCallee()->stripPointerCasts());
+  markFunctionNosanitize(F);
+  UCRuntimeFunctions.insert(F);
+  UCCheckLibArgFn = M.getOrInsertFunction("ucsan_check_lib_arg", UCCheckPointerFnTy);
+  F = dyn_cast<Function>(UCCheckLibArgFn.getCallee()->stripPointerCasts());
   markFunctionNosanitize(F);
   UCRuntimeFunctions.insert(F);
 
@@ -2659,6 +2668,54 @@ bool UCSanFunction::reusableCheck(Instruction *Checked, Instruction *Pos) {
       return false;
   }
   return false;  // Pos is not after it
+}
+
+// A pointer argument whose use is the callee's to decide: checked only when
+// it is not null (see visitCallBase's library calls).  IRB is at CB, and is
+// left there, after the check's block split.
+// LibArg: a library callee's, whose unlabeled value in the null range is no
+// null dereference either (ucsan_check_lib_arg).  Its check is always the
+// split block's own, never one reused from before (a dereference's).
+Value *UCSanFunction::checkPointerUnlessNull(Value *P, Value *Size,
+                                             uint32_t TypeID, CallBase &CB,
+                                             IRBuilder<> &IRB, bool LibArg) {
+  const DataLayout &DL = F->getParent()->getDataLayout();
+  if (!LibArg && isKnownNonZero(P, DL))
+    return checkPointer(P, Size, true, IRB, TypeID);
+  // (null by its value *and* unlabeled: an under-constrained pointer's
+  // value is only what the path so far asked of it, and it still names
+  // an object, created here: resign_sprintf's name, 0 in the first run)
+  Value *NotNull = IRB.CreateICmpNE(
+      P, ConstantPointerNull::get(cast<PointerType>(P->getType())));
+  UC.markNosanitize(NotNull);
+  Value *Labeled = IRB.CreateICmpNE(getShadow(P),
+                                    UC.ZeroPrimitiveShadow);
+  UC.markNosanitize(Labeled);
+  Value *Check = IRB.CreateOr(NotNull, Labeled);
+  UC.markNosanitize(Check);
+  // (CB, and the block's terminator with its BBID, go to the tail)
+  Instruction *ThenTerm = SplitBlockAndInsertIfThen(Check, &CB, false);
+  BasicBlock *ThenBB = ThenTerm->getParent();
+  BasicBlock *HeadBB = ThenBB->getSinglePredecessor();
+  DT.recalculate(*F);
+  IRBuilder<> ThenIRB(ThenTerm);
+  Value *Checked = checkPointer(P, Size, true, ThenIRB, TypeID);
+  if (LibArg) {
+    // (the then block is new: its check is the one just made)
+    for (Instruction &I : *ThenBB)
+      if (auto *C = dyn_cast<CallInst>(&I);
+          C && C->getCalledOperand() == UC.UCCheckPointerFn.getCallee())
+        C->setCalledFunction(UC.UCCheckLibArgFn);
+  }
+  IRB.SetInsertPoint(&CB);
+  PHINode *Phi = IRB.CreatePHI(P->getType(), 2);
+  Phi->addIncoming(Checked, ThenTerm->getParent());
+  Phi->addIncoming(P, HeadBB);
+  // skipped by UCSanPass, but not nosanitize: TaintPass gives it the checked
+  // pointer's SymSan label.  (As nosanitize it had none, so every pointer
+  // checked here lost it: what a free's wrapper and a library callee got.)
+  SkipInsts.insert(Phi);
+  return Phi;
 }
 
 Value *UCSanFunction::checkPointer(Value *Ptr, Value *Size, bool dereference,
@@ -6192,6 +6249,19 @@ void UCSanVisitor::guardAsmIndirectCall(CallBase &CB, ArrayRef<AsmOp> Ops,
   UF.DT.recalculate(*UF.F);
 }
 
+// A call's return label, before a callee that may not write one: zero
+void UCSanVisitor::zeroRetvalTLS(Type *RT, IRBuilder<> &IRB) {
+  if (RT->isVoidTy())
+    return;
+  const DataLayout &DL = getDataLayout();
+  if (DL.getTypeAllocSize(UF.UC.getShadowTy(RT)) > kRetvalTLSSize)
+    return;
+  StoreInst *SI = IRB.CreateAlignedStore(UF.UC.getZeroShadow(RT),
+                                         UF.getRetvalTLS(RT, IRB),
+                                         ShadowTLSAlignment);
+  UF.UC.markNosanitize(SI);
+}
+
 void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
   Value *Shadow = UF.getShadow(FPtr);
   Type *RT = CB.getFunctionType()->getReturnType();
@@ -6255,6 +6325,12 @@ void UCSanVisitor::visitIndirectCallBase(Value *FPtr, CallBase &CB) {
       ArgOffset += alignTo(Size, ShadowTLSAlignment);
       Args.push_back(Arg);
     }
+    // The callee may write no return label: library code (TaintPass's) and
+    // native code do not, and the load at the merge read what an earlier
+    // call left.  v8's TRACE_EVENT0 cached GetCategoryGroupEnabled()'s
+    // pointer, a virtual call into library code, with a handle block's label
+    // (an in-scope call's return), and its global was an OOB of the block.
+    zeroRetvalTLS(RT, IRB_TB);
     if (auto *II = dyn_cast<InvokeInst>(&CB)) {
       // An invoke ends its block, so the call made in its place is an invoke
       // too, to the merge block, and unwinds where it did.  It was a call,
@@ -6507,33 +6583,11 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
     // an empty ostringstream is basic_string::__init(nullptr, 0), libc++.a's:
     // a false 153.  And snprintf's "%p" of a null pointer.)  The mem/str
     // functions' own pointers are still checked as dereferenced.
+    // (and an unlabeled value in the null range is not checked as a null
+    // dereference: cppgc's conservative stack scan hands TryFindNode every
+    // stack word, small integers too, to compare with node ranges)
     auto checkUnlessNull = [&](Value *P, Value *Size, uint32_t TypeID) -> Value * {
-      if (isKnownNonZero(P, DL))
-        return UF.checkPointer(P, Size, true, IRB, TypeID);
-      // (null by its value *and* unlabeled: an under-constrained pointer's
-      // value is only what the path so far asked of it, and it still names
-      // an object, created here: resign_sprintf's name, 0 in the first run)
-      Value *NotNull = IRB.CreateICmpNE(
-          P, ConstantPointerNull::get(cast<PointerType>(P->getType())));
-      UF.UC.markNosanitize(NotNull);
-      Value *Labeled = IRB.CreateICmpNE(UF.getShadow(P),
-                                        UF.UC.ZeroPrimitiveShadow);
-      UF.UC.markNosanitize(Labeled);
-      Value *Check = IRB.CreateOr(NotNull, Labeled);
-      UF.UC.markNosanitize(Check);
-      // (CB, and the block's terminator with its BBID, go to the tail)
-      Instruction *ThenTerm = SplitBlockAndInsertIfThen(Check, &CB, false);
-      BasicBlock *ThenBB = ThenTerm->getParent();
-      BasicBlock *HeadBB = ThenBB->getSinglePredecessor();
-      UF.DT.recalculate(*UF.F);
-      IRBuilder<> ThenIRB(ThenTerm);
-      Value *Checked = UF.checkPointer(P, Size, true, ThenIRB, TypeID);
-      IRB.SetInsertPoint(&CB);
-      PHINode *Phi = IRB.CreatePHI(P->getType(), 2);
-      Phi->addIncoming(Checked, ThenTerm->getParent());
-      Phi->addIncoming(P, HeadBB);
-      UF.UC.markNosanitize(Phi);
-      return Phi;
+      return UF.checkPointerUnlessNull(P, Size, TypeID, CB, IRB, true);
     };
 
     auto *I = CB.arg_begin();
@@ -6744,7 +6798,12 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
           sizeArg = LenVal;
           TypeID = 0;
         }
-        Value *rptr = UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
+        // Without a byte count, null is a value the wrapper takes, as a
+        // library callee does: realloc(nullptr, n), free(nullptr) (v8's
+        // ValueSerializer grows its buffer from nullptr: a false 153)
+        Value *rptr = LenVal ? UF.checkPointer(*I, sizeArg, true, IRB, TypeID)
+                             : UF.checkPointerUnlessNull(*I, sizeArg, TypeID,
+                                                         CB, IRB);
         Args.push_back(rptr);
       } else {
         Args.push_back(*I);
@@ -7006,6 +7065,11 @@ void UCSanVisitor::visitCallBase(CallBase &CB) {
       ArgOffset += alignTo(Size, ShadowTLSAlignment);
     }
   }
+
+  // (a callee defined elsewhere may write no return label: see
+  // visitIndirectCallBase)
+  if (!F || F->isDeclaration())
+    zeroRetvalTLS(CB.getType(), IRB);
 
   Instruction *Next = nullptr;
   if (!CB.getType()->isVoidTy()) {

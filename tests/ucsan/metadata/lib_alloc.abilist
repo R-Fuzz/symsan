@@ -1,0 +1,2 @@
+fun:lib_churn=uninstrumented
+fun:lib_alloc4=uninstrumented

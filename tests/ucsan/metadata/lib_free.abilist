@@ -1,0 +1,2 @@
+fun:lib_alloc8=uninstrumented
+fun:lib_free=uninstrumented

@@ -69,6 +69,10 @@ DFSAN_FLAG(bool, solve_wrap, false,
            "and unsigned (-fsanitize=unsigned-integer-overflow's opt-in check).")
 DFSAN_FLAG(bool, allow_zero_size_alloc, false,
            "Allow malloc-size minimization to solve allocation sizes to zero.")
+DFSAN_FLAG(bool, allow_threads, false,
+           "Let pthread_create start a thread.  Threads are not supported: "
+           "the trace's event ring has one producer, which a second thread "
+           "tears; without this a trace ends at the call (exit 127).")
 DFSAN_FLAG(bool, debug, false, "Print debug output.")
 DFSAN_FLAG(const char *, output_dir, ".", "The path for output file.")
 DFSAN_FLAG(int, instance_id, 0, "instance id for multi-instance fuzzing.")

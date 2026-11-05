@@ -22,6 +22,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -652,6 +653,7 @@ class Taint {
   FunctionCallee TaintDebugFn;
   FunctionCallee TaintMinimizeLabelFn;
   FunctionCallee TaintAssumeFn;
+  FunctionCallee TaintReleaseObjectFn;
   FunctionCallee TaintByvalCopyFn;
   FunctionCallee UCSanLibStoreFn;
   FunctionCallee UCSanLibStorePtrFn;
@@ -811,6 +813,8 @@ struct TaintFunction {
   // static allocas whose shadow in memory is marked when the function is
   // entered, and their sizes: cleared again when it returns
   SmallVector<std::pair<AllocaInst *, Value *>, 4> FrameAllocas;
+  // byval parameters given their source's shadow at entry, cleared at exit
+  SmallVector<std::pair<Argument *, Value *>, 2> ByvalCopies;
   // an argument's labels, one per byte, as the caller left them for it, and
   // whether it did (see getMovedBytes)
   DenseMap<Argument *, std::pair<Value *, Value *>> MovedArgs;
@@ -2449,6 +2453,19 @@ void Taint::initializeRuntimeFunctions(Module &M) {
         Type::getInt1Ty(*Ctx));
     TaintRuntimeFunctions.insert(TaintAssumeFn.getCallee()->stripPointerCasts());
   }
+  {
+    // void __taint_release_object(ptr, label, i1 is_free, ptr addr): the
+    // combined runtime's, see handleUCSanCall
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 2, Attribute::ZExt);
+    TaintReleaseObjectFn = Mod->getOrInsertFunction(
+        "__taint_release_object", AL, Type::getVoidTy(*Ctx), VoidPtrTy,
+        PrimitiveShadowTy, Type::getInt1Ty(*Ctx), VoidPtrTy);
+    TaintRuntimeFunctions.insert(
+        TaintReleaseObjectFn.getCallee()->stripPointerCasts());
+  }
 
   if (ClUCSanLib)
     initializeUCSanLibFunctions(M);
@@ -3021,6 +3038,7 @@ bool Taint::runImpl(Module &M) {
             TaintByvalCopyFn,
             {&A, Len, ConstantInt::get(Int32Ty, A.getArgNo())});
         TF.SkipInsts.insert(Copy);
+        TF.ByvalCopies.push_back({&A, Len});
       }
       TF.readMovedArgs();
     }
@@ -3129,7 +3147,13 @@ bool Taint::runImpl(Module &M) {
     // under UCSan clears UCSan's shadow there too (__ucsan_lib_frame_exit):
     // a custom wrapper's out-parameter, or an in-scope callee storing through
     // a pointer to a local, left a UC object's label in it.
-    if (!TF.FrameAllocas.empty()) {
+    // A byval parameter's copy is on the stack too, in the caller's outgoing
+    // arguments, and __taint_byval_copy gave it its source's shadow, an
+    // uninitialized padding byte's kInitializingLabel with it: cleared the
+    // same way (CppHeap's ctor's copy was the slot where a builtin later put
+    // Runtime_JSReceiverGetPrototypeOf's argument, a UBI cascade in v8's
+    // ValueSerializer tests).
+    if (!TF.FrameAllocas.empty() || !TF.ByvalCopies.empty()) {
       for (BasicBlock &BB : *F) {
         Instruction *Term = BB.getTerminator();
         if (!Term || !(isa<ReturnInst>(Term) || isa<ResumeInst>(Term)))
@@ -3139,6 +3163,11 @@ bool Taint::runImpl(Module &M) {
           IRB.CreateCall(TaintSetLabelFn, {ZeroPrimitiveShadow, AI, Size});
           if (TF.UCSanLib)
             IRB.CreateCall(UCSanLibFrameExitFn, {AI, Size});
+        }
+        for (auto &[A, Size] : TF.ByvalCopies) {
+          IRB.CreateCall(TaintSetLabelFn, {ZeroPrimitiveShadow, A, Size});
+          if (TF.UCSanLib)
+            IRB.CreateCall(UCSanLibFrameExitFn, {A, Size});
         }
       }
     }
@@ -3570,6 +3599,30 @@ bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
           ShadowTLSAlignment, "_dfsret");
       SkipInsts.insert(LI);
       setShadow(CI, LI);
+    }
+  }
+
+  // SymSan's half of a free.  UCSan's wrapper marks only UCSan's label freed,
+  // so after it (its own checks, a double free, go first) the pointer's bounds
+  // label is marked too: an in-scope use of an object library code allocated
+  // has only SymSan's to be a UAF by.  Library code's frees tell SymSan
+  // through their __dfsl_ adapters.
+  bool IsFree = BaseName == "free" || BaseName == "__libc_free" ||
+                BaseName.starts_with("_ZdlPv") || BaseName.starts_with("_ZdaPv");
+  bool IsRealloc = BaseName == "realloc" || BaseName == "__libc_realloc" ||
+                   BaseName == "reallocarray" ||
+                   BaseName == "__libc_reallocarray";
+  if ((IsFree || IsRealloc) && CI->arg_size() > 0 &&
+      CI->getArgOperand(0)->getType()->isPointerTy()) {
+    Value *Ptr = CI->getArgOperand(0);
+    Value *Shadow = getShadow(Ptr);
+    if (!TT.isZeroShadow(Shadow)) {
+      IRBuilder<> IRB(LI ? LI->getNextNode() : Next);
+      CallInst *R = IRB.CreateCall(
+          TT.TaintReleaseObjectFn,
+          {Ptr, Shadow, IRB.getInt1(IsFree),
+           ConstantPointerNull::get(TT.VoidPtrTy)});
+      SkipInsts.insert(R);
     }
   }
 
@@ -5946,11 +5999,23 @@ matchReadOnlyTable(const GlobalVariable *GV, uint64_t ByteOffset,
 // checks each leaf).  Used so Base = select(gep @A,0,field, gep @B,0,field)
 // still resolves to offsetof(field).
 static bool tableOffsetFromGV(Value *V, const GlobalVariable *GV,
-                              const DataLayout &DL, int64_t &Off) {
+                              const DataLayout &DL, int64_t &Off,
+                              SmallPtrSetImpl<Value *> &Visited, bool &Cycle) {
   int64_t ConstOff = 0;
   Value *Base = GetPointerBaseWithConstantOffset(V, ConstOff, DL);
   if (ConstOff < 0)
     return false;
+  // A loop's phi reaches itself (p = phi(@T + off, p + 1)): the walk recursed
+  // until the stack ran out (v8's absl numbers.cc, flags.cc), and a pointer
+  // that moves has no one offset anyway
+  // (Visited is the path from the query: a value two arms share is no cycle)
+  if (isa<SelectInst>(Base) || isa<PHINode>(Base)) {
+    if (!Visited.insert(Base).second) {
+      Cycle = true;
+      return false;
+    }
+  }
+  auto Leave = make_scope_exit([&] { Visited.erase(Base); });
   if (auto *G = dyn_cast<GlobalVariable>(Base)) {
     if (G != GV)
       return false;
@@ -5961,8 +6026,10 @@ static bool tableOffsetFromGV(Value *V, const GlobalVariable *GV,
     // Arms may point at *different* encoding globals; only the arm(s) that
     // resolve to GV contribute.  If both do, they must agree on the offset.
     int64_t OffT = 0, OffF = 0;
-    bool OkT = tableOffsetFromGV(Sel->getTrueValue(), GV, DL, OffT);
-    bool OkF = tableOffsetFromGV(Sel->getFalseValue(), GV, DL, OffF);
+    bool OkT = tableOffsetFromGV(Sel->getTrueValue(), GV, DL, OffT, Visited,
+                                 Cycle);
+    bool OkF = tableOffsetFromGV(Sel->getFalseValue(), GV, DL, OffF, Visited,
+                                 Cycle);
     if (OkT && OkF && OffT != OffF)
       return false;
     if (!OkT && !OkF)
@@ -5975,7 +6042,8 @@ static bool tableOffsetFromGV(Value *V, const GlobalVariable *GV,
     int64_t Off0 = 0;
     for (unsigned i = 0, e = PHI->getNumIncomingValues(); i < e; ++i) {
       int64_t OffI = 0;
-      if (!tableOffsetFromGV(PHI->getIncomingValue(i), GV, DL, OffI))
+      if (!tableOffsetFromGV(PHI->getIncomingValue(i), GV, DL, OffI, Visited,
+                             Cycle))
         continue;
       if (!Have) {
         Off0 = OffI;
@@ -5990,6 +6058,13 @@ static bool tableOffsetFromGV(Value *V, const GlobalVariable *GV,
     return true;
   }
   return false;
+}
+
+static bool tableOffsetFromGV(Value *V, const GlobalVariable *GV,
+                              const DataLayout &DL, int64_t &Off) {
+  SmallPtrSet<Value *, 8> Visited;
+  bool Cycle = false;
+  return tableOffsetFromGV(V, GV, DL, Off, Visited, Cycle) && !Cycle;
 }
 
 // P1: every underlying object of Base must be a GlobalVariable that carries
@@ -6192,6 +6267,47 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
     }
   }
 
+  // p + (q - r), r in p's object, moves p into q's: v8's Assembler::GrowBuffer
+  // takes its pc_ to the new buffer as `pc_ += new_start - buffer_start_`.  A
+  // bounds label does not survive ptrtoint, so the difference has none, and
+  // the result kept p's -- the old, freed buffer's: every emit after a grow
+  // was a UAF.  When r's label is p's, the result is q's, and so is the base
+  // its offset is taken from.
+  Value *OffBase = Base;
+  if (I->getNumIndices() == 1 && !TT.isZeroShadow(Shadow)) {
+    Value *Idx = I->getOperand(1);
+    // (through a width change, and a typed pointer's exact division)
+    while (true) {
+      if (auto *C = dyn_cast<CastInst>(Idx);
+          C && (isa<SExtInst>(C) || isa<ZExtInst>(C) || isa<TruncInst>(C)))
+        Idx = C->getOperand(0);
+      else if (auto *D = dyn_cast<BinaryOperator>(Idx);
+               D && D->isExact() && isa<ConstantInt>(D->getOperand(1)) &&
+               (D->getOpcode() == Instruction::SDiv ||
+                D->getOpcode() == Instruction::UDiv ||
+                D->getOpcode() == Instruction::AShr ||
+                D->getOpcode() == Instruction::LShr))
+        Idx = D->getOperand(0);
+      else
+        break;
+    }
+    auto *Sub = dyn_cast<BinaryOperator>(Idx);
+    auto *Q = Sub && Sub->getOpcode() == Instruction::Sub
+                  ? dyn_cast<PtrToIntInst>(Sub->getOperand(0)) : nullptr;
+    auto *R = Sub && Sub->getOpcode() == Instruction::Sub
+                  ? dyn_cast<PtrToIntInst>(Sub->getOperand(1)) : nullptr;
+    Value *RShadow = R ? getShadow(R->getPointerOperand()) : nullptr;
+    if (Q && RShadow && !TT.isZeroShadow(RShadow)) {
+      Value *QPtr = Q->getPointerOperand();
+      Value *Moved = IRB.CreateAnd(
+          IRB.CreateICmpEQ(Shadow, RShadow),
+          IRB.CreateICmpNE(RShadow, TT.ZeroPrimitiveShadow));
+      Shadow = IRB.CreateSelect(Moved, getShadow(QPtr), Shadow);
+      OffBase = IRB.CreateSelect(Moved, IRB.CreateBitOrPointerCast(QPtr, TT.VoidPtrTy),
+                                 IRB.CreateBitOrPointerCast(Base, TT.VoidPtrTy));
+    }
+  }
+
   // we need to check GEP for two reasons:
   // 1. For constant offset GEPs on string op pointers, create fstr_off label
   // to track the offset (e.g., sep + 1 where sep is from strchr)
@@ -6200,7 +6316,7 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
     IRBuilder<> IRB(I->getNextNode());
     Shadow = IRB.CreateCall(TT.TaintGEPOffsetFn,
         {Shadow, IRB.CreateBitOrPointerCast(I, TT.VoidPtrTy),
-                 IRB.CreateBitOrPointerCast(Base, TT.VoidPtrTy)});
+                 IRB.CreateBitOrPointerCast(OffBase, TT.VoidPtrTy)});
   }
 
   setShadow(I, Shadow);
@@ -7474,9 +7590,13 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
 
   // handle ucsan_check_pointer / ucsan_uncheck_pointer: both return a pointer
   // that aliases their first argument (real<->pseudo translation), so the
-  // symsan taint label flows straight through from arg 0.
+  // symsan taint label flows straight through from arg 0.  So does
+  // ucsan_check_lib_arg, ucsan_check_pointer for a library callee's argument
+  // (missing here, every pointer in-scope code passed library code lost its
+  // label: its bounds, and library code's free no longer marked it freed).
   if (F && ClWithUCSan &&
       (F->getName().equals("ucsan_check_pointer") ||
+       F->getName().equals("ucsan_check_lib_arg") ||
        F->getName().equals("ucsan_uncheck_pointer"))) {
     // just propagate the label
     Value *Shadow = TF.getShadow(CB.getArgOperand(0));

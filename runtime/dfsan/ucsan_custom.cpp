@@ -55,12 +55,34 @@ extern "C" {
 
 extern "C" {
 
+// Set by a library allocation's __dfsl_ adapter (DFSL_ALLOC_CALL) for the
+// wrapper it calls: see create_alloca_label.
+static bool lib_alloc;
+
 // Helper to create an alloca-style bounds label for heap allocations
 // Also sets shadow memory to kUninitializedLabel for UBI detection
+// (Library code's allocation gets no UCSan label: library code keeps none,
+// so the label never reached a pointer -- the adapter dropped it, and the
+// library's stores of the pointer leave its slot concrete -- and only used up
+// the 16-bit labels, 61% of them in v8's PreParserScopeAnalysis, which ran
+// out.  Its memory is still painted uninitialized, for in-scope reads, and
+// its bounds are SymSan's label's.)
 static ucsan_label create_alloca_label(void *ptr, size_t size, bool set_uninitialized) {
   if (ptr == nullptr) {
     // clear retval TLS for null pointer (no label, no bounds)
     __taint_set_retval_tls(0, 0, sizeof(void*) * 8);
+    return UCSAN_CONST_LABEL;
+  }
+
+  if (lib_alloc) {
+    lib_alloc = false;
+    if (set_uninitialized) {
+      ucsan_label *shadow = ucsan_shadow_for(ptr);
+      for (size_t i = 0; i < size; i++)
+        shadow[i] = kUninitializedLabel;
+    }
+    dfsan_label bounds = __taint_get_ptr_bounds_label(nullptr, (u64)ptr, (u64)ptr + size);
+    __taint_set_retval_tls(0, bounds, sizeof(void*) * 8);
     return UCSAN_CONST_LABEL;
   }
 
@@ -178,6 +200,7 @@ void *__dfsw_realloc(void *ptr, size_t size, ucsan_label ptr_label,
         ucsan_obj_info *old_obj = to_obj_info(old_info);
         if (old_obj->op == OP_ALLOCA) {
           old_obj->op = OP_FREE;  // Mark old buffer as freed
+          ucsan_retire_label(ptr_label);
         }
         old_size = old_obj->upper_bound - old_obj->lower_bound;
         if (ptr != old_obj->real_ptr) {
@@ -269,6 +292,9 @@ void __dfsw_free(void *ptr, ucsan_label ptr_label) {
       ucsan_mark_obj_freed(obj_label);
     }
     if (info->common.op == OP_ALLOCA || info->common.op == OP_EXTERNAL) {
+      // (only a heap object's label is taken back: see allocate_label)
+      if (info->common.op == OP_ALLOCA)
+        ucsan_retire_label(ptr_label);
       info->common.op = OP_FREE;
     } else if (info->common.op == OP_FREE) {
       UCSAN_OUT("WARNING: double free detected for ptr %p, label %d\n", ptr, ptr_label);
@@ -1554,30 +1580,45 @@ int __dfsw___cxa_atexit(void (*fn)(void *), void *arg, void *dso,
     *(ret_label) = __taint_get_retval_tls(0);                                  \
     ret;                                                                       \
   })
+// ...and for an allocation: no UCSan label for it (see create_alloca_label;
+// cleared after, for a wrapper that took no path to it)
+#define DFSL_ALLOC_CALL(ret_label, call)                                       \
+  ({                                                                           \
+    lib_alloc = true;                                                          \
+    auto ret = DFSL_CALL(ret_label, call);                                     \
+    lib_alloc = false;                                                         \
+    ret;                                                                       \
+  })
+// SymSan's half of a free: the object's bounds label marked freed (see
+// dfsan_custom.cpp's __taint_release_object)
+extern "C" void __taint_release_object(void *ptr, dfsan_label ptr_label,
+                                       bool is_free, void *addr);
 
 __attribute__((visibility("default")))
 void *__dfsl_malloc(size_t size, dfsan_label size_label,
                     dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_malloc(size, 0, &l));
+  return DFSL_ALLOC_CALL(ret_label, __dfsw_malloc(size, 0, &l));
 }
 
 __attribute__((visibility("default")))
 void *__dfsl_calloc(size_t nmemb, size_t size, dfsan_label nmemb_label,
                     dfsan_label size_label, dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_calloc(nmemb, size, 0, 0, &l));
+  return DFSL_ALLOC_CALL(ret_label, __dfsw_calloc(nmemb, size, 0, 0, &l));
 }
 
 __attribute__((visibility("default")))
 void *__dfsl_realloc(void *ptr, size_t size, dfsan_label ptr_label,
                      dfsan_label size_label, dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_realloc(ptr, size, 0, 0, &l));
+  void *ret = DFSL_ALLOC_CALL(ret_label, __dfsw_realloc(ptr, size, 0, 0, &l));
+  __taint_release_object(ptr, ptr_label, false, __builtin_return_address(0));
+  return ret;
 }
 
 __attribute__((visibility("default")))
 void *__dfsl_aligned_alloc(size_t alignment, size_t size,
                            dfsan_label alignment_label, dfsan_label size_label,
                            dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label, __dfsw_aligned_alloc(alignment, size, 0, 0, &l));
+  return DFSL_ALLOC_CALL(ret_label, __dfsw_aligned_alloc(alignment, size, 0, 0, &l));
 }
 
 // (library code's objects have no UCSan label: the C library's size)
@@ -1591,14 +1632,15 @@ __attribute__((visibility("default")))
 int __dfsl_posix_memalign(void **memptr, size_t alignment, size_t size,
                           dfsan_label memptr_label, dfsan_label alignment_label,
                           dfsan_label size_label, dfsan_label *ret_label) {
-  return DFSL_CALL(ret_label,
-                   __dfsw_posix_memalign(memptr, alignment, size, 0, 0, 0, &l));
+  return DFSL_ALLOC_CALL(ret_label,
+                         __dfsw_posix_memalign(memptr, alignment, size, 0, 0, 0, &l));
 }
 
 // (with no UCSan label, UCSan's free does nothing: it never frees)
 __attribute__((visibility("default")))
 void __dfsl_free(void *ptr, dfsan_label ptr_label) {
   __dfsw_free(ptr, 0);
+  __taint_release_object(ptr, ptr_label, true, __builtin_return_address(0));
 }
 
 // The file I/O adapters.  UCSan's wrappers simulate one symbolic file, and a

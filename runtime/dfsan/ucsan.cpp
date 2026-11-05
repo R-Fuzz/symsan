@@ -613,7 +613,43 @@ void check_label(ucsan_label label) {
   }
 }
 
+// Freed heap objects' labels, oldest first.  A freed label stays OP_FREE --
+// a use through it is a UAF -- for as long as the labels last, a quarantine:
+// only once the heap's would come within kStackReserve of the stack's does
+// allocate_label take the oldest back.  (v8's PreParserScopeAnalysis frees
+// 57k of the 63k objects it allocates, in a loop, and ran out.)  A pointer
+// left dangling past that names the label's new object: its use is an OOB
+// against that object, not a UAF.  Only an object malloc's wrappers made
+// (OP_ALLOCA): an external pointer's object is named by its other pointer
+// labels and the freed bitmap, so its label is never taken back.
+static ucsan_label __ucsan_freed_labels[1u << (8 * sizeof(ucsan_label))];
+static uint32_t __ucsan_freed_head, __ucsan_freed_tail;
+// labels kept for the stack, which the heap's are not taken from first
+static const uint32_t kStackReserve = 4096;
+
+void ucsan_retire_label(ucsan_label label) {
+  // a heap label: a stack object's is the frame's, and goes with it
+  if (label <= UCSAN_CONST_LABEL ||
+      label > atomic_load(&__ucsan_last_label, memory_order_relaxed))
+    return;
+  // (each label is in the queue at most once, while it is OP_FREE, so the
+  // queue -- one slot per label -- never overflows)
+  __ucsan_freed_labels[__ucsan_freed_tail++ % (1u << (8 * sizeof(ucsan_label)))] = label;
+}
+
 ucsan_label allocate_label() {
+  uint32_t last = atomic_load(&__ucsan_last_label, memory_order_relaxed);
+  while (last + 1 + kStackReserve >= __alloca_stack_top &&
+         __ucsan_freed_head != __ucsan_freed_tail) {
+    ucsan_label label = __ucsan_freed_labels[__ucsan_freed_head++ %
+                                             (1u << (8 * sizeof(ucsan_label)))];
+    ucsan_label_info *info = get_label_info(label);
+    if (info->common.op != OP_FREE)
+      continue;
+    internal_memset(info, 0, sizeof(*info));
+    UCSAN_OUT("allocate_label: reusing freed label %u\n", label);
+    return label;
+  }
   ucsan_label label = atomic_fetch_add(&__ucsan_last_label, 1, memory_order_relaxed) + 1;
   check_label(label);
   return label;
@@ -966,10 +1002,15 @@ static char *align_object(ucsan_obj_info *obj, ucsan_label obj_label,
   return move_object(obj, need);
 }
 
+// Set by ucsan_check_lib_arg for the one check it hands on (see there).
+static bool check_lib_arg;
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool dereferencing, uint32_t type_id, uint32_t align) {
   UCSAN_OUT("%p: label: %d, size: %zu, dereferencing: %d, type_id: %u\n", p, label, size, dereferencing, type_id);
   __ucsan_null_deref_flag = nullptr;
+  bool lib_arg = check_lib_arg;
+  check_lib_arg = false;
 
   // Global variable handling
   // Only for a pointer the program got from a global itself: no label, or
@@ -1077,8 +1118,15 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       exit(exit_reason::REASON_OBJ_OOB);
     }
     // Null dereference checking
+    // (a library callee's argument is a value the callee decides what to do
+    // with: an unlabeled one in the null range is no dereference yet -- cppgc's
+    // conservative stack scan hands each stack word, small integers too, to
+    // TryFindNode, which only compares it with node ranges.  If the callee
+    // does dereference it, the fault is reported as one, at this call: the
+    // flag the segfault handler reads.)
     if (dereferencing && ucsan_flags().checker_nullderef) {
-      if ((uint64_t)p < size || (uint64_t)p < ucsan_object_size_limit()) {
+      if (!lib_arg &&
+          ((uint64_t)p < size || (uint64_t)p < ucsan_object_size_limit())) {
         // Trace null dereference event
         __taint_trace_event_addr(label, EVENT_NULL_DEREF, 0, __builtin_return_address(0), 0);
         exit(exit_reason::EVENT_NULL_DEREF);
@@ -1154,7 +1202,12 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
       uint64_t ptr_addr = (uint64_t)p;
       uint64_t offset = ptr_addr - lower;
       uint64_t object_size = upper - lower;
-      if (ptr_addr < lower || offset >= object_size ||
+      // A check for no size (a pointer handed to a callee that decides what
+      // it reads, or a 0-byte copy) may point at the end: one past the
+      // object is a value, an end iterator's (v8's ~HandleScope passes its
+      // block's limit to CloseScope).  An access of any size there is OOB.
+      if (ptr_addr < lower || offset > object_size ||
+          (size != 0 && offset == object_size) ||
           size > object_size - offset) {
         UCSAN_OUT("ERROR: OOB access ptr %p, lower = %p, upper = %p, size = %zu, label = %u, deref=%d\n",
                   p, (void*)lower, (void*)upper, size, label, dereferencing);
@@ -1441,6 +1494,18 @@ void* ucsan_check_pointer(void* p, ucsan_label label, size_t size, bool derefere
 
   UCSAN_OUT("Unknown pointer state: %d\n", ptr_info->status);
   return nullptr;
+}
+
+// A pointer argument of a library callee (UCSanPass's checkPointerUnlessNull):
+// ucsan_check_pointer's check, but an unlabeled value in the null range is no
+// null dereference, only the site a fault in the callee is reported at.  A
+// tail call, so that the return address every report takes is the
+// instrumented call site's.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void* ucsan_check_lib_arg(void* p, ucsan_label label, size_t size, bool dereferencing, uint32_t type_id, uint32_t align) {
+  check_lib_arg = true;
+  [[clang::musttail]] return ucsan_check_pointer(p, label, size, dereferencing,
+                                                 type_id, align);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -2710,6 +2775,16 @@ ucsan_label ucsan_trace_alloca(uint64_t size, uint64_t elem_size, uint64_t addr)
   void *ptr = (void*)addr;
 
   // Allocate label from stack top (grows downward)
+  // (toward the heap's, which grow up: allocate_label checks a heap label
+  // against the stack's top when it takes one, and a frame that would take a
+  // label the heap holds has run out as well -- unchecked, a deeper call made
+  // the heap object's label its local's, and a later use of the object was an
+  // OOB against that local: v8's PreParserScopeAnalysis after 65k labels)
+  if ((uint32_t)__alloca_stack_top - 1 <=
+      atomic_load(&__ucsan_last_label, memory_order_relaxed)) {
+    Report("FATAL: UCSan: exhausted labels\n");
+    Die();
+  }
   __alloca_stack_top -= 1;
   ucsan_label label = __alloca_stack_top;
 

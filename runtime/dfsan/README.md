@@ -74,7 +74,21 @@ dfsan label UCSan's wrapper set in retval TLS slot 0, which is the label an
 in-scope call reads.  It clears the slot first, because not every path of
 UCSan's wrappers sets it.  A library `free` therefore has no UCSan label, and
 UCSan's `free` does nothing with it.  UCSan never really frees, so an object
-freed inside libc++ is not tracked for use-after-free.
+freed inside libc++ is not tracked for use-after-free by UCSan.
+
+SymSan tracks it.  A library allocation gets no UCSan label at all, but it
+does get a SymSan bounds label, like every allocation.  In the combined
+build `free` and `realloc` are UCSan's wrappers, which never touch SymSan's
+labels, so each free also tells SymSan (`__taint_release_object`, in
+dfsan_custom.cpp under `USE_UCSAN_CUSTOM`):
+- library code's free: its `__dfsl_free`/`__dfsl_realloc` adapter, which has
+  the pointer's dfsan label;
+- in-scope code's free, `delete` or `realloc`: a call TaintPass emits after
+  UCSan's wrapper, so UCSan's own checks (a double free) go first.
+
+So an in-scope use after free is a UAF whichever side allocated or freed the
+object: UCSan's label for in-scope/in-scope, SymSan's for the rest.  The
+tests: `tests/ucsan/test/lib_free_*.c`, `lib_alloc_scope_free_uaf.c`.
 
 This is not specific to libc++: any TaintPass-only library linked into a
 combined binary works the same way.  A call to a UCSan `custom` function

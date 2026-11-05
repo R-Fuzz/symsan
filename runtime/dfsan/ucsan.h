@@ -367,6 +367,10 @@ ucsan_label_info* get_label_info(ucsan_label label);
 // Allocate a new label
 ucsan_label allocate_label();
 
+// A freed heap object's label (OP_FREE), for allocate_label to take back once
+// the labels run low
+void ucsan_retire_label(ucsan_label label);
+
 // Check if label is valid
 void check_label(ucsan_label label);
 
@@ -461,6 +465,11 @@ SANITIZER_INTERFACE_ATTRIBUTE void ucsan_materialize_range(void *addr, uint64_t 
 // @return: resolved real pointer (may differ from p for pseudo-pointers)
 SANITIZER_INTERFACE_ATTRIBUTE
 void* ucsan_check_pointer(void* p, __ucsan::ucsan_label label, size_t size, bool dereferencing, uint32_t type_id, uint32_t align);
+
+// ucsan_check_pointer for a library callee's pointer argument: an unlabeled
+// value in the null range is no null dereference (see ucsan.cpp)
+SANITIZER_INTERFACE_ATTRIBUTE
+void* ucsan_check_lib_arg(void* p, __ucsan::ucsan_label label, size_t size, bool dereferencing, uint32_t type_id, uint32_t align);
 
 // Inverse of ucsan_check_pointer: translate a real (materialized) pointer back
 // into the UC pseudo-pointer space, using the pointer's label to find the

@@ -171,6 +171,19 @@ static void dfsan_check_label(dfsan_label label) {
   }
 }
 
+// Checks a label just taken from __dfsan_last_label.  The union labels grow
+// up toward the alloca (stack bounds) labels, which grow down from the table's
+// end: a new one at or above __alloca_stack_top has run out.  (dfsan_check_label
+// takes any label in the alloca range for a valid alloca label, as an existing
+// one is, so the union node was written over a live alloca's bounds; with no
+// alloca, the labels past the table's end were taken too.)
+static void dfsan_check_new_label(dfsan_label label) {
+  if (label >= __alloca_stack_top) {
+    Report("FATAL: Taint: out of labels\n");
+    Die();
+  }
+}
+
 // based on https://github.com/Cyan4973/xxHash
 // simplified since we only have 12 bytes info
 static inline uint32_t xxhash(uint32_t h1, uint32_t h2, uint32_t h3) {
@@ -234,7 +247,7 @@ static inline bool is_valid_op(uint16_t op) {
 static inline dfsan_label add_taint_info(dfsan_label_info *info) {
   dfsan_label label =
     atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
-  dfsan_check_label(label);
+  dfsan_check_new_label(label);
 
   AOUT("%u = (%u, %u, %u, %u, %lu, %lu)\n", label, info->l1, info->l2,
        info->op, info->size, info->op1.i, info->op2.i);
@@ -1574,6 +1587,14 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size,
                                  uint64_t elem_size, uint64_t base) {
   if (flags().trace_bounds) {
+    // (toward the union labels, which grow up: dfsan_check_new_label checks
+    // theirs against the stack's top, and a frame that would take a label
+    // they hold has run out as well -- unchecked, it reset a live node)
+    if (__alloca_stack_top - 1 <=
+        atomic_load(&__dfsan_last_label, memory_order_relaxed)) {
+      Report("FATAL: Taint: out of labels\n");
+      Die();
+    }
     __alloca_stack_top -= 1;
     AOUT("label = %d, base = %p, size = %lu, elem_size = %lu\n",
         __alloca_stack_top, (void*)base, size, elem_size);
@@ -1625,7 +1646,7 @@ dfsan_label __taint_trace_global(uint64_t addr, uint64_t size) {
 
     dfsan_label label =
       atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
-    dfsan_check_label(label);
+    dfsan_check_new_label(label);
     internal_memcpy(&__dfsan_label_info[label], &label_info, sizeof(dfsan_label_info));
     __union_table.insert(&__dfsan_label_info[label], label);
 
@@ -2057,7 +2078,7 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label dfsan_create_label(uint64_t input_id, uint64_t offset, uint32_t size_in_bytes) {
   dfsan_label label =
     atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
-  dfsan_check_label(label);
+  dfsan_check_new_label(label);
   AOUT("creating label %u: input %lu, offset %lu, size %u\n",
        label, input_id, offset, size_in_bytes);
   internal_memset(&__dfsan_label_info[label], 0, sizeof(dfsan_label_info));

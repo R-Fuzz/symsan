@@ -45,6 +45,7 @@
 #include <wchar.h>
 
 #include "dfsan.h"
+#include "ucsan_exit_reason.h"
 
 #include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_internal_defs.h"
@@ -469,6 +470,47 @@ static dfsan_label_info *released_object(dfsan_label ptr_label, void *ptr,
   }
   return dfsan_get_label_info(ptr_label);
 }
+
+// Marks the object freed (trace_bounds): its memory is kept, so the address
+// is never handed out again and a later use is a UAF.  A free of one already
+// freed is a double free; a realloc of one only warns.
+static void release_object(dfsan_label ptr_label, void *ptr, void *addr,
+                           bool is_free) {
+  dfsan_label_info *info = released_object(ptr_label, ptr, addr);
+  if (!info) {
+    // (reported)
+  } else if (info->op == Alloca) {
+    info->op = Free;
+  } else if (is_free && info->op == Free) {
+    AOUT("WARNING: double free %p = %d @%p\n", ptr, ptr_label, addr);
+    __taint_trace_memerr(ptr_label, (uptr)ptr, 0, 0, F_MEMERR_FREE, addr);
+  } else {
+    AOUT("WARNING: wrong ptr op %d = %d @%p\n", ptr_label, info->op, addr);
+    // Die();
+  }
+}
+
+#ifdef USE_UCSAN_CUSTOM
+// In the combined runtime free and realloc are UCSan's wrappers, which know
+// nothing of SymSan's labels: every object's bounds label (in-scope and
+// library allocations both have one) stayed Alloca, and SymSan saw no UAF.
+// So each free tells SymSan too: library code's through its __dfsl_ adapter,
+// which has the label, and in-scope code's by a call TaintPass emits after
+// UCSan's wrapper (whose own checks go first).  addr: the call site, or null
+// for this function's caller.  An uninitialized pointer (kInitializingLabel)
+// is UCSan's to report, not SymSan's.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_release_object(void *ptr, dfsan_label ptr_label, bool is_free,
+                       void *addr) {
+  if (!ptr || ptr_label == 0 || ptr_label == kInitializingLabel ||
+      !flags().trace_bounds)
+    return;
+  if (!addr)
+    addr = __builtin_return_address(0);
+  AOUT("release: %p = %d @%p\n", ptr, ptr_label, addr);
+  release_object(ptr_label, ptr, addr, is_free);
+}
+#endif
 
 extern "C" {
 SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
@@ -1897,6 +1939,15 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_pthread_create(
     void *arg, dfsan_label thread_label,
     dfsan_label attr_label, dfsan_label start_routine_label,
     dfsan_label arg_label, dfsan_label *ret_label) {
+  // Threads are not supported: the event ring has one producer, and a second
+  // thread's records tear it (v8's DefaultPlatform workers: garbage message
+  // types, false OOBs in absl's CondVar).  The trace ends where the thread
+  // would start, with a reason of its own, unless allow_threads.
+  if (!flags().allow_threads) {
+    Report("FATAL: Taint: pthread_create: threads are not supported "
+           "(allow_threads=1 starts it)\n");
+    internal__exit(exit_reason::REASON_THREAD);
+  }
   pthread_create_info *pci =
       (pthread_create_info *)malloc(sizeof(pthread_create_info));
   pci->start_routine = start_routine;
@@ -4285,14 +4336,7 @@ __dfsw_realloc(void *ptr, size_t new_size,
     }
     if (flags().trace_bounds) {
       // mark old buffer as freed without truely free it
-      dfsan_label_info *info =
-          released_object(ptr_label, ptr, __builtin_return_address(0));
-      if (!info) {
-        // (reported)
-      } else if (info->op != Alloca) {
-        AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-        // Die();
-      } else info->op = Free;
+      release_object(ptr_label, ptr, __builtin_return_address(0), false);
     } else {
       free(ptr);
     }
@@ -4332,14 +4376,7 @@ __dfsw___libc_realloc(void *ptr, size_t new_size,
     }
     if (flags().trace_bounds) {
       // mark old buffer as freed without truely free it
-      dfsan_label_info *info =
-          released_object(ptr_label, ptr, __builtin_return_address(0));
-      if (!info) {
-        // (reported)
-      } else if (info->op != Alloca) {
-        AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-        // Die();
-      } else info->op = Free;
+      release_object(ptr_label, ptr, __builtin_return_address(0), false);
     } else {
       free(ptr);
     }
@@ -4386,14 +4423,7 @@ void *__dfsw_reallocarray(void *ptr, size_t nmemb, size_t new_size,
     }
     if (flags().trace_bounds) {
       // mark old buffer as freed without truely free it
-      dfsan_label_info *info =
-          released_object(ptr_label, ptr, __builtin_return_address(0));
-      if (!info) {
-        // (reported)
-      } else if (info->op != Alloca) {
-        AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-        // Die();
-      } else info->op = Free;
+      release_object(ptr_label, ptr, __builtin_return_address(0), false);
     } else {
       free(ptr);
     }
@@ -4439,14 +4469,7 @@ void *__dfsw___libc_reallocarray(void *ptr, size_t nmemb, size_t new_size,
     }
     if (flags().trace_bounds) {
       // mark old buffer as freed without truely free it
-      dfsan_label_info *info =
-          released_object(ptr_label, ptr, __builtin_return_address(0));
-      if (!info) {
-        // (reported)
-      } else if (info->op != Alloca) {
-        AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-        // Die();
-      } else info->op = Free;
+      release_object(ptr_label, ptr, __builtin_return_address(0), false);
     } else {
       free(ptr);
     }
@@ -4697,21 +4720,7 @@ SANITIZER_INTERFACE_ATTRIBUTE void __dfsw_free(void *ptr, dfsan_label ptr_label)
     // don't really free, a hacky way to avoid reusing the address
     // just mark as freed
     AOUT("addr: %p = %d\n", ptr, ptr_label);
-    dfsan_label_info *info =
-        released_object(ptr_label, ptr, __builtin_return_address(0));
-    if (!info) {
-      // (reported)
-    } else if (info->op == Alloca) {
-      info->op = Free;
-    } else if (info->op == Free) {
-      void *addr = __builtin_return_address(0);
-      AOUT("WARNING: double free %p = %d @%p\n", ptr, ptr_label, addr);
-      __taint_trace_memerr(ptr_label, (uptr)ptr, 0, 0, F_MEMERR_FREE, addr);
-    } else {
-      AOUT("WARNING: wrong ptr op %d = %d @%p\n", ptr_label, info->op,
-           __builtin_return_address(0));
-      // Die();
-    }
+    release_object(ptr_label, ptr, __builtin_return_address(0), true);
   } else {
     free(ptr);
   }
@@ -4733,20 +4742,7 @@ void __dfsw___libc_free(void *ptr, dfsan_label ptr_label) {
     // don't really free, a hacky way to avoid reusing the address
     // just mark as freed
     AOUT("addr: %p = %d\n", ptr, ptr_label);
-    dfsan_label_info *info =
-        released_object(ptr_label, ptr, __builtin_return_address(0));
-    if (!info) {
-      // (reported)
-    } else if (info->op == Alloca) {
-      info->op = Free;
-    } else if (info->op == Free) {
-      void *addr = __builtin_return_address(0);
-      AOUT("WARNING: double free %p = %d @%p\n", ptr, ptr_label, addr);
-      __taint_trace_memerr(ptr_label, (uptr)ptr, 0, 0, F_MEMERR_FREE, addr);
-    } else {
-      AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-      // Die();
-    }
+    release_object(ptr_label, ptr, __builtin_return_address(0), true);
   } else {
     free(ptr);
   }

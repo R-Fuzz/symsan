@@ -1,0 +1,2 @@
+fun:lib_in_range=uninstrumented
+fun:lib_deref=uninstrumented
