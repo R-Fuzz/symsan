@@ -8304,6 +8304,12 @@ bool UCSan::runImpl(Module &M) {
                           return !(F->isDeclaration() &&
                                    AsmDefinedFns.count(F->getName()));
                         });
+  // the module's thread_local declarations in use before the bodies go (not
+  // the pass's own, declared already and used only once instrumented)
+  SmallVector<GlobalVariable *, 8> UsedTLSDecls;
+  for (GlobalVariable &GV : M.globals())
+    if (GV.isDeclaration() && GV.isThreadLocal() && !GV.use_empty())
+      UsedTLSDecls.push_back(&GV);
   for (Function *F : FnsOutOfScope) {
     if (Function *dangle = buildDangleFunction(F)) {
       if (F->isDeclaration() && AsmDefinedFns.count(F->getName())) {
@@ -8379,6 +8385,17 @@ bool UCSan::runImpl(Module &M) {
       F->replaceAllUsesWith(dangle);
       F->eraseFromParent();
     }
+  }
+
+  // A thread_local declaration only an erased body used: a hidden one is
+  // still emitted, as an untyped undefined symbol, and GNU ld takes that for
+  // a non-TLS reference to a TLS symbol ("TLS reference ... mismatches
+  // non-TLS reference": v8's g_current_isolate_, read only by an
+  // out-of-scope Heap::CollectGarbage).
+  for (GlobalVariable *GV : UsedTLSDecls) {
+    GV->removeDeadConstantUsers();
+    if (GV->use_empty())
+      GV->eraseFromParent();
   }
 
   // check if we need to dump cov information

@@ -334,6 +334,10 @@ private:
   z3::expr get_byte_expr(uint32_t input, uint32_t offset, input_dep_set_t &deps);
   bool label_contains_indexof(dfsan_label label);
   bool label_contains_unvalued(dfsan_label label);
+  // their answers, per label: walked as a tree, a DAG that reuses its
+  // operands (v8's conservative stack scan) took exponential time
+  std::unordered_map<dfsan_label, bool> contains_indexof_memo_;
+  std::unordered_map<dfsan_label, bool> contains_unvalued_memo_;
 
   // Helper for linking bitvec and string constraints on shared offsets
   void add_string_bitvec_link(offset_t off, z3_task_t *task);

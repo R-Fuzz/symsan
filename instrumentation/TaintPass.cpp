@@ -4505,8 +4505,19 @@ void TaintFunction::hoistBoundsChecks() {
       symsan::ucsan::MemoryAccessSummary Summary;
     };
     SmallVector<UCSanCallSummary, 8> UCSanCallSummaries;
+    SmallVector<BasicBlock *, 4> Latches;
+    L->getLoopLatches(Latches);
     for (BasicBlock *BB : L->blocks()) {
       if (LI->getLoopFor(BB) != L) continue;
+      // only what every iteration does: the summary covers the access of
+      // each iteration up to the trip count, and one under a condition in the
+      // body (`index < n ? stub_targets[index] : ...` in a loop that runs past
+      // n, v8's JumpTableAssembler::GenerateFarJumpTable) was a false OOB on
+      // the iterations that skip it.  Not hoisted, it is checked where it is.
+      if (!all_of(Latches, [&](BasicBlock *Latch) {
+            return DT.dominates(BB, Latch);
+          }))
+        continue;
       for (Instruction &I : *BB) {
         auto *CI = dyn_cast<CallInst>(&I);
         if (!CI) continue;

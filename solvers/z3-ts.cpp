@@ -175,29 +175,30 @@ static inline bool is_content_string_op(uint16_t op) {
 // check over it compares against a placeholder.
 bool Z3AstParser::label_contains_unvalued(dfsan_label label) {
   if (label < CONST_OFFSET) return false;
+  auto it = contains_unvalued_memo_.find(label);
+  if (it != contains_unvalued_memo_.end()) return it->second;
 
   dfsan_label_info *info = get_label_info(label);
-  if (is_indexof_op(info->op) || info->op == __dfsan::fmemcmp ||
-      info->op == __dfsan::fatoi || info->op == __dfsan::fstrcmp)
-    return true;
-
-  if (info->l1 >= CONST_OFFSET && label_contains_unvalued(info->l1)) return true;
-  if (info->l2 >= CONST_OFFSET && label_contains_unvalued(info->l2)) return true;
-
-  return false;
+  bool r = is_indexof_op(info->op) || info->op == __dfsan::fmemcmp ||
+           info->op == __dfsan::fatoi || info->op == __dfsan::fstrcmp ||
+           (info->l1 >= CONST_OFFSET && label_contains_unvalued(info->l1)) ||
+           (info->l2 >= CONST_OFFSET && label_contains_unvalued(info->l2));
+  contains_unvalued_memo_[label] = r;
+  return r;
 }
 
 bool Z3AstParser::label_contains_indexof(dfsan_label label) {
   if (label < CONST_OFFSET) return false;
+  auto it = contains_indexof_memo_.find(label);
+  if (it != contains_indexof_memo_.end()) return it->second;
 
   dfsan_label_info *info = get_label_info(label);
-  if (is_indexof_op(info->op)) return true;
-
   // Recursively check dependencies
-  if (info->l1 >= CONST_OFFSET && label_contains_indexof(info->l1)) return true;
-  if (info->l2 >= CONST_OFFSET && label_contains_indexof(info->l2)) return true;
-
-  return false;
+  bool r = is_indexof_op(info->op) ||
+           (info->l1 >= CONST_OFFSET && label_contains_indexof(info->l1)) ||
+           (info->l2 >= CONST_OFFSET && label_contains_indexof(info->l2));
+  contains_indexof_memo_[label] = r;
+  return r;
 }
 
 // Decode Z3's escaped string format (e.g., "\u{1}\u{2}" -> bytes 0x01, 0x02)
@@ -339,6 +340,8 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
   is_label_seq_.clear();
   is_label_seq_.resize(1); // reserve for CONST_OFFSET
   poison_reason_.clear();
+  contains_indexof_memo_.clear();
+  contains_unvalued_memo_.clear();
 
   aux_constraints_.clear();
   minimize_hints_.clear();
