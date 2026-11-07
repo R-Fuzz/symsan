@@ -1,7 +1,9 @@
-from os import pipe, read, write, close, system, open, O_RDWR
+from os import pipe, read, write, close, system, open, O_RDWR, mkfifo, unlink, getpid
 from typing import Optional, TypeVar, Generic, Type
 from .message import MessageBase
 from uuid import uuid4
+import tempfile
+import os.path
 import logging
 
 TMessageBase = TypeVar('TMessageBase', bound=bytes)
@@ -9,9 +11,19 @@ logger = logging.getLogger(__name__)
 
 class Pipe(Generic[TMessageBase]):
     def __init__(self, flag="control_pipe_name", T: Type[TMessageBase] = MessageBase,  open_flag=0) -> None:
-        self.pipe_file = f"/tmp/pipe_{uuid4()}"
-        system(f"mkfifo {self.pipe_file}")
-        self.fd = open(self.pipe_file, O_RDWR | open_flag)
+        # The FIFO's name is unlinked as soon as it is open: the target opens
+        # it through /proc/<pid>/fd/<fd>, a link to this open pipe, not to a
+        # name in a directory.  So none is left behind however this process
+        # ends -- the runners leave with os._exit, which skips __del__, and a
+        # killed one never gets there (thousands of leaked /tmp/pipe_* FIFOs).
+        self.fd = None
+        fifo = os.path.join(tempfile.gettempdir(), f"pipe_{uuid4()}")
+        mkfifo(fifo)
+        try:
+            self.fd = open(fifo, O_RDWR | open_flag)
+        finally:
+            unlink(fifo)
+        self.pipe_file = f"/proc/{getpid()}/fd/{self.fd}"
         self.T = T
         self.flag = flag
 
@@ -36,8 +48,9 @@ class Pipe(Generic[TMessageBase]):
         write(self.fd, bytes(msg))
 
     def close(self):
-        close(self.fd)
-        system(f"rm {self.pipe_file}")
+        if self.fd is not None:
+            close(self.fd)
+            self.fd = None
 
     def __del__(self):
         self.close()
