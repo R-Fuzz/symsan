@@ -33,6 +33,10 @@
 #include <cstring>
 #include <cassert>
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
 using namespace __sanitizer;
 
 // Forward declarations for trace callbacks (implemented in solvers)
@@ -2888,6 +2892,139 @@ ucsan_label ucsan_trace_unsized_global(uint64_t addr) {
   return label;
 }
 
+// The program's own page mappings (mmap, munmap, mprotect: the interceptors,
+// dfsan_interceptors.cpp in the combined build, ucsan_interceptors.cpp
+// alone), as disjoint, sorted ranges of a state:
+//  - reserved: mapped inaccessible (PROT_NONE), not used since.  v8 reserves
+//    its address spaces so (a VirtualAddressSubspace, a SegmentedTable's)
+//    and commits pages inside with mprotect;
+//  - accessible: mapped or made accessible;
+//  - freed: accessible once, then decommitted -- remapped inaccessible
+//    (v8's OS::DecommitPages, mmap MAP_FIXED PROT_NONE), made inaccessible
+//    with mprotect (OS::SetPermissions kNoAccess), or unmapped.  An access
+//    there is a use after free (__ucsan_page_freed): the page is the object.
+// Two uses: an address in any of them is the program's memory, not a fixed
+// address (ucsan_int_to_pointer), and a fault in a freed range is a UAF
+// (__ucsan_page_freed).
+// Single-threaded, as the run is; past the table, nothing is tracked any more
+// (map_lost), and both fall back to the old behavior.
+enum MapState : u8 { kMapNone = 0, kMapReserved, kMapAccessible, kMapFreed };
+struct MapRange {
+  uptr beg, end;
+  MapState state;
+};
+static const unsigned kMaxMapRanges = 8192;
+static MapRange map_ranges[kMaxMapRanges];
+static MapRange map_scratch[2 * kMaxMapRanges + 3];
+static unsigned n_map_ranges;
+static bool map_lost;
+
+static MapState map_state(uptr a) {
+  unsigned lo = 0, hi = n_map_ranges;
+  while (lo < hi) {
+    unsigned mid = (lo + hi) / 2;
+    if (a < map_ranges[mid].beg) hi = mid;
+    else if (a >= map_ranges[mid].end) lo = mid + 1;
+    else return map_ranges[mid].state;
+  }
+  return kMapNone;
+}
+
+enum MapOp { kOpMap, kOpMapFixed, kOpUnmap, kOpProtect };
+
+// the state a page in state `old` has after `op` with `prot`
+static MapState map_next(MapState old, MapOp op, int prot) {
+  bool used = old == kMapAccessible || old == kMapFreed;
+  switch (op) {
+  case kOpMap:        // a fresh range: whatever was there is gone
+    return prot != PROT_NONE ? kMapAccessible : kMapReserved;
+  case kOpMapFixed:   // over what was there
+    if (prot != PROT_NONE) return kMapAccessible;
+    return used ? kMapFreed : kMapReserved;
+  case kOpUnmap:
+    return used ? kMapFreed : kMapNone;
+  case kOpProtect:    // only the program's own mappings
+    if (old == kMapNone) return kMapNone;
+    if (prot != PROT_NONE) return kMapAccessible;
+    return used ? kMapFreed : kMapReserved;
+  }
+  return old;
+}
+
+static void map_update(uptr beg, uptr len, MapOp op, int prot) {
+  if (map_lost || len == 0)
+    return;
+  uptr page = GetPageSizeCached();
+  uptr end = RoundUpTo(beg + len, page);
+  beg = RoundDownTo(beg, page);
+  unsigned n = 0;
+  auto put = [&](uptr b, uptr e, MapState s) {
+    if (b >= e || s == kMapNone) return;
+    if (n && map_scratch[n - 1].end == b && map_scratch[n - 1].state == s)
+      map_scratch[n - 1].end = e;
+    else
+      map_scratch[n++] = {b, e, s};
+  };
+  uptr cur = beg;  // [beg, cur) of the operation is done
+  bool done = false;
+  for (unsigned i = 0; i < n_map_ranges; ++i) {
+    MapRange r = map_ranges[i];
+    if (r.end <= beg || done) { put(r.beg, r.end, r.state); continue; }
+    if (r.beg >= end) {
+      put(cur, end, map_next(kMapNone, op, prot));
+      done = true;
+      put(r.beg, r.end, r.state);
+      continue;
+    }
+    put(r.beg, beg, r.state);                          // left of the operation
+    put(cur, r.beg, map_next(kMapNone, op, prot));     // a gap inside it
+    put(Max(r.beg, beg), Min(r.end, end), map_next(r.state, op, prot));
+    cur = Min(r.end, end);
+    put(end, r.end, r.state);                          // right of it
+  }
+  if (!done)
+    put(cur, end, map_next(kMapNone, op, prot));
+  if (n > kMaxMapRanges) {
+    map_lost = true;
+    n_map_ranges = 0;
+    return;
+  }
+  internal_memcpy(map_ranges, map_scratch, n * sizeof(MapRange));
+  n_map_ranges = n;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_note_mmap(void *addr, uptr len, int prot, int flags) {
+  map_update((uptr)addr, len,
+             (flags & MAP_FIXED) && !(flags & MAP_FIXED_NOREPLACE) ? kOpMapFixed
+                                                                  : kOpMap,
+             prot);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_note_munmap(void *addr, uptr len) {
+  map_update((uptr)addr, len, kOpUnmap, PROT_NONE);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_note_mprotect(void *addr, uptr len, int prot) {
+  map_update((uptr)addr, len, kOpProtect, prot);
+}
+
+// Whether a fault at `addr` is in a range the program freed (above): a use
+// after free, which the fault handler (thoroupy.cpp segfault_handler)
+// reports as one, at the faulting instruction.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+int __ucsan_page_freed(uptr addr) {
+  return map_state(addr) == kMapFreed;
+}
+
+// UCSan alone: its own interceptors for the map state above
+// (ucsan_interceptors.cpp; the combined build has dfsan's)
+#ifndef USE_UCSAN_CUSTOM
+extern "C" void __ucsan_install_map_interceptors();
+#endif
+
 // The pointer label of `inttoptr v` (op is v's label, width its bytes): a
 // pointer the program makes of an integer is one it could have loaded.
 //  - v is seed bytes (an OP_NONE byte label, as an integer load of them
@@ -2906,7 +3043,11 @@ ucsan_label ucsan_trace_unsized_global(uint64_t addr) {
 //    ERR_PTR, or a non-canonical address -- LIST_POISON and the like, which
 //    exist to fault when dereferenced.  (UCSanPass leaves a constant operand
 //    alone for the same reason: the kernel's constant pointers are those
-//    sentinels.)
+//    sentinels.)  Nor an address in a range the program mapped (map_state),
+//    accessible or not: a PROT_NONE reservation (v8's address spaces) is its
+//    memory too, whose pages it commits later -- as a pseudo object, its
+//    accesses went to the object, never to the pages, and one after a
+//    decommit read the object instead of faulting (a use after free).
 // Any other label is already a pointer's, or UBI's: it stays.
 // An invariant the code relies on (UCSanPass's assumeAsmCallTarget): a seed
 // that breaks it is no input the program can have -- the run ends, nothing
@@ -2941,6 +3082,8 @@ ucsan_label ucsan_int_to_pointer(uint64_t v, ucsan_label op, uint64_t width) {
     return 0;
   char *image = &__executable_start ? &__executable_start : &__dso_handle;
   if (image <= (char *)v && (char *)v <= &end)
+    return 0;
+  if (map_state(v) != kMapNone)
     return 0;
   if (top == 0 && IsAccessibleMemoryRange((uptr)v, 1))
     return 0;
@@ -3284,6 +3427,11 @@ void ucsan_init() {
 
   // which global bytes have been symbolized or written (see global_seen)
   init_global_seen();
+
+  // the program's page mappings (map_state), above the fork point
+#ifndef USE_UCSAN_CUSTOM
+  __ucsan_install_map_interceptors();
+#endif
 
   // Register cleanup callback
   // (above the fork point in InitializeUCSanSolver, so a child inherits the

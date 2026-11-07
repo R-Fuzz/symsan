@@ -66,6 +66,8 @@ static uint64_t __stack_frame_counter[STACK_FRAME_COUNTER_SIZE];
 static uint64_t __stack_frame_guid[STACK_FRAME_COUNTER_SIZE];
 
 extern void* __ucsan_null_deref_flag;
+// a fault in pages the program decommitted or unmapped (ucsan.cpp map_state)
+extern "C" int __ucsan_page_freed(uptr addr);
 
 // based on https://github.com/Cyan4973/xxHash
 // simplified since we only have 12 bytes info
@@ -345,6 +347,16 @@ __taint_trace_global_var(uint32_t obj_id, uint64_t offset, uint64_t size, void *
 
 static void segfault_handler(int sig, siginfo_t *si, void *ctx)
 {
+  // a use after free, reported at the faulting instruction: the access was
+  // through a pointer UCSan does not check (the program's own pages, not an
+  // object of its), so only the fault tells -- whatever the null-dereference
+  // flag says, which any unchecked dereference sets
+  if (__ucsan_page_freed((uptr)si->si_addr)) {
+    void *pc = (void *)((ucontext_t *)ctx)->uc_mcontext.gregs[REG_RIP];
+    AOUT("Use of freed pages at address: %p, pc: %p\n", si->si_addr, pc);
+    __taint_trace_event_addr(0, EVENT_UAF, 0, pc, 0);
+    internal__exit(EVENT_UAF);
+  }
   if (__ucsan_null_deref_flag) {
       AOUT("Poential Null dereference detected\n");
       __taint_trace_event_addr(0, EVENT_NULL_DEREF, 0, __ucsan_null_deref_flag, 0);

@@ -13,7 +13,8 @@ set(SYMSAN_RTL_SOURCES
 # UCSan sources (under-constrained execution, pointer/object tracking)
 set(UCSAN_RTL_SOURCES
   ucsan.cpp
-  ucsan_custom.cpp)
+  ucsan_custom.cpp
+  ucsan_interceptors.cpp)
 
 # Combined sources (both SymSan and UCSan)
 set(DFSAN_RTL_SOURCES

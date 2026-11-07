@@ -34,6 +34,14 @@ void ReleaseShadowMemoryPagesToOS(void *addr, SIZE_T length) {
 
 }
 
+#ifdef USE_UCSAN_CUSTOM
+// UCSan's page map (ucsan.cpp map_state): which ranges the program mapped,
+// and which it freed since, for a fault there to be a use after free
+extern "C" void __ucsan_note_mmap(void *addr, uptr len, int prot, int flags);
+extern "C" void __ucsan_note_munmap(void *addr, uptr len);
+extern "C" void __ucsan_note_mprotect(void *addr, uptr len, int prot);
+#endif
+
 INTERCEPTOR(void *, mmap, void *addr, SIZE_T length, int prot, int flags,
             int fd, OFF_T offset) {
   void *res = nullptr;
@@ -45,16 +53,24 @@ INTERCEPTOR(void *, mmap, void *addr, SIZE_T length, int prot, int flags,
   else
     res = REAL(mmap)(addr, length, prot, flags, fd, offset);
 
-  if (res != (void*)-1)
+  if (res != (void*)-1) {
     ReleaseShadowMemoryPagesToOS(res, length);
+#ifdef USE_UCSAN_CUSTOM
+    __ucsan_note_mmap(res, length, prot, flags);
+#endif
+  }
   return res;
 }
 
 INTERCEPTOR(void *, mmap64, void *addr, SIZE_T length, int prot, int flags,
             int fd, OFF64_T offset) {
   void *res = REAL(mmap64)(addr, length, prot, flags, fd, offset);
-  if (res != (void*)-1)
+  if (res != (void*)-1) {
     ReleaseShadowMemoryPagesToOS(res, length);
+#ifdef USE_UCSAN_CUSTOM
+    __ucsan_note_mmap(res, length, prot, flags);
+#endif
+  }
   return res;
 }
 
@@ -62,9 +78,21 @@ INTERCEPTOR(int, munmap, void *addr, SIZE_T length) {
   int res = REAL(munmap)(addr, length);
   if (res != -1) {
     ReleaseShadowMemoryPagesToOS(addr, length);
+#ifdef USE_UCSAN_CUSTOM
+    __ucsan_note_munmap(addr, length);
+#endif
   }
   return res;
 }
+
+#ifdef USE_UCSAN_CUSTOM
+INTERCEPTOR(int, mprotect, void *addr, SIZE_T length, int prot) {
+  int res = REAL(mprotect)(addr, length, prot);
+  if (res == 0)
+    __ucsan_note_mprotect(addr, length, prot);
+  return res;
+}
+#endif
 
 namespace __dfsan {
 void InitializeInterceptors() {
@@ -73,6 +101,9 @@ void InitializeInterceptors() {
   INTERCEPT_FUNCTION(mmap);
   INTERCEPT_FUNCTION(mmap64);
   INTERCEPT_FUNCTION(munmap);
+#ifdef USE_UCSAN_CUSTOM
+  INTERCEPT_FUNCTION(mprotect);
+#endif
 
   interceptors_initialized = true;
 }
