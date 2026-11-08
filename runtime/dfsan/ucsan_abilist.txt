@@ -48,6 +48,11 @@ fun:__cxa_guard_acquire=custom
 fun:__cxa_guard_release=custom
 fun:__cxa_guard_abort=custom
 
+# The runtime's: the program says a range is initialized (v8's
+# MSAN_MEMORY_IS_INITIALIZED in a SymSan/UCSan build).  Uninstrumented, not
+# discard: discard would replace the call with a stub.
+fun:__symsan_unpoison=uninstrumented
+
 # libc++'s hash-table bucket count, from its library (ucsan_custom.cpp)
 fun:_ZNSt3__112__next_primeEm=custom
 

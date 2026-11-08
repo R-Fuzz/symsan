@@ -36,6 +36,11 @@ fun:dfsan_has_label_with_desc=discard
 fun:dfsan_set_write_callback=uninstrumented
 fun:dfsan_set_write_callback=custom
 fun:dfsan_shadow_for=discard
+# the program says a range is initialized (runtime's __symsan_unpoison; v8's
+# MSAN_MEMORY_IS_INITIALIZED in a SymSan/UCSan build): the runtime gets the
+# address itself
+fun:__symsan_unpoison=uninstrumented
+fun:__symsan_unpoison=discard
 
 fun:dfsan_fun_init=uninstrumented
 fun:dfsan_fun_init=discard

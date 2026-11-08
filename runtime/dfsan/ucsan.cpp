@@ -71,6 +71,9 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_set_label(dfsan_label label, void *addr, uint64_t size);
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_unpoison(const void *addr, uint64_t size);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2);
 
@@ -1988,6 +1991,21 @@ void ucsan_set_label(ucsan_label label, void *addr, uint64_t size) {
   }
 }
 
+// [addr, addr + size) is initialized, the program says: what MSan's
+// __msan_unpoison is told (v8's MSAN_MEMORY_IS_INITIALIZED, whose builds for
+// SymSan/UCSan call this instead).  A conservative GC's stack scan copies
+// each slot, live or not, to a local and says so of the copy; its uninit
+// bytes become concrete, and any other label stays.  Then SymSan's shadow,
+// in the combined runtime (dfsan.cpp; SymSan alone has its own entry there).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __symsan_unpoison(const void *addr, uint64_t size) {
+  ucsan_label *shadow = ucsan_shadow_for(const_cast<void *>(addr));
+  for (uint64_t i = 0; i < size; ++i)
+    if (shadow[i] == kUninitializedLabel)
+      shadow[i] = 0;
+  __taint_unpoison(addr, size);
+}
+
 // A byval parameter's memory is the copy the call made, on the callee's
 // frame: the call copied the bytes, not their labels, and that shadow is
 // whatever an earlier frame left.  So the callee's prologue gives the copy its
@@ -3584,6 +3602,11 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_retval_tls, uint32_t, dfsan_label
 // @param addr: memory address
 // @param size: size in bytes
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_set_label, dfsan_label, void*, uint64_t) {}
+
+// Make SymSan's uninitialized labels in a region concrete (__symsan_unpoison)
+// @param addr: memory address
+// @param size: size in bytes
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_unpoison, const void*, uint64_t) {}
 
 // Make a SymSan expression label (op over l1/op1 and l2/op2)
 // @return: SymSan label (0 when standalone)

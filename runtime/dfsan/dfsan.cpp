@@ -3152,6 +3152,27 @@ void __taint_set_label(dfsan_label label, void *addr, uint64_t size) {
   dfsan_set_label(label, addr, size);
 }
 
+// The program says [addr, addr + size) is initialized (__symsan_unpoison):
+// its uninitialized bytes become concrete, any other label stays.
+// Overrides weak stub in ucsan.cpp
+SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_unpoison(const void *addr, uint64_t size) {
+  if (addr == 0) return;
+  for (dfsan_label *labelp = shadow_for(const_cast<void *>(addr)); size != 0;
+       --size, ++labelp)
+    if (*labelp == kInitializingLabel)
+      *labelp = 0;
+}
+
+#ifndef USE_UCSAN_CUSTOM
+// SymSan alone: the entry (ucsan.cpp's, in the combined runtime, also
+// clears UCSan's shadow)
+SANITIZER_INTERFACE_ATTRIBUTE
+void __symsan_unpoison(const void *addr, uint64_t size) {
+  __taint_unpoison(addr, size);
+}
+#endif
+
 // Copy SymSan shadow memory from src to dst
 // Overrides weak stub in ucsan.cpp
 SANITIZER_INTERFACE_ATTRIBUTE
