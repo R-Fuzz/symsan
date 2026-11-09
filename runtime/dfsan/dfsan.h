@@ -301,8 +301,34 @@ enum operators {
   cttz      = last_llvm_op + 45, // 112
   ctlz      = last_llvm_op + 46, // 113
   ctpop     = last_llvm_op + 47, // 114
-  LastOp    = last_llvm_op + 48, // 115
+  // A value some of whose bits are uninitialized and the rest not: a word that
+  // moves a padded struct reads the padding with the fields (v8's GCConfig,
+  // {u8, 3 bytes of padding, i32, ...}, passed as an i64, and its first field
+  // read as `and i64 %config, 255`).  The Concat of its bytes with the
+  // uninitialized ones as such, kept as l1, the value with those bits taken as
+  // the concrete bits they hold (a label, or 0), and op1, the bits that are
+  // uninitialized; size is the width, at most 64.  An operation reads it for
+  // the bits it depends on: none of them uninitialized, it is the operation
+  // on l1; some, the result is one again; all, kInitializingLabel.  Only a
+  // value has one -- memory keeps a label per byte, and a store gives an
+  // uninitialized byte kInitializingLabel -- and every runtime entry other
+  // than an operation takes it as kInitializingLabel (is_partly_uninit), so
+  // it is never part of an expression.
+  Uninit    = last_llvm_op + 48, // 115
+  LastOp    = last_llvm_op + 49, // 116
 };
+
+// a value's label that has some of its bits uninitialized (see Uninit)
+inline bool is_partly_uninit(dfsan_label label) {
+  return label >= CONST_OFFSET && label != kInitializingLabel &&
+         get_label_info(label)->op == Uninit;
+}
+
+// what an entry that takes a value's label as a whole sees of it: a value
+// with some bits uninitialized is uninitialized (see Uninit)
+inline dfsan_label as_whole(dfsan_label label) {
+  return is_partly_uninit(label) ? kInitializingLabel : label;
+}
 
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP
 // arithmetic in the solver.  Values match z3::rounding_mode ordering.

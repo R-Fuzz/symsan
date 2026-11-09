@@ -428,11 +428,145 @@ void __taint_assume(dfsan_label label, bool holds) {
                          __builtin_return_address(0));
 }
 
+// ub_addr: the instrumented operation, for its UB checks
+// (__taint_trace_ub_check)
+static dfsan_label taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
+                               uint16_t size, uint64_t op1, uint64_t op2,
+                               void *ub_addr);
+
+static inline uint64_t width_bits(uint16_t size) {
+  return size >= 64 ? ~(uint64_t)0 : ((uint64_t)1 << size) - 1;
+}
+
+// base, with the bits in uninit uninitialized (see Uninit): base itself when
+// there are none, kInitializingLabel when they are all of them
+static dfsan_label make_partly_uninit(dfsan_label base, uint64_t uninit,
+                                      uint16_t size) {
+  const uint64_t all = width_bits(size);
+  uninit &= all;
+  if (uninit == 0)
+    return base;
+  if (uninit == all || size > 64)
+    return kInitializingLabel;
+  return do_taint_union(base, CONST_LABEL, __dfsan::Uninit, size, uninit, 0);
+}
+
+// An operation on a value some of whose bits are uninitialized (see Uninit):
+// the operation on the values with those bits as the concrete bits they hold,
+// uninitialized in the bits that depend on one.  A bit of `x & c` where c's
+// is 0 does not, nor a bit a shift or a truncation drops, nor a bit of a sum
+// below the lowest uninitialized one; an operation with no rule here, a
+// comparison among them, depends on all.  A kInitializingLabel operand is
+// uninitialized in all its bits.
+static dfsan_label union_partly_uninit(dfsan_label l1, dfsan_label l2,
+                                       uint16_t op, uint16_t size,
+                                       uint64_t op1, uint64_t op2,
+                                       void *ub_addr) {
+  auto split = [](dfsan_label l, dfsan_label *base, uint16_t *w) -> uint64_t {
+    if (l == kInitializingLabel) {
+      *base = 0;
+      return ~(uint64_t)0;
+    }
+    if (!is_partly_uninit(l)) {
+      *base = l;
+      return 0;
+    }
+    dfsan_label_info *info = get_label_info(l);
+    *base = info->l1;
+    *w = info->size;
+    return info->op1.i;
+  };
+  dfsan_label b1, b2;
+  uint16_t w1 = size, w2 = size;
+  uint64_t u1 = split(l1, &b1, &w1), u2 = split(l2, &b2, &w2);
+  const uint64_t all = width_bits(size);
+  // the concrete operand of a binary operation, or none: every bit could be
+  // either
+  const bool c1 = l1 == 0, c2 = l2 == 0;
+  uint64_t u;
+  switch (op & 0xff) {
+    case __dfsan::Trunc:
+    case __dfsan::ZExt:
+      u = u1;
+      break;
+    case __dfsan::SExt:
+      u = u1;
+      if (w1 < 64 && (u1 >> (w1 - 1) & 1))
+        u |= all & ~width_bits(w1);
+      break;
+    case __dfsan::Extract: // op2: the offset in bits
+      u = op2 < 64 ? u1 >> op2 : 0;
+      break;
+    case __dfsan::And:
+      u = (u1 & (c2 ? op2 : ~(uint64_t)0)) | (u2 & (c1 ? op1 : ~(uint64_t)0));
+      break;
+    case __dfsan::Or:
+      u = (u1 & ~(c2 ? op2 : 0)) | (u2 & ~(c1 ? op1 : 0));
+      break;
+    case __dfsan::Xor:
+      u = u1 | u2;
+      break;
+    case __dfsan::Shl:
+    case __dfsan::LShr:
+    case __dfsan::AShr:
+      if (!c2 || op2 >= size) {
+        u = all;
+      } else if ((op & 0xff) == __dfsan::Shl) {
+        u = u1 << op2;
+      } else {
+        u = (u1 & all) >> op2;
+        if ((op & 0xff) == __dfsan::AShr && (u1 >> (size - 1) & 1))
+          u |= all & ~(all >> op2);
+      }
+      break;
+    case __dfsan::Add:
+    case __dfsan::Sub:
+    case __dfsan::Mul: {
+      // a carry goes up, never down
+      uint64_t v = (u1 | u2) & all;
+      u = v ? all & ~((v & -v) - 1) : 0;
+      break;
+    }
+    case __dfsan::Not:
+      u = u1;
+      break;
+    default:
+      u = (u1 | u2) ? all : 0;
+      break;
+  }
+  u &= all;
+  if (u == all)
+    return kInitializingLabel;
+  // a UB check of the operation on bits that are not the program's is no
+  // check of the program: its poison flags go
+  if (u != 0) {
+    switch (op & 0xff) {
+      case __dfsan::Add: case __dfsan::Sub: case __dfsan::Mul:
+      case __dfsan::Shl: case __dfsan::LShr: case __dfsan::AShr:
+      case __dfsan::UDiv: case __dfsan::SDiv:
+        op &= 0xff;
+        break;
+      default:
+        break;
+    }
+  }
+  dfsan_label base = taint_union(b1, b2, op, size, op1, op2, ub_addr);
+  return make_partly_uninit(base, u, size);
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                           uint16_t size, uint64_t op1, uint64_t op2) {
   // the instrumented operation, for its UB checks (__taint_trace_ub_check)
   void *ub_addr = __builtin_return_address(0);
+  if (is_partly_uninit(l1) || is_partly_uninit(l2))
+    return union_partly_uninit(l1, l2, op, size, op1, op2, ub_addr);
+  return taint_union(l1, l2, op, size, op1, op2, ub_addr);
+}
+
+static dfsan_label taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
+                               uint16_t size, uint64_t op1, uint64_t op2,
+                               void *ub_addr) {
   if (!is_valid_op(op)) {
     AOUT("WARNING: invalid op %d\n", op);
     return 0;
@@ -756,7 +890,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           __taint_trace_ub_check(cond, 0, ub_division_by_zero, ub_addr);
         } else {
           AOUT("WARNING: division by zero\n");
-          __taint_trace_event_addr(l2, EVENT_DIV_BY_ZERO, 0, __builtin_return_address(0), 0);
+          __taint_trace_event_addr(l2, EVENT_DIV_BY_ZERO, 0, ub_addr, 0);
         }
         // -fsanitize=signed-integer-overflow also covers INT_MIN / -1, which
         // traps exactly like a division by zero and was not modelled here at
@@ -774,7 +908,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
           if (op1_min && op2_neg1) {
             AOUT("WARNING: signed division overflow\n");
             __taint_trace_event_addr(l1 ? l1 : l2, EVENT_INT_OVERFLOW, 0,
-                                     __builtin_return_address(0), 0);
+                                     ub_addr, 0);
           } else if (l1 || op1_min) {
             // with a concrete dividend that is not INT_MIN the conjunction is
             // unsatisfiable, so there is nothing to hand the solver; with a
@@ -1212,6 +1346,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
 // If label is other symbolic label, create an Add label with offset
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_gep_offset(dfsan_label label, char* result, char* base) {
+  label = as_whole(label);
   // check label
   if (label == 0 || label == kInitializingLabel)
     return label;
@@ -1273,6 +1408,29 @@ static dfsan_label union_load(const dfsan_label *ls, uptr n, uint64_t size_in_bi
   } else if (((uptr)ls & (align - 1)) != 0) {
     AOUT("WARNING: unaligned load %p\n", ls);
   }
+  // Some of the bytes uninitialized and the rest not: the value has those
+  // bits uninitialized, and what is done with it reads the ones it depends
+  // on (see Uninit).  The fields of a padded struct a word moves are
+  // initialized; its padding is not.
+  if (n <= 8 && size_in_bits == n * 8) {
+    uint64_t read = 0, uninit = 0;
+    for (uptr i = 0; i < n; ++i) {
+      if (unread >> i & 1)
+        continue;
+      read |= (uint64_t)1 << i;
+      if (ls[i] == kInitializingLabel)
+        uninit |= (uint64_t)1 << i;
+    }
+    if (uninit != 0 && uninit != read) {
+      dfsan_label base = union_load(ls, n, size_in_bits, align, unread | uninit);
+      uint64_t bits = 0;
+      for (uptr i = 0; i < n; ++i)
+        if (uninit >> i & 1)
+          bits |= (uint64_t)0xff << (i * 8);
+      return make_partly_uninit(base, bits, size_in_bits);
+    }
+  }
+
   dfsan_label label0 = at(0);
   if (label0 == kInitializingLabel) return kInitializingLabel;
 
@@ -1480,6 +1638,17 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
   } else if (((uptr)ls & (align - 1)) != 0) {
     AOUT("WARNING: unaligned store %p\n", ls);
   }
+  // a value with some bits uninitialized: a byte with one of them is
+  // uninitialized, the others have their labels (see Uninit)
+  if (is_partly_uninit(l)) {
+    dfsan_label_info *info = get_label_info(l);
+    uint64_t bits = info->op1.i;
+    __taint_union_store(info->l1, ls, n, align);
+    for (uptr i = 0; i < n && i < 8; ++i)
+      if (bits >> (i * 8) & 0xff)
+        ls[i] = kInitializingLabel;
+    return;
+  }
   if (l != kInitializingLabel) {
     // for debugging
     dfsan_label h = atomic_load(&__dfsan_last_label, memory_order_relaxed);
@@ -1553,7 +1722,9 @@ void __taint_store_rmw(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align,
     __taint_union_store(l, ls, n, align);
     return;
   }
-  __taint_union_store(l_load == kInitializingLabel ? l_alt : l, tmp, n, 1);
+  // (a load with some bits uninitialized as well, see Uninit)
+  __taint_union_store(as_whole(l_load) == kInitializingLabel ? l_alt : l, tmp,
+                      n, 1);
   for (uptr i = 0; i < n; ++i)
     if (touched & (1ULL << i))
       ls[i] = tmp[i];
@@ -1669,6 +1840,8 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memerr, dfsan_label, uptr,
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_check_bounds(dfsan_label addr_label, uptr addr,
                           dfsan_label size_label, uint64_t size) {
+  addr_label = as_whole(addr_label);
+  size_label = as_whole(size_label);
   if (flags().trace_bounds) {
     void *retaddr = __builtin_return_address(0);
     // a length of 0 touches nothing on this run, whatever its label: libc++
@@ -1722,6 +1895,8 @@ void __taint_solve_bounds(dfsan_label ptr_label, uint64_t ptr,
                           int64_t current_offset, uint32_t cid) {
   if (index_label == 0 || !flags().solve_ub)
     return;
+  ptr_label = as_whole(ptr_label);
+  index_label = as_whole(index_label);
 
   void *addr = __builtin_return_address(0);
 
@@ -1841,6 +2016,8 @@ void __taint_solve_size(dfsan_label ptr_label, uint64_t ptr,
                         uint32_t cid) {
   if (!flags().solve_ub)
     return;
+  ptr_label = as_whole(ptr_label);
+  size_label = as_whole(size_label);
 
   void *addr = __builtin_return_address(0);
 
@@ -2114,6 +2291,8 @@ static bool ReleaseShadow(void *addr, uptr size) {
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __dfsan_set_label(dfsan_label label, void *addr, uptr size) {
   if (addr == 0) return;
+  // memory has a label per byte (see Uninit)
+  label = as_whole(label);
   if (label == 0 && ReleaseShadow(addr, size)) return;
   for (dfsan_label *labelp = shadow_for(addr); size != 0; --size, ++labelp) {
     // Don't write the label if it is already the value we need it to be.
@@ -3225,7 +3404,8 @@ void __taint_move_shadow(void *dst, void *src, uint64_t size) {
 // Overrides weak stub in ucsan.cpp
 SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_extend_label(dfsan_label label, bool sign_extend, uint16_t new_size_in_bits) {
-  if (label == 0) return 0;
+  label = as_whole(label);
+  if (label == 0 || label == kInitializingLabel) return label;
   uint16_t op = sign_extend ? __dfsan::SExt : __dfsan::ZExt;
   return do_taint_union(label, CONST_LABEL, op, new_size_in_bits, 0, 0);
 }

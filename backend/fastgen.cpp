@@ -54,6 +54,9 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
                   uint64_t c1, uint64_t c2, uint32_t cid) {
   if (op1 == 0 && op2 == 0)
     return;
+  // (a value with some bits uninitialized is compared as a whole, see Uninit)
+  op1 = as_whole(op1);
+  op2 = as_whole(op2);
 
   void *addr = __builtin_return_address(0);
 
@@ -245,6 +248,8 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
                   int64_t current_offset, uint32_t cid) {
   if (index_label == 0)
     return;
+  ptr_label = as_whole(ptr_label);
+  index_label = as_whole(index_label);
 
   void *addr = __builtin_return_address(0);
 
@@ -322,6 +327,7 @@ __taint_table_lookup(dfsan_label index_label, int64_t index,
                      uint64_t elem_size) {
   if (index_label == 0)
     return 0;
+  index_label = as_whole(index_label);
 
   void *addr = __builtin_return_address(0);
 
@@ -430,6 +436,7 @@ __taint_add_constraint(dfsan_label label, uint8_t result) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_minimize_label(dfsan_label label, u64 size, dfsan_label bounds) {
+  label = as_whole(label);
   if (label == 0 || label == kInitializingLabel)
     return;
 
@@ -475,6 +482,7 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_memcmp(dfsan_label label) {
   if (label == 0)
     return;
+  label = as_whole(label);
 
   void *addr = __builtin_return_address(0);
 

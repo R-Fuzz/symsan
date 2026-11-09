@@ -78,7 +78,9 @@ static off_t current_stdin_offset = 0;
 // std::string whose header byte libc++ had read as part of an 8-byte word:
 // data() selected on is_long, bcmp's pointer and length labels were
 // kInitializingLabel, and the run died in get_str_label_n.
+// (A value with some bits uninitialized is one too, see Uninit.)
 static inline dfsan_label_info *label_info(dfsan_label label) {
+  label = as_whole(label);
   if (label < CONST_OFFSET || label == kInitializingLabel) return nullptr;
   return dfsan_get_label_info(label);
 }
