@@ -781,6 +781,70 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strpbrk(const char *s,
   return const_cast<char *>(ret);
 }
 
+// The most bytes a comparison's operand label can describe: an n-byte Concat
+// is n * 8 bits wide, and a label's width is 16 bits.  Past it the label's size
+// wraps (a 16 MB operand was a Concat "40 bytes" wide), and building it at all
+// is one Concat per byte: v8's BitVector::Equals, a bcmp of two 16 MB liveness
+// vectors with a symbolic word at either end, was 2 x 16.8M labels, which the
+// solver then serialized in one call.
+static const size_t kMaxCmpLabelBytes = 0xffff / 8;
+
+// A memcmp/bcmp over more than kMaxCmpLabelBytes, compacted to the positions
+// that can decide it.  Its result is the first position where the two sides
+// differ; a position where both bytes are concrete and equal never is, so
+// leaving it out keeps the result the same function of the symbolic bytes, and
+// past a position where both are concrete and differ, nothing can matter.  The
+// kept bytes are copied, with their labels, to the stack, the comparison label
+// is built over the copies and its content sent while they are there, and
+// their shadow is cleared.  More positions than a label can describe: the
+// result is left concrete.
+static dfsan_label cmp_label_compacted(const void *s1, const void *s2, size_t n) {
+  const uint8_t *c1 = (const uint8_t *)s1, *c2 = (const uint8_t *)s2;
+  const dfsan_label *sh1 = shadow_for(s1), *sh2 = shadow_for(s2);
+  size_t k = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (sh1[i] || sh2[i]) {
+      k++;
+    } else if (c1[i] != c2[i]) {
+      k++;
+      break;
+    }
+  }
+  if (k == 0) return 0;
+  if (k > kMaxCmpLabelBytes) {
+    static bool warned;
+    if (!warned) {
+      warned = true;
+      Report("WARNING: DataFlowSanitizer: a %zu-byte comparison has %zu "
+             "deciding positions, more than a label describes; its result "
+             "is left concrete\n", n, k);
+    }
+    return 0;
+  }
+
+  uint8_t *b1 = (uint8_t *)__builtin_alloca(k);
+  uint8_t *b2 = (uint8_t *)__builtin_alloca(k);
+  dfsan_label *bs1 = shadow_for(b1), *bs2 = shadow_for(b2);
+  size_t j = 0;
+  for (size_t i = 0; j < k; i++) {
+    if (!sh1[i] && !sh2[i] && c1[i] == c2[i]) continue;
+    b1[j] = c1[i]; bs1[j] = sh1[i];
+    b2[j] = c2[i]; bs2[j] = sh2[i];
+    j++;
+  }
+
+  dfsan_label l1 = dfsan_read_label(b1, k);
+  dfsan_label l2 = dfsan_read_label(b2, k);
+  dfsan_label cmp = 0;
+  if (l1 || l2) {
+    cmp = dfsan_union(l1, l2, __dfsan::fmemcmp, k, (uint64_t)b1, (uint64_t)b2);
+    if (cmp) __taint_trace_memcmp(cmp);
+  }
+  internal_memset(bs1, 0, k * sizeof(dfsan_label));
+  internal_memset(bs2, 0, k * sizeof(dfsan_label));
+  return cmp;
+}
+
 DECLARE_WEAK_INTERCEPTOR_HOOK(dfsan_weak_hook_memcmp, uptr caller_pc,
                               const void *s1, const void *s2, size_t n,
                               dfsan_label s1_label, dfsan_label s2_label,
@@ -796,6 +860,13 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
   __taint_check_bounds(s1_label, (uptr)s1, n_label, n);
   __taint_check_bounds(s2_label, (uptr)s2, n_label, n);
   int ret = memcmp(s1, s2, n);
+
+  // (more bytes than a label describes: the deciding positions only, as plain
+  // bytes -- get_str_label_n's string-op recovery would read all n)
+  if (n > kMaxCmpLabelBytes) {
+    *ret_label = cmp_label_compacted(s1, s2, n);
+    return ret;
+  }
 
   // Check for fsubstr labels
   dfsan_label l1 = get_str_label_n(s1, s1_label, n, n_label);
@@ -827,6 +898,12 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   __taint_solve_size(s1_label, (uint64_t)s1, n_label, n, 0);
   __taint_solve_size(s2_label, (uint64_t)s2, n_label, n, 0);
   int ret = bcmp(s1, s2, n);
+
+  // (as __dfsw_memcmp: a bcmp is decided by the same positions)
+  if (n > kMaxCmpLabelBytes) {
+    *ret_label = cmp_label_compacted(s1, s2, n);
+    return ret;
+  }
 
   // Check for fsubstr labels (from strncpy with symbolic length)
   dfsan_label l1 = get_str_label_n(s1, s1_label, n, n_label);
