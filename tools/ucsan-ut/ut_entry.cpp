@@ -24,11 +24,24 @@
 // A test function's calls to the check helpers are specialized the same way,
 // so its CHECK_EQ is an assumption as its CHECK is.
 //
+// The test's functions are the allow file's, and with --harness-file every
+// function whose debug info places it in a file under that path: the allow
+// file has only what ut-unit's walk saw, the test's own TU, and a helper
+// another test file defines is test code too (function-tester.cc's
+// CompileRun, whose ToLocalChecked is how a test says its JS compiles).
+//
 // usage: ut-entry IN.bc OUT.bc ALLOW
 //          [--fatal MANGLED]... [--fatal-prefix NAME]...
-//          [--helper-prefix NAME]...
+//          [--helper-prefix NAME]... [--harness-file PATH]...
 //   ALLOW: the scope's allow file; its harness-prefix / harness-exact lines
 //          name the test's functions (ut_scope.py)
+//   PATH:  a prefix of the debug info's file name, as the compiler saw it
+//          (v8: ../../test/ and V8_DIR/test/, both spellings occur)
+//   --changed-out FILE: the test functions whose bodies it changed, one
+//          mangled name per line.  A prebuilt archive's copy of one has none
+//          of the changes, so it must not replace this one (ut-strip KEEP):
+//          function-tester.cc's CompileRun is in the archive and not in the
+//          scope.
 //   NAME:  matched against the bare name (ns::C::f: no return type, template
 //          arguments or parameters), as cg_scope.py matches
 //   prints the __ucsan_ut_assume.N names it declared, one per fatal reporter
@@ -36,6 +49,7 @@
 // ut-entry --bare < NAMES: the bare-name rule alone, for testing it
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
@@ -55,7 +69,7 @@
 
 using namespace llvm;
 
-static std::vector<std::string> FatalPrefixes, HelperPrefixes;
+static std::vector<std::string> FatalPrefixes, HelperPrefixes, HarnessFiles;
 static std::set<std::string> FatalNames;
 
 static bool endsWith(const std::string &S, const std::string &X) {
@@ -187,10 +201,21 @@ static bool isHelper(const Function &F) {
   return !F.isDeclaration() && beginsAny(bareOf(F), HelperPrefixes);
 }
 
+// defined in a file under one of the --harness-file paths
+static bool inHarnessFile(const Function &F) {
+  const DISubprogram *SP = F.getSubprogram();
+  return SP && beginsAny(SP->getFilename().str(), HarnessFiles);
+}
+
+// through an alias too: a complete-object constructor (C1) is an alias of the
+// base-object one (C2), so a test's `BytecodeArrayBuilder builder(...)` was
+// not seen as a call into the unit, and its CHECK_GE on the symbolized
+// parameter_count stayed a PANIC
 static Function *directCallee(Instruction &I) {
   auto *CB = dyn_cast<CallBase>(&I);
   if (!CB) return nullptr;
-  return dyn_cast_or_null<Function>(CB->getCalledOperand()->stripPointerCasts());
+  return dyn_cast_or_null<Function>(
+      CB->getCalledOperand()->stripPointerCastsAndAliases());
 }
 
 struct Specializer {
@@ -272,14 +297,18 @@ int main(int argc, char **argv) {
   }
   if (argc < 4) {
     errs() << "usage: ut-entry IN.bc OUT.bc ALLOW [--fatal M]... "
-              "[--fatal-prefix N]... [--helper-prefix N]...\n";
+              "[--fatal-prefix N]... [--helper-prefix N]... "
+              "[--harness-file P]... [--changed-out FILE]\n";
     return 1;
   }
+  std::string ChangedOut;
   for (int I = 4; I + 1 < argc; I += 2) {
     std::string K = argv[I], V = argv[I + 1];
     if (K == "--fatal") FatalNames.insert(V);
     else if (K == "--fatal-prefix") FatalPrefixes.push_back(V);
     else if (K == "--helper-prefix") HelperPrefixes.push_back(V);
+    else if (K == "--harness-file") HarnessFiles.push_back(V);
+    else if (K == "--changed-out") ChangedOut = V;
     else { errs() << "unknown option " << K << "\n"; return 1; }
   }
   // the test's functions, as ut_scope.py writes them: an allow entry is a
@@ -306,7 +335,8 @@ int main(int argc, char **argv) {
   for (Function &F : *M) {
     if (F.isDeclaration()) continue;
     std::string B = bareOf(F);
-    if (HarnessExact.count(B) || beginsAny(B, HarnessPrefixes)) {
+    if (HarnessExact.count(B) || beginsAny(B, HarnessPrefixes) ||
+        inHarnessFile(F)) {
       Harness.push_back(&F);
       IsHarness.insert(&F);
     }
@@ -314,10 +344,12 @@ int main(int argc, char **argv) {
 
   Specializer S(*M);
   unsigned Own = 0, Sites = 0;
-  std::set<Function *> Entries;
+  std::set<Function *> Entries, Changed;
   for (Function *H : Harness) {
     // 1. the test's own checks
-    Own += Specializer::redirect(H, S.replacements(H));
+    unsigned N = Specializer::redirect(H, S.replacements(H));
+    Own += N;
+    if (N) Changed.insert(H);
     // 2. the unit's preconditions, at the test's calls into it
     for (Instruction &I : instructions(H)) {
       Function *Callee = directCallee(I);
@@ -328,11 +360,17 @@ int main(int argc, char **argv) {
       if (Function *C = S.specialize(Callee)) {
         cast<CallBase>(I).setCalledOperand(C);
         Entries.insert(Callee);
+        Changed.insert(H);
         ++Sites;
       }
     }
   }
   if (verifyModule(*M, &errs())) return 1;
+  if (!ChangedOut.empty()) {
+    std::ofstream CO(ChangedOut);
+    if (!CO) { errs() << ChangedOut << ": cannot open\n"; return 1; }
+    for (Function *F : Changed) CO << F->getName().str() << "\n";
+  }
   std::error_code EC;
   raw_fd_ostream OS(argv[2], EC);
   if (EC) { errs() << argv[2] << ": " << EC.message() << "\n"; return 1; }
