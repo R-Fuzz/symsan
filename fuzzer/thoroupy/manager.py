@@ -3,6 +3,7 @@ import psutil
 from sys import exit
 import ctypes
 import pickle
+import struct
 import time
 
 from control import Process, GepMsg, PIPE_MSG_TYPE, PIPE_EVENT_TYPE, COND_FLAGS, MEMERR_TO_EVENT # type: ignore
@@ -582,6 +583,23 @@ class UcsanManager:
                         self.solver.record_minimize(msg.label)
                     except Exception as e:
                         logger.error(f"Error recording minimize hint: {e}")
+            case PIPE_MSG_TYPE.TABLE_TYPE:
+                # A symbolic index into a read-only global table (a tlookup):
+                # table_msg is u64 ptr, num_elems, elem_size + the contents,
+                # msg.result bytes of them, once per table per trace.  Drained
+                # even though z3 declines tlookup (fgtest does the same), or
+                # the rest of the stream is misparsed.  (V8's scanner classifies
+                # each character of a symbolic source string through one.)
+                raw = self.p.get_pipe().read_raw(24 + msg.result)
+                ptr, num_elems, elem_size = struct.unpack_from("<QQQ", raw)
+                if num_elems * elem_size != msg.result:
+                    logger.error(f"Incorrect table msg: {num_elems} x {elem_size} "
+                                 f"vs {msg.result}")
+                else:
+                    try:
+                        self.solver.record_table(ptr, bytes(raw[24:]))
+                    except Exception as e:
+                        logger.error(f"Error recording table: {e}")
             case _:
                 raise NotImplementedError("msg_type: {}".format(msg.msg_type))
 

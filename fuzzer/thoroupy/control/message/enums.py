@@ -10,6 +10,7 @@ class PIPE_MSG_TYPE:
     EVENT_TYPE = 8
     GV_TYPE = 9  # Global Variable
     MINIMIZE_TYPE = 10
+    TABLE_TYPE = 11  # a read-only lookup table's contents (table_msg)
 
 class PIPE_EVENT_TYPE:
     EVENT_LAZY_INIT = 100

@@ -51,6 +51,10 @@ class Z3Solver:
         """Record memcmp concrete data."""
         symsan.record_memcmp(label, data)
 
+    def record_table(self, ptr: int, data: bytes) -> None:
+        """Record a read-only lookup table's contents, keyed on its base address."""
+        symsan.record_table(ptr, data)
+
     def record_minimize(self, label: int, allow_zero: bool = False) -> None:
         """Record a label to minimize during solving (e.g., malloc size).
 
