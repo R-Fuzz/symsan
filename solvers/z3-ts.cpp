@@ -345,6 +345,8 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
 
   aux_constraints_.clear();
   minimize_hints_.clear();
+  // (the saved tasks keep their own copies, save_task_ctx)
+  last_ctx_ = task_ctx_t();
   string_info_cache_.clear();
   int_var_cache_.clear();
   branch_deps_.clear();
@@ -2916,7 +2918,7 @@ int Z3AstParser::parse_cond(dfsan_label label, bool result, bool add_nested, std
     add_nested_constraints(inputs, task.get());
 
     // save the task
-    tasks.push_back(save_task(task));
+    tasks.push_back(save_task_ctx(save_task(task)));
 
     // save nested unless it's a fsize constraints
     if (add_nested && !has_fsize) {
@@ -2965,7 +2967,7 @@ void Z3AstParser::construct_index_tasks(z3::expr &index, uint64_t curr,
     // add nested constraints
     task->insert(task->end(), nested.begin(), nested.end());
     // save the task
-    tasks.push_back(save_task(task));
+    tasks.push_back(save_task_ctx(save_task(task)));
   }
 }
 
@@ -3178,6 +3180,22 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
   }
 
   return 0;
+}
+
+uint64_t Z3AstParser::save_task_ctx(uint64_t tid) {
+  // (copied again only when the trace has added to them since the last task)
+  if (!last_ctx_.aux || last_ctx_.aux->size() != aux_constraints_.size())
+    last_ctx_.aux = std::make_shared<const std::vector<z3::expr>>(aux_constraints_);
+  if (!last_ctx_.hints || last_ctx_.hints->size() != minimize_hints_.size())
+    last_ctx_.hints =
+        std::make_shared<const std::vector<minimize_hint_t>>(minimize_hints_);
+  task_ctx_[tid] = last_ctx_;
+  return tid;
+}
+
+void Z3AstParser::discard_task(uint64_t id) {
+  tasks_.erase(id);
+  task_ctx_.erase(id);
 }
 
 int Z3AstParser::record_minimize(dfsan_label label, bool allow_zero) {
@@ -3481,9 +3499,19 @@ Z3ParserSolver::solving_status
 Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solutions) {
   solving_status ret = unknown_error;
   auto task = retrieve_task(task_id);
+  // the trace state it was parsed with (save_task_ctx), not the current
+  // trace's: a task solved on demand is solved after a later restart()
+  task_ctx_t ctx;
+  auto ci = task_ctx_.find(task_id);
+  if (ci != task_ctx_.end()) {
+    ctx = std::move(ci->second);
+    task_ctx_.erase(ci);
+  }
   if (task == nullptr) {
     return invalid_task;
   }
+  const auto &aux = ctx.aux ? *ctx.aux : aux_constraints_;
+  const auto &hints = ctx.hints ? *ctx.hints : minimize_hints_;
 
   try {
     // setup global solver
@@ -3491,7 +3519,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
     z3::solver solver(context_);
     solver.set("timeout", timeout);
     // add auxiliary constraints (e.g., Int variable bounds from sort coercion)
-    for (const auto &ac : aux_constraints_) {
+    for (const auto &ac : aux) {
       // fprintf(stderr, "DEBUG solve_task[%lu]: adding aux constraint: %s\n", task_id, ac.to_string().c_str());
       solver.add(ac);
     }
@@ -3534,7 +3562,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           z3::set_param("smt.string_solver", "none");
           z3::solver fallback(context_);
           fallback.set("timeout", timeout);
-          for (const auto &ac : aux_constraints_) {
+          for (const auto &ac : aux) {
             fallback.add(ac);
           }
           for (const auto &expr : *task) {
@@ -3605,7 +3633,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
 
       // Find matching minimize hints based on input dep overlap
       std::vector<std::pair<z3::expr, bool>> alloc_minimize;
-      for (const auto &hint : minimize_hints_) {
+      for (const auto &hint : hints) {
         for (const auto &dep : hint.deps) {
           if (model_inputs.count(dep)) {
             alloc_minimize.push_back({hint.expr, hint.allow_zero});
@@ -3621,7 +3649,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
         p.set("timeout", timeout);
         opt.set(p);
 
-        for (const auto &ac : aux_constraints_) {
+        for (const auto &ac : aux) {
           opt.add(ac);
         }
         for (const auto &expr : *task) {
@@ -4015,11 +4043,14 @@ int Z3ParserSolver::export_task_smt2(uint64_t task_id, int fd) {
     return -1;
   }
   auto task = it->second;
+  auto ci = task_ctx_.find(task_id);
+  const auto &aux = ci != task_ctx_.end() && ci->second.aux ? *ci->second.aux
+                                                             : aux_constraints_;
 
   try {
     // Create solver and add all constraints
     z3::solver solver(context_);
-    for (const auto &ac : aux_constraints_) {
+    for (const auto &ac : aux) {
       solver.add(ac);
     }
     for (const auto &expr : *task) {

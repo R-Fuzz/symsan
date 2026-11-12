@@ -79,6 +79,10 @@ class Z3Solver:
         """
         return symsan.solve_task(task_id, timeout)
 
+    def discard_task(self, task_id: int) -> None:
+        """Drop a parsed task without solving it."""
+        symsan.discard_task(task_id)
+
     def export_task_smt2(self, task_id: int, filename: str) -> None:
         """Export a task's constraints as SMT-LIB v2 to a file."""
         symsan.export_task_smt2(task_id, filename)

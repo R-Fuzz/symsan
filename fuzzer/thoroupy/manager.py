@@ -7,7 +7,7 @@ import struct
 import time
 
 from control import Process, GepMsg, PIPE_MSG_TYPE, PIPE_EVENT_TYPE, COND_FLAGS, MEMERR_TO_EVENT # type: ignore
-from scheduler.fifo_scheduler import FIFOScheduler
+from scheduler.fifo_scheduler import FIFOScheduler, PendingTask
 from scheduler.hier_scheduler import HierachicalScheduler
 from scheduler.policy_scheduler import PolicyScheduler
 from scheduler.ternimation import StopExecution, TerminationManager
@@ -158,6 +158,20 @@ class UcsanManager:
         self._flip_succeeded = False       # True if flip was confirmed during replay
         self._flip_expecting_cond = False  # True after BB trace, waiting for target COND
         self._flip_task_id = None          # solving task that produced the flip solution
+
+        # On-demand solving (config on_demand_solve): a branch's tasks are
+        # parsed as its trace runs, queued, and solved when the scheduler
+        # reaches them -- not inline, with the target waiting on the solver --
+        # and only if their direction is still untaken then.  Debug and policy
+        # runs, which look at a solve as it happens, solve inline.
+        self._on_demand = (bool(self.config.get("on_demand_solve", False))
+                           and hasattr(self.scheduler, "set_resolver")
+                           and not self._flip_verify and not auto_debug)
+        if self._on_demand:
+            self.scheduler.set_resolver(self._resolve_task)
+        # deferred: queued; dropped: their direction taken before they were
+        # reached; solved / sat: solve_task calls / with solutions
+        self.solve_stats = {"deferred": 0, "dropped": 0, "solved": 0, "sat": 0}
         self._stop_if_not_flipped = bool(target_branch and target_branch.get("stop_if_not_flipped"))
         self._stop_if_not_reached = bool(target_branch and target_branch.get("stop_if_not_reached"))
         self._flip_original_occurrence = target_branch.get("occurrence", 0) if self._flip_verify else 0
@@ -310,7 +324,18 @@ class UcsanManager:
                                 msg.label, msg.result, False
                             )
                         saw_solution = False
+                        # on demand: queued, with the seed as it is now (the
+                        # object tracer changes it as the trace goes on)
+                        defer = (self._on_demand and not self._trace_only
+                                 and not (_is_target_bid or is_policy_target))
+                        if defer and task_ids:
+                            snapshot = self._current.clone()
+                            ask = None if is_ub_solve else self._termination_manager.last_ask()
                         for task_id in task_ids:
+                            if defer:
+                                self.scheduler.append_task(PendingTask(task_id, snapshot, ask))
+                                self.solve_stats["deferred"] += 1
+                                continue
                             # Concrete replay (trace_only): never solve/queue.  Check
                             # BEFORE solve_task — solving is the expensive SMT, and in
                             # trace_only the solution is discarded anyway, so doing it
@@ -646,6 +671,25 @@ class UcsanManager:
             logger.critical(f"Synthesized unit test: {filepath}")
         except Exception as e:
             logger.error(f"Unit test synthesis failed: {e}")
+
+    def _resolve_task(self, task):
+        """An on-demand task the scheduler has reached (PendingTask): its seed,
+        or None -- its direction was taken since, it has no solution, or the
+        run is stopping."""
+        if self._stop_requested or not self._termination_manager.still_wanted(task.ask):
+            self.solver.discard_task(task.task_id)
+            self.solve_stats["dropped"] += 1
+            return None
+        status, solutions = self.solver.solve_task(task.task_id)
+        self.solve_stats["solved"] += 1
+        if not solutions:
+            logger.debug(f"Solver returned no solution for task {task.task_id}, status={status}")
+            return None
+        self.solve_stats["sat"] += 1
+        seed = task.seed.clone()
+        seed.flip_meta = None  # don't inherit parent's flip_meta
+        self._apply_solutions(seed, solutions)
+        return seed
 
     def _apply_solutions(self, seed, solutions):
         """Apply solver solutions to seed."""

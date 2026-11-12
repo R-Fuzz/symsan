@@ -39,6 +39,8 @@ public:
 
   int add_constraints(dfsan_label label, uint64_t result) override;
   int record_minimize(dfsan_label label, bool allow_zero = true) override;
+  /// drop a task that will not be solved (solve_task takes the ones that are)
+  void discard_task(uint64_t id);
 
 protected:
   z3::context &context_;
@@ -59,6 +61,18 @@ protected:
     std::unordered_set<offset_t, offset_hash> deps;
   };
   std::vector<minimize_hint_t> minimize_hints_;
+
+  // A task's share of the per-trace state it is solved with (aux_constraints_,
+  // minimize_hints_), taken when the task is saved: a task solved on demand is
+  // solved after restart() has cleared them for a later trace.  Tasks saved
+  // while neither grew share one copy.
+  struct task_ctx_t {
+    std::shared_ptr<const std::vector<z3::expr>> aux;
+    std::shared_ptr<const std::vector<minimize_hint_t>> hints;
+  };
+  std::unordered_map<uint64_t, task_ctx_t> task_ctx_;
+  task_ctx_t last_ctx_;
+  uint64_t save_task_ctx(uint64_t tid);
 
   // String range entry with cached str- expr for linking constraints
   struct string_range_t {

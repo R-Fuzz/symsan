@@ -871,6 +871,22 @@ static PyObject* SolveTask(PyObject *self, PyObject *args) {
   return ret;
 }
 
+// A task parsed but not to be solved: on-demand solving queues a branch's
+// tasks, and drops one whose direction a later seed covered first.
+static PyObject* DiscardTask(PyObject *self, PyObject *args) {
+  if (__z3_parser == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
+    return NULL;
+  }
+
+  uint64_t id = 0;
+  if (!PyArg_ParseTuple(args, "K", &id)) {
+    return NULL;
+  }
+  __z3_parser->discard_task(id);
+  Py_RETURN_NONE;
+}
+
 static PyObject* ExportTaskSMT2(PyObject *self, PyObject *args) {
   if (__z3_parser == nullptr) {
     PyErr_SetString(PyExc_RuntimeError, "parser not initialized");
@@ -957,6 +973,7 @@ static PyMethodDef SymSanMethods[] = {
   {"record_table", RecordTable, METH_VARARGS, "record the contents of a read-only lookup table, keyed on its base address"},
   {"record_minimize", RecordMinimize, METH_VARARGS, "record a label to minimize during solving (e.g., malloc size)"},
   {"solve_task", SolveTask, METH_VARARGS, "solve a task"},
+  {"discard_task", DiscardTask, METH_VARARGS, "drop a parsed task without solving it"},
   {"export_task_smt2", ExportTaskSMT2, METH_VARARGS, "export a task as SMT-LIB v2 to a file"},
   {"ring_total_size", RingTotalSize, METH_VARARGS, "header size + capacity, for sizing a ring's backing memory"},
   {"ring_init", RingInit, METH_VARARGS, "initialize a symsan_ring_hdr at an already-mapped address"},
