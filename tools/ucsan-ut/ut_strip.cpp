@@ -117,7 +117,10 @@ int main(int argc, char **argv) {
 
   LLVMContext Ctx;
   SMDiagnostic Err;
-  std::unique_ptr<Module> M = parseIRFile(argv[1], Err, Ctx);
+  // lazily: a body is read only when it stays (a test's module is ~330 MB of
+  // bitcode, ~110k functions, ~97k of them dropped; reading them all was ~30 s
+  // of ut-strip's ~33)
+  std::unique_ptr<Module> M = getLazyIRFileModule(argv[1], Err, Ctx);
   if (!M) { Err.print(argv[0], errs()); return 1; }
 
   // an alias the archive does not define keeps what it aliases: an alias of
@@ -134,6 +137,7 @@ int main(int argc, char **argv) {
   unsigned Fns = 0, Vars = 0, Aliases = 0;
   for (Function &F : *M) {
     if (!drop(F)) continue;
+    F.setIsMaterializable(false);   // (its body is never read)
     F.deleteBody();          // (external linkage)
     F.setComdat(nullptr);
     F.clearMetadata();       // a declaration's !dbg may not be distinct
@@ -166,6 +170,14 @@ int main(int argc, char **argv) {
     Dead.push_back(&A);
   }
   for (GlobalAlias *A : Dead) { A->eraseFromParent(); ++Aliases; }
+  // the bodies that stay, read only now: the reader's last step verifies the
+  // module (debug-info upgrade), and an alias of a dropped body is broken
+  // until replaced above.  (A body read now that names a replaced alias gets
+  // its declaration: the reader's values are handles that follow RAUW.)
+  if (Error E = M->materializeAll()) {
+    errs() << argv[1] << ": " << toString(std::move(E)) << "\n";
+    return 1;
+  }
 
   // A static constructor left to the archive is its object's: that object's
   // .init_array runs it, whenever the object is linked in.  Listed in the
