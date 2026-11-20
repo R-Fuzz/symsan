@@ -7,6 +7,9 @@ enum exit_reason {
   REASON_STACK_OOB = 125,
   REASON_MISALIGNED = 126,    // a faulting access whose alignment no placement of its UC object satisfies
   REASON_THREAD = 127,        // the program started a thread: unsupported (__dfsw_pthread_create)
+  REASON_LABELS = 128,        // out of labels (UCSan's 16-bit or SymSan's): a limit of ours, not
+                              // the program's -- a symbolized loop bound of 84M allocations, a
+                              // literal symbolized per iteration -- so no finding (it was Die()'s 1)
 
   /* checker */
   EVENT_UBI = 150,

@@ -616,7 +616,7 @@ ucsan_label_info* get_label_info(ucsan_label label) {
 void check_label(ucsan_label label) {
   if (label >= __alloca_stack_top) {
     Report("FATAL: UCSan: exhausted labels\n");
-    Die();
+    internal__exit(exit_reason::REASON_LABELS);
   }
 }
 
@@ -2847,7 +2847,7 @@ ucsan_label ucsan_trace_alloca(uint64_t size, uint64_t elem_size, uint64_t addr)
   if ((uint32_t)__alloca_stack_top - 1 <=
       atomic_load(&__ucsan_last_label, memory_order_relaxed)) {
     Report("FATAL: UCSan: exhausted labels\n");
-    Die();
+    internal__exit(exit_reason::REASON_LABELS);
   }
   __alloca_stack_top -= 1;
   ucsan_label label = __alloca_stack_top;

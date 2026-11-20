@@ -30,6 +30,8 @@ UNION_TABLE_SIZE = 0x7f000000 # FIXME: will mmap failed if set to 0x80000000
 CHECKER_UBI = 150
 # runtime/dfsan/ucsan_exit_reason.h: the input breaks an invariant the code relies on
 REASON_INVALID_INPUT = 122
+# ... and the input took more labels than the runtime has (no finding either)
+REASON_LABELS = 128
 
 ERROR_EVENTS = {
     'UBI': 150,
@@ -452,8 +454,12 @@ class UcsanManager:
                 # REASON_INVALID_INPUT, a broken assumption -- __dfsw_ucsan_assume,
                 # a unit test harness's own CHECK -- is no finding)
                 status = msg.result if msg.result < 255 else msg.result >> 8
-                if status == REASON_INVALID_INPUT:
-                    logger.info("Seed is invalid input (a broken assumption)")
+                # (nor one that ran out of labels, REASON_LABELS: a limit of
+                # the runtime's, which the program does not have)
+                if status in (REASON_INVALID_INPUT, REASON_LABELS):
+                    logger.info("Seed is invalid input (a broken assumption)"
+                                if status == REASON_INVALID_INPUT else
+                                "Seed ran out of labels")
                     # still an exit status (a test asserts the assumption
                     # ends the run), only not a bug: no seed, no report
                     if status not in self._reported:

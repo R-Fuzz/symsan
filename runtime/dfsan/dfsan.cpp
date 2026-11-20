@@ -180,7 +180,7 @@ static void dfsan_check_label(dfsan_label label) {
 static void dfsan_check_new_label(dfsan_label label) {
   if (label >= __alloca_stack_top) {
     Report("FATAL: Taint: out of labels\n");
-    Die();
+    internal__exit(exit_reason::REASON_LABELS);
   }
 }
 
@@ -1764,7 +1764,7 @@ dfsan_label __taint_trace_alloca(dfsan_label l, uint64_t size,
     if (__alloca_stack_top - 1 <=
         atomic_load(&__dfsan_last_label, memory_order_relaxed)) {
       Report("FATAL: Taint: out of labels\n");
-      Die();
+      internal__exit(exit_reason::REASON_LABELS);
     }
     __alloca_stack_top -= 1;
     AOUT("label = %d, base = %p, size = %lu, elem_size = %lu\n",
