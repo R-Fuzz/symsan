@@ -2084,9 +2084,16 @@ void* ucsan_set_label_for_args(uint32_t index, uint32_t size_in_bits, uint8_t is
   return (void*)given;
 }
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __ucsan_symbolize_input(void *ptr, size_t size, int id) {
-  UCSAN_OUT("symbolize_input: ptr=%p, size=%zu, id=%d\n", ptr, size, id);
+// ucsan_labels: whether UCSan labels the bytes as well (OP_NONE, the
+// object's), or only SymSan does.  UCSan's labels are what a pointer made of
+// the bytes is resolved by (seed_bytes_to_pointer); a value no pointer is made
+// of needs SymSan's only.  UCSan's are 16 bits and never reclaimed, and a
+// symbolized literal in a loop took 4 more per iteration: dtoa-unittest's
+// DoubleToAscii(v, DTOA_SHORTEST, 0, ...) over 100k precomputed doubles ran
+// out of labels ("exhausted labels") at iteration 16k.
+static void symbolize_input(void *ptr, size_t size, int id, bool ucsan_labels) {
+  UCSAN_OUT("symbolize_input: ptr=%p, size=%zu, id=%d, ucsan_labels=%d\n", ptr,
+            size, id, ucsan_labels);
 
   if (!ptr || size == 0) return;
 
@@ -2142,11 +2149,32 @@ void __ucsan_symbolize_input(void *ptr, size_t size, int id) {
   }
 
   // Register in addr range map for lazy pointer relationship discovery
-  __symbolize_addr_map.insert(ptr, size, object_id, ptr_label);
+  // (once: a site in a loop symbolizes the same copy every iteration, and
+  // each insert shifts the entries after it)
+  uint32_t found_id, found_offset;
+  ucsan_label found_ptr_label;
+  if (!__symbolize_addr_map.find(ptr, &found_id, &found_offset,
+                                 &found_ptr_label) ||
+      found_id != object_id || found_offset != 0 ||
+      found_ptr_label != ptr_label)
+    __symbolize_addr_map.insert(ptr, size, object_id, ptr_label);
 
   // Label every byte OP_NONE — same pattern as ucsan_check_pointer:861-879
   ucsan_label *shadow = ucsan_shadow_for(ptr);
-  for (size_t offset = 0; offset < size; ++offset) {
+  // (without UCSan's labels: a written, concrete byte to UCSan -- and, in a
+  // global (__ucsan_sym_str's copy), never one to symbolize at its first
+  // dereference, see global_seen)
+  if (!ucsan_labels) {
+    if (in_data_section(ptr))
+      mark_global_seen(ptr, size);
+    for (size_t offset = 0; offset < size; ++offset) {
+      shadow[offset] = 0;
+      void *byte_addr = (void *)((uintptr_t)ptr + offset);
+      dfsan_label symsan_label = __taint_create_label(object_id, offset, 1);
+      __taint_set_label(symsan_label, byte_addr, 1);
+    }
+  }
+  for (size_t offset = 0; ucsan_labels && offset < size; ++offset) {
     ucsan_label byte_label = allocate_label();
 
     ucsan_label_info *byte_info = get_label_info(byte_label);
@@ -2177,6 +2205,20 @@ void __ucsan_symbolize_input(void *ptr, size_t size, int id) {
   }
 
   UCSAN_OUT("symbolize_input: done, labeled %zu bytes for object %u\n", size, object_id);
+}
+
+// A seed's value, symbolized in place: an object of the seed (ID, 1-based)
+// whose bytes are ptr's (the UT harness's __ucsan_sym*: a copy of a literal).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_symbolize_input(void *ptr, size_t size, int id) {
+  symbolize_input(ptr, size, id, true);
+}
+
+// The same, for a value no pointer is made of (a float, an integer narrower
+// than a pointer, a string's characters): SymSan's labels only.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __ucsan_symbolize_value(void *ptr, size_t size, int id) {
+  symbolize_input(ptr, size, id, false);
 }
 
 // Find a live stack alloca whose [base, base+size) contains ptr. Opaque

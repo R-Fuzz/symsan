@@ -1171,10 +1171,12 @@ void UCSan::initializeRuntimeFunctions(Module &M) {
   // __ucsan_symbolize_input: declared in user source code, not emitted by pass.
   // Register as runtime function to prevent dangle wrapping.
   // Arg shadow is stored to __ucsan_arg_tls automatically by visitCallBase.
-  if (Function *MakeInputFn = M.getFunction("__ucsan_symbolize_input")) {
-    markFunctionNosanitize(MakeInputFn);
-    UCRuntimeFunctions.insert(MakeInputFn);
-  }
+  // (and __ucsan_symbolize_value, its SymSan-only twin)
+  for (const char *Name : {"__ucsan_symbolize_input", "__ucsan_symbolize_value"})
+    if (Function *MakeInputFn = M.getFunction(Name)) {
+      markFunctionNosanitize(MakeInputFn);
+      UCRuntimeFunctions.insert(MakeInputFn);
+    }
 }
 
 void UCSan::initializeCustomFunctionTypes() {
