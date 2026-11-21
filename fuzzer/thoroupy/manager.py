@@ -734,19 +734,11 @@ class UcsanManager:
         # ids never reach the program (func_loop outer-exit is the canary).
         # Mirror them onto object 1.  Object 2 is the second arg (e.g. arr2)
         # and already receives correct ids from the callee-loop solves.
-        for sol in solutions:
-            if sol['op'] != OpType.SET:
-                continue
-            obj_id = sol['id']
-            if obj_id <= 2:
-                continue
-            offset = sol['offset']
-            adjusted = offset  # UObject coords, see above
-            logger.debug(
-                f"Mirror SET obj[{obj_id}][{offset}] -> obj[1][{adjusted}] "
-                f"= 0x{sol['val']:02x}"
-            )
-            seed.set_byte(1, adjusted, sol['val'])
+        # (no longer: the mirror wrote every solution on an object 3+ onto
+        # object 1 as well -- a unit test's third symbolized value onto its
+        # first (SmallVector's added onto size, breaking pos <= size in most
+        # seeds), a list's next node onto its head -- and it no longer fired
+        # in loop/func_loop/nested_loop at all, which pass without it)
 
         # Propagate solver data from resign-alias objects to canonical objects.
         # When resign re-labels memory (e.g., return_ptr with KO_RESIGN_PTRARGS),
