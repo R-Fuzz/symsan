@@ -999,12 +999,51 @@ static inline bool cmp_label_fits(dfsan_label l, size_t n) {
   return !info || info->size == n * 8;
 }
 
+// The n bytes of one side, as dfsan_read_label reads them, except that a byte
+// past the side's own terminator that was never written counts as the
+// concrete byte it holds.  str_cmp_len makes n the *other* side's length + 1,
+// so for a shorter string the read runs past its terminator, into bytes
+// strcmp never looks at.  When those were never written (a stack buffer's
+// tail, kInitializingLabel per byte) the operand came out partly
+// uninitialized, so did the comparison, and __taint_trace_memcmp took the
+// strcmp for a use of uninitialized memory: Die() under exit_on_memerror,
+// and under UCSan a UBI (exit 150) at the branch on its result -- v8's
+// BignumTest.Square, strcmp("64", buffer) with buffer holding "1".  The bytes
+// still take part in the comparison, so the width stays the one the solvers
+// need.  The read has to be of the shadow itself (union_load takes a
+// concrete byte from the application address of its label: app_for), so the
+// marks are cleared there for the read and put back after it.
+static inline dfsan_label str_cmp_read(const char *s, size_t n) {
+  size_t len = strnlen(s, n);
+  if (len + 1 >= n) return dfsan_read_label(s, n);
+  dfsan_label *shadow = shadow_for(const_cast<char *>(s));
+  size_t first = n;
+  for (size_t i = len + 1; i < n; ++i)
+    if (shadow[i] == kInitializingLabel) {
+      first = i;
+      break;
+    }
+  if (first == n) return dfsan_read_label(s, n);
+  // (which bytes were marked: one bit per byte, the rest read as they are)
+  constexpr size_t kMax = 4096;
+  uint64_t marked[kMax / 64] = {0};
+  for (size_t i = first; i < n && i < kMax; ++i)
+    if (shadow[i] == kInitializingLabel) {
+      marked[i / 64] |= (uint64_t)1 << (i % 64);
+      shadow[i] = 0;
+    }
+  dfsan_label label = dfsan_read_label(s, n);
+  for (size_t i = first; i < n && i < kMax; ++i)
+    if (marked[i / 64] >> (i % 64) & 1) shadow[i] = kInitializingLabel;
+  return label;
+}
+
 static inline uint16_t str_cmp_operands(const char *s1, const char *s2, size_t n,
                                         dfsan_label *l1, dfsan_label *l2) {
   if (str_cmp_op(*l1, *l2) == __dfsan::fstrcmp) return __dfsan::fstrcmp;
 
-  dfsan_label b1 = dfsan_read_label(s1, n);
-  dfsan_label b2 = dfsan_read_label(s2, n);
+  dfsan_label b1 = str_cmp_read(s1, n);
+  dfsan_label b2 = str_cmp_read(s2, n);
   if (!cmp_label_fits(b1, n) || !cmp_label_fits(b2, n))
     return __dfsan::fstrcmp;
 
