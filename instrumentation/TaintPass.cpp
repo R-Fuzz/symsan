@@ -3096,6 +3096,15 @@ bool Taint::runImpl(Module &M) {
           if (auto *CI = dyn_cast<CallInst>(Inst)) {
             TF.handleUCSanCall(CI, Next);
           }
+        } else if (ClWithUCSan) {
+          // and an assumption the source states itself (a unit test
+          // harness's ucsan_ut::assume, a spec's precondition): the same
+          // __taint_assume, or the solver never sees it and a seed that
+          // breaks it is only rejected (tests/ucsan/test/assume_source.c)
+          if (auto *CI = dyn_cast<CallInst>(Inst))
+            if (Function *F = CI->getCalledFunction())
+              if (F->getName() == "__dfsw_ucsan_assume")
+                TF.handleUCSanCall(CI, Next);
         }
         if (UCSanLib && !TF.SkipInsts.count(Inst) &&
             !Inst->getMetadata("nosanitize"))
