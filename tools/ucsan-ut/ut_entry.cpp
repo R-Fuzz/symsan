@@ -33,6 +33,7 @@
 // usage: ut-entry IN.bc OUT.bc ALLOW
 //          [--fatal MANGLED]... [--fatal-prefix NAME]...
 //          [--helper-prefix NAME]... [--harness-file PATH]...
+//          [--unit-preconditions off]
 //   ALLOW: the scope's allow file; its harness-prefix / harness-exact lines
 //          name the test's functions (ut_scope.py)
 //   PATH:  a prefix of the debug info's file name, as the compiler saw it
@@ -44,6 +45,13 @@
 //          scope.
 //   NAME:  matched against the bare name (ns::C::f: no return type, template
 //          arguments or parameters), as cg_scope.py matches
+//   --unit-preconditions off: step 2 (the unit's checks at the test's calls
+//          into it as assumptions) is not done; the test's own checks still
+//          are.  For a test with a spec (UT_SPEC): the spec states the API's
+//          preconditions from its contract, and the unit's CHECK/DCHECK/
+//          UNREACHABLE stay detectors -- assumed, they hid a death test's
+//          death and every input where the unit is stricter than its contract
+//          (bignum: ShiftLeft(-1), AssignPowerUInt16's EnsureCapacity)
 //   prints the __ucsan_ut_assume.N names it declared, one per fatal reporter
 //   (each to be mapped to ucsan_invalid_input)
 // ut-entry --bare < NAMES: the bare-name rule alone, for testing it
@@ -70,6 +78,7 @@
 using namespace llvm;
 
 static std::vector<std::string> FatalPrefixes, HelperPrefixes, HarnessFiles;
+static bool UnitPreconditions = true;  // --unit-preconditions off: false
 static std::set<std::string> FatalNames;
 
 static bool endsWith(const std::string &S, const std::string &X) {
@@ -298,7 +307,8 @@ int main(int argc, char **argv) {
   if (argc < 4) {
     errs() << "usage: ut-entry IN.bc OUT.bc ALLOW [--fatal M]... "
               "[--fatal-prefix N]... [--helper-prefix N]... "
-              "[--harness-file P]... [--changed-out FILE]\n";
+              "[--harness-file P]... [--unit-preconditions off] "
+              "[--changed-out FILE]\n";
     return 1;
   }
   std::string ChangedOut;
@@ -309,6 +319,7 @@ int main(int argc, char **argv) {
     else if (K == "--helper-prefix") HelperPrefixes.push_back(V);
     else if (K == "--harness-file") HarnessFiles.push_back(V);
     else if (K == "--changed-out") ChangedOut = V;
+    else if (K == "--unit-preconditions") UnitPreconditions = V != "off";
     else { errs() << "unknown option " << K << "\n"; return 1; }
   }
   // the test's functions, as ut_scope.py writes them: an allow entry is a
@@ -351,6 +362,7 @@ int main(int argc, char **argv) {
     Own += N;
     if (N) Changed.insert(H);
     // 2. the unit's preconditions, at the test's calls into it
+    if (!UnitPreconditions) continue;
     for (Instruction &I : instructions(H)) {
       Function *Callee = directCallee(I);
       if (!Callee || Callee->isDeclaration() || IsHarness.count(Callee) ||
