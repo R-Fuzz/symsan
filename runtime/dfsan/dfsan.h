@@ -512,6 +512,10 @@ static const uint8_t UndefinedCheck = 0x10;
 // the condition of a select, not of a branch: an uninitialized one is not a
 // UBI, the select's result carries it (TaintFunction::visitSelectInst)
 static const uint8_t SelectCondition = 0x20;
+// an add_constraint_type message's flags: an assumption the program states
+// (__taint_assume), which every solve of a later task must keep -- never
+// relaxed or dropped, unlike a constraint of the path (backend/fastgen.cpp)
+static const uint8_t AssumedConstraint = 0x1;
 
 enum undefined_check_ids {
   ub_integer_overflow = 1,

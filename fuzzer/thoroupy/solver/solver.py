@@ -43,9 +43,10 @@ class Z3Solver:
         return symsan.parse_gep(ptr_label, ptr, index_label, index,
                                 num_elems, elem_size, current_offset, enum_index)
 
-    def add_constraint(self, label: int, value: int) -> None:
-        """Add explicit constraint (for trace_cond)."""
-        symsan.add_constraint(label, value)
+    def add_constraint(self, label: int, value: int, hard: bool = False) -> None:
+        """Add explicit constraint (for trace_cond).  hard: an assumption the
+        program states (AssumedConstraint), kept by every later solve."""
+        symsan.add_constraint(label, value, hard)
 
     def record_memcmp(self, label: int, data: bytes) -> None:
         """Record memcmp concrete data."""

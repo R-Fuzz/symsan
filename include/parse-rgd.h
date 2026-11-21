@@ -40,7 +40,8 @@ public:
                 int64_t current_offset, bool enum_index,
                 std::vector<uint64_t> &tasks) override;
 
-  int add_constraints(dfsan_label label, uint64_t result) override;
+  int add_constraints(dfsan_label label, uint64_t result,
+                      bool hard = false) override;
 
   // --- dependency queries ----------------------------------------------------
   // The parser already computes which input offsets each label reads, and which

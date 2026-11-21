@@ -584,7 +584,10 @@ class UcsanManager:
             case PIPE_MSG_TYPE.ADD_CONSTRAINT_TYPE:
                 if msg.label != 0:
                     try:
-                        self.solver.add_constraint(msg.label, msg.result)
+                        # flags & 1: AssumedConstraint (__taint_assume), a
+                        # hard constraint of every later task (dfsan.h)
+                        self.solver.add_constraint(msg.label, msg.result,
+                                                   bool(msg.flags & 1))
                     except Exception as e:
                         logger.error(f"Error adding constraint (msg_type=3): {e}")
             case PIPE_MSG_TYPE.MEMCMP_TYPE:

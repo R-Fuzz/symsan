@@ -728,12 +728,13 @@ static PyObject* AddConstraint(PyObject *self, PyObject *args) {
 
   dfsan_label label = 0;
   uint64_t val = 0;
+  int hard = 0;  // an assumption (AssumedConstraint): never relaxed
 
-  if (!PyArg_ParseTuple(args, "IL", &label, &val)) {
+  if (!PyArg_ParseTuple(args, "IL|p", &label, &val, &hard)) {
     return NULL;
   }
 
-  if (__z3_parser->add_constraints(label, val) != 0) {
+  if (__z3_parser->add_constraints(label, val, hard) != 0) {
     PyErr_Format(PyExc_RuntimeError, "failed to add constraint: %s",
                  __z3_parser->last_error().c_str());
     return NULL;

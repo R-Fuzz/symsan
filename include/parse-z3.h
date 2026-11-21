@@ -37,7 +37,8 @@ public:
                 int64_t current_offset, bool enum_index,
                 std::vector<uint64_t> &tasks) override;
 
-  int add_constraints(dfsan_label label, uint64_t result) override;
+  int add_constraints(dfsan_label label, uint64_t result,
+                      bool hard = false) override;
   int record_minimize(dfsan_label label, bool allow_zero = true) override;
   /// drop a task that will not be solved (solve_task takes the ones that are)
   void discard_task(uint64_t id);

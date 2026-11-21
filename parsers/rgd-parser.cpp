@@ -2769,7 +2769,8 @@ int RGDAstParser::parse_gep(dfsan_label ptr_label, uptr ptr,
   return 0;
 }
 
-int RGDAstParser::add_constraints(dfsan_label label, uint64_t result) {
+int RGDAstParser::add_constraints(dfsan_label label, uint64_t result,
+                                  bool /*hard*/) {
   // offset constraint should be in the form of r = (offset == label) = true
   if (!solve_nested_) {
     // only matters in nested mode

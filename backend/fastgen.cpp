@@ -434,6 +434,35 @@ __taint_add_constraint(dfsan_label label, uint8_t result) {
   return;
 }
 
+// an assumption that holds: add_constraint_type with AssumedConstraint, a
+// constraint the solver keeps in every later task's solve (never relaxed)
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_add_assumption(dfsan_label label) {
+  if (label == 0)
+    return;
+
+  void *addr = __builtin_return_address(0);
+
+  AOUT("tainted add_assumption: %d @%p\n", label, addr);
+
+  if (__pipe_fd < 0)
+    return;
+
+  pipe_msg msg = {
+    .msg_type = add_constraint_type,
+    .flags = AssumedConstraint,
+    .instance_id = __instance_id,
+    .addr = (uptr)addr,
+    .context = __taint_trace_callstack,
+    .label = label,
+    .result = 1
+  };
+
+  __taint_emit(&msg, sizeof(msg));
+
+  return;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_minimize_label(dfsan_label label, u64 size, dfsan_label bounds) {
   label = as_whole(label);

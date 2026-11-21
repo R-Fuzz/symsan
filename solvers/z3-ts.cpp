@@ -3095,7 +3095,7 @@ int Z3AstParser::parse_gep(dfsan_label ptr_label, uptr ptr, dfsan_label index_la
   return -1;
 }
 
-int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
+int Z3AstParser::add_constraints(dfsan_label label, uint64_t result, bool hard) {
   if (label < CONST_OFFSET || label == __dfsan::kInitializingLabel || label >= size_) {
     // invalid label
     set_error("invalid label");
@@ -3147,6 +3147,12 @@ int Z3AstParser::add_constraints(dfsan_label label, uint64_t result) {
 #endif
 
     save_constraint(expr == r, inputs);
+    // an assumption is also an aux constraint: solve_task adds those to every
+    // check (the optimistic one, relax_nested's, the optimizer's), so a task
+    // whose path is unsat or times out still keeps it -- as a nested one only,
+    // a held ucsan_ut::assume(pos <= size) was dropped and its seeds broke it
+    if (hard)
+      aux_constraints_.push_back(expr == r);
 
     // Track ICmp comparisons for Int mirroring of BV nested constraints.
     // When both operands later get int-* variables (from sort coercion or fsubstr),

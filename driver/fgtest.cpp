@@ -429,7 +429,8 @@ static int run_one(char *program, char *input, int is_stdin) {
           free(tmsg);
           break;
         case add_constraint_type:
-          if (__z3_parser->add_constraints(msg.label, msg.result) != 0) {
+          if (__z3_parser->add_constraints(msg.label, msg.result,
+                                           msg.flags & AssumedConstraint) != 0) {
             fprintf(stderr, "Failed to add constraint %d = %lu @%p\n",
                     msg.label, msg.result, (void*)msg.addr);
           }

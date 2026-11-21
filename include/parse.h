@@ -72,8 +72,11 @@ public:
   /// @brief Add a constraint, typically from symbolic offset
   /// @param label symbolic label of the constraint
   /// @param result concrete value of the constraint
+  /// @param hard an assumption (AssumedConstraint): kept by every later
+  ///        task's solve, never relaxed; a parser may treat it as a constraint
   /// @return 0 on success, -1 on failure
-  virtual int add_constraints(dfsan_label label, uint64_t result) = 0;
+  virtual int add_constraints(dfsan_label label, uint64_t result,
+                              bool hard = false) = 0;
 
   /// @brief Record a label to minimize during solving (e.g., malloc size)
   /// @param label symbolic label to minimize

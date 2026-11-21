@@ -302,6 +302,11 @@ void __taint_trace_ub_check(dfsan_label label, bool r, uint32_t cid,
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_add_constraint(dfsan_label label, uint8_t result);
 
+// an assumption that holds (label true): a hard constraint of every later
+// task, which a solver must not relax (backend/fastgen.cpp, AssumedConstraint)
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_add_assumption(dfsan_label label);
+
 // Forward declarations for trace callbacks (implemented in solvers)
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __taint_trace_event_addr(uint32_t label, uint32_t event_id,
@@ -420,7 +425,10 @@ void __taint_assume(dfsan_label label, bool holds) {
   if (label < CONST_OFFSET)
     return;
   if (holds) {
-    __taint_add_constraint(label, 1);
+    // hard: a solver that relaxes the path (z3-ts.cpp's relax_nested, or the
+    // optimistic model of a nested-unsat task) would otherwise drop it too,
+    // and its seeds break the assumption
+    __taint_add_assumption(label);
     return;
   }
   AOUT("assumption broken by the input, label %u\n", label);
@@ -3252,6 +3260,7 @@ SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_offset, dfsan_label, int64_t,
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_memcmp, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_distance, uint64_t, uint64_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_add_constraint, dfsan_label, uint8_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_add_assumption, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(bool, __ucsan_is_placement_byte, uint32_t, int64_t) {
   return false;
 }
