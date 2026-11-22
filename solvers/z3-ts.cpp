@@ -345,6 +345,7 @@ int Z3AstParser::restart(std::vector<input_t> &inputs, bool copy_input) {
 
   aux_constraints_.clear();
   minimize_hints_.clear();
+  initial_values_.clear();
   // (the saved tasks keep their own copies, save_task_ctx)
   last_ctx_ = task_ctx_t();
   string_info_cache_.clear();
@@ -627,6 +628,16 @@ static uint64_t eval_fp_binop(uint16_t op, uint64_t v1, uint64_t v2, uint8_t bit
   return fp_encode(r, bits);
 }
 
+static bool keep_seed_values_on();
+
+void Z3AstParser::note_initial_value(const z3::expr &byte, uint32_t input,
+                                     uint32_t offset) {
+  uint8_t v;
+  // (kept only for keep_seed_values: each task would copy them)
+  if (keep_seed_values_on() && cached_input_byte(input, offset, v))
+    initial_values_.emplace_back(byte, v);
+}
+
 uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_t offset,
                                       uint32_t bytes, input_dep_set_t &input_deps) {
   char name[256];
@@ -644,6 +655,7 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
   // Load operation can load overlapping bytes, so we need to check
   if (get_branch_dep({input, offset}) == nullptr) {
     set_branch_dep({input, offset}, std::make_unique<branch_dependency_t>(first_byte));
+    note_initial_value(first_byte, input, offset);
   }
   input_deps.insert(std::make_pair(input, offset));
   uint64_t val = 0;
@@ -661,6 +673,7 @@ uint64_t Z3AstParser::serialize_input(dfsan_label label, uint32_t input, uint32_
     out = z3::concat(byte_expr, out);
     if (get_branch_dep({input, offset + i}) == nullptr) {
       set_branch_dep({input, offset + i}, std::make_unique<branch_dependency_t>(byte_expr));
+      note_initial_value(byte_expr, input, offset + i);
     }
     input_deps.insert(std::make_pair(input, offset + i));
 #if FILTER_WRONG_AST
@@ -3195,6 +3208,9 @@ uint64_t Z3AstParser::save_task_ctx(uint64_t tid) {
   if (!last_ctx_.hints || last_ctx_.hints->size() != minimize_hints_.size())
     last_ctx_.hints =
         std::make_shared<const std::vector<minimize_hint_t>>(minimize_hints_);
+  if (!last_ctx_.init || last_ctx_.init->size() != initial_values_.size())
+    last_ctx_.init = std::make_shared<
+        const std::vector<std::pair<z3::expr, uint8_t>>>(initial_values_);
   task_ctx_[tid] = last_ctx_;
   return tid;
 }
@@ -3459,6 +3475,98 @@ static unsigned relax_rounds() {
   return n;
 }
 
+// SYMSAN_KEEP_SEED_VALUES=1 (thoroupy, i.e. UCSan, sets it): keep_seed_values.
+// Off by default; its cost where nested constraints often move other bytes
+// (file fuzzing) is unmeasured.
+static bool keep_seed_values_on() {
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("SYMSAN_KEEP_SEED_VALUES");
+    on = e ? atoi(e) != 0 : 0;
+  }
+  return on;
+}
+
+// If m changes an input byte the target does not mention from its seed value
+// (init, initial_values_), solve again for the constraints m meets -- aux, the
+// target, and the nested ones m satisfies (after relax_nested, not all) --
+// with z3's optimizer and a soft `byte == seed value` for every byte in m, and
+// take that model: a byte changes only where the constraints need it.  m
+// stays if nothing changed, or the optimizer gives no model in time.  Without
+// it a byte only a hard assumption mentions came back as anything the
+// assumption allows (`3 < new_n`: new_n = 33,620,488, then rejected by a later
+// 256 limit; 451 of 950 runs of a v8 unit test, 2 with it, at no cost in
+// solves).  z3's initial values (Z3_solver_set_initial_value) were not enough:
+// only its SMT core honours them, which made 4x fewer solves there and lost
+// inputs in 8 of tests/symsan, and Z3_optimize_set_initial_value segfaults in
+// the bit-blaster (z3 5.3.1).
+static void keep_seed_values(z3::model &m, const z3_task_t &task,
+                             const std::vector<z3::expr> &aux,
+                             const std::vector<std::pair<z3::expr, uint8_t>> &init,
+                             unsigned timeout) {
+  if (init.empty() || task.empty())
+    return;
+  z3::context &ctx = m.ctx();
+  std::unordered_map<unsigned, uint8_t> seed;
+  for (const auto &iv : init)
+    seed[iv.first.id()] = iv.second;
+  // the target's own variables: changing those is the point of the solve, so
+  // only a change elsewhere (a byte only aux or a nested constraint mentions)
+  // asks for the optimizer
+  std::unordered_set<unsigned> target, seen;
+  std::vector<z3::expr> todo{task[0]};
+  while (!todo.empty()) {
+    z3::expr e = todo.back();
+    todo.pop_back();
+    if (!seen.insert(e.id()).second)
+      continue;
+    if (e.is_const() && !e.is_numeral()) {
+      target.insert(e.id());
+    } else if (e.is_app()) {
+      for (unsigned i = 0; i < e.num_args(); i++)
+        todo.push_back(e.arg(i));
+    }
+  }
+  std::vector<z3::expr> soft;
+  bool changed = false;
+  for (unsigned i = 0; i < m.num_consts(); ++i) {
+    z3::func_decl decl = m.get_const_decl(i);
+    if (decl.arity() != 0 || !decl.range().is_bv() || decl.range().bv_size() != 8)
+      continue;
+    z3::expr var = decl();
+    auto it = seed.find(var.id());
+    if (it == seed.end())
+      continue;
+    z3::expr val = ctx.bv_val(it->second, 8);
+    soft.push_back(var == val);
+    if (target.count(var.id()))
+      continue;
+    z3::expr cur = m.eval(var, true);
+    if (cur.is_numeral() && cur.get_numeral_uint() != it->second)
+      changed = true;
+  }
+  if (!changed)
+    return;
+  try {
+    z3::optimize opt(ctx);
+    z3::params p(ctx);
+    p.set("timeout", timeout);
+    opt.set(p);
+    for (const auto &ac : aux)
+      opt.add(ac);
+    opt.add(task[0]);
+    for (size_t i = 1; i < task.size(); i++)
+      if (m.eval(task[i], true).is_true())
+        opt.add(task[i]);
+    for (const auto &s : soft)
+      opt.add_soft(s, 1);
+    if (opt.check() == z3::sat)
+      m = opt.get_model();
+  } catch (z3::exception &e) {
+    DEBUGF("WARNING: keep_seed_values: %s\n", e.msg());
+  }
+}
+
 static bool relax_nested(z3::solver &solver, z3_task_t *task, unsigned rounds,
                          z3::model &m) {
   z3::context &ctx = solver.ctx();
@@ -3518,6 +3626,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
   }
   const auto &aux = ctx.aux ? *ctx.aux : aux_constraints_;
   const auto &hints = ctx.hints ? *ctx.hints : minimize_hints_;
+  const auto &init = ctx.init ? *ctx.init : initial_values_;
 
   try {
     // setup global solver
@@ -3605,6 +3714,8 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
 
       // Collect input offsets from the model for minimize hint matching
       std::unordered_set<offset_t, offset_hash> model_inputs;
+      // the minimizer below replaced m (keep_seed_values leaves it alone)
+      bool minimized = false;
 
       for (unsigned i = 0; i < m.num_consts(); ++i) {
         z3::func_decl decl = m.get_const_decl(i);
@@ -3693,6 +3804,7 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           if (all_within_bounds) {
             m = opt_model;
             use_optimized = true;
+            minimized = true;
           }
           // else: optimized model exceeds bounds, fall back to bounded solver
         }
@@ -3711,6 +3823,9 @@ Z3ParserSolver::solve_task(uint64_t task_id, unsigned timeout, solution_t &solut
           solver.pop();
         }
       }
+
+      if (keep_seed_values_on() && !minimized && !str_abstract)
+        keep_seed_values(m, *task, aux, init, timeout);
 
       generate_solution(m, solutions);
       // fprintf(stderr, "DEBUG solve_task[%lu]: after generate_solution, solutions.size() = %zu\n", task_id, solutions.size());

@@ -63,13 +63,20 @@ protected:
   };
   std::vector<minimize_hint_t> minimize_hints_;
 
+  // Each input byte's value in the trace's seed, taken when the byte first
+  // becomes a variable: what keep_seed_values (z3-ts.cpp) keeps a byte at
+  // where no constraint makes it change.
+  std::vector<std::pair<z3::expr, uint8_t>> initial_values_;
+  void note_initial_value(const z3::expr &byte, uint32_t input, uint32_t offset);
+
   // A task's share of the per-trace state it is solved with (aux_constraints_,
-  // minimize_hints_), taken when the task is saved: a task solved on demand is
+  // minimize_hints_, initial_values_), taken when the task is saved: a task solved on demand is
   // solved after restart() has cleared them for a later trace.  Tasks saved
   // while neither grew share one copy.
   struct task_ctx_t {
     std::shared_ptr<const std::vector<z3::expr>> aux;
     std::shared_ptr<const std::vector<minimize_hint_t>> hints;
+    std::shared_ptr<const std::vector<std::pair<z3::expr, uint8_t>>> init;
   };
   std::unordered_map<uint64_t, task_ctx_t> task_ctx_;
   task_ctx_t last_ctx_;

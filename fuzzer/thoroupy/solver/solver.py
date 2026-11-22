@@ -1,4 +1,13 @@
+import os
+
 import symsan
+
+# UCSan's unit inputs: a solution keeps every input byte the constraints do not
+# make change at its seed value (z3-ts.cpp keep_seed_values).  Without it a
+# byte only a test's assumption mentions came back as anything the assumption
+# allows, and a later precondition rejected the run.  Read at the first solve;
+# SYMSAN_KEEP_SEED_VALUES=0 in the environment turns it off.
+os.environ.setdefault("SYMSAN_KEEP_SEED_VALUES", "1")
 
 
 class OpType:
