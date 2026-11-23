@@ -754,6 +754,10 @@ struct UCSanFunction {
   Value *checkPointerUnlessNull(Value *P, Value *Size, uint32_t TypeID,
                                 CallBase &CB, IRBuilder<> &IRB,
                                 bool LibArg = false);
+  Value *checkPointerCounted(Value *P, Value *Count, uint32_t TypeID,
+                             Instruction &At, IRBuilder<> &IRB,
+                             MaybeAlign Alignment = std::nullopt,
+                             bool ExactSize = false);
   void checkGlobalDest(Value *Dest, Value *Length, IRBuilder<> &IRB);
   void recordPointerLoadSummary(LoadInst &LI);
   void recordMemoryAccessSummary(Value *Ptr, uint64_t AccessSize, bool IsWrite,
@@ -2462,26 +2466,31 @@ Function *UCSan::getCustomFunction(const Function *F) {
     // for ref functions with no entry (e.g. strcmp) pass 0 (strlen-determined).
     int SizeArgIdx = ABIList.getSizeArgIdx(CustomEntry.ref_name);
     Value *SizeVal;
-    if (SizeArgIdx >= 0 && (unsigned)SizeArgIdx < Args.size()) {
+    bool Counted = SizeArgIdx >= 0 && (unsigned)SizeArgIdx < Args.size();
+    if (Counted) {
       SizeVal = IRB.CreateZExtOrTrunc(Args[SizeArgIdx], Int64Ty);
       markNosanitize(SizeVal);
     } else {
       SizeVal = ConstantInt::get(Int64Ty, 0);
     }
-    for (unsigned i = 0, e = Args.size(); i != e; ++i) {
-      if (!Args[i]->getType()->isPointerTy()) continue;
-      // typeID 0 = typeless bytes (matches WK_TaintCustom convention)
-      Args[i] = UF.checkPointer(Args[i], SizeVal, true, IRB, 0);
-    }
-
+    // (the call and the return first: a count's check splits the block at
+    // the call, which needs the block's terminator)
+    CallInst *RefCall = IRB.CreateCall(RefedFunc, Args);
     if (!F->getReturnType()->isVoidTy()) {
-      Value *RetVal = IRB.CreateCall(RefedFunc, Args);
-      Value *FinalRet = invertIntRet(RetVal, F->getReturnType(),
+      Value *FinalRet = invertIntRet(RefCall, F->getReturnType(),
                                       CustomEntry.invert_ret, IRB);
       IRB.CreateRet(FinalRet);
     } else {
-      IRB.CreateCall(RefedFunc, Args);
       IRB.CreateRetVoid();
+    }
+    IRB.SetInsertPoint(RefCall);
+    for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+      if (!Args[i]->getType()->isPointerTy()) continue;
+      // typeID 0 = typeless bytes (matches WK_TaintCustom convention)
+      // (a byte count of 0 touches nothing: see checkPointerCounted)
+      RefCall->setArgOperand(
+          i, Counted ? UF.checkPointerCounted(Args[i], SizeVal, 0, *RefCall, IRB)
+                     : UF.checkPointer(Args[i], SizeVal, true, IRB, 0));
     }
 
     CustomFuncs[Name] = WrapperFunc;
@@ -2716,6 +2725,52 @@ Value *UCSanFunction::checkPointerUnlessNull(Value *P, Value *Size,
   // skipped by UCSanPass, but not nosanitize: TaintPass gives it the checked
   // pointer's SymSan label.  (As nosanitize it had none, so every pointer
   // checked here lost it: what a free's wrapper and a library callee got.)
+  SkipInsts.insert(Phi);
+  return Phi;
+}
+
+// A pointer that a mem/str function or a memory intrinsic touches Count bytes
+// behind (the abilist's sizeN, an intrinsic's length): checked as a
+// dereference of Count bytes, except that with Count == 0 nothing is touched,
+// so an unlabeled null then is no null dereference.  (libc++'s equal of two
+// empty ranges is __builtin_memcmp(nullptr, p, 0) when one of them is an
+// empty UniqueArray's: a false 153; an llvm.memcpy of length 0 is a no-op.)
+// A labeled pointer is still checked, null or not: it names an object.  Not
+// for a string function's size 0, which means "up to the terminator".  IRB
+// is at At, and is left there, after the check's block split.
+Value *UCSanFunction::checkPointerCounted(Value *P, Value *Count,
+                                          uint32_t TypeID, Instruction &At,
+                                          IRBuilder<> &IRB,
+                                          MaybeAlign Alignment,
+                                          bool ExactSize) {
+  const DataLayout &DL = F->getParent()->getDataLayout();
+  auto *CI = dyn_cast<ConstantInt>(Count);
+  if ((CI && !CI->isZero()) || isKnownNonZero(P, DL))
+    return checkPointer(P, Count, true, IRB, TypeID, Alignment, ExactSize);
+  Value *NotNull = IRB.CreateICmpNE(
+      P, ConstantPointerNull::get(cast<PointerType>(P->getType())));
+  UC.markNosanitize(NotNull);
+  Value *Labeled = IRB.CreateICmpNE(getShadow(P), UC.ZeroPrimitiveShadow);
+  UC.markNosanitize(Labeled);
+  Value *NonEmpty =
+      IRB.CreateICmpNE(Count, ConstantInt::get(Count->getType(), 0));
+  UC.markNosanitize(NonEmpty);
+  Value *Check = IRB.CreateOr(NotNull, Labeled);
+  UC.markNosanitize(Check);
+  Check = IRB.CreateOr(Check, NonEmpty);
+  UC.markNosanitize(Check);
+  Instruction *ThenTerm = SplitBlockAndInsertIfThen(Check, &At, false);
+  BasicBlock *ThenBB = ThenTerm->getParent();
+  BasicBlock *HeadBB = ThenBB->getSinglePredecessor();
+  DT.recalculate(*F);
+  IRBuilder<> ThenIRB(ThenTerm);
+  Value *Checked =
+      checkPointer(P, Count, true, ThenIRB, TypeID, Alignment, ExactSize);
+  IRB.SetInsertPoint(&At);
+  PHINode *Phi = IRB.CreatePHI(P->getType(), 2);
+  Phi->addIncoming(Checked, ThenTerm->getParent());
+  Phi->addIncoming(P, HeadBB);
+  // (as checkPointerUnlessNull's: TaintPass gives it the pointer's label)
   SkipInsts.insert(Phi);
   return Phi;
 }
@@ -3237,19 +3292,20 @@ void UCSanVisitor::visitMemCpyInst(MemCpyInst &I) {
   }
 
   // Check source and destination pointers
-  Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
-                               I.getSourceAlign(), true);
+  Value *src = UF.checkPointerCounted(I.getRawSource(), Length, 0, I, IRB,
+                                      I.getSourceAlign(), true);
   // check the destination pointer, if it's a global variable,
   // no need to call check pointer to symbolize, as it's the dest.
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
-    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign(), true);
+    dest = UF.checkPointerCounted(dest, Length, 0, I, IRB, I.getDestAlign(),
+                                  true);
     // the destination's check can move the object the source points into
     // (when it is the same one, see align_object in ucsan.cpp): the source
     // is checked again, with no alignment, which never moves anything
     if (I.getDestAlign().valueOrOne() > 1)
-      src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
-                            std::nullopt, true);
+      src = UF.checkPointerCounted(I.getRawSource(), Length, 0, I, IRB,
+                                   std::nullopt, true);
   } else {
     UF.checkGlobalDest(dest, Length, IRB);
   }
@@ -3294,7 +3350,8 @@ void UCSanVisitor::visitMemSetInst(MemSetInst &I) {
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
     // Check destination pointer
-    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign(), true);
+    dest = UF.checkPointerCounted(dest, Length, 0, I, IRB, I.getDestAlign(),
+                                  true);
     I.setDest(dest);
   } else {
     UF.checkGlobalDest(dest, Length, IRB);
@@ -3316,19 +3373,20 @@ void UCSanVisitor::visitMemMoveInst(MemMoveInst &I) {
   }
 
   // Check source and destination pointers
-  Value *src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
-                               I.getSourceAlign(), true);
+  Value *src = UF.checkPointerCounted(I.getRawSource(), Length, 0, I, IRB,
+                                      I.getSourceAlign(), true);
   // check the destination pointer, if it's a global variable,
   // no need to call check pointer to symbolize, as it's the dest.
   Value *dest = I.getRawDest();
   if (!isa<GlobalVariable>(getUnderlyingObject(dest->stripPointerCasts()))) {
-    dest = UF.checkPointer(dest, Length, true, IRB, 0, I.getDestAlign(), true);
+    dest = UF.checkPointerCounted(dest, Length, 0, I, IRB, I.getDestAlign(),
+                                  true);
     // the destination's check can move the object the source points into
     // (when it is the same one, see align_object in ucsan.cpp): the source
     // is checked again, with no alignment, which never moves anything
     if (I.getDestAlign().valueOrOne() > 1)
-      src = UF.checkPointer(I.getRawSource(), Length, true, IRB, 0,
-                            std::nullopt, true);
+      src = UF.checkPointerCounted(I.getRawSource(), Length, 0, I, IRB,
+                                   std::nullopt, true);
   } else {
     UF.checkGlobalDest(dest, Length, IRB);
   }
@@ -6599,6 +6657,7 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
       if ((*I)->getType()->isPointerTy() && !isa<ConstantPointerNull>(*I)) {
         Value *sizeArg;
         uint32_t TypeID;
+        bool Counted = false;  // sizeArg is a byte count (not strlen's 0)
         if (IsMemOrStrFn) {
           TypeID = 0;  // typeless bytes
           if (LenArgIdx == -2) {
@@ -6607,11 +6666,13 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
             if (MyLenIdx < CB.arg_size()) {
               sizeArg = IRB.CreateZExtOrTrunc(CB.getArgOperand(MyLenIdx), UF.UC.Int64Ty);
               UF.UC.markNosanitize(sizeArg);
+              Counted = true;
             } else {
               sizeArg = ConstantInt::get(UF.UC.Int64Ty, 0);
             }
           } else if (LenVal) {
             sizeArg = LenVal;
+            Counted = true;
           } else {
             sizeArg = ConstantInt::get(UF.UC.Int64Ty, 0);  // string fn, unknown length
           }
@@ -6654,9 +6715,10 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
 
         Value *rptr = *I;
         if (!skipCheckPointer) {
-          rptr = IsMemOrStrFn
-                     ? UF.checkPointer(*I, sizeArg, true, IRB, TypeID)
-                     : checkUnlessNull(*I, sizeArg, TypeID);
+          // (a byte count of 0 touches nothing: see checkPointerCounted)
+          rptr = !IsMemOrStrFn ? checkUnlessNull(*I, sizeArg, TypeID)
+                 : Counted ? UF.checkPointerCounted(*I, sizeArg, TypeID, CB, IRB)
+                           : UF.checkPointer(*I, sizeArg, true, IRB, TypeID);
         }
         CB.setArgOperand(ArgIdx, rptr);
 
@@ -6803,7 +6865,9 @@ bool UCSanVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
         // Without a byte count, null is a value the wrapper takes, as a
         // library callee does: realloc(nullptr, n), free(nullptr) (v8's
         // ValueSerializer grows its buffer from nullptr: a false 153)
-        Value *rptr = LenVal ? UF.checkPointer(*I, sizeArg, true, IRB, TypeID)
+        // (and with one, a count of 0 touches nothing: checkPointerCounted)
+        Value *rptr = LenVal ? UF.checkPointerCounted(*I, sizeArg, TypeID,
+                                                      CB, IRB)
                              : UF.checkPointerUnlessNull(*I, sizeArg, TypeID,
                                                          CB, IRB);
         Args.push_back(rptr);
